@@ -713,7 +713,7 @@ pub(super) fn turn_status_line(status: TurnStatus<'_>, content_width: usize) -> 
 /// Past a minute the seconds stop being a quantity anyone reads — `253s` is
 /// arithmetic, `4m 13s` is a fact — so the label changes unit rather than
 /// growing.
-fn elapsed_label(elapsed: Duration) -> String {
+pub(super) fn elapsed_label(elapsed: Duration) -> String {
     let seconds = elapsed.as_secs();
     if seconds >= 3_600 {
         let minutes = (seconds % 3_600) / 60;

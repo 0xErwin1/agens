@@ -2654,10 +2654,7 @@ fn fitted_subagent_tree_lines(state: &ViewState<'_>, rows: u16, width: u16) -> V
 
     let mut lines = Vec::new();
     if spare > 0 {
-        lines.push(Line::from(Span::styled(
-            render::bounded_single_line("Main", width),
-            tree_row_style(state, TranscriptId::Main),
-        )));
+        lines.push(tree_root_line(state, width));
     }
     let backgroundable = branches
         .iter()
@@ -2668,12 +2665,55 @@ fn fitted_subagent_tree_lines(state: &ViewState<'_>, rows: u16, width: u16) -> V
         spare.saturating_sub(1),
         width,
     ));
+    let cancellable = branches.iter().any(|execution| {
+        state.active_transcript == TranscriptId::Subagent(execution.id)
+            && matches!(
+                execution.state,
+                TuiExecutionState::ForegroundRunning | TuiExecutionState::BackgroundRunning
+            )
+    });
     lines.push(tree_affordance_line(
         state.executions.len().saturating_sub(branches.len()),
         backgroundable,
+        cancellable,
         width,
     ));
     lines
+}
+
+/// The tree's root: the parent transcript, and how much delegated work hangs
+/// off it.
+///
+/// The count is what makes the row worth its line. "Main" alone says nothing a
+/// reader cannot see; "Main · 3 running" answers how much is in flight before
+/// any branch is read, and keeps answering it when the branches themselves have
+/// been elided for height. Finished branches are counted separately so a row of
+/// leftovers never reads as live work.
+fn tree_root_line(state: &ViewState<'_>, width: usize) -> Line<'static> {
+    let running = state
+        .executions
+        .iter()
+        .filter(|execution| {
+            matches!(
+                execution.state,
+                TuiExecutionState::ForegroundRunning | TuiExecutionState::BackgroundRunning
+            )
+        })
+        .count();
+    let finished = state.executions.len().saturating_sub(running);
+
+    let mut label = "Main".to_owned();
+    if running > 0 {
+        label.push_str(&format!(" · {running} running"));
+    }
+    if finished > 0 {
+        label.push_str(&format!(" · {finished} done"));
+    }
+
+    Line::from(Span::styled(
+        render::bounded_single_line(&label, width),
+        tree_row_style(state, TranscriptId::Main),
+    ))
 }
 
 fn tree_branch_lines(
@@ -2754,19 +2794,27 @@ fn tree_branch_lines(
 /// Closes the tree with its navigation affordance, folding the branches that
 /// did not fit into the same row so the hidden count stays discoverable.
 ///
-/// Backgrounding only applies to a branch still running in the foreground, so
-/// the hint is dropped when no shown branch can accept it.
+/// Backgrounding only applies to a branch still running in the foreground, and
+/// cancelling only to a branch still running at all, so each hint is dropped
+/// when nothing on screen can accept it. A key advertised over work it cannot
+/// act on is worse than no hint: it invites a press that does nothing.
 fn tree_affordance_line(
     hidden_branches: usize,
     backgroundable: bool,
+    cancellable: bool,
     width: usize,
 ) -> Line<'static> {
     let text = if hidden_branches > 0 {
         format!("+{hidden_branches} more · Tab to focus")
-    } else if backgroundable {
-        "Tab focus · Enter inspect · Ctrl+B background".to_owned()
     } else {
-        "Tab focus · Enter inspect".to_owned()
+        let mut hints = vec!["Tab focus", "Enter inspect"];
+        if backgroundable {
+            hints.push("Ctrl+B background");
+        }
+        if cancellable {
+            hints.push("x cancel");
+        }
+        hints.join(" · ")
     };
     Line::from(Span::styled(
         render::bounded_single_line(&text, width),
@@ -2792,18 +2840,29 @@ fn tree_row_style(state: &ViewState<'_>, id: TranscriptId) -> Style {
     }
 }
 
+/// One supervisable row: who is running, in what state, for how long, on what.
+///
+/// The model closes the row because it is the datum that makes the elapsed time
+/// mean something — a slow branch on a large model and a slow branch on a small
+/// one are different problems. It is omitted rather than filled in when the
+/// runtime has not reported it, so the row never guesses.
 fn tree_execution_label(execution: &TuiExecution, now: Duration) -> String {
     let elapsed = execution
         .terminal_at
         .unwrap_or(now)
         .saturating_sub(execution.started_at);
-    format!(
-        "{} #{} · {} · {}s",
+    let mut label = format!(
+        "{} #{} · {} · {}",
         display_agent_name(&execution.agent),
         execution.id,
         execution_state_label(execution.state),
-        elapsed.as_secs()
-    )
+        render::elapsed_label(elapsed)
+    );
+    if let Some(model) = execution.model.as_deref().filter(|model| !model.is_empty()) {
+        label.push_str(" · ");
+        label.push_str(model);
+    }
+    label
 }
 
 const fn execution_state_label(state: TuiExecutionState) -> &'static str {
@@ -4472,12 +4531,19 @@ where
                 execution.terminal_at = Some(self.now);
             }
         }
-        if let agens_core::TuiSubagentUpdate::Started { agent, .. } = &event.update {
+        if let agens_core::TuiSubagentUpdate::Started { agent, model, .. } = &event.update {
             self.transcripts
                 .get_mut(&TranscriptId::Subagent(event.id))
                 .expect("admitted child event has a transcript")
                 .owner_label
                 .clone_from(agent);
+            if let Some(execution) = self
+                .executions
+                .iter_mut()
+                .find(|execution| execution.id == event.id)
+            {
+                execution.model.clone_from(model);
+            }
         }
         self.transcripts
             .get_mut(&TranscriptId::Subagent(event.id))
@@ -4897,6 +4963,7 @@ where
             id,
             agent: agent.to_owned(),
             state,
+            model: None,
             started_at: self.now,
             last_activity: self.now,
             terminal_at: None,

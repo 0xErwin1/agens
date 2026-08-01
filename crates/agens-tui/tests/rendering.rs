@@ -1846,6 +1846,114 @@ fn no_header_row_and_the_working_indicator_lives_at_the_end_of_the_chat() {
     );
 }
 
+/// Supervising delegated work means comparing branches against each other. A
+/// row that reports only a state and a second count cannot be compared: elapsed
+/// time is meaningless without knowing what each branch runs on, and raw
+/// seconds past a minute are arithmetic rather than a reading.
+#[test]
+fn three_running_subagents_report_which_is_slowest_and_what_each_runs_on() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(100, 50)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.handle(Event::Resize {
+        width: 100,
+        height: 50,
+    });
+    tui.begin_submission("delegate");
+
+    for (id, agent, model) in [
+        (9_u64, "explore", "gpt-5.6-sol"),
+        (10, "plan", "claude-opus-5"),
+        (11, "build", "gpt-5.6-mini"),
+    ] {
+        tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
+            agent: agent.into(),
+            event: TuiExecutionEvent::ForegroundStarted { id },
+        });
+        apply_subagent(
+            &mut tui,
+            TuiSubagentEvent::started_on(
+                id,
+                agent,
+                "task",
+                TuiExecutionState::ForegroundRunning,
+                Some(model),
+                Some("high"),
+            ),
+        );
+    }
+    tui.tick(Duration::from_secs(253));
+
+    renderer.render(tui.view()).unwrap();
+    let text = rendered_text(&renderer);
+
+    for model in ["gpt-5.6-sol", "claude-opus-5", "gpt-5.6-mini"] {
+        assert!(text.contains(model), "missing {model:?}: {text:?}");
+    }
+    assert!(
+        text.contains("4m 13s"),
+        "elapsed changes unit rather than growing: {text:?}"
+    );
+    assert!(!text.contains("253s"), "{text:?}");
+    assert!(
+        text.contains("Main · 3 running"),
+        "the root answers how much is in flight before any branch is read: {text:?}"
+    );
+}
+
+/// Cancelling is the one panel action with a consequence outside the screen, so
+/// the hint and the key have to agree: advertised exactly where a press would
+/// cancel something, absent where it would do nothing.
+#[test]
+fn the_tree_offers_cancel_only_over_a_running_branch_and_the_key_cancels_it() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(100, 50)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.handle(Event::Resize {
+        width: 100,
+        height: 50,
+    });
+    tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
+        agent: "explore".into(),
+        event: TuiExecutionEvent::ForegroundStarted { id: 9 },
+    });
+    apply_subagent(
+        &mut tui,
+        TuiSubagentEvent::started(9, "explore", "task", TuiExecutionState::ForegroundRunning),
+    );
+
+    renderer.render(tui.view()).unwrap();
+    assert!(
+        !rendered_text(&renderer).contains("x cancel"),
+        "nothing is selected yet, so the key would act on nothing"
+    );
+
+    tui.handle(Event::Key(Key::Escape));
+    tui.handle(Event::Key(Key::Char('l')));
+    assert_eq!(tui.view().active_transcript, TranscriptId::Subagent(9));
+
+    renderer.render(tui.view()).unwrap();
+    assert!(
+        rendered_text(&renderer).contains("x cancel"),
+        "{:?}",
+        rendered_text(&renderer)
+    );
+
+    assert_eq!(
+        tui.handle(Event::Key(Key::Char('x'))),
+        Action::CancelExecution(9)
+    );
+
+    tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
+        agent: "explore".into(),
+        event: TuiExecutionEvent::Cancelled { id: 9 },
+    });
+    renderer.render(tui.view()).unwrap();
+    assert!(
+        !rendered_text(&renderer).contains("x cancel"),
+        "a cancelled branch cannot be cancelled again: {:?}",
+        rendered_text(&renderer)
+    );
+}
+
 #[test]
 fn subagent_tree_renders_below_the_composer_and_owns_the_navigation_hints() {
     let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(100, 50)).unwrap());
