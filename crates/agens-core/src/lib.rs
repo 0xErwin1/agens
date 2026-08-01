@@ -1430,6 +1430,8 @@ pub enum HeadlessTurnPortError {
     Provider,
     ProviderRejected,
     ProviderContext,
+    ProviderHistoryBudget,
+    ProviderToolRounds,
     ProviderRateLimited,
     ProviderServer,
     ProviderNetwork,
@@ -1575,6 +1577,12 @@ pub enum HeadlessTurnError {
     Provider,
     ProviderRejected,
     ProviderContext,
+    /// The session's own history outgrew what one request may replay. This is
+    /// the runtime's budget, not the model's context window: reporting it as
+    /// context sends the reader to shorten a prompt that was never the problem.
+    ProviderHistoryBudget,
+    /// The turn kept calling tools past the round limit without finishing.
+    ProviderToolRounds,
     ProviderRateLimited,
     ProviderServer,
     ProviderNetwork,
@@ -1598,6 +1606,8 @@ impl fmt::Display for HeadlessTurnError {
             Self::Provider => "provider operation failed",
             Self::ProviderRejected => "provider rejected the request",
             Self::ProviderContext => "provider rejected the request because it exceeds context",
+            Self::ProviderHistoryBudget => "session history outgrew the replay budget",
+            Self::ProviderToolRounds => "turn exceeded the tool continuation rounds",
             Self::ProviderRateLimited => "provider rate limited the request",
             Self::ProviderServer => "provider service failed",
             Self::ProviderNetwork => "provider network request failed",
@@ -1965,6 +1975,10 @@ fn map_port_error(error: HeadlessTurnPortError) -> Option<HeadlessTurnError> {
     match error {
         HeadlessTurnPortError::ProviderRejected => Some(HeadlessTurnError::ProviderRejected),
         HeadlessTurnPortError::ProviderContext => Some(HeadlessTurnError::ProviderContext),
+        HeadlessTurnPortError::ProviderHistoryBudget => {
+            Some(HeadlessTurnError::ProviderHistoryBudget)
+        }
+        HeadlessTurnPortError::ProviderToolRounds => Some(HeadlessTurnError::ProviderToolRounds),
         HeadlessTurnPortError::ProviderRateLimited => Some(HeadlessTurnError::ProviderRateLimited),
         HeadlessTurnPortError::ProviderServer => Some(HeadlessTurnError::ProviderServer),
         HeadlessTurnPortError::ProviderNetwork => Some(HeadlessTurnError::ProviderNetwork),

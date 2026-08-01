@@ -1971,7 +1971,7 @@ fn subscription_tool_replay_forwards_error_outputs_and_rejects_item_history_and_
     assert_eq!(requests[1].body["input"][3]["output"], sanitized_failure);
     fs::remove_dir_all(directory).expect("temporary directory should be removed");
 
-    let oversized_items = (0..=512)
+    let oversized_items = (0..=4096)
         .map(|index| json!({"type":"message","id":format!("item_{index}"),"role":"assistant","content":[]}))
         .collect::<Vec<_>>();
     assert_replay_response_rejection(
@@ -1992,10 +1992,11 @@ fn subscription_tool_replay_forwards_error_outputs_and_rejects_item_history_and_
             })
         })
         .collect::<Vec<_>>();
+    // A runtime budget reports itself as one, never as the model's window.
     assert_replay_response_rejection(
         "history-bound",
         tool_round_sse(&history_items, &[("item_call", "call", "weather", "{}")]),
-        HeadlessTurnPortError::ProviderContext,
+        HeadlessTurnPortError::ProviderHistoryBudget,
         ProviderDiagnosticKind::ReplayLimitExceeded,
     );
 
@@ -2033,7 +2034,7 @@ fn subscription_tool_replay_forwards_error_outputs_and_rejects_item_history_and_
     events.push(tool_result("call_127", "ok", false));
     assert_eq!(
         run_with_events(&mut provider, &events, HeadlessTurnCancellation::new()),
-        Err(HeadlessTurnPortError::ProviderContext),
+        Err(HeadlessTurnPortError::ProviderToolRounds),
     );
     let diagnostic_events = diagnostic_events.lock().expect("event lock");
     let rejected = diagnostic_events.last().expect("limit should be diagnosed");
@@ -2041,7 +2042,7 @@ fn subscription_tool_replay_forwards_error_outputs_and_rejects_item_history_and_
         rejected.event,
         ProviderDiagnosticKind::ContinuationLimitExceeded
     );
-    assert_eq!(rejected.class, Some(ProviderDiagnosticClass::Context));
+    assert_eq!(rejected.class, Some(ProviderDiagnosticClass::Runtime));
     drop(diagnostic_events);
     assert_eq!(server.join().len(), 128);
     fs::remove_dir_all(directory).expect("temporary directory should be removed");
