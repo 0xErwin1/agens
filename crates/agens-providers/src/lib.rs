@@ -2003,8 +2003,12 @@ impl OpenAiResponsesProvider {
 /// layer therefore forwards what it was given, bounded against runaway size. Collapsing a
 /// failure to a generic string here would drop the failing command's own output — the detail
 /// the model needs in order to recover — and would make the same event look different to the
-/// model depending on the dialect and on whether the session had been resumed, since the
-/// resumed-history encoder replays the stored content verbatim.
+/// model depending on the dialect and on whether the session had been resumed.
+///
+/// The resumed-history encoder routes through here for the same reason: the store keeps a tool
+/// result at full length for the transcript, so replaying it verbatim produced items past the
+/// per-item replay budget and made a session that had run fine live permanently unresumable.
+/// Bounding both paths with one budget keeps a replayed turn byte-identical to the live one.
 fn model_visible_tool_output(content: &str) -> String {
     bounded_tool_output(content)
 }
@@ -2675,7 +2679,7 @@ pub fn encode_openai_response_request_with_messages(
                     input.push(serde_json::json!({
                         "type": "function_call_output",
                         "call_id": tool_call_id,
-                        "output": content,
+                        "output": model_visible_tool_output(content),
                     }));
                 }
             }
@@ -3787,6 +3791,37 @@ mod tests {
                 .collect::<String>(),
             text
         );
+    }
+
+    #[test]
+    fn resumed_tool_results_stay_inside_the_replay_item_budget() {
+        let stored = "x".repeat(MAX_CHATGPT_REPLAY_ITEM_BYTES * 2);
+        let messages = vec![
+            Message {
+                role: Role::Assistant,
+                parts: vec![MessagePart::ToolCall {
+                    id: "call-1".into(),
+                    name: "native::read".into(),
+                    input: r#"{"path":"notes.md"}"#.into(),
+                }],
+            },
+            Message {
+                role: Role::Tool,
+                parts: vec![MessagePart::ToolResult {
+                    tool_call_id: "call-1".into(),
+                    content: stored.clone(),
+                    is_error: false,
+                }],
+            },
+        ];
+
+        let input = resumed_input("test-model", &messages, &[]).expect("history should encode");
+
+        assert_eq!(
+            input[1]["output"].as_str(),
+            Some(model_visible_tool_output(&stored).as_str())
+        );
+        assert!(validate_chatgpt_replay_history(&input).is_ok());
     }
 
     #[test]
