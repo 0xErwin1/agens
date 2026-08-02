@@ -29,7 +29,7 @@ assert_lines $'just target-budget\njust contracts\njust fmt-check\njust lint\nju
 
 assert_lines 'cargo fmt --all -- --check' "$(body fmt-check)" "Rust format check"
 assert_lines 'cargo clippy --workspace --all-targets --locked -- -D warnings' "$(body lint)" "Rust lint"
-assert_lines 'cargo test --workspace --all-targets --locked' "$(body test)" "Rust tests"
+assert_lines 'cargo test --workspace --all-targets --locked --no-fail-fast' "$(body test)" "Rust tests"
 assert_lines 'cargo build --workspace --locked' "$(body build)" "Rust build"
 assert_lines 'cargo deny check' "$(body deny)" "supply-chain check"
 
