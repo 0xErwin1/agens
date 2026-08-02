@@ -170,6 +170,7 @@ jq -e '
       "agens-fixtures",
       "agens-headless",
       "agens-models",
+      "agens-perf",
       "agens-permissions",
       "agens-providers",
       "agens-session",
