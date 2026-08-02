@@ -70,26 +70,31 @@ struct SettledConversationKey {
     display_modes: u64,
 }
 
+/// A settled conversation's painted output, cached whole.
+///
+/// The painter produces the rows and their owning calls in one pass, so
+/// caching only the rows means anything that needs owners — hit-testing the
+/// pointer, most of all — repeats the entire pass on a conversation that by
+/// definition cannot have changed.
+#[derive(Clone)]
+pub(super) struct SettledBlocks {
+    pub lines: Arc<[Line<'static>]>,
+    pub owners: Arc<[Option<String>]>,
+}
+
 thread_local! {
     static SETTLED_CONVERSATION_CACHE: std::cell::RefCell<
-        VecDeque<(SettledConversationKey, Arc<[Line<'static>]>)>,
+        VecDeque<(SettledConversationKey, SettledBlocks)>,
     > = const { std::cell::RefCell::new(VecDeque::new()) };
 }
 
-/// Described lines for a conversation that can no longer change, reused across frames.
-///
-/// The transcript is rebuilt on every frame, so without this a long session pays
-/// a full markdown parse and layout pass for its whole history on each animation
-/// tick. A conversation only qualifies once nothing in it is still animating:
-/// any unfinished tool call or subagent card keeps its rows tied to the frame
-/// clock, and those are described live.
-pub(super) fn settled_conversation_lines(
+pub(super) fn settled_conversation_blocks(
     identity: SettledConversation,
     conversation: &Conversation,
     tool_display_modes: &BTreeMap<String, DisplayMode>,
     content_width: u16,
     state: ConversationRenderState<'_>,
-) -> Arc<[Line<'static>]> {
+) -> SettledBlocks {
     let _perf_settled = agens_perf::span!(
         "tui.transcript.settled_turn",
         index = identity.index as u64,
@@ -99,8 +104,12 @@ pub(super) fn settled_conversation_lines(
 
     if !is_settled(conversation) {
         agens_perf::field!(cache_hit = false);
-        return conversation_lines(conversation, &[], tool_display_modes, content_width, state)
-            .into();
+        let painted =
+            painted_conversation(conversation, &[], tool_display_modes, content_width, state);
+        return SettledBlocks {
+            lines: painted.lines.into(),
+            owners: painted.owners.into(),
+        };
     }
 
     let mut hasher = DefaultHasher::new();
@@ -123,27 +132,30 @@ pub(super) fn settled_conversation_lines(
         cache
             .iter()
             .find(|(entry, _)| *entry == key)
-            .map(|(_, lines)| Arc::clone(lines))
+            .map(|(_, blocks)| blocks.clone())
     });
-    if let Some(lines) = cached {
+    if let Some(blocks) = cached {
         agens_perf::field!(cache_hit = true);
-        return lines;
+        return blocks;
     }
 
     #[cfg(test)]
     SETTLED_CONVERSATION_RENDERS.with(|renders| renders.set(renders.get() + 1));
 
-    let lines: Arc<[Line<'static>]> =
-        conversation_lines(conversation, &[], tool_display_modes, content_width, state).into();
+    let painted = painted_conversation(conversation, &[], tool_display_modes, content_width, state);
+    let blocks = SettledBlocks {
+        lines: painted.lines.into(),
+        owners: painted.owners.into(),
+    };
     SETTLED_CONVERSATION_CACHE.with_borrow_mut(|cache| {
         while cache.len() >= SETTLED_CONVERSATION_CACHE_MAX_ENTRIES {
             cache.pop_front();
         }
-        cache.push_back((key, Arc::clone(&lines)));
+        cache.push_back((key, blocks.clone()));
     });
 
     agens_perf::field!(cache_hit = false);
-    lines
+    blocks
 }
 
 /// Whether every row of a conversation is frozen: no spinner, no live elapsed time.
@@ -159,7 +171,8 @@ fn is_settled(conversation: &Conversation) -> bool {
             .all(|call| call.result.is_some())
 }
 
-pub(super) fn conversation_lines(
+#[cfg(test)]
+fn conversation_lines(
     conversation: &Conversation,
     events: &[TuiRuntimeEvent],
     tool_display_modes: &BTreeMap<String, DisplayMode>,
@@ -176,25 +189,7 @@ pub(super) fn conversation_lines(
     .lines
 }
 
-/// The same rows `conversation_lines` paints, each tagged with its owning call.
-pub(super) fn conversation_call_rows(
-    conversation: &Conversation,
-    events: &[TuiRuntimeEvent],
-    tool_display_modes: &BTreeMap<String, DisplayMode>,
-    content_width: u16,
-    state: ConversationRenderState<'_>,
-) -> Vec<Option<String>> {
-    painted_conversation(
-        conversation,
-        events,
-        tool_display_modes,
-        content_width,
-        state,
-    )
-    .owners
-}
-
-fn painted_conversation(
+pub(super) fn painted_conversation(
     conversation: &Conversation,
     events: &[TuiRuntimeEvent],
     tool_display_modes: &BTreeMap<String, DisplayMode>,
@@ -4265,7 +4260,7 @@ mod tests {
         conversation: &Conversation,
         identity: SettledConversation,
     ) -> Arc<[Line<'static>]> {
-        settled_conversation_lines(
+        settled_conversation_blocks(
             identity,
             conversation,
             &BTreeMap::new(),
@@ -4279,6 +4274,7 @@ mod tests {
                 unicode: UnicodeLevel::Extended,
             },
         )
+        .lines
     }
 
     fn settled_identity(index: usize, generation: u64) -> SettledConversation {

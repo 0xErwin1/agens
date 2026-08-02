@@ -153,9 +153,13 @@ fn transcript_drag_selection_paints_exact_cells_and_preserves_original_text() {
 
     assert_eq!(tui.selected_text(), Some("café"));
     for offset in 0..4 {
+        let cell = &renderer.terminal().backend().buffer()[(column + offset, row)];
+        assert_eq!(cell.bg, Color::Rgb(0x1b, 0x33, 0x30));
         assert_eq!(
-            renderer.terminal().backend().buffer()[(column + offset, row)].bg,
-            Color::Rgb(0x95, 0xe6, 0xcb)
+            cell.fg,
+            Color::Rgb(0xd6, 0xd4, 0xcd),
+            "selected text must take the selection foreground; leaving the \
+             original colour under a selection wash is how it became unreadable"
         );
     }
     let rendered = rendered_text(&renderer);
@@ -491,11 +495,25 @@ fn hovering_a_block_focuses_it_and_adds_nothing_the_keyboard_cannot_do() {
         "hover moves focus; opening still costs a deliberate press"
     );
 
+    // Movement that lands on the block already under the cursor changes
+    // nothing a reader could see, and must not cost a repaint: pointer events
+    // arrive dozens of times per second and almost all of them are this one.
+    assert_eq!(
+        tui.handle(Event::MouseMove {
+            column: 14,
+            row: second,
+        }),
+        Action::Unchanged
+    );
+
     let first = rendered_row(&renderer, "read-1.log") as u16;
-    tui.handle(Event::MouseMove {
-        column: 10,
-        row: first,
-    });
+    assert_eq!(
+        tui.handle(Event::MouseMove {
+            column: 10,
+            row: first,
+        }),
+        Action::Render
+    );
     assert_eq!(tui.view().focused_call, Some("read-1"));
 
     // Off the transcript there is nothing to focus, and nothing is claimed.

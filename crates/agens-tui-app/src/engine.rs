@@ -69,6 +69,27 @@ fn interactive_turn_cancellation() -> HeadlessTurnCancellation {
     HeadlessTurnCancellation::new()
 }
 
+/// Installs the trace recorder when `AGENS_PERF_TRACE` names a directory.
+///
+/// This is the only path that measures a real terminal. The scenario harness
+/// drives a `TestBackend`, so everything crossterm does to paint an actual tty
+/// — and everything the terminal emulator does with it — is invisible there.
+#[cfg(feature = "perf-audit")]
+fn session_perf_recorder() -> Option<agens_perf::Recorder> {
+    let directory = std::env::var("AGENS_PERF_TRACE").ok()?;
+    let run_id = std::env::var("AGENS_PERF_RUN").unwrap_or_else(|_| "session".to_owned());
+
+    match agens_perf::Recorder::install(
+        agens_perf::RecorderConfig::new(directory, run_id).with_scenario("live_session"),
+    ) {
+        Ok(recorder) => Some(recorder),
+        Err(error) => {
+            eprintln!("perf tracing is off: {error}");
+            None
+        }
+    }
+}
+
 pub fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<String, CliError> {
     run_production_tui_with_profile_store(bootstrap, resume, None)
 }
@@ -174,6 +195,9 @@ pub fn run_production_tui_with_profile_store(
     let message_controls = task_controls.clone();
     let submit_task_controls = task_controls.clone();
     let prompt_bridge = permission_bridge.clone();
+    #[cfg(feature = "perf-audit")]
+    let perf_recorder = session_perf_recorder();
+
     let tui_result = run_with_default_progress_submit_with_permissions_and_task_controls(
         &mut tui,
         move |request, progress, cancellation| {
@@ -346,6 +370,14 @@ pub fn run_production_tui_with_profile_store(
     let _ = task_controls
         .0
         .wait_for_idle(std::time::Duration::from_secs(2));
+    #[cfg(feature = "perf-audit")]
+    if let Some(recorder) = perf_recorder {
+        match recorder.finish() {
+            Ok(paths) => eprintln!("perf trace: {}", paths.jsonl.display()),
+            Err(error) => eprintln!("perf trace was not written: {error}"),
+        }
+    }
+
     tui_result.map_err(|_| CliError::new(ExitStatus::Failure, "ui", "terminal UI failed"))?;
 
     Ok(String::new())

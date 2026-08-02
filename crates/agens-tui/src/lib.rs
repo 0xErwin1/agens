@@ -267,6 +267,12 @@ impl Key {
 pub enum Action {
     /// Render the current view state.
     Render,
+    /// The event changed nothing a reader could see.
+    ///
+    /// Pointer movement is the reason this exists: it arrives dozens of times
+    /// per second and almost all of it lands inside the block already under
+    /// the cursor, where repainting shows exactly what was already on screen.
+    Unchanged,
     /// Send this prompt to the composition layer.
     Submit(String),
     /// Submit a redacted credential through the dedicated route only.
@@ -504,6 +510,7 @@ impl std::fmt::Debug for Action {
                 .field("secret", &"<redacted>")
                 .finish(),
             Self::Render => formatter.write_str("Render"),
+            Self::Unchanged => formatter.write_str("Unchanged"),
             Self::Submit(value) => formatter.debug_tuple("Submit").field(value).finish(),
             Self::SubmitBackground(value) => formatter
                 .debug_tuple("SubmitBackground")
@@ -3063,6 +3070,20 @@ fn transcript_call_owners(state: &ViewState<'_>, row_width: u16) -> Vec<Option<S
     assemble_transcript(state, row_width, true).1
 }
 
+/// The rows a turn contributes, described only when the caller wants them.
+///
+/// A turn's owners can be shorter than its rows — trailing rows belong to no
+/// call — so the row count always comes from the painted lines. Copying those
+/// lines is what a pointer movement cannot afford, and hit-testing never reads
+/// them, so it gets rows of the right shape and no content.
+fn turn_placeholder_rows(lines: &[Line<'static>], want_owners: bool) -> Vec<Line<'static>> {
+    if want_owners {
+        vec![Line::default(); lines.len()]
+    } else {
+        lines.to_vec()
+    }
+}
+
 fn assemble_transcript(
     state: &ViewState<'_>,
     row_width: u16,
@@ -3079,15 +3100,18 @@ fn assemble_transcript(
     let thinking_streaming = state.running;
     let mut turn_lines = Vec::new();
     let mut turn_owners: Vec<Option<String>> = Vec::new();
+    let mut turn_rows = 0usize;
     let mut append_turn = |lines: Vec<Line<'static>>, mut lines_owners: Vec<Option<String>>| {
         if lines.is_empty() {
             return;
         }
-        if !turn_lines.is_empty() {
+        if turn_rows > 0 {
             turn_lines.push(Line::default());
             turn_owners.push(None);
+            turn_rows += 1;
         }
         lines_owners.resize(lines.len(), None);
+        turn_rows += lines.len();
         turn_lines.extend(lines);
         turn_owners.extend(lines_owners);
     };
@@ -3116,31 +3140,25 @@ fn assemble_transcript(
             focused_call: state.focused_call,
             unicode: state.unicode_level,
         };
-        let owners = if want_owners {
-            render::conversation_call_rows(
-                conversation,
-                &[],
-                state.tool_display_modes,
-                row_width,
-                settled_state,
-            )
-        } else {
-            Vec::new()
+        let identity = render::SettledConversation {
+            generation: state.transcript_generation,
+            transcript: state.active_transcript,
+            index,
         };
+        let blocks = render::settled_conversation_blocks(
+            identity,
+            conversation,
+            state.tool_display_modes,
+            row_width,
+            settled_state,
+        );
         append_turn(
-            render::settled_conversation_lines(
-                render::SettledConversation {
-                    generation: state.transcript_generation,
-                    transcript: state.active_transcript,
-                    index,
-                },
-                conversation,
-                state.tool_display_modes,
-                row_width,
-                settled_state,
-            )
-            .to_vec(),
-            owners,
+            turn_placeholder_rows(&blocks.lines, want_owners),
+            if want_owners {
+                blocks.owners.to_vec()
+            } else {
+                Vec::new()
+            },
         );
     }
     if let Some(conversation) = state.conversation {
@@ -3152,26 +3170,20 @@ fn assemble_transcript(
             focused_call: state.focused_call,
             unicode: state.unicode_level,
         };
-        let owners = if want_owners {
-            render::conversation_call_rows(
-                conversation,
-                state.runtime_events,
-                state.tool_display_modes,
-                row_width,
-                live_state,
-            )
-        } else {
-            Vec::new()
-        };
+        let painted = render::painted_conversation(
+            conversation,
+            state.runtime_events,
+            state.tool_display_modes,
+            row_width,
+            live_state,
+        );
         append_turn(
-            render::conversation_lines(
-                conversation,
-                state.runtime_events,
-                state.tool_display_modes,
-                row_width,
-                live_state,
-            ),
-            owners,
+            turn_placeholder_rows(&painted.lines, want_owners),
+            if want_owners {
+                painted.owners
+            } else {
+                Vec::new()
+            },
         );
     }
     let turn_start = transcript.len();
@@ -3306,6 +3318,32 @@ impl SelectableTranscript {
         Self { rows }
     }
 
+    /// How many rows these lines wrap into, without materializing any of them.
+    ///
+    /// Scroll bounds need the row count and nothing else. Building the full
+    /// index for it means allocating a styled, copyable, text-carrying cell
+    /// for every character in the transcript — tens of thousands of them, on
+    /// a path that runs for every scroll tick and every mouse press.
+    fn row_count(lines: &[Line<'_>], width: u16) -> usize {
+        let width = width.max(1);
+        let mut rows = 0;
+
+        for line in lines {
+            let mut shapes = line
+                .styled_graphemes(Style::default())
+                .map(CellShape::from_grapheme)
+                .collect::<Vec<_>>();
+
+            if shapes.last().is_some_and(CellShape::is_wrap_joiner) {
+                shapes.pop();
+            }
+
+            rows += wrap_cells(shapes, width, CellShape::width, CellShape::is_whitespace).len();
+        }
+
+        rows
+    }
+
     fn position_at(&self, row: usize, column: u16) -> Option<TranscriptPosition> {
         let cells = &self.rows.get(row)?.cells;
         let cell = cells
@@ -3374,7 +3412,7 @@ impl SelectableTranscript {
                         cell.style.patch(
                             Style::default()
                                 .fg(widgets::RolePalette::selection_fg())
-                                .bg(widgets::RolePalette::brand()),
+                                .bg(widgets::RolePalette::selection_bg()),
                         )
                     } else {
                         cell.style
@@ -3397,25 +3435,80 @@ impl SelectableTranscript {
 }
 
 fn wrap_selectable_line(cells: Vec<SelectableCell>, width: u16) -> Vec<Vec<SelectableCell>> {
+    wrap_cells(
+        cells,
+        width,
+        |cell| cell.width,
+        selectable_cell_is_whitespace,
+    )
+}
+
+/// Everything the wrap algorithm needs to know about a cell, and nothing else.
+///
+/// Deliberately `Copy` and three bytes wide: this is what a transcript costs
+/// when it only has to be counted.
+#[derive(Clone, Copy)]
+struct CellShape {
+    width: u16,
+    whitespace: bool,
+    wrap_joiner: bool,
+}
+
+impl CellShape {
+    fn from_grapheme(grapheme: ratatui::text::StyledGrapheme<'_>) -> Self {
+        let symbol = grapheme.symbol;
+        Self {
+            width: saturating_u16(symbol.width()),
+            whitespace: symbol == "\u{200b}"
+                || symbol != "\u{00a0}" && symbol.chars().all(char::is_whitespace),
+            wrap_joiner: symbol == render::WRAP_JOINER_SPACE || symbol == render::WRAP_JOINER_TIGHT,
+        }
+    }
+
+    const fn width(&self) -> u16 {
+        self.width
+    }
+
+    const fn is_whitespace(&self) -> bool {
+        self.whitespace
+    }
+
+    const fn is_wrap_joiner(&self) -> bool {
+        self.wrap_joiner
+    }
+}
+
+/// Wraps a line's cells into rows.
+///
+/// Generic over the cell so that counting rows and materializing them run the
+/// same algorithm: only the advance width and whether a cell is whitespace
+/// affect where a row breaks, and a second implementation for counting would
+/// be free to drift away from this one without any test noticing.
+fn wrap_cells<T>(
+    cells: Vec<T>,
+    width: u16,
+    cell_width: impl Fn(&T) -> u16,
+    is_whitespace_cell: impl Fn(&T) -> bool,
+) -> Vec<Vec<T>> {
     let mut rows = Vec::new();
     let mut line = Vec::new();
     let mut line_width = 0_u16;
     let mut word = Vec::new();
     let mut word_width = 0_u16;
-    let mut whitespace: VecDeque<SelectableCell> = VecDeque::new();
+    let mut whitespace: VecDeque<T> = VecDeque::new();
     let mut whitespace_width = 0_u16;
     let mut previous_was_text = false;
 
     for cell in cells {
-        if cell.width > width {
+        if cell_width(&cell) > width {
             continue;
         }
-        let is_whitespace = selectable_cell_is_whitespace(&cell);
+        let is_whitespace = is_whitespace_cell(&cell);
         let word_finished = previous_was_text && is_whitespace;
         let segment_overflow = line.is_empty()
             && word_width
                 .saturating_add(whitespace_width)
-                .saturating_add(cell.width)
+                .saturating_add(cell_width(&cell))
                 > width;
         if word_finished || segment_overflow {
             line.extend(whitespace.drain(..));
@@ -3427,7 +3520,7 @@ fn wrap_selectable_line(cells: Vec<SelectableCell>, width: u16) -> Vec<Vec<Selec
         }
 
         let line_full = line_width >= width;
-        let word_overflow = cell.width > 0
+        let word_overflow = cell_width(&cell) > 0
             && line_width
                 .saturating_add(whitespace_width)
                 .saturating_add(word_width)
@@ -3437,11 +3530,11 @@ fn wrap_selectable_line(cells: Vec<SelectableCell>, width: u16) -> Vec<Vec<Selec
             rows.push(std::mem::take(&mut line));
             line_width = 0;
             while let Some(pending) = whitespace.front() {
-                if pending.width > remaining {
+                if cell_width(pending) > remaining {
                     break;
                 }
-                whitespace_width = whitespace_width.saturating_sub(pending.width);
-                remaining = remaining.saturating_sub(pending.width);
+                whitespace_width = whitespace_width.saturating_sub(cell_width(pending));
+                remaining = remaining.saturating_sub(cell_width(pending));
                 whitespace.pop_front();
             }
             if is_whitespace && whitespace.is_empty() {
@@ -3451,10 +3544,10 @@ fn wrap_selectable_line(cells: Vec<SelectableCell>, width: u16) -> Vec<Vec<Selec
         }
 
         if is_whitespace {
-            whitespace_width = whitespace_width.saturating_add(cell.width);
+            whitespace_width = whitespace_width.saturating_add(cell_width(&cell));
             whitespace.push_back(cell);
         } else {
-            word_width = word_width.saturating_add(cell.width);
+            word_width = word_width.saturating_add(cell_width(&cell));
             word.push(cell);
         }
         previous_was_text = !is_whitespace;
@@ -6272,9 +6365,9 @@ where
             .transcript
             .width
             .saturating_sub(TRANSCRIPT_ROW_INDENT);
-        let transcript =
-            SelectableTranscript::from_lines(&rendered_transcript(&view, row_width), row_width);
-        saturating_u16(transcript.rows.len().saturating_sub(visible_rows))
+        let rows =
+            SelectableTranscript::row_count(&rendered_transcript(&view, row_width), row_width);
+        saturating_u16(rows.saturating_sub(visible_rows))
     }
 
     /// Rows a page advances, bounded by the rows the transcript actually shows:
@@ -7152,7 +7245,7 @@ where
             || column < layout.transcript.x
             || column >= layout.transcript.right()
         {
-            return Action::Render;
+            return Action::Unchanged;
         }
 
         let row_width = layout
@@ -7172,7 +7265,7 @@ where
             .checked_sub(layout.transcript.y)
             .and_then(|offset| offset.checked_sub(1))
         else {
-            return Action::Render;
+            return Action::Unchanged;
         };
         let target = scroll.saturating_add(usize::from(inside));
 
@@ -7182,9 +7275,11 @@ where
             .flatten();
 
         let record = self.active_record_mut();
-        if record.focused_call != hovered {
-            record.focused_call = hovered;
+        if record.focused_call == hovered {
+            return Action::Unchanged;
         }
+
+        record.focused_call = hovered;
         Action::Render
     }
 
@@ -7666,7 +7761,8 @@ where
                 terminal.copy_selection(&text)?;
                 renderer.render(tui.view())?;
             }
-            Action::Render
+            Action::Unchanged
+            | Action::Render
             | Action::Submit(_)
             | Action::SubmitSecret { .. }
             | Action::SubmitBackground(_)
@@ -7744,7 +7840,8 @@ where
                 });
                 renderer.render(tui.view())?;
             }
-            Action::Render
+            Action::Unchanged
+            | Action::Render
             | Action::SubmitSecret { .. }
             | Action::SubmitBackground(_)
             | Action::TransitionToBackground(_)
@@ -8184,6 +8281,7 @@ where
         } else {
             tui.handle(event)
         };
+        let changed_something = !matches!(action, Action::Unchanged);
         match action {
             Action::Quit => {
                 if let Some((_, cancellation, session_load)) = active_route.take()
@@ -8386,6 +8484,7 @@ where
             Action::CopySelection(text) => {
                 runtime_terminal.copy_selection(&text)?;
             }
+            Action::Unchanged => {}
             Action::Render | Action::Cancel => {
                 if cancel_permission
                     && let (Some(id), Some(permission_bridge)) =
@@ -8395,7 +8494,9 @@ where
                 }
             }
         }
-        render_requested = true;
+        if changed_something {
+            render_requested = true;
+        }
     }
 }
 
@@ -9770,6 +9871,29 @@ mod runtime_tests {
             tui.view().scroll_offset > 0,
             "a prompt row is reachable even though the accent column precedes its glyph"
         );
+    }
+
+    #[test]
+    fn counting_rows_agrees_with_building_them() {
+        let lines = vec![
+            Line::raw("short"),
+            Line::raw(""),
+            Line::raw("a much longer paragraph that has to wrap several times at this width"),
+            Line::raw("AAA AAA AAAAA AA AAAAAA"),
+            Line::raw("supercalifragilisticexpialidocious antidisestablishmentarianism"),
+            Line::raw("  indented continuation with trailing space   "),
+            Line::raw("café ñandú 日本語 mixed widths"),
+            Line::raw(format!("joined{}", render::WRAP_JOINER_SPACE)),
+            Line::raw(format!("tight{}", render::WRAP_JOINER_TIGHT)),
+        ];
+
+        for width in [1, 2, 3, 7, 10, 23, 80] {
+            assert_eq!(
+                SelectableTranscript::row_count(&lines, width),
+                SelectableTranscript::from_lines(&lines, width).rows.len(),
+                "row count and row construction disagreed at width {width}"
+            );
+        }
     }
 
     #[test]

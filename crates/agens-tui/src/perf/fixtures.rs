@@ -12,6 +12,50 @@ pub struct TranscriptFixture {
     pub lines: usize,
 }
 
+/// Builds one exchange whose assistant reply makes `calls` tool calls.
+///
+/// History elision folds settled *turns*, not lines, so a single turn is
+/// never elided however large it grows. A long agentic turn is therefore the
+/// shape that puts the most rows on screen at once, and the one a
+/// turn-count-based fixture cannot produce.
+pub fn tool_heavy_turn(calls: usize) -> TranscriptFixture {
+    let mut messages = Vec::with_capacity(calls * 2 + 2);
+    messages.push(Message {
+        role: Role::User,
+        parts: vec![MessagePart::Text("Do the whole thing.".to_owned())],
+    });
+
+    for call in 0..calls {
+        let call_id = format!("call-{call}");
+        messages.push(Message {
+            role: Role::Assistant,
+            parts: vec![MessagePart::ToolCall {
+                id: call_id.clone(),
+                name: "read".to_owned(),
+                input: format!("{{\"path\":\"crate/module_{call}.rs\"}}"),
+            }],
+        });
+        messages.push(Message {
+            role: Role::Tool,
+            parts: vec![MessagePart::ToolResult {
+                tool_call_id: call_id,
+                content: format!("pub fn item_{call}() -> u32 {{ {call} }}"),
+                is_error: false,
+            }],
+        });
+    }
+
+    messages.push(Message {
+        role: Role::Assistant,
+        parts: vec![MessagePart::Text("All done.".to_owned())],
+    });
+
+    TranscriptFixture {
+        messages,
+        lines: calls * 2 + 2,
+    }
+}
+
 /// Builds `turns` user/assistant exchanges, each assistant reply spanning
 /// roughly `lines_per_turn` lines.
 ///
