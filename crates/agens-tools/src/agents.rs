@@ -5,7 +5,7 @@ use std::{
 
 use agens_core::{
     AgentDefinition, AgentMode, PermissionDecision, PermissionPattern, PermissionRule,
-    ReasoningEffort, RequestConfig,
+    ReasoningEffort, RequestConfig, permission_target_kind_for_tool,
 };
 
 use crate::markdown::{self, FrontmatterValue, MarkdownDocument};
@@ -342,7 +342,9 @@ fn list(document: &MarkdownDocument, name: &str) -> Result<Vec<String>, String> 
 /// written here; it has to go in the TOML `[permissions]` block instead,
 /// whose `tool(target)` syntax keeps the target intact up to the closing
 /// parenthesis. An omitted target defaults to `PermissionPattern::Any`,
-/// matching every target for that tool.
+/// matching every target for that tool. The target glob's `/`-crossing
+/// behavior is chosen by `tool` via `permission_target_kind_for_tool`, so a
+/// single-word `bash` target such as `rm*` already crosses `/`.
 fn permission(rule: &str) -> Result<PermissionRule, String> {
     let mut parts = rule.split_whitespace();
     let decision = match parts.next() {
@@ -360,9 +362,11 @@ fn permission(rule: &str) -> Result<PermissionRule, String> {
         decision,
         PermissionPattern::glob(tool).map_err(|_| "invalid permission tool")?,
         match target {
-            Some(target) => {
-                PermissionPattern::glob(target).map_err(|_| "invalid permission target")?
-            }
+            Some(target) => PermissionPattern::glob_for_target_kind(
+                target,
+                permission_target_kind_for_tool(tool),
+            )
+            .map_err(|_| "invalid permission target")?,
             None => PermissionPattern::Any,
         },
     ))
@@ -387,6 +391,26 @@ mod permission_parsing_tests {
 
         assert!(rule.target.matches("rm -rf"));
         assert!(!rule.target.matches("echo hi"));
+    }
+
+    /// `bash` is free-form text, not a filesystem path, so a bare `*`
+    /// crosses `/` for a declaration parsed from agent frontmatter exactly
+    /// as it does for one parsed from the TOML `[permissions]` block.
+    #[test]
+    fn a_bash_target_glob_crosses_a_slash() {
+        let rule = permission("deny bash rm*").expect("targeted declaration should parse");
+
+        assert!(rule.target.matches("rm -rf /tmp/x"));
+    }
+
+    /// A path-shaped tool's target glob keeps segment discipline: a bare
+    /// `*` never crosses `/`.
+    #[test]
+    fn a_path_shaped_target_glob_does_not_cross_a_slash() {
+        let rule = permission("deny write secret*").expect("targeted declaration should parse");
+
+        assert!(rule.target.matches("secret.env"));
+        assert!(!rule.target.matches("dir/secret.env"));
     }
 
     /// The markdown grammar is `decision tool target`, split on whitespace

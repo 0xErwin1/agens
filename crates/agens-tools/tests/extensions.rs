@@ -12,8 +12,8 @@ use std::{
 
 use agens_core::{
     AgentDefinition, AgentMode, Error, HeadlessTaskTerminal, PermissionDecision, PermissionMode,
-    PermissionPattern, PermissionPolicy, PermissionRule, PermissionSession, ReasoningEffort,
-    RequestConfig, ToolAccess,
+    PermissionPattern, PermissionPolicy, PermissionRule, PermissionSession, PermissionTargetKind,
+    ReasoningEffort, RequestConfig, ToolAccess,
 };
 use agens_tools::{
     AgentCatalog, AgentModelValidationError, AgentModelValidator, CommandCatalog,
@@ -1694,6 +1694,34 @@ fn effective_capabilities_normalize_aliases_globs_projects_and_last_matches() {
     assert_eq!(set.descriptors()[1].decision(), PermissionDecision::Ask);
     assert!(set.descriptors()[1].matches_identity("native:10:files_read"));
     assert!(set.descriptors()[1].matches_identity("native:11:files_write"));
+}
+
+#[test]
+fn effective_capabilities_round_trip_a_declared_bash_target_as_free_form_text() {
+    let mut dispatcher = ToolDispatcher::new();
+    dispatcher
+        .register_native("native::bash", ToolAccess::Write, InertTool)
+        .unwrap();
+    let agent = agent_with_rules(vec![PermissionRule::global(
+        PermissionDecision::Deny,
+        PermissionPattern::Exact("native::bash".into()),
+        PermissionPattern::glob_for_target_kind("rm*", PermissionTargetKind::FreeFormText).unwrap(),
+    )]);
+
+    let set = EffectiveCapabilitySet::from_agent(&agent, "project", &dispatcher);
+    let rules = set.permission_rules();
+    assert_eq!(
+        rules.len(),
+        1,
+        "the declared bash rule should survive the round trip"
+    );
+    let rebuilt = &rules[0];
+
+    assert!(
+        rebuilt.target.matches("rm -rf /tmp/x"),
+        "a bash target reconstructed from its selector's tool identity must stay free-form, \
+         not fall back to path-shaped segment discipline"
+    );
 }
 
 #[test]

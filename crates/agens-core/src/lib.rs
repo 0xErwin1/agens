@@ -2022,18 +2022,33 @@ pub const MAX_PERMISSION_GLOB_SEGMENTS: usize = 256;
 pub const MAX_PERMISSION_TARGET_BYTES: usize = 16 * 1024;
 
 impl PermissionPattern {
-    /// Builds a glob pattern where `/` is a literal path-segment boundary
-    /// that a bare `*` never crosses; only `**` occupying a whole segment
-    /// (`prefix/**`, `**/suffix`, `dir/**/secret`) matches across it.
+    /// Builds a glob pattern for a path-shaped target, where `/` is a
+    /// literal path-segment boundary that a bare `*` never crosses; only
+    /// `**` occupying a whole segment (`prefix/**`, `**/suffix`,
+    /// `dir/**/secret`) matches across it. This is the right matcher for
+    /// filesystem paths and for tool-name patterns, so it is also the
+    /// default used everywhere a target's kind is not otherwise known.
     ///
-    /// Every permission target shares this same matcher, including command
-    /// targets that are not filesystem paths. A shell command such as
-    /// `rm -rf /tmp/x` still contains `/`, so a pattern like `rm*` matches
-    /// only slash-free commands (`rm -rf`) and silently does not match a
-    /// command with a path argument. To cover path-bearing commands, the
-    /// `**` segment has to be explicit, e.g. `rm -rf /**`.
+    /// A target that is free-form text rather than a path — most notably
+    /// `bash`'s command line, which routinely contains `/` as an ordinary
+    /// character rather than a hierarchy boundary — needs
+    /// [`Self::glob_for_target_kind`] with [`PermissionTargetKind::FreeFormText`]
+    /// instead; this constructor would otherwise make a pattern like `rm*`
+    /// silently fail to match `rm -rf /tmp/x`.
     pub fn glob(pattern: impl Into<String>) -> Result<Self, PermissionPatternError> {
-        ValidatedPermissionGlob::new(pattern.into()).map(Self::Glob)
+        Self::glob_for_target_kind(pattern, PermissionTargetKind::Path)
+    }
+
+    /// Builds a glob pattern whose `/`-crossing behavior is chosen by the
+    /// target's kind. See [`PermissionTargetKind`] for the semantics of each
+    /// kind and [`permission_target_kind_for_tool`] for classifying a tool by
+    /// name.
+    pub fn glob_for_target_kind(
+        pattern: impl Into<String>,
+        kind: PermissionTargetKind,
+    ) -> Result<Self, PermissionPatternError> {
+        let literal_separator = matches!(kind, PermissionTargetKind::Path);
+        ValidatedPermissionGlob::new(pattern.into(), literal_separator).map(Self::Glob)
     }
 
     pub fn glob_source(&self) -> Option<&str> {
@@ -2052,6 +2067,38 @@ impl PermissionPattern {
     }
 }
 
+/// Classifies what kind of value a permission target holds, which decides
+/// whether a bare `*` in a glob pattern may cross a `/`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PermissionTargetKind {
+    /// A filesystem-shaped target: `read`/`write`/`edit`/`list`/`search`
+    /// paths, `glob`'s own file-glob argument, `grep`'s search pattern, and
+    /// `webfetch` URLs (a URL's scheme/host/path components are themselves
+    /// hierarchical, so treating `/` as a path-segment boundary there gives
+    /// the same predictable, non-surprising behavior as an actual path).
+    /// `/` is a meaningful segment boundary that a bare `*` never crosses;
+    /// only an explicit `**` segment matches across it.
+    Path,
+    /// A free-form target that is not shaped like a path even though it may
+    /// contain `/` incidentally: `bash`'s shell command line and
+    /// `git_read`'s operation keyword. `/` is an ordinary character here, so
+    /// a bare `*` crosses it, matching a user's plain-English expectation
+    /// that `rm*` denies `rm -rf /tmp/x`.
+    FreeFormText,
+}
+
+/// Classifies a native tool's permission target by name, matching either the
+/// bare form (`bash`) or the fully-qualified native identity (`native::bash`).
+/// A tool this function does not recognize as free-form text defaults to
+/// [`PermissionTargetKind::Path`], preserving today's segment-discipline
+/// matching for every target this change does not touch.
+pub fn permission_target_kind_for_tool(tool: &str) -> PermissionTargetKind {
+    match tool.strip_prefix("native::").unwrap_or(tool) {
+        "bash" | "git_read" => PermissionTargetKind::FreeFormText,
+        _ => PermissionTargetKind::Path,
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ValidatedPermissionGlob {
     pattern: String,
@@ -2059,7 +2106,7 @@ pub struct ValidatedPermissionGlob {
 }
 
 impl ValidatedPermissionGlob {
-    fn new(pattern: String) -> Result<Self, PermissionPatternError> {
+    fn new(pattern: String, literal_separator: bool) -> Result<Self, PermissionPatternError> {
         if pattern.trim().is_empty() {
             return Err(PermissionPatternError::InvalidGlob { pattern });
         }
@@ -2080,7 +2127,7 @@ impl ValidatedPermissionGlob {
         }
 
         let matcher = GlobBuilder::new(&pattern)
-            .literal_separator(true)
+            .literal_separator(literal_separator)
             .build()
             .map_err(|_| PermissionPatternError::InvalidGlob {
                 pattern: pattern.clone(),

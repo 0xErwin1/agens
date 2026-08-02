@@ -8,7 +8,7 @@
 //!
 //! An untargeted `deny` (no target pattern, `PermissionPattern::Any`) omits
 //! its tool from the catalog entirely. A target-scoped `deny` (for example
-//! `deny bash rm -rf /**`) leaves the tool in the catalog and relies on the
+//! `deny bash rm*`) leaves the tool in the catalog and relies on the
 //! retained policy rule to deny the matching calls at evaluation time — the
 //! tool has to still be present for that narrower rule to have anything to
 //! act on.

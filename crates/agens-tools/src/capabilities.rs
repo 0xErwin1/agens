@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use agens_core::{
     AgentDefinition, PermissionDecision, PermissionPattern, PermissionRule, PermissionScope,
+    PermissionTargetKind, permission_target_kind_for_tool,
 };
 
 use crate::ToolDispatcher;
@@ -24,16 +25,18 @@ impl EffectiveCapabilitySet {
                 continue;
             };
             let target = target(&rule.target);
-            normalized.insert((selector, target), rule.decision);
+            let kind = target_kind(&rule.tool);
+            normalized.insert((selector, target), (rule.decision, kind));
         }
 
         let mut descriptors = normalized
             .into_iter()
             .map(
-                |((selector, target), decision)| EffectiveCapabilityDescriptor {
+                |((selector, target), (decision, kind))| EffectiveCapabilityDescriptor {
                     selector,
                     target,
                     decision,
+                    kind,
                 },
             )
             .collect::<Vec<_>>();
@@ -79,6 +82,7 @@ pub struct EffectiveCapabilityDescriptor {
     selector: ToolSelector,
     target: Option<String>,
     decision: PermissionDecision,
+    kind: PermissionTargetKind,
 }
 
 impl EffectiveCapabilityDescriptor {
@@ -106,7 +110,8 @@ impl EffectiveCapabilityDescriptor {
             self.target
                 .as_ref()
                 .map(|pattern| {
-                    PermissionPattern::glob(pattern.clone()).expect("stored target is validated")
+                    PermissionPattern::glob_for_target_kind(pattern.clone(), self.kind)
+                        .expect("stored target is validated")
                 })
                 .unwrap_or(PermissionPattern::Any),
         )
@@ -134,6 +139,24 @@ impl ToolSelector {
 }
 
 type DescriptorKey = (ToolSelector, Option<String>);
+
+/// Classifies a declared rule's target kind from its `tool` pattern before
+/// that pattern is resolved into the dispatcher's internal identity space
+/// (`ToolSelector`'s `native:<len>:<name>` form), which no longer carries a
+/// recognizable tool name. An unresolvable pattern (`Any`, or a glob whose
+/// source is not a plain tool name) defaults to `Path`, the conservative
+/// choice that keeps segment discipline.
+fn target_kind(pattern: &PermissionPattern) -> PermissionTargetKind {
+    let source = match pattern {
+        PermissionPattern::Exact(value) => Some(value.as_str()),
+        PermissionPattern::Glob(_) => pattern.glob_source(),
+        PermissionPattern::Any => None,
+    };
+
+    source
+        .map(permission_target_kind_for_tool)
+        .unwrap_or(PermissionTargetKind::Path)
+}
 
 fn rule_applies_to_project(rule: &PermissionRule, project: &str) -> bool {
     rule.scope == PermissionScope::Global || rule.project.as_deref() == Some(project)

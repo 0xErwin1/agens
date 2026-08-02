@@ -4,7 +4,8 @@ use agens_core::{
     HeadlessTurnCancellation, MAX_PERMISSION_GLOB_SEGMENTS, MAX_PERMISSION_TARGET_BYTES,
     PermissionDecision, PermissionMode, PermissionPattern, PermissionPatternError,
     PermissionPolicy, PermissionRequest, PermissionRule, PermissionScope, PermissionSession,
-    PermissionTarget, ProjectPermissionGrant, ToolAccess,
+    PermissionTarget, PermissionTargetKind, ProjectPermissionGrant, ToolAccess,
+    permission_target_kind_for_tool,
 };
 
 #[test]
@@ -64,16 +65,74 @@ fn validated_target_globs_match_paths_with_documented_segment_semantics() {
 }
 
 #[test]
-fn a_bare_star_target_does_not_cross_a_slash_in_a_shell_command() {
+fn a_bare_star_target_does_not_cross_a_slash_for_a_path_shaped_target() {
     let narrow = PermissionPattern::glob("rm*").expect("glob should be valid");
     let path_aware = PermissionPattern::glob("rm -rf /**").expect("glob should be valid");
 
     assert!(narrow.matches("rm -rf"));
     assert!(
         !narrow.matches("rm -rf /tmp/x"),
-        "a bare * never crosses a / even inside a command string, not just a filesystem path"
+        "path-shaped targets (read/write/edit/list/search paths) must keep segment discipline: \
+         a bare * never crosses a /, only an explicit ** does"
     );
     assert!(path_aware.matches("rm -rf /tmp/x"));
+}
+
+/// `bash` (and `git_read`'s operation keyword) are free-form text, not
+/// filesystem paths, even though a shell command routinely contains `/`.
+/// Regression-pins the previously silent failure of the most common
+/// deny-by-prefix rules a user would write for `bash`.
+#[test]
+fn a_bare_star_target_crosses_a_slash_for_a_free_form_command_target() {
+    let cases = [
+        ("git reset --hard*", "git reset --hard origin/main"),
+        ("git push*", "git push origin feature/x"),
+        ("git rebase*", "git rebase origin/main"),
+        ("rm*", "rm -rf /tmp/x"),
+    ];
+
+    for (pattern, command) in cases {
+        let free_form =
+            PermissionPattern::glob_for_target_kind(pattern, PermissionTargetKind::FreeFormText)
+                .expect("glob should be valid");
+
+        assert!(
+            free_form.matches(command),
+            "free-form command pattern {pattern:?} should have matched {command:?}"
+        );
+    }
+}
+
+#[test]
+fn permission_target_kind_classifies_bash_and_git_read_as_free_form_and_everything_else_as_path() {
+    for tool in ["bash", "native::bash", "git_read", "native::git_read"] {
+        assert_eq!(
+            permission_target_kind_for_tool(tool),
+            PermissionTargetKind::FreeFormText,
+            "{tool} should classify as free-form text"
+        );
+    }
+
+    for tool in [
+        "read",
+        "native::read",
+        "write",
+        "edit",
+        "list",
+        "search",
+        "glob",
+        "native::glob",
+        "grep",
+        "native::grep",
+        "webfetch",
+        "native::webfetch",
+    ] {
+        assert_eq!(
+            permission_target_kind_for_tool(tool),
+            PermissionTargetKind::Path,
+            "{tool} should classify as a path-shaped target"
+        );
+    }
 }
 
 #[test]

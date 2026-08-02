@@ -56,9 +56,13 @@ model = "gpt-5.5"
 effort = "high"
 
 # Rules are evaluated in global-then-project order. A target in parentheses
-# is a glob; a tool named without one matches every target. Keep destructive
-# operations denied explicitly, and reserve `ask` for operations you want a
-# human to confirm even when bypass or dangerous mode is on.
+# is a glob; a tool named without one matches every target. For path-shaped
+# targets (read/write/edit/list/search/glob/grep/webfetch) a bare `*` never
+# crosses a `/`; only an explicit `**` segment does. `bash` targets are
+# free-form command text, so a bare `*` there does cross `/` — `bash(rm*)`
+# already matches `rm -rf /tmp/x`. Keep destructive operations denied
+# explicitly, and reserve `ask` for operations you want a human to confirm
+# even when bypass or dangerous mode is on.
 [permissions]
 allow = [
   "read(**)",

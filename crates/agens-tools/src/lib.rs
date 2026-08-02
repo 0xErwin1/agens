@@ -4422,14 +4422,15 @@ impl NativeTools {
     /// deliberate, accepted property of granting `bash`, not an oversight.
     ///
     /// The declared guardrail against this is a target-pattern rule on the
-    /// command text, e.g. `deny bash rm -rf /**`, evaluated by
-    /// `PermissionPolicy` before this method ever runs. That guardrail is
-    /// pattern matching over a raw shell string, not a security boundary: it
-    /// does not stop `/bin/rm`, `sudo rm`, `cd foo && rm`, `xargs rm`, or any
-    /// other way to reach the same effect through different text. It also
-    /// inherits the glob's path-segment semantics documented on
-    /// `PermissionPattern::glob` — a bare `*` does not cross a `/`, so
-    /// `deny bash rm*` only catches a slash-free `rm` command.
+    /// command text, e.g. `deny bash rm*`, evaluated by `PermissionPolicy`
+    /// before this method ever runs. That guardrail is pattern matching over
+    /// a raw shell string, not a security boundary: it does not stop
+    /// `/bin/rm`, `sudo rm`, `cd foo && rm`, `xargs rm`, or any other way to
+    /// reach the same effect through different text. Unlike a path target,
+    /// a `bash` target is classified `PermissionTargetKind::FreeFormText`
+    /// (see `permission_target_kind_for_tool`), so a bare `*` crosses `/`
+    /// there: `deny bash rm*` already catches `rm -rf /tmp/x`, not just a
+    /// slash-free `rm` command.
     pub fn bash(&self, input: BashInput) -> Result<ToolOutput, Error> {
         if input.command.trim().is_empty() {
             return Ok(ToolOutput::failure("bash: command is required"));

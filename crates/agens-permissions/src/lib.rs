@@ -34,7 +34,7 @@ use agens_core::{
     FactPath, HeadlessPermissionGate, HeadlessPermissionResolver, HeadlessToolCall,
     HeadlessTurnCancellation, HeadlessTurnPortError, PermissionDecision, PermissionMode,
     PermissionPattern, PermissionPolicy, PermissionRule, PermissionSession, ToolInput, ToolOutcome,
-    ToolResultFacts,
+    ToolResultFacts, permission_target_kind_for_tool,
 };
 use agens_store::PermissionGrantStore;
 use agens_tools::{
@@ -553,8 +553,11 @@ pub fn permission_policy(
                 .map(|identity| PermissionPattern::Exact(identity.as_str().to_owned()))
                 .ok_or_else(|| CliError::configuration("permission configuration is invalid"))?;
             let target = match &rule.target_pattern {
-                Some(pattern) => PermissionPattern::glob(pattern.clone())
-                    .map_err(|_| CliError::configuration("permission configuration is invalid"))?,
+                Some(pattern) => PermissionPattern::glob_for_target_kind(
+                    pattern.clone(),
+                    permission_target_kind_for_tool(&configured),
+                )
+                .map_err(|_| CliError::configuration("permission configuration is invalid"))?,
                 None => PermissionPattern::Any,
             };
             Ok(match rule.scope {
@@ -741,6 +744,58 @@ mod tests {
             matches!(bypassed_outcome, ToolEvaluationOutcome::PromptRequired(_)),
             "a configured ask must survive temporary_bypass exactly like an agent-declared ask"
         );
+    }
+
+    #[test]
+    fn a_configured_bash_deny_matches_a_command_carrying_a_path_argument() {
+        let cases = [
+            ("git reset --hard*", "git reset --hard origin/main"),
+            ("git push*", "git push origin feature/x"),
+            ("git rebase*", "git rebase origin/main"),
+            ("rm*", "rm -rf /tmp/x"),
+        ];
+
+        for (target_pattern, command) in cases {
+            let mut dispatcher = ToolDispatcher::new();
+            dispatcher
+                .register_native("native::bash", ToolAccess::Write, StubBashTool)
+                .expect("native bash should register");
+            let dispatcher: SharedToolDispatcher = Arc::new(Mutex::new(dispatcher));
+
+            let policy = permission_policy(
+                &[ConfigPermissionRule {
+                    scope: ConfigPermissionScope::Global,
+                    decision: ConfigPermissionDecision::Deny,
+                    tool_pattern: "bash".into(),
+                    target_pattern: Some(target_pattern.into()),
+                }],
+                "project",
+                PermissionMode::Edit,
+                &dispatcher,
+                None,
+            )
+            .expect("a configured deny rule should resolve");
+
+            let outcome = dispatcher
+                .lock()
+                .expect("dispatcher should remain available")
+                .evaluate(
+                    &policy,
+                    &[],
+                    &PermissionSession::new(),
+                    ToolDispatchRequest::new(
+                        "project",
+                        "native::bash",
+                        serde_json::json!({"target": command}),
+                    ),
+                )
+                .expect("configured deny should evaluate");
+
+            assert!(
+                matches!(outcome, ToolEvaluationOutcome::Denied),
+                "deny bash({target_pattern}) should have denied {command:?}, got {outcome:?}"
+            );
+        }
     }
 
     struct StubBashTool;
