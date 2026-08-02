@@ -302,11 +302,13 @@ fn stdio_transport_reaps_process_group_descendants_after_timeout_cancellation_an
 fn wait_for_descendant(path: &std::path::Path) -> i32 {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        if let Ok(pid) = std::fs::read_to_string(path) {
-            return pid
-                .trim()
-                .parse()
-                .expect("recorded descendant PID should be valid");
+        // The child records the PID with a plain write, which creates the file
+        // before filling it, so an existing-but-empty read means "not yet"
+        // rather than "malformed".
+        if let Ok(pid) = std::fs::read_to_string(path)
+            && let Ok(pid) = pid.trim().parse()
+        {
+            return pid;
         }
         assert!(Instant::now() < deadline, "descendant PID was not recorded");
         thread::sleep(Duration::from_millis(2));
