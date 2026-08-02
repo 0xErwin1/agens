@@ -90,7 +90,10 @@ const CASES: &[Case] = &[
         target: "echo hi",
         expected: PermissionDecision::Allow,
     },
-    // A narrower tool pattern outranks a broader one on an equal target.
+    // A wildcard tool pattern resolves to the very tools it names on both
+    // paths, so `*` and `bash` end up selecting the same call and the more
+    // restrictive decision takes the tie — the tool patterns never compare as
+    // one being narrower than the other.
     Case {
         declarations: &["allow *", "deny bash"],
         tool: "bash",
@@ -103,8 +106,8 @@ const CASES: &[Case] = &[
         target: "echo hi",
         expected: PermissionDecision::Deny,
     },
-    // On an equal target and an equal tool specificity, `deny` wins in either
-    // authoring order: declaration order never decides safety.
+    // Where two rules select the same call, `deny` wins in either authoring
+    // order: declaration order never decides safety.
     Case {
         declarations: &["deny *", "allow *"],
         tool: "bash",
@@ -137,8 +140,8 @@ const CASES: &[Case] = &[
         target: "echo hi",
         expected: PermissionDecision::Deny,
     },
-    // Two globs of different breadth are equally specific, so the deny holds
-    // whichever side of the allow it is written on.
+    // `rm*` selects a strict subset of `*`, so the deny outranks the allow
+    // whichever side of it the allow is written on.
     Case {
         declarations: &["deny bash rm*", "allow bash *"],
         tool: "bash",

@@ -1277,9 +1277,9 @@ mod tests {
     }
 
     /// `deny bash rm*` beside `allow bash *` is the canonical "bash, except
-    /// these" shape written with the wildcard spelled out. Both targets are
-    /// globs and therefore equally specific, so only the deny-takes-the-tie
-    /// rule keeps the narrow deny from being overtaken by the broad allow.
+    /// these" shape written with the wildcard spelled out. `rm*` selects a
+    /// strict subset of `*`, so the deny outranks the allow it is written
+    /// beside, in either order.
     #[test]
     fn a_narrow_deny_holds_against_an_explicit_wildcard_allow_in_either_order() {
         for (label, declarations) in [

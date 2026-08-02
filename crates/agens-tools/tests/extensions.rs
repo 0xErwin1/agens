@@ -1932,11 +1932,11 @@ fn an_allow_naming_a_tool_the_dispatcher_lacks_is_dropped() {
     assert!(set.descriptors().is_empty());
 }
 
-/// Descriptor order is authoring order, deliberately: `permission_rules` hands
-/// the sequence to `ordered_permission_rules`, which is the only place a tie
-/// between two equally specific declarations is broken. A set ordered by
-/// selector instead would answer differently from the delegated child's surface
-/// for the same definition.
+/// Descriptor order is authoring order, deliberately: these descriptors are
+/// read back by the surfaces that display an agent's declarations, and a set
+/// reordered by selector would show the operator something they did not write.
+/// It decides nothing — precedence is read off what each rule selects — so this
+/// pins presentation, not policy.
 #[test]
 fn capability_descriptors_follow_declaration_order() {
     let mut dispatcher = ToolDispatcher::new();
