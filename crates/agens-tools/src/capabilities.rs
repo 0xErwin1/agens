@@ -2,8 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use agens_core::{
     AgentDefinition, PermissionDecision, PermissionPattern, PermissionRule, PermissionScope,
-    PermissionTargetKind, ordered_permission_rules, permission_target_kind_for_tool,
-    prevailing_decision,
+    PermissionTargetKind, permission_target_kind_for_tool, prevailing_decision,
 };
 
 use crate::ToolDispatcher;
@@ -17,17 +16,15 @@ impl EffectiveCapabilitySet {
     /// Resolves an agent's declarations against the tools a dispatcher
     /// actually holds, in declaration order.
     ///
-    /// Authoring order is preserved end to end: a redeclared selector moves to
-    /// the position of its latest mention rather than keeping the position of
-    /// its first, so `permission_rules` can hand
-    /// [`agens_core::ordered_permission_rules`] the same sequence a delegated
-    /// child's surface hands it. Sorting descriptors by selector here would
-    /// destroy that order and make the two paths answer differently for the
-    /// same definition.
+    /// Declaration order is preserved only so the descriptors read back the way
+    /// they were written, for the surfaces that display them. It decides
+    /// nothing: [`agens_core::prevailing_rule_decision`] reads precedence off
+    /// what each rule selects, so the same definition answers the same whatever
+    /// order it was authored in.
     ///
     /// Two rules selecting exactly the same calls collapse into one descriptor,
     /// carrying the decision [`agens_core::prevailing_decision`] gives them —
-    /// the same answer the ordering would have reached had both survived, so
+    /// the same answer precedence would have reached had both survived, so
     /// collapsing them cannot change what the definition means.
     pub fn from_agent(agent: &AgentDefinition, project: &str, dispatcher: &ToolDispatcher) -> Self {
         let snapshot = dispatcher.capability_snapshot();
@@ -65,12 +62,10 @@ impl EffectiveCapabilitySet {
     }
 
     pub fn permission_rules(&self) -> Vec<PermissionRule> {
-        ordered_permission_rules(
-            self.descriptors
-                .iter()
-                .flat_map(EffectiveCapabilityDescriptor::permission_rules)
-                .collect(),
-        )
+        self.descriptors
+            .iter()
+            .flat_map(EffectiveCapabilityDescriptor::permission_rules)
+            .collect()
     }
 
     pub fn is_expansion_from(&self, prior: &Self) -> bool {

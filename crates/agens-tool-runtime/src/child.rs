@@ -10,7 +10,7 @@ use agens_core::{
     HeadlessPermissionResolver, HeadlessToolCall, HeadlessTurnCancellation, HeadlessTurnError,
     HeadlessTurnPortError, Message, MessagePart, PermissionDecision, PermissionMode,
     PermissionPattern, PermissionPolicy, PermissionRule, PermissionSession, Role, SafetyPredicate,
-    TurnEvent, TurnProgressSink, TurnProvider, ordered_permission_rules,
+    TurnEvent, TurnProgressSink, TurnProvider,
     run_isolated_headless_turn_with_max_iterations_and_progress,
 };
 use agens_providers::{
@@ -474,13 +474,12 @@ where
                 )
             }),
     );
-    let mut safety_predicates = vec![SafetyPredicate::WorktreeEscape, SafetyPredicate::ChatWrite];
-    safety_predicates.extend(surface.safety_predicates.iter().cloned());
     let policy = PermissionPolicy::with_safety_predicates(
         PermissionMode::Edit,
-        ordered_permission_rules(rules),
-        safety_predicates,
-    );
+        rules,
+        vec![SafetyPredicate::WorktreeEscape, SafetyPredicate::ChatWrite],
+    )
+    .with_configured_floor(surface.configured_floor.clone());
     let grants = Arc::new(Mutex::new(Vec::new()));
     let session = PermissionSession::new();
     let pending = Arc::new(Mutex::new(BTreeMap::new()));

@@ -31,11 +31,10 @@ use std::sync::{Arc, Mutex};
 
 use agens_config::{ConfigPermissionDecision, ConfigPermissionRule, ConfigPermissionScope};
 use agens_core::{
-    FactPath, HeadlessPermissionGate, HeadlessPermissionResolver, HeadlessToolCall,
-    HeadlessTurnCancellation, HeadlessTurnPortError, PermissionDecision, PermissionMode,
-    PermissionPattern, PermissionPolicy, PermissionRule, PermissionSession, SafetyPredicate,
-    ToolInput, ToolOutcome, ToolResultFacts, ordered_permission_rules,
-    permission_target_kind_for_tool,
+    ConfiguredFloor, FactPath, HeadlessPermissionGate, HeadlessPermissionResolver,
+    HeadlessToolCall, HeadlessTurnCancellation, HeadlessTurnPortError, PermissionDecision,
+    PermissionMode, PermissionPattern, PermissionPolicy, PermissionRule, PermissionSession,
+    SafetyPredicate, ToolInput, ToolOutcome, ToolResultFacts, permission_target_kind_for_tool,
 };
 use agens_store::PermissionGrantStore;
 use agens_tools::{
@@ -538,7 +537,7 @@ pub fn permission_policy(
     dispatcher: &SharedToolDispatcher,
     effective_capabilities: Option<&EffectiveCapabilitySet>,
 ) -> Result<PermissionPolicy, CliError> {
-    let mut rules = configured_permission_rules(rules, project, |configured| {
+    let configured = configured_permission_rules(rules, project, |configured| {
         dispatcher
             .lock()
             .map_err(|_| CliError::configuration("tool catalog is invalid"))?
@@ -546,30 +545,27 @@ pub fn permission_policy(
             .map(|identity| PermissionPattern::Exact(identity.as_str().to_owned()))
             .ok_or_else(|| CliError::configuration("permission configuration is invalid"))
     })?;
-    let configured_floor = ordered_permission_rules(rules.clone());
-    if let Some(capabilities) = effective_capabilities {
-        rules.extend(capabilities.permission_rules());
-    }
+    let declared = effective_capabilities
+        .map(EffectiveCapabilitySet::permission_rules)
+        .unwrap_or_default();
+
     Ok(PermissionPolicy::with_safety_predicates(
         mode,
-        ordered_permission_rules(rules),
-        vec![
-            SafetyPredicate::WorktreeEscape,
-            SafetyPredicate::ChatWrite,
-            SafetyPredicate::ConfiguredDenial(configured_floor),
-        ],
-    ))
+        declared,
+        vec![SafetyPredicate::WorktreeEscape, SafetyPredicate::ChatWrite],
+    )
+    .with_configured_floor(ConfiguredFloor::governing(configured)))
 }
 
 /// Converts configured `[permissions]` entries into policy rules, resolving
 /// each entry's tool name through `resolve_tool`.
 ///
-/// The mapping from a configured name to a tool (`edit` meaning the same tool
-/// as `write`) and the target's `/`-crossing kind live here alone, so a
-/// delegated child derives the parent's configured rules exactly as the parent
-/// itself does. Only the tool pattern differs between callers: the primary
-/// path resolves it to a live dispatcher identity, while a caller building a
-/// child surface has no dispatcher yet and keeps the qualified name.
+/// The mapping from a configured name to the tool it names and the target's
+/// `/`-crossing kind live here alone, so a delegated child derives the parent's
+/// configured rules exactly as the parent itself does. Only the tool pattern
+/// differs between callers: the primary path resolves it to a live dispatcher
+/// identity, while a caller building a child surface has no dispatcher yet and
+/// keeps the qualified name.
 pub fn configured_permission_rules(
     rules: &[ConfigPermissionRule],
     project: &str,

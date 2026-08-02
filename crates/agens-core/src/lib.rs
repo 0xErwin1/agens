@@ -16,7 +16,7 @@ pub mod redaction;
 mod request_config;
 
 pub use permission_precedence::{
-    declarations_deny_every_target, ordered_permission_rules, prevailing_decision,
+    declarations_deny_every_target, prevailing_decision, prevailing_rule_decision,
 };
 pub use request_config::{ReasoningEffort, RequestConfig, RequestConfigError};
 
@@ -2152,6 +2152,46 @@ impl PermissionPattern {
             Self::Glob(pattern) => pattern.matches(value),
         }
     }
+
+    /// Reports whether this pattern selects every value it could be compared
+    /// against, which is what makes an absent target, `*` on a free-form
+    /// target, and `**` three spellings of one thing rather than three
+    /// different breadths.
+    ///
+    /// `*` on a path-shaped target is deliberately NOT one of them: it stops
+    /// at a `/`, so `src/main.rs` escapes it while `**` covers it.
+    pub fn denotes_everything(&self) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Exact(_) => false,
+            Self::Glob(pattern) => pattern.denotes_everything(),
+        }
+    }
+
+    /// Reports whether every value `other` selects is also selected by `self`.
+    ///
+    /// This is a sound under-approximation: it answers `true` only where the
+    /// containment can be established structurally, and `false` — meaning
+    /// "not known to be broader" — for every pattern shape it cannot decide.
+    /// Callers therefore have to treat `false` in both directions as
+    /// "incomparable" rather than as "disjoint". [`Self::Any`] is decided by
+    /// the two breadth checks above and never reaches the shape comparison.
+    pub fn covers(&self, other: &Self) -> bool {
+        if self.denotes_everything() {
+            return true;
+        }
+        if other.denotes_everything() {
+            return false;
+        }
+
+        match (self, other) {
+            (Self::Exact(broader), Self::Exact(narrower)) => broader == narrower,
+            (Self::Exact(_), _) => false,
+            (_, Self::Exact(value)) => self.matches(value),
+            (Self::Glob(broader), Self::Glob(narrower)) => broader.covers(narrower),
+            (Self::Any, _) | (_, Self::Any) => false,
+        }
+    }
 }
 
 /// Classifies what kind of value a permission target holds, which decides
@@ -2189,6 +2229,7 @@ pub fn permission_target_kind_for_tool(tool: &str) -> PermissionTargetKind {
 #[derive(Clone, Debug)]
 pub struct ValidatedPermissionGlob {
     pattern: String,
+    literal_separator: bool,
     matcher: GlobMatcher,
 }
 
@@ -2221,12 +2262,63 @@ impl ValidatedPermissionGlob {
             })?
             .compile_matcher();
 
-        Ok(Self { pattern, matcher })
+        Ok(Self {
+            pattern,
+            literal_separator,
+            matcher,
+        })
     }
 
     fn matches(&self, value: &str) -> bool {
         value.len() <= MAX_PERMISSION_TARGET_BYTES && self.matcher.is_match(value)
     }
+
+    fn denotes_everything(&self) -> bool {
+        self.pattern == "**" || self.pattern == "*" && !self.literal_separator
+    }
+
+    /// Establishes containment between two globs from the only shape it can be
+    /// read off structurally: a wildcard-free prefix followed by a trailing
+    /// wildcard that runs to the end of the pattern. Every other shape is left
+    /// undecided, because `a*` and `*b` overlap without either containing the
+    /// other and no ordering of them would be defensible.
+    fn covers(&self, other: &Self) -> bool {
+        if self.pattern == other.pattern && self.literal_separator == other.literal_separator {
+            return true;
+        }
+
+        if !has_glob_wildcard(&other.pattern) {
+            return self.matches(&other.pattern);
+        }
+
+        let (Some((prefix, crosses_separator)), Some((other_prefix, other_crosses_separator))) = (
+            self.trailing_wildcard_prefix(),
+            other.trailing_wildcard_prefix(),
+        ) else {
+            return false;
+        };
+
+        let Some(remainder) = other_prefix.strip_prefix(prefix) else {
+            return false;
+        };
+
+        crosses_separator || !other_crosses_separator && !remainder.contains('/')
+    }
+
+    /// Splits `<literal><trailing wildcard>` into the literal and whether that
+    /// wildcard reaches across `/`, or reports `None` for any other shape.
+    fn trailing_wildcard_prefix(&self) -> Option<(&str, bool)> {
+        let (prefix, crosses_separator) = match self.pattern.strip_suffix("**") {
+            Some(prefix) => (prefix, true),
+            None => (self.pattern.strip_suffix('*')?, !self.literal_separator),
+        };
+
+        (!has_glob_wildcard(prefix)).then_some((prefix, crosses_separator))
+    }
+}
+
+fn has_glob_wildcard(pattern: &str) -> bool {
+    pattern.contains(['*', '?', '[', ']', '{', '}', '\\'])
 }
 
 impl PartialEq for ValidatedPermissionGlob {
@@ -2561,16 +2653,72 @@ pub enum SafetyPredicate {
     WorktreeEscape,
     ChatWrite,
     GlobalDeny(Box<GlobalDenyPredicate>),
-    /// The operator's configured `[permissions]` rules, resolved among
-    /// themselves by [`ordered_permission_rules`] and held above the policy.
-    ///
-    /// Configuration is a floor rather than one voice among many: an agent
-    /// definition can narrow it further, but a declaration must never reopen a
-    /// call the configuration nets to `Deny`, whether the call is made by a
-    /// primary agent or by a delegated child. Resolving the configured rules
-    /// against each other first is what keeps a configured `allow` able to
-    /// carve an exception out of a configured `deny`.
-    ConfiguredDenial(Vec<PermissionRule>),
+}
+
+/// The operator's configured `[permissions]` rules, resolved among themselves
+/// and then combined with whatever the agent declared.
+///
+/// Configuration is a ceiling on authority rather than one voice among many: a
+/// declaration can narrow it further, but can never reopen a call the
+/// configuration nets to `Deny` nor skip an approval it nets to `Ask`. The two
+/// sets are resolved separately and combined by taking the more restrictive
+/// answer, which is what keeps both halves of that sentence true — merging them
+/// into one set would let whichever rule happened to be narrower decide alone.
+///
+/// Resolving the configured rules against each other first is also what keeps a
+/// configured `allow` able to carve an exception out of a configured `deny`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConfiguredFloor {
+    rules: Vec<PermissionRule>,
+    role: ConfiguredRole,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConfiguredRole {
+    Governing,
+    Restricting,
+}
+
+impl ConfiguredFloor {
+    /// The primary path, where the operator's configuration is the authority a
+    /// call is measured against: a configured `allow` authorizes on its own.
+    pub fn governing(rules: Vec<PermissionRule>) -> Self {
+        Self {
+            rules,
+            role: ConfiguredRole::Governing,
+        }
+    }
+
+    /// A delegated child, where only the agent definition can authorize a tool.
+    /// The same rules still restrict, so a configured `deny` or `ask` reaches
+    /// the child exactly as it reaches the parent, but a configured `allow`
+    /// grants a child nothing it did not declare.
+    pub fn restricting(rules: Vec<PermissionRule>) -> Self {
+        Self {
+            rules,
+            role: ConfiguredRole::Restricting,
+        }
+    }
+
+    pub fn rules(&self) -> &[PermissionRule] {
+        &self.rules
+    }
+
+    fn denies(&self, request: &PermissionRequest) -> bool {
+        self.decision(request) == Some(PermissionDecision::Deny)
+    }
+
+    fn decision(&self, request: &PermissionRequest) -> Option<PermissionDecision> {
+        prevailing_rule_decision(&self.rules, request)
+    }
+
+    /// The configured answer as far as it constrains this path: everything on
+    /// the primary path, and only the non-authorizing decisions in a child.
+    fn constraint(&self, request: &PermissionRequest) -> Option<PermissionDecision> {
+        self.decision(request).filter(|decision| {
+            self.role == ConfiguredRole::Governing || *decision != PermissionDecision::Allow
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2584,6 +2732,7 @@ pub struct PermissionPolicy {
     mode: PermissionMode,
     static_rules: Vec<PermissionRule>,
     safety_predicates: Vec<SafetyPredicate>,
+    configured_floor: Option<ConfiguredFloor>,
 }
 
 impl PermissionPolicy {
@@ -2604,7 +2753,17 @@ impl PermissionPolicy {
             mode,
             static_rules,
             safety_predicates,
+            configured_floor: None,
         }
+    }
+
+    /// Holds the operator's configured rules above the declared ones. See
+    /// [`ConfiguredFloor`] for why they are kept as a separate set rather than
+    /// concatenated onto `static_rules`.
+    #[must_use]
+    pub fn with_configured_floor(mut self, floor: ConfiguredFloor) -> Self {
+        self.configured_floor = Some(floor);
+        self
     }
 
     pub fn evaluate(
@@ -2626,12 +2785,12 @@ impl PermissionPolicy {
                 SafetyPredicate::GlobalDeny(deny) => {
                     normalize_tool_pattern(&mut deny.tool, &aliases);
                 }
-                SafetyPredicate::ConfiguredDenial(rules) => {
-                    for rule in rules {
-                        normalize_tool_pattern(&mut rule.tool, &aliases);
-                    }
-                }
                 SafetyPredicate::WorktreeEscape | SafetyPredicate::ChatWrite => {}
+            }
+        }
+        if let Some(floor) = policy.configured_floor.as_mut() {
+            for rule in &mut floor.rules {
+                normalize_tool_pattern(&mut rule.tool, &aliases);
             }
         }
         policy
@@ -2654,16 +2813,19 @@ impl PermissionPolicy {
     }
 
     /// Resolves a permission request against static rules, then persisted
-    /// grants, then an unmatched-call fallback — in that order of authority.
+    /// grants, then an unmatched-call fallback — in that order of authority —
+    /// and never above what the operator's configured rules leave open.
     ///
     /// A static rule's `Deny` is sticky: once a declaration (agent-defined or
     /// configured) denies a request, no later project or session grant can
-    /// reopen it, regardless of chain order. Any other matched decision keeps
-    /// the existing last-matching-wins behavior between static rules and
-    /// grants. A matched decision is never touched by `unmatched_allow` or by
-    /// `session.temporary_bypass` — those two only decide what happens when
-    /// nothing matched at all, which is the sole remaining role of
-    /// `resolve_ask`.
+    /// reopen it. Any other matched decision keeps the existing
+    /// grant-outranks-rule behavior. A matched decision is never touched by
+    /// `unmatched_allow` or by `session.temporary_bypass` — those two only
+    /// decide what happens when nothing matched at all, which is the sole
+    /// remaining role of `resolve_ask`.
+    ///
+    /// Which static rule decides is [`prevailing_rule_decision`]'s answer, not
+    /// the last one written: authoring order never decides safety.
     pub fn evaluate_with_unmatched_override(
         &self,
         request: &PermissionRequest,
@@ -2676,12 +2838,7 @@ impl PermissionPolicy {
             return PermissionDecision::Deny;
         }
 
-        let static_decision = self
-            .static_rules
-            .iter()
-            .filter(|rule| rule.matches(request))
-            .map(|rule| rule.decision)
-            .next_back();
+        let static_decision = prevailing_rule_decision(&self.static_rules, request);
 
         let grant_decision = project_grants
             .iter()
@@ -2701,9 +2858,16 @@ impl PermissionPolicy {
             grant_decision.or(static_decision)
         };
 
-        match matched {
-            Some(decision) => decision,
-            None => {
+        let configured = self
+            .configured_floor
+            .as_ref()
+            .and_then(|floor| floor.constraint(request));
+
+        match (matched, configured) {
+            (Some(decision), Some(floor)) => prevailing_decision(decision, floor),
+            (Some(decision), None) => decision,
+            (None, Some(floor)) => floor,
+            (None, None) => {
                 let fallback = if unmatched_allow {
                     PermissionDecision::Allow
                 } else {
@@ -2715,6 +2879,14 @@ impl PermissionPolicy {
     }
 
     pub fn hard_safety_allows(&self, request: &PermissionRequest) -> bool {
+        if self
+            .configured_floor
+            .as_ref()
+            .is_some_and(|floor| floor.denies(request))
+        {
+            return false;
+        }
+
         !self.safety_predicates.iter().any(|predicate| {
             matches!(predicate, SafetyPredicate::WorktreeEscape) && request.outside_worktree
                 || matches!(predicate, SafetyPredicate::ChatWrite)
@@ -2723,8 +2895,6 @@ impl PermissionPolicy {
                 || matches!(predicate, SafetyPredicate::GlobalDeny(global_deny)
                     if global_deny.tool.matches(&request.tool)
                         && global_deny.target.matches(&request.target))
-                || matches!(predicate, SafetyPredicate::ConfiguredDenial(rules)
-                    if configured_denial(rules, request))
         })
     }
 
@@ -2738,19 +2908,6 @@ impl PermissionPolicy {
             decision
         }
     }
-}
-
-/// Resolves the configured rules against each other alone and reports whether
-/// they leave the request denied. The rules are ordered by
-/// [`ordered_permission_rules`] before they get here, so this is the same
-/// last-match-wins resolution the policy applies to its own static rules.
-fn configured_denial(rules: &[PermissionRule], request: &PermissionRequest) -> bool {
-    rules
-        .iter()
-        .filter(|rule| rule.matches(request))
-        .map(|rule| rule.decision)
-        .next_back()
-        == Some(PermissionDecision::Deny)
 }
 
 pub fn normalize_project_permission_grants(

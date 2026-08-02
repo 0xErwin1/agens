@@ -241,6 +241,58 @@ const CASES: &[Case] = &[
         target: "src/main.rs",
         expected: PermissionDecision::Allow,
     },
+    // An explicitly spelled wildcard names exactly the calls an absent target
+    // names, so the two are interchangeable and neither outranks the other.
+    Case {
+        declarations: &["deny bash", "allow bash *"],
+        tool: "bash",
+        target: "rm -rf victim.txt",
+        expected: PermissionDecision::Deny,
+    },
+    Case {
+        declarations: &["allow bash *", "deny bash"],
+        tool: "bash",
+        target: "rm -rf victim.txt",
+        expected: PermissionDecision::Deny,
+    },
+    Case {
+        declarations: &["allow bash", "deny bash *"],
+        tool: "bash",
+        target: "echo hi",
+        expected: PermissionDecision::Deny,
+    },
+    Case {
+        declarations: &["deny bash *", "allow bash"],
+        tool: "bash",
+        target: "echo hi",
+        expected: PermissionDecision::Deny,
+    },
+    // `**` is the path-shaped spelling of the same breadth; `*` on a path stops
+    // at a separator and is genuinely narrower, which the two rows after it pin.
+    Case {
+        declarations: &["deny write", "allow write **"],
+        tool: "write",
+        target: ".env",
+        expected: PermissionDecision::Deny,
+    },
+    Case {
+        declarations: &["allow write **", "deny write"],
+        tool: "write",
+        target: ".env",
+        expected: PermissionDecision::Deny,
+    },
+    Case {
+        declarations: &["allow write", "deny write *"],
+        tool: "write",
+        target: ".env",
+        expected: PermissionDecision::Deny,
+    },
+    Case {
+        declarations: &["allow write", "deny write *"],
+        tool: "write",
+        target: "src/main.rs",
+        expected: PermissionDecision::Allow,
+    },
     // A declaration matching no tool decides nothing and rejects nothing.
     Case {
         declarations: &["deny zz*"],
@@ -347,6 +399,61 @@ const CONFIGURED_CASES: &[ConfiguredCase] = &[
         target: "echo hi",
         expected: PermissionDecision::Deny,
     },
+    // A configured `ask` is an approval the operator asked for. A declaration
+    // cannot skip it, and it has to reach a delegated child too, where the
+    // unreachable prompt is what turns it into a refusal.
+    ConfiguredCase {
+        configured: &["ask bash git push*"],
+        declarations: &["allow bash"],
+        tool: "bash",
+        target: "git push origin main",
+        expected: PermissionDecision::Ask,
+    },
+    ConfiguredCase {
+        configured: &["ask bash git push*"],
+        declarations: &["allow bash"],
+        tool: "bash",
+        target: "echo hi",
+        expected: PermissionDecision::Allow,
+    },
+    ConfiguredCase {
+        configured: &["ask bash"],
+        declarations: &["allow bash"],
+        tool: "bash",
+        target: "rm -rf victim.txt",
+        expected: PermissionDecision::Ask,
+    },
+    ConfiguredCase {
+        configured: &["ask write"],
+        declarations: &["allow write src/**"],
+        tool: "write",
+        target: "src/main.rs",
+        expected: PermissionDecision::Ask,
+    },
+    // The other half of "a declaration can narrow the configured floor
+    // further": a declared deny holds against a configured allow, however
+    // narrowly the configured rule was written.
+    ConfiguredCase {
+        configured: &["allow bash rm*"],
+        declarations: &["deny bash"],
+        tool: "bash",
+        target: "rm -rf victim.txt",
+        expected: PermissionDecision::Deny,
+    },
+    ConfiguredCase {
+        configured: &["allow bash"],
+        declarations: &["deny bash rm*"],
+        tool: "bash",
+        target: "rm -rf victim.txt",
+        expected: PermissionDecision::Deny,
+    },
+    ConfiguredCase {
+        configured: &["allow write src/**"],
+        declarations: &["ask write"],
+        tool: "write",
+        target: "src/main.rs",
+        expected: PermissionDecision::Ask,
+    },
 ];
 
 #[test]
@@ -380,12 +487,13 @@ fn the_child_path_and_the_parent_path_decide_every_configured_shape_identically(
 
 /// Parses `decision tool [target]` into a configured `[permissions]` entry,
 /// deliberately reusing the declaration spelling so a case reads as one rule
-/// set written in two places.
+/// set written in two places. A configured target is a single TOML string and
+/// may contain spaces, so everything past the tool name is the target.
 fn configured_entries(entries: &[&str]) -> Vec<ConfigPermissionRule> {
     entries
         .iter()
         .map(|entry| {
-            let mut parts = entry.split_whitespace();
+            let mut parts = entry.splitn(3, ' ');
             let decision = match parts.next() {
                 Some("allow") => ConfigPermissionDecision::Allow,
                 Some("deny") => ConfigPermissionDecision::Deny,
@@ -432,12 +540,9 @@ fn configured_child_decision(
         return PermissionDecision::Deny;
     }
 
-    PermissionPolicy::with_safety_predicates(
-        PermissionMode::Edit,
-        surface.rules,
-        surface.safety_predicates,
-    )
-    .evaluate(&request(&qualified, target), &[], &PermissionSession::new())
+    PermissionPolicy::new(PermissionMode::Edit, surface.rules)
+        .with_configured_floor(surface.configured_floor)
+        .evaluate(&request(&qualified, target), &[], &PermissionSession::new())
 }
 
 fn configured_parent_decision(

@@ -2,55 +2,47 @@
 //!
 //! Every surface that turns declarations into a [`PermissionPolicy`] — a
 //! delegated child's tool surface, a primary agent's capability set, and the
-//! configured `[permissions]` block — orders them here, so one declaration set
-//! can only ever produce one decision.
+//! configured `[permissions]` block — asks this module which rule prevails, so
+//! one rule set can only ever produce one decision.
 //!
 //! [`PermissionPolicy`]: crate::PermissionPolicy
 
-use crate::{PermissionDecision, PermissionPattern, PermissionRule};
+use crate::{PermissionDecision, PermissionRequest, PermissionRule, PermissionScope};
 
-/// Orders rules so that [`PermissionPolicy`]'s last-match-wins resolution of
-/// static rules realizes the precedence contract below.
+/// Reports the decision `rules` give `request`, or `None` when none of them
+/// selects it.
 ///
-/// 1. The rule with the narrower TARGET wins. Naming any target at all
-///    outranks [`PermissionPattern::Any`], which is what makes the natural
-///    authoring shape `deny bash rm*` followed by `allow bash` — "bash, except
-///    these" — deny `rm` instead of being overtaken by the broad allow that
-///    trails it. Two *named* targets are treated as equally specific: `rm*` and
-///    `*` are both globs, and there is no total order on glob breadth to
-///    separate them by.
-/// 2. On an equally specific target, the rule with the narrower TOOL pattern
-///    wins, so `allow *` followed by `deny bash` denies `bash`.
-/// 3. On an equally specific target and tool, the more RESTRICTIVE decision
-///    wins: `deny` beats `ask`, and `ask` beats `allow`. Authoring order never
-///    decides safety, so `deny bash rm*` and `allow bash *` deny `rm` in either
-///    order, and a `deny` cannot be silently revoked by appending an allow.
-///    `ask` sits between the two because it withholds authority pending a
-///    human, which grants strictly less than `allow` and strictly more than
-///    `deny`; inside a delegated child, where the prompt is unreachable, it
-///    resolves to a denial anyway.
+/// Precedence is read off what a rule DENOTES, never off how it was spelled or
+/// where it was written:
 ///
-/// The consequence to be aware of is that a *narrower* `allow` cannot carve an
-/// exception out of a *broader* `deny` when both name a target, because rule 1
-/// already ranks them equal and rule 3 then hands the tie to the deny. An
-/// exception has to be carved the other way round — a broad `allow` with the
-/// exceptions denied — or by leaving the broader rule untargeted, which rule 1
-/// does separate.
+/// 1. A rule whose selected calls are a strict subset of another's outranks it,
+///    so `deny bash rm*` decides `rm -rf x` even beside `allow bash *`, and
+///    `allow write src/generated/**` decides its own subtree even beside
+///    `deny write src/**`. "Selects everything" is one breadth rather than
+///    several: an absent target, `*` on a free-form target and `**` are the
+///    same rule written three ways.
+///    A rule scoped to one project also selects strictly fewer calls than the
+///    same rule written globally.
+/// 2. Where neither rule's selection contains the other's — or where the
+///    containment cannot be established, which [`crate::PermissionPattern::covers`]
+///    reports conservatively — the rules tie, and the more RESTRICTIVE decision
+///    wins: `deny` beats `ask`, and `ask` beats `allow`. `ask` sits between the
+///    two because it withholds authority pending a human, which grants strictly
+///    less than `allow` and strictly more than `deny`; inside a delegated child,
+///    where the prompt is unreachable, it resolves to a denial anyway.
 ///
-/// The sort is stable, so two rules identical under all three rules keep their
-/// authoring order, which is the only case where authoring order is consulted
-/// at all.
-///
-/// [`PermissionPolicy`]: crate::PermissionPolicy
-pub fn ordered_permission_rules(mut rules: Vec<PermissionRule>) -> Vec<PermissionRule> {
-    rules.sort_by_key(|rule| {
-        (
-            specificity(&rule.target),
-            specificity(&rule.tool),
-            restrictiveness(rule.decision),
-        )
-    });
-    rules
+/// Authoring order is never consulted, so appending a rule can never silently
+/// revoke one already written.
+pub fn prevailing_rule_decision(
+    rules: &[PermissionRule],
+    request: &PermissionRequest,
+) -> Option<PermissionDecision> {
+    let matching = rules
+        .iter()
+        .filter(|rule| rule.matches(request))
+        .collect::<Vec<_>>();
+
+    narrowest_decision(&matching)
 }
 
 /// Reports whether these rules, taken as a whole, leave no call to `tool` that
@@ -58,40 +50,45 @@ pub fn ordered_permission_rules(mut rules: Vec<PermissionRule>) -> Vec<Permissio
 ///
 /// A delegated child enforces that case by omitting the tool from its catalog
 /// rather than by a policy rule, so this has to answer exactly what
-/// [`ordered_permission_rules`] would: a tool is omitted if and only if the
-/// ordering leaves no reachable non-`Deny` decision for it.
+/// [`prevailing_rule_decision`] would for every target at once. It does that by
+/// asking that same question about each region the rules themselves carve out,
+/// rather than by re-deriving the precedence contract in a second place:
 ///
-/// That reduces to two questions against the ordered rules, because rule 1
-/// places every target-naming rule after every untargeted one, so an untargeted
-/// rule can never outrank a targeted one:
+/// - unless some rule selects every target, a target no rule names reaches the
+///   policy's unmatched fallback, which is not a denial;
+/// - otherwise every rule's own region has to net `Deny`, where the rules
+///   deciding a region are those whose selection contains it.
 ///
-/// 1. does the winning UNTARGETED rule for the tool deny it, and
-/// 2. is every target-naming rule for the tool also a deny?
+/// A rule that overlaps a region without containing it cannot make the region
+/// unreachable, because the part it does not cover is still a call the region's
+/// own rules decide — so leaving those rules out is what makes this exact
+/// rather than approximate.
 ///
-/// If a target-naming rule allows or asks, that rule outranks the blanket deny
-/// for the calls it covers, so those calls are still reachable and the tool has
-/// to stay in the catalog for the rule to act on. An `ask` counts as reachable
-/// on purpose: a child resolves it to a denial that states the prompt could not
-/// be reached, which an omitted tool could never distinguish itself from.
+/// An `ask` counts as reachable on purpose: a child resolves it to a denial
+/// that states the prompt could not be reached, which an omitted tool could
+/// never distinguish itself from.
 pub fn declarations_deny_every_target(rules: &[PermissionRule], tool: &str) -> bool {
-    let ordered = ordered_permission_rules(rules.to_vec());
-    let matching = || ordered.iter().filter(|rule| rule.tool.matches(tool));
+    let matching = rules
+        .iter()
+        .filter(|rule| rule.tool.matches(tool))
+        .collect::<Vec<_>>();
 
-    let denied_untargeted = matching()
-        .rfind(|rule| rule.target == PermissionPattern::Any)
-        .is_some_and(|rule| rule.decision == PermissionDecision::Deny);
+    matching.iter().any(|rule| rule.target.denotes_everything())
+        && matching.iter().all(|region| {
+            let deciding = matching
+                .iter()
+                .copied()
+                .filter(|rule| covers(rule, region))
+                .collect::<Vec<_>>();
 
-    denied_untargeted
-        && matching().all(|rule| {
-            rule.target == PermissionPattern::Any || rule.decision == PermissionDecision::Deny
+            narrowest_decision(&deciding) == Some(PermissionDecision::Deny)
         })
 }
 
-/// Resolves two decisions that rules 1 and 2 above rank equal, by rule 3.
+/// Resolves two decisions that select the same calls, by the tie-break above.
 ///
-/// Collapsing two rules that select exactly the same calls into one is the same
-/// question the ordering answers, so it is answered here rather than beside the
-/// caller that needs it.
+/// Collapsing two such rules into one is the same question precedence answers,
+/// so it is answered here rather than beside the caller that needs it.
 pub const fn prevailing_decision(
     first: PermissionDecision,
     second: PermissionDecision,
@@ -103,29 +100,40 @@ pub const fn prevailing_decision(
     }
 }
 
-/// How narrowly a pattern selects, for ordering only.
-///
-/// There are exactly two rungs because there is no defensible total order on
-/// glob breadth: `rm*` matches strictly less than `*`, but `a*` and `*b` are
-/// incomparable, and a rule that decides safety must not depend on a heuristic
-/// that answers differently for equally reasonable authoring. Rules that tie
-/// here are separated by [`restrictiveness`] instead, which is total.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum PatternSpecificity {
-    Any,
-    Named,
+/// Keeps only the rules no other rule strictly narrows, then lets the most
+/// restrictive of those decide.
+fn narrowest_decision(matching: &[&PermissionRule]) -> Option<PermissionDecision> {
+    matching
+        .iter()
+        .filter(|rule| {
+            !matching
+                .iter()
+                .any(|other| covers(rule, other) && !covers(other, rule))
+        })
+        .map(|rule| rule.decision)
+        .reduce(prevailing_decision)
 }
 
-const fn specificity(pattern: &PermissionPattern) -> PatternSpecificity {
-    match pattern {
-        PermissionPattern::Any => PatternSpecificity::Any,
-        PermissionPattern::Glob(_) | PermissionPattern::Exact(_) => PatternSpecificity::Named,
+/// Reports whether every call `narrower` selects is also selected by
+/// `broader`, across all three axes a rule selects on: the project it is scoped
+/// to, the tool, and the target. A rule scoped to one project selects strictly
+/// fewer calls than the same rule written globally, which is what lets a
+/// project-scoped exception outrank a global default.
+fn covers(broader: &PermissionRule, narrower: &PermissionRule) -> bool {
+    scope_covers(broader, narrower)
+        && broader.tool.covers(&narrower.tool)
+        && broader.target.covers(&narrower.target)
+}
+
+fn scope_covers(broader: &PermissionRule, narrower: &PermissionRule) -> bool {
+    match (broader.scope, narrower.scope) {
+        (PermissionScope::Global, _) => true,
+        (PermissionScope::Project, PermissionScope::Global) => false,
+        (PermissionScope::Project, PermissionScope::Project) => broader.project == narrower.project,
     }
 }
 
-/// Ranks decisions from the most permissive to the most restrictive, so that a
-/// stable ascending sort under last-match-wins resolution lets the most
-/// restrictive one win a tie.
+/// Ranks decisions from the most permissive to the most restrictive.
 const fn restrictiveness(decision: PermissionDecision) -> u8 {
     match decision {
         PermissionDecision::Allow => 0,
@@ -137,99 +145,176 @@ const fn restrictiveness(decision: PermissionDecision) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::PermissionDecision;
+    use crate::{
+        PermissionDecision, PermissionPattern, ToolAccess, permission_target_kind_for_tool,
+    };
 
+    /// Builds a rule the way both production paths build one: the target's
+    /// `/`-crossing behavior comes from the tool it belongs to, so `*` is the
+    /// whole space for `bash` and stops at a separator for `write`.
     fn rule(decision: PermissionDecision, tool: &str, target: Option<&str>) -> PermissionRule {
         PermissionRule::global(
             decision,
             PermissionPattern::glob(tool).unwrap(),
             match target {
-                Some(target) => PermissionPattern::glob(target).unwrap(),
+                Some(target) => PermissionPattern::glob_for_target_kind(
+                    target,
+                    permission_target_kind_for_tool(tool),
+                )
+                .unwrap(),
                 None => PermissionPattern::Any,
             },
         )
     }
 
+    fn decision(rules: &[PermissionRule], tool: &str, target: &str) -> Option<PermissionDecision> {
+        prevailing_rule_decision(
+            rules,
+            &PermissionRequest::new("project", tool, target, ToolAccess::Write),
+        )
+    }
+
+    /// Both orders, because authoring order is exactly what must not decide.
+    fn both_orders(first: PermissionRule, second: PermissionRule) -> [Vec<PermissionRule>; 2] {
+        [vec![first.clone(), second.clone()], vec![second, first]]
+    }
+
     #[test]
-    fn a_targeted_declaration_outranks_an_untargeted_one_declared_after_it() {
-        let ordered = ordered_permission_rules(vec![
+    fn a_narrower_target_outranks_a_broader_one() {
+        for rules in both_orders(
             rule(PermissionDecision::Deny, "bash", Some("rm*")),
-            rule(PermissionDecision::Allow, "bash", None),
-        ]);
-
-        assert_eq!(ordered.last().unwrap().decision, PermissionDecision::Deny);
-    }
-
-    #[test]
-    fn a_narrower_tool_pattern_outranks_a_broader_one_on_an_equal_target() {
-        let ordered = ordered_permission_rules(vec![
-            rule(PermissionDecision::Deny, "bash", None),
-            PermissionRule::global(
-                PermissionDecision::Allow,
-                PermissionPattern::Any,
-                PermissionPattern::Any,
-            ),
-        ]);
-
-        assert_eq!(ordered.last().unwrap().decision, PermissionDecision::Deny);
-    }
-
-    #[test]
-    fn deny_wins_an_equally_specific_tie_in_either_authoring_order() {
-        for pair in [
-            [
-                rule(PermissionDecision::Deny, "bash", None),
-                rule(PermissionDecision::Allow, "bash", None),
-            ],
-            [
-                rule(PermissionDecision::Allow, "bash", None),
-                rule(PermissionDecision::Deny, "bash", None),
-            ],
-        ] {
-            let ordered = ordered_permission_rules(pair.to_vec());
-
-            assert_eq!(ordered.last().unwrap().decision, PermissionDecision::Deny);
+            rule(PermissionDecision::Allow, "bash", Some("*")),
+        ) {
+            assert_eq!(
+                decision(&rules, "bash", "rm -rf victim"),
+                Some(PermissionDecision::Deny)
+            );
+            assert_eq!(
+                decision(&rules, "bash", "echo hi"),
+                Some(PermissionDecision::Allow)
+            );
         }
     }
 
     #[test]
-    fn two_globs_of_different_breadth_tie_and_the_deny_takes_the_tie() {
-        let ordered = ordered_permission_rules(vec![
-            rule(PermissionDecision::Deny, "bash", Some("rm*")),
-            rule(PermissionDecision::Allow, "bash", Some("*")),
-        ]);
+    fn a_nested_path_target_outranks_the_subtree_that_contains_it() {
+        for rules in both_orders(
+            rule(PermissionDecision::Deny, "write", Some("src/secret/**")),
+            rule(PermissionDecision::Allow, "write", Some("src/**")),
+        ) {
+            assert_eq!(
+                decision(&rules, "write", "src/secret/key.txt"),
+                Some(PermissionDecision::Deny)
+            );
+            assert_eq!(
+                decision(&rules, "write", "src/main.rs"),
+                Some(PermissionDecision::Allow)
+            );
+        }
+    }
 
-        assert_eq!(ordered.last().unwrap().decision, PermissionDecision::Deny);
+    /// The shape that reopened a closed tool: an explicitly spelled `*` names
+    /// exactly the calls an absent target names, so it can never outrank it.
+    #[test]
+    fn an_explicit_wildcard_target_ties_with_an_absent_one() {
+        for rules in both_orders(
+            rule(PermissionDecision::Deny, "bash", None),
+            rule(PermissionDecision::Allow, "bash", Some("*")),
+        ) {
+            assert_eq!(
+                decision(&rules, "bash", "rm -rf victim"),
+                Some(PermissionDecision::Deny)
+            );
+        }
+
+        for rules in both_orders(
+            rule(PermissionDecision::Deny, "write", None),
+            rule(PermissionDecision::Allow, "write", Some("**")),
+        ) {
+            assert_eq!(
+                decision(&rules, "write", ".env"),
+                Some(PermissionDecision::Deny)
+            );
+        }
     }
 
     #[test]
-    fn ask_outranks_allow_and_loses_to_deny_on_an_equal_tie() {
-        let ordered = ordered_permission_rules(vec![
+    fn incomparable_targets_tie_and_the_more_restrictive_decision_wins() {
+        for rules in both_orders(
+            rule(PermissionDecision::Deny, "bash", Some("*victim*")),
+            rule(PermissionDecision::Allow, "bash", Some("rm*")),
+        ) {
+            assert_eq!(
+                decision(&rules, "bash", "rm -rf victim"),
+                Some(PermissionDecision::Deny)
+            );
+        }
+    }
+
+    #[test]
+    fn ask_sits_between_allow_and_deny_on_a_tie() {
+        for rules in both_orders(
             rule(PermissionDecision::Ask, "bash", None),
             rule(PermissionDecision::Allow, "bash", None),
-        ]);
-        assert_eq!(ordered.last().unwrap().decision, PermissionDecision::Ask);
+        ) {
+            assert_eq!(
+                decision(&rules, "bash", "echo hi"),
+                Some(PermissionDecision::Ask)
+            );
+        }
 
-        let ordered = ordered_permission_rules(vec![
-            rule(PermissionDecision::Deny, "bash", None),
+        for rules in both_orders(
             rule(PermissionDecision::Ask, "bash", None),
-        ]);
-        assert_eq!(ordered.last().unwrap().decision, PermissionDecision::Deny);
+            rule(PermissionDecision::Deny, "bash", None),
+        ) {
+            assert_eq!(
+                decision(&rules, "bash", "echo hi"),
+                Some(PermissionDecision::Deny)
+            );
+        }
+    }
+
+    #[test]
+    fn a_narrower_tool_pattern_outranks_a_broader_one_on_an_equal_target() {
+        for rules in both_orders(
+            PermissionRule::global(
+                PermissionDecision::Deny,
+                PermissionPattern::Exact("native::bash".into()),
+                PermissionPattern::Any,
+            ),
+            rule(PermissionDecision::Allow, "*", None),
+        ) {
+            assert_eq!(
+                decision(&rules, "native::bash", "echo hi"),
+                Some(PermissionDecision::Deny)
+            );
+        }
     }
 
     #[test]
     fn an_untargeted_allow_cannot_reopen_a_tool_an_untargeted_deny_closed() {
-        for pair in [
-            [
-                rule(PermissionDecision::Deny, "bash", None),
-                rule(PermissionDecision::Allow, "bash", None),
-            ],
-            [
-                rule(PermissionDecision::Allow, "bash", None),
-                rule(PermissionDecision::Deny, "bash", None),
-            ],
-        ] {
-            assert!(declarations_deny_every_target(&pair, "bash"));
+        for rules in both_orders(
+            rule(PermissionDecision::Deny, "bash", None),
+            rule(PermissionDecision::Allow, "bash", None),
+        ) {
+            assert!(declarations_deny_every_target(&rules, "bash"));
+        }
+    }
+
+    /// The catalog and the policy have to answer one question: an explicit
+    /// wildcard allow that the policy ties into a denial must not leave the
+    /// tool reachable, and vice versa.
+    #[test]
+    fn omission_agrees_with_the_policy_on_an_explicit_wildcard_pairing() {
+        for rules in both_orders(
+            rule(PermissionDecision::Allow, "bash", None),
+            rule(PermissionDecision::Deny, "bash", Some("*")),
+        ) {
+            assert_eq!(
+                decision(&rules, "bash", "echo hi"),
+                Some(PermissionDecision::Deny)
+            );
+            assert!(declarations_deny_every_target(&rules, "bash"));
         }
     }
 
@@ -241,22 +326,20 @@ mod tests {
         ));
     }
 
-    /// Omission has to answer exactly what the ordering answers: a targeted
+    /// Omission has to answer exactly what precedence answers: a targeted
     /// `allow` outranks an untargeted `deny`, so the tool is still reachable
     /// for the calls that rule covers and must stay in the catalog.
     #[test]
     fn a_targeted_allow_keeps_a_tool_an_untargeted_deny_would_have_closed() {
-        for pair in [
-            [
-                rule(PermissionDecision::Deny, "bash", None),
-                rule(PermissionDecision::Allow, "bash", Some("git*")),
-            ],
-            [
-                rule(PermissionDecision::Allow, "bash", Some("git*")),
-                rule(PermissionDecision::Deny, "bash", None),
-            ],
-        ] {
-            assert!(!declarations_deny_every_target(&pair, "bash"));
+        for rules in both_orders(
+            rule(PermissionDecision::Deny, "bash", None),
+            rule(PermissionDecision::Allow, "bash", Some("git*")),
+        ) {
+            assert!(!declarations_deny_every_target(&rules, "bash"));
+            assert_eq!(
+                decision(&rules, "bash", "git status"),
+                Some(PermissionDecision::Allow)
+            );
         }
     }
 
@@ -281,6 +364,18 @@ mod tests {
                 rule(PermissionDecision::Deny, "bash", Some("rm*")),
             ],
             "bash"
+        ));
+    }
+
+    #[test]
+    fn a_path_wildcard_that_stops_at_a_separator_closes_no_tool() {
+        assert!(!declarations_deny_every_target(
+            &[rule(PermissionDecision::Deny, "write", Some("*"))],
+            "write"
+        ));
+        assert!(declarations_deny_every_target(
+            &[rule(PermissionDecision::Deny, "write", Some("**"))],
+            "write"
         ));
     }
 }

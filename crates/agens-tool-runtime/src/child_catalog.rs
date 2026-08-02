@@ -15,13 +15,13 @@
 //! tool has to be present for the narrower rule to have anything to act on.
 //!
 //! Omission is not decided here. `agens_core::declarations_deny_every_target`
-//! derives it from the same ordering that resolves the retained rules, so the
-//! two enforcement mechanisms answer one question rather than two similar
-//! ones and cannot disagree about a declaration set.
+//! asks the precedence owner what it would decide for each region the rules
+//! carve out, so the two enforcement mechanisms answer one question rather
+//! than two similar ones.
 
 use agens_core::{
-    PermissionDecision, PermissionPattern, PermissionRule, SafetyPredicate,
-    declarations_deny_every_target, ordered_permission_rules, permission_target_kind_for_tool,
+    ConfiguredFloor, PermissionDecision, PermissionPattern, PermissionRule,
+    declarations_deny_every_target, permission_target_kind_for_tool,
 };
 use agens_tools::{NativeToolCatalog, NativeToolMetadata, TaskDeclarationRejection};
 
@@ -69,7 +69,7 @@ const AUTO_ALLOW_NATIVE_TOOLS: [&str; 6] = [
 pub struct ChildToolSurface {
     pub tools: Vec<NativeToolMetadata>,
     pub rules: Vec<PermissionRule>,
-    pub safety_predicates: Vec<SafetyPredicate>,
+    pub configured_floor: ConfiguredFloor,
 }
 
 /// Resolves the surface a delegated child runs under from the parent's own
@@ -84,10 +84,12 @@ pub struct ChildToolSurface {
 /// Where that resolution nets to a denial it is enforced three ways — the tool
 /// leaves the catalog when no call to it could survive, a declaration that
 /// would reopen such a tool is a hard error, and the whole configured set is
-/// carried as a [`SafetyPredicate::ConfiguredDenial`] so no declaration can
-/// outrank it on the child's own policy. The primary path holds the same
-/// predicate over the same rules, which is what keeps the two from answering
-/// a configured deny differently.
+/// carried as a [`ConfiguredFloor`] so no declaration can outrank it on the
+/// child's own policy. The floor also carries a configured `ask` through, which
+/// a child resolves to a denial stating the prompt was unreachable. The primary
+/// path holds the same floor over the same rules, which is what keeps the two
+/// from answering a configured rule differently; the one deliberate difference
+/// is that a configured `allow` authorizes there and not here.
 pub fn resolve_child_surface(
     parent_rules: &[PermissionRule],
     declarations: &[PermissionRule],
@@ -150,14 +152,10 @@ pub fn resolve_child_surface(
         .collect::<Vec<_>>();
     rules.extend(normalized_declarations);
 
-    let safety_predicates = vec![SafetyPredicate::ConfiguredDenial(ordered_permission_rules(
-        parent_rules,
-    ))];
-
     Ok(ChildToolSurface {
         tools,
-        rules: ordered_permission_rules(rules),
-        safety_predicates,
+        rules,
+        configured_floor: ConfiguredFloor::restricting(parent_rules),
     })
 }
 
@@ -249,6 +247,9 @@ fn declaration_tool_label(pattern: &PermissionPattern) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agens_core::{
+        PermissionMode, PermissionPolicy, PermissionRequest, PermissionSession, ToolAccess,
+    };
 
     fn rule(decision: PermissionDecision, tool: &str) -> PermissionRule {
         PermissionRule::global(
@@ -360,27 +361,28 @@ mod tests {
         }
     }
 
+    /// The read-class tools carry a derived `allow`, which a declaration has to
+    /// be able to narrow. Precedence decides that, not the position the two
+    /// rules end up in.
     #[test]
-    fn declared_rules_are_appended_after_the_derived_allow_rules() {
-        let surface =
-            resolve_child_surface(&[], &[rule(PermissionDecision::Deny, "read")]).unwrap();
+    fn a_declared_narrowing_outranks_the_derived_allow_for_a_read_class_tool() {
+        let declared = PermissionRule::global(
+            PermissionDecision::Deny,
+            PermissionPattern::glob("read").unwrap(),
+            PermissionPattern::glob(".env*").unwrap(),
+        );
+        let surface = resolve_child_surface(&[], &[declared]).unwrap();
+        let policy = PermissionPolicy::new(PermissionMode::Edit, surface.rules);
+        let decision = |target| {
+            policy.evaluate(
+                &PermissionRequest::new("project", "native::read", target, ToolAccess::ReadOnly),
+                &[],
+                &PermissionSession::new(),
+            )
+        };
 
-        let allow_read_index = surface
-            .rules
-            .iter()
-            .position(|rule| {
-                rule.decision == PermissionDecision::Allow && rule.tool.matches("native::read")
-            })
-            .expect("derived allow rule for read must exist");
-        let deny_read_index = surface
-            .rules
-            .iter()
-            .position(|rule| {
-                rule.decision == PermissionDecision::Deny && rule.tool.matches("native::read")
-            })
-            .expect("declared deny rule for read must exist");
-
-        assert!(allow_read_index < deny_read_index);
+        assert_eq!(decision(".env"), PermissionDecision::Deny);
+        assert_eq!(decision("notes.md"), PermissionDecision::Allow);
     }
 
     fn parent_deny(tool: &str, target: Option<&str>) -> PermissionRule {
@@ -431,7 +433,7 @@ mod tests {
     /// enforced above the declarations rather than beside them — a declared
     /// `allow bash` would otherwise outrank it on the child's own policy.
     #[test]
-    fn a_targeted_configured_deny_becomes_a_child_safety_predicate() {
+    fn a_targeted_configured_deny_outranks_a_declared_allow_in_the_child() {
         let surface = resolve_child_surface(
             &[parent_deny("bash", Some("rm*"))],
             &[rule(PermissionDecision::Allow, "bash")],
@@ -439,16 +441,53 @@ mod tests {
         .expect("a targeted configured deny must not reject the delegation");
 
         assert!(tool_names(&surface).contains(&"native::bash".to_owned()));
-        assert!(
-            surface.safety_predicates.iter().any(|predicate| matches!(
-                predicate,
-                SafetyPredicate::ConfiguredDenial(rules)
-                    if rules.iter().any(|rule| rule.decision == PermissionDecision::Deny
-                        && rule.tool.matches("native::bash")
-                        && rule.target.matches("rm -rf /tmp/x"))
-            )),
-            "the configured deny must survive as a hard safety predicate"
+        assert_eq!(
+            child_decision(&surface, "rm -rf /tmp/x"),
+            PermissionDecision::Deny
         );
+        assert_eq!(
+            child_decision(&surface, "echo hi"),
+            PermissionDecision::Allow
+        );
+    }
+
+    /// A configured `ask` is not a denial, so it never omits a tool — it has to
+    /// reach the child as a decision, where the unreachable prompt is what
+    /// turns it into a refusal.
+    #[test]
+    fn a_configured_ask_survives_a_declared_allow_in_the_child() {
+        let ask = PermissionRule::global(
+            PermissionDecision::Ask,
+            PermissionPattern::Exact("native::bash".into()),
+            PermissionPattern::glob_for_target_kind(
+                "git push*",
+                permission_target_kind_for_tool("bash"),
+            )
+            .unwrap(),
+        );
+        let surface = resolve_child_surface(&[ask], &[rule(PermissionDecision::Allow, "bash")])
+            .expect("a configured ask must not reject the delegation");
+
+        assert!(tool_names(&surface).contains(&"native::bash".to_owned()));
+        assert_eq!(
+            child_decision(&surface, "git push origin main"),
+            PermissionDecision::Ask
+        );
+        assert_eq!(
+            child_decision(&surface, "echo hi"),
+            PermissionDecision::Allow
+        );
+    }
+
+    /// Resolves a `bash` call the way a delegated child does, floor included.
+    fn child_decision(surface: &ChildToolSurface, command: &str) -> PermissionDecision {
+        PermissionPolicy::new(PermissionMode::Edit, surface.rules.clone())
+            .with_configured_floor(surface.configured_floor.clone())
+            .evaluate(
+                &PermissionRequest::new("project", "native::bash", command, ToolAccess::Write),
+                &[],
+                &PermissionSession::new(),
+            )
     }
 
     /// The configured rules resolve against each other before any declaration
