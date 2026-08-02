@@ -9,8 +9,9 @@ use std::sync::{Arc, Mutex};
 use agens_core::{
     HeadlessPermissionResolver, HeadlessToolCall, HeadlessTurnCancellation, HeadlessTurnError,
     HeadlessTurnPortError, Message, MessagePart, PermissionDecision, PermissionMode,
-    PermissionPattern, PermissionPolicy, PermissionRule, PermissionSession, Role, TurnEvent,
-    TurnProgressSink, TurnProvider, run_isolated_headless_turn_with_max_iterations_and_progress,
+    PermissionPattern, PermissionPolicy, PermissionRule, PermissionSession, Role, SafetyPredicate,
+    TurnEvent, TurnProgressSink, TurnProvider, ordered_permission_rules,
+    run_isolated_headless_turn_with_max_iterations_and_progress,
 };
 use agens_providers::{
     ChatGptResponsesProvider, MoonshotProvider, OpenAiResponsesProvider, ProgressAwareProvider,
@@ -25,11 +26,16 @@ use crate::block_on_headless_turn;
 use crate::child_catalog::resolve_child_surface;
 use crate::runtime::production_child_tool_runtime;
 use agens_bootstrap::Bootstrap;
+use agens_bootstrap::session_config::SessionConfig;
+use agens_bootstrap::session_root::SessionRoot;
 use agens_core::DiscardCompletedTurnRepository;
 use agens_core::SubagentErrorKind;
-use agens_diagnostics::diagnostic_store;
+use agens_diagnostics::{diagnostic_store, record_subagent_surface_rejection};
 use agens_dispatch::ProductionToolDispatcher;
-use agens_permissions::{ProductionPermissionGate, SharedToolDispatcher};
+use agens_error::CliError;
+use agens_permissions::{
+    ProductionPermissionGate, SharedToolDispatcher, configured_permission_rules,
+};
 
 #[derive(Clone, Copy)]
 pub enum ChildRunError {
@@ -122,6 +128,28 @@ fn child_run_error(error: HeadlessTurnError) -> ChildRunError {
     }
 }
 
+/// Reads the parent's own configured `[permissions]` rules for `project_root`.
+///
+/// Resolved through [`SessionConfig`] rather than from the process-captured
+/// bootstrap value, so a delegation is bounded by the configuration of the
+/// root it actually runs in. The tool pattern keeps its qualified name because
+/// the child's dispatcher does not exist yet; the child's own policy resolves
+/// names to identities when it evaluates.
+fn parent_configured_rules(
+    bootstrap: &Bootstrap,
+    project_root: &Path,
+) -> Result<Vec<PermissionRule>, CliError> {
+    let session_config = SessionConfig::resolve(
+        &SessionRoot::confined_to(project_root.to_path_buf()),
+        bootstrap,
+    )?;
+    configured_permission_rules(
+        session_config.permission_rules(),
+        &project_root.display().to_string(),
+        |configured| Ok(PermissionPattern::Exact(configured.to_owned())),
+    )
+}
+
 pub struct ProductionTaskExecutionContext<'a> {
     pub bootstrap: &'a Bootstrap,
     pub project_root: &'a Path,
@@ -157,8 +185,15 @@ pub fn run_production_task(
             parts: vec![MessagePart::Text(request.description().to_owned())],
         },
     ];
+    let parent_rules = parent_configured_rules(bootstrap, project_root).map_err(|error| {
+        record_subagent_surface_rejection(bootstrap, diagnostic_reference, &error.message);
+        ChildRunError::Runtime
+    })?;
     let surface =
-        resolve_child_surface(request.permission_rules()).map_err(|_| ChildRunError::Runtime)?;
+        resolve_child_surface(&parent_rules, request.permission_rules()).map_err(|error| {
+            record_subagent_surface_rejection(bootstrap, diagnostic_reference, &error.message);
+            ChildRunError::Runtime
+        })?;
     let (provider_tools, tool_runtime) = production_child_tool_runtime(
         project_root,
         bootstrap.tool_limits(),
@@ -207,7 +242,7 @@ pub fn run_production_task(
                     dangerous_mode,
                     cancellation,
                     progress,
-                    surface_rules: &surface.rules,
+                    surface: &surface,
                     mailbox: TaskMailboxContext {
                         registry: task_registry.clone(),
                         target: TaskMessageTarget::Execution(execution_id),
@@ -242,7 +277,7 @@ pub fn run_production_task(
                     dangerous_mode,
                     cancellation,
                     progress,
-                    surface_rules: &surface.rules,
+                    surface: &surface,
                     mailbox: TaskMailboxContext {
                         registry: task_registry.clone(),
                         target: TaskMessageTarget::Execution(execution_id),
@@ -278,7 +313,7 @@ pub fn run_production_task(
                     dangerous_mode,
                     cancellation,
                     progress,
-                    surface_rules: &surface.rules,
+                    surface: &surface,
                     mailbox: TaskMailboxContext {
                         registry: task_registry.clone(),
                         target: TaskMessageTarget::Execution(execution_id),
@@ -382,7 +417,7 @@ struct IsolatedTaskTurnContext<'a> {
     dangerous_mode: bool,
     cancellation: &'a HeadlessTurnCancellation,
     progress: Option<&'a TurnProgressSink>,
-    surface_rules: &'a [PermissionRule],
+    surface: &'a crate::child_catalog::ChildToolSurface,
     mailbox: TaskMailboxContext,
 }
 
@@ -405,12 +440,12 @@ where
         dangerous_mode,
         cancellation,
         progress,
-        surface_rules,
+        surface,
         mailbox,
     } = context;
     let max_iterations = configured_task_max_iterations(&mailbox.registry);
     let mut provider = TaskMailboxProvider::new(provider, Some(mailbox.registry), mailbox.target);
-    let mut rules = surface_rules.to_vec();
+    let mut rules = surface.rules.clone();
     rules.extend(
         ["native::task_control", "native::task_message"]
             .into_iter()
@@ -422,7 +457,13 @@ where
                 )
             }),
     );
-    let policy = PermissionPolicy::new(PermissionMode::Edit, rules);
+    let mut safety_predicates = vec![SafetyPredicate::WorktreeEscape, SafetyPredicate::ChatWrite];
+    safety_predicates.extend(surface.safety_predicates.iter().cloned());
+    let policy = PermissionPolicy::with_safety_predicates(
+        PermissionMode::Edit,
+        ordered_permission_rules(rules),
+        safety_predicates,
+    );
     let grants = Arc::new(Mutex::new(Vec::new()));
     let session = PermissionSession::new();
     let pending = Arc::new(Mutex::new(BTreeMap::new()));
@@ -562,9 +603,7 @@ mod tests {
                 dangerous_mode: false,
                 cancellation: &HeadlessTurnCancellation::new(),
                 progress: None,
-                surface_rules: &crate::child_catalog::resolve_child_surface(&[])
-                    .unwrap()
-                    .rules,
+                surface: &crate::child_catalog::resolve_child_surface(&[], &[]).unwrap(),
                 mailbox: TaskMailboxContext {
                     registry,
                     target: TaskMessageTarget::Main,
@@ -703,9 +742,7 @@ mod tests {
                 dangerous_mode: false,
                 cancellation: &HeadlessTurnCancellation::new(),
                 progress: None,
-                surface_rules: &crate::child_catalog::resolve_child_surface(&[])
-                    .unwrap()
-                    .rules,
+                surface: &crate::child_catalog::resolve_child_surface(&[], &[]).unwrap(),
                 mailbox: TaskMailboxContext {
                     registry,
                     target: TaskMessageTarget::Main,
@@ -780,11 +817,13 @@ mod tests {
     fn single_call_turn(
         project_root: &Path,
         declarations: &[PermissionRule],
+        parent_rules: &[PermissionRule],
         dangerous_mode: bool,
         tool_name: &str,
         input: &str,
     ) -> String {
-        let surface = crate::child_catalog::resolve_child_surface(declarations).unwrap();
+        let surface =
+            crate::child_catalog::resolve_child_surface(parent_rules, declarations).unwrap();
         let registry = TaskExecutionRegistry::with_limits(agens_tools::TaskExecutionLimits {
             max_iterations: 3,
             max_concurrency: 1,
@@ -814,7 +853,7 @@ mod tests {
                 dangerous_mode,
                 cancellation: &HeadlessTurnCancellation::new(),
                 progress: None,
-                surface_rules: &surface.rules,
+                surface: &surface,
                 mailbox: TaskMailboxContext {
                     registry,
                     target: TaskMessageTarget::Main,
@@ -833,6 +872,7 @@ mod tests {
 
         let output = single_call_turn(
             &project_root,
+            &[],
             &[],
             false,
             "native::grep",
@@ -880,6 +920,7 @@ mod tests {
             let output = single_call_turn(
                 &project_root,
                 &read_only_rules,
+                &[],
                 dangerous_mode,
                 "native::write",
                 r#"{"path":"denied.txt","content":"x"}"#,
@@ -907,6 +948,7 @@ mod tests {
                 PermissionPattern::glob("bash").unwrap(),
                 PermissionPattern::Any,
             )],
+            &[],
             false,
             "native::bash",
             r#"{"command":"echo should-never-run > ask-marker.txt"}"#,
@@ -945,6 +987,7 @@ mod tests {
                     PermissionPattern::Any,
                 ),
             ],
+            &[],
             false,
             "native::write",
             r#"{"path":"granted.txt","content":"hello from a declared allow"}"#,
@@ -974,6 +1017,7 @@ mod tests {
                 PermissionPattern::glob("bash").unwrap(),
                 PermissionPattern::Any,
             )],
+            &[],
             false,
             "native::bash",
             r#"{"command":"echo marker > bash-marker.txt"}"#,
@@ -1015,6 +1059,7 @@ mod tests {
             let denied_output = single_call_turn(
                 &project_root,
                 &declarations,
+                &[],
                 dangerous_mode,
                 "native::bash",
                 r#"{"command":"rm -rf /tmp/should-never-run"}"#,
@@ -1029,6 +1074,7 @@ mod tests {
             let allowed_output = single_call_turn(
                 &project_root,
                 &declarations,
+                &[],
                 dangerous_mode,
                 "native::bash",
                 r#"{"command":"echo marker > survives.txt"}"#,
@@ -1064,13 +1110,17 @@ mod tests {
 
         let temporary = agens_fixtures::session_directory("targeted-wildcard-bash-deny-slash");
         let project_root = temporary.join("project");
+        let victim = project_root.join("nested").join("probe-victim.txt");
+        std::fs::create_dir_all(victim.parent().unwrap()).unwrap();
+        std::fs::write(&victim, "victim").unwrap();
 
         let denied_output = single_call_turn(
             &project_root,
             &declarations,
+            &[],
             false,
             "native::bash",
-            r#"{"command":"rm -rf /tmp/probe-victim-with-slash.txt"}"#,
+            &format!(r#"{{"command":"rm -rf {}"}}"#, victim.display()),
         );
 
         assert!(
@@ -1079,8 +1129,8 @@ mod tests {
              containing a slash, not just a slash-free one, got: {denied_output}"
         );
         assert!(
-            !std::path::Path::new("/tmp/probe-victim-with-slash.txt").exists(),
-            "the denied command must never have run"
+            victim.exists(),
+            "the denied command must never have run, yet the victim file is gone"
         );
 
         std::fs::remove_dir_all(temporary).unwrap();
@@ -1103,10 +1153,14 @@ mod tests {
 
         let temporary = agens_fixtures::session_directory("targeted-wildcard-bash-deny");
         let project_root = temporary.join("project");
+        let victim = project_root.join("probe-victim.txt");
+        std::fs::create_dir_all(&project_root).unwrap();
+        std::fs::write(&victim, "victim").unwrap();
 
         let denied_output = single_call_turn(
             &project_root,
             &declarations,
+            &[],
             false,
             "native::bash",
             r#"{"command":"rm -rf probe-victim.txt"}"#,
@@ -1118,8 +1172,8 @@ mod tests {
              command, got: {denied_output}"
         );
         assert!(
-            !project_root.join("probe-victim.txt").exists(),
-            "the denied command must never have run"
+            victim.exists(),
+            "the denied command must never have run, yet the victim file is gone"
         );
 
         std::fs::remove_dir_all(temporary).unwrap();
@@ -1145,6 +1199,7 @@ mod tests {
         let denied_output = single_call_turn(
             &project_root,
             &declarations,
+            &[],
             false,
             "native::write",
             r#"{"path":".env","content":"SECRET=1"}"#,
@@ -1158,6 +1213,7 @@ mod tests {
         let allowed_output = single_call_turn(
             &project_root,
             &declarations,
+            &[],
             false,
             "native::write",
             r#"{"path":"notes.md","content":"fine"}"#,
@@ -1174,6 +1230,79 @@ mod tests {
         std::fs::remove_dir_all(temporary).unwrap();
     }
 
+    /// A project-supplied definition can declare `allow bash`, so the parent's
+    /// own configured deny has to outrank it. Enforced as a hard safety
+    /// predicate rather than as a policy rule, because a declaration would
+    /// otherwise be the more specific match and win.
+    #[test]
+    fn a_configured_deny_outranks_a_declared_allow_inside_the_child() {
+        let temporary = agens_fixtures::session_directory("configured-deny-outranks");
+        let project_root = temporary.join("project");
+        let victim = project_root.join("probe-victim.txt");
+        std::fs::create_dir_all(&project_root).unwrap();
+        std::fs::write(&victim, "victim").unwrap();
+
+        let denied_output = single_call_turn(
+            &project_root,
+            &[PermissionRule::global(
+                PermissionDecision::Allow,
+                PermissionPattern::glob("bash").unwrap(),
+                PermissionPattern::Any,
+            )],
+            &[PermissionRule::global(
+                PermissionDecision::Deny,
+                PermissionPattern::Exact("native::bash".into()),
+                PermissionPattern::glob_for_target_kind(
+                    "rm*",
+                    agens_core::PermissionTargetKind::FreeFormText,
+                )
+                .unwrap(),
+            )],
+            false,
+            "native::bash",
+            r#"{"command":"rm -rf probe-victim.txt"}"#,
+        );
+
+        assert!(
+            denied_output.contains("permission denied"),
+            "a configured deny must survive a declared allow, got: {denied_output}"
+        );
+        assert!(
+            victim.exists(),
+            "the denied command must never have run, yet the victim file is gone"
+        );
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn a_configured_deny_removes_a_declared_tool_from_the_child_entirely() {
+        let temporary = agens_fixtures::session_directory("configured-deny-omits");
+        let project_root = temporary.join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+
+        let output = single_call_turn(
+            &project_root,
+            &[],
+            &[PermissionRule::global(
+                PermissionDecision::Deny,
+                PermissionPattern::Exact("native::write".into()),
+                PermissionPattern::Any,
+            )],
+            true,
+            "native::write",
+            r#"{"path":"notes.md","content":"nope"}"#,
+        );
+
+        assert!(
+            output.contains("permission denied"),
+            "a configured deny must reach the child even under dangerous mode, got: {output}"
+        );
+        assert!(!project_root.join("notes.md").exists());
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
     #[test]
     fn a_granted_bash_call_can_still_reach_outside_the_project_root() {
         let temporary = agens_fixtures::session_directory("bash-unconfined");
@@ -1186,6 +1315,7 @@ mod tests {
                 PermissionPattern::glob("bash").unwrap(),
                 PermissionPattern::Any,
             )],
+            &[],
             false,
             "native::bash",
             r#"{"command":"echo escaped > ../outside-marker.txt"}"#,
@@ -1216,7 +1346,7 @@ mod tests {
             .agent("explore")
             .expect("explore is a built-in agent");
 
-        let surface = resolve_child_surface(&explore.permission_rules).unwrap();
+        let surface = resolve_child_surface(&[], &explore.permission_rules).unwrap();
         let tool_names = surface
             .tools
             .iter()

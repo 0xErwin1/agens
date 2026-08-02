@@ -34,7 +34,7 @@ use agens_core::{
     FactPath, HeadlessPermissionGate, HeadlessPermissionResolver, HeadlessToolCall,
     HeadlessTurnCancellation, HeadlessTurnPortError, PermissionDecision, PermissionMode,
     PermissionPattern, PermissionPolicy, PermissionRule, PermissionSession, ToolInput, ToolOutcome,
-    ToolResultFacts, permission_target_kind_for_tool,
+    ToolResultFacts, ordered_permission_rules, permission_target_kind_for_tool,
 };
 use agens_store::PermissionGrantStore;
 use agens_tools::{
@@ -537,7 +537,35 @@ pub fn permission_policy(
     dispatcher: &SharedToolDispatcher,
     effective_capabilities: Option<&EffectiveCapabilitySet>,
 ) -> Result<PermissionPolicy, CliError> {
-    let mut rules = rules
+    let mut rules = configured_permission_rules(rules, project, |configured| {
+        dispatcher
+            .lock()
+            .map_err(|_| CliError::configuration("tool catalog is invalid"))?
+            .canonical_identity(configured)
+            .map(|identity| PermissionPattern::Exact(identity.as_str().to_owned()))
+            .ok_or_else(|| CliError::configuration("permission configuration is invalid"))
+    })?;
+    if let Some(capabilities) = effective_capabilities {
+        rules.extend(capabilities.permission_rules());
+    }
+    Ok(PermissionPolicy::new(mode, ordered_permission_rules(rules)))
+}
+
+/// Converts configured `[permissions]` entries into policy rules, resolving
+/// each entry's tool name through `resolve_tool`.
+///
+/// The mapping from a configured name to a tool (`edit` meaning the same tool
+/// as `write`) and the target's `/`-crossing kind live here alone, so a
+/// delegated child derives the parent's configured rules exactly as the parent
+/// itself does. Only the tool pattern differs between callers: the primary
+/// path resolves it to a live dispatcher identity, while a caller building a
+/// child surface has no dispatcher yet and keeps the qualified name.
+pub fn configured_permission_rules(
+    rules: &[ConfigPermissionRule],
+    project: &str,
+    resolve_tool: impl Fn(&str) -> Result<PermissionPattern, CliError>,
+) -> Result<Vec<PermissionRule>, CliError> {
+    rules
         .iter()
         .map(|rule| {
             let decision = match rule.decision {
@@ -546,12 +574,7 @@ pub fn permission_policy(
                 ConfigPermissionDecision::Ask => PermissionDecision::Ask,
             };
             let configured = configured_tool_name(&rule.tool_pattern)?;
-            let tool = dispatcher
-                .lock()
-                .map_err(|_| CliError::configuration("tool catalog is invalid"))?
-                .canonical_identity(&configured)
-                .map(|identity| PermissionPattern::Exact(identity.as_str().to_owned()))
-                .ok_or_else(|| CliError::configuration("permission configuration is invalid"))?;
+            let tool = resolve_tool(&configured)?;
             let target = match &rule.target_pattern {
                 Some(pattern) => PermissionPattern::glob_for_target_kind(
                     pattern.clone(),
@@ -567,11 +590,7 @@ pub fn permission_policy(
                 }
             })
         })
-        .collect::<Result<Vec<_>, CliError>>()?;
-    if let Some(capabilities) = effective_capabilities {
-        rules.extend(capabilities.permission_rules());
-    }
-    Ok(PermissionPolicy::new(mode, rules))
+        .collect()
 }
 
 fn configured_tool_name(name: &str) -> Result<String, CliError> {

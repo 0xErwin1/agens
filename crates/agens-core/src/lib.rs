@@ -11,9 +11,11 @@ use std::{
 
 use globset::{GlobBuilder, GlobMatcher};
 
+mod permission_precedence;
 pub mod redaction;
 mod request_config;
 
+pub use permission_precedence::{declarations_deny_every_target, ordered_permission_rules};
 pub use request_config::{ReasoningEffort, RequestConfig, RequestConfigError};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2167,8 +2169,8 @@ pub enum PermissionTargetKind {
 /// Classifies a native tool's permission target by name, matching either the
 /// bare form (`bash`) or the fully-qualified native identity (`native::bash`).
 /// A tool this function does not recognize as free-form text defaults to
-/// [`PermissionTargetKind::Path`], preserving today's segment-discipline
-/// matching for every target this change does not touch.
+/// [`PermissionTargetKind::Path`], keeping segment-discipline matching for
+/// every target whose shape is not known to be free-form.
 pub fn permission_target_kind_for_tool(tool: &str) -> PermissionTargetKind {
     match tool.strip_prefix("native::").unwrap_or(tool) {
         "bash" | "git_read" => PermissionTargetKind::FreeFormText,

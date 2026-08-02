@@ -17,12 +17,13 @@ use agens_core::{
 };
 use agens_tools::{
     AgentCatalog, AgentModelValidationError, AgentModelValidator, CommandCatalog,
-    CommandDefinition, DispatchTool, EffectiveCapabilitySet, SkillCatalog, TaskControlAction,
-    TaskControlTool, TaskExecutionEvent, TaskExecutionId, TaskExecutionLifecycle,
-    TaskExecutionRegistry, TaskInvocation, TaskLaunchMode, TaskMessageSource, TaskMessageTarget,
-    TaskMessageTool, TaskModelResolutionError, TaskRunContext, TaskRunner, TaskRunnerError,
-    TaskSkill, TaskTerminalState, TaskTool, TaskTurnRequest, TaskTurnResult, ToolDispatchRequest,
-    ToolDispatcher, ToolEvaluationOutcome, ToolExecutionContext, ToolOutput,
+    CommandDefinition, DispatchTool, EffectiveCapabilityDescriptor, EffectiveCapabilitySet,
+    SkillCatalog, TaskControlAction, TaskControlTool, TaskExecutionEvent, TaskExecutionId,
+    TaskExecutionLifecycle, TaskExecutionRegistry, TaskInvocation, TaskLaunchMode,
+    TaskMessageSource, TaskMessageTarget, TaskMessageTool, TaskModelResolutionError,
+    TaskRunContext, TaskRunner, TaskRunnerError, TaskSkill, TaskTerminalState, TaskTool,
+    TaskTurnRequest, TaskTurnResult, ToolDispatchRequest, ToolDispatcher, ToolEvaluationOutcome,
+    ToolExecutionContext, ToolOutput,
     markdown::{self, FrontmatterValue, MarkdownRoot},
 };
 use serde_json::Value;
@@ -1851,8 +1852,63 @@ fn a_partial_wildcard_tool_pattern_still_produces_a_descriptor_on_the_parent_pat
     assert_eq!(set.descriptors()[0].decision(), PermissionDecision::Deny);
 }
 
+/// A `deny` or `ask` naming a tool the dispatcher does not hold must survive
+/// resolution, symmetrically with the delegated-child surface. The same
+/// `permission_rules` are shared by both paths, so a rule naming an MCP tool
+/// absent from one of them has to keep meaning the same thing on the other.
 #[test]
-fn capability_descriptors_are_ordered_independently_of_rule_insertion() {
+fn a_deny_naming_a_tool_the_dispatcher_lacks_is_retained_rather_than_dropped() {
+    let mut dispatcher = ToolDispatcher::new();
+    dispatcher
+        .register_native("native::files_read", ToolAccess::ReadOnly, InertTool)
+        .unwrap();
+
+    for decision in [PermissionDecision::Deny, PermissionDecision::Ask] {
+        let set = EffectiveCapabilitySet::from_agent(
+            &agent_with_rules(vec![PermissionRule::global(
+                decision,
+                PermissionPattern::glob("mcp::github::create_*").unwrap(),
+                PermissionPattern::Any,
+            )]),
+            "project",
+            &dispatcher,
+        );
+
+        assert_eq!(set.descriptors().len(), 1, "{decision:?} must be retained");
+        let rules = set.permission_rules();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].decision, decision);
+        assert!(rules[0].tool.matches("mcp::github::create_issue"));
+        assert!(!rules[0].tool.matches("native:10:files_read"));
+    }
+}
+
+/// An `allow` for a tool the dispatcher does not hold grants nothing, so it is
+/// dropped rather than retained — the one asymmetry with a `deny`, and the
+/// direction that can never widen anything.
+#[test]
+fn an_allow_naming_a_tool_the_dispatcher_lacks_is_dropped() {
+    let dispatcher = ToolDispatcher::new();
+    let set = EffectiveCapabilitySet::from_agent(
+        &agent_with_rules(vec![PermissionRule::global(
+            PermissionDecision::Allow,
+            PermissionPattern::glob("mcp::github::create_*").unwrap(),
+            PermissionPattern::Any,
+        )]),
+        "project",
+        &dispatcher,
+    );
+
+    assert!(set.descriptors().is_empty());
+}
+
+/// Descriptor order is authoring order, deliberately: `permission_rules`
+/// hands the sequence to `ordered_permission_rules`, which breaks a tie
+/// between two equally specific declarations by taking the later one. A set
+/// ordered by selector instead would answer differently from the delegated
+/// child's surface for the same definition.
+#[test]
+fn capability_descriptors_follow_declaration_order() {
     let mut dispatcher = ToolDispatcher::new();
     dispatcher
         .register_native("native::files_read", ToolAccess::ReadOnly, InertTool)
@@ -1888,8 +1944,34 @@ fn capability_descriptors_are_ordered_independently_of_rule_insertion() {
         &dispatcher,
     );
 
-    assert_eq!(forward.descriptors(), reverse.descriptors());
     assert_eq!(forward.descriptors().len(), 3);
+    assert_eq!(reverse.descriptors().len(), 3);
+    assert_eq!(
+        forward
+            .descriptors()
+            .iter()
+            .map(EffectiveCapabilityDescriptor::decision)
+            .collect::<Vec<_>>(),
+        vec![
+            PermissionDecision::Allow,
+            PermissionDecision::Deny,
+            PermissionDecision::Ask,
+        ]
+    );
+    assert_eq!(
+        reverse
+            .descriptors()
+            .iter()
+            .map(EffectiveCapabilityDescriptor::decision)
+            .collect::<Vec<_>>(),
+        vec![
+            PermissionDecision::Ask,
+            PermissionDecision::Deny,
+            PermissionDecision::Allow,
+        ]
+    );
+    assert!(!forward.is_expansion_from(&reverse));
+    assert!(!reverse.is_expansion_from(&forward));
 }
 
 #[test]

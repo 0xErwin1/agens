@@ -2,19 +2,23 @@
 //! `permission_rules`.
 //!
 //! The child's catalog is a filter over the parent's native tools, never a
-//! union: a declaration can only narrow what the child inherits, and any
-//! declaration naming a tool the parent does not hold is a hard error rather
-//! than a silent clamp.
+//! union: a declaration can only narrow what the child inherits, and an
+//! `allow` naming a tool the parent does not hold is a hard error rather than
+//! a silent clamp. A `deny` or `ask` naming an unheld tool exceeds nothing, so
+//! it is retained inert instead — see [`normalize_declared_tool`].
 //!
-//! An untargeted `deny` (no target pattern, `PermissionPattern::Any`) omits
-//! its tool from the catalog entirely. A target-scoped `deny` (for example
-//! `deny bash rm*`) leaves the tool in the catalog and relies on the
-//! retained policy rule to deny the matching calls at evaluation time — the
-//! tool has to still be present for that narrower rule to have anything to
-//! act on.
+//! Declarations that deny a tool for every target omit it from the catalog
+//! entirely. A target-scoped `deny` (for example `deny bash rm*`) leaves the
+//! tool in the catalog and relies on the retained policy rule to deny the
+//! matching calls at evaluation time — the tool has to still be present for
+//! that narrower rule to have anything to act on. Which of the two applies is
+//! decided by `agens_core::declarations_deny_every_target`, the same owner
+//! that orders the retained rules, so catalog omission and policy evaluation
+//! can never disagree about a declaration set.
 
 use agens_core::{
-    PermissionDecision, PermissionPattern, PermissionRule, permission_target_kind_for_tool,
+    GlobalDenyPredicate, PermissionDecision, PermissionPattern, PermissionRule, SafetyPredicate,
+    declarations_deny_every_target, ordered_permission_rules, permission_target_kind_for_tool,
 };
 use agens_error::CliError;
 use agens_tools::{NativeToolCatalog, NativeToolMetadata};
@@ -37,21 +41,52 @@ const AUTO_ALLOW_NATIVE_TOOLS: [&str; 6] = [
 pub struct ChildToolSurface {
     pub tools: Vec<NativeToolMetadata>,
     pub rules: Vec<PermissionRule>,
+    pub safety_predicates: Vec<SafetyPredicate>,
 }
 
+/// Resolves the surface a delegated child runs under from the parent's own
+/// configured `[permissions]` rules and the agent definition's declarations.
+///
+/// `parent_rules` bound the result and are never a source of authority: only a
+/// declaration can authorize a child tool, so a configured `allow` grants the
+/// child nothing on its own. A configured `deny`, in contrast, is enforced
+/// three ways — the tool leaves the catalog when the deny covers every target,
+/// a declaration that would reopen it is a hard error, and the deny is
+/// re-emitted as a hard safety predicate so no declaration can outrank it on
+/// the child's own policy.
 pub fn resolve_child_surface(
+    parent_rules: &[PermissionRule],
     declarations: &[PermissionRule],
 ) -> Result<ChildToolSurface, CliError> {
     let metadata = NativeToolCatalog::metadata();
 
+    let parent_denials = parent_rules
+        .iter()
+        .filter(|rule| rule.decision == PermissionDecision::Deny)
+        .cloned()
+        .flat_map(|rule| normalize_declared_tool(rule, &metadata))
+        .collect::<Vec<_>>();
+
     for declaration in declarations {
+        if declaration.decision != PermissionDecision::Allow {
+            continue;
+        }
         if !metadata
             .iter()
             .any(|entry| declaration_names_tool(declaration, entry))
         {
             return Err(CliError::configuration(format!(
-                "permission declaration names a tool the parent does not hold: {}",
+                "permission declaration grants a tool the parent does not hold: {}",
                 declaration_tool_label(&declaration.tool)
+            )));
+        }
+        if let Some(entry) = metadata.iter().find(|entry| {
+            declaration_names_tool(declaration, entry)
+                && declarations_deny_every_target(&parent_denials, &entry.qualified_name)
+        }) {
+            return Err(CliError::configuration(format!(
+                "permission declaration grants a tool the configuration denies: {}",
+                entry.qualified_name
             )));
         }
     }
@@ -65,11 +100,8 @@ pub fn resolve_child_surface(
     let tools = metadata
         .into_iter()
         .filter(|entry| {
-            !declarations.iter().any(|declaration| {
-                declaration.decision == PermissionDecision::Deny
-                    && declaration.target == PermissionPattern::Any
-                    && declaration_names_tool(declaration, entry)
-            })
+            !declarations_deny_every_target(&normalized_declarations, &entry.qualified_name)
+                && !declarations_deny_every_target(&parent_denials, &entry.qualified_name)
         })
         .collect::<Vec<_>>();
 
@@ -85,7 +117,21 @@ pub fn resolve_child_surface(
         .collect::<Vec<_>>();
     rules.extend(normalized_declarations);
 
-    Ok(ChildToolSurface { tools, rules })
+    let safety_predicates = parent_denials
+        .into_iter()
+        .map(|rule| {
+            SafetyPredicate::GlobalDeny(Box::new(GlobalDenyPredicate {
+                tool: rule.tool,
+                target: rule.target,
+            }))
+        })
+        .collect();
+
+    Ok(ChildToolSurface {
+        tools,
+        rules: ordered_permission_rules(rules),
+        safety_predicates,
+    })
 }
 
 fn declaration_names_tool(declaration: &PermissionRule, entry: &NativeToolMetadata) -> bool {
@@ -120,11 +166,19 @@ fn declaration_names_tool(declaration: &PermissionRule, entry: &NativeToolMetada
 /// `bash` and a path-shaped tool) each keep the target-kind their own name
 /// implies, rather than inheriting whatever kind the raw wildcard token
 /// happened to classify as.
+///
+/// A declaration matching no native tool is kept verbatim rather than dropped.
+/// `permission_rules` are shared with the primary path, where the same rule may
+/// name an MCP tool this surface never holds, so vanishing here would silently
+/// change what the definition means depending on how it was launched. Only a
+/// `deny` or `ask` reaches this branch — an unmatched `allow` is rejected by
+/// the subset invariant before normalization — so a retained rule can narrow
+/// and never widen.
 fn normalize_declared_tool(
     declaration: PermissionRule,
     metadata: &[NativeToolMetadata],
 ) -> Vec<PermissionRule> {
-    metadata
+    let expanded = metadata
         .iter()
         .filter(|entry| declaration_names_tool(&declaration, entry))
         .map(|entry| PermissionRule {
@@ -132,7 +186,13 @@ fn normalize_declared_tool(
             target: retarget_for_tool(&declaration.target, &entry.qualified_name),
             ..declaration.clone()
         })
-        .collect()
+        .collect::<Vec<_>>();
+
+    if expanded.is_empty() {
+        return vec![declaration];
+    }
+
+    expanded
 }
 
 fn retarget_for_tool(target: &PermissionPattern, qualified_tool_name: &str) -> PermissionPattern {
@@ -181,7 +241,7 @@ mod tests {
 
     #[test]
     fn empty_declarations_yield_every_native_tool() {
-        let surface = resolve_child_surface(&[]).unwrap();
+        let surface = resolve_child_surface(&[], &[]).unwrap();
 
         assert_eq!(
             tool_names(&surface),
@@ -194,7 +254,8 @@ mod tests {
 
     #[test]
     fn a_declared_deny_omits_its_tool_from_the_catalog() {
-        let surface = resolve_child_surface(&[rule(PermissionDecision::Deny, "bash")]).unwrap();
+        let surface =
+            resolve_child_surface(&[], &[rule(PermissionDecision::Deny, "bash")]).unwrap();
 
         assert!(!tool_names(&surface).contains(&"native::bash".to_owned()));
         assert_eq!(
@@ -210,9 +271,11 @@ mod tests {
             PermissionPattern::glob("bash").unwrap(),
             PermissionPattern::glob("rm -rf /**").unwrap(),
         );
-        let surface =
-            resolve_child_surface(&[rule(PermissionDecision::Allow, "bash"), targeted_deny])
-                .unwrap();
+        let surface = resolve_child_surface(
+            &[],
+            &[rule(PermissionDecision::Allow, "bash"), targeted_deny],
+        )
+        .unwrap();
 
         assert!(
             tool_names(&surface).contains(&"native::bash".to_owned()),
@@ -228,16 +291,45 @@ mod tests {
     }
 
     #[test]
-    fn a_declaration_naming_an_unknown_tool_errors_naming_it() {
-        let error = resolve_child_surface(&[rule(PermissionDecision::Allow, "not_a_real_tool")])
-            .unwrap_err();
+    fn an_allow_naming_an_unknown_tool_errors_naming_it() {
+        let error =
+            resolve_child_surface(&[], &[rule(PermissionDecision::Allow, "not_a_real_tool")])
+                .unwrap_err();
 
         assert!(format!("{error:?}").contains("not_a_real_tool"));
     }
 
+    /// The subset invariant governs what a declaration would GRANT. A `deny`
+    /// or `ask` naming a tool this surface never holds — an MCP tool the
+    /// primary path resolves, or a typo — exceeds nothing, so rejecting it
+    /// would make an otherwise valid definition undelegatable.
+    #[test]
+    fn a_deny_or_ask_naming_an_unheld_tool_is_retained_rather_than_rejected() {
+        for decision in [PermissionDecision::Deny, PermissionDecision::Ask] {
+            for tool in ["webfetc", "mcp::github::create_issue", "zz*"] {
+                let surface = resolve_child_surface(&[], &[rule(decision, tool)])
+                    .unwrap_or_else(|error| panic!("{decision:?} {tool} must resolve: {error:?}"));
+
+                assert_eq!(
+                    tool_names(&surface).len(),
+                    NativeToolCatalog::metadata().len(),
+                    "{decision:?} {tool} matches no native tool and must omit none"
+                );
+                assert!(
+                    surface
+                        .rules
+                        .iter()
+                        .any(|rule| rule.decision == decision && rule.tool.matches(tool)),
+                    "{decision:?} {tool} must be retained as a rule, not dropped"
+                );
+            }
+        }
+    }
+
     #[test]
     fn declared_rules_are_appended_after_the_derived_allow_rules() {
-        let surface = resolve_child_surface(&[rule(PermissionDecision::Deny, "read")]).unwrap();
+        let surface =
+            resolve_child_surface(&[], &[rule(PermissionDecision::Deny, "read")]).unwrap();
 
         let allow_read_index = surface
             .rules
@@ -257,9 +349,88 @@ mod tests {
         assert!(allow_read_index < deny_read_index);
     }
 
+    fn parent_deny(tool: &str, target: Option<&str>) -> PermissionRule {
+        PermissionRule::global(
+            PermissionDecision::Deny,
+            PermissionPattern::Exact(format!("native::{tool}")),
+            match target {
+                Some(target) => PermissionPattern::glob_for_target_kind(
+                    target,
+                    permission_target_kind_for_tool(tool),
+                )
+                .unwrap(),
+                None => PermissionPattern::Any,
+            },
+        )
+    }
+
+    /// A child must never hold what the parent's own configuration denies, so
+    /// an untargeted configured deny removes the tool from the child catalog
+    /// no matter what the definition declares.
+    #[test]
+    fn a_configured_deny_omits_its_tool_from_the_child_catalog() {
+        let surface =
+            resolve_child_surface(&[parent_deny("bash", None)], &[]).expect("surface must resolve");
+
+        assert!(!tool_names(&surface).contains(&"native::bash".to_owned()));
+    }
+
+    #[test]
+    fn a_declared_allow_cannot_reopen_a_tool_the_configuration_denies() {
+        let error = resolve_child_surface(
+            &[parent_deny("bash", None)],
+            &[rule(PermissionDecision::Allow, "bash")],
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:?}").contains("bash"));
+    }
+
+    /// A targeted configured deny leaves the tool reachable, so it has to be
+    /// enforced above the declarations rather than beside them — a declared
+    /// `allow bash` would otherwise outrank it on the child's own policy.
+    #[test]
+    fn a_targeted_configured_deny_becomes_a_child_safety_predicate() {
+        let surface = resolve_child_surface(
+            &[parent_deny("bash", Some("rm*"))],
+            &[rule(PermissionDecision::Allow, "bash")],
+        )
+        .expect("a targeted configured deny must not reject the delegation");
+
+        assert!(tool_names(&surface).contains(&"native::bash".to_owned()));
+        assert!(
+            surface.safety_predicates.iter().any(|predicate| matches!(
+                predicate,
+                SafetyPredicate::GlobalDeny(deny)
+                    if deny.tool.matches("native::bash") && deny.target.matches("rm -rf /tmp/x")
+            )),
+            "the configured deny must survive as a hard safety predicate"
+        );
+    }
+
+    #[test]
+    fn a_configured_allow_grants_the_child_nothing_on_its_own() {
+        let surface = resolve_child_surface(
+            &[PermissionRule::global(
+                PermissionDecision::Allow,
+                PermissionPattern::Exact("native::bash".into()),
+                PermissionPattern::Any,
+            )],
+            &[],
+        )
+        .expect("surface must resolve");
+
+        assert!(
+            !surface.rules.iter().any(|rule| {
+                rule.decision == PermissionDecision::Allow && rule.tool.matches("native::bash")
+            }),
+            "only a declaration authorizes a child tool, never the parent's configuration"
+        );
+    }
+
     #[test]
     fn webfetch_is_excluded_from_the_derived_allow_set() {
-        let surface = resolve_child_surface(&[]).unwrap();
+        let surface = resolve_child_surface(&[], &[]).unwrap();
 
         assert!(
             !surface.rules.iter().any(|rule| {

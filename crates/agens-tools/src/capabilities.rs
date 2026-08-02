@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use agens_core::{
     AgentDefinition, PermissionDecision, PermissionPattern, PermissionRule, PermissionScope,
-    PermissionTargetKind, permission_target_kind_for_tool,
+    PermissionTargetKind, ordered_permission_rules, permission_target_kind_for_tool,
 };
 
 use crate::ToolDispatcher;
@@ -13,33 +13,37 @@ pub struct EffectiveCapabilitySet {
 }
 
 impl EffectiveCapabilitySet {
+    /// Resolves an agent's declarations against the tools a dispatcher
+    /// actually holds, in declaration order.
+    ///
+    /// Authoring order is preserved end to end: a redeclared selector moves to
+    /// the position of its latest mention rather than keeping the position of
+    /// its first, so `permission_rules` can hand
+    /// [`agens_core::ordered_permission_rules`] the same sequence a delegated
+    /// child's surface hands it. Sorting descriptors by selector here would
+    /// destroy that order and make the two paths answer differently for the
+    /// same definition.
     pub fn from_agent(agent: &AgentDefinition, project: &str, dispatcher: &ToolDispatcher) -> Self {
         let snapshot = dispatcher.capability_snapshot();
-        let mut normalized = BTreeMap::new();
+        let mut descriptors: Vec<EffectiveCapabilityDescriptor> = Vec::new();
 
         for rule in &agent.permission_rules {
             if !rule_applies_to_project(rule, project) {
                 continue;
             }
             let target = target(&rule.target);
-            for (selector, kind) in selectors(&rule.tool, &snapshot) {
-                normalized.insert((selector, target.clone()), (rule.decision, kind));
+            for (selector, kind) in resolved_selectors(rule, &snapshot) {
+                let descriptor = EffectiveCapabilityDescriptor {
+                    selector,
+                    target: target.clone(),
+                    decision: rule.decision,
+                    kind,
+                };
+                descriptors.retain(|existing| existing.key() != descriptor.key());
+                descriptors.push(descriptor);
             }
         }
 
-        let mut descriptors = normalized
-            .into_iter()
-            .map(
-                |((selector, target), (decision, kind))| EffectiveCapabilityDescriptor {
-                    selector,
-                    target,
-                    decision,
-                    kind,
-                },
-            )
-            .collect::<Vec<_>>();
-        descriptors.sort_by_key(EffectiveCapabilityDescriptor::key);
-        descriptors.dedup();
         Self { descriptors }
     }
 
@@ -48,10 +52,12 @@ impl EffectiveCapabilitySet {
     }
 
     pub fn permission_rules(&self) -> Vec<PermissionRule> {
-        self.descriptors
-            .iter()
-            .flat_map(EffectiveCapabilityDescriptor::permission_rules)
-            .collect()
+        ordered_permission_rules(
+            self.descriptors
+                .iter()
+                .flat_map(EffectiveCapabilityDescriptor::permission_rules)
+                .collect(),
+        )
     }
 
     pub fn is_expansion_from(&self, prior: &Self) -> bool {
@@ -98,6 +104,7 @@ impl EffectiveCapabilityDescriptor {
             ToolSelector::Pattern { identities, .. } => {
                 identities.iter().any(|candidate| candidate == identity)
             }
+            ToolSelector::Unmatched(_) => false,
         }
     }
 
@@ -116,6 +123,14 @@ impl EffectiveCapabilityDescriptor {
                     .expect("stored target is validated")
             })
             .unwrap_or(PermissionPattern::Any);
+
+        if let ToolSelector::Unmatched(source) = &self.selector {
+            return vec![PermissionRule::global(
+                self.decision,
+                PermissionPattern::glob(source.clone()).expect("stored tool pattern is validated"),
+                target,
+            )];
+        }
 
         self.selector
             .identities()
@@ -137,6 +152,9 @@ enum ToolSelector {
         source: String,
         identities: Vec<String>,
     },
+    /// A declared tool pattern the dispatcher holds nothing for, kept with the
+    /// pattern exactly as written. See [`resolved_selectors`].
+    Unmatched(String),
 }
 
 impl ToolSelector {
@@ -144,6 +162,7 @@ impl ToolSelector {
         match self {
             Self::Exact(identity) => std::slice::from_ref(identity),
             Self::Pattern { identities, .. } => identities.as_slice(),
+            Self::Unmatched(_) => &[],
         }
         .iter()
         .map(String::as_str)
@@ -154,6 +173,44 @@ type DescriptorKey = (ToolSelector, Option<String>);
 
 fn rule_applies_to_project(rule: &PermissionRule, project: &str) -> bool {
     rule.scope == PermissionScope::Global || rule.project.as_deref() == Some(project)
+}
+
+/// Resolves a declaration's tool pattern, keeping a rule that matches nothing
+/// instead of letting it vanish.
+///
+/// A definition's `permission_rules` are shared with the delegated-child path,
+/// so a rule may legitimately name a tool one surface holds and the other does
+/// not — an MCP tool here, a native tool there. Dropping it silently would
+/// make the same definition mean different things depending on how it was
+/// launched, and would hide a typo behind a rule that appears to be in force.
+/// The retained rule is compared against dispatcher identities at evaluation
+/// time and matches none of them, so it decides nothing until the surface
+/// grows a tool it names.
+///
+/// An unmatched `allow` is dropped rather than retained: it could only ever
+/// widen, and a grant for a tool the dispatcher does not hold grants nothing.
+fn resolved_selectors(
+    rule: &PermissionRule,
+    snapshot: &CapabilitySnapshot,
+) -> Vec<(ToolSelector, PermissionTargetKind)> {
+    let resolved = selectors(&rule.tool, snapshot);
+    if !resolved.is_empty() || rule.decision == PermissionDecision::Allow {
+        return resolved;
+    }
+
+    let Some(source) = tool_pattern_source(&rule.tool) else {
+        return Vec::new();
+    };
+    let kind = permission_target_kind_for_tool(&source);
+    vec![(ToolSelector::Unmatched(source), kind)]
+}
+
+fn tool_pattern_source(pattern: &PermissionPattern) -> Option<String> {
+    match pattern {
+        PermissionPattern::Any => None,
+        PermissionPattern::Exact(value) => Some(value.clone()),
+        PermissionPattern::Glob(_) => pattern.glob_source().map(ToOwned::to_owned),
+    }
 }
 
 /// Resolves a declared `tool` pattern into the selector(s) it applies to,

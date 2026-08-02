@@ -488,7 +488,7 @@ mod tests {
         let project_root = temporary.join("project");
         std::fs::create_dir_all(&project_root).unwrap();
 
-        let surface = crate::child_catalog::resolve_child_surface(&[]).unwrap();
+        let surface = crate::child_catalog::resolve_child_surface(&[], &[]).unwrap();
         let task_registry = TaskExecutionRegistry::new();
         let execution_id = task_registry.admit(TaskLaunchMode::Foreground).unwrap();
         let (tools, dispatcher) = production_child_tool_runtime(
@@ -535,28 +535,31 @@ mod tests {
         let project_root = temporary.join("project");
         std::fs::create_dir_all(&project_root).unwrap();
 
-        let surface = crate::child_catalog::resolve_child_surface(&[
-            PermissionRule::global(
-                PermissionDecision::Deny,
-                PermissionPattern::glob("write").unwrap(),
-                PermissionPattern::Any,
-            ),
-            PermissionRule::global(
-                PermissionDecision::Deny,
-                PermissionPattern::glob("edit").unwrap(),
-                PermissionPattern::Any,
-            ),
-            PermissionRule::global(
-                PermissionDecision::Deny,
-                PermissionPattern::glob("bash").unwrap(),
-                PermissionPattern::Any,
-            ),
-            PermissionRule::global(
-                PermissionDecision::Deny,
-                PermissionPattern::glob("webfetch").unwrap(),
-                PermissionPattern::Any,
-            ),
-        ])
+        let surface = crate::child_catalog::resolve_child_surface(
+            &[],
+            &[
+                PermissionRule::global(
+                    PermissionDecision::Deny,
+                    PermissionPattern::glob("write").unwrap(),
+                    PermissionPattern::Any,
+                ),
+                PermissionRule::global(
+                    PermissionDecision::Deny,
+                    PermissionPattern::glob("edit").unwrap(),
+                    PermissionPattern::Any,
+                ),
+                PermissionRule::global(
+                    PermissionDecision::Deny,
+                    PermissionPattern::glob("bash").unwrap(),
+                    PermissionPattern::Any,
+                ),
+                PermissionRule::global(
+                    PermissionDecision::Deny,
+                    PermissionPattern::glob("webfetch").unwrap(),
+                    PermissionPattern::Any,
+                ),
+            ],
+        )
         .unwrap();
         let task_registry = TaskExecutionRegistry::new();
         let execution_id = task_registry.admit(TaskLaunchMode::Foreground).unwrap();
