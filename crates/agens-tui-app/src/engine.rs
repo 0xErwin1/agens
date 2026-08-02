@@ -5,16 +5,16 @@
 use std::sync::{Arc, Mutex};
 
 use agens_core::SubmitOrigin;
-use agens_core::ask_user::UnavailableAskUserPort;
 use agens_core::{HeadlessTurnCancellation, HeadlessTurnError, PermissionMode, TurnProgressSink};
 use agens_tools::{
     CommandCatalog, SkillCatalog, TaskExecutionRegistry, TaskMessageSource, TaskMessageTarget,
 };
 use agens_tui::{
     BridgeCancel, Engine as TuiEngine, Tui, TuiProviderOutcome, TuiSubmissionOutcome,
-    run_with_default_progress_submit_with_permissions_and_task_controls,
+    run_with_default_progress_submit_with_permissions_task_controls_and_ask_user,
 };
 
+use crate::ask_user_prompt::{TuiAskUserPort, production_tui_ask_user_bridge};
 use crate::extensions::{start_tui_commands, start_tui_skills};
 use crate::files::{expand_tui_file_reference, tui_picker_file_candidates};
 use crate::metrics::{TuiMetricsPublisher, finish_tui_metrics};
@@ -191,15 +191,17 @@ pub fn run_production_tui_with_profile_store(
     let mcp_noticed: Arc<Mutex<std::collections::BTreeSet<String>>> =
         Arc::new(Mutex::new(std::collections::BTreeSet::new()));
     let (permission_bridge, permission_requests) = production_tui_permission_bridge();
+    let (ask_user_bridge, ask_user_requests) = production_tui_ask_user_bridge();
     let transition_controls = task_controls.clone();
     let cancel_controls = task_controls.clone();
     let message_controls = task_controls.clone();
     let submit_task_controls = task_controls.clone();
     let prompt_bridge = permission_bridge.clone();
+    let submit_ask_user_bridge = ask_user_bridge.clone();
     #[cfg(feature = "perf-audit")]
     let perf_recorder = session_perf_recorder();
 
-    let tui_result = run_with_default_progress_submit_with_permissions_and_task_controls(
+    let tui_result = run_with_default_progress_submit_with_permissions_task_controls_and_ask_user(
         &mut tui,
         move |request, progress, cancellation| {
             route_router.route_request_with_cancellation(request, progress, cancellation)
@@ -278,7 +280,7 @@ pub fn run_production_tui_with_profile_store(
                 task_parent_request_config.clone(),
                 task_diagnostic_reference.clone(),
                 session_bypass,
-                Box::new(UnavailableAskUserPort),
+                Box::new(TuiAskUserPort(submit_ask_user_bridge.clone())),
             ) {
                 Ok(runtime) => runtime,
                 Err(error) => return tui_provider_outcome(Err(error)),
@@ -329,7 +331,7 @@ pub fn run_production_tui_with_profile_store(
                         .with_bypass(request.dangerously_allow_all),
                         task_parent_request_config.clone(),
                         Some(task_diagnostic_reference.clone()),
-                        Box::new(UnavailableAskUserPort),
+                        Box::new(TuiAskUserPort(submit_ask_user_bridge.clone())),
                     )?;
                     run_production_headless_chat_with_progress(
                         request,
@@ -368,6 +370,7 @@ pub fn run_production_tui_with_profile_store(
                 .is_ok()
         },
         Some((permission_bridge, permission_requests)),
+        Some((ask_user_bridge, ask_user_requests)),
     );
     task_controls.0.cancel_all();
     let _ = task_controls

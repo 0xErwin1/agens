@@ -19,7 +19,10 @@ pub use agens_core::{
 };
 pub use app::{AppEvent, AppState, Command, Dialog, Effect, Runtime};
 pub use ask_user::{AskUserEditing, AskUserRowSnapshot, AskUserSnapshot};
-pub use bridge::{TuiPermissionBridge, TuiPermissionReply, TuiPermissionRequest};
+pub use bridge::{
+    TuiAskUserBridge, TuiAskUserRequest, TuiPermissionBridge, TuiPermissionReply,
+    TuiPermissionRequest,
+};
 pub use conversation::{
     ActionableError, Conversation, ConversationError, ConversationEvent, SubagentCard, ToolBatch,
     ToolCall, ToolResult, TurnCost,
@@ -6533,6 +6536,25 @@ where
         self.ask_user.as_ref().map(AskUserState::snapshot)
     }
 
+    /// Closes the open ask-user overlay if it is the one identified by
+    /// `id`, without resolving anything itself. Returns whether it closed
+    /// one.
+    ///
+    /// This is for a request the BRIDGE resolved on its own — a deadline
+    /// expiring, an external cancellation, or the surface closing — none of
+    /// which travel through `Action::AskUserReply`. Without this, the
+    /// overlay would keep holding the keyboard for a turn that has already
+    /// ended, and whatever the person then typed or submitted into it would
+    /// be silently dropped rather than answering anyone.
+    pub fn dismiss_ask_user(&mut self, id: u64) -> bool {
+        if self.ask_user.as_ref().is_some_and(|state| state.id() == id) {
+            self.ask_user = None;
+            true
+        } else {
+            false
+        }
+    }
+
     /// The context pane's scroll ceiling in the frame the reader is looking at.
     ///
     /// Measured from the same geometry the renderer solves, so `End` stores a
@@ -8692,6 +8714,13 @@ impl Drop for PermissionBridgeTeardown {
     }
 }
 
+struct AskUserBridgeTeardown(Option<TuiAskUserBridge>);
+impl Drop for AskUserBridgeTeardown {
+    fn drop(&mut self) {
+        let _ = self.0.as_ref().is_some_and(TuiAskUserBridge::close);
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct FrameSchedule {
     last_render: Option<Duration>,
@@ -8959,6 +8988,59 @@ where
     C: Fn(u64) -> bool + Send + Sync + 'static,
     M: Fn(u64, String) -> bool + Send + Sync + 'static,
 {
+    run_with_default_progress_submit_with_permissions_task_controls_and_ask_user(
+        tui,
+        route,
+        submit,
+        transition,
+        cancel_execution,
+        send_task_message,
+        permissions,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_with_default_progress_submit_with_permissions_task_controls_and_ask_user<
+    E,
+    R,
+    F,
+    B,
+    C,
+    M,
+>(
+    tui: &mut Tui<E>,
+    route: R,
+    submit: F,
+    transition: B,
+    cancel_execution: C,
+    send_task_message: M,
+    permissions: Option<(TuiPermissionBridge, mpsc::Receiver<TuiPermissionRequest>)>,
+    ask_user: Option<(TuiAskUserBridge, mpsc::Receiver<TuiAskUserRequest>)>,
+) -> io::Result<()>
+where
+    E: Engine + Send,
+    R: Fn(
+            TuiRouteRequest,
+            mpsc::Sender<TuiRouteProgress>,
+            TuiRouteCancellation,
+        ) -> TuiSubmissionOutcome
+        + Send
+        + Sync
+        + 'static,
+    F: Fn(
+            String,
+            SubmitOrigin,
+            mpsc::Sender<TurnEvent>,
+            BridgeTx<TuiRuntimeEvent>,
+        ) -> TuiProviderOutcome
+        + Send
+        + Sync
+        + 'static,
+    B: Fn(u64) -> bool + Send + Sync + 'static,
+    C: Fn(u64) -> bool + Send + Sync + 'static,
+    M: Fn(u64, String) -> bool + Send + Sync + 'static,
+{
     let route = Arc::new(route);
     let submit = Arc::new(submit);
     let transition = Arc::new(transition);
@@ -8972,6 +9054,9 @@ where
     let (permission_bridge, permission_requests) = permissions.unzip();
     let _permission_teardown = PermissionBridgeTeardown(permission_bridge.clone());
     let mut active_permission = None;
+    let (ask_user_bridge, ask_user_requests) = ask_user.unzip();
+    let _ask_user_teardown = AskUserBridgeTeardown(ask_user_bridge.clone());
+    let mut active_ask_user: Option<u64> = None;
     let mut runtime_terminal = Terminal::enter()?;
     sync_terminal_size(tui)?;
     let terminal = RatatuiTerminal::new(CrosstermBackend::new(io::stdout()))?;
@@ -9062,6 +9147,19 @@ where
                 )
                 .as_confirm(),
             );
+            dirty = true;
+        }
+        if dismiss_resolved_ask_user(tui, active_ask_user, ask_user_bridge.as_ref()) {
+            active_ask_user = None;
+            dirty = true;
+        }
+        if let Some(id) = drain_ask_user_request(
+            tui,
+            active_ask_user,
+            ask_user_bridge.as_ref(),
+            ask_user_requests.as_ref(),
+        ) {
+            active_ask_user = Some(id);
             dirty = true;
         }
         if active_route.is_none()
@@ -9299,11 +9397,12 @@ where
                 runtime_terminal.copy_selection(&text)?;
             }
             Action::Unchanged => {}
-            // No bridge is wired into this entry point yet: the ask-user
-            // reply already resolved the interaction locally, so a bare
-            // render is all this loop can offer until the run entry point
-            // that owns a `TuiAskUserBridge` replaces this arm.
-            Action::AskUserReply { .. } => {}
+            Action::AskUserReply { id, reply } => {
+                resolve_ask_user_reply(ask_user_bridge.as_ref(), id, reply);
+                active_ask_user = None;
+                render_requested = true;
+                continue;
+            }
             Action::Render | Action::Cancel => {
                 if cancel_permission
                     && let (Some(id), Some(permission_bridge)) =
@@ -9316,6 +9415,60 @@ where
         if changed_something {
             render_requested = true;
         }
+    }
+}
+
+/// The event loop's ask-user drain arm: opens a newly parked request as the
+/// active overlay, if none is already open and the request the drain
+/// received is still genuinely pending. Factored out of the loop so it can
+/// be exercised directly by a test without a live terminal.
+fn drain_ask_user_request<E: Engine>(
+    tui: &mut Tui<E>,
+    active_ask_user: Option<u64>,
+    ask_user_bridge: Option<&TuiAskUserBridge>,
+    ask_user_requests: Option<&mpsc::Receiver<TuiAskUserRequest>>,
+) -> Option<u64> {
+    if active_ask_user.is_some() {
+        return None;
+    }
+    let request = ask_user_requests?.try_recv().ok()?;
+    if !ask_user_bridge?.is_pending(request.id()) {
+        return None;
+    }
+    let id = request.id();
+    tui.open_ask_user(id, request.request().clone());
+    Some(id)
+}
+
+/// The event loop's ask-user teardown arm: dismisses the open overlay when
+/// the bridge resolved the active request from its own side — deadline
+/// expiry, external cancellation, or a closed surface — none of which
+/// travel through `Action::AskUserReply`. Factored out for the same reason
+/// as the drain arm above.
+fn dismiss_resolved_ask_user<E: Engine>(
+    tui: &mut Tui<E>,
+    active_ask_user: Option<u64>,
+    ask_user_bridge: Option<&TuiAskUserBridge>,
+) -> bool {
+    let Some(id) = active_ask_user else {
+        return false;
+    };
+    if ask_user_bridge.is_none_or(|bridge| bridge.is_pending(id)) {
+        return false;
+    }
+    tui.dismiss_ask_user(id)
+}
+
+/// The event loop's ask-user reply arm: forwards a UI-driven resolution to
+/// the bridge. Factored out for the same reason as the drain and teardown
+/// arms above.
+fn resolve_ask_user_reply(
+    ask_user_bridge: Option<&TuiAskUserBridge>,
+    id: u64,
+    reply: AskUserReply,
+) {
+    if let Some(bridge) = ask_user_bridge {
+        let _ = bridge.reply(id, reply);
     }
 }
 
@@ -11541,5 +11694,135 @@ mod runtime_tests {
         assert!(!format!("{request:?}").contains("SECRET_SUBMISSION_SENTINEL"));
         assert!(!is_session_resume_request(&request));
         assert!(!is_session_browser_request(&request));
+    }
+
+    fn runtime_glue_ask_user_request() -> AskUserRequest {
+        use agens_core::ask_user::AskUserOption;
+
+        let options = vec![
+            AskUserOption::new("a", "Option A", None, None),
+            AskUserOption::new("b", "Option B", None, None),
+        ];
+        let question = AskUserQuestion::new(
+            "plan",
+            "Which plan?",
+            None,
+            AskUserMode::Single,
+            options,
+            false,
+            false,
+            false,
+        );
+        AskUserRequest::new(None, vec![question]).expect("valid request")
+    }
+
+    /// Calls the real drain arm until it opens the request the waiter
+    /// thread just parked, spinning rather than sleeping: the waiter sends
+    /// on its own thread, so the exact instant its message reaches
+    /// `requests` is not observable from here without polling for it.
+    fn open_first_ask_user_request(
+        tui: &mut Tui<NoopEngine>,
+        bridge: &TuiAskUserBridge,
+        requests: &mpsc::Receiver<TuiAskUserRequest>,
+    ) -> u64 {
+        loop {
+            if let Some(id) = drain_ask_user_request(tui, None, Some(bridge), Some(requests)) {
+                return id;
+            }
+            thread::yield_now();
+        }
+    }
+
+    /// Drives a real request through the event loop's actual drain and
+    /// reply arms — not a reimplementation of them, the exact functions the
+    /// running loop calls — proving they open the overlay for a genuinely
+    /// parked request and, once the UI resolves it, deliver that resolution
+    /// back to the parked tool thread through the bridge.
+    #[test]
+    fn the_ask_user_drain_and_reply_arms_carry_a_real_request_through_open_and_resolve() {
+        use agens_core::ask_user::AskUserAnswer;
+
+        let (bridge, requests) = TuiAskUserBridge::channel();
+        let cancellation = agens_core::HeadlessTurnCancellation::new();
+        let waiting_bridge = bridge.clone();
+
+        let waiter = thread::spawn(move || {
+            waiting_bridge.wait_for_reply(runtime_glue_ask_user_request(), &cancellation)
+        });
+
+        let mut tui = Tui::new(NoopEngine);
+        let id = open_first_ask_user_request(&mut tui, &bridge, &requests);
+        assert!(tui.ask_user_snapshot().is_some());
+        assert!(bridge.is_pending(id));
+
+        let stale_drain =
+            drain_ask_user_request(&mut tui, Some(id), Some(&bridge), Some(&requests));
+        assert_eq!(
+            stale_drain, None,
+            "the drain arm must not reopen while a request is already active"
+        );
+
+        let answer = AskUserAnswer {
+            question_id: "plan".into(),
+            selected: vec!["a".into()],
+            other: None,
+            note: None,
+        };
+        resolve_ask_user_reply(
+            Some(&bridge),
+            id,
+            AskUserReply::Answered(vec![answer.clone()]),
+        );
+
+        assert_eq!(
+            waiter.join().expect("waiter thread should not panic"),
+            AskUserReply::Answered(vec![answer])
+        );
+        assert!(!bridge.is_pending(id));
+    }
+
+    /// The spec's "surface closes" scenario as seen by the running loop: a
+    /// deadline firing releases the parked tool thread as expected, but the
+    /// bug this pins is that nothing DROVE the overlay closed on the UI side
+    /// — before this fix, `self.ask_user` stayed populated, kept answering
+    /// keys instead of routing them anywhere real, and no later UI action
+    /// could ever resolve the (already-resolved) request again.
+    #[test]
+    fn bridge_side_expiry_dismisses_the_open_overlay_and_releases_the_keyboard() {
+        let (bridge, requests) = TuiAskUserBridge::channel();
+        let cancellation = agens_core::HeadlessTurnCancellation::with_deadline(
+            std::time::Duration::from_millis(15),
+        );
+        let waiting_bridge = bridge.clone();
+
+        let waiter = thread::spawn(move || {
+            waiting_bridge.wait_for_reply(runtime_glue_ask_user_request(), &cancellation)
+        });
+
+        let mut tui = Tui::new(NoopEngine);
+        let id = open_first_ask_user_request(&mut tui, &bridge, &requests);
+        assert!(tui.ask_user_snapshot().is_some());
+
+        assert_eq!(
+            waiter.join().expect("waiter thread should not panic"),
+            AskUserReply::Expired
+        );
+
+        assert!(
+            !dismiss_resolved_ask_user(&mut tui, None, Some(&bridge)),
+            "there must be no active overlay to dismiss before the loop notices the resolution"
+        );
+        let dismissed = dismiss_resolved_ask_user(&mut tui, Some(id), Some(&bridge));
+
+        assert!(
+            dismissed,
+            "an expired request must release the overlay it opened, not leave it stuck \
+             answering a turn that already ended"
+        );
+        assert!(
+            tui.ask_user_snapshot().is_none(),
+            "the overlay must be gone so `handle_key` stops routing keystrokes into a dead \
+             ask-user interaction and returns to ordinary composer handling"
+        );
     }
 }
