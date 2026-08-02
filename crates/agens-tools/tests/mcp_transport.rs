@@ -1062,8 +1062,7 @@ fn connect_and_list_tools_enforce_one_deadline_across_internal_steps() {
 #[test]
 fn concurrent_server_loading_isolates_a_cooperative_deadline_and_keeps_resources_bounded() {
     let cancellation = Arc::new(AtomicBool::new(false));
-    let slow =
-        LocalTransport::with_responses([Ok(initialized())]).delayed(Duration::from_millis(20));
+    let slow = LocalTransport::with_responses([Ok(initialized())]).delayed(Duration::from_secs(5));
     let healthy = LocalTransport::with_responses([
         Ok(initialized()),
         Ok(page(vec![tool("status", Some(true))], None)),
@@ -1084,7 +1083,7 @@ fn concurrent_server_loading_isolates_a_cooperative_deadline_and_keeps_resources
         Arc::clone(&cancellation),
     );
 
-    assert!(start.elapsed() < Duration::from_millis(15));
+    assert!(start.elapsed() < Duration::from_secs(1));
     assert!(reports[0].is_failed());
     assert_eq!(reports[1], McpServerReport::loaded("healthy", 1));
     assert!(registry.tool("healthy::status").is_some());

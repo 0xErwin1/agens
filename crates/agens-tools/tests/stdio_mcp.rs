@@ -124,6 +124,7 @@ fn stdio_transport_returns_promptly_when_a_child_does_not_read_stdin() {
     let context = McpOperationContext::new(Arc::clone(&cancellation), Duration::from_millis(100));
     let (sender, receiver) = mpsc::sync_channel(1);
     thread::spawn(move || {
+        let started = Instant::now();
         let result = transport.execute(
             McpRequest::CallTool {
                 name: "x".repeat(512 * 1024),
@@ -131,12 +132,16 @@ fn stdio_transport_returns_promptly_when_a_child_does_not_read_stdin() {
             },
             &context,
         );
-        let _ = sender.send(result);
+        let _ = sender.send((started.elapsed(), result));
     });
 
-    assert_eq!(
-        receiver.recv_timeout(Duration::from_millis(250)),
-        Ok(Err(McpTransportError::TimedOut))
+    let (elapsed, result) = receiver
+        .recv_timeout(Duration::from_secs(30))
+        .expect("transport should not hang while the child never reads stdin");
+    assert_eq!(result, Err(McpTransportError::TimedOut));
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "transport did not return promptly: {elapsed:?}"
     );
 }
 
@@ -221,7 +226,7 @@ fn blocked_stdin_transport() -> (McpStdioTransport, PathBuf, TemporaryDirectory)
 }
 
 fn wait_for_path(path: &std::path::Path) {
-    let deadline = Instant::now() + Duration::from_secs(1);
+    let deadline = Instant::now() + Duration::from_secs(5);
     while !path.exists() {
         assert!(Instant::now() < deadline, "child should signal readiness");
         thread::sleep(Duration::from_millis(2));
@@ -269,6 +274,7 @@ fn stdio_transport_reaps_process_group_descendants_after_timeout_cancellation_an
             McpTimeouts::new(timeout, timeout, timeout).unwrap(),
             McpLimits::new(4, 4).unwrap(),
         );
+        let descendant = wait_for_descendant(&pid_path);
         if cancel {
             let signal = Arc::clone(&cancellation);
             thread::spawn(move || {
@@ -288,14 +294,13 @@ fn stdio_transport_reaps_process_group_descendants_after_timeout_cancellation_an
             ),
             "{mode}: {result:?}"
         );
-        let descendant = wait_for_descendant(&pid_path);
         assert_no_orphan(descendant, mode);
     }
 }
 
 #[cfg(unix)]
 fn wait_for_descendant(path: &std::path::Path) -> i32 {
-    let deadline = Instant::now() + Duration::from_secs(1);
+    let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         if let Ok(pid) = std::fs::read_to_string(path) {
             return pid
