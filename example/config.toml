@@ -80,6 +80,14 @@ effort = "high"
 # `glob` and `grep` are matched on their pattern argument rather than on a
 # path, and `bash` on its command line, so a path deny never reaches them —
 # granting `bash` grants a way around every path rule below.
+#
+# What that costs, stated once: the denies below bound `read`, `write`,
+# `edit`, `list` and `search`, and nothing else. A delegated subagent is
+# authorized to use `grep` and `glob` without declaring anything, and `grep`
+# reports the lines it matched, so a subagent can read the contents of any
+# file in the worktree — `.env` included — whichever paths are denied here.
+# On the primary agent the same call is not denied either; it stops at the
+# approval prompt, which a subagent has no way to reach.
 [permissions]
 allow = [
   "read(**)",

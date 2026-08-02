@@ -129,6 +129,8 @@ The `task` tool delegates work to a subagent, which runs its own turn loop with 
 
 **What a subagent can reach.** It inherits the parent's native tool surface — `read`, `list`, `search`, `grep`, `glob`, `git_read`, `write`, `edit`, `bash`, `webfetch` — plus `task_control` and `task_message` for reporting back. The read-class tools (`read`, `list`, `search`, `grep`, `glob`, `git_read`) are authorized automatically. `write`, `edit`, `bash` and `webfetch` are present but unauthorized: a call to one is refused unless the agent definition declares `allow`, or the session is in dangerous mode. `webfetch` is excluded from the automatic grant deliberately — it is network egress rather than a worktree read.
 
+**What the automatic grant costs.** The read-class grant is not bounded by the `[permissions]` path rules. `grep` and `glob` are matched on their pattern argument, and `bash` on its command line, so a `deny` naming a path never reaches any of the three — and `grep` reports the lines it matched. A subagent that declares nothing can therefore read the contents of any file in the worktree, including one the configuration denies to `read`. On the primary agent that same `grep` call stops at an approval prompt; a subagent has no prompt to stop at.
+
 **Narrowing and granting.** Agent definitions are markdown files with YAML frontmatter, discovered in `<project-root>/.agens/agents/` and in `agents/` beside the global configuration. A `permissions:` list adjusts the inherited surface:
 
 ```markdown
