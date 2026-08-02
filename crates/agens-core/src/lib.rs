@@ -2022,6 +2022,16 @@ pub const MAX_PERMISSION_GLOB_SEGMENTS: usize = 256;
 pub const MAX_PERMISSION_TARGET_BYTES: usize = 16 * 1024;
 
 impl PermissionPattern {
+    /// Builds a glob pattern where `/` is a literal path-segment boundary
+    /// that a bare `*` never crosses; only `**` occupying a whole segment
+    /// (`prefix/**`, `**/suffix`, `dir/**/secret`) matches across it.
+    ///
+    /// Every permission target shares this same matcher, including command
+    /// targets that are not filesystem paths. A shell command such as
+    /// `rm -rf /tmp/x` still contains `/`, so a pattern like `rm*` matches
+    /// only slash-free commands (`rm -rf`) and silently does not match a
+    /// command with a path argument. To cover path-bearing commands, the
+    /// `**` segment has to be explicit, e.g. `rm -rf /**`.
     pub fn glob(pattern: impl Into<String>) -> Result<Self, PermissionPatternError> {
         ValidatedPermissionGlob::new(pattern.into()).map(Self::Glob)
     }
@@ -2482,31 +2492,74 @@ impl PermissionPolicy {
         session_grants: &[ProjectPermissionGrant],
         session: &PermissionSession,
     ) -> PermissionDecision {
+        self.evaluate_with_unmatched_override(
+            request,
+            project_grants,
+            session_grants,
+            session,
+            false,
+        )
+    }
+
+    /// Resolves a permission request against static rules, then persisted
+    /// grants, then an unmatched-call fallback — in that order of authority.
+    ///
+    /// A static rule's `Deny` is sticky: once a declaration (agent-defined or
+    /// configured) denies a request, no later project or session grant can
+    /// reopen it, regardless of chain order. Any other matched decision keeps
+    /// the existing last-matching-wins behavior between static rules and
+    /// grants. A matched decision is never touched by `unmatched_allow` or by
+    /// `session.temporary_bypass` — those two only decide what happens when
+    /// nothing matched at all, which is the sole remaining role of
+    /// `resolve_ask`.
+    pub fn evaluate_with_unmatched_override(
+        &self,
+        request: &PermissionRequest,
+        project_grants: &[ProjectPermissionGrant],
+        session_grants: &[ProjectPermissionGrant],
+        session: &PermissionSession,
+        unmatched_allow: bool,
+    ) -> PermissionDecision {
         if !self.hard_safety_allows(request) {
             return PermissionDecision::Deny;
         }
 
-        let decision = self
+        let static_decision = self
             .static_rules
             .iter()
             .filter(|rule| rule.matches(request))
             .map(|rule| rule.decision)
-            .chain(
-                project_grants
-                    .iter()
-                    .filter(|grant| grant.matches(request))
-                    .map(|grant| grant.decision),
-            )
+            .next_back();
+
+        let grant_decision = project_grants
+            .iter()
+            .filter(|grant| grant.matches(request))
+            .map(|grant| grant.decision)
             .chain(
                 session_grants
                     .iter()
                     .filter(|grant| grant.matches(request))
                     .map(|grant| grant.decision),
             )
-            .last()
-            .unwrap_or(PermissionDecision::Ask);
+            .last();
 
-        Self::resolve_ask(decision, session)
+        let matched = if static_decision == Some(PermissionDecision::Deny) {
+            static_decision
+        } else {
+            grant_decision.or(static_decision)
+        };
+
+        match matched {
+            Some(decision) => decision,
+            None => {
+                let fallback = if unmatched_allow {
+                    PermissionDecision::Allow
+                } else {
+                    PermissionDecision::Ask
+                };
+                Self::resolve_ask(fallback, session)
+            }
+        }
     }
 
     pub fn hard_safety_allows(&self, request: &PermissionRequest) -> bool {

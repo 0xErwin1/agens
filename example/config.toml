@@ -56,7 +56,9 @@ model = "gpt-5.5"
 effort = "high"
 
 # Rules are evaluated in global-then-project order. A target in parentheses
-# is a glob. Keep destructive operations denied explicitly.
+# is a glob; a tool named without one matches every target. Keep destructive
+# operations denied explicitly, and reserve `ask` for operations you want a
+# human to confirm even when bypass or dangerous mode is on.
 [permissions]
 allow = [
   "read(**)",
@@ -68,6 +70,10 @@ deny = [
   "read(**/.env)",
   "write(**/.env)",
   "bash(rm *)",
+]
+ask = [
+  "bash(git commit*)",
+  "bash(git push*)",
 ]
 
 # MCP server definitions are global-only. Uncomment and adapt one or more of

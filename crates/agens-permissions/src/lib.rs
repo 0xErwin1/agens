@@ -219,6 +219,11 @@ impl ProductionPermissionGate {
         }
     }
 
+    /// Sets the fallback this gate applies when a call matches no static
+    /// rule and no grant. This never touches a matched decision: a declared
+    /// `deny` or `ask` for a dangerous child tool still denies or asks even
+    /// with the override set, because `evaluate_with_unmatched_override`
+    /// only consults it after the matched-decision chain comes up empty.
     pub fn with_dangerous_override(mut self, dangerous_override: bool) -> Self {
         self.dangerous_override = dangerous_override;
         self
@@ -538,6 +543,7 @@ pub fn permission_policy(
             let decision = match rule.decision {
                 ConfigPermissionDecision::Allow => PermissionDecision::Allow,
                 ConfigPermissionDecision::Deny => PermissionDecision::Deny,
+                ConfigPermissionDecision::Ask => PermissionDecision::Ask,
             };
             let configured = configured_tool_name(&rule.tool_pattern)?;
             let tool = dispatcher
@@ -627,13 +633,15 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
 
+    use agens_config::{ConfigPermissionDecision, ConfigPermissionRule, ConfigPermissionScope};
     use agens_core::{
-        HeadlessPermissionGate, HeadlessToolCall, HeadlessTurnCancellation, HeadlessTurnPortError,
-        PermissionDecision, PermissionMode, PermissionPolicy, PermissionSession,
+        Error, HeadlessPermissionGate, HeadlessToolCall, HeadlessTurnCancellation,
+        HeadlessTurnPortError, PermissionDecision, PermissionMode, PermissionPolicy,
+        PermissionSession, ToolAccess,
     };
-    use agens_tools::ToolDispatcher;
+    use agens_tools::{DispatchTool, ToolDispatchRequest, ToolDispatcher, ToolEvaluationOutcome};
 
-    use super::{ProductionPermissionGate, SharedToolDispatcher};
+    use super::{ProductionPermissionGate, SharedToolDispatcher, permission_policy};
 
     fn run_ready<T>(
         future: impl std::future::Future<Output = Result<T, HeadlessTurnPortError>>,
@@ -677,5 +685,81 @@ mod tests {
             run_ready(gate.evaluate(&call, &cancellation)),
             Ok(PermissionDecision::Deny)
         );
+    }
+
+    #[test]
+    fn a_configured_ask_rule_produces_a_matched_ask_decision_that_survives_bypass() {
+        let mut dispatcher = ToolDispatcher::new();
+        dispatcher
+            .register_native("native::bash", ToolAccess::Write, StubBashTool)
+            .expect("native bash should register");
+        let dispatcher: SharedToolDispatcher = Arc::new(Mutex::new(dispatcher));
+
+        let policy = permission_policy(
+            &[ConfigPermissionRule {
+                scope: ConfigPermissionScope::Global,
+                decision: ConfigPermissionDecision::Ask,
+                tool_pattern: "bash".into(),
+                target_pattern: None,
+            }],
+            "project",
+            PermissionMode::Edit,
+            &dispatcher,
+            None,
+        )
+        .expect("a configured ask rule should resolve");
+
+        let request = || {
+            ToolDispatchRequest::new(
+                "project",
+                "native::bash",
+                serde_json::json!({"target": "echo hi"}),
+            )
+        };
+
+        let plain_outcome = dispatcher
+            .lock()
+            .expect("dispatcher should remain available")
+            .evaluate(&policy, &[], &PermissionSession::new(), request())
+            .expect("configured ask should evaluate");
+        assert!(matches!(
+            plain_outcome,
+            ToolEvaluationOutcome::PromptRequired(_)
+        ));
+
+        let bypassed_outcome = dispatcher
+            .lock()
+            .expect("dispatcher should remain available")
+            .evaluate(
+                &policy,
+                &[],
+                &PermissionSession::with_temporary_bypass(),
+                request(),
+            )
+            .expect("configured ask should evaluate under bypass");
+        assert!(
+            matches!(bypassed_outcome, ToolEvaluationOutcome::PromptRequired(_)),
+            "a configured ask must survive temporary_bypass exactly like an agent-declared ask"
+        );
+    }
+
+    struct StubBashTool;
+
+    impl DispatchTool for StubBashTool {
+        fn permission_target(&self, arguments: &serde_json::Value) -> Result<String, Error> {
+            arguments
+                .get("target")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .ok_or_else(|| Error::Tool("tool target is required".into()))
+        }
+
+        fn execute(
+            &mut self,
+            _context: &agens_tools::ToolExecutionContext,
+            _arguments: serde_json::Value,
+        ) -> Result<agens_tools::ToolOutput, Error> {
+            unreachable!("test tool is never executed")
+        }
     }
 }

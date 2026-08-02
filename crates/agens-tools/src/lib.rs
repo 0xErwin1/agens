@@ -3366,15 +3366,21 @@ impl ToolDispatcher {
         self.evaluate_with_policy_override(policy, grants, session, request, false)
     }
 
-    /// Evaluates identity, arguments, target projection, and hard safety before an optional
-    /// caller-owned override of ordinary policy decisions.
+    /// Evaluates identity, arguments, target projection, and hard safety
+    /// before consulting policy.
+    ///
+    /// `unmatched_allow` never overrides a matched rule or grant decision —
+    /// a declared `deny` or `ask` stays exactly that, even when this flag is
+    /// set. It only decides what happens when nothing matched at all, which
+    /// is the same fallback role `temporary_bypass` plays in the policy
+    /// layer.
     pub fn evaluate_with_policy_override(
         &self,
         policy: &PermissionPolicy,
         grants: &[ProjectPermissionGrant],
         session: &PermissionSession,
         request: ToolDispatchRequest,
-        override_ordinary_policy: bool,
+        unmatched_allow: bool,
     ) -> Result<ToolEvaluationOutcome, Error> {
         let identity = self
             .aliases
@@ -3406,19 +3412,13 @@ impl ToolDispatcher {
             return Ok(ToolEvaluationOutcome::Denied);
         }
 
-        if override_ordinary_policy {
-            return Ok(ToolEvaluationOutcome::Authorized(AuthorizedToolCall {
-                dispatcher_id: self.dispatcher_id,
-                registration_version: registered.version,
-                identity: identity.clone(),
-                projected_target: permission.target,
-                access: permission.access,
-                arguments_digest: digest_arguments(&request.arguments),
-                arguments: request.arguments,
-            }));
-        }
-
-        match policy.evaluate(&permission, grants, session) {
+        match policy.evaluate_with_unmatched_override(
+            &permission,
+            grants,
+            &[],
+            session,
+            unmatched_allow,
+        ) {
             PermissionDecision::Deny => Ok(ToolEvaluationOutcome::Denied),
             PermissionDecision::Ask => Ok(ToolEvaluationOutcome::PromptRequired(
                 PermissionPromptContext::from_request(&permission),
@@ -4413,6 +4413,23 @@ impl NativeTools {
         }
     }
 
+    /// Runs a shell command with its working directory set to the project
+    /// root; nothing else confines it. Unlike `read`/`write`/`edit`/`grep`,
+    /// which resolve through a `*_confined` helper before touching disk, a
+    /// granted `bash` call can read or write anywhere the OS process can
+    /// reach — an absolute path, `cd ..`, or a relative `../` escapes the
+    /// project root exactly as it would in an interactive shell. This is a
+    /// deliberate, accepted property of granting `bash`, not an oversight.
+    ///
+    /// The declared guardrail against this is a target-pattern rule on the
+    /// command text, e.g. `deny bash rm -rf /**`, evaluated by
+    /// `PermissionPolicy` before this method ever runs. That guardrail is
+    /// pattern matching over a raw shell string, not a security boundary: it
+    /// does not stop `/bin/rm`, `sudo rm`, `cd foo && rm`, `xargs rm`, or any
+    /// other way to reach the same effect through different text. It also
+    /// inherits the glob's path-segment semantics documented on
+    /// `PermissionPattern::glob` — a bare `*` does not cross a `/`, so
+    /// `deny bash rm*` only catches a slash-free `rm` command.
     pub fn bash(&self, input: BashInput) -> Result<ToolOutput, Error> {
         if input.command.trim().is_empty() {
             return Ok(ToolOutput::failure("bash: command is required"));

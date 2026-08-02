@@ -470,21 +470,20 @@ fn u15_a1b2_permission_cardinality_is_exact_for_allow_ask_and_deny() {
 }
 
 /// Pins the CRITICAL fix for the TUI-launched-subagent path: a runner carrying
-/// `with_bypass(true)` must resolve an `Ask` decision to `Allow` on `runtime.authorized`
-/// without prompting, and a runner with `with_bypass(false)` must still prompt. This is the
-/// exact seam `production_tui_task_runtime_with_runner_and_parent_config` feeds and
-/// `crates/agens-tui-app/src/engine.rs`'s selected-subagent-launch runtime must be built through.
+/// `with_bypass(true)` must resolve an *unmatched* call's fallback `Ask` to `Allow` on
+/// `runtime.authorized` without prompting, and a runner with `with_bypass(false)` must still
+/// prompt. This is the exact seam `production_tui_task_runtime_with_runner_and_parent_config`
+/// feeds and `crates/agens-tui-app/src/engine.rs`'s selected-subagent-launch runtime must be
+/// built through.
+///
+/// The policy here carries no rule for `native::task` on purpose: a matched declared decision
+/// (from a static rule or a grant) now outranks bypass unconditionally, so testing the
+/// bypass-fallback wiring needs an unmatched call, exactly as `native::task` is in production
+/// unless an agent explicitly declares a rule for it.
 #[test]
 fn u15_bypass_upgrades_ask_to_allow_on_the_authorized_launch_path_and_no_bypass_still_prompts() {
     fn ask_policy() -> PermissionPolicy {
-        PermissionPolicy::new(
-            PermissionMode::Edit,
-            vec![PermissionRule::global(
-                PermissionDecision::Ask,
-                PermissionPattern::Exact("native::task".into()),
-                PermissionPattern::Any,
-            )],
-        )
+        PermissionPolicy::new(PermissionMode::Edit, Vec::new())
     }
 
     let temporary = tui_session_directory("selected-task-bypass");
@@ -579,6 +578,10 @@ fn u15_bypass_upgrades_ask_to_allow_on_the_authorized_launch_path_and_no_bypass_
 /// Pins the actual production entry point `crates/agens-tui-app/src/engine.rs` calls for the
 /// selected-subagent-launch runtime (before this fix, `production_tui_task_runtime` had no
 /// parameter to carry the session's bypass at all, so the flag could never reach `authorized`).
+///
+/// The gate's policy carries no rule for `native::task`: a matched declared decision now
+/// outranks bypass unconditionally, so this has to be an unmatched call to exercise the
+/// bypass-fallback wiring being pinned here.
 #[test]
 fn u15_the_production_wrapper_threads_its_bypass_flag_into_the_authorized_gate() {
     let temporary = tui_session_directory("selected-task-bypass-wrapper");
@@ -603,14 +606,7 @@ fn u15_the_production_wrapper_threads_its_bypass_flag_into_the_authorized_gate()
         true,
     )
     .unwrap();
-    runtime.authorized.gate.policy = PermissionPolicy::new(
-        PermissionMode::Edit,
-        vec![PermissionRule::global(
-            PermissionDecision::Ask,
-            PermissionPattern::Exact("native::task".into()),
-            PermissionPattern::Any,
-        )],
-    );
+    runtime.authorized.gate.policy = PermissionPolicy::new(PermissionMode::Edit, Vec::new());
     let call = HeadlessToolCall {
         id: "call-1".into(),
         name: "native::task".into(),
@@ -945,6 +941,12 @@ fn canonical_filesystem_reasons_survive_sanitization() {
     );
 }
 
+/// A declared policy decision now outranks the dangerous-mode fallback: the
+/// fallback only ever fires for a call that matched no static rule and no
+/// grant. `dangerous_override` used to short-circuit an ordinary declared
+/// `Deny` straight to `Authorized`; it no longer reaches a matched rule at
+/// all, so a declared `deny native::write` still denies with dangerous mode
+/// on.
 #[test]
 fn dangerous_override_never_precedes_hard_safety_or_reuses_authorization() {
     let ordinary_deny = PermissionPolicy::new(
@@ -970,7 +972,10 @@ fn dangerous_override_never_precedes_hard_safety_or_reuses_authorization() {
     );
     assert!(ordinary.result.is_ok());
     assert!(ordinary.prompts.is_empty());
-    assert_eq!(ordinary.executions, ["notes.md"]);
+    assert!(
+        ordinary.executions.is_empty(),
+        "a declared deny must survive dangerous mode, not just hard safety predicates"
+    );
 
     let hard_global_deny = PermissionPolicy::with_safety_predicates(
         PermissionMode::Edit,

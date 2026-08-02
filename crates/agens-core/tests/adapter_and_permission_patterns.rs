@@ -64,6 +64,19 @@ fn validated_target_globs_match_paths_with_documented_segment_semantics() {
 }
 
 #[test]
+fn a_bare_star_target_does_not_cross_a_slash_in_a_shell_command() {
+    let narrow = PermissionPattern::glob("rm*").expect("glob should be valid");
+    let path_aware = PermissionPattern::glob("rm -rf /**").expect("glob should be valid");
+
+    assert!(narrow.matches("rm -rf"));
+    assert!(
+        !narrow.matches("rm -rf /tmp/x"),
+        "a bare * never crosses a / even inside a command string, not just a filesystem path"
+    );
+    assert!(path_aware.matches("rm -rf /tmp/x"));
+}
+
+#[test]
 fn malformed_target_globs_are_rejected_by_the_safe_constructor() {
     for pattern in ["", "   ", "file[", "file[z-a].txt"] {
         assert!(matches!(
@@ -181,9 +194,166 @@ fn glob_rules_preserve_deny_mode_allow_grant_and_bypass_precedence() {
         ask.evaluate(&request, &[], &PermissionSession::new()),
         PermissionDecision::Ask
     );
+    // A matched `Ask` is a declaration, not a default: it must survive
+    // `temporary_bypass` rather than being silently upgraded to `Allow`.
+    // Only an *unmatched* call falls through to the bypass fallback.
     assert_eq!(
         ask.evaluate(&request, &[], &PermissionSession::with_temporary_bypass()),
+        PermissionDecision::Ask
+    );
+}
+
+#[test]
+fn a_matched_ask_survives_bypass_and_dangerous_mode_regardless_of_its_source() {
+    let tool = PermissionPattern::Exact("native::bash".into());
+    let target = PermissionPattern::Any;
+
+    for rule in [
+        PermissionRule::global(PermissionDecision::Ask, tool.clone(), target.clone()),
+        PermissionRule::project(
+            "project",
+            PermissionDecision::Ask,
+            tool.clone(),
+            target.clone(),
+        ),
+    ] {
+        let policy = PermissionPolicy::new(PermissionMode::Edit, vec![rule]);
+        let request =
+            PermissionRequest::new("project", "native::bash", "echo hi", ToolAccess::ReadOnly);
+
+        assert_eq!(
+            policy.evaluate(&request, &[], &PermissionSession::new()),
+            PermissionDecision::Ask
+        );
+        assert_eq!(
+            policy.evaluate(&request, &[], &PermissionSession::with_temporary_bypass()),
+            PermissionDecision::Ask,
+            "a matched Ask must survive bypass no matter which static-rule producer emitted it"
+        );
+        assert_eq!(
+            policy.evaluate_with_unmatched_override(
+                &request,
+                &[],
+                &[],
+                &PermissionSession::new(),
+                true,
+            ),
+            PermissionDecision::Ask,
+            "a matched Ask must survive the dangerous-mode unmatched-call fallback too"
+        );
+    }
+}
+
+#[test]
+fn precedence_matrix_matched_decisions_always_outrank_the_unmatched_call_fallback() {
+    let tool = PermissionPattern::Exact("native::write".into());
+    let target = PermissionPattern::Any;
+    let request = PermissionRequest::new("project", "native::write", "notes.md", ToolAccess::Write);
+
+    for (decision, expected) in [
+        (PermissionDecision::Allow, PermissionDecision::Allow),
+        (PermissionDecision::Deny, PermissionDecision::Deny),
+        (PermissionDecision::Ask, PermissionDecision::Ask),
+    ] {
+        let policy = PermissionPolicy::new(
+            PermissionMode::Edit,
+            vec![PermissionRule::global(
+                decision,
+                tool.clone(),
+                target.clone(),
+            )],
+        );
+
+        for session in [
+            PermissionSession::new(),
+            PermissionSession::with_temporary_bypass(),
+        ] {
+            for unmatched_allow in [false, true] {
+                assert_eq!(
+                    policy.evaluate_with_unmatched_override(
+                        &request,
+                        &[],
+                        &[],
+                        &session,
+                        unmatched_allow,
+                    ),
+                    expected,
+                    "matched {decision:?} must not move under bypass={session:?} unmatched_allow={unmatched_allow}"
+                );
+            }
+        }
+    }
+
+    let unmatched_policy = PermissionPolicy::new(PermissionMode::Edit, Vec::new());
+    let other_request =
+        PermissionRequest::new("project", "native::read", "notes.md", ToolAccess::ReadOnly);
+
+    assert_eq!(
+        unmatched_policy.evaluate_with_unmatched_override(
+            &other_request,
+            &[],
+            &[],
+            &PermissionSession::new(),
+            false,
+        ),
+        PermissionDecision::Ask
+    );
+    assert_eq!(
+        unmatched_policy.evaluate_with_unmatched_override(
+            &other_request,
+            &[],
+            &[],
+            &PermissionSession::new(),
+            true,
+        ),
         PermissionDecision::Allow
+    );
+    assert_eq!(
+        unmatched_policy.evaluate_with_unmatched_override(
+            &other_request,
+            &[],
+            &[],
+            &PermissionSession::with_temporary_bypass(),
+            false,
+        ),
+        PermissionDecision::Allow
+    );
+}
+
+#[test]
+fn a_static_rule_deny_survives_a_later_matching_project_or_session_grant() {
+    let tool = PermissionPattern::Exact("native::write".into());
+    let target = PermissionPattern::Any;
+    let policy = PermissionPolicy::new(
+        PermissionMode::Edit,
+        vec![PermissionRule::global(
+            PermissionDecision::Deny,
+            tool.clone(),
+            target.clone(),
+        )],
+    );
+    let request = PermissionRequest::new("project", "native::write", "notes.md", ToolAccess::Write);
+    let project_grant = ProjectPermissionGrant::allow("project", tool.clone(), target.clone());
+    let session_grant = ProjectPermissionGrant::allow("project", tool, target);
+
+    assert_eq!(
+        policy.evaluate(
+            &request,
+            std::slice::from_ref(&project_grant),
+            &PermissionSession::new()
+        ),
+        PermissionDecision::Deny,
+        "a persisted AllowAlways project grant must not outrank a declared deny"
+    );
+    assert_eq!(
+        policy.evaluate_with_session_grants(
+            &request,
+            &[project_grant],
+            &[session_grant],
+            &PermissionSession::new(),
+        ),
+        PermissionDecision::Deny,
+        "a persisted AllowAlways session grant must not outrank a declared deny"
     );
 }
 
