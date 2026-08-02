@@ -10,7 +10,7 @@ use agens_core::{
     HeadlessPermissionResolver, HeadlessToolCall, HeadlessTurnCancellation, HeadlessTurnError,
     HeadlessTurnPortError, Message, MessagePart, PermissionDecision, PermissionMode,
     PermissionPattern, PermissionPolicy, PermissionRule, PermissionSession, Role, TurnEvent,
-    TurnProgressSink, TurnProvider, run_headless_turn_with_max_iterations_and_progress,
+    TurnProgressSink, TurnProvider, run_isolated_headless_turn_with_max_iterations_and_progress,
 };
 use agens_providers::{
     ChatGptResponsesProvider, MoonshotProvider, OpenAiResponsesProvider, ProgressAwareProvider,
@@ -441,19 +441,20 @@ where
     .with_dangerous_override(dangerous_mode);
     let mut resolver = ChildPermissionResolver;
     let mut dispatcher = ProductionToolDispatcher::new(tool_runtime, pending);
-    let snapshot = block_on_headless_turn(run_headless_turn_with_max_iterations_and_progress(
-        &mut provider,
-        &mut gate,
-        &mut resolver,
-        &mut dispatcher,
-        &mut repository,
-        cancellation,
-        max_iterations,
-        progress,
-        None,
-    ))
-    .map_err(|_| ChildRunError::Runtime)?
-    .map_err(child_run_error)?;
+    let snapshot =
+        block_on_headless_turn(run_isolated_headless_turn_with_max_iterations_and_progress(
+            &mut provider,
+            &mut gate,
+            &mut resolver,
+            &mut dispatcher,
+            &mut repository,
+            cancellation,
+            max_iterations,
+            progress,
+            None,
+        ))
+        .map_err(|_| ChildRunError::Runtime)?
+        .map_err(child_run_error)?;
 
     Ok(snapshot
         .events()
@@ -895,6 +896,37 @@ mod tests {
     }
 
     #[test]
+    fn a_declared_ask_in_a_child_denies_and_states_the_prompt_was_unreachable() {
+        let temporary = agens_fixtures::session_directory("declared-ask-unreachable");
+        let project_root = temporary.join("project");
+
+        let output = single_call_turn(
+            &project_root,
+            &[PermissionRule::global(
+                PermissionDecision::Ask,
+                PermissionPattern::glob("bash").unwrap(),
+                PermissionPattern::Any,
+            )],
+            false,
+            "native::bash",
+            r#"{"command":"echo should-never-run > ask-marker.txt"}"#,
+        );
+
+        assert!(
+            output.contains("permission denied"),
+            "a declared ask must still deny inside a child, got: {output}"
+        );
+        assert!(
+            output.contains("could not be reached"),
+            "the denial must state that the prompt was unreachable in a subagent, \
+             not read like a plain policy deny, got: {output}"
+        );
+        assert!(!project_root.join("ask-marker.txt").exists());
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
     fn a_write_granted_agent_actually_writes_the_file() {
         let temporary = agens_fixtures::session_directory("write-granted");
         let project_root = temporary.join("project");
@@ -1013,6 +1045,45 @@ mod tests {
 
             std::fs::remove_dir_all(temporary).unwrap();
         }
+    }
+
+    #[test]
+    fn a_target_scoped_deny_with_a_wildcard_tool_pattern_still_blocks_the_matching_command() {
+        let declarations = [
+            PermissionRule::global(
+                PermissionDecision::Allow,
+                PermissionPattern::glob("bash").unwrap(),
+                PermissionPattern::Any,
+            ),
+            PermissionRule::global(
+                PermissionDecision::Deny,
+                PermissionPattern::glob("bas*").unwrap(),
+                PermissionPattern::glob("rm*").unwrap(),
+            ),
+        ];
+
+        let temporary = agens_fixtures::session_directory("targeted-wildcard-bash-deny");
+        let project_root = temporary.join("project");
+
+        let denied_output = single_call_turn(
+            &project_root,
+            &declarations,
+            false,
+            "native::bash",
+            r#"{"command":"rm -rf probe-victim.txt"}"#,
+        );
+
+        assert!(
+            denied_output.contains("permission denied"),
+            "a target-scoped deny whose tool pattern is a wildcard must still deny a matching \
+             command, got: {denied_output}"
+        );
+        assert!(
+            !project_root.join("probe-victim.txt").exists(),
+            "the denied command must never have run"
+        );
+
+        std::fs::remove_dir_all(temporary).unwrap();
     }
 
     #[test]

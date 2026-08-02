@@ -1660,6 +1660,7 @@ pub async fn run_headless_turn_with_progress(
         None,
         progress,
         attempt,
+        AskUnreachable::PromptIsReachable,
     )
     .await
 }
@@ -1709,8 +1710,63 @@ pub async fn run_headless_turn_with_max_iterations_and_progress(
         Some(max_iterations),
         progress,
         attempt,
+        AskUnreachable::PromptIsReachable,
     )
     .await
+}
+
+/// Runs an isolated child turn, where no human can be reached to answer a
+/// permission prompt: any tool call that resolves to `Ask` is answered by
+/// the child's own [`HeadlessPermissionResolver`], which denies it without
+/// ever surfacing a prompt. The rendered denial states plainly that the
+/// prompt could not be reached, so it is never mistaken for a policy
+/// `deny`.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_isolated_headless_turn_with_max_iterations_and_progress(
+    provider: &mut impl TurnProvider,
+    permission_gate: &mut impl HeadlessPermissionGate,
+    permission_resolver: &mut impl HeadlessPermissionResolver,
+    dispatcher: &mut impl HeadlessToolDispatcher,
+    repository: &mut impl CompletedTurnRepository,
+    cancellation: &HeadlessTurnCancellation,
+    max_iterations: usize,
+    progress: Option<&TurnProgressSink>,
+    attempt: Option<AttemptKey>,
+) -> Result<CompletedTurnSnapshot, HeadlessTurnError> {
+    run_headless_turn_with_iteration_limit(
+        provider,
+        permission_gate,
+        permission_resolver,
+        dispatcher,
+        repository,
+        cancellation,
+        Some(max_iterations),
+        progress,
+        attempt,
+        AskUnreachable::PromptIsUnreachable,
+    )
+    .await
+}
+
+/// Whether a call resolving to [`PermissionDecision::Ask`] can actually
+/// reach a human. An isolated child turn has no such channel: its
+/// [`HeadlessPermissionResolver`] denies every `Ask` unconditionally, so a
+/// resulting `Deny` needs its own wording rather than the generic policy
+/// denial message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AskUnreachable {
+    PromptIsReachable,
+    PromptIsUnreachable,
+}
+
+/// What a tool call's preflight permission step decided, ahead of the
+/// second pass that actually dispatches or fails it. A call that resolved
+/// `Ask` inside an isolated child turn is tracked separately from a plain
+/// `Deny`, so the two can be rendered with different wording.
+enum PreflightAuthorization {
+    InvalidArguments,
+    Decided(PermissionDecision),
+    UnreachablePromptDenial,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1724,6 +1780,7 @@ async fn run_headless_turn_with_iteration_limit(
     max_iterations: Option<usize>,
     progress: Option<&TurnProgressSink>,
     attempt: Option<AttemptKey>,
+    ask_unreachable: AskUnreachable,
 ) -> Result<CompletedTurnSnapshot, HeadlessTurnError> {
     let mut coordinator = match attempt {
         Some(key) => TurnCoordinator::for_attempt(key),
@@ -1789,7 +1846,7 @@ async fn run_headless_turn_with_iteration_limit(
             let decision = match permission_gate.evaluate(&call, cancellation).await {
                 Ok(decision) => decision,
                 Err(HeadlessTurnPortError::Tool) => {
-                    preflight.push((call, None));
+                    preflight.push((call, PreflightAuthorization::InvalidArguments));
                     continue;
                 }
                 Err(error) => {
@@ -1800,6 +1857,7 @@ async fn run_headless_turn_with_iteration_limit(
                     ));
                 }
             };
+            let asked = decision == PermissionDecision::Ask;
             check_cancelled(&mut coordinator, cancellation)?;
             let decision = resolve_permission_decision(
                 decision,
@@ -1811,29 +1869,48 @@ async fn run_headless_turn_with_iteration_limit(
             .await?;
             check_cancelled(&mut coordinator, cancellation)?;
 
-            preflight.push((call, Some(decision)));
+            let authorization = if asked
+                && decision == PermissionDecision::Deny
+                && ask_unreachable == AskUnreachable::PromptIsUnreachable
+            {
+                PreflightAuthorization::UnreachablePromptDenial
+            } else {
+                PreflightAuthorization::Decided(decision)
+            };
+            preflight.push((call, authorization));
         }
 
-        for (call, decision) in preflight {
+        for (call, authorization) in preflight {
             check_cancelled(&mut coordinator, cancellation)?;
             flush_progress(&coordinator, progress, &mut progress_cursor);
 
-            let output = match decision {
-                None => HeadlessToolOutput::failure("invalid tool arguments"),
-                Some(PermissionDecision::Allow) => dispatcher
+            let output = match authorization {
+                PreflightAuthorization::InvalidArguments => {
+                    HeadlessToolOutput::failure("invalid tool arguments")
+                }
+                PreflightAuthorization::Decided(PermissionDecision::Allow) => dispatcher
                     .dispatch(call.clone(), cancellation)
                     .await
                     .map_err(|error| {
                         finish_port_error(&mut coordinator, error, HeadlessTurnError::Tool)
                     })?,
-                Some(PermissionDecision::Deny) => {
+                PreflightAuthorization::Decided(PermissionDecision::Deny) => {
                     let output = HeadlessToolOutput::failure("permission denied");
                     match permission_gate.denial_facts(&call) {
                         Some(facts) => output.with_facts(facts),
                         None => output,
                     }
                 }
-                Some(PermissionDecision::Ask) => {
+                PreflightAuthorization::UnreachablePromptDenial => {
+                    let output = HeadlessToolOutput::failure(
+                        "permission denied: the approval prompt could not be reached in a subagent",
+                    );
+                    match permission_gate.denial_facts(&call) {
+                        Some(facts) => output.with_facts(facts),
+                        None => output,
+                    }
+                }
+                PreflightAuthorization::Decided(PermissionDecision::Ask) => {
                     return Err(permission_required(&mut coordinator));
                 }
             };

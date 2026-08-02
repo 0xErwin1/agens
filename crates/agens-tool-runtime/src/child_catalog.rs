@@ -57,10 +57,7 @@ pub fn resolve_child_surface(
     let normalized_declarations = declarations
         .iter()
         .cloned()
-        .map(|mut declaration| {
-            declaration.tool = normalize_declared_tool(declaration.tool, &metadata);
-            declaration
-        })
+        .flat_map(|declaration| normalize_declared_tool(declaration, &metadata))
         .collect::<Vec<_>>();
 
     let tools = metadata
@@ -97,43 +94,32 @@ fn declaration_names_tool(declaration: &PermissionRule, entry: &NativeToolMetada
     declaration.tool.matches(&entry.qualified_name) || declaration.tool.matches(bare)
 }
 
-/// A dispatched child call carries its tool identity fully qualified
-/// (`native::write`), but a declaration written in an agent's markdown names
-/// it bare (`write`) — the same short form the parent path resolves through
+/// A dispatched child call carries its tool identity fully qualified and
+/// further encoded by the dispatcher (`native:4:bash`), but a declaration
+/// written in an agent's markdown names it bare (`write`) or qualified
+/// (`native::write`) — the short forms the parent path resolves through
 /// `EffectiveCapabilitySet::from_agent`'s dispatcher-backed alias lookup.
-/// Mirrors that resolution here so a literal declared name matches the
-/// qualified identity the policy actually evaluates against; a genuine
-/// wildcard is left untouched; a wildcard is matched directly against the
-/// already-qualified identity string at evaluation time.
+/// A tool pattern, literal or wildcard, is matched here against the same
+/// bare/qualified forms `declaration_names_tool` uses for catalog omission
+/// and against the same forms the load-time diagnostic checks, then expanded
+/// into one concrete `Exact` rule per matched native tool. This is the only
+/// normalization a declared tool pattern needs: the dispatcher's own alias
+/// lookup then carries an `Exact(qualified_name)` the rest of the way to the
+/// identity string policy evaluation actually compares against. A raw
+/// `Glob` tool pattern is never retained past this point, because it can
+/// never be compared against that identity string directly.
 fn normalize_declared_tool(
-    pattern: PermissionPattern,
+    declaration: PermissionRule,
     metadata: &[NativeToolMetadata],
-) -> PermissionPattern {
-    let literal = match &pattern {
-        PermissionPattern::Glob(_) if pattern.glob_source().is_some_and(is_literal_glob) => {
-            pattern.glob_source().map(ToOwned::to_owned)
-        }
-        _ => None,
-    };
-    let Some(literal) = literal else {
-        return pattern;
-    };
-
+) -> Vec<PermissionRule> {
     metadata
         .iter()
-        .find(|entry| {
-            let bare = entry
-                .qualified_name
-                .strip_prefix("native::")
-                .unwrap_or(entry.qualified_name.as_str());
-            literal == entry.qualified_name || literal == bare
+        .filter(|entry| declaration_names_tool(&declaration, entry))
+        .map(|entry| PermissionRule {
+            tool: PermissionPattern::Exact(entry.qualified_name.clone()),
+            ..declaration.clone()
         })
-        .map(|entry| PermissionPattern::Exact(entry.qualified_name.clone()))
-        .unwrap_or(pattern)
-}
-
-fn is_literal_glob(pattern: &str) -> bool {
-    !pattern.contains(['*', '?', '[', ']', '{', '}'])
+        .collect()
 }
 
 fn declaration_tool_label(pattern: &PermissionPattern) -> String {
