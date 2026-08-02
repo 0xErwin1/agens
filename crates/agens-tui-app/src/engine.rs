@@ -445,8 +445,9 @@ pub fn run_tui_prompt_with(
         if let Some(skills) = skills {
             let base = match request.system_prompt.take() {
                 Some(explicit) => explicit,
-                None => tui_turn_system_prompt(&session, bootstrap)?
-                    .unwrap_or_else(|| "You are Agens, a helpful coding agent.".into()),
+                None => agens_core::prompt::base_system_prompt(
+                    tui_turn_system_prompt(&session, bootstrap)?.as_deref(),
+                ),
             };
             request.system_prompt = Some(parent_skill_system_prompt(&base, &skills));
         }
@@ -1103,6 +1104,45 @@ mod tests {
                 .list_sessions()
                 .unwrap(),
             saved_sessions
+        );
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn an_unconfigured_skills_turn_still_starts_from_the_built_in_base_prompt() {
+        let temporary = tui_session_directory("skills-base-prompt");
+        let bootstrap = tui_session_bootstrap(&temporary, &[]);
+        let session = Arc::new(Mutex::new(SessionContext::fresh()));
+        let skills = Some(Arc::new(SkillCatalog::default()));
+        let captured_system_prompt = std::cell::RefCell::new(None);
+
+        let result = run_tui_prompt_with(&bootstrap, "prompt", &session, skills, |request| {
+            *captured_system_prompt.borrow_mut() = request.system_prompt.clone();
+            Ok(HeadlessChatCompletion {
+                text: "captured".into(),
+                metadata: SessionMetadata {
+                    id: 1,
+                    project: tui_project(&temporary),
+                    title: "conversation".into(),
+                    active_agent: "primary".into(),
+                    provider_id: None,
+                    model_id: None,
+                    reasoning_effort: None,
+                    created_at: 1,
+                    updated_at: 1,
+                    completed_turn_count: 1,
+                    resumable: true,
+                },
+                messages: Vec::new(),
+            })
+        });
+
+        assert!(result.is_ok());
+        assert_eq!(
+            captured_system_prompt.into_inner().as_deref(),
+            Some(agens_core::prompt::BASE_SYSTEM_PROMPT),
+            "an unconfigured skills-branch turn must send the built-in base prompt verbatim"
         );
 
         std::fs::remove_dir_all(temporary).unwrap();

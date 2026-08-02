@@ -459,9 +459,21 @@ fn a_headless_turns_own_system_prompt_is_unchanged_when_no_agents_md_exists() {
 fn primary_task_instruction_requires_explicit_delegation_and_is_idempotent() {
     let prompt = explicit_task_delegation_prompt("Base instructions.");
 
-    assert_eq!(
-        prompt,
-        "Base instructions.\n\nWhen the user explicitly asks for subagent delegation, use the `task` tool instead of completing the delegated work inline. Use `task_control` to inspect, background, or cancel a live execution and `task_message` to send bounded coordination without waiting for completion."
+    assert!(
+        prompt.starts_with(
+            "Base instructions.\n\nWhen the user explicitly asks for subagent delegation, use \
+             the `task` tool instead of completing the delegated work inline. Use \
+             `task_control` to inspect, background, or cancel a live execution and \
+             `task_message` to send bounded coordination without waiting for completion."
+        ),
+        "the routing instruction must still open the appended block: {prompt}"
+    );
+    assert!(
+        prompt.contains(
+            "Subagent delegation is a routing decision, not a search for an agent that happens \
+             to work."
+        ),
+        "the delegation discipline text must be appended in the same block: {prompt}"
     );
     assert_eq!(explicit_task_delegation_prompt(&prompt), prompt);
 }
