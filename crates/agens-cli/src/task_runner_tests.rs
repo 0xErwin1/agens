@@ -8,6 +8,7 @@
 use std::sync::{Arc, Mutex};
 
 use agens_bus::BridgeTx;
+use agens_core::ask_user::UnavailableAskUserPort;
 use agens_core::{
     HeadlessTaskTerminal, HeadlessToolOutput, HeadlessTurnCancellation, HeadlessTurnError,
     MessagePart, PermissionDecision, PermissionMode, PermissionPattern, PermissionPolicy,
@@ -86,6 +87,7 @@ fn p1c1_terminal_observer_excludes_non_completed_matrix() {
                 Arc::new(Mutex::new(Vec::new())),
             )
             .with_lifecycle_bridge(lifecycle_bridge),
+            Box::new(UnavailableAskUserPort),
         )
         .unwrap();
         runtime.authorized.gate.policy = PermissionPolicy::new(
@@ -171,6 +173,7 @@ fn u15_a1b2_selected_launch_uses_the_registered_production_task_runner() {
             agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap),
             Arc::clone(&probe),
         ),
+        Box::new(UnavailableAskUserPort),
     )
     .unwrap();
     let session = Arc::new(Mutex::new(SessionContext {
@@ -276,6 +279,7 @@ fn p1c1_p1b_authorized_runner_persists_one_completed_subagent_turn() {
             ],
         )
         .with_lifecycle_bridge(lifecycle_bridge),
+        Box::new(UnavailableAskUserPort),
     )
     .unwrap();
     runtime.authorized.gate.policy = PermissionPolicy::new(
@@ -537,6 +541,7 @@ fn production_runner_error_publication_orders_sanitized_typed_failure_before_ter
                 "provider-token=super-secret-error-detail",
             )
             .with_lifecycle_bridge(lifecycle_bridge),
+            Box::new(UnavailableAskUserPort),
         )
         .unwrap();
         runtime.authorized.gate.policy = PermissionPolicy::new(

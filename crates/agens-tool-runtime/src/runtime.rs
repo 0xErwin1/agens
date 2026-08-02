@@ -7,9 +7,10 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use agens_config::{SubagentSettings, ToolLimitSettings};
+use agens_core::ask_user::{AskUserPort, UnavailableAskUserPort};
 use agens_providers::OpenAiFunctionTool;
 use agens_tools::{
-    NativeToolCatalog, NativeTools, SkillCatalog, SkillResourceTool, TaskControlTool,
+    AskUserTool, NativeToolCatalog, NativeTools, SkillCatalog, SkillResourceTool, TaskControlTool,
     TaskExecutionRegistry, TaskMessageSource, TaskMessageTool, TaskRunner, ToolDispatcher,
 };
 
@@ -123,6 +124,33 @@ pub fn production_tool_runtime_with_parent_task_runner<R: TaskRunner>(
     model_resolution_reference: Option<String>,
     task_runner: R,
 ) -> Result<(Vec<OpenAiFunctionTool>, SharedToolDispatcher), CliError> {
+    production_tool_runtime_with_parent_task_runner_and_ask_user(
+        bootstrap,
+        project_root,
+        skills,
+        parent_model,
+        parent_request_config,
+        model_resolution_reference,
+        task_runner,
+        Box::new(UnavailableAskUserPort),
+    )
+}
+
+/// Same as [`production_tool_runtime_with_parent_task_runner`], but lets the caller supply the
+/// `ask_user` port instead of always defaulting to [`UnavailableAskUserPort`]. Kept as a
+/// separate function rather than adding a parameter to the existing one, so every one of that
+/// function's ~20 existing callers keeps compiling unchanged.
+#[allow(clippy::too_many_arguments)]
+pub fn production_tool_runtime_with_parent_task_runner_and_ask_user<R: TaskRunner>(
+    bootstrap: &Bootstrap,
+    project_root: &Path,
+    skills: Option<&SkillCatalog>,
+    parent_model: String,
+    parent_request_config: agens_core::RequestConfig,
+    model_resolution_reference: Option<String>,
+    task_runner: R,
+    ask_user: Box<dyn AskUserPort>,
+) -> Result<(Vec<OpenAiFunctionTool>, SharedToolDispatcher), CliError> {
     agens_callcount::note_tool_runtime_build();
 
     let native_catalog = Arc::new(Mutex::new(NativeToolCatalog::new(open_native_tools(
@@ -179,6 +207,23 @@ pub fn production_tool_runtime_with_parent_task_runner<R: TaskRunner>(
             "native::skill",
             agens_core::ToolAccess::ReadOnly,
             SkillResourceTool::new(skills.clone()),
+        )
+        .map_err(|_| CliError::configuration("tool catalog is invalid"))?;
+
+    provider_tools.insert(
+        "ask_user".into(),
+        OpenAiFunctionTool::new(
+            "ask_user",
+            "Ask the person at the terminal one or more bounded structured questions",
+            AskUserTool::input_schema(),
+        )
+        .map_err(|_| CliError::configuration("ask_user tool is unavailable"))?,
+    );
+    dispatcher
+        .register_native(
+            "native::ask_user",
+            agens_core::ToolAccess::ReadOnly,
+            AskUserTool::new(ask_user),
         )
         .map_err(|_| CliError::configuration("tool catalog is invalid"))?;
 
@@ -702,6 +747,203 @@ mod tests {
         assert_eq!(dispatcher.canonical_identity("native::task"), None);
         drop(dispatcher);
         std::fs::remove_dir_all(override_temporary).unwrap();
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn ask_user_has_exactly_one_provider_definition_named_ask_user_not_native_prefixed() {
+        let temporary = tui_session_directory("ask-user-provider-definition");
+        let bootstrap = tui_session_bootstrap(&temporary, &[]);
+        let project_root = agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap);
+
+        let (provider_tools, dispatcher) = production_tool_runtime_for_parent(
+            &bootstrap,
+            &project_root,
+            Some(&SkillCatalog::default()),
+            "gpt-4.1".to_owned(),
+            agens_core::RequestConfig::default(),
+            None,
+        )
+        .unwrap();
+
+        let matches: Vec<_> = provider_tools
+            .iter()
+            .filter(|tool| tool.name() == "ask_user")
+            .collect();
+        assert_eq!(
+            matches.len(),
+            1,
+            "exactly one provider tool must be named ask_user, saw {:?}",
+            provider_tools
+                .iter()
+                .map(|tool| tool.name())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            provider_tools
+                .iter()
+                .all(|tool| tool.name() != "native::ask_user"),
+            "the provider-visible name must have the native:: prefix stripped"
+        );
+        assert!(
+            dispatcher
+                .lock()
+                .unwrap()
+                .canonical_identity("native::ask_user")
+                .is_some(),
+            "the dispatch identity native::ask_user must be registered"
+        );
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    /// `hard_safety_allows` denies a `ToolAccess::Write` tool outright in `PermissionMode::Chat`
+    /// regardless of any matching rule. Proving a matching Allow rule still authorizes
+    /// `native::ask_user` under Chat mode is therefore proof the tool is registered
+    /// `ToolAccess::ReadOnly`, since a `Write` registration would be hard-denied here even with
+    /// the rule present.
+    #[test]
+    fn ask_user_is_registered_read_only_and_survives_chat_mode_hard_safety() {
+        let temporary = tui_session_directory("ask-user-read-only-classification");
+        let bootstrap = tui_session_bootstrap(&temporary, &[]);
+        let project_root = agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap);
+
+        let (_, dispatcher) = production_tool_runtime_for_parent(
+            &bootstrap,
+            &project_root,
+            Some(&SkillCatalog::default()),
+            "gpt-4.1".to_owned(),
+            agens_core::RequestConfig::default(),
+            None,
+        )
+        .unwrap();
+
+        let policy = PermissionPolicy::new(
+            PermissionMode::Chat,
+            vec![PermissionRule::global(
+                PermissionDecision::Allow,
+                PermissionPattern::Exact("native::ask_user".into()),
+                PermissionPattern::Any,
+            )],
+        );
+        let outcome = dispatcher
+            .lock()
+            .unwrap()
+            .evaluate(
+                &policy,
+                &[],
+                &PermissionSession::new(),
+                ToolDispatchRequest::new("project", "native::ask_user", serde_json::json!({})),
+            )
+            .unwrap();
+
+        assert!(
+            matches!(outcome, ToolEvaluationOutcome::Authorized(_)),
+            "a ReadOnly tool with a matching Allow rule must not be hard-denied in Chat mode, saw {outcome:?}"
+        );
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn ask_user_default_wiring_yields_unavailable_without_blocking() {
+        let temporary = tui_session_directory("ask-user-default-unavailable");
+        let bootstrap = tui_session_bootstrap(&temporary, &[]);
+        let project_root = agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap);
+
+        let (_, dispatcher) = production_tool_runtime_for_parent(
+            &bootstrap,
+            &project_root,
+            Some(&SkillCatalog::default()),
+            "gpt-4.1".to_owned(),
+            agens_core::RequestConfig::default(),
+            None,
+        )
+        .unwrap();
+
+        let policy = PermissionPolicy::new(PermissionMode::Edit, vec![]);
+        let cancellation = HeadlessTurnCancellation::new();
+        let context = ToolExecutionContext::from_headless_adapter(cancellation.adapter_view());
+        let mut dispatcher = dispatcher.lock().unwrap();
+        let ToolEvaluationOutcome::Authorized(handle) = dispatcher
+            .evaluate(
+                &policy,
+                &[],
+                &PermissionSession::with_temporary_bypass(),
+                ToolDispatchRequest::new(
+                    "project",
+                    "native::ask_user",
+                    serde_json::json!({
+                        "questions": [{
+                            "id": "q",
+                            "prompt": "p",
+                            "mode": "single",
+                            "options": [{"id": "a", "label": "A"}]
+                        }]
+                    }),
+                ),
+            )
+            .unwrap()
+        else {
+            panic!("ask_user should authorize under a bypassed session");
+        };
+
+        let output = dispatcher.execute(handle, &context).unwrap();
+        assert!(!output.is_error);
+        assert_eq!(
+            output.content,
+            "{\"status\":\"unavailable\",\"reason\":\"no interactive surface\"}"
+        );
+    }
+
+    #[test]
+    fn ask_user_is_absent_from_every_child_runtime() {
+        let temporary = tui_session_directory("ask-user-absent-from-child-runtimes");
+        let project_root = temporary.join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+
+        let (read_only_tools, read_only_dispatcher) =
+            production_read_only_tool_runtime(&project_root, ToolLimitSettings::default()).unwrap();
+        assert!(read_only_tools.iter().all(|tool| tool.name() != "ask_user"));
+        assert!(
+            read_only_dispatcher
+                .lock()
+                .unwrap()
+                .canonical_identity("native::ask_user")
+                .is_none()
+        );
+
+        let (dangerous_tools, dangerous_dispatcher) =
+            production_dangerous_child_tool_runtime(&project_root, ToolLimitSettings::default())
+                .unwrap();
+        assert!(dangerous_tools.iter().all(|tool| tool.name() != "ask_user"));
+        assert!(
+            dangerous_dispatcher
+                .lock()
+                .unwrap()
+                .canonical_identity("native::ask_user")
+                .is_none()
+        );
+
+        let task_registry = TaskExecutionRegistry::new();
+        let execution_id = task_registry.admit(TaskLaunchMode::Foreground).unwrap();
+        let (child_tools, child_dispatcher) = production_child_tool_runtime(
+            &project_root,
+            ToolLimitSettings::default(),
+            false,
+            task_registry,
+            execution_id,
+        )
+        .unwrap();
+        assert!(child_tools.iter().all(|tool| tool.name() != "ask_user"));
+        assert!(
+            child_dispatcher
+                .lock()
+                .unwrap()
+                .canonical_identity("native::ask_user")
+                .is_none()
+        );
 
         std::fs::remove_dir_all(temporary).unwrap();
     }

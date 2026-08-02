@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use agens_bus::BridgeTx;
+use agens_core::ask_user::UnavailableAskUserPort;
 use agens_core::{
     HeadlessTurnCancellation, HeadlessTurnPortError, Message, MessagePart, PermissionDecision,
     PermissionMode, PermissionPattern, PermissionPolicy, PermissionRule, Role, TurnEvent,
@@ -202,6 +203,7 @@ fn p1c3_completed_background_subagent_notifies_the_next_main_turn() {
             Vec::new(),
         )
         .with_lifecycle_bridge(lifecycle_bridge),
+        Box::new(UnavailableAskUserPort),
     )
     .unwrap();
     runtime.authorized.gate.policy = PermissionPolicy::new(

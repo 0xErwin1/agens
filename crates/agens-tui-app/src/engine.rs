@@ -5,6 +5,7 @@
 use std::sync::{Arc, Mutex};
 
 use agens_core::SubmitOrigin;
+use agens_core::ask_user::UnavailableAskUserPort;
 use agens_core::{HeadlessTurnCancellation, HeadlessTurnError, PermissionMode, TurnProgressSink};
 use agens_tools::{
     CommandCatalog, SkillCatalog, TaskExecutionRegistry, TaskMessageSource, TaskMessageTarget,
@@ -277,6 +278,7 @@ pub fn run_production_tui_with_profile_store(
                 task_parent_request_config.clone(),
                 task_diagnostic_reference.clone(),
                 session_bypass,
+                Box::new(UnavailableAskUserPort),
             ) {
                 Ok(runtime) => runtime,
                 Err(error) => return tui_provider_outcome(Err(error)),
@@ -327,6 +329,7 @@ pub fn run_production_tui_with_profile_store(
                         .with_bypass(request.dangerously_allow_all),
                         task_parent_request_config.clone(),
                         Some(task_diagnostic_reference.clone()),
+                        Box::new(UnavailableAskUserPort),
                     )?;
                     run_production_headless_chat_with_progress(
                         request,
