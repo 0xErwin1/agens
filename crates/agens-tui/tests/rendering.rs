@@ -591,7 +591,7 @@ fn bottom_chrome_bands_share_one_gutter_and_the_composer_keeps_both_edges_free()
     }
 
     assert_eq!(
-        rendered_column(&renderer, "Tab focus"),
+        rendered_column(&renderer, "↑↓ walk"),
         usize::from(CHROME_GUTTER),
         "the subagent tree starts at the shared gutter"
     );
@@ -632,7 +632,7 @@ fn responsive_layout_saturates_heights_one_through_six() {
         assert!(!text.contains("agens safe"), "height {height}: {text:?}");
         if height >= 12 {
             assert!(
-                text.contains("Ready") || text.contains("gpt"),
+                text.contains("model —") || text.contains("gpt"),
                 "height {height}: expected footer metrics: {text:?}"
             );
         }
@@ -683,9 +683,11 @@ fn conversational_surface_uses_full_width_and_moves_context_to_footer() {
             assert!(text.contains("gpt-4.1"), "footer model: {text:?}");
             assert!(text.contains("high"), "footer effort: {text:?}");
             assert!(text.contains("agens"), "footer project basename: {text:?}");
-            assert!(text.contains("8/128"), "footer usage: {text:?}");
             assert!(text.contains("6%"), "footer context share: {text:?}");
-            assert!(text.contains("Ready"), "{text:?}");
+            assert!(
+                !text.contains("8/128"),
+                "counts wait for pressure: {text:?}"
+            );
             assert!(!text.contains("Enter send"), "{text:?}");
         }
     }
@@ -706,11 +708,24 @@ fn footer_shows_compact_tokens_used_over_window_without_header_ctx() {
     renderer.render(tui.view()).unwrap();
     let text = rendered_text(&renderer);
 
-    assert!(text.contains("15/8.2k"), "{text:?}");
+    // Well below pressure, the share is the whole answer and the raw counts
+    // stay out of the border.
     assert!(text.contains("0%"), "{text:?}");
+    assert!(!text.contains("15/8.2k"), "{text:?}");
     assert!(!text.contains("ctx 15/8192"), "{text:?}");
     assert!(!text.contains("context 8192"), "{text:?}");
     assert!(!text.contains("unavailable"), "{text:?}");
+
+    tui.apply_runtime_event(TuiRuntimeEvent::Usage(Usage {
+        input_tokens: Some(7_000),
+        output_tokens: Some(5),
+        total_tokens: Some(7_000),
+        context_window: Some(8_192),
+    }));
+    renderer.render(tui.view()).unwrap();
+    let pressed = rendered_text(&renderer);
+    assert!(pressed.contains("85%"), "{pressed:?}");
+    assert!(pressed.contains("7.0k/8.2k"), "{pressed:?}");
 }
 
 #[test]
@@ -727,9 +742,7 @@ fn footer_keeps_five_fields_and_usage_across_submission_start() {
     renderer.render(tui.view()).unwrap();
     let before_usage = rendered_text(&renderer);
     assert!(
-        before_usage.contains(
-            "gpt-4.1 · high ·    0/200k   0% · tools hidden ^O · ~/d/p/agens · ask ^⇧P · Ready"
-        ),
+        before_usage.contains("gpt-4.1 (high) ·   0% · ~/d/p/agens · ask"),
         "{before_usage:?}"
     );
     assert!(!before_usage.contains("model · default · ctx —"));
@@ -749,7 +762,7 @@ fn footer_keeps_five_fields_and_usage_across_submission_start() {
     renderer.render(tui.view()).unwrap();
     let next_turn = rendered_text(&renderer);
     assert!(
-        next_turn.contains("gpt-4.1 · high ·  71k/200k  36% · tools hidden ^O · ~/d/p/agens"),
+        next_turn.contains("gpt-4.1 (high) ·  36% · ~/d/p/agens"),
         "{next_turn:?}"
     );
 }
@@ -762,7 +775,7 @@ fn footer_uses_explicit_fallbacks_without_inventing_values() {
     renderer.render(tui.view()).unwrap();
     let text = rendered_text(&renderer);
 
-    assert!(text.contains("model — · effort — · ctx —"), "{text:?}");
+    assert!(text.contains("model — · ctx —"), "{text:?}");
     assert!(!text.contains("model · default · ctx —"), "{text:?}");
 }
 
@@ -778,8 +791,9 @@ fn active_status_glyph_advances_with_tick_and_idle_stays_static() {
     renderer.render(tui.view()).unwrap();
     let idle_later = rendered_text(&renderer);
 
-    assert!(idle_early.contains("Ready"), "{idle_early:?}");
-    assert!(idle_later.contains("Ready"), "{idle_later:?}");
+    // Idle is the absence of news; the footer keeps the slot empty for it.
+    assert!(!idle_early.contains("Ready"), "{idle_early:?}");
+    assert!(!idle_later.contains("Ready"), "{idle_later:?}");
     assert!(!idle_early.contains("⠋"), "{idle_early:?}");
     assert!(!idle_later.contains("⠼"), "{idle_later:?}");
     assert_eq!(
@@ -901,7 +915,9 @@ fn a_settled_turn_keeps_what_it_took_and_what_it_billed() {
     let rendered = rendered_text(&renderer);
 
     assert!(rendered.contains("14s"), "{rendered:?}");
-    assert!(rendered.contains("3.2k tok in"), "{rendered:?}");
+    // Two rounds of 1.2k and 2.0k prompt tokens are one 2.0k conversation, not
+    // a 3.2k one: the second round resent the first.
+    assert!(rendered.contains("2.0k tok context"), "{rendered:?}");
     assert!(rendered.contains("1.0k tok out"), "{rendered:?}");
 }
 
@@ -1046,7 +1062,7 @@ fn composer_dock_and_footer_degrade_without_detached_bands() {
         );
         if expects_footer {
             assert!(
-                text.contains("Ready") || text.contains("Responding"),
+                text.contains("model —") || text.contains("Responding"),
                 "height {height}: expected operational footer: {text:?}"
             );
         }
@@ -2319,7 +2335,7 @@ fn the_tree_offers_cancel_only_over_a_running_branch_and_the_key_cancels_it() {
     );
 
     tui.handle(Event::Key(Key::Escape));
-    tui.handle(Event::Key(Key::Char('l')));
+    tui.handle(Event::Key(Key::Char(']')));
     assert_eq!(tui.view().active_transcript, TranscriptId::Subagent(9));
 
     renderer.render(tui.view()).unwrap();
@@ -2387,13 +2403,13 @@ fn subagent_tree_renders_below_the_composer_and_owns_the_navigation_hints() {
     assert!(!text.contains("secret-child-input"), "{text:?}");
 
     assert_eq!(
-        text.matches("Tab focus · Enter inspect · Ctrl+B background")
+        text.matches("↑↓ walk · Enter inspect · Ctrl+B background")
             .count(),
         1,
         "the navigation hints live with the tree only: {text:?}"
     );
     let body_row = rendered_row(&renderer, "assistant body");
-    let tree_row = rendered_row(&renderer, "Tab focus");
+    let tree_row = rendered_row(&renderer, "↑↓ walk");
     let footer_row = rendered_row(&renderer, "model —");
     assert!(
         body_row < footer_row && footer_row < tree_row,
@@ -2455,7 +2471,7 @@ fn narrow_terminals_elide_long_summaries_on_a_word_boundary_instead_of_slicing_t
         "a tree branch label is elided instead of sliced: {text:?}"
     );
     assert!(
-        text.contains("Tab focus · Enter inspect…"),
+        text.contains("↑↓ walk · Enter inspect…"),
         "the tree affordance row is elided instead of sliced: {text:?}"
     );
 }
@@ -3196,7 +3212,7 @@ fn restored_history_scroll_stays_fixed_while_streaming_and_end_resumes_follow() 
 
     // The top of a long transcript is the elision row, not its oldest turn:
     // scrolling there is exactly where the key that unfolds it has to be found.
-    tui.handle(Event::Key(Key::Home));
+    tui.handle(Event::Key(Key::CtrlG));
     renderer.render(tui.view()).unwrap();
     let top = rendered_text(&renderer);
     assert!(!top.contains("restored-user-00"), "{top:?}");
@@ -3204,12 +3220,12 @@ fn restored_history_scroll_stays_fixed_while_streaming_and_end_resumes_follow() 
     assert!(!tui.following_bottom());
 
     tui.handle(Event::Key(Key::CtrlY));
-    tui.handle(Event::Key(Key::Home));
+    tui.handle(Event::Key(Key::CtrlG));
     renderer.render(tui.view()).unwrap();
     assert!(rendered_text(&renderer).contains("restored-user-00"));
     assert!(!tui.following_bottom());
 
-    tui.handle(Event::Key(Key::End));
+    tui.handle(Event::Key(Key::CtrlShiftG));
     renderer.render(tui.view()).unwrap();
     assert!(rendered_text(&renderer).contains("streaming-line-19"));
     assert!(tui.following_bottom());
@@ -3637,6 +3653,7 @@ fn subagent_inspect_dialog_renders_through_the_overlay_shell() {
 
     tui.handle(Event::Key(Key::Escape));
     tui.handle(Event::Key(Key::Char('g')));
+    tui.handle(Event::Key(Key::Char('t')));
     renderer.render(tui.view()).unwrap();
     let inspect = rendered_text(&renderer);
 
@@ -4009,12 +4026,19 @@ fn physical_cursor_follows_main_composer_focus_and_overlay_ownership() {
     renderer.render(tui.view()).unwrap();
     assert!(renderer.terminal().backend().cursor_visible());
 
+    // Scrolling reads the transcript without leaving the prompt, so the cursor
+    // stays where the typing still goes.
     tui.handle(Event::Key(Key::PageUp));
     for _ in 0..3 {
         renderer.render(tui.view()).unwrap();
-        assert!(!renderer.terminal().backend().cursor_visible());
+        assert!(renderer.terminal().backend().cursor_visible());
     }
     tui.handle(Event::Key(Key::ScrollUp));
+    renderer.render(tui.view()).unwrap();
+    assert!(renderer.terminal().backend().cursor_visible());
+
+    // Focusing the transcript does leave it, and takes the cursor with it.
+    tui.handle(Event::Key(Key::Escape));
     renderer.render(tui.view()).unwrap();
     assert!(!renderer.terminal().backend().cursor_visible());
 
@@ -4659,7 +4683,8 @@ fn structural_pty_resize_scroll_stream_and_dialog_contract() {
     assert!(!streamed.contains("streamed-after-scroll-sentinel") || !tui.following_bottom());
     assert!(!tui.following_bottom());
 
-    tui.handle(Event::Key(Key::End));
+    // End edits the prompt; re-following the stream is the composer-safe jump.
+    tui.handle(Event::Key(Key::CtrlShiftG));
     let refollowed = harness.render(&tui);
     assert!(refollowed.contains("streamed-after-scroll-sentinel"));
     assert!(tui.following_bottom());
@@ -4768,7 +4793,7 @@ fn active_transcript_render_keeps_child_rows_out_of_main_and_renders_owner_navig
     let child = rendered_text(&renderer);
     assert!(child.contains("Subagent 7 · reviewer"), "{child:?}");
     assert!(
-        child.contains("g select · m Main · h/l sibling"),
+        child.contains("gt select · m Main · [/] sibling"),
         "{child:?}"
     );
     assert!(
@@ -4867,15 +4892,15 @@ fn reserved_bottom_chrome_parks_the_composer_and_keeps_it_stable() {
         "notices and the subagent tree must not move the composer"
     );
     let notice_row = rendered_row(&renderer, "notice-sentinel") as u16;
-    let tree_row = rendered_row(&renderer, "Tab focus") as u16;
+    let tree_row = rendered_row(&renderer, "↑↓ walk") as u16;
     let footer_row = rendered_row(&renderer, "model —") as u16;
     assert_eq!(
         footer_row, idle_bottom,
         "the metadata stays glued to the composer border"
     );
     assert!(
-        idle_bottom < notice_row && notice_row < tree_row,
-        "bottom chrome order below the composer is notice then tree: {notice_row} {tree_row}"
+        idle_bottom < tree_row && tree_row < notice_row,
+        "bottom chrome order below the composer is tree then notice: {tree_row} {notice_row}"
     );
 
     tui.handle(Event::Key(Key::Escape));
@@ -4898,7 +4923,7 @@ fn tree_affordance_advertises_background_only_while_a_branch_runs_in_foreground(
 
     renderer.render(tui.view()).unwrap();
     assert!(
-        rendered_text(&renderer).contains("Tab focus · Enter inspect · Ctrl+B background"),
+        rendered_text(&renderer).contains("↑↓ walk · Enter inspect · Ctrl+B background"),
         "a foreground branch can still be backgrounded: {:?}",
         rendered_text(&renderer)
     );
@@ -4910,7 +4935,7 @@ fn tree_affordance_advertises_background_only_while_a_branch_runs_in_foreground(
     renderer.render(tui.view()).unwrap();
     let backgrounded = rendered_text(&renderer);
     assert!(
-        backgrounded.contains("Tab focus · Enter inspect"),
+        backgrounded.contains("↑↓ walk · Enter inspect"),
         "focus and inspect always apply: {backgrounded:?}"
     );
     assert!(
@@ -4921,7 +4946,7 @@ fn tree_affordance_advertises_background_only_while_a_branch_runs_in_foreground(
     start_execution(&mut tui, 10, "plan");
     renderer.render(tui.view()).unwrap();
     assert!(
-        rendered_text(&renderer).contains("Tab focus · Enter inspect · Ctrl+B background"),
+        rendered_text(&renderer).contains("↑↓ walk · Enter inspect · Ctrl+B background"),
         "a new foreground branch brings the hint back: {:?}",
         rendered_text(&renderer)
     );
@@ -4959,14 +4984,13 @@ fn bottom_chrome_flushes_the_subagent_tree_under_the_composer() {
         "showing a notice must not move the composer"
     );
     assert_eq!(
-        rendered_row(&renderer, "notice-sentinel") as u16,
-        bottom + 1,
-        "an active notice owns the row under the composer"
-    );
-    assert_eq!(
         rendered_row(&renderer, "Main") as u16,
-        bottom + 2,
-        "the tree follows the notice without a gap"
+        bottom + 1,
+        "the tree keeps the row under the composer, because Down walks into it"
+    );
+    assert!(
+        rendered_row(&renderer, "notice-sentinel") as u16 > bottom + 1,
+        "the notice band sits under the tree, not between it and the composer"
     );
     assert_eq!(
         rendered_row(&renderer, "model —") as u16,
@@ -5005,8 +5029,8 @@ fn composer_bottom_border_hosts_the_metadata_right_aligned() {
     assert_eq!(
         rendered_line(&renderer, usize::from(bottom)),
         format!(
-            "    └{} model — · effort — · ctx — · tools hidden ^O · agens · ask ^⇧P · Ready ┘    ",
-            "─".repeat(18)
+            "    └{} model — · ctx — · agens · ask ┘    ",
+            "─".repeat(59)
         ),
         "the metadata is spliced into the composer border, one gap off the corner"
     );
@@ -5046,23 +5070,12 @@ fn composer_bottom_border_hosts_the_metadata_right_aligned() {
 
 #[test]
 fn border_metadata_drops_segments_as_the_composer_narrows() {
-    // The declared shed order: the detail level, then effort, then the
-    // directory, then the context, then the approval mode, leaving the model
-    // and the turn outcome last.
+    // Where it is working sheds first, then the context reading. The full shed
+    // ladder is exercised against the footer directly, because the border stops
+    // hosting metadata at all before the narrowest rungs are reachable.
     for (width, present, absent) in [
-        (
-            100_u16,
-            "model — · effort — · ctx — · tools hidden ^O · agens · ask ^⇧P · Ready",
-            "",
-        ),
-        (
-            72,
-            "model — · effort — · ctx — · agens · ask ^⇧P · Ready",
-            "tools hidden",
-        ),
-        (56, "model — · ctx — · agens · ask ^⇧P · Ready", "effort —"),
-        (52, "model — · ctx — · ask ^⇧P · Ready", "agens"),
-        (40, "model — · ask ^⇧P · Ready", "ctx —"),
+        (100_u16, "model — · ctx — · agens · ask", ""),
+        (40, "model — · ctx — · ask", "agens"),
     ] {
         let (mut renderer, tui) = docked_renderer(width, 20);
         renderer.render(tui.view()).unwrap();
@@ -5157,12 +5170,12 @@ fn elided_subagent_tree_keeps_a_running_branch_and_the_affordance_as_its_last_ro
         "a finished branch is elided before a running one: {text:?}"
     );
     assert_eq!(
-        rendered_row(&renderer, "Tab to focus"),
+        rendered_row(&renderer, "↓ to focus"),
         rendered_row(&renderer, "Plan #10") + 1,
         "the affordance survives elision as the last tree row: {text:?}"
     );
     assert!(
-        rendered_row(&renderer, "Tab to focus") < usize::from(height - 1),
+        rendered_row(&renderer, "↓ to focus") < usize::from(height - 1),
         "the elided tree stays inside its reserved band: {text:?}"
     );
     assert!(
@@ -5185,7 +5198,7 @@ fn elided_subagent_tree_reports_the_hidden_branch_count() {
     let text = rendered_text(&renderer);
 
     assert!(
-        text.contains("+2 more · Tab to focus"),
+        text.contains("+2 more · ↓ to focus"),
         "the elision row states the hidden branch count and keeps the affordance: {text:?}"
     );
 }
@@ -5272,7 +5285,7 @@ fn active_transcript_render_keeps_terminal_child_renderable_after_expiry_and_swi
     assert!(expired.contains("expired-child-sentinel"), "{expired:?}");
     assert!(expired.contains("expired-final-sentinel"), "{expired:?}");
 
-    tui.handle(Event::Key(Key::Char('l')));
+    tui.handle(Event::Key(Key::Char(']')));
     renderer.render(tui.view()).unwrap();
     let sibling = rendered_text(&renderer);
     assert!(sibling.contains("Subagent 8 · writer"), "{sibling:?}");
@@ -5368,7 +5381,7 @@ fn bypass_is_compact_footer_metadata_instead_of_a_dedicated_notice() {
     assert_eq!(rendered.matches("bypass").count(), 1, "{rendered:?}");
     assert!(!rendered.contains("BYPASS"), "{rendered:?}");
     // The mode is its own segment, so it no longer costs the turn its status.
-    assert!(rendered.contains("bypass ^⇧P · Waiting"), "{rendered:?}");
+    assert!(rendered.contains("bypass · Waiting"), "{rendered:?}");
 }
 
 #[test]
@@ -5821,18 +5834,17 @@ fn the_footer_answers_its_questions_at_every_real_terminal_width() {
         let text = rendered_text(&renderer);
 
         // What survives at 80 columns is the floor every wider terminal keeps.
-        for datum in ["gpt-5.6-sol", "71k/200k", "36%", "ask ^⇧P"] {
+        for datum in ["gpt-5.6-sol", "36%", "ask"] {
             assert!(
                 text.contains(datum),
                 "width {width} lost {datum:?}: {text:?}"
             );
         }
-        // A deep path never spends the footer's budget on its ancestors.
-        assert!(
-            text.contains("/agens") && !text.contains("/personal/deep"),
-            "width {width}: {text:?}"
-        );
+        // Where it is working is one segment now, so it sheds as a unit and only
+        // the widths that can afford the whole of it show any of it.
+        assert!(!text.contains("/personal/deep"), "width {width}: {text:?}");
         if width >= 120 {
+            assert!(text.contains("/agens"), "width {width}: {text:?}");
             assert!(text.contains("feat/agn-114"), "width {width}: {text:?}");
             assert!(text.contains("+120"), "width {width}: {text:?}");
         }

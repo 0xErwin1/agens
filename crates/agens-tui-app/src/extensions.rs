@@ -686,6 +686,7 @@ mod tests {
                 "bypass",
                 "dangerous",
                 "help",
+                "keys",
                 "mcp",
                 "select",
                 "subagent-profiles",

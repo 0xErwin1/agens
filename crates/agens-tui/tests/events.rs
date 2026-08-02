@@ -519,13 +519,14 @@ fn transcript_navigation_restores_focus_and_routes_live_child_composer_to_mailbo
     }
 
     tui.handle(Event::Key(Key::Escape));
-    assert_eq!(tui.handle(Event::Key(Key::Char('g'))), Action::Render);
+    tui.handle(Event::Key(Key::Char('g')));
+    assert_eq!(tui.handle(Event::Key(Key::Char('t'))), Action::Render);
     assert!(tui.view().dialog.is_some());
     tui.handle(Event::Key(Key::Enter));
     assert_eq!(tui.view().active_transcript, TranscriptId::Subagent(7));
-    tui.handle(Event::Key(Key::Char('h')));
+    tui.handle(Event::Key(Key::Char('[')));
     assert_eq!(tui.view().active_transcript, TranscriptId::Subagent(7));
-    tui.handle(Event::Key(Key::Char('l')));
+    tui.handle(Event::Key(Key::Char(']')));
     assert_eq!(tui.view().active_transcript, TranscriptId::Subagent(8));
     tui.handle(Event::Key(Key::Char('l')));
     assert_eq!(tui.view().active_transcript, TranscriptId::Subagent(8));
@@ -560,13 +561,16 @@ fn transcript_navigation_restores_focus_and_routes_live_child_composer_to_mailbo
     tui.handle(Event::Key(Key::Char('i')));
     assert_eq!(tui.view().focus, TranscriptFocus::Composer);
     assert!(!tui.view().collapse_thinking);
-    assert!(tui.view().following_bottom);
+    // Main was detached by the Escape that focused it at the top of this test:
+    // entering the transcript keymap pins the viewport so a running turn cannot
+    // scroll the row being read out from under it.
+    assert!(!tui.view().following_bottom);
     assert!(tui.view().tool_display_modes.is_empty());
     tui.handle(Event::Key(Key::Char('m')));
     assert_eq!(tui.input(), "m");
 
     tui.handle(Event::Key(Key::Escape));
-    tui.handle(Event::Key(Key::Char('l')));
+    tui.handle(Event::Key(Key::Char(']')));
     assert!(tui.view().collapse_thinking);
     assert!(!tui.view().following_bottom);
     assert_eq!(tui.handle(Event::Paste(" blocked".into())), Action::Render);
@@ -580,7 +584,7 @@ fn transcript_navigation_restores_focus_and_routes_live_child_composer_to_mailbo
         }
     );
     assert_eq!(tui.input(), "");
-    tui.handle(Event::Key(Key::Char('l')));
+    tui.handle(Event::Key(Key::Char(']')));
     tui.handle(Event::Key(Key::CtrlO));
     tui.handle(Event::Key(Key::CtrlO));
     tui.handle(Event::Key(Key::PageUp));
@@ -591,7 +595,7 @@ fn transcript_navigation_restores_focus_and_routes_live_child_composer_to_mailbo
     // absent here (state isolation), not a "seven" collapse claim.
     assert!(!tui.view().tool_display_modes.contains_key("seven"));
 
-    tui.handle(Event::Key(Key::Char('h')));
+    tui.handle(Event::Key(Key::Char('[')));
     assert_eq!(tui.view().scroll_offset, child_seven_offset);
     assert!(!is_collapsed(tui.view().tool_display_modes, "seven"));
 
@@ -709,7 +713,7 @@ fn child_activity_reorders_executions_and_background_transition_keeps_parent_run
 }
 
 #[test]
-fn transcript_picker_outcome_and_g_use_the_same_main_and_child_entries() {
+fn transcript_picker_outcome_and_gt_use_the_same_main_and_child_entries() {
     let mut tui = Tui::new(FakeEngine::default());
     start_child(&mut tui, 7);
     tui.apply_runtime_event(TuiRuntimeEvent::SubagentExecution(
@@ -722,13 +726,14 @@ fn transcript_picker_outcome_and_g_use_the_same_main_and_child_entries() {
     ));
 
     tui.handle(Event::Key(Key::Escape));
-    assert_eq!(tui.handle(Event::Key(Key::Char('g'))), Action::Render);
-    let from_g = format!("{:?}", tui.view().dialog);
+    tui.handle(Event::Key(Key::Char('g')));
+    assert_eq!(tui.handle(Event::Key(Key::Char('t'))), Action::Render);
+    let from_gt = format!("{:?}", tui.view().dialog);
     tui.handle(Event::Key(Key::Escape));
     tui.apply_submission_outcome(TuiSubmissionOutcome::TranscriptDialog);
     let from_command = format!("{:?}", tui.view().dialog);
 
-    assert_eq!(from_command, from_g);
+    assert_eq!(from_command, from_gt);
     assert!(from_command.contains("Main"));
     assert!(from_command.contains("Reviewer"));
 }
@@ -745,12 +750,13 @@ fn vim_modes_remove_all_function_key_routes() {
 
     tui.select_transcript(TranscriptId::Subagent(7));
     assert_eq!(tui.handle(Event::Key(Key::Char('g'))), Action::Render);
+    assert_eq!(tui.handle(Event::Key(Key::Char('t'))), Action::Render);
     assert!(tui.view().dialog.is_some());
     tui.handle(Event::Key(Key::Escape));
 
-    assert_eq!(tui.handle(Event::Key(Key::Char('l'))), Action::Render);
+    assert_eq!(tui.handle(Event::Key(Key::Char(']'))), Action::Render);
     assert_eq!(tui.view().active_transcript, TranscriptId::Subagent(8));
-    assert_eq!(tui.handle(Event::Key(Key::Char('h'))), Action::Render);
+    assert_eq!(tui.handle(Event::Key(Key::Char('['))), Action::Render);
     assert_eq!(tui.view().active_transcript, TranscriptId::Subagent(7));
     assert_eq!(tui.handle(Event::Key(Key::Char('m'))), Action::Render);
     assert_eq!(tui.view().active_transcript, TranscriptId::Main);
@@ -776,7 +782,7 @@ fn viewport_vim_routes_preserve_per_transcript_state() {
     }
 
     tui.handle(Event::Key(Key::Escape));
-    tui.handle(Event::Key(Key::Char('l')));
+    tui.handle(Event::Key(Key::Char(']')));
     assert_eq!(tui.view().active_transcript, TranscriptId::Subagent(7));
     tui.handle(Event::Key(Key::CtrlO));
     tui.handle(Event::Key(Key::PageUp));
@@ -787,7 +793,7 @@ fn viewport_vim_routes_preserve_per_transcript_state() {
         is_collapsed(tui.view().tool_display_modes, "seven"),
     );
 
-    tui.handle(Event::Key(Key::Char('l')));
+    tui.handle(Event::Key(Key::Char(']')));
     assert_eq!(tui.view().active_transcript, TranscriptId::Subagent(8));
     assert!(tui.view().following_bottom);
     assert_eq!(tui.view().focus, TranscriptFocus::Viewport);
@@ -798,7 +804,7 @@ fn viewport_vim_routes_preserve_per_transcript_state() {
     tui.handle(Event::Key(Key::PageUp));
     let child_eight_offset = tui.view().scroll_offset;
 
-    tui.handle(Event::Key(Key::Char('h')));
+    tui.handle(Event::Key(Key::Char('[')));
     assert_eq!(tui.view().active_transcript, TranscriptId::Subagent(7));
     assert_eq!(
         (
@@ -810,7 +816,7 @@ fn viewport_vim_routes_preserve_per_transcript_state() {
         child_seven
     );
 
-    tui.handle(Event::Key(Key::Char('l')));
+    tui.handle(Event::Key(Key::Char(']')));
     assert_eq!(tui.view().scroll_offset, child_eight_offset);
     assert!(!is_collapsed(tui.view().tool_display_modes, "eight"));
     tui.handle(Event::Key(Key::Char('m')));
@@ -872,7 +878,9 @@ fn ctrl_o_toggles_bounded_detail_without_viewport_motion() {
             .contains("retained-tail-sentinel")
     );
 
-    tui.handle(Event::Key(Key::End));
+    // Scrolling no longer moves focus, so returning to the bottom from the
+    // composer is the composer-safe jump rather than End.
+    tui.handle(Event::Key(Key::CtrlShiftG));
 
     let backend = TestBackend::new(48, 12);
     let terminal = Terminal::new(backend).unwrap();
@@ -1010,14 +1018,15 @@ fn block_focus_walks_settled_calls_and_opens_only_the_one_it_stands_on() {
 
     // Focus enters at the newest block, which is the one a reader just watched
     // happen.
-    tui.handle(Event::Key(Key::Char('k')));
+    // j and k scroll rows now, so walking blocks moved up a case.
+    tui.handle(Event::Key(Key::Char('K')));
     assert_eq!(tui.view().focused_call, Some("read-3"));
-    tui.handle(Event::Key(Key::Char('k')));
+    tui.handle(Event::Key(Key::Char('K')));
     assert_eq!(tui.view().focused_call, Some("read-2"));
-    tui.handle(Event::Key(Key::Char('j')));
+    tui.handle(Event::Key(Key::Char('J')));
     assert_eq!(tui.view().focused_call, Some("read-3"));
 
-    tui.handle(Event::Key(Key::Char('k')));
+    tui.handle(Event::Key(Key::Char('K')));
     tui.handle(Event::Key(Key::Char('o')));
     assert_eq!(
         tui.view().tool_display_modes.get("read-2"),
@@ -1063,7 +1072,7 @@ fn opening_a_focused_block_does_not_move_the_rows_above_it() {
     tui.finish_provider_turn(agens_tui::TuiProviderOutcome::Completed("answer".into()));
 
     tui.handle(Event::Key(Key::Escape));
-    tui.handle(Event::Key(Key::Char('k')));
+    tui.handle(Event::Key(Key::Char('K')));
     assert_eq!(tui.view().focused_call, Some("read-1"));
     let anchored = tui.view().scroll_offset;
     assert!(!tui.view().following_bottom, "navigation detaches the view");
@@ -1348,7 +1357,7 @@ fn main_and_child_hierarchy_renders_each_event_once() {
         "{child_seven:?}"
     );
 
-    tui.handle(Event::Key(Key::Char('l')));
+    tui.handle(Event::Key(Key::Char(']')));
     assert_eq!(tui.view().active_transcript, TranscriptId::Subagent(8));
     renderer.render(tui.view()).unwrap();
     let child_eight = renderer
@@ -2786,12 +2795,20 @@ fn double_control_c_exits_without_clearing_composer_input() {
 }
 
 #[test]
-fn escape_cancels_running_without_arming_quit() {
+fn escape_leaves_the_composer_then_cancels_without_arming_quit() {
     let mut tui = Tui::new(FakeEngine::default());
     tui.set_running(true);
 
+    // Stopping to read must not cost the turn, so the first Escape only moves
+    // focus and the second is the one that reaches the engine.
+    assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Render);
+    assert_eq!(tui.view().focus, TranscriptFocus::Viewport);
+    assert_eq!(tui.engine().cancellations, 0);
+    assert!(!tui.view().quit_armed);
+
     assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Cancel);
     assert_eq!(tui.engine().cancellations, 1);
+    assert!(!tui.view().quit_armed);
 }
 
 #[test]
@@ -2904,7 +2921,9 @@ fn multiline_editing_and_scroll_follow_are_deterministic() {
 
     assert_eq!(tui.input(), "ab");
     assert!(!tui.following_bottom());
-    assert_eq!(tui.handle(Event::Key(Key::End)), Action::Render);
+    // End edits the prompt; following the transcript again is the
+    // composer-safe jump, since scrolling no longer moves focus.
+    assert_eq!(tui.handle(Event::Key(Key::CtrlShiftG)), Action::Render);
     assert!(tui.following_bottom());
     assert_eq!(
         tui.handle(Event::Key(Key::Enter)),
@@ -3046,6 +3065,7 @@ fn ratatui_active_turn_row_distinguishes_waiting_responding_cancelling_and_failu
         .collect::<String>();
     assert!(responding.contains("Responding"));
 
+    assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Render);
     assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Cancel);
     renderer.render(tui.view()).unwrap();
     let cancelling = renderer
@@ -3107,7 +3127,10 @@ fn plain_jk_insert_while_ctrl_timeline_nav_scrolls_and_jumps() {
         "Ctrl+k must scroll the timeline up"
     );
     assert!(!tui.view().following_bottom);
-    assert_eq!(tui.view().focus, TranscriptFocus::Viewport);
+    // Ctrl+j and Ctrl+k are the composer-safe scroll: they detach the viewport
+    // and leave the prompt taking text, which is the whole point of having them
+    // alongside the plain motions.
+    assert_eq!(tui.view().focus, TranscriptFocus::Composer);
     assert_eq!(tui.input(), "jk");
 
     let after_up = tui.view().scroll_offset;
@@ -3138,7 +3161,7 @@ fn plain_jk_insert_while_ctrl_timeline_nav_scrolls_and_jumps() {
 }
 
 #[test]
-fn viewport_owner_keys_remain_g_m_h_l_with_ctrl_timeline_nav() {
+fn viewport_owner_keys_are_gt_m_and_brackets_with_ctrl_timeline_nav() {
     let mut tui = Tui::new(FakeEngine::default());
     start_child(&mut tui, 7);
     tui.apply_runtime_event(TuiRuntimeEvent::SubagentExecution(
@@ -3151,24 +3174,28 @@ fn viewport_owner_keys_remain_g_m_h_l_with_ctrl_timeline_nav() {
 
     tui.handle(Event::Key(Key::Escape));
     assert_eq!(tui.view().focus, TranscriptFocus::Viewport);
+    // `g` is a chord prefix now, so the picker costs its second key.
     assert_eq!(tui.handle(Event::Key(Key::Char('g'))), Action::Render);
+    assert!(tui.view().dialog.is_none(), "g alone opens nothing");
+    assert_eq!(tui.handle(Event::Key(Key::Char('t'))), Action::Render);
     assert!(tui.view().dialog.is_some());
     tui.handle(Event::Key(Key::Escape));
 
-    tui.handle(Event::Key(Key::Char('l')));
+    // h and l are horizontal motions in a vim keymap, so sibling navigation
+    // moved to the bracket pair.
+    tui.handle(Event::Key(Key::Char(']')));
     assert_eq!(tui.view().active_transcript, TranscriptId::Subagent(7));
-    tui.handle(Event::Key(Key::Char('l')));
+    tui.handle(Event::Key(Key::Char(']')));
     assert_eq!(tui.view().active_transcript, TranscriptId::Subagent(8));
-    tui.handle(Event::Key(Key::Char('h')));
+    tui.handle(Event::Key(Key::Char('[')));
     assert_eq!(tui.view().active_transcript, TranscriptId::Subagent(7));
     tui.handle(Event::Key(Key::Char('m')));
     assert_eq!(tui.view().active_transcript, TranscriptId::Main);
 
-    // Ctrl timeline keys must not steal plain characters the viewport does not
-    // claim. `j`, `k` and `o` are claimed — they walk and open blocks — so the
-    // check uses a letter the viewport leaves alone.
+    // A focused transcript swallows what it does not claim. Letting the key
+    // through is what used to make reading a transcript type into the prompt.
     tui.handle(Event::Key(Key::Char('z')));
-    assert_eq!(tui.input(), "z");
+    assert_eq!(tui.input(), "");
 }
 
 fn permission_confirm_entries(request_id: u64) -> Vec<DialogEntry> {
@@ -3605,6 +3632,7 @@ fn the_auto_turn_is_cancellable_and_never_fabricates_a_user_prompt() {
             .any(|entry| matches!(entry, TranscriptEntry::User(_)))
     );
 
+    assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Render);
     assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Cancel);
     assert_eq!(tui.engine().cancellations, 1);
     assert_eq!(tui.view().turn_state, Some(TurnState::Cancelled));

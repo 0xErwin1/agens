@@ -1711,7 +1711,7 @@ fn render_frame_content(frame: &mut ratatui::Frame<'_>, state: &ViewState<'_>) {
     let notice = notice_spans(state);
     let layout = {
         let _perf_layout = agens_perf::span!("tui.frame.layout");
-        screen_layout(area, state.input, !notice.is_empty())
+        screen_layout(area, state.input)
     };
 
     let row_width = layout
@@ -3383,13 +3383,22 @@ impl BottomChrome {
         }
     }
 
-    /// Places the reserved rows inside their region: the notice and the tree hug
-    /// the composer and the status bar keeps the last row, so the rows a missing
-    /// notice does not claim become a gap above the status bar instead of dead
-    /// air under the composer. The region keeps its full reserved height either
-    /// way, which is what keeps the composer a function of terminal height only.
-    fn placed(self, region: Rect, notice_shown: bool) -> ChromeBands {
-        let notice = if notice_shown { self.notice } else { 0 };
+    /// Places the reserved rows inside their region: the tree hugs the composer,
+    /// the notice and hint band sits under it, and the status bar keeps the last
+    /// row. The region keeps its full reserved height, which is what keeps the
+    /// composer a function of terminal height only.
+    ///
+    /// The tree goes first because a reader walks into it with Down out of the
+    /// prompt, and a legend wedged between the two would break the only reason
+    /// that gesture reads as movement.
+    ///
+    /// The notice band always claims its row, because it always has something
+    /// to say: a warning when there is one, and the contextual key hints
+    /// otherwise. It used to be conditional, and the condition was evaluated
+    /// once by the renderer and once by hit-testing — which is exactly how a
+    /// click came to land on a different tree row than the one on screen.
+    fn placed(self, region: Rect) -> ChromeBands {
+        let notice = self.notice;
         let band = |y: u16, height: u16| Rect {
             x: region.x,
             y,
@@ -3397,8 +3406,8 @@ impl BottomChrome {
             height,
         };
         ChromeBands {
-            notice: band(region.y, notice),
-            tree: band(region.y.saturating_add(notice), self.tree),
+            tree: band(region.y, self.tree),
+            notice: band(region.y.saturating_add(self.tree), notice),
             footer: band(region.bottom().saturating_sub(self.footer), self.footer),
         }
     }
@@ -3442,7 +3451,7 @@ fn composer_rows(height: u16, input: &str) -> u16 {
     }
 }
 
-fn screen_layout(area: Rect, input: &str, notice_shown: bool) -> ScreenLayout {
+fn screen_layout(area: Rect, input: &str) -> ScreenLayout {
     let area = conversation_surface(area);
     let composer_rows = composer_rows(area.height, input).min(area.height);
     let chrome =
@@ -3459,7 +3468,7 @@ fn screen_layout(area: Rect, input: &str, notice_shown: bool) -> ScreenLayout {
     .split(area);
 
     let gutter = Margin::new(chrome_gutter(area.width), 0);
-    let bands = chrome.placed(chunks[2].inner(gutter), notice_shown);
+    let bands = chrome.placed(chunks[2].inner(gutter));
 
     ScreenLayout {
         transcript: chunks[0],
@@ -3625,9 +3634,23 @@ fn render_notice(frame: &mut ratatui::Frame<'_>, area: Rect, spans: Vec<Span<'st
 /// The tree is painted without wrapping, so every label is bounded to the
 /// columns left of it by its own rail and glyph.
 fn fitted_subagent_tree_lines(state: &ViewState<'_>, rows: u16, width: u16) -> Vec<Line<'static>> {
+    fitted_subagent_tree(state, rows, width).0
+}
+
+/// The tree's rows, paired with the transcript each one is a way into.
+///
+/// Both come from the same pass on purpose. The rows are not one per branch —
+/// the root is dropped when the tree is tight, activity rows sit under their
+/// branch, and the affordance closes the list — so anything deriving an index
+/// from a row on its own was reading a different tree than the one on screen.
+fn fitted_subagent_tree(
+    state: &ViewState<'_>,
+    rows: u16,
+    width: u16,
+) -> (Vec<Line<'static>>, Vec<Option<TranscriptId>>) {
     let _perf_tree = agens_perf::span!("tui.tree", rows = rows, width = width);
     if state.executions.is_empty() || rows == 0 {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
     let width = usize::from(width);
 
@@ -3641,18 +3664,18 @@ fn fitted_subagent_tree_lines(state: &ViewState<'_>, rows: u16, width: u16) -> V
     let spare = body.saturating_sub(branches.len());
 
     let mut lines = Vec::new();
+    let mut ids: Vec<Option<TranscriptId>> = Vec::new();
     if spare > 0 {
         lines.push(tree_root_line(state, width));
+        ids.push(Some(TranscriptId::Main));
     }
     let backgroundable = branches
         .iter()
         .any(|execution| execution.state == TuiExecutionState::ForegroundRunning);
-    lines.extend(tree_branch_lines(
-        state,
-        &branches,
-        spare.saturating_sub(1),
-        width,
-    ));
+    let (branch_lines, branch_ids) =
+        tree_branch_lines(state, &branches, spare.saturating_sub(1), width);
+    lines.extend(branch_lines);
+    ids.extend(branch_ids);
     let cancellable = branches.iter().any(|execution| {
         state.active_transcript == TranscriptId::Subagent(execution.id)
             && matches!(
@@ -3666,7 +3689,8 @@ fn fitted_subagent_tree_lines(state: &ViewState<'_>, rows: u16, width: u16) -> V
         cancellable,
         width,
     ));
-    lines
+    ids.push(None);
+    (lines, ids)
 }
 
 /// The tree's root: the parent transcript, and how much delegated work hangs
@@ -3709,8 +3733,9 @@ fn tree_branch_lines(
     branches: &[&TuiExecution],
     activity_rows: usize,
     width: usize,
-) -> Vec<Line<'static>> {
+) -> (Vec<Line<'static>>, Vec<Option<TranscriptId>>) {
     let mut lines = Vec::new();
+    let mut ids: Vec<Option<TranscriptId>> = Vec::new();
     let mut activity_budget = activity_rows.min(MAX_TREE_ACTIVITIES);
 
     for (index, execution) in branches.iter().enumerate() {
@@ -3739,6 +3764,7 @@ fn tree_branch_lines(
                 tree_row_style(state, TranscriptId::Subagent(execution.id)),
             ),
         ]));
+        ids.push(Some(TranscriptId::Subagent(execution.id)));
 
         let children = state
             .execution_activities
@@ -3784,9 +3810,12 @@ fn tree_branch_lines(
                     Style::default().fg(widgets::RolePalette::muted()),
                 ),
             ]));
+            // An activity row belongs to its branch but is not a way into it:
+            // it names a tool call, and there is no transcript to open for one.
+            ids.push(None);
         }
     }
-    lines
+    (lines, ids)
 }
 
 /// Closes the tree with its navigation affordance, folding the branches that
@@ -4682,7 +4711,7 @@ pub struct Tui<E> {
     turn_duration: Option<Duration>,
     turn_started_at: Option<Duration>,
     /// Tokens billed by the rounds of the active turn, summed as they report.
-    turn_input_tokens: Option<u64>,
+    turn_context_tokens: Option<u64>,
     turn_output_tokens: Option<u64>,
     latest_usage: Option<Usage>,
     status: Option<String>,
@@ -4773,7 +4802,7 @@ where
             runtime_events: Vec::new(),
             turn_duration: None,
             turn_started_at: None,
-            turn_input_tokens: None,
+            turn_context_tokens: None,
             turn_output_tokens: None,
             latest_usage: None,
             status: None,
@@ -5007,7 +5036,7 @@ where
         self.reasoning_started_at = None;
         if running {
             self.turn_started_at = Some(self.now);
-            self.turn_input_tokens = None;
+            self.turn_context_tokens = None;
             self.turn_output_tokens = None;
             self.palette_open = false;
             self.turn_state = Some(TurnState::Requesting);
@@ -5035,7 +5064,7 @@ where
             duration: self
                 .turn_started_at
                 .map(|started| self.now.saturating_sub(started)),
-            input_tokens: self.turn_input_tokens,
+            context_tokens: self.turn_context_tokens,
             output_tokens: self.turn_output_tokens,
         };
         if let Some(conversation) = self.conversation.as_mut() {
@@ -5044,10 +5073,14 @@ where
         }
     }
 
-    /// Adds one round's report to the active turn's running total.
+    /// Folds one round's report into the active turn, per figure.
+    ///
+    /// See [`TurnCost`]: output accumulates because each round generates its
+    /// own, and the prompt takes the maximum because each round resends the
+    /// last one's.
     fn accumulate_turn_usage(&mut self, usage: &Usage) {
         if let Some(input) = usage.input_tokens {
-            self.turn_input_tokens = Some(self.turn_input_tokens.unwrap_or(0) + input);
+            self.turn_context_tokens = Some(self.turn_context_tokens.unwrap_or(0).max(input));
         }
         if let Some(output) = usage.output_tokens {
             self.turn_output_tokens = Some(self.turn_output_tokens.unwrap_or(0) + output);
@@ -5695,9 +5728,7 @@ where
     /// same rows the renderer paints.
     fn screen_layout(&self) -> ScreenLayout {
         let area = Rect::new(0, 0, self.size.0.max(1), self.size.1.max(1));
-        // The band is never empty now: without a notice it carries the hints,
-        // so it always claims the row it already reserved.
-        screen_layout(area, &self.input, true)
+        screen_layout(area, &self.input)
     }
 
     /// Selects a transcript from a click on the subagent tree.
@@ -5715,7 +5746,9 @@ where
         }
 
         let index = usize::from(row.saturating_sub(layout.tree.y));
-        let id = *self.execution_strip_ids().get(index)?;
+        let id = (*fitted_subagent_tree(&self.view(), layout.tree.height, layout.tree.width)
+            .1
+            .get(index)?)?;
         self.execution_selection = Some(id);
         self.select_transcript(id);
         Some(Action::Render)
@@ -12314,7 +12347,7 @@ mod runtime_tests {
 
     #[test]
     fn bottom_chrome_bands_share_one_gutter_that_collapses_on_narrow_terminals() {
-        let layout = screen_layout(Rect::new(0, 0, 120, 24), "", true);
+        let layout = screen_layout(Rect::new(0, 0, 120, 24), "");
         for band in [layout.composer, layout.notice, layout.tree, layout.footer] {
             assert_eq!(band.x, CHROME_GUTTER, "{band:?}");
             assert_eq!(band.width, 120 - 2 * CHROME_GUTTER, "{band:?}");
@@ -12328,7 +12361,7 @@ mod runtime_tests {
         );
 
         for width in 0..=64_u16 {
-            let layout = screen_layout(Rect::new(0, 0, width, 24), "", false);
+            let layout = screen_layout(Rect::new(0, 0, width, 24), "");
             assert!(layout.composer.right() <= width, "width {width}");
             assert!(
                 layout.composer.width >= width.min(MIN_GUTTERED_COMPOSER_WIDTH),

@@ -133,19 +133,28 @@ pub(super) enum ConversationItem {
 
 /// What one turn cost: wall time, and the tokens its provider rounds billed.
 ///
-/// Tokens are summed across every round of the turn, not taken from the last
-/// one: a turn that ran tools bills one usage report per round, and reporting
-/// only the last would understate a long turn by most of its cost.
+/// The two token figures a turn can report, each aggregated the only way it
+/// means anything.
+///
+/// A turn that runs tools bills one usage report per round. Output is new text
+/// every round, so summing it answers how much the turn produced. Input is not:
+/// every round resends the whole conversation, so round N's prompt already
+/// contains rounds 1..N-1 and summing counts the same tokens once per round.
+/// That is how a seven-minute turn over a 130k context came to claim 2.6M
+/// tokens in. The prompt figure is therefore the high-water mark — how large
+/// the conversation actually grew — and is named for what it is.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TurnCost {
     pub duration: Option<Duration>,
-    pub input_tokens: Option<u64>,
+    /// Largest prompt the turn sent, which is the size the conversation reached.
+    pub context_tokens: Option<u64>,
+    /// Every token the turn generated, summed across its rounds.
     pub output_tokens: Option<u64>,
 }
 
 impl TurnCost {
     pub(crate) const fn is_empty(self) -> bool {
-        self.duration.is_none() && self.input_tokens.is_none() && self.output_tokens.is_none()
+        self.duration.is_none() && self.context_tokens.is_none() && self.output_tokens.is_none()
     }
 }
 

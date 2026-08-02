@@ -250,8 +250,8 @@ fn turn_cost_rows(conversation: &Conversation) -> Option<Vec<Line<'static>>> {
     if let Some(duration) = cost.duration {
         parts.push(elapsed_label(duration));
     }
-    if let Some(input) = cost.input_tokens {
-        parts.push(format!("{} in", compact_tokens(input)));
+    if let Some(context) = cost.context_tokens {
+        parts.push(format!("{} context", compact_tokens(context)));
     }
     if let Some(output) = cost.output_tokens {
         parts.push(format!("{} out", compact_tokens(output)));
