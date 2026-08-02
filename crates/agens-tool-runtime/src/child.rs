@@ -1390,6 +1390,7 @@ mod tests {
             "echo x | xargs rm probe-victim.txt",
             "bash -c \\\"rm -rf probe-victim.txt\\\"",
             "echo $(rm -rf probe-victim.txt)",
+            "\\\\rm -rf probe-victim.txt",
         ] {
             std::fs::write(&victim, "victim").unwrap();
 
@@ -1436,20 +1437,81 @@ mod tests {
         std::fs::create_dir_all(&project_root).unwrap();
 
         let rules = declared(&temporary, &["deny write .env*", "allow write"]);
-        let denied_output = single_call_turn(
+
+        for path in ["./.env", ".//.env", "././.env", "./././/.env"] {
+            let denied_output = single_call_turn(
+                &project_root,
+                &rules,
+                &[],
+                false,
+                "native::write",
+                &format!(r#"{{"path":"{path}","content":"SECRET=1"}}"#),
+            );
+
+            assert!(
+                denied_output.contains("permission denied"),
+                "{path} must not defeat a path deny, got: {denied_output}"
+            );
+            assert!(!project_root.join(".env").exists(), "{path} wrote the file");
+        }
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    /// The same file written another way is the same file. A deny on the
+    /// directory has to hold against every spelling that reaches it, and the
+    /// victim's contents are what proves the call never ran.
+    #[test]
+    fn a_nested_path_deny_holds_against_every_spelling_that_reaches_the_file() {
+        let temporary = agens_fixtures::session_directory("path-spelling-separators");
+        let project_root = temporary.join("project");
+        let victim = project_root.join("src").join("secret").join("key.txt");
+        std::fs::create_dir_all(victim.parent().unwrap()).unwrap();
+        std::fs::write(&victim, "victim").unwrap();
+
+        let rules = declared(&temporary, &["allow write **", "deny write src/secret/**"]);
+
+        for path in [
+            "src/secret/key.txt",
+            "src//secret/key.txt",
+            "src///secret/key.txt",
+            "./src//secret/key.txt",
+            "src/./secret/key.txt",
+            "src/.//./secret/key.txt",
+            ".//src/secret//key.txt",
+        ] {
+            let denied_output = single_call_turn(
+                &project_root,
+                &rules,
+                &[],
+                false,
+                "native::write",
+                &format!(r#"{{"path":"{path}","content":"OVERWRITTEN"}}"#),
+            );
+
+            assert!(
+                denied_output.contains("permission denied"),
+                "{path} must be denied, got: {denied_output}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&victim).unwrap(),
+                "victim",
+                "{path} reached the file the deny names"
+            );
+        }
+
+        let allowed_output = single_call_turn(
             &project_root,
             &rules,
             &[],
             false,
             "native::write",
-            r#"{"path":"./.env","content":"SECRET=1"}"#,
+            r#"{"path":"src//main.rs","content":"fn main() {}"}"#,
         );
-
         assert!(
-            denied_output.contains("permission denied"),
-            "a leading ./ must not defeat a path deny, got: {denied_output}"
+            !allowed_output.contains("permission denied"),
+            "a path the deny does not name must still be written, got: {allowed_output}"
         );
-        assert!(!project_root.join(".env").exists());
 
         std::fs::remove_dir_all(temporary).unwrap();
     }

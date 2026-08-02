@@ -135,6 +135,27 @@ fn permission_target_kind_classifies_bash_and_git_read_as_free_form_and_everythi
     }
 }
 
+/// A rule spelled with components that select nothing still names the files it
+/// reads as naming. Without this the rule would silently match nothing, which
+/// is the same hole as a target spelled that way, entered from the other side.
+#[test]
+fn a_path_pattern_spelled_with_no_op_components_selects_what_it_names() {
+    for pattern in [
+        "src/secret/**",
+        "./src/secret/**",
+        "src//secret/**",
+        "src/./secret///**",
+        ".//src//secret//**",
+    ] {
+        let compiled = PermissionPattern::glob(pattern).expect("the pattern must compile");
+
+        assert!(
+            compiled.matches("src/secret/key.txt"),
+            "{pattern:?} should have selected src/secret/key.txt"
+        );
+    }
+}
+
 #[test]
 fn malformed_target_globs_are_rejected_by_the_safe_constructor() {
     for pattern in ["", "   ", "file[", "file[z-a].txt"] {

@@ -2131,12 +2131,23 @@ impl PermissionPattern {
     /// target's kind. See [`PermissionTargetKind`] for the semantics of each
     /// kind and [`permission_target_kind_for_tool`] for classifying a tool by
     /// name.
+    ///
+    /// A path-shaped pattern is reduced to the same canonical spelling its
+    /// targets are, so a rule written `./src//secret/**` selects the files it
+    /// reads as naming instead of silently selecting nothing.
     pub fn glob_for_target_kind(
         pattern: impl Into<String>,
         kind: PermissionTargetKind,
     ) -> Result<Self, PermissionPatternError> {
         let literal_separator = matches!(kind, PermissionTargetKind::Path);
-        ValidatedPermissionGlob::new(pattern.into(), literal_separator).map(Self::Glob)
+        let pattern = pattern.into();
+        let pattern = if literal_separator {
+            permission_target::normalized_path_target(&pattern)
+        } else {
+            pattern
+        };
+
+        ValidatedPermissionGlob::new(pattern, literal_separator).map(Self::Glob)
     }
 
     pub fn glob_source(&self) -> Option<&str> {
@@ -2355,10 +2366,12 @@ pub struct PermissionRequest {
     pub target: String,
     pub access: ToolAccess,
     outside_worktree: bool,
-    /// The invocations a shell target would run, each given as the equivalent
-    /// spellings a rule could be written against. Empty for every tool whose
-    /// target is not a command line.
-    invocations: Vec<Vec<String>>,
+    /// What the target names, as the subjects a rule could be written against:
+    /// one entry per invocation a command line would run, or a single entry
+    /// for a path the caller spelled in more than one equivalent way. Each
+    /// entry holds the interchangeable spellings of that one subject. Empty
+    /// whenever the target names exactly one thing under exactly one spelling.
+    subjects: Vec<Vec<String>>,
 }
 
 impl PermissionRequest {
@@ -2386,18 +2399,28 @@ impl PermissionRequest {
     }
 
     /// Reads the raw target as what it names before any rule sees it: a path
-    /// loses the components that select nothing, and a command line is
+    /// loses the components that select nothing and keeps the directory
+    /// spelling a rule may have been written against, and a command line is
     /// decomposed into the invocations it would run. See
     /// [`crate::permission_target`] for what that does and does not cover.
     fn build(project: String, tool: String, target: String, access: ToolAccess) -> Self {
-        let target = match permission_target_kind_for_tool(&tool) {
-            PermissionTargetKind::Path => permission_target::normalized_path_target(&target),
-            PermissionTargetKind::FreeFormText => target,
-        };
-        let invocations = if bare_tool_name(&tool) == "bash" {
-            permission_target::command_invocations(&target)
-        } else {
-            Vec::new()
+        let (target, subjects) = match permission_target_kind_for_tool(&tool) {
+            PermissionTargetKind::Path => {
+                let spellings = permission_target::path_target_forms(&target);
+                let normalized = spellings.first().cloned().unwrap_or(target);
+                let subjects = if spellings.len() > 1 {
+                    vec![spellings]
+                } else {
+                    Vec::new()
+                };
+
+                (normalized, subjects)
+            }
+            PermissionTargetKind::FreeFormText if bare_tool_name(&tool) == "bash" => {
+                let invocations = permission_target::command_invocations(&target);
+                (target, invocations)
+            }
+            PermissionTargetKind::FreeFormText => (target, Vec::new()),
         };
 
         Self {
@@ -2406,7 +2429,7 @@ impl PermissionRequest {
             target,
             access,
             outside_worktree: false,
-            invocations,
+            subjects,
         }
     }
 
@@ -2423,6 +2446,10 @@ impl PermissionRequest {
     /// `cd /tmp && rm -rf x`. A permissive rule selects it only when EVERY
     /// invocation is selected, because authorizing `git*` is not authorization
     /// for whatever was chained onto it.
+    ///
+    /// A path is one subject rather than several, so both directions reduce to
+    /// the same question there: the rule selects the call when it names the
+    /// file under any of its spellings.
     fn target_selected_by(
         &self,
         pattern: &PermissionPattern,
@@ -2431,10 +2458,10 @@ impl PermissionRequest {
         let selects = |forms: &Vec<String>| forms.iter().any(|form| pattern.matches(form));
 
         match decision {
-            _ if self.invocations.is_empty() => pattern.matches(&self.target),
-            PermissionDecision::Allow => self.invocations.iter().all(selects),
+            _ if self.subjects.is_empty() => pattern.matches(&self.target),
+            PermissionDecision::Allow => self.subjects.iter().all(selects),
             PermissionDecision::Ask | PermissionDecision::Deny => {
-                pattern.matches(&self.target) || self.invocations.iter().any(selects)
+                pattern.matches(&self.target) || self.subjects.iter().any(selects)
             }
         }
     }

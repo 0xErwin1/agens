@@ -23,7 +23,8 @@ use std::sync::{Arc, Mutex};
 use agens_config::{ConfigPermissionDecision, ConfigPermissionRule, ConfigPermissionScope};
 use agens_core::{
     AgentDefinition, PermissionDecision, PermissionMode, PermissionPolicy, PermissionRequest,
-    PermissionRule, PermissionSession, ToolAccess,
+    PermissionRule, PermissionSession, PermissionTargetKind, ToolAccess,
+    permission_target_kind_for_tool,
 };
 use agens_permissions::{configured_permission_rules, permission_policy};
 use agens_tool_runtime::child_catalog::resolve_child_surface;
@@ -334,6 +335,12 @@ const CASES: &[Case] = &[
         target: "echo $(rm -rf victim.txt)",
         expected: PermissionDecision::Deny,
     },
+    Case {
+        declarations: &["deny bash rm*", "allow bash"],
+        tool: "bash",
+        target: r"\rm -rf victim.txt",
+        expected: PermissionDecision::Deny,
+    },
     // An allow names what it names: it authorizes a compound command only when
     // every part of it is authorized.
     Case {
@@ -360,6 +367,20 @@ const CASES: &[Case] = &[
         declarations: &["deny write src/secret/**", "allow write src/**"],
         tool: "write",
         target: "./src/./secret/key.txt",
+        expected: PermissionDecision::Deny,
+    },
+    // A call on the directory a deny names is inside what the deny selects,
+    // however the operator spelled the rule.
+    Case {
+        declarations: &["deny write src/secret/**", "allow write **"],
+        tool: "write",
+        target: "src/secret/",
+        expected: PermissionDecision::Deny,
+    },
+    Case {
+        declarations: &["deny write src/secret", "allow write **"],
+        tool: "write",
+        target: "src/secret/",
         expected: PermissionDecision::Deny,
     },
     // A declaration matching no tool decides nothing and rejects nothing.
@@ -524,6 +545,122 @@ const CONFIGURED_CASES: &[ConfiguredCase] = &[
         expected: PermissionDecision::Ask,
     },
 ];
+
+/// A rewrite of a path target into an equivalent spelling of the same file.
+struct Spelling {
+    name: &'static str,
+    rewrite: fn(&str) -> String,
+}
+
+/// The spelling axis of the two tables above: a path names a file, and every
+/// spelling of that file has to reach the same decision under every rule shape
+/// already enumerated, on both paths.
+///
+/// This is a dimension rather than a handful of extra rows on purpose. A
+/// spelling added here is checked against every path-shaped case in both
+/// tables, so the cost of covering the next one is a single entry.
+const PATH_SPELLINGS: &[Spelling] = &[
+    Spelling {
+        name: "as written",
+        rewrite: str::to_owned,
+    },
+    Spelling {
+        name: "doubled separators",
+        rewrite: |target| target.replace('/', "//"),
+    },
+    Spelling {
+        name: "tripled separators",
+        rewrite: |target| target.replace('/', "///"),
+    },
+    Spelling {
+        name: "leading ./",
+        rewrite: |target| format!("./{target}"),
+    },
+    Spelling {
+        name: "repeated leading ./",
+        rewrite: |target| format!("././{target}"),
+    },
+    Spelling {
+        name: "interior /./",
+        rewrite: |target| target.replace('/', "/./"),
+    },
+    Spelling {
+        name: "leading ./ over doubled separators",
+        rewrite: |target| format!(".//{}", target.replace('/', "//")),
+    },
+    Spelling {
+        name: "trailing /.",
+        rewrite: |target| format!("{target}/."),
+    },
+];
+
+#[test]
+fn every_spelling_of_a_path_decides_the_same_on_both_paths() {
+    let mut disagreements = Vec::new();
+
+    for case in CASES.iter().filter(|case| is_path_shaped(case.tool)) {
+        for spelling in PATH_SPELLINGS {
+            let target = (spelling.rewrite)(case.target);
+            let declarations = parsed_declarations(case.declarations);
+
+            let child = child_decision(&declarations, case.tool, &target);
+            let parent = parent_decision(&declarations, case.tool, &target);
+
+            if child != case.expected || parent != case.expected {
+                disagreements.push(format!(
+                    "{:?} on {} {:?} spelled {} as {target:?}: expected {:?}, \
+                     child {child:?}, parent {parent:?}",
+                    case.declarations, case.tool, case.target, spelling.name, case.expected
+                ));
+            }
+        }
+    }
+
+    for case in CONFIGURED_CASES
+        .iter()
+        .filter(|case| is_path_shaped(case.tool))
+    {
+        for spelling in PATH_SPELLINGS {
+            let target = (spelling.rewrite)(case.target);
+            let declarations = parsed_declarations(case.declarations);
+            let configured = configured_rules(case.configured);
+
+            let child = configured_child_decision(&configured, &declarations, case.tool, &target);
+            let parent =
+                configured_parent_decision(case.configured, &declarations, case.tool, &target);
+
+            if child != case.expected || parent != case.expected {
+                disagreements.push(format!(
+                    "config {:?} + {:?} on {} {:?} spelled {} as {target:?}: expected {:?}, \
+                     child {child:?}, parent {parent:?}",
+                    case.configured,
+                    case.declarations,
+                    case.tool,
+                    case.target,
+                    spelling.name,
+                    case.expected
+                ));
+            }
+        }
+    }
+
+    assert!(
+        disagreements.is_empty(),
+        "{} spellings disagreed:\n{}",
+        disagreements.len(),
+        disagreements.join("\n")
+    );
+}
+
+/// A command line is spelled by its own axis — wrappers, separators and
+/// quoting — which the tables above already enumerate; only path targets are
+/// rewritten here.
+fn is_path_shaped(tool: &str) -> bool {
+    matches!(
+        permission_target_kind_for_tool(tool),
+        PermissionTargetKind::Path
+    )
+}
 
 #[test]
 fn the_child_path_and_the_parent_path_decide_every_configured_shape_identically() {

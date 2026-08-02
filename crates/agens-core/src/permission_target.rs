@@ -15,18 +15,88 @@
 
 /// Normalizes a path-shaped target to the spelling a rule is written in.
 ///
-/// Only the no-op components are removed — a leading `./` and any interior
-/// `/./`. `..` is deliberately left alone: resolving it would need the real
+/// Every component that selects nothing is dropped, in whatever combination it
+/// was written: repeated separators (`src//secret`), a component of `.`
+/// wherever it appears (`./src/./secret/.`), and the trailing separator that
+/// names a directory. What remains is what the path names — whether it is
+/// relative, whether it is absolute, and which components it walks through.
+///
+/// `..` is deliberately left alone: resolving it would need the real
 /// filesystem and would quietly change which directory a rule is talking
-/// about.
+/// about. The URI prefix of a `webfetch` target is left alone for the same
+/// reason — the `//` after a scheme introduces an authority rather than
+/// repeating a separator, and collapsing it would stop a rule from matching
+/// the URL it was written against.
 pub(crate) fn normalized_path_target(value: &str) -> String {
-    let mut normalized = value.replace("/./", "/");
+    let (prefix, remainder) = split_uri_prefix(value);
+    let absolute = remainder.starts_with('/');
 
-    while let Some(remainder) = normalized.strip_prefix("./") {
-        normalized = remainder.to_owned();
+    let components = remainder
+        .split('/')
+        .filter(|component| !component.is_empty() && *component != ".")
+        .collect::<Vec<_>>();
+
+    if components.is_empty() {
+        let bare = if absolute {
+            "/"
+        } else if remainder.is_empty() {
+            ""
+        } else {
+            "."
+        };
+        return format!("{prefix}{bare}");
     }
 
-    normalized
+    let separator = if absolute { "/" } else { "" };
+    format!("{prefix}{separator}{}", components.join("/"))
+}
+
+/// Gives the spellings of one path a rule could be written against: the
+/// normalized form, and the directory spelling of it when the caller named a
+/// directory.
+///
+/// The two are kept apart because the glob shapes an operator writes do not
+/// agree on the trailing separator — `dir/**` selects `dir/` but not `dir`,
+/// while an exact `dir` selects only `dir`. Offering both is what makes either
+/// rule shape select a call on the directory it names.
+pub(crate) fn path_target_forms(value: &str) -> Vec<String> {
+    let normalized = normalized_path_target(value);
+
+    if !names_a_directory(value) || normalized.ends_with('/') {
+        return vec![normalized];
+    }
+
+    let directory = format!("{normalized}/");
+    vec![normalized, directory]
+}
+
+/// Reports whether the value spells its last component as a directory, by
+/// ending in a separator or in a `.` component that only a directory has.
+fn names_a_directory(value: &str) -> bool {
+    value.ends_with('/') || value.ends_with("/.") || value == "."
+}
+
+/// Splits off a `scheme://` prefix, whose `//` is part of the URI's grammar
+/// rather than a repeated path separator.
+fn split_uri_prefix(value: &str) -> (&str, &str) {
+    let Some(scheme_end) = value.find("://") else {
+        return ("", value);
+    };
+
+    let scheme = &value[..scheme_end];
+    let is_scheme = scheme
+        .chars()
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic())
+        && scheme.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '+' | '-' | '.')
+        });
+
+    if is_scheme {
+        value.split_at(scheme_end + 3)
+    } else {
+        ("", value)
+    }
 }
 
 /// Decomposes a shell command line into the invocations it would run, each
@@ -187,17 +257,30 @@ fn scan(command: &str) -> (Vec<String>, Vec<String>) {
     (segments, substitutions)
 }
 
-/// Splits one invocation into its words, dropping the quotes that grouped them.
+/// Splits one invocation into its words, dropping the quotes and the
+/// backslashes that grouped them — `\rm` and `"rm"` both name `rm`.
 fn tokenize(segment: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
     let mut quote: Option<char> = None;
+    let mut escaped = false;
     let mut started = false;
 
     for character in segment.chars() {
+        if escaped {
+            escaped = false;
+            current.push(character);
+            started = true;
+            continue;
+        }
+
         match quote {
             Some(open) if character == open => quote = None,
             Some(_) => current.push(character),
+            None if character == '\\' => {
+                escaped = true;
+                started = true;
+            }
             None if character == '\'' || character == '"' => {
                 quote = Some(character);
                 started = true;
@@ -378,5 +461,87 @@ mod tests {
             normalized_path_target("https://example.invalid/a"),
             "https://example.invalid/a"
         );
+    }
+
+    /// Every spelling of one file has to reduce to the same string, whichever
+    /// no-op components it was written with and however they were combined.
+    #[test]
+    fn every_spelling_of_one_path_reduces_to_the_same_target() {
+        for spelling in [
+            "src/secret/key.txt",
+            "src//secret/key.txt",
+            "src///secret/key.txt",
+            "./src//secret/key.txt",
+            "src/./secret/key.txt",
+            "././src/.//secret///key.txt",
+            ".//src/secret/./key.txt",
+            "src/secret/key.txt/.",
+        ] {
+            assert_eq!(
+                normalized_path_target(spelling),
+                "src/secret/key.txt",
+                "{spelling} must name the same file as src/secret/key.txt"
+            );
+        }
+    }
+
+    #[test]
+    fn a_path_keeps_what_changes_which_file_it_names() {
+        assert_eq!(normalized_path_target("../.env"), "../.env");
+        assert_eq!(normalized_path_target("//etc/passwd"), "/etc/passwd");
+        assert_eq!(normalized_path_target("/etc//passwd"), "/etc/passwd");
+        assert_eq!(normalized_path_target("."), ".");
+        assert_eq!(normalized_path_target("./"), ".");
+        assert_eq!(normalized_path_target("/"), "/");
+        assert_eq!(normalized_path_target(""), "");
+    }
+
+    /// A URL's `//` separates its scheme from its authority and is not a
+    /// repeated path separator, so collapsing it would stop a `webfetch` rule
+    /// from matching the URL it was written against.
+    #[test]
+    fn a_url_keeps_the_separator_that_introduces_its_authority() {
+        assert_eq!(
+            normalized_path_target("https://example.invalid/a"),
+            "https://example.invalid/a"
+        );
+        assert_eq!(
+            normalized_path_target("https://example.invalid//a/./b"),
+            "https://example.invalid/a/b"
+        );
+        assert_eq!(normalized_path_target("file:///tmp/x"), "file:///tmp/x");
+    }
+
+    /// A trailing separator names the same directory, but the glob shapes a
+    /// rule is written in do not all agree on that: `dir/**` selects `dir/`
+    /// and not `dir`, while an exact `dir` selects only `dir`. Both spellings
+    /// are therefore offered so either rule shape selects the call.
+    #[test]
+    fn a_directory_named_with_a_trailing_separator_is_offered_both_ways() {
+        assert_eq!(
+            path_target_forms("src//secret/"),
+            vec!["src/secret".to_owned(), "src/secret/".to_owned()]
+        );
+        assert_eq!(
+            path_target_forms("src/secret/."),
+            vec!["src/secret".to_owned(), "src/secret/".to_owned()]
+        );
+        assert_eq!(
+            path_target_forms("src/secret"),
+            vec!["src/secret".to_owned()]
+        );
+    }
+
+    /// A backslash is the shell's own way of spelling a command plainly, and
+    /// `\rm` runs the same `rm`.
+    #[test]
+    fn an_escaped_command_name_reduces_to_the_command_it_runs() {
+        for command in [
+            r"\rm -rf victim",
+            r"\/bin/rm -rf victim",
+            r"cd /tmp && \rm -rf victim",
+        ] {
+            assert!(selects(command, "rm"), "{command} must reduce to rm");
+        }
     }
 }
