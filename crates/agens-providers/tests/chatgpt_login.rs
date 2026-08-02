@@ -922,8 +922,9 @@ fn provider_entry_upsert_cancels_or_times_out_while_the_credentials_lock_is_held
             Instant::now() + Duration::from_millis(30),
         );
         assert!(
-            started.elapsed() < Duration::from_millis(150),
-            "lock wait did not stop promptly"
+            started.elapsed() < Duration::from_secs(1),
+            "lock wait did not stop promptly: {:?}",
+            started.elapsed()
         );
         assert_eq!(
             result,

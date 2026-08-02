@@ -225,11 +225,24 @@ fn u15_a1b2_selected_launch_uses_the_registered_production_task_runner() {
         launch_selected_tui_task(&mut runtime, &session, "review task", false, &cancellation),
         Ok(TuiSelectedTaskLaunch::Dispatched)
     );
-    let probe = probe.lock().unwrap();
-    assert_eq!(probe.len(), 2);
-    assert_eq!(probe[0].1, TaskLaunchMode::Background);
-    assert_eq!(probe[1].1, TaskLaunchMode::Foreground);
-    assert_ne!(probe[0].0, probe[1].0);
+    // A background dispatch reaches the runner on its own thread while the
+    // foreground one reaches it inline, so which lands first is not a
+    // guarantee this design makes. Wait for both, then compare without
+    // ordering.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while probe.lock().unwrap().len() < 2 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "both task dispatches should reach the runner, saw {:?}",
+            *probe.lock().unwrap()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let mut observed = probe.lock().unwrap().clone();
+    observed.sort_by_key(|entry| entry.0);
+    assert_eq!(observed[0].1, TaskLaunchMode::Background);
+    assert_eq!(observed[1].1, TaskLaunchMode::Foreground);
+    assert_ne!(observed[0].0, observed[1].0);
     assert!(reply.join().unwrap());
 
     std::fs::remove_dir_all(temporary).unwrap();

@@ -91,7 +91,19 @@ fn one_hundred_same_process_cancellations_and_timeouts_have_bounded_resources() 
         server.join();
     }
 
-    let after = ResourceSnapshot::capture();
+    // Task and file-descriptor counts are process-wide, and sibling tests in
+    // this same test binary transiently move them; a real leak is permanent
+    // and per-iteration, so it never settles, while sibling noise does.
+    let settle_deadline = Instant::now() + Duration::from_secs(10);
+    let mut after = ResourceSnapshot::capture();
+    while after.tasks > baseline.tasks + 2 || after.file_descriptors > baseline.file_descriptors + 2
+    {
+        if Instant::now() >= settle_deadline {
+            break;
+        }
+        thread::sleep(Duration::from_millis(25));
+        after = ResourceSnapshot::capture();
+    }
     assert!(
         after.tasks <= baseline.tasks + 2,
         "task count grew from {} to {}",
@@ -1586,6 +1598,7 @@ impl LocalResponsesServer {
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
 struct ResourceSnapshot {
     tasks: usize,
     file_descriptors: usize,

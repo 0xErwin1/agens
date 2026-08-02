@@ -194,6 +194,10 @@ pub enum Key {
     CtrlJ,
     /// Scrolls the transcript timeline up (composer-safe).
     CtrlK,
+    /// Half-page down in the focused transcript; forward delete in the composer.
+    CtrlD,
+    /// Half-page up in the focused transcript; delete-to-line-start in the composer.
+    CtrlU,
     /// Jumps the transcript viewport to the top.
     CtrlG,
     /// Jumps the transcript viewport to the bottom.
@@ -265,7 +269,56 @@ impl Key {
                 | Self::ScrollDown
                 | Self::CtrlJ
                 | Self::CtrlK
+                | Self::CtrlD
+                | Self::CtrlU
         )
+    }
+
+    /// Whether this key moves the transcript viewport under the vim keymap.
+    ///
+    /// Reading the transcript stays available while a session is being
+    /// restored, so these keys survive the load-time key filter.
+    pub const fn moves_viewport(self) -> bool {
+        matches!(
+            self,
+            Self::Char('j' | 'k' | 'g' | 'G' | '{' | '}') | Self::CtrlD | Self::CtrlU
+        )
+    }
+
+    /// Whether this key's only meaning is to edit or submit the prompt.
+    pub const fn edits_composer(self) -> bool {
+        matches!(
+            self,
+            Self::Char(_)
+                | Self::ShiftEnter
+                | Self::Enter
+                | Self::Backspace
+                | Self::Delete
+                | Self::DeletePreviousWord
+                | Self::DeleteNextWord
+                | Self::DeleteToLineStart
+                | Self::DeleteToLineEnd
+                | Self::Left
+                | Self::Right
+                | Self::PreviousWord
+                | Self::NextWord
+                | Self::LineStart
+                | Self::LineEnd
+        )
+    }
+
+    /// The composer meaning of a key whose transcript meaning differs.
+    ///
+    /// `Ctrl+D` and `Ctrl+U` are readline edits inside the composer and vim
+    /// half-page motions over the transcript. The terminal cannot tell those
+    /// apart — the mode can — so the raw key is carried to the handler and
+    /// resolved here rather than being decided while mapping the event.
+    const fn composer_equivalent(self) -> Self {
+        match self {
+            Self::CtrlD => Self::Delete,
+            Self::CtrlU => Self::DeleteToLineStart,
+            other => other,
+        }
     }
 }
 
@@ -729,6 +782,17 @@ pub enum TranscriptId {
 pub enum TranscriptFocus {
     Composer,
     Viewport,
+}
+
+/// Which user message a jump lands on.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UserMessageTarget {
+    /// The nearest one above the viewport.
+    Previous,
+    /// The nearest one below the viewport.
+    Next,
+    /// The most recent one in the transcript.
+    Last,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -1708,6 +1772,14 @@ fn render_frame_content(frame: &mut ratatui::Frame<'_>, state: &ViewState<'_>) {
             .border_style(Style::default().fg(composer_color));
         if let Some(metrics) = border_metrics(state, layout.composer) {
             composer = composer.title_bottom(metrics);
+        }
+        // The transcript keymap is only legible if the reader can see it is on:
+        // every key means something different here than it does in the prompt.
+        if state.focus == TranscriptFocus::Viewport {
+            composer = composer.title_top(Span::styled(
+                " NORMAL · j/k scroll · gg/G ends · {/} prompts · i insert ",
+                Style::default().fg(widgets::RolePalette::navigation()),
+            ));
         }
         frame.render_widget(
             Paragraph::new(state.input).block(composer).scroll((
@@ -4380,7 +4452,7 @@ fn transcript_provenance(state: &ViewState<'_>) -> Vec<Line<'static>> {
                     .add_modifier(Modifier::BOLD),
             ),
             Line::styled(
-                "g select · m Main · h/l sibling",
+                "gt select · m Main · [/] sibling",
                 Style::default().fg(widgets::RolePalette::chrome()),
             ),
             Line::default(),
@@ -4565,6 +4637,8 @@ pub struct Tui<E> {
     now: Duration,
     next_runtime_ordinal: u64,
     mouse_selection_snapshot: Option<MouseSelectionSnapshot>,
+    /// First key of an unfinished viewport chord, such as the `g` of `gg`.
+    pending_viewport_key: Option<char>,
 }
 
 impl<E> Tui<E>
@@ -4647,12 +4721,19 @@ where
             now: Duration::ZERO,
             next_runtime_ordinal: 0,
             mouse_selection_snapshot: None,
+            pending_viewport_key: None,
         }
     }
 
     /// Handles one input or resize event without performing rendering or engine work.
     pub fn handle(&mut self, event: Event) -> Action {
         let _perf_event = agens_perf::span!("tui.event", kind = event.trace_kind(), batch = 1u64,);
+        // A chord is only ever completed by the key that follows it. Anything
+        // else the reader does abandons it, so `gt` cannot be completed by a
+        // `t` typed a mouse click and a resize later.
+        if !matches!(event, Event::Key(_)) {
+            self.pending_viewport_key = None;
+        }
         match event {
             Event::Resize { width, height } => {
                 self.size = (width, height);
@@ -6167,13 +6248,27 @@ where
     }
 
     fn begin_mouse_selection(&mut self, column: u16, row: u16) -> Action {
-        let Some(snapshot) = self.capture_mouse_selection_snapshot() else {
+        // An overlay owns the whole screen while it is up, so a press under it
+        // belongs to the overlay and must not disturb what is behind it.
+        if self.dialog.is_some() || self.palette_open {
+            return Action::Render;
+        }
+
+        let snapshot = self.capture_mouse_selection_snapshot();
+        let position = snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.position(column, row));
+
+        let Some(position) = position else {
+            // A press that lands on no transcript row is the reader putting the
+            // selection down. Leaving it painted, and the transcript focused,
+            // is what used to make dismissing it cost a keypress of its own.
+            self.clear_selection();
+            self.active_record_mut().focus = TranscriptFocus::Composer;
             return Action::Render;
         };
-        let Some(position) = snapshot.position(column, row) else {
-            return Action::Render;
-        };
-        self.mouse_selection_snapshot = Some(snapshot);
+
+        self.mouse_selection_snapshot = snapshot;
         let record = self.active_record_mut();
         record.focus = TranscriptFocus::Viewport;
         record.selection = Some(TranscriptSelection {
@@ -6225,9 +6320,12 @@ where
                 record.selection_too_large = false;
             }
             Some(Ok(_)) | None => {
+                // A press that selected nothing is a plain click, and a plain
+                // click is how the reader dismisses what was selected before.
                 record.selection = None;
                 record.selection_text = None;
                 record.selection_too_large = false;
+                record.focus = TranscriptFocus::Composer;
             }
             Some(Err(())) => {
                 record.selection_text = None;
@@ -6632,6 +6730,7 @@ where
                     | Key::CtrlG
                     | Key::CtrlShiftG
             )
+            && !(self.viewport_focused() && key.moves_viewport())
         {
             return Action::Render;
         }
@@ -6699,65 +6798,26 @@ where
             return Action::Render;
         }
 
+        if key == Key::Escape {
+            return self.handle_escape();
+        }
+
+        // An open palette or picker is typed into, so it owns the alphabet even
+        // when the transcript behind it still holds focus.
+        if self.viewport_focused()
+            && !self.palette_open
+            && !self.file_picker_open()
+            && let Some(action) = self.handle_viewport_key(key)
+        {
+            return action;
+        }
+
         match key {
-            Key::Char('g') if self.active_record_mut().focus == TranscriptFocus::Viewport => {
-                self.show_transcript_dialog();
-                return Action::Render;
-            }
-            Key::Char('m') if self.active_record_mut().focus == TranscriptFocus::Viewport => {
-                self.select_transcript(TranscriptId::Main);
-                return Action::Render;
-            }
-            Key::Char('j') if self.active_record_mut().focus == TranscriptFocus::Viewport => {
-                self.move_block_focus(true);
-                self.scroll_to_focused_block();
-                return Action::Render;
-            }
-            Key::Char('k') if self.active_record_mut().focus == TranscriptFocus::Viewport => {
-                self.move_block_focus(false);
-                self.scroll_to_focused_block();
-                return Action::Render;
-            }
-            Key::Char('o') if self.active_record_mut().focus == TranscriptFocus::Viewport => {
-                self.cycle_focused_block_detail();
-                self.scroll_to_focused_block();
-                return Action::Render;
-            }
-            Key::Char('h') if self.active_record_mut().focus == TranscriptFocus::Viewport => {
-                self.select_sibling(-1);
-                return Action::Render;
-            }
-            Key::Char('l') if self.active_record_mut().focus == TranscriptFocus::Viewport => {
-                self.select_sibling(1);
-                return Action::Render;
-            }
-            Key::Char('i')
-                if self.active_record_mut().focus == TranscriptFocus::Viewport
-                    && !self.active_record_mut().terminal =>
-            {
-                self.active_record_mut().focus = TranscriptFocus::Composer;
-                self.execution_selection = None;
-                return Action::Render;
-            }
-            Key::Char('x')
-                if self.active_record_mut().focus == TranscriptFocus::Viewport
-                    && !self.active_record_mut().terminal =>
-            {
-                if let TranscriptId::Subagent(id) = self.active_transcript {
-                    return Action::CancelExecution(id);
-                }
-            }
-            Key::Home
-                if self.active_transcript != TranscriptId::Main
-                    || self.active_record_mut().focus == TranscriptFocus::Viewport =>
-            {
+            Key::Home if self.active_transcript != TranscriptId::Main => {
                 self.scroll_to_start();
                 return Action::Render;
             }
-            Key::End
-                if self.active_transcript != TranscriptId::Main
-                    || self.active_record_mut().focus == TranscriptFocus::Viewport =>
-            {
+            Key::End if self.active_transcript != TranscriptId::Main => {
                 self.scroll_to_end();
                 return Action::Render;
             }
@@ -6875,11 +6935,11 @@ where
                 Action::Render
             }
             Key::CtrlN => {
-                self.jump_to_user_message(false);
+                self.jump_to_user_message(UserMessageTarget::Last);
                 Action::Render
             }
             Key::CtrlShiftN => {
-                self.jump_to_user_message(true);
+                self.jump_to_user_message(UserMessageTarget::Previous);
                 Action::Render
             }
             Key::PageUp => {
@@ -6964,23 +7024,7 @@ where
                 self.recovered_failed_prompt = false;
                 Action::Submit(std::mem::take(&mut self.input))
             }
-            Key::Escape if self.recovered_failed_prompt => {
-                self.input.clear();
-                self.input_cursor = 0;
-                self.recovered_failed_prompt = false;
-                self.active_record_mut().focus = TranscriptFocus::Composer;
-                self.status = Some("Recovered prompt discarded.".into());
-                Action::Render
-            }
-            Key::Escape if self.running => self.cancel_running(),
-            Key::Escape if self.dialog.is_some() => {
-                self.dialog = None;
-                Action::Render
-            }
-            Key::Escape => {
-                self.active_record_mut().focus = TranscriptFocus::Viewport;
-                Action::Render
-            }
+            Key::Escape => unreachable!("Escape is handled before focused input"),
             Key::CtrlC => unreachable!("Ctrl+C is handled before focused input"),
             _ => unreachable!("composer keys are handled before global keys"),
         }
@@ -6988,7 +7032,7 @@ where
 
     fn handle_composer_key(&mut self, key: Key) -> Option<Action> {
         let cursor = self.input_cursor;
-        match key {
+        match key.composer_equivalent() {
             Key::Char(character) => self.insert_text(&character.to_string()),
             Key::ShiftEnter => self.insert_text("\n"),
             Key::Backspace if cursor > 0 => self.replace_chars(cursor - 1, cursor, ""),
@@ -7111,10 +7155,12 @@ where
                 }
             }
         }
-        record.focus = TranscriptFocus::Viewport;
         Action::Render
     }
 
+    // Scrolling moves the viewport and nothing else. Focus is a mode now, and a
+    // mode that Ctrl+K or the wheel could switch by accident would leave the
+    // reader typing into a prompt that had quietly stopped accepting text.
     fn scroll_up(&mut self, rows: u16) {
         let bottom = self.detached_scroll_bottom();
         let record = self.active_record_mut();
@@ -7125,26 +7171,22 @@ where
         };
         record.following_bottom = false;
         record.scroll_offset = current.saturating_sub(rows);
-        record.focus = TranscriptFocus::Viewport;
     }
 
     fn scroll_down(&mut self, rows: u16) {
         let bottom = self.detached_scroll_bottom();
         let record = self.active_record_mut();
         if record.following_bottom {
-            record.focus = TranscriptFocus::Viewport;
             return;
         }
         record.scroll_offset = record.scroll_offset.saturating_add(rows).min(bottom);
         record.following_bottom = record.scroll_offset == bottom;
-        record.focus = TranscriptFocus::Viewport;
     }
 
     fn scroll_to_start(&mut self) {
         let record = self.active_record_mut();
         record.following_bottom = false;
         record.scroll_offset = 0;
-        record.focus = TranscriptFocus::Viewport;
     }
 
     fn scroll_to_end(&mut self) {
@@ -7152,7 +7194,6 @@ where
         let record = self.active_record_mut();
         record.following_bottom = true;
         record.scroll_offset = scroll_offset;
-        record.focus = TranscriptFocus::Viewport;
     }
 
     fn clamp_scroll_offset(&mut self) {
@@ -7232,6 +7273,193 @@ where
         let end_byte = byte_index(&self.input, end);
         self.input.replace_range(start_byte..end_byte, replacement);
         self.input_cursor = start + replacement.chars().count();
+    }
+
+    fn viewport_focused(&self) -> bool {
+        self.transcripts
+            .get(&self.active_transcript)
+            .expect("active transcript always exists")
+            .focus
+            == TranscriptFocus::Viewport
+    }
+
+    /// Focuses the transcript and pins the viewport where the reader left it.
+    ///
+    /// Detaching on entry rather than on the first motion is what makes the
+    /// mode worth entering during a turn: output that keeps arriving would
+    /// otherwise scroll away the very row the reader stopped to read.
+    fn enter_viewport(&mut self) {
+        let bottom = self.detached_scroll_bottom();
+        let record = self.active_record_mut();
+        if record.following_bottom {
+            record.scroll_offset = bottom;
+            record.following_bottom = false;
+        }
+        record.focus = TranscriptFocus::Viewport;
+    }
+
+    /// Drops the painted selection, reporting whether there was one to drop.
+    fn clear_selection(&mut self) -> bool {
+        let record = self.active_record_mut();
+        let painted = record.selection.is_some()
+            || record.selection_text.is_some()
+            || record.selection_too_large;
+
+        record.selection = None;
+        record.selection_text = None;
+        record.selection_too_large = false;
+        record.selecting = false;
+
+        painted
+    }
+
+    /// Escape leaves the composer before it reaches the running turn.
+    ///
+    /// Stopping to read and cancelling are different intents, and a reader who
+    /// only wanted to look must not lose the turn to do it. Escape therefore
+    /// always steps out of the composer first; only a second Escape, pressed
+    /// with the transcript already focused and nothing selected, cancels.
+    fn handle_escape(&mut self) -> Action {
+        self.pending_viewport_key = None;
+
+        if self.recovered_failed_prompt {
+            self.input.clear();
+            self.input_cursor = 0;
+            self.recovered_failed_prompt = false;
+            self.active_record_mut().focus = TranscriptFocus::Composer;
+            self.status = Some("Recovered prompt discarded.".into());
+            return Action::Render;
+        }
+
+        if self.dialog.is_some() {
+            self.dialog = None;
+            return Action::Render;
+        }
+
+        if !self.viewport_focused() {
+            self.enter_viewport();
+            return Action::Render;
+        }
+
+        if self.clear_selection() {
+            return Action::Render;
+        }
+
+        if self.running {
+            return self.cancel_running();
+        }
+
+        Action::Render
+    }
+
+    /// The transcript keymap, applied only while the viewport holds focus.
+    ///
+    /// Returning `None` lets the key continue to the global and composer
+    /// handlers; every arm that returns swallows it, which is what stops a
+    /// motion from also landing as text in the prompt underneath.
+    fn handle_viewport_key(&mut self, key: Key) -> Option<Action> {
+        if self.pending_viewport_key.take() == Some('g') {
+            return Some(self.handle_g_chord(key));
+        }
+
+        match key {
+            Key::Char('g') => {
+                self.pending_viewport_key = Some('g');
+                Some(Action::Render)
+            }
+            Key::Char('G') => {
+                self.scroll_to_end();
+                Some(Action::Render)
+            }
+            Key::Char('j') | Key::Down => {
+                self.scroll_down(1);
+                Some(Action::Render)
+            }
+            Key::Char('k') | Key::Up => {
+                self.scroll_up(1);
+                Some(Action::Render)
+            }
+            Key::CtrlD => {
+                self.scroll_down(self.half_page_rows());
+                Some(Action::Render)
+            }
+            Key::CtrlU => {
+                self.scroll_up(self.half_page_rows());
+                Some(Action::Render)
+            }
+            Key::Home => {
+                self.scroll_to_start();
+                Some(Action::Render)
+            }
+            Key::End => {
+                self.scroll_to_end();
+                Some(Action::Render)
+            }
+            Key::Char('{') => {
+                self.jump_to_user_message(UserMessageTarget::Previous);
+                Some(Action::Render)
+            }
+            Key::Char('}') => {
+                self.jump_to_user_message(UserMessageTarget::Next);
+                Some(Action::Render)
+            }
+            Key::Char('J') => {
+                self.move_block_focus(true);
+                self.scroll_to_focused_block();
+                Some(Action::Render)
+            }
+            Key::Char('K') => {
+                self.move_block_focus(false);
+                self.scroll_to_focused_block();
+                Some(Action::Render)
+            }
+            Key::Char('o') => {
+                self.cycle_focused_block_detail();
+                self.scroll_to_focused_block();
+                Some(Action::Render)
+            }
+            Key::Char('[') => {
+                self.select_sibling(-1);
+                Some(Action::Render)
+            }
+            Key::Char(']') => {
+                self.select_sibling(1);
+                Some(Action::Render)
+            }
+            Key::Char('m') => {
+                self.select_transcript(TranscriptId::Main);
+                Some(Action::Render)
+            }
+            Key::Char('i' | 'a') if !self.active_record_mut().terminal => {
+                self.clear_selection();
+                self.active_record_mut().focus = TranscriptFocus::Composer;
+                self.execution_selection = None;
+                Some(Action::Render)
+            }
+            Key::Char('x') if !self.active_record_mut().terminal => match self.active_transcript {
+                TranscriptId::Subagent(id) => Some(Action::CancelExecution(id)),
+                TranscriptId::Main => Some(Action::Render),
+            },
+            // Nothing types while the transcript holds focus. Letting an
+            // unclaimed editing key through would put text into a prompt whose
+            // cursor is not even being drawn.
+            key if key.edits_composer() => Some(Action::Render),
+            _ => None,
+        }
+    }
+
+    fn handle_g_chord(&mut self, key: Key) -> Action {
+        match key {
+            Key::Char('g') => self.scroll_to_start(),
+            Key::Char('t') => self.show_transcript_dialog(),
+            _ => {}
+        }
+        Action::Render
+    }
+
+    /// Rows a `Ctrl+D`/`Ctrl+U` step advances.
+    fn half_page_rows(&self) -> u16 {
+        (self.transcript_page_rows() / 2).max(1)
     }
 
     fn cancel_running(&mut self) -> Action {
@@ -8009,7 +8237,8 @@ where
         }
     }
 
-    fn jump_to_user_message(&mut self, previous: bool) {
+    /// Absolute wrapped rows every user message of the active transcript starts on.
+    fn user_message_offsets(&self) -> Vec<u16> {
         let layout = self.screen_layout();
         let row_width = layout
             .transcript
@@ -8017,7 +8246,8 @@ where
             .saturating_sub(TRANSCRIPT_ROW_INDENT)
             .max(1);
         let lines = rendered_transcript(&self.view(), row_width);
-        let mut user_offsets = Vec::new();
+
+        let mut offsets = Vec::new();
         let mut row = 0usize;
         for line in &lines {
             if line
@@ -8025,10 +8255,16 @@ where
                 .get(1)
                 .is_some_and(|span| span.content.starts_with('❯'))
             {
-                user_offsets.push(saturating_u16(row));
+                offsets.push(saturating_u16(row));
             }
             row += line.width().div_ceil(usize::from(row_width)).max(1);
         }
+
+        offsets
+    }
+
+    fn jump_to_user_message(&mut self, target: UserMessageTarget) {
+        let user_offsets = self.user_message_offsets();
         if user_offsets.is_empty() {
             return;
         }
@@ -8045,15 +8281,19 @@ where
             }
         };
 
-        let target = if previous {
-            user_offsets
+        let target = match target {
+            UserMessageTarget::Previous => user_offsets
                 .iter()
                 .rev()
                 .find(|offset| **offset < current)
                 .copied()
-                .or_else(|| user_offsets.first().copied())
-        } else {
-            user_offsets.last().copied()
+                .or_else(|| user_offsets.first().copied()),
+            UserMessageTarget::Next => user_offsets
+                .iter()
+                .find(|offset| **offset > current)
+                .copied()
+                .or_else(|| user_offsets.last().copied()),
+            UserMessageTarget::Last => user_offsets.last().copied(),
         };
 
         if let Some(offset) = target {
@@ -8061,7 +8301,6 @@ where
             let record = self.active_record_mut();
             record.following_bottom = false;
             record.scroll_offset = offset.min(bottom);
-            record.focus = TranscriptFocus::Viewport;
         }
     }
 
@@ -8158,7 +8397,6 @@ where
         );
         let record = self.active_record_mut();
         record.following_bottom = false;
-        record.focus = TranscriptFocus::Viewport;
         if target < record.scroll_offset {
             record.scroll_offset = target.min(bottom);
         } else if usize::from(target) >= usize::from(record.scroll_offset) + visible {
@@ -9661,7 +9899,7 @@ fn map_key(event: KeyEvent) -> Option<Event> {
             Key::DeletePreviousWord
         }
         (KeyCode::Char('u' | 'U'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
-            Key::DeleteToLineStart
+            Key::CtrlU
         }
         (KeyCode::Char('a' | 'A'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
             Key::LineStart
@@ -9673,7 +9911,7 @@ fn map_key(event: KeyEvent) -> Option<Event> {
             Key::Right
         }
         (KeyCode::Char('d' | 'D'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
-            Key::Delete
+            Key::CtrlD
         }
         (KeyCode::Char('b' | 'B'), modifiers) if modifiers.contains(KeyModifiers::ALT) => {
             Key::PreviousWord
@@ -10625,7 +10863,7 @@ mod runtime_tests {
                 KeyModifiers::CONTROL,
                 KeyEventKind::Press,
             )),
-            Some(Event::Key(Key::Delete))
+            Some(Event::Key(Key::CtrlD))
         );
     }
 
@@ -11106,6 +11344,251 @@ mod runtime_tests {
         assert_eq!(tui.input(), "x");
     }
 
+    /// Three settled turns, long enough that scrolling has somewhere to go and
+    /// that every prompt row a `{`/`}` jump looks for is really in the render.
+    fn scrollable_tui() -> Tui<NoopEngine> {
+        let mut tui = Tui::new(NoopEngine);
+        tui.handle(Event::Resize {
+            width: 80,
+            height: 24,
+        });
+        for turn in 0..12 {
+            tui.begin_submission(format!("prompt-{turn}"));
+            tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text(
+                "body\n".repeat(40),
+            )));
+            tui.apply_progress(TurnEvent::StateChanged(TurnState::Completed));
+        }
+        // Settled turns are elided by default, which would leave the prompt rows
+        // a jump navigates by collapsed out of the render.
+        tui.active_record_mut().history_expanded = true;
+        tui.scroll_to_end();
+        tui.active_record_mut().focus = TranscriptFocus::Composer;
+        tui
+    }
+
+    /// Escape used to be the cancel key, so a reader who only wanted to scroll
+    /// up and look at something lost the turn to do it.
+    #[test]
+    fn escape_focuses_the_transcript_before_it_cancels_a_running_turn() {
+        let mut tui = scrollable_tui();
+        tui.running = true;
+
+        assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Render);
+        assert_eq!(tui.view().focus, TranscriptFocus::Viewport);
+        assert!(tui.running, "leaving the composer never cancels the turn");
+
+        assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Cancel);
+    }
+
+    /// A selection is the nearer thing to dismiss, so it goes before the turn.
+    #[test]
+    fn escape_drops_the_selection_before_it_reaches_the_running_turn() {
+        let mut tui = selected_tui();
+        tui.running = true;
+
+        assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Render);
+        assert_eq!(tui.selected_text(), None);
+        assert!(tui.running, "dropping a selection never cancels the turn");
+
+        assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Cancel);
+    }
+
+    /// Entering the mode has to pin the viewport, or output arriving during the
+    /// turn scrolls away the row the reader stopped on.
+    #[test]
+    fn focusing_the_transcript_detaches_it_from_the_bottom() {
+        let mut tui = scrollable_tui();
+        assert!(tui.following_bottom());
+
+        tui.handle(Event::Key(Key::Escape));
+        assert!(!tui.following_bottom());
+
+        tui.handle(Event::Key(Key::Char('G')));
+        assert!(tui.following_bottom(), "G re-attaches to the bottom");
+    }
+
+    #[test]
+    fn viewport_vim_motions_scroll_rows_rather_than_typing_into_the_composer() {
+        let mut tui = scrollable_tui();
+        tui.handle(Event::Key(Key::Escape));
+
+        let bottom = tui.view().scroll_offset;
+        tui.handle(Event::Key(Key::Char('k')));
+        assert_eq!(tui.view().scroll_offset, bottom - 1, "k scrolls one row up");
+
+        tui.handle(Event::Key(Key::Char('j')));
+        assert_eq!(tui.view().scroll_offset, bottom, "j scrolls one row down");
+
+        tui.handle(Event::Key(Key::CtrlU));
+        assert!(tui.view().scroll_offset < bottom, "Ctrl+U is a half page");
+
+        tui.handle(Event::Key(Key::Char('g')));
+        tui.handle(Event::Key(Key::Char('g')));
+        assert_eq!(tui.view().scroll_offset, 0, "gg reaches the top");
+
+        assert_eq!(tui.input(), "", "no motion ever reached the prompt");
+    }
+
+    #[test]
+    fn braces_walk_the_transcript_prompt_by_prompt_in_both_directions() {
+        let mut tui = scrollable_tui();
+        tui.handle(Event::Key(Key::Escape));
+        tui.handle(Event::Key(Key::Char('g')));
+        tui.handle(Event::Key(Key::Char('g')));
+        assert_eq!(tui.view().scroll_offset, 0);
+
+        tui.handle(Event::Key(Key::Char('}')));
+        let first = tui.view().scroll_offset;
+        assert!(first > 0, "}} advances to the next prompt");
+
+        tui.handle(Event::Key(Key::Char('}')));
+        let second = tui.view().scroll_offset;
+        assert!(second > first, "}} keeps advancing rather than resting");
+
+        tui.handle(Event::Key(Key::Char('{')));
+        assert_eq!(tui.view().scroll_offset, first, "{{ walks back one prompt");
+    }
+
+    /// `g` alone is a prefix now, so it must not act until its second key.
+    #[test]
+    fn an_abandoned_g_chord_neither_acts_nor_survives_the_next_event() {
+        let mut tui = scrollable_tui();
+        tui.handle(Event::Key(Key::Escape));
+        let resting = tui.view().scroll_offset;
+
+        tui.handle(Event::Key(Key::Char('g')));
+        assert_eq!(tui.view().scroll_offset, resting, "g alone moves nothing");
+
+        tui.handle(Event::Key(Key::Char('z')));
+        assert_eq!(tui.view().scroll_offset, resting);
+
+        tui.handle(Event::Key(Key::Char('g')));
+        tui.handle(Event::Resize {
+            width: 80,
+            height: 24,
+        });
+        tui.handle(Event::Key(Key::Char('g')));
+        assert_eq!(
+            tui.view().scroll_offset,
+            resting,
+            "a resize between the two g's abandons the chord"
+        );
+    }
+
+    #[test]
+    fn i_returns_to_the_composer_and_typing_resumes() {
+        let mut tui = scrollable_tui();
+        tui.handle(Event::Key(Key::Escape));
+
+        assert_eq!(tui.handle(Event::Key(Key::Char('i'))), Action::Render);
+        assert_eq!(tui.view().focus, TranscriptFocus::Composer);
+
+        tui.handle(Event::Key(Key::Char('j')));
+        assert_eq!(tui.input(), "j", "j is a character again in the composer");
+    }
+
+    /// Scrolling is not a mode switch. Ctrl+J/Ctrl+K and the wheel are reachable
+    /// from the prompt, so letting them focus the transcript would leave the
+    /// reader typing into a composer that had silently stopped accepting text.
+    #[test]
+    fn scrolling_detaches_the_viewport_without_taking_focus_from_the_composer() {
+        for scroll in [
+            Event::Key(Key::CtrlK),
+            Event::MouseWheel(MouseWheelDirection::Up),
+            Event::Key(Key::PageUp),
+            Event::Key(Key::CtrlN),
+        ] {
+            let mut tui = scrollable_tui();
+
+            tui.handle(scroll.clone());
+            assert!(!tui.following_bottom(), "the viewport detached");
+            assert_eq!(
+                tui.view().focus,
+                TranscriptFocus::Composer,
+                "scrolling never enters the transcript keymap"
+            );
+
+            tui.handle(Event::Key(Key::Char('j')));
+            assert_eq!(tui.input(), "j", "the composer still takes text");
+        }
+    }
+
+    /// The palette is typed into, so it keeps the alphabet even when a mouse
+    /// press left the transcript focused behind it.
+    #[test]
+    fn an_open_palette_keeps_the_alphabet_from_the_transcript_keymap() {
+        let mut tui = scrollable_tui();
+        tui.handle(Event::Key(Key::Char('/')));
+        assert!(tui.palette_open);
+
+        tui.active_record_mut().focus = TranscriptFocus::Viewport;
+        tui.handle(Event::Key(Key::Char('g')));
+        assert_eq!(tui.input(), "/g", "the palette query kept the key");
+    }
+
+    /// Ctrl+D and Ctrl+U carry two meanings; the composer must keep its own.
+    #[test]
+    fn ctrl_d_and_ctrl_u_still_edit_the_composer_while_it_holds_focus() {
+        let mut tui = Tui::new(NoopEngine);
+        for character in "hello world".chars() {
+            tui.handle(Event::Key(Key::Char(character)));
+        }
+
+        tui.input_cursor = 5;
+        tui.handle(Event::Key(Key::CtrlD));
+        assert_eq!(tui.input(), "helloworld", "Ctrl+D deletes forward");
+
+        tui.handle(Event::Key(Key::CtrlU));
+        assert_eq!(tui.input(), "world", "Ctrl+U deletes to the line start");
+    }
+
+    /// Drags across one known transcript row, leaving a painted selection.
+    fn selected_tui() -> Tui<NoopEngine> {
+        let mut tui = Tui::new(NoopEngine);
+        tui.handle(Event::Resize {
+            width: 80,
+            height: 12,
+        });
+        tui.active_record_mut()
+            .transcript
+            .push(TranscriptEntry::Info("alpha café 🙂 omega".into()));
+
+        tui.handle(Event::MouseDown { column: 24, row: 1 });
+        tui.handle(Event::MouseDrag { column: 30, row: 1 });
+        tui.handle(Event::MouseUp { column: 30, row: 1 });
+        assert_eq!(tui.selected_text(), Some("café 🙂"));
+
+        tui
+    }
+
+    /// The selection used to outlive every click that missed the transcript.
+    #[test]
+    fn a_click_outside_the_transcript_drops_the_selection_and_restores_the_composer() {
+        let mut tui = selected_tui();
+        assert_eq!(tui.view().focus, TranscriptFocus::Viewport);
+
+        let composer_row = tui.size().1 - 2;
+        tui.handle(Event::MouseDown {
+            column: 4,
+            row: composer_row,
+        });
+        assert_eq!(tui.selected_text(), None);
+        assert_eq!(tui.view().focus, TranscriptFocus::Composer);
+    }
+
+    /// A press and release on the same cell selects nothing, which is exactly
+    /// how a reader dismisses what was selected before.
+    #[test]
+    fn a_bare_click_inside_the_transcript_drops_the_selection_and_restores_the_composer() {
+        let mut tui = selected_tui();
+
+        tui.handle(Event::MouseDown { column: 24, row: 1 });
+        tui.handle(Event::MouseUp { column: 24, row: 1 });
+        assert_eq!(tui.selected_text(), None);
+        assert_eq!(tui.view().focus, TranscriptFocus::Composer);
+    }
+
     fn press<E: Engine>(tui: &mut Tui<E>, code: KeyCode, modifiers: KeyModifiers) -> Action {
         let event = map_key(crossterm::event::KeyEvent::new(code, modifiers)).unwrap();
         tui.handle(event)
@@ -11185,7 +11668,7 @@ mod runtime_tests {
             (KeyCode::Char('w'), ctrl, Key::DeletePreviousWord),
             (KeyCode::Backspace, ctrl, Key::DeletePreviousWord),
             (KeyCode::Delete, ctrl, Key::DeleteNextWord),
-            (KeyCode::Char('u'), ctrl, Key::DeleteToLineStart),
+            (KeyCode::Char('u'), ctrl, Key::CtrlU),
             (KeyCode::Char('j'), ctrl, Key::CtrlJ),
             (KeyCode::Char('k'), ctrl, Key::CtrlK),
             (KeyCode::Char('g'), ctrl, Key::CtrlG),
@@ -11200,7 +11683,7 @@ mod runtime_tests {
             (KeyCode::Char('f'), alt, Key::NextWord),
             (KeyCode::Left, ctrl, Key::PreviousWord),
             (KeyCode::Right, ctrl, Key::NextWord),
-            (KeyCode::Char('d'), ctrl, Key::Delete),
+            (KeyCode::Char('d'), ctrl, Key::CtrlD),
             (KeyCode::Char('o'), ctrl, Key::CtrlO),
             (KeyCode::Char('O'), ctrl, Key::CtrlShiftO),
             (KeyCode::Char('t'), ctrl, Key::CtrlT),

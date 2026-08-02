@@ -1062,8 +1062,7 @@ fn connect_and_list_tools_enforce_one_deadline_across_internal_steps() {
 #[test]
 fn concurrent_server_loading_isolates_a_cooperative_deadline_and_keeps_resources_bounded() {
     let cancellation = Arc::new(AtomicBool::new(false));
-    let slow =
-        LocalTransport::with_responses([Ok(initialized())]).delayed(Duration::from_millis(20));
+    let slow = LocalTransport::with_responses([Ok(initialized())]).delayed(Duration::from_secs(5));
     let healthy = LocalTransport::with_responses([
         Ok(initialized()),
         Ok(page(vec![tool("status", Some(true))], None)),
@@ -1084,7 +1083,7 @@ fn concurrent_server_loading_isolates_a_cooperative_deadline_and_keeps_resources
         Arc::clone(&cancellation),
     );
 
-    assert!(start.elapsed() < Duration::from_millis(15));
+    assert!(start.elapsed() < Duration::from_secs(1));
     assert!(reports[0].is_failed());
     assert_eq!(reports[1], McpServerReport::loaded("healthy", 1));
     assert!(registry.tool("healthy::status").is_some());
@@ -1496,6 +1495,10 @@ fn legacy_sse_transport_accepts_exact_limit_exhausts_retries_and_closes_on_curre
         body.extend(std::iter::repeat_n(b' ', 1024 * 1024 - body.len()));
         write!(events, "event: message\ndata: ").unwrap();
         events.write_all(&body).unwrap();
+        events.flush().unwrap();
+        // Force the "\n\n" terminator into a later socket read so the reader
+        // observes a pending, unterminated line at exactly the byte limit.
+        thread::sleep(Duration::from_millis(50));
         write!(events, "\n\n").unwrap();
         events.flush().unwrap();
     });

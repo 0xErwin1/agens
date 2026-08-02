@@ -11,7 +11,7 @@ lint:
     cargo clippy --workspace --all-targets --locked -- -D warnings
 
 test:
-    cargo test --workspace --all-targets --locked
+    cargo test --workspace --all-targets --locked --no-fail-fast
 
 build:
     cargo build --workspace --locked
