@@ -1230,6 +1230,198 @@ mod tests {
         std::fs::remove_dir_all(temporary).unwrap();
     }
 
+    /// Parses declarations through the real agent-markdown grammar, so a probe
+    /// exercises exactly the rules an authored definition produces rather than
+    /// a hand-built approximation of them.
+    fn declared(directory: &Path, declarations: &[&str]) -> Vec<PermissionRule> {
+        let global = directory.join("agents-global");
+        let project = directory.join("agents-project");
+        std::fs::create_dir_all(&global).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+
+        let entries = declarations
+            .iter()
+            .map(|entry| format!("  - {entry}\n"))
+            .collect::<String>();
+        std::fs::write(
+            global.join("probe.md"),
+            format!(
+                "---\nname: probe\ndescription: probe\nmode: all\npermissions:\n{entries}---\nbody\n"
+            ),
+        )
+        .unwrap();
+
+        agens_tools::AgentCatalog::discover(&[], &global, &project)
+            .unwrap()
+            .catalog()
+            .agent("probe")
+            .expect("the probe definition must load")
+            .permission_rules
+            .clone()
+    }
+
+    /// `deny bash rm*` beside `allow bash *` is the canonical "bash, except
+    /// these" shape written with the wildcard spelled out. Both targets are
+    /// globs and therefore equally specific, so only the deny-takes-the-tie
+    /// rule keeps the narrow deny from being overtaken by the broad allow.
+    #[test]
+    fn a_narrow_deny_holds_against_an_explicit_wildcard_allow_in_either_order() {
+        for (label, declarations) in [
+            ("deny-first", ["deny bash rm*", "allow bash *"]),
+            ("allow-first", ["allow bash *", "deny bash rm*"]),
+        ] {
+            let temporary = agens_fixtures::session_directory(&format!("wildcard-allow-{label}"));
+            let project_root = temporary.join("project");
+            let victim = project_root.join("probe-victim.txt");
+            std::fs::create_dir_all(&project_root).unwrap();
+            std::fs::write(&victim, "victim").unwrap();
+
+            let rules = declared(&temporary, &declarations);
+            let denied_output = single_call_turn(
+                &project_root,
+                &rules,
+                &[],
+                false,
+                "native::bash",
+                r#"{"command":"rm -rf probe-victim.txt"}"#,
+            );
+
+            assert!(
+                denied_output.contains("permission denied"),
+                "{label}: an explicit wildcard allow must not overtake a narrower deny, \
+                 got: {denied_output}"
+            );
+            assert!(
+                victim.exists(),
+                "{label}: the denied command must never have run, yet the victim file is gone"
+            );
+
+            let allowed_output = single_call_turn(
+                &project_root,
+                &rules,
+                &[],
+                false,
+                "native::bash",
+                r#"{"command":"echo hi"}"#,
+            );
+            assert!(
+                !allowed_output.contains("permission denied"),
+                "{label}: the broad allow must still authorize a non-matching command, \
+                 got: {allowed_output}"
+            );
+
+            std::fs::remove_dir_all(temporary).unwrap();
+        }
+    }
+
+    /// "Deny the secrets, allow the tree" is the canonical authoring shape for
+    /// a write-scoped agent, and both of its targets are globs.
+    #[test]
+    fn a_nested_write_deny_holds_against_a_broader_write_allow_in_either_order() {
+        for (label, declarations) in [
+            (
+                "deny-first",
+                ["deny write src/secret/**", "allow write src/**"],
+            ),
+            (
+                "allow-first",
+                ["allow write src/**", "deny write src/secret/**"],
+            ),
+        ] {
+            let temporary =
+                agens_fixtures::session_directory(&format!("nested-write-deny-{label}"));
+            let project_root = temporary.join("project");
+            std::fs::create_dir_all(project_root.join("src").join("secret")).unwrap();
+
+            let rules = declared(&temporary, &declarations);
+            let denied_output = single_call_turn(
+                &project_root,
+                &rules,
+                &[],
+                false,
+                "native::write",
+                r#"{"path":"src/secret/key.txt","content":"SECRET"}"#,
+            );
+
+            assert!(
+                denied_output.contains("permission denied"),
+                "{label}: a broader allow must not overtake a nested deny, got: {denied_output}"
+            );
+            assert!(
+                !project_root
+                    .join("src")
+                    .join("secret")
+                    .join("key.txt")
+                    .exists(),
+                "{label}: the denied write must never have run, yet the secret file exists"
+            );
+
+            let allowed_output = single_call_turn(
+                &project_root,
+                &rules,
+                &[],
+                false,
+                "native::write",
+                r#"{"path":"src/main.rs","content":"fn main() {}"}"#,
+            );
+            assert!(
+                !allowed_output.contains("permission denied"),
+                "{label}: a write outside the denied subtree must still be allowed, \
+                 got: {allowed_output}"
+            );
+
+            std::fs::remove_dir_all(temporary).unwrap();
+        }
+    }
+
+    /// "Deny X except for these commands" is the standard allowlist shape. The
+    /// untargeted deny must not erase the tool from the catalog, because the
+    /// targeted allow outranks it for the calls it names and needs the tool to
+    /// still be there to act on.
+    #[test]
+    fn an_untargeted_deny_leaves_a_targeted_allow_reachable_in_either_order() {
+        for (label, declarations) in [
+            ("deny-first", ["deny bash", "allow bash git*"]),
+            ("allow-first", ["allow bash git*", "deny bash"]),
+        ] {
+            let temporary =
+                agens_fixtures::session_directory(&format!("targeted-allowlist-{label}"));
+            let project_root = temporary.join("project");
+            std::fs::create_dir_all(&project_root).unwrap();
+
+            let rules = declared(&temporary, &declarations);
+            let allowed_output = single_call_turn(
+                &project_root,
+                &rules,
+                &[],
+                false,
+                "native::bash",
+                r#"{"command":"git --version"}"#,
+            );
+            assert!(
+                !allowed_output.contains("permission denied"),
+                "{label}: the targeted allow must outrank the untargeted deny, \
+                 got: {allowed_output}"
+            );
+
+            let denied_output = single_call_turn(
+                &project_root,
+                &rules,
+                &[],
+                false,
+                "native::bash",
+                r#"{"command":"echo hi"}"#,
+            );
+            assert!(
+                denied_output.contains("permission denied"),
+                "{label}: everything the targeted allow does not name stays denied, \
+                 got: {denied_output}"
+            );
+
+            std::fs::remove_dir_all(temporary).unwrap();
+        }
+    }
+
     /// A project-supplied definition can declare `allow bash`, so the parent's
     /// own configured deny has to outrank it. Enforced as a hard safety
     /// predicate rather than as a policy rule, because a declaration would

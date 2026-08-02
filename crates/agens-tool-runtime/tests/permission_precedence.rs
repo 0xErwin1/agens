@@ -96,18 +96,114 @@ const CASES: &[Case] = &[
         target: "echo hi",
         expected: PermissionDecision::Deny,
     },
-    // On an equal target and an equal tool specificity, the last declaration
-    // wins.
+    // On an equal target and an equal tool specificity, `deny` wins in either
+    // authoring order: declaration order never decides safety.
     Case {
         declarations: &["deny *", "allow *"],
         tool: "bash",
         target: "echo hi",
-        expected: PermissionDecision::Allow,
+        expected: PermissionDecision::Deny,
     },
     Case {
         declarations: &["allow *", "deny *"],
         tool: "bash",
         target: "echo hi",
+        expected: PermissionDecision::Deny,
+    },
+    Case {
+        declarations: &["allow bash", "deny bash"],
+        tool: "bash",
+        target: "echo hi",
+        expected: PermissionDecision::Deny,
+    },
+    // `ask` sits between `allow` and `deny`: the more restrictive decision
+    // wins a tie, and requiring a human is more restrictive than granting.
+    Case {
+        declarations: &["ask bash", "allow bash"],
+        tool: "bash",
+        target: "echo hi",
+        expected: PermissionDecision::Ask,
+    },
+    Case {
+        declarations: &["ask bash", "deny bash"],
+        tool: "bash",
+        target: "echo hi",
+        expected: PermissionDecision::Deny,
+    },
+    // Two globs of different breadth are equally specific, so the deny holds
+    // whichever side of the allow it is written on.
+    Case {
+        declarations: &["deny bash rm*", "allow bash *"],
+        tool: "bash",
+        target: "rm -rf victim.txt",
+        expected: PermissionDecision::Deny,
+    },
+    Case {
+        declarations: &["allow bash *", "deny bash rm*"],
+        tool: "bash",
+        target: "rm -rf victim.txt",
+        expected: PermissionDecision::Deny,
+    },
+    Case {
+        declarations: &["deny bash rm*", "allow bash *"],
+        tool: "bash",
+        target: "echo hi",
+        expected: PermissionDecision::Allow,
+    },
+    Case {
+        declarations: &["deny write src/secret/**", "allow write src/**"],
+        tool: "write",
+        target: "src/secret/key.txt",
+        expected: PermissionDecision::Deny,
+    },
+    Case {
+        declarations: &["allow write src/**", "deny write src/secret/**"],
+        tool: "write",
+        target: "src/secret/key.txt",
+        expected: PermissionDecision::Deny,
+    },
+    Case {
+        declarations: &["deny write src/secret/**", "allow write src/**"],
+        tool: "write",
+        target: "src/main.rs",
+        expected: PermissionDecision::Allow,
+    },
+    // "deny X except for these": an untargeted deny must not erase a targeted
+    // allow on one path while the other honors it.
+    Case {
+        declarations: &["deny bash", "allow bash git*"],
+        tool: "bash",
+        target: "git status",
+        expected: PermissionDecision::Allow,
+    },
+    Case {
+        declarations: &["allow bash git*", "deny bash"],
+        tool: "bash",
+        target: "git status",
+        expected: PermissionDecision::Allow,
+    },
+    Case {
+        declarations: &["deny bash", "allow bash git*"],
+        tool: "bash",
+        target: "echo hi",
+        expected: PermissionDecision::Deny,
+    },
+    Case {
+        declarations: &["allow write src/**", "deny write"],
+        tool: "write",
+        target: "src/main.rs",
+        expected: PermissionDecision::Allow,
+    },
+    Case {
+        declarations: &["deny write", "allow write src/**"],
+        tool: "write",
+        target: "src/main.rs",
+        expected: PermissionDecision::Allow,
+    },
+    Case {
+        declarations: &["allow write src/**", "deny write"],
+        tool: "write",
+        target: "README.md",
         expected: PermissionDecision::Deny,
     },
     // A targeted deny outranks an untargeted allow even when the allow names
@@ -155,23 +251,29 @@ const CASES: &[Case] = &[
 
 #[test]
 fn the_child_path_and_the_parent_path_decide_every_declaration_shape_identically() {
+    let mut disagreements = Vec::new();
+
     for case in CASES {
         let declarations = parsed_declarations(case.declarations);
 
         let child = child_decision(&declarations, case.tool, case.target);
         let parent = parent_decision(&declarations, case.tool, case.target);
 
-        assert_eq!(
-            child, case.expected,
-            "child path disagreed for {:?} on {} {:?}",
-            case.declarations, case.tool, case.target
-        );
-        assert_eq!(
-            parent, case.expected,
-            "parent path disagreed for {:?} on {} {:?}",
-            case.declarations, case.tool, case.target
-        );
+        if child != case.expected || parent != case.expected {
+            disagreements.push(format!(
+                "{:?} on {} {:?}: expected {:?}, child {child:?}, parent {parent:?}",
+                case.declarations, case.tool, case.target, case.expected
+            ));
+        }
     }
+
+    assert!(
+        disagreements.is_empty(),
+        "{} of {} cases disagreed:\n{}",
+        disagreements.len(),
+        CASES.len(),
+        disagreements.join("\n")
+    );
 }
 
 /// Parses declarations through the real agent-markdown grammar, so both paths

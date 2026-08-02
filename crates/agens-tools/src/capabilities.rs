@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use agens_core::{
     AgentDefinition, PermissionDecision, PermissionPattern, PermissionRule, PermissionScope,
     PermissionTargetKind, ordered_permission_rules, permission_target_kind_for_tool,
+    prevailing_decision,
 };
 
 use crate::ToolDispatcher;
@@ -23,6 +24,11 @@ impl EffectiveCapabilitySet {
     /// child's surface hands it. Sorting descriptors by selector here would
     /// destroy that order and make the two paths answer differently for the
     /// same definition.
+    ///
+    /// Two rules selecting exactly the same calls collapse into one descriptor,
+    /// carrying the decision [`agens_core::prevailing_decision`] gives them —
+    /// the same answer the ordering would have reached had both survived, so
+    /// collapsing them cannot change what the definition means.
     pub fn from_agent(agent: &AgentDefinition, project: &str, dispatcher: &ToolDispatcher) -> Self {
         let snapshot = dispatcher.capability_snapshot();
         let mut descriptors: Vec<EffectiveCapabilityDescriptor> = Vec::new();
@@ -33,12 +39,19 @@ impl EffectiveCapabilitySet {
             }
             let target = target(&rule.target);
             for (selector, kind) in resolved_selectors(rule, &snapshot) {
-                let descriptor = EffectiveCapabilityDescriptor {
+                let mut descriptor = EffectiveCapabilityDescriptor {
                     selector,
                     target: target.clone(),
                     decision: rule.decision,
                     kind,
                 };
+                if let Some(existing) = descriptors
+                    .iter()
+                    .find(|existing| existing.key() == descriptor.key())
+                {
+                    descriptor.decision =
+                        prevailing_decision(existing.decision, descriptor.decision);
+                }
                 descriptors.retain(|existing| existing.key() != descriptor.key());
                 descriptors.push(descriptor);
             }

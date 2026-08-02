@@ -1654,8 +1654,12 @@ fn task_control_and_message_tools_share_registry_and_enforce_caller_routes() {
     );
 }
 
+/// Two rules that resolve to the same selector and target collapse into one
+/// descriptor carrying the prevailing decision, not the later one: `files_read`
+/// and `native::files_read` name the same tool, so the deny holds against the
+/// allow that follows it.
 #[test]
-fn effective_capabilities_normalize_aliases_globs_projects_and_last_matches() {
+fn effective_capabilities_normalize_aliases_globs_projects_and_prevailing_decisions() {
     let mut dispatcher = ToolDispatcher::new();
     dispatcher
         .register_native("native::files_read", ToolAccess::ReadOnly, InertTool)
@@ -1691,7 +1695,7 @@ fn effective_capabilities_normalize_aliases_globs_projects_and_last_matches() {
     let set = EffectiveCapabilitySet::from_agent(&agent, "project", &dispatcher);
 
     assert_eq!(set.descriptors().len(), 2);
-    assert_eq!(set.descriptors()[0].decision(), PermissionDecision::Allow);
+    assert_eq!(set.descriptors()[0].decision(), PermissionDecision::Deny);
     assert_eq!(set.descriptors()[1].decision(), PermissionDecision::Ask);
     assert!(set.descriptors()[1].matches_identity("native:10:files_read"));
     assert!(set.descriptors()[1].matches_identity("native:11:files_write"));
@@ -1818,8 +1822,10 @@ fn parsed_literal_aliases_resolve_while_globs_remain_distinct_descriptors() {
             .iter()
             .filter(|descriptor| descriptor.decision() == PermissionDecision::Allow)
             .count(),
-        1
+        0,
+        "the allow collapses into the deny that names the same tool"
     );
+    assert_eq!(set.descriptors()[0].decision(), PermissionDecision::Deny);
     assert!(set.descriptors()[0].matches_identity("native:10:files_read"));
     assert!(set.descriptors()[1].matches_identity("native:10:files_read"));
     assert!(set.descriptors()[1].matches_identity("native:11:files_write"));
@@ -1902,11 +1908,11 @@ fn an_allow_naming_a_tool_the_dispatcher_lacks_is_dropped() {
     assert!(set.descriptors().is_empty());
 }
 
-/// Descriptor order is authoring order, deliberately: `permission_rules`
-/// hands the sequence to `ordered_permission_rules`, which breaks a tie
-/// between two equally specific declarations by taking the later one. A set
-/// ordered by selector instead would answer differently from the delegated
-/// child's surface for the same definition.
+/// Descriptor order is authoring order, deliberately: `permission_rules` hands
+/// the sequence to `ordered_permission_rules`, which is the only place a tie
+/// between two equally specific declarations is broken. A set ordered by
+/// selector instead would answer differently from the delegated child's surface
+/// for the same definition.
 #[test]
 fn capability_descriptors_follow_declaration_order() {
     let mut dispatcher = ToolDispatcher::new();

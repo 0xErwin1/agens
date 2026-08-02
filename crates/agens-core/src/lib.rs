@@ -15,7 +15,9 @@ mod permission_precedence;
 pub mod redaction;
 mod request_config;
 
-pub use permission_precedence::{declarations_deny_every_target, ordered_permission_rules};
+pub use permission_precedence::{
+    declarations_deny_every_target, ordered_permission_rules, prevailing_decision,
+};
 pub use request_config::{ReasoningEffort, RequestConfig, RequestConfigError};
 
 #[derive(Clone, Debug, PartialEq, Eq)]

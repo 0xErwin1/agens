@@ -7,14 +7,17 @@
 //! a silent clamp. A `deny` or `ask` naming an unheld tool exceeds nothing, so
 //! it is retained inert instead — see [`normalize_declared_tool`].
 //!
-//! Declarations that deny a tool for every target omit it from the catalog
-//! entirely. A target-scoped `deny` (for example `deny bash rm*`) leaves the
-//! tool in the catalog and relies on the retained policy rule to deny the
-//! matching calls at evaluation time — the tool has to still be present for
-//! that narrower rule to have anything to act on. Which of the two applies is
-//! decided by `agens_core::declarations_deny_every_target`, the same owner
-//! that orders the retained rules, so catalog omission and policy evaluation
-//! can never disagree about a declaration set.
+//! A tool is omitted from the catalog exactly when the declarations leave no
+//! call to it that the policy could answer with anything but `Deny`. Every
+//! other narrowing — a target-scoped `deny bash rm*`, or a `deny bash` beside
+//! an `allow bash git*` that outranks it for the calls it names — leaves the
+//! tool in the catalog and relies on the retained policy rules, because the
+//! tool has to be present for the narrower rule to have anything to act on.
+//!
+//! Omission is not decided here. `agens_core::declarations_deny_every_target`
+//! derives it from the same ordering that resolves the retained rules, so the
+//! two enforcement mechanisms answer one question rather than two similar
+//! ones and cannot disagree about a declaration set.
 
 use agens_core::{
     GlobalDenyPredicate, PermissionDecision, PermissionPattern, PermissionRule, SafetyPredicate,
