@@ -5,6 +5,13 @@
 //! union: a declaration can only narrow what the child inherits, and any
 //! declaration naming a tool the parent does not hold is a hard error rather
 //! than a silent clamp.
+//!
+//! An untargeted `deny` (no target pattern, `PermissionPattern::Any`) omits
+//! its tool from the catalog entirely. A target-scoped `deny` (for example
+//! `deny bash rm -rf /**`) leaves the tool in the catalog and relies on the
+//! retained policy rule to deny the matching calls at evaluation time — the
+//! tool has to still be present for that narrower rule to have anything to
+//! act on.
 
 use agens_core::{PermissionDecision, PermissionPattern, PermissionRule};
 use agens_error::CliError;
@@ -61,6 +68,7 @@ pub fn resolve_child_surface(
         .filter(|entry| {
             !declarations.iter().any(|declaration| {
                 declaration.decision == PermissionDecision::Deny
+                    && declaration.target == PermissionPattern::Any
                     && declaration_names_tool(declaration, entry)
             })
         })
@@ -177,6 +185,30 @@ mod tests {
         assert_eq!(
             tool_names(&surface).len(),
             NativeToolCatalog::metadata().len() - 1
+        );
+    }
+
+    #[test]
+    fn a_target_scoped_deny_keeps_its_tool_in_the_catalog() {
+        let targeted_deny = PermissionRule::global(
+            PermissionDecision::Deny,
+            PermissionPattern::glob("bash").unwrap(),
+            PermissionPattern::glob("rm -rf /**").unwrap(),
+        );
+        let surface =
+            resolve_child_surface(&[rule(PermissionDecision::Allow, "bash"), targeted_deny])
+                .unwrap();
+
+        assert!(
+            tool_names(&surface).contains(&"native::bash".to_owned()),
+            "a target-scoped deny must not omit its tool from the catalog, \
+             only an untargeted deny does that"
+        );
+        assert!(
+            surface.rules.iter().any(|rule| {
+                rule.decision == PermissionDecision::Deny && rule.tool.matches("native::bash")
+            }),
+            "the target-scoped deny must still be retained as a policy rule"
         );
     }
 

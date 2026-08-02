@@ -960,6 +960,141 @@ mod tests {
     }
 
     #[test]
+    fn a_target_scoped_bash_deny_blocks_only_the_matching_command_and_survives_dangerous_mode() {
+        let declarations = [
+            PermissionRule::global(
+                PermissionDecision::Allow,
+                PermissionPattern::glob("bash").unwrap(),
+                PermissionPattern::Any,
+            ),
+            PermissionRule::global(
+                PermissionDecision::Deny,
+                PermissionPattern::glob("bash").unwrap(),
+                PermissionPattern::glob("rm -rf /**").unwrap(),
+            ),
+        ];
+
+        for dangerous_mode in [false, true] {
+            let temporary = agens_fixtures::session_directory(&format!(
+                "targeted-bash-deny-dangerous-{dangerous_mode}"
+            ));
+            let project_root = temporary.join("project");
+
+            let denied_output = single_call_turn(
+                &project_root,
+                &declarations,
+                dangerous_mode,
+                "native::bash",
+                r#"{"command":"rm -rf /tmp/should-never-run"}"#,
+            );
+
+            assert!(
+                denied_output.contains("permission denied"),
+                "a target-scoped declared deny must survive dangerous_mode={dangerous_mode}, \
+                 got: {denied_output}"
+            );
+
+            let allowed_output = single_call_turn(
+                &project_root,
+                &declarations,
+                dangerous_mode,
+                "native::bash",
+                r#"{"command":"echo marker > survives.txt"}"#,
+            );
+
+            assert!(
+                !allowed_output.contains("permission denied"),
+                "a non-matching bash command must still run, got: {allowed_output}"
+            );
+            assert!(
+                project_root.join("survives.txt").exists(),
+                "the non-matching bash command must have actually run"
+            );
+
+            std::fs::remove_dir_all(temporary).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_target_scoped_write_deny_generalizes_the_guardrail_beyond_bash() {
+        let temporary = agens_fixtures::session_directory("targeted-write-deny");
+        let project_root = temporary.join("project");
+        let declarations = [
+            PermissionRule::global(
+                PermissionDecision::Allow,
+                PermissionPattern::glob("write").unwrap(),
+                PermissionPattern::Any,
+            ),
+            PermissionRule::global(
+                PermissionDecision::Deny,
+                PermissionPattern::glob("write").unwrap(),
+                PermissionPattern::glob(".env*").unwrap(),
+            ),
+        ];
+
+        let denied_output = single_call_turn(
+            &project_root,
+            &declarations,
+            false,
+            "native::write",
+            r#"{"path":".env","content":"SECRET=1"}"#,
+        );
+        assert!(
+            denied_output.contains("permission denied"),
+            "a target-scoped deny must block a matching write target, got: {denied_output}"
+        );
+        assert!(!project_root.join(".env").exists());
+
+        let allowed_output = single_call_turn(
+            &project_root,
+            &declarations,
+            false,
+            "native::write",
+            r#"{"path":"notes.md","content":"fine"}"#,
+        );
+        assert!(
+            !allowed_output.contains("permission denied"),
+            "a non-matching write target must still be allowed, got: {allowed_output}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(project_root.join("notes.md")).unwrap(),
+            "fine"
+        );
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn a_granted_bash_call_can_still_reach_outside_the_project_root() {
+        let temporary = agens_fixtures::session_directory("bash-unconfined");
+        let project_root = temporary.join("project");
+
+        let output = single_call_turn(
+            &project_root,
+            &[PermissionRule::global(
+                PermissionDecision::Allow,
+                PermissionPattern::glob("bash").unwrap(),
+                PermissionPattern::Any,
+            )],
+            false,
+            "native::bash",
+            r#"{"command":"echo escaped > ../outside-marker.txt"}"#,
+        );
+
+        assert!(
+            !output.contains("permission denied"),
+            "a declared allow bash must not be denied, got: {output}"
+        );
+        assert!(
+            temporary.join("outside-marker.txt").exists(),
+            "a granted bash call is not confined to the project root: this is the accepted, \
+             documented cost of granting bash, not a regression"
+        );
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
     fn built_in_explore_still_cannot_write_edit_bash_or_fetch_after_inheriting_the_parent_surface()
     {
         let temporary = agens_fixtures::session_directory("explore-narrowing");

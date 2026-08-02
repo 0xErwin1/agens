@@ -336,6 +336,13 @@ fn list(document: &MarkdownDocument, name: &str) -> Result<Vec<String>, String> 
     }
 }
 
+/// Parses one `permissions:` entry (`decision tool [target]`) from an
+/// agent's frontmatter. Tokens split on whitespace with no quoting, so a
+/// target naming a multi-word shell command — `rm -rf /**` — cannot be
+/// written here; it has to go in the TOML `[permissions]` block instead,
+/// whose `tool(target)` syntax keeps the target intact up to the closing
+/// parenthesis. An omitted target defaults to `PermissionPattern::Any`,
+/// matching every target for that tool.
 fn permission(rule: &str) -> Result<PermissionRule, String> {
     let mut parts = rule.split_whitespace();
     let decision = match parts.next() {
@@ -359,6 +366,43 @@ fn permission(rule: &str) -> Result<PermissionRule, String> {
             None => PermissionPattern::Any,
         },
     ))
+}
+
+#[cfg(test)]
+mod permission_parsing_tests {
+    use super::*;
+
+    #[test]
+    fn a_bare_tool_name_matches_every_target() {
+        let rule = permission("deny bash").expect("bare declaration should parse");
+
+        assert_eq!(rule.target, PermissionPattern::Any);
+        assert!(rule.target.matches("rm -rf /"));
+        assert!(rule.target.matches(""));
+    }
+
+    #[test]
+    fn a_targeted_tool_name_matches_only_that_glob() {
+        let rule = permission("deny bash rm*").expect("targeted declaration should parse");
+
+        assert!(rule.target.matches("rm -rf"));
+        assert!(!rule.target.matches("echo hi"));
+    }
+
+    /// The markdown grammar is `decision tool target`, split on whitespace
+    /// with no quoting: it can only ever express a single target token. A
+    /// multi-word command pattern such as `rm -rf /**` has to be written in
+    /// the TOML `[permissions]` block instead, where `tool(target)` keeps the
+    /// target intact up to the closing parenthesis.
+    #[test]
+    fn a_target_pattern_containing_whitespace_is_rejected_by_the_markdown_grammar() {
+        let error = permission("deny bash rm -rf /**").unwrap_err();
+
+        assert_eq!(
+            error,
+            "permission must contain decision, tool, and optional target"
+        );
+    }
 }
 
 fn diagnostic(path: PathBuf, message: impl Into<String>) -> AgentDiagnostic {
