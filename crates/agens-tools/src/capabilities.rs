@@ -21,12 +21,10 @@ impl EffectiveCapabilitySet {
             if !rule_applies_to_project(rule, project) {
                 continue;
             }
-            let Some(selector) = selector(&rule.tool, &snapshot) else {
-                continue;
-            };
             let target = target(&rule.target);
-            let kind = target_kind(&rule.tool);
-            normalized.insert((selector, target), (rule.decision, kind));
+            for (selector, kind) in selectors(&rule.tool, &snapshot) {
+                normalized.insert((selector, target.clone()), (rule.decision, kind));
+            }
         }
 
         let mut descriptors = normalized
@@ -52,7 +50,7 @@ impl EffectiveCapabilitySet {
     pub fn permission_rules(&self) -> Vec<PermissionRule> {
         self.descriptors
             .iter()
-            .map(EffectiveCapabilityDescriptor::permission_rule)
+            .flat_map(EffectiveCapabilityDescriptor::permission_rules)
             .collect()
     }
 
@@ -103,18 +101,32 @@ impl EffectiveCapabilityDescriptor {
         }
     }
 
-    fn permission_rule(&self) -> PermissionRule {
-        PermissionRule::global(
-            self.decision,
-            self.selector.permission_pattern(),
-            self.target
-                .as_ref()
-                .map(|pattern| {
-                    PermissionPattern::glob_for_target_kind(pattern.clone(), self.kind)
-                        .expect("stored target is validated")
-                })
-                .unwrap_or(PermissionPattern::Any),
-        )
+    /// Reconstructs one concrete policy rule per identity this descriptor
+    /// covers. A `Pattern` selector's declared `source` (for example `bas*`)
+    /// is never reused directly here: it was matched against tool names, not
+    /// against the dispatcher's internal identity strings, so a glob built
+    /// from it would compare false against every real call. Each matched
+    /// identity therefore gets its own `Exact` rule instead.
+    fn permission_rules(&self) -> Vec<PermissionRule> {
+        let target = self
+            .target
+            .as_ref()
+            .map(|pattern| {
+                PermissionPattern::glob_for_target_kind(pattern.clone(), self.kind)
+                    .expect("stored target is validated")
+            })
+            .unwrap_or(PermissionPattern::Any);
+
+        self.selector
+            .identities()
+            .map(|identity| {
+                PermissionRule::global(
+                    self.decision,
+                    PermissionPattern::Exact(identity.to_owned()),
+                    target.clone(),
+                )
+            })
+            .collect()
     }
 }
 
@@ -128,57 +140,102 @@ enum ToolSelector {
 }
 
 impl ToolSelector {
-    fn permission_pattern(&self) -> PermissionPattern {
+    fn identities(&self) -> impl Iterator<Item = &str> {
         match self {
-            Self::Exact(identity) => PermissionPattern::Exact(identity.clone()),
-            Self::Pattern { source, .. } => {
-                PermissionPattern::glob(source.clone()).expect("stored selector is validated")
-            }
+            Self::Exact(identity) => std::slice::from_ref(identity),
+            Self::Pattern { identities, .. } => identities.as_slice(),
         }
+        .iter()
+        .map(String::as_str)
     }
 }
 
 type DescriptorKey = (ToolSelector, Option<String>);
 
-/// Classifies a declared rule's target kind from its `tool` pattern before
-/// that pattern is resolved into the dispatcher's internal identity space
-/// (`ToolSelector`'s `native:<len>:<name>` form), which no longer carries a
-/// recognizable tool name. An unresolvable pattern (`Any`, or a glob whose
-/// source is not a plain tool name) defaults to `Path`, the conservative
-/// choice that keeps segment discipline.
-fn target_kind(pattern: &PermissionPattern) -> PermissionTargetKind {
-    let source = match pattern {
-        PermissionPattern::Exact(value) => Some(value.as_str()),
-        PermissionPattern::Glob(_) => pattern.glob_source(),
-        PermissionPattern::Any => None,
-    };
-
-    source
-        .map(permission_target_kind_for_tool)
-        .unwrap_or(PermissionTargetKind::Path)
-}
-
 fn rule_applies_to_project(rule: &PermissionRule, project: &str) -> bool {
     rule.scope == PermissionScope::Global || rule.project.as_deref() == Some(project)
 }
 
-fn selector(pattern: &PermissionPattern, snapshot: &CapabilitySnapshot) -> Option<ToolSelector> {
+/// Resolves a declared `tool` pattern into the selector(s) it applies to,
+/// each paired with the target kind its own matched tool implies.
+///
+/// A literal (non-wildcard) pattern names exactly one tool, so its kind is
+/// classified directly from that name. A wildcard pattern can match several
+/// tools, and those tools are not guaranteed to share a target kind (a
+/// pattern spanning `bash` and a path-shaped tool, for instance) — so
+/// matched identities are grouped by their own kind rather than by the
+/// pattern that found them, and each group becomes its own selector. This
+/// keeps a `bash` match's target free-form even when a sibling match under
+/// the same wildcard is path-shaped, and vice versa.
+fn selectors(
+    pattern: &PermissionPattern,
+    snapshot: &CapabilitySnapshot,
+) -> Vec<(ToolSelector, PermissionTargetKind)> {
     match pattern {
-        PermissionPattern::Exact(value) => exact_selector(value, snapshot),
+        PermissionPattern::Exact(value) => exact_selector(value, snapshot)
+            .map(|selector| (selector, permission_target_kind_for_tool(value)))
+            .into_iter()
+            .collect(),
         PermissionPattern::Glob(_) if pattern.glob_source().is_some_and(is_literal_glob) => {
-            exact_selector(pattern.glob_source().unwrap(), snapshot)
+            let source = pattern.glob_source().unwrap();
+            exact_selector(source, snapshot)
+                .map(|selector| (selector, permission_target_kind_for_tool(source)))
+                .into_iter()
+                .collect()
         }
         PermissionPattern::Any | PermissionPattern::Glob(_) => {
             let source = pattern.glob_source().unwrap_or("*").to_owned();
-            let identities = snapshot
-                .identities
-                .iter()
-                .filter(|identity| pattern.matches(identity))
-                .cloned()
-                .collect::<Vec<_>>();
-            (!identities.is_empty()).then_some(ToolSelector::Pattern { source, identities })
+            let mut groups: Vec<(PermissionTargetKind, Vec<String>)> = Vec::new();
+
+            for (identity, kind) in matched_identities_with_kind(pattern, snapshot) {
+                match groups.iter_mut().find(|(existing, _)| *existing == kind) {
+                    Some((_, identities)) => identities.push(identity),
+                    None => groups.push((kind, vec![identity])),
+                }
+            }
+
+            groups
+                .into_iter()
+                .map(|(kind, identities)| {
+                    (
+                        ToolSelector::Pattern {
+                            source: source.clone(),
+                            identities,
+                        },
+                        kind,
+                    )
+                })
+                .collect()
         }
     }
+}
+
+/// Matches a wildcard tool pattern both against the dispatcher's internal
+/// identity strings directly (`native:4:bash`) and against every alias
+/// (bare and qualified tool names) those identities are known by, so a
+/// pattern written in either shape resolves the same matched tools. The
+/// alias form is preferred for classifying a match's target kind, since it
+/// still carries a recognizable tool name; the raw identity form does not.
+fn matched_identities_with_kind(
+    pattern: &PermissionPattern,
+    snapshot: &CapabilitySnapshot,
+) -> Vec<(String, PermissionTargetKind)> {
+    let mut kinds: BTreeMap<String, PermissionTargetKind> = BTreeMap::new();
+
+    for identity in &snapshot.identities {
+        if pattern.matches(identity) {
+            kinds
+                .entry(identity.clone())
+                .or_insert(PermissionTargetKind::Path);
+        }
+    }
+    for (alias, identity) in &snapshot.aliases {
+        if pattern.matches(alias) {
+            kinds.insert(identity.clone(), permission_target_kind_for_tool(alias));
+        }
+    }
+
+    kinds.into_iter().collect()
 }
 
 fn exact_selector(value: &str, snapshot: &CapabilitySnapshot) -> Option<ToolSelector> {

@@ -13,7 +13,9 @@
 //! tool has to still be present for that narrower rule to have anything to
 //! act on.
 
-use agens_core::{PermissionDecision, PermissionPattern, PermissionRule};
+use agens_core::{
+    PermissionDecision, PermissionPattern, PermissionRule, permission_target_kind_for_tool,
+};
 use agens_error::CliError;
 use agens_tools::{NativeToolCatalog, NativeToolMetadata};
 
@@ -108,6 +110,16 @@ fn declaration_names_tool(declaration: &PermissionRule, entry: &NativeToolMetada
 /// identity string policy evaluation actually compares against. A raw
 /// `Glob` tool pattern is never retained past this point, because it can
 /// never be compared against that identity string directly.
+///
+/// A declared target's `/`-crossing behavior depends on which concrete tool
+/// it belongs to (`permission_target_kind_for_tool`), and a wildcard tool
+/// pattern is only classifiable once it has been expanded to a concrete
+/// native tool — never from the raw declared token. The target glob is
+/// therefore rebuilt per expanded tool from its own source pattern, so two
+/// tools expanded from the same wildcard (for example a pattern spanning
+/// `bash` and a path-shaped tool) each keep the target-kind their own name
+/// implies, rather than inheriting whatever kind the raw wildcard token
+/// happened to classify as.
 fn normalize_declared_tool(
     declaration: PermissionRule,
     metadata: &[NativeToolMetadata],
@@ -117,9 +129,26 @@ fn normalize_declared_tool(
         .filter(|entry| declaration_names_tool(&declaration, entry))
         .map(|entry| PermissionRule {
             tool: PermissionPattern::Exact(entry.qualified_name.clone()),
+            target: retarget_for_tool(&declaration.target, &entry.qualified_name),
             ..declaration.clone()
         })
         .collect()
+}
+
+fn retarget_for_tool(target: &PermissionPattern, qualified_tool_name: &str) -> PermissionPattern {
+    match target {
+        PermissionPattern::Glob(_) => {
+            let source = target
+                .glob_source()
+                .expect("a Glob variant always carries its source pattern");
+            PermissionPattern::glob_for_target_kind(
+                source,
+                permission_target_kind_for_tool(qualified_tool_name),
+            )
+            .expect("a source pattern already validated under one target kind stays valid under another")
+        }
+        PermissionPattern::Any | PermissionPattern::Exact(_) => target.clone(),
+    }
 }
 
 fn declaration_tool_label(pattern: &PermissionPattern) -> String {

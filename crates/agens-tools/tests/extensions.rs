@@ -1725,6 +1725,45 @@ fn effective_capabilities_round_trip_a_declared_bash_target_as_free_form_text() 
 }
 
 #[test]
+fn a_wildcard_tool_pattern_spanning_differing_target_kinds_keeps_each_kind_of_its_own() {
+    let mut dispatcher = ToolDispatcher::new();
+    dispatcher
+        .register_native("native::bash", ToolAccess::Write, InertTool)
+        .unwrap();
+    dispatcher
+        .register_native("native::write", ToolAccess::Write, InertTool)
+        .unwrap();
+
+    let agent = agent_with_rules(vec![PermissionRule::global(
+        PermissionDecision::Deny,
+        PermissionPattern::glob("*").unwrap(),
+        PermissionPattern::glob("rm*").unwrap(),
+    )]);
+
+    let set = EffectiveCapabilitySet::from_agent(&agent, "project", &dispatcher);
+    let rules = set.permission_rules();
+
+    let bash_rule = rules
+        .iter()
+        .find(|rule| rule.tool.matches("native:4:bash"))
+        .expect("bash must still have a reconstructed rule");
+    let write_rule = rules
+        .iter()
+        .find(|rule| rule.tool.matches("native:5:write"))
+        .expect("write must still have a reconstructed rule");
+
+    assert!(
+        bash_rule.target.matches("rm -rf /tmp/x"),
+        "bash's own target must stay free-form even though it shares a wildcard with a \
+         path-shaped tool"
+    );
+    assert!(
+        !write_rule.target.matches("rm -rf /tmp/x"),
+        "write's own target must stay path-shaped even though it shares a wildcard with bash"
+    );
+}
+
+#[test]
 fn effective_capability_expansion_detects_only_declared_broadenings() {
     let mut dispatcher = ToolDispatcher::new();
     dispatcher
@@ -1783,6 +1822,33 @@ fn parsed_literal_aliases_resolve_while_globs_remain_distinct_descriptors() {
     assert!(set.descriptors()[0].matches_identity("native:10:files_read"));
     assert!(set.descriptors()[1].matches_identity("native:10:files_read"));
     assert!(set.descriptors()[1].matches_identity("native:11:files_write"));
+}
+
+#[test]
+fn a_partial_wildcard_tool_pattern_still_produces_a_descriptor_on_the_parent_path() {
+    let mut dispatcher = ToolDispatcher::new();
+    dispatcher
+        .register_native("native::bash", ToolAccess::Write, InertTool)
+        .unwrap();
+    dispatcher
+        .register_native("native::files_write", ToolAccess::Write, InertTool)
+        .unwrap();
+
+    let agent = agent_with_rules(vec![PermissionRule::global(
+        PermissionDecision::Deny,
+        PermissionPattern::glob("bas*").unwrap(),
+        PermissionPattern::Any,
+    )]);
+
+    let set = EffectiveCapabilitySet::from_agent(&agent, "project", &dispatcher);
+
+    assert_eq!(
+        set.descriptors().len(),
+        1,
+        "a partial-wildcard tool pattern that matches a known native tool must not vanish"
+    );
+    assert!(set.descriptors()[0].matches_identity("native:4:bash"));
+    assert_eq!(set.descriptors()[0].decision(), PermissionDecision::Deny);
 }
 
 #[test]

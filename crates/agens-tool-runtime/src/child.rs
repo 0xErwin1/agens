@@ -1048,6 +1048,45 @@ mod tests {
     }
 
     #[test]
+    fn a_target_scoped_deny_with_a_wildcard_tool_pattern_blocks_a_command_containing_a_slash() {
+        let declarations = [
+            PermissionRule::global(
+                PermissionDecision::Allow,
+                PermissionPattern::glob("bash").unwrap(),
+                PermissionPattern::Any,
+            ),
+            PermissionRule::global(
+                PermissionDecision::Deny,
+                PermissionPattern::glob("bas*").unwrap(),
+                PermissionPattern::glob("rm*").unwrap(),
+            ),
+        ];
+
+        let temporary = agens_fixtures::session_directory("targeted-wildcard-bash-deny-slash");
+        let project_root = temporary.join("project");
+
+        let denied_output = single_call_turn(
+            &project_root,
+            &declarations,
+            false,
+            "native::bash",
+            r#"{"command":"rm -rf /tmp/probe-victim-with-slash.txt"}"#,
+        );
+
+        assert!(
+            denied_output.contains("permission denied"),
+            "a target-scoped deny whose tool pattern is a wildcard must still deny a command \
+             containing a slash, not just a slash-free one, got: {denied_output}"
+        );
+        assert!(
+            !std::path::Path::new("/tmp/probe-victim-with-slash.txt").exists(),
+            "the denied command must never have run"
+        );
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
     fn a_target_scoped_deny_with_a_wildcard_tool_pattern_still_blocks_the_matching_command() {
         let declarations = [
             PermissionRule::global(
