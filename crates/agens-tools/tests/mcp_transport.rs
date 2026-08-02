@@ -1496,6 +1496,10 @@ fn legacy_sse_transport_accepts_exact_limit_exhausts_retries_and_closes_on_curre
         body.extend(std::iter::repeat_n(b' ', 1024 * 1024 - body.len()));
         write!(events, "event: message\ndata: ").unwrap();
         events.write_all(&body).unwrap();
+        events.flush().unwrap();
+        // Force the "\n\n" terminator into a later socket read so the reader
+        // observes a pending, unterminated line at exactly the byte limit.
+        thread::sleep(Duration::from_millis(50));
         write!(events, "\n\n").unwrap();
         events.flush().unwrap();
     });
