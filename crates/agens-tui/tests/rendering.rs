@@ -1,6 +1,7 @@
 use agens_core::{SubagentErrorKind, SubagentStatus};
 use std::time::Duration;
 
+use agens_core::ask_user::{AskUserMode, AskUserOption, AskUserQuestion, AskUserRequest};
 use agens_core::{Message, MessagePart, Role, TurnEvent, TurnRetryReason, Usage};
 use agens_tui::{
     Action, ColorLevel, ConversationEvent, DialogEntry, DialogView, DiffLine, DiffLineKind,
@@ -6014,4 +6015,598 @@ fn typed_input_sits_in_the_same_column_as_the_prose_above_it() {
         rendered_column(&renderer, "ANSWER_SENTINEL"),
         "what the user types lines up with what the agent said"
     );
+}
+
+// --- `native::ask_user` two-column contextual layout ---------------------------
+
+/// Terminal width whose overlay resolves wide enough for two columns.
+const ASK_USER_WIDE_TERMINAL: u16 = 100;
+/// Terminal width whose overlay is forced to stack the context below the list.
+const ASK_USER_NARROW_TERMINAL: u16 = 56;
+
+fn ask_user_option(
+    id: &str,
+    label: &str,
+    explanation: &str,
+    context: Option<&str>,
+) -> AskUserOption {
+    AskUserOption::new(
+        id,
+        label,
+        Some(explanation.to_owned()),
+        context.map(str::to_owned),
+    )
+}
+
+fn ask_user_request_with_context() -> AskUserRequest {
+    AskUserRequest::new(
+        Some("Pick a rollout".to_owned()),
+        vec![AskUserQuestion::new(
+            "plan",
+            "How should the migration land?",
+            Some("Both options keep the old table readable.".to_owned()),
+            AskUserMode::Single,
+            vec![
+                ask_user_option(
+                    "big-bang",
+                    "BIGBANG_LABEL",
+                    "BIGBANG_EXPLAIN one shot",
+                    Some("BIGBANG_CONTEXT cuts over in a single deploy window."),
+                ),
+                ask_user_option(
+                    "phased",
+                    "PHASED_LABEL",
+                    "PHASED_EXPLAIN two steps",
+                    Some("PHASED_CONTEXT dual writes first, then a backfill."),
+                ),
+            ],
+            false,
+            false,
+            false,
+        )],
+    )
+    .expect("a bounded single question forms a valid request")
+}
+
+fn three_question_ask_user_request() -> AskUserRequest {
+    let question = |id: &str| {
+        AskUserQuestion::new(
+            id,
+            format!("PROMPT_{id}"),
+            None,
+            AskUserMode::Single,
+            vec![
+                ask_user_option("a", &format!("{id}_A"), "first", Some("CTX_A")),
+                ask_user_option("b", &format!("{id}_B"), "second", Some("CTX_B")),
+            ],
+            true,
+            true,
+            false,
+        )
+    };
+    AskUserRequest::new(None, vec![question("q1"), question("q2"), question("q3")])
+        .expect("three bounded questions form a valid request")
+}
+
+fn open_ask_user(
+    width: u16,
+    height: u16,
+    request: AskUserRequest,
+) -> (Tui<FakeEngine>, RatatuiRenderer<TestBackend>) {
+    let mut tui = Tui::new(FakeEngine);
+    tui.open_ask_user(1, request);
+    let renderer = rendered_at(&mut tui, width, height);
+    (tui, renderer)
+}
+
+/// Re-renders the same interaction into a terminal of a different size.
+///
+/// `TestBackend` cannot be resized behind the renderer, so the frame is
+/// rebuilt; the [`Tui`] is the same one, which is what the assertion about
+/// preserved state is actually about.
+fn rendered_at(tui: &mut Tui<FakeEngine>, width: u16, height: u16) -> RatatuiRenderer<TestBackend> {
+    let mut renderer =
+        RatatuiRenderer::new(Terminal::new(TestBackend::new(width, height)).unwrap());
+    tui.handle(Event::Resize { width, height });
+    renderer.render(tui.view()).unwrap();
+    renderer
+}
+
+#[test]
+fn ask_user_wide_layout_puts_context_beside_the_options_and_follows_the_highlight() {
+    let (mut tui, mut renderer) =
+        open_ask_user(ASK_USER_WIDE_TERMINAL, 30, ask_user_request_with_context());
+
+    let text = rendered_text(&renderer);
+    assert!(text.contains("BIGBANG_LABEL"), "{text:?}");
+    assert!(text.contains("BIGBANG_EXPLAIN"), "{text:?}");
+    assert!(text.contains("PHASED_LABEL"), "{text:?}");
+    assert!(
+        text.contains("BIGBANG_CONTEXT"),
+        "the highlighted option's context is shown: {text:?}"
+    );
+    assert!(
+        !text.contains("PHASED_CONTEXT"),
+        "only the highlighted option's context is shown: {text:?}"
+    );
+    assert!(
+        rendered_column(&renderer, "BIGBANG_CONTEXT") > rendered_column(&renderer, "BIGBANG_LABEL"),
+        "context sits in the right column, beside the options"
+    );
+    assert_eq!(
+        rendered_row(&renderer, "BIGBANG_CONTEXT"),
+        rendered_row(&renderer, "BIGBANG_LABEL"),
+        "the first context row is level with the first option row"
+    );
+
+    tui.handle(Event::Key(Key::Down));
+    renderer.render(tui.view()).unwrap();
+
+    let text = rendered_text(&renderer);
+    assert!(
+        text.contains("PHASED_CONTEXT"),
+        "moving the highlight changes the context pane: {text:?}"
+    );
+    assert!(!text.contains("BIGBANG_CONTEXT"), "{text:?}");
+}
+
+#[test]
+fn ask_user_narrow_layout_stacks_context_below_the_options_with_a_visible_affordance() {
+    let (_tui, renderer) = open_ask_user(
+        ASK_USER_NARROW_TERMINAL,
+        30,
+        ask_user_request_with_context(),
+    );
+
+    let text = rendered_text(&renderer);
+    assert!(text.contains("BIGBANG_LABEL"), "{text:?}");
+    assert!(
+        text.contains("BIGBANG_CONTEXT"),
+        "context stays reachable when the overlay is too narrow for two columns: {text:?}"
+    );
+    assert!(
+        rendered_row(&renderer, "BIGBANG_CONTEXT") > rendered_row(&renderer, "BIGBANG_LABEL"),
+        "context moves below the option list"
+    );
+    assert!(
+        text.contains("context"),
+        "the stacked section names itself so the reader knows it can be scrolled: {text:?}"
+    );
+    assert!(
+        text.contains("pgup/pgdn"),
+        "the keys that reach it are on screen: {text:?}"
+    );
+}
+
+#[test]
+fn ask_user_resizing_across_the_layout_threshold_preserves_every_interaction_state() {
+    let (mut tui, _wide) = open_ask_user(
+        ASK_USER_WIDE_TERMINAL,
+        30,
+        three_question_ask_user_request(),
+    );
+
+    tui.handle(Event::Key(Key::Tab));
+    tui.handle(Event::Key(Key::Down));
+    tui.handle(Event::Key(Key::Enter));
+    for character in "oOTHER_TEXT".chars() {
+        tui.handle(Event::Key(Key::Char(character)));
+    }
+    tui.handle(Event::Key(Key::Enter));
+    tui.handle(Event::Key(Key::Char('n')));
+    for character in "NOTE_TEXT".chars() {
+        tui.handle(Event::Key(Key::Char(character)));
+    }
+    let before = tui.ask_user_snapshot().expect("ask-user still open");
+    assert_eq!(before.question_index, 1);
+    assert_eq!(before.selected, vec![1]);
+    assert_eq!(before.other, "OTHER_TEXT");
+    assert_eq!(before.note, "NOTE_TEXT");
+
+    let renderer = rendered_at(&mut tui, ASK_USER_NARROW_TERMINAL, 30);
+    assert_eq!(
+        tui.ask_user_snapshot().expect("ask-user still open"),
+        before,
+        "no interaction state may be derived from terminal width"
+    );
+    let narrow = rendered_text(&renderer);
+    assert!(narrow.contains("OTHER_TEXT"), "{narrow:?}");
+    assert!(narrow.contains("NOTE_TEXT"), "{narrow:?}");
+    assert!(narrow.contains("CTX_B"), "{narrow:?}");
+
+    let renderer = rendered_at(&mut tui, ASK_USER_WIDE_TERMINAL, 30);
+    assert_eq!(
+        tui.ask_user_snapshot().expect("ask-user still open"),
+        before,
+        "returning to the wide layout restores nothing because nothing was lost"
+    );
+    let wide = rendered_text(&renderer);
+    assert!(wide.contains("OTHER_TEXT"), "{wide:?}");
+    assert!(wide.contains("q2_B"), "{wide:?}");
+}
+
+fn long_context_request() -> AskUserRequest {
+    let context = (0..60)
+        .map(|index| format!("CTXLINE{index:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let second = (0..60)
+        .map(|index| format!("BCTXLINE{index:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    AskUserRequest::new(
+        None,
+        vec![AskUserQuestion::new(
+            "q1",
+            "long context",
+            None,
+            AskUserMode::Single,
+            vec![
+                ask_user_option("a", "A_LABEL", "first", Some(&context)),
+                ask_user_option("b", "B_LABEL", "second", Some(&second)),
+            ],
+            false,
+            false,
+            false,
+        )],
+    )
+    .expect("a bounded question forms a valid request")
+}
+
+#[test]
+fn ask_user_context_pane_scrolls_by_keyboard_and_end_leaves_a_reachable_last_page() {
+    let (mut tui, mut renderer) = open_ask_user(ASK_USER_WIDE_TERMINAL, 30, long_context_request());
+    let text = rendered_text(&renderer);
+    assert!(text.contains("CTXLINE00"), "{text:?}");
+
+    tui.handle(Event::Key(Key::PageDown));
+    renderer.render(tui.view()).unwrap();
+    let scrolled = rendered_text(&renderer);
+    assert!(!scrolled.contains("CTXLINE00"), "{scrolled:?}");
+
+    tui.handle(Event::Key(Key::End));
+    renderer.render(tui.view()).unwrap();
+    let bottom = rendered_text(&renderer);
+    assert!(
+        bottom.contains("CTXLINE59"),
+        "End reaches the last context row: {bottom:?}"
+    );
+
+    tui.handle(Event::Key(Key::PageUp));
+    renderer.render(tui.view()).unwrap();
+    let stepped_back = rendered_text(&renderer);
+    assert_ne!(
+        stepped_back, bottom,
+        "a single PageUp after End must move the pane, not walk back from a sentinel"
+    );
+    assert!(
+        !stepped_back.contains("CTXLINE59"),
+        "one page back from the bottom leaves the last row: {stepped_back:?}"
+    );
+
+    tui.handle(Event::Key(Key::Home));
+    renderer.render(tui.view()).unwrap();
+    assert!(rendered_text(&renderer).contains("CTXLINE00"));
+}
+
+#[test]
+fn ask_user_context_scroll_resets_between_options_but_survives_an_action_row_move() {
+    let (mut tui, mut renderer) = open_ask_user(ASK_USER_WIDE_TERMINAL, 30, long_context_request());
+    tui.handle(Event::Key(Key::PageDown));
+    let scrolled = tui.ask_user_snapshot().unwrap().context_scroll;
+    assert!(scrolled > 0);
+
+    tui.handle(Event::Key(Key::Down));
+    assert_eq!(
+        tui.ask_user_snapshot().unwrap().context_scroll,
+        0,
+        "a different option shows different context, so its scroll starts at the top"
+    );
+
+    tui.handle(Event::Key(Key::PageDown));
+    let before_action_rows = tui.ask_user_snapshot().unwrap().context_scroll;
+    assert_eq!(before_action_rows, scrolled);
+
+    tui.handle(Event::Key(Key::Down));
+    renderer.render(tui.view()).unwrap();
+    let on_submit = rendered_text(&renderer);
+    assert_eq!(
+        tui.ask_user_snapshot().unwrap().context_scroll,
+        before_action_rows,
+        "walking down to the action rows does not change what the context pane shows"
+    );
+    assert!(
+        on_submit.contains("BCTXLINE1"),
+        "the last highlighted option keeps the pane while the cursor is on an action row: \
+         {on_submit:?}"
+    );
+
+    tui.handle(Event::Key(Key::Down));
+    assert_eq!(
+        tui.ask_user_snapshot().unwrap().context_scroll,
+        before_action_rows,
+        "moving between action rows does not change what the context pane shows"
+    );
+}
+
+#[test]
+fn ask_user_context_keeps_diagram_rows_and_truncates_an_unbreakable_line() {
+    let context = format!(
+        "  ┌──────────┐\n  │ small    │\n  └──────────┘\nWIDE ┌{0}┐ ───▶ ┌{0}┐\nRULE{1}",
+        "─".repeat(30),
+        "─".repeat(72)
+    );
+    let request = AskUserRequest::new(
+        None,
+        vec![AskUserQuestion::new(
+            "q1",
+            "diagram",
+            None,
+            AskUserMode::Single,
+            vec![ask_user_option("a", "A_LABEL", "first", Some(&context))],
+            false,
+            false,
+            false,
+        )],
+    )
+    .expect("a bounded question forms a valid request");
+    let (_tui, renderer) = open_ask_user(ASK_USER_WIDE_TERMINAL, 30, request);
+
+    let text = rendered_text(&renderer);
+    assert!(
+        text.contains("┌──────────┐"),
+        "a diagram row that fits is painted verbatim: {text:?}"
+    );
+    assert!(
+        text.contains("│ small    │"),
+        "interior spacing is preserved: {text:?}"
+    );
+    let wide_row = rendered_row(&renderer, "WIDE");
+    assert!(
+        rendered_line(&renderer, wide_row).contains('…'),
+        "a diagram row wider than the column is cut even though it has spaces \
+         in it — word-wrapping a diagram misaligns every row below it: {:?}",
+        rendered_line(&renderer, wide_row)
+    );
+    assert!(
+        !rendered_line(&renderer, wide_row + 1).contains("───▶"),
+        "the cut row's remainder never re-flows onto the next row: {:?}",
+        rendered_line(&renderer, wide_row + 1)
+    );
+
+    let rule_row = rendered_row(&renderer, "RULE");
+    assert!(
+        rendered_line(&renderer, rule_row).contains('…'),
+        "an unbreakable row wider than the column is cut: {:?}",
+        rendered_line(&renderer, rule_row)
+    );
+    assert!(
+        !rendered_line(&renderer, rule_row + 1).contains("──────"),
+        "the remainder is dropped, never re-flowed onto the next row: {:?}",
+        rendered_line(&renderer, rule_row + 1)
+    );
+}
+
+#[test]
+fn ask_user_header_reports_completion_and_names_the_question_that_blocks_submission() {
+    let (mut tui, mut renderer) = open_ask_user(
+        ASK_USER_WIDE_TERMINAL,
+        30,
+        three_question_ask_user_request(),
+    );
+    tui.handle(Event::Key(Key::Enter));
+    renderer.render(tui.view()).unwrap();
+    let answered_one = rendered_text(&renderer);
+    assert!(answered_one.contains("1 of 3 answered"), "{answered_one:?}");
+
+    for _ in 0..2 {
+        tui.handle(Event::Key(Key::Down));
+    }
+    tui.handle(Event::Key(Key::Enter));
+    renderer.render(tui.view()).unwrap();
+
+    let blocked = rendered_text(&renderer);
+    assert!(
+        blocked.contains("answer question 2 first"),
+        "an incomplete submission names the question that blocks it: {blocked:?}"
+    );
+    assert!(tui.ask_user_snapshot().is_some(), "nothing was submitted");
+}
+
+/// The settled render cache is only bypassed when something actually moved, so
+/// an ask-user key that changes nothing has to say so. Scroll keys are the ones
+/// at risk: before the pane's real extent was measured, `End` always reported a
+/// change because it stored a sentinel no pane could ever be as tall as.
+#[test]
+fn ask_user_scroll_keys_report_unchanged_when_the_context_pane_cannot_move() {
+    let mut tui = Tui::new(FakeEngine);
+    tui.handle(Event::Resize {
+        width: ASK_USER_WIDE_TERMINAL,
+        height: 30,
+    });
+    tui.open_ask_user(1, ask_user_request_with_context());
+
+    for key in [Key::End, Key::PageDown, Key::Home, Key::PageUp] {
+        assert_eq!(
+            tui.handle(Event::Key(key)),
+            Action::Unchanged,
+            "{key:?} on a context that fits its pane changes nothing a reader can see"
+        );
+    }
+
+    let mut scrollable = Tui::new(FakeEngine);
+    scrollable.handle(Event::Resize {
+        width: ASK_USER_WIDE_TERMINAL,
+        height: 30,
+    });
+    scrollable.open_ask_user(1, long_context_request());
+    assert_eq!(scrollable.handle(Event::Key(Key::End)), Action::Render);
+    assert_eq!(
+        scrollable.handle(Event::Key(Key::End)),
+        Action::Unchanged,
+        "a second End is already at the bottom"
+    );
+}
+
+fn single_context_request(context: &str) -> AskUserRequest {
+    AskUserRequest::new(
+        None,
+        vec![AskUserQuestion::new(
+            "q1",
+            "context shape",
+            None,
+            AskUserMode::Single,
+            vec![ask_user_option("a", "A_LABEL", "first", Some(context))],
+            false,
+            false,
+            false,
+        )],
+    )
+    .expect("a bounded question forms a valid request")
+}
+
+#[test]
+fn ask_user_context_freezes_ascii_diagrams_and_still_wraps_ordinary_prose() {
+    let context = "\
+ASCII |   ingest    |   -->    |   transform |   -->    |    store    |
++--------+   +-----------+   +---------+   +----------+   +----------+
+FITS |  a  |  -->  |  b  |
+PROSE the well-known trade-off here is a pipe | and a hyphen - in ordinary \
+prose that has to keep wrapping across several rows of the pane instead of \
+being frozen and cut";
+    let (_tui, renderer) =
+        open_ask_user(ASK_USER_WIDE_TERMINAL, 30, single_context_request(context));
+
+    let ascii_row = rendered_row(&renderer, "ASCII");
+    let ascii_line = rendered_line(&renderer, ascii_row);
+    assert!(
+        ascii_line.contains("|   ingest    |"),
+        "an ASCII diagram's interior spacing is load-bearing and must survive \
+         verbatim up to the cut: {ascii_line:?}"
+    );
+    assert!(
+        ascii_line.contains('…'),
+        "an over-wide ASCII diagram row is cut, not re-flowed: {ascii_line:?}"
+    );
+    assert!(
+        !rendered_line(&renderer, ascii_row + 1).contains("store"),
+        "the cut row's remainder never re-flows onto the next row: {:?}",
+        rendered_line(&renderer, ascii_row + 1)
+    );
+
+    let rule_row = rendered_row(&renderer, "+--------+");
+    assert!(
+        rendered_line(&renderer, rule_row).contains('…'),
+        "a pure-ASCII rule of boxes is a drawing too: {:?}",
+        rendered_line(&renderer, rule_row)
+    );
+
+    let fits_line = rendered_line(&renderer, rendered_row(&renderer, "FITS"));
+    assert!(
+        fits_line.contains("|  a  |  -->  |  b  |"),
+        "a drawing that fits is painted exactly as authored: {fits_line:?}"
+    );
+
+    let prose_row = rendered_row(&renderer, "PROSE");
+    let prose_line = rendered_line(&renderer, prose_row);
+    assert!(
+        !prose_line.contains('…'),
+        "prose that merely contains a hyphen and a pipe is not a drawing and \
+         must wrap, not freeze: {prose_line:?}"
+    );
+    let text = rendered_text(&renderer);
+    assert!(
+        text.contains("instead of"),
+        "the tail of the wrapped paragraph is still on screen: {text:?}"
+    );
+}
+
+#[test]
+fn ask_user_context_wraps_wide_glyphs_by_display_width_without_losing_characters() {
+    let body = "設計上の判断をここに書き並べておくための長い日本語の段落である".repeat(3);
+    let (_tui, renderer) = open_ask_user(
+        ASK_USER_WIDE_TERMINAL,
+        30,
+        single_context_request(&format!("始{body}終")),
+    );
+
+    let text = rendered_text(&renderer);
+    assert!(text.contains('始'), "the head of the paragraph is shown");
+    assert!(
+        text.contains('終'),
+        "text with no ASCII space still has to wrap; truncating it to one row \
+         puts characters in no buffer that any keypress can reach: {text:?}"
+    );
+    assert!(
+        rendered_row(&renderer, "終") > rendered_row(&renderer, "始"),
+        "a paragraph wider than the pane occupies more than one row"
+    );
+}
+
+#[test]
+fn ask_user_context_wraps_double_width_emoji_without_dropping_the_tail() {
+    let (_tui, renderer) = open_ask_user(
+        ASK_USER_WIDE_TERMINAL,
+        30,
+        single_context_request(&format!("START{}END", "🙂".repeat(160))),
+    );
+
+    let text = rendered_text(&renderer);
+    assert!(text.contains("START"), "{text:?}");
+    assert!(
+        text.contains("END"),
+        "wrapping measured in characters rather than display columns builds \
+         rows twice as wide as the pane, and everything past the pane's width \
+         is silently clipped: {text:?}"
+    );
+}
+
+/// The scroll-position row is reserved out of the pane only when the pane is
+/// tall enough to spare it. Painting it unconditionally writes one row below
+/// the pane — onto the footer, or onto the overlay's own border — which no
+/// panic ever reports.
+fn assert_ask_user_frame_is_not_corrupted(renderer: &RatatuiRenderer<TestBackend>, label: &str) {
+    let height = renderer.terminal().backend().buffer().area.height;
+    for row in 0..height {
+        let line = rendered_line(renderer, usize::from(row));
+        let footer = line.contains("↑↓ move") || line.contains("esc cancel");
+        let position = line.contains(" of ") && line.contains("pgup/pgdn");
+        assert!(
+            !(footer && position),
+            "{label}: the context position row escaped its pane onto the \
+             footer: {line:?}"
+        );
+        assert!(
+            line.matches("pgup/pgdn").count() <= 1,
+            "{label}: the context position row was painted over another row: {line:?}"
+        );
+    }
+}
+
+#[test]
+fn ask_user_overlay_never_panics_or_corrupts_its_frame_at_degenerate_sizes() {
+    let long = (0..40)
+        .map(|index| format!("CTXLINE{index:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for (width, height) in [
+        (1, 1),
+        (8, 4),
+        (34, 10),
+        (12, 3),
+        (200, 3),
+        (100, 5),
+        (100, 6),
+        (100, 7),
+        (100, 8),
+        (100, 9),
+        (56, 7),
+        (56, 16),
+    ] {
+        let (_tui, renderer) = open_ask_user(width, height, ask_user_request_with_context());
+        assert_ask_user_frame_is_not_corrupted(&renderer, &format!("{width}x{height} short"));
+
+        let (_tui, renderer) = open_ask_user(width, height, single_context_request(&long));
+        assert_ask_user_frame_is_not_corrupted(&renderer, &format!("{width}x{height} long"));
+    }
 }

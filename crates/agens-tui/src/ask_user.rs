@@ -20,7 +20,8 @@ use crate::Key;
 /// How far one `PageUp`/`PageDown` press moves the context pane.
 ///
 /// The pane's real extent is only known once a frame is laid out, which this
-/// module never sees, so this is a plain step rather than a page height.
+/// module never sees; the caller passes that extent in as the scroll ceiling,
+/// so the step stays a plain constant while the bound stays truthful.
 const ASK_USER_CONTEXT_PAGE_STEP: u16 = 10;
 
 /// The row the interaction cursor is standing on within the current question.
@@ -115,6 +116,12 @@ pub(crate) struct AskUserState {
     other: Vec<String>,
     notes: Vec<String>,
     entry: AskUserEntry,
+    /// The option whose context the pane is showing.
+    ///
+    /// Tracked separately from [`Self::row`] so walking down to the action rows
+    /// leaves the pane — and its scroll offset — exactly where the reader left
+    /// it, instead of blanking the explanation they are still consulting.
+    context_option: usize,
     context_scroll: u16,
     incomplete: Option<usize>,
 }
@@ -131,6 +138,7 @@ impl AskUserState {
             question: 0,
             row: AskUserRow::Option(0),
             entry: AskUserEntry::Browsing,
+            context_option: 0,
             context_scroll: 0,
             incomplete: None,
         }
@@ -138,6 +146,65 @@ impl AskUserState {
 
     pub(crate) const fn id(&self) -> u64 {
         self.id
+    }
+
+    pub(crate) const fn request(&self) -> &AskUserRequest {
+        &self.request
+    }
+
+    pub(crate) const fn question_index(&self) -> usize {
+        self.question
+    }
+
+    pub(crate) const fn row(&self) -> AskUserRow {
+        self.row
+    }
+
+    pub(crate) fn current_selections(&self) -> &BTreeSet<usize> {
+        &self.selections[self.question]
+    }
+
+    pub(crate) fn current_other(&self) -> &str {
+        &self.other[self.question]
+    }
+
+    pub(crate) fn current_note(&self) -> &str {
+        &self.notes[self.question]
+    }
+
+    pub(crate) const fn entry(&self) -> AskUserEntry {
+        self.entry
+    }
+
+    pub(crate) const fn context_option(&self) -> usize {
+        self.context_option
+    }
+
+    pub(crate) const fn context_scroll(&self) -> u16 {
+        self.context_scroll
+    }
+
+    pub(crate) const fn incomplete(&self) -> Option<usize> {
+        self.incomplete
+    }
+
+    /// How many questions currently hold a valid answer.
+    pub(crate) fn answered_count(&self) -> usize {
+        (0..self.request.questions().len())
+            .filter(|index| self.question_is_answered(*index))
+            .count()
+    }
+
+    /// Pulls a stored scroll offset back inside a freshly measured pane.
+    ///
+    /// Returns whether anything moved, so a caller that only resized can tell a
+    /// real change from a no-op.
+    pub(crate) fn clamp_context_scroll(&mut self, max: u16) -> bool {
+        if self.context_scroll <= max {
+            return false;
+        }
+        self.context_scroll = max;
+        true
     }
 
     pub(crate) fn snapshot(&self) -> AskUserSnapshot {
@@ -155,29 +222,35 @@ impl AskUserState {
         }
     }
 
-    pub(crate) fn reduce(&mut self, key: Key) -> AskUserOutcome {
+    /// Reduces one key against the interaction.
+    ///
+    /// `max_context_scroll` is the scroll ceiling the caller measured against
+    /// the frame it last laid out. It is a parameter rather than state because
+    /// the extent depends on the terminal's width and height, which this module
+    /// deliberately knows nothing about.
+    pub(crate) fn reduce(&mut self, key: Key, max_context_scroll: u16) -> AskUserOutcome {
         if self.entry != AskUserEntry::Browsing {
-            return self.reduce_entry_mode(key);
+            return self.reduce_entry_mode(key, max_context_scroll);
         }
-        self.reduce_browse_mode(key)
+        self.reduce_browse_mode(key, max_context_scroll)
     }
 
-    fn reduce_entry_mode(&mut self, key: Key) -> AskUserOutcome {
+    fn reduce_entry_mode(&mut self, key: Key, max_context_scroll: u16) -> AskUserOutcome {
         match key {
             Key::Char(character) => self.type_char(character),
             Key::Backspace | Key::Delete => self.backspace(),
             Key::DeleteToLineStart => self.clear_buffer(),
             Key::Enter => self.commit_entry(),
             Key::Escape => self.escape(),
-            Key::PageUp => self.scroll_context(-1),
-            Key::PageDown => self.scroll_context(1),
-            Key::Home => self.scroll_context_home(),
-            Key::End => self.scroll_context_end(),
+            Key::PageUp => self.scroll_context(-1, max_context_scroll),
+            Key::PageDown => self.scroll_context(1, max_context_scroll),
+            Key::Home => self.scroll_context_to(0),
+            Key::End => self.scroll_context_to(max_context_scroll),
             _ => AskUserOutcome::Unchanged,
         }
     }
 
-    fn reduce_browse_mode(&mut self, key: Key) -> AskUserOutcome {
+    fn reduce_browse_mode(&mut self, key: Key, max_context_scroll: u16) -> AskUserOutcome {
         match key {
             Key::Up => self.move_row(-1),
             Key::Down => self.move_row(1),
@@ -189,10 +262,10 @@ impl AskUserState {
             Key::Char('o') => self.open_other(),
             Key::Char('n') => self.open_note(),
             Key::Escape => self.escape(),
-            Key::PageUp => self.scroll_context(-1),
-            Key::PageDown => self.scroll_context(1),
-            Key::Home => self.scroll_context_home(),
-            Key::End => self.scroll_context_end(),
+            Key::PageUp => self.scroll_context(-1, max_context_scroll),
+            Key::PageDown => self.scroll_context(1, max_context_scroll),
+            Key::Home => self.scroll_context_to(0),
+            Key::End => self.scroll_context_to(max_context_scroll),
             _ => AskUserOutcome::Unchanged,
         }
     }
@@ -261,7 +334,12 @@ impl AskUserState {
             return AskUserOutcome::Unchanged;
         }
         self.row = self.row_at(next);
-        self.context_scroll = 0;
+        if let AskUserRow::Option(index) = self.row
+            && index != self.context_option
+        {
+            self.context_option = index;
+            self.context_scroll = 0;
+        }
         AskUserOutcome::Changed
     }
 
@@ -271,6 +349,7 @@ impl AskUserState {
         }
         self.question = target;
         self.row = AskUserRow::Option(0);
+        self.context_option = 0;
         self.context_scroll = 0;
         AskUserOutcome::Changed
     }
@@ -416,7 +495,7 @@ impl AskUserState {
         }
     }
 
-    fn scroll_context(&mut self, direction: i32) -> AskUserOutcome {
+    fn scroll_context(&mut self, direction: i32, max: u16) -> AskUserOutcome {
         let next = if direction < 0 {
             self.context_scroll
                 .saturating_sub(ASK_USER_CONTEXT_PAGE_STEP)
@@ -424,26 +503,14 @@ impl AskUserState {
             self.context_scroll
                 .saturating_add(ASK_USER_CONTEXT_PAGE_STEP)
         };
-        if next == self.context_scroll {
-            return AskUserOutcome::Unchanged;
-        }
-        self.context_scroll = next;
-        AskUserOutcome::Changed
+        self.scroll_context_to(next.min(max))
     }
 
-    fn scroll_context_home(&mut self) -> AskUserOutcome {
-        if self.context_scroll == 0 {
+    fn scroll_context_to(&mut self, offset: u16) -> AskUserOutcome {
+        if offset == self.context_scroll {
             return AskUserOutcome::Unchanged;
         }
-        self.context_scroll = 0;
-        AskUserOutcome::Changed
-    }
-
-    fn scroll_context_end(&mut self) -> AskUserOutcome {
-        if self.context_scroll == u16::MAX {
-            return AskUserOutcome::Unchanged;
-        }
-        self.context_scroll = u16::MAX;
+        self.context_scroll = offset;
         AskUserOutcome::Changed
     }
 

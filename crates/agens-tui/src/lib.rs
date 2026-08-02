@@ -45,9 +45,9 @@ use std::{
 
 use agens_core::SubagentStatus;
 use agens_core::SubmitOrigin;
-use agens_core::ask_user::{AskUserReply, AskUserRequest};
+use agens_core::ask_user::{AskUserMode, AskUserQuestion, AskUserReply, AskUserRequest};
 use agens_core::{MessagePart, TurnEvent, TurnState, Usage};
-use ask_user::{AskUserOutcome, AskUserState};
+use ask_user::{AskUserEntry, AskUserOutcome, AskUserRow, AskUserState};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use crossterm::{
     cursor::{Hide as HideCursor, Show as ShowCursor},
@@ -68,7 +68,7 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Borders, Padding, Paragraph, Wrap},
 };
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const TRANSCRIPT_CONTENT_INDENT: u16 = 4;
 /// Chrome padding left of a transcript row, once the row itself spends
@@ -502,6 +502,49 @@ struct DeviceAuthRender<'a> {
     confirmation: Option<&'static str>,
 }
 
+/// Borrowed projection of an open ask-user interaction, for one frame.
+///
+/// Every field either points into the state the interaction already owns or is
+/// a scalar. A renderer that copied the request would pay for the whole
+/// question set — labels, explanations and context — on every frame, including
+/// the frames where nothing about it changed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AskUserRender<'a> {
+    request: &'a AskUserRequest,
+    question: usize,
+    row: AskUserRow,
+    selected: &'a BTreeSet<usize>,
+    other: &'a str,
+    note: &'a str,
+    entry: AskUserEntry,
+    context_option: usize,
+    context_scroll: u16,
+    incomplete: Option<usize>,
+    answered: usize,
+}
+
+impl<'a> AskUserRender<'a> {
+    fn of(state: &'a AskUserState) -> Self {
+        Self {
+            request: state.request(),
+            question: state.question_index(),
+            row: state.row(),
+            selected: state.current_selections(),
+            other: state.current_other(),
+            note: state.current_note(),
+            entry: state.entry(),
+            context_option: state.context_option(),
+            context_scroll: state.context_scroll(),
+            incomplete: state.incomplete(),
+            answered: state.answered_count(),
+        }
+    }
+
+    fn current(&self) -> &'a AskUserQuestion {
+        &self.request.questions()[self.question]
+    }
+}
+
 #[derive(Clone)]
 struct DeviceAuthState {
     verification_url: String,
@@ -871,6 +914,8 @@ pub struct ViewState<'a> {
     secret_entry: Option<SecretEntryRender<'a>>,
     /// Active device-authentication flow kept outside generic dialogs so its actions remain local.
     device_auth: Option<DeviceAuthRender<'a>>,
+    /// Open structured question set, borrowed rather than copied for the frame.
+    ask_user: Option<AskUserRender<'a>>,
     /// Slash palette metadata and current filtered selection.
     pub palette: Option<PaletteView<'a>>,
     /// Open `@` file picker, its typed query, and its current selection.
@@ -1728,6 +1773,10 @@ fn render_frame_content(frame: &mut ratatui::Frame<'_>, state: &ViewState<'_>) {
         render_file_picker(frame, area, layout.composer, picker);
     }
 
+    if let Some(ask_user) = state.ask_user {
+        render_ask_user(frame, area, ask_user);
+    }
+
     if let Some(secret_entry) = state.secret_entry {
         render_secret_entry(frame, area, secret_entry);
     }
@@ -1735,6 +1784,672 @@ fn render_frame_content(frame: &mut ratatui::Frame<'_>, state: &ViewState<'_>) {
     if let Some(device_auth) = state.device_auth {
         render_device_auth(frame, area, device_auth);
     }
+}
+
+/// Inner overlay width at which the context earns a column of its own.
+///
+/// Composed rather than guessed: the narrowest option column that still shows a
+/// label with its selection marker is 33 columns, the narrowest column that
+/// wraps prose without turning it into a ladder is 32, and the divider gutter
+/// between them costs [`ASK_USER_COLUMN_GAP`]. It is also exactly the inner
+/// width a classic 80-column terminal resolves to under
+/// [`widgets::OverlaySizing::ask_user`], which is the narrowest terminal where
+/// the second column still earns its space.
+const ASK_USER_TWO_COLUMN_MIN_WIDTH: u16 = 68;
+/// Space, divider rule, space between the two columns.
+const ASK_USER_COLUMN_GAP: u16 = 3;
+/// Wrapped context rows kept for scrolling, on top of the domain's own cap on
+/// the source text.
+const MAX_ASK_USER_CONTEXT_ROWS: usize = 200;
+const MAX_ASK_USER_PROMPT_ROWS: usize = 3;
+const MAX_ASK_USER_EXPLANATION_ROWS: usize = 2;
+/// Shortest stacked context section worth carving out of the option list.
+const MIN_ASK_USER_STACKED_ROWS: u16 = 3;
+const ASK_USER_DEFAULT_TITLE: &str = "the agent needs an answer";
+const ASK_USER_EMPTY_CONTEXT: &str = "no extra context for this option";
+const ASK_USER_CONTEXT_KEYS: &str = "pgup/pgdn";
+
+/// One frame's worth of resolved ask-user geometry and content.
+///
+/// Layout and paint are separated the same way [`widgets::OverlayLayout`]
+/// separates them: everything here is decided before a single cell is written,
+/// so the scroll ceiling the key handler enforces and the rows the renderer
+/// paints are read off the same measurement.
+struct AskUserFrame<'a> {
+    title: &'a str,
+    shortcuts: Vec<widgets::OverlayShortcut<'static>>,
+    layout: widgets::OverlayLayout,
+    header: Rect,
+    rule: Option<Rect>,
+    list: Rect,
+    divider: Option<Rect>,
+    context_label: Option<Rect>,
+    context: Option<Rect>,
+    /// Reserved out of `context`, so it is `Some` exactly when the pane gave up
+    /// a row for it.
+    context_position: Option<Rect>,
+    header_lines: Vec<Line<'static>>,
+    rows: Vec<widgets::OverlayRow<'a>>,
+    selected_row: usize,
+    context_lines: Vec<String>,
+    max_context_scroll: u16,
+}
+
+/// Whether the current question offers any per-option context to show.
+///
+/// When it does not, the pane is not merely empty — the two-column layout would
+/// spend half the overlay on nothing, so the list keeps the whole width.
+fn ask_user_has_context(render: &AskUserRender<'_>) -> bool {
+    render
+        .current()
+        .options()
+        .iter()
+        .any(|option| option.context().is_some())
+}
+
+fn ask_user_context_text<'a>(render: &AskUserRender<'a>) -> &'a str {
+    render
+        .current()
+        .options()
+        .get(render.context_option)
+        .and_then(agens_core::ask_user::AskUserOption::context)
+        .unwrap_or(ASK_USER_EMPTY_CONTEXT)
+}
+
+fn ask_user_shortcuts(render: &AskUserRender<'_>) -> Vec<widgets::OverlayShortcut<'static>> {
+    let question = render.current();
+    let mut shortcuts = vec![
+        widgets::OverlayShortcut {
+            key: "↑↓",
+            label: "move",
+        },
+        widgets::OverlayShortcut {
+            key: "⏎",
+            label: "choose",
+        },
+    ];
+    if render.request.questions().len() > 1 {
+        shortcuts.push(widgets::OverlayShortcut {
+            key: "tab",
+            label: "question",
+        });
+    }
+    if question.allow_other() {
+        shortcuts.push(widgets::OverlayShortcut {
+            key: "o",
+            label: "other",
+        });
+    }
+    if question.allow_note() {
+        shortcuts.push(widgets::OverlayShortcut {
+            key: "n",
+            label: "note",
+        });
+    }
+    if ask_user_has_context(render) {
+        shortcuts.push(widgets::OverlayShortcut {
+            key: ASK_USER_CONTEXT_KEYS,
+            label: "context",
+        });
+    }
+    shortcuts.push(widgets::OverlayShortcut {
+        key: "esc",
+        label: "cancel",
+    });
+    shortcuts
+}
+
+/// ASCII characters a drawing is built out of.
+///
+/// Each one also occurs in ordinary prose, which is why no single occurrence
+/// decides anything — only their density does.
+const ASK_USER_ASCII_ART: [char; 8] = ['|', '+', '-', '/', '\\', '>', '<', '='];
+/// Share of a line's visible characters that must be drawing characters before
+/// the line is read as art. One in three is far above what prose reaches with
+/// a hyphen or two and far below what any box or arrow row falls to.
+const ASK_USER_ART_DENSITY: usize = 3;
+/// Consecutive interior spaces that mark alignment rather than sentence
+/// spacing. Two is what a typist leaves after a full stop; three is a column.
+const ASK_USER_ALIGNMENT_RUN: &str = "   ";
+
+/// Whether a line's own spacing carries meaning, so it must never be re-flowed.
+///
+/// Every row of a diagram is positioned relative to the rows above it, so
+/// wrapping one row silently misaligns all of them — and the wrap also collapses
+/// the interior space runs the drawing is made of. The test is structural rather
+/// than a character range, because the diagram a model is most likely to draw is
+/// `+---+` and `-->`, not `┌───┐`:
+///
+/// 1. a box-drawing, block, geometric or arrow glyph, which prose never carries;
+/// 2. a run of three or more interior spaces, which is alignment, not prose;
+/// 3. ASCII drawing characters at [`ASK_USER_ART_DENSITY`] of the visible
+///    characters, which catches `+-----+-----+` and leaves a sentence with a
+///    hyphen and a pipe in it alone.
+fn ask_user_line_is_preformatted(line: &str) -> bool {
+    if line
+        .chars()
+        .any(|character| matches!(character, '\u{2190}'..='\u{21ff}' | '\u{2500}'..='\u{25ff}'))
+    {
+        return true;
+    }
+    if line.trim().contains(ASK_USER_ALIGNMENT_RUN) {
+        return true;
+    }
+
+    let visible = line.chars().filter(|character| !character.is_whitespace());
+    let (art, total) = visible.fold((0usize, 0usize), |(art, total), character| {
+        (
+            art + usize::from(ASK_USER_ASCII_ART.contains(&character)),
+            total + 1,
+        )
+    });
+    total > 0 && art * ASK_USER_ART_DENSITY >= total
+}
+
+/// Greedy wrap measured in display columns.
+///
+/// Distinct from [`wrapped_prose_lines`], which counts `char`s: a pane is
+/// measured in columns, and a paragraph of double-width glyphs wrapped by
+/// character count produces rows twice as wide as the pane, whose overflow the
+/// terminal silently clips — losing text no keypress can scroll to. Text with no
+/// ASCII space to break at is broken between characters for the same reason: an
+/// unwrappable paragraph must still be readable, not truncated.
+fn ask_user_wrapped_lines(source: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut used = 0usize;
+
+    for word in source.split_whitespace() {
+        let word_width = word.width();
+        if used > 0 && used + 1 + word_width <= width {
+            current.push(' ');
+            current.push_str(word);
+            used += 1 + word_width;
+            continue;
+        }
+
+        if used > 0 {
+            lines.push(std::mem::take(&mut current));
+            used = 0;
+        }
+        if word_width <= width {
+            current.push_str(word);
+            used = word_width;
+            continue;
+        }
+
+        for character in word.chars() {
+            let columns = UnicodeWidthChar::width(character).unwrap_or(0);
+            if used > 0 && used + columns > width {
+                lines.push(std::mem::take(&mut current));
+                used = 0;
+            }
+            current.push(character);
+            used += columns;
+        }
+    }
+
+    lines.push(current);
+    lines
+}
+
+/// Wraps context for a pane of `width` columns.
+///
+/// A source line that already fits is painted verbatim, indentation included,
+/// because that is the only way a drawing survives at all. A line that does not
+/// fit is cut with `…` when its spacing is load-bearing and wrapped otherwise: a
+/// clipped diagram is still readable, a re-flowed one is noise, and a clipped
+/// paragraph is text the reader can never get back.
+fn ask_user_context_lines(text: &str, width: u16) -> Vec<String> {
+    if width == 0 {
+        return Vec::new();
+    }
+
+    let budget = usize::from(width);
+    let mut lines = Vec::new();
+    for source in text.lines() {
+        if source.width() <= budget {
+            lines.push(source.to_owned());
+        } else if ask_user_line_is_preformatted(source) {
+            lines.push(widgets::truncate_columns(source, budget));
+        } else {
+            lines.extend(ask_user_wrapped_lines(source, budget));
+        }
+
+        if lines.len() >= MAX_ASK_USER_CONTEXT_ROWS {
+            lines.truncate(MAX_ASK_USER_CONTEXT_ROWS);
+            break;
+        }
+    }
+    lines
+}
+
+fn ask_user_header_lines(render: &AskUserRender<'_>, width: u16) -> Vec<Line<'static>> {
+    let muted = Style::default().fg(widgets::RolePalette::muted());
+    let total = render.request.questions().len();
+    let mut status = vec![
+        Span::styled(
+            format!("Question {}/{total}", render.question + 1),
+            Style::default().fg(widgets::RolePalette::navigation()),
+        ),
+        Span::styled("  ·  ", muted),
+        Span::styled(
+            format!("{} of {total} answered", render.answered),
+            if render.answered == total {
+                Style::default().fg(widgets::RolePalette::success())
+            } else {
+                muted
+            },
+        ),
+    ];
+    if let Some(index) = render.incomplete {
+        status.push(Span::styled("  ·  ", muted));
+        status.push(Span::styled(
+            format!("answer question {} first", index + 1),
+            Style::default().fg(widgets::RolePalette::warning()),
+        ));
+    }
+
+    let question = render.current();
+    let mut lines = vec![Line::from(status)];
+    lines.extend(
+        wrapped_prose_lines(question.prompt(), width)
+            .into_iter()
+            .take(MAX_ASK_USER_PROMPT_ROWS)
+            .map(|line| {
+                Line::styled(
+                    line,
+                    Style::default()
+                        .fg(widgets::RolePalette::assistant())
+                        .add_modifier(Modifier::BOLD),
+                )
+            }),
+    );
+    if let Some(explanation) = question.explanation() {
+        lines.extend(
+            wrapped_prose_lines(explanation, width)
+                .into_iter()
+                .take(MAX_ASK_USER_EXPLANATION_ROWS)
+                .map(|line| Line::styled(line, muted)),
+        );
+    }
+    lines
+}
+
+/// The option list, its per-option sub-lines, the free-form buffers and the
+/// action rows, plus the index of the row the cursor stands on.
+fn ask_user_rows<'a>(render: &AskUserRender<'a>) -> (Vec<widgets::OverlayRow<'a>>, usize) {
+    let question = render.current();
+    let multiple = question.mode() == AskUserMode::Multiple;
+    let mut rows: Vec<widgets::OverlayRow<'a>> = Vec::new();
+    let mut selected_row = 0;
+
+    for (index, option) in question.options().iter().enumerate() {
+        let chosen = render.selected.contains(&index);
+        let marker = match (multiple, chosen) {
+            (true, true) => "[x]",
+            (true, false) => "[ ]",
+            (false, true) => "(•)",
+            (false, false) => "( )",
+        };
+        let highlighted = render.row == AskUserRow::Option(index);
+        if highlighted {
+            selected_row = rows.len();
+        }
+        rows.push(widgets::OverlayRow {
+            label: Cow::Borrowed(option.label()),
+            badge: Some(marker),
+            selected: highlighted,
+            ..widgets::OverlayRow::default()
+        });
+        if let Some(explanation) = option.explanation() {
+            rows.push(widgets::OverlayRow {
+                label: Cow::Borrowed(explanation),
+                indent: 1,
+                dimmed: true,
+                ..widgets::OverlayRow::default()
+            });
+        }
+    }
+
+    if question.allow_other() {
+        rows.push(ask_user_buffer_row(
+            "other",
+            render.other,
+            render.entry == AskUserEntry::Other,
+            "press o to type your own answer",
+        ));
+    }
+    if question.allow_note() {
+        rows.push(ask_user_buffer_row(
+            "note",
+            render.note,
+            render.entry == AskUserEntry::Note,
+            "press n to add a note",
+        ));
+    }
+
+    rows.push(widgets::OverlayRow::new(""));
+    let blocked = render.answered < render.request.questions().len();
+    let mut action = |row: AskUserRow, label: &'static str, right: Option<&'static str>| {
+        let highlighted = render.row == row;
+        if highlighted {
+            selected_row = rows.len();
+        }
+        rows.push(widgets::OverlayRow {
+            label: Cow::Borrowed(label),
+            right_label: right.map(Cow::Borrowed),
+            selected: highlighted,
+            dimmed: right.is_some() && !highlighted,
+            ..widgets::OverlayRow::default()
+        });
+    };
+    action(
+        AskUserRow::Submit,
+        "Submit answers",
+        blocked.then_some("incomplete"),
+    );
+    if question.allow_discuss() {
+        action(AskUserRow::Discuss, "Discuss this in chat instead", None);
+    }
+    action(AskUserRow::Cancel, "Cancel", None);
+
+    (rows, selected_row)
+}
+
+fn ask_user_buffer_row<'a>(
+    field: &str,
+    buffer: &str,
+    editing: bool,
+    hint: &str,
+) -> widgets::OverlayRow<'a> {
+    let label = if editing {
+        format!("{field}: {buffer}▏")
+    } else if buffer.is_empty() {
+        format!("{field}: {hint}")
+    } else {
+        format!("{field}: {buffer}")
+    };
+    widgets::OverlayRow {
+        label: Cow::Owned(label),
+        dimmed: !editing && buffer.is_empty(),
+        ..widgets::OverlayRow::default()
+    }
+}
+
+/// Keeps the cursor's row on screen with the least scrolling that achieves it.
+const fn ask_user_list_offset(selected: usize, height: usize, total: usize) -> usize {
+    if height == 0 || total <= height {
+        return 0;
+    }
+    if selected < height {
+        0
+    } else {
+        let last = total - height;
+        let wanted = selected + 1 - height;
+        if wanted < last { wanted } else { last }
+    }
+}
+
+/// Resolves the whole overlay before anything is painted.
+#[allow(clippy::too_many_lines)]
+fn ask_user_frame<'a>(area: Rect, render: &AskUserRender<'a>) -> Option<AskUserFrame<'a>> {
+    let sizing = widgets::OverlaySizing::ask_user();
+    let inner = sizing.inner_width(area)?;
+    let has_context = ask_user_has_context(render);
+    let two_column = has_context && inner >= ASK_USER_TWO_COLUMN_MIN_WIDTH;
+    let (list_width, context_width) = if two_column {
+        let right = (inner - ASK_USER_COLUMN_GAP) / 2;
+        (inner - ASK_USER_COLUMN_GAP - right, right)
+    } else {
+        (inner, inner)
+    };
+
+    let header_lines = ask_user_header_lines(render, inner);
+    let (rows, selected_row) = ask_user_rows(render);
+    let context_lines = if has_context {
+        ask_user_context_lines(ask_user_context_text(render), context_width)
+    } else {
+        Vec::new()
+    };
+
+    let body_rows = if two_column {
+        rows.len().max(context_lines.len())
+    } else if has_context {
+        rows.len() + context_lines.len() + 1
+    } else {
+        rows.len()
+    };
+    let shortcuts = ask_user_shortcuts(render);
+    let title = render.request.title().unwrap_or(ASK_USER_DEFAULT_TITLE);
+    let layout = widgets::OverlayLayout::solve(
+        area,
+        &widgets::OverlayConfig {
+            title,
+            tabs: None,
+            shortcuts: &shortcuts,
+            sizing,
+            desired_content_rows: saturating_u16(header_lines.len() + 1 + body_rows),
+        },
+    )?;
+
+    let content = layout.content;
+    let header_rows = saturating_u16(header_lines.len()).min(content.height.saturating_sub(1));
+    let header = Rect::new(content.x, content.y, content.width, header_rows);
+    let mut cursor = content.y + header_rows;
+    let mut remaining = content.height - header_rows;
+    let rule = (remaining >= 3).then(|| {
+        cursor += 1;
+        remaining -= 1;
+        Rect::new(content.x, cursor - 1, content.width, 1)
+    });
+    let body = Rect::new(content.x, cursor, content.width, remaining);
+
+    let (list, divider, context_label, mut context) = if two_column {
+        (
+            Rect::new(body.x, body.y, list_width, body.height),
+            Some(Rect::new(body.x + list_width + 1, body.y, 1, body.height)),
+            None,
+            Some(Rect::new(
+                body.x + list_width + ASK_USER_COLUMN_GAP,
+                body.y,
+                context_width,
+                body.height,
+            )),
+        )
+    } else if has_context && body.height >= 2 * MIN_ASK_USER_STACKED_ROWS {
+        let (list, label, pane) = ask_user_stacked_split(body, rows.len(), context_lines.len());
+        (list, None, Some(label), Some(pane))
+    } else {
+        (body, None, None, None)
+    };
+
+    // The scroll affordance costs a row, so it is taken out of the pane before
+    // the ceiling is measured: the reader must never be told there is more
+    // below on a row that is itself the last row of content. The reserved rect
+    // is carried rather than recomputed at paint time, so the pane the renderer
+    // fills and the row it writes the position on cannot disagree.
+    let mut context_position = None;
+    if let Some(pane) = context.as_mut()
+        && context_lines.len() > usize::from(pane.height)
+        && pane.height >= MIN_ASK_USER_STACKED_ROWS
+    {
+        pane.height -= 1;
+        context_position = Some(Rect::new(pane.x, pane.y + pane.height, pane.width, 1));
+    }
+    let max_context_scroll = context.map_or(0, |pane| {
+        saturating_u16(context_lines.len().saturating_sub(usize::from(pane.height)))
+    });
+
+    Some(AskUserFrame {
+        title,
+        shortcuts,
+        layout,
+        header,
+        rule,
+        list,
+        divider,
+        context_label,
+        context,
+        context_position,
+        header_lines,
+        rows,
+        selected_row,
+        context_lines,
+        max_context_scroll,
+    })
+}
+
+/// Divides a single-column body into the option list, the named divider and the
+/// context section, as `(list, label, context)`.
+///
+/// The list is served first: an option set the reader has to scroll past before
+/// discovering that Submit exists is a worse trade than a context section they
+/// have already been told how to page through.
+fn ask_user_stacked_split(body: Rect, rows: usize, context_lines: usize) -> (Rect, Rect, Rect) {
+    let wanted = saturating_u16(context_lines + 1);
+    let floor = MIN_ASK_USER_STACKED_ROWS + 1;
+    let ceiling = (body.height / 2).max(floor);
+    let block = body
+        .height
+        .saturating_sub(saturating_u16(rows))
+        .clamp(floor, ceiling)
+        .min(wanted.max(floor));
+    let list_rows = body.height - block;
+
+    (
+        Rect::new(body.x, body.y, body.width, list_rows),
+        Rect::new(body.x, body.y + list_rows, body.width, 1),
+        Rect::new(body.x, body.y + list_rows + 1, body.width, block - 1),
+    )
+}
+
+fn render_ask_user(frame: &mut ratatui::Frame<'_>, area: Rect, render: AskUserRender<'_>) {
+    let Some(laid) = ask_user_frame(area, &render) else {
+        return;
+    };
+    let AskUserFrame {
+        title,
+        shortcuts,
+        layout,
+        header,
+        rule,
+        list,
+        divider,
+        context_label,
+        context,
+        context_position,
+        header_lines,
+        rows,
+        selected_row,
+        context_lines,
+        max_context_scroll,
+    } = laid;
+
+    let config = widgets::OverlayConfig {
+        title,
+        tabs: None,
+        shortcuts: &shortcuts,
+        sizing: widgets::OverlaySizing::ask_user(),
+        desired_content_rows: layout.content.height,
+    };
+    widgets::OverlayFrame::render(frame, &layout, &config);
+
+    let chrome = Style::default().fg(widgets::RolePalette::chrome());
+    if header.height > 0 {
+        frame.render_widget(Paragraph::new(Text::from(header_lines)), header);
+    }
+    if let Some(rule) = rule {
+        frame.render_widget(
+            Paragraph::new(Line::styled("─".repeat(usize::from(rule.width)), chrome)),
+            rule,
+        );
+    }
+
+    let offset = ask_user_list_offset(selected_row, usize::from(list.height), rows.len());
+    widgets::OverlayList::render(frame, list, &rows, offset, rows.len());
+
+    if let Some(divider) = divider {
+        frame.render_widget(
+            Paragraph::new(Text::from(vec![
+                Line::styled("│", chrome);
+                usize::from(divider.height)
+            ])),
+            divider,
+        );
+    }
+    if let Some(label) = context_label {
+        frame.render_widget(
+            Paragraph::new(Line::styled(ask_user_context_label(label.width), chrome)),
+            label,
+        );
+    }
+    if let Some(pane) = context {
+        let scroll = render.context_scroll.min(max_context_scroll);
+        render_ask_user_context(frame, pane, &context_lines, scroll);
+        if let Some(position) = context_position {
+            render_ask_user_context_position(
+                frame,
+                position,
+                scroll,
+                pane.height,
+                context_lines.len(),
+            );
+        }
+    }
+}
+
+/// The stacked-mode divider: it names the section and the keys that reach it,
+/// because a pane below the fold nobody knows how to scroll is not reachable.
+fn ask_user_context_label(width: u16) -> String {
+    let named = format!("── context ── {ASK_USER_CONTEXT_KEYS} ");
+    if named.width() >= usize::from(width) {
+        return widgets::truncate_columns(&named, usize::from(width));
+    }
+    format!("{named}{}", "─".repeat(usize::from(width) - named.width()))
+}
+
+fn render_ask_user_context(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    lines: &[String],
+    scroll: u16,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let style = Style::default().fg(widgets::RolePalette::muted());
+    let visible: Vec<Line<'static>> = lines
+        .iter()
+        .skip(usize::from(scroll))
+        .take(usize::from(area.height))
+        .map(|line| Line::styled(line.clone(), style))
+        .collect();
+    frame.render_widget(Paragraph::new(Text::from(visible)), area);
+}
+
+fn render_ask_user_context_position(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    scroll: u16,
+    height: u16,
+    total: usize,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let first = usize::from(scroll) + 1;
+    let last = (usize::from(scroll) + usize::from(height)).min(total);
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            widgets::truncate_columns(
+                &format!("{first}–{last} of {total}  ·  {ASK_USER_CONTEXT_KEYS}"),
+                usize::from(area.width),
+            ),
+            Style::default().fg(widgets::RolePalette::chrome()),
+        )),
+        area,
+    );
 }
 
 const SECRET_ENTRY_SHORTCUTS: [widgets::OverlayShortcut<'static>; 3] = [
@@ -3942,6 +4657,7 @@ where
                 self.clamp_palette_selection();
                 self.clamp_scroll_offset();
                 self.ensure_dialog_selection_visible();
+                self.clamp_ask_user_context_scroll();
                 Action::Render
             }
             Event::Key(key) => self.handle_key(key),
@@ -5243,6 +5959,7 @@ where
                 selected: entry.selected,
                 confirmation: entry.confirmation,
             }),
+            ask_user: self.ask_user.as_ref().map(AskUserRender::of),
             palette: self.palette_open.then_some(PaletteView {
                 entries: &self.palette_entries,
                 selected: self.palette_selected,
@@ -5816,15 +6533,41 @@ where
         self.ask_user.as_ref().map(AskUserState::snapshot)
     }
 
+    /// The context pane's scroll ceiling in the frame the reader is looking at.
+    ///
+    /// Measured from the same geometry the renderer solves, so `End` stores a
+    /// real offset instead of a sentinel the next `PageUp` would have to walk
+    /// back from one step at a time.
+    fn ask_user_max_context_scroll(&self) -> u16 {
+        let Some(state) = self.ask_user.as_ref() else {
+            return 0;
+        };
+        let render = AskUserRender::of(state);
+        let area = Rect::new(0, 0, self.size.0, self.size.1);
+        ask_user_frame(area, &render).map_or(0, |laid| laid.max_context_scroll)
+    }
+
+    fn clamp_ask_user_context_scroll(&mut self) {
+        let max = self.ask_user_max_context_scroll();
+        if let Some(state) = self.ask_user.as_mut() {
+            state.clamp_context_scroll(max);
+        }
+    }
+
     fn handle_ask_user_key(&mut self, key: Key) -> Action {
+        let max_context_scroll = self.ask_user_max_context_scroll();
         let Some(state) = self.ask_user.as_mut() else {
             return Action::Render;
         };
-        match state.reduce(key) {
+        let outcome = state.reduce(key, max_context_scroll);
+        let id = state.id();
+        match outcome {
             AskUserOutcome::Unchanged => Action::Unchanged,
-            AskUserOutcome::Changed => Action::Render,
+            AskUserOutcome::Changed => {
+                self.clamp_ask_user_context_scroll();
+                Action::Render
+            }
             AskUserOutcome::Resolved(reply) => {
-                let id = state.id();
                 self.ask_user = None;
                 Action::AskUserReply { id, reply }
             }
