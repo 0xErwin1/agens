@@ -68,32 +68,25 @@ impl SafeDiagnosticStore {
             self.write_subagent_model_unavailable(event, agent, requested_model, fallback_model);
     }
 
-    fn write(&self, event: &ProviderDiagnosticEvent) -> std::io::Result<()> {
-        ensure_private_diagnostics_directory(&self.directory)?;
-        let line = diagnostic_json_line(event)?;
-        let active = self.active_path();
-        let existing_size = match fs::symlink_metadata(&active) {
-            Ok(metadata) if metadata.file_type().is_file() => metadata.len(),
-            Ok(_) => {
-                return Err(std::io::Error::other(
-                    "diagnostics path is not a regular file",
-                ));
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
-            Err(error) => return Err(error),
-        };
-        if existing_size.saturating_add(line.len() as u64) > DIAGNOSTIC_FILE_LIMIT_BYTES {
-            self.rotate()?;
+    /// Records why a delegated subagent's declared tool surface was refused.
+    ///
+    /// The caller has no error type able to carry the reason to its own
+    /// caller, so the record is the only place the offending declaration
+    /// survives; without it the operator sees an opaque runtime failure and
+    /// cannot tell a typo from a genuine over-grant.
+    pub fn record_subagent_surface_rejection(&self, event: &ProviderDiagnosticEvent, reason: &str) {
+        if !self.enabled {
+            return;
         }
+        let _guard = DIAGNOSTIC_FILE_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let _ = self.write_subagent_surface_rejection(event, reason);
+    }
 
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(active)?;
-        file.set_permissions(fs::Permissions::from_mode(0o600))?;
-        file.write_all(&line)
+    fn write(&self, event: &ProviderDiagnosticEvent) -> std::io::Result<()> {
+        self.append(diagnostic_json_line(event)?)
     }
 
     fn write_subagent_model_unavailable(
@@ -103,9 +96,27 @@ impl SafeDiagnosticStore {
         requested_model: &str,
         fallback_model: &str,
     ) -> std::io::Result<()> {
+        self.append(subagent_model_unavailable_json_line(
+            event,
+            agent,
+            requested_model,
+            fallback_model,
+        )?)
+    }
+
+    fn write_subagent_surface_rejection(
+        &self,
+        event: &ProviderDiagnosticEvent,
+        reason: &str,
+    ) -> std::io::Result<()> {
+        self.append(subagent_surface_rejection_json_line(event, reason)?)
+    }
+
+    /// Appends one already-serialized record to the active log, rotating first
+    /// when the record would push the file past its size limit. The log is
+    /// opened without following symlinks and kept owner-only.
+    fn append(&self, line: Vec<u8>) -> std::io::Result<()> {
         ensure_private_diagnostics_directory(&self.directory)?;
-        let line =
-            subagent_model_unavailable_json_line(event, agent, requested_model, fallback_model)?;
         let active = self.active_path();
         let existing_size = match fs::symlink_metadata(&active) {
             Ok(metadata) if metadata.file_type().is_file() => metadata.len(),
@@ -120,6 +131,7 @@ impl SafeDiagnosticStore {
         if existing_size.saturating_add(line.len() as u64) > DIAGNOSTIC_FILE_LIMIT_BYTES {
             self.rotate()?;
         }
+
         let mut file = fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -225,6 +237,32 @@ fn subagent_model_unavailable_json_line(
         "agent": agent,
         "requested_model": requested_model,
         "fallback_model": fallback_model,
+    }))
+    .map_err(std::io::Error::other)?;
+    line.push(b'\n');
+    Ok(line)
+}
+
+fn subagent_surface_rejection_json_line(
+    event: &ProviderDiagnosticEvent,
+    reason: &str,
+) -> std::io::Result<Vec<u8>> {
+    let timestamp_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let mut line = serde_json::to_vec(&serde_json::json!({
+        "timestamp_ms": u64::try_from(timestamp_ms).unwrap_or(u64::MAX),
+        "reference": event.reference.as_str(),
+        "scope": event.scope.as_str(),
+        "component": event.component.as_str(),
+        "event": "surface_rejection",
+        "attempt": event.attempt,
+        "max_attempts": event.max_attempts,
+        "delay_ms": event.delay_ms,
+        "status": event.status,
+        "class": event.class.map(ProviderDiagnosticClass::as_str),
+        "reason": reason,
     }))
     .map_err(std::io::Error::other)?;
     line.push(b'\n');
@@ -372,6 +410,29 @@ pub fn record_subagent_terminal(
     });
 }
 
+/// Records a refused subagent tool surface against `reference`, naming the
+/// declaration that caused it. See
+/// [`SafeDiagnosticStore::record_subagent_surface_rejection`].
+pub fn record_subagent_surface_rejection(bootstrap: &Bootstrap, reference: &str, reason: &str) {
+    let Ok(reference) = DiagnosticRef::new(reference.to_owned()) else {
+        return;
+    };
+    diagnostic_store(bootstrap).record_subagent_surface_rejection(
+        &ProviderDiagnosticEvent {
+            reference,
+            scope: ProviderDiagnosticScope::Subagent,
+            component: ProviderDiagnosticComponent::Subagent,
+            event: ProviderDiagnosticKind::Terminal,
+            attempt: 0,
+            max_attempts: 0,
+            delay_ms: None,
+            status: None,
+            class: Some(ProviderDiagnosticClass::Runtime),
+        },
+        reason,
+    );
+}
+
 pub fn record_parent_terminal(bootstrap: &Bootstrap, reference: &str, error: &CliError) {
     if error.message == agens_core::HeadlessTaskTerminal::ModelUnavailable.message() {
         return;
@@ -452,6 +513,48 @@ mod tests {
                 .count()
                 > 0
         );
+
+        std::fs::remove_dir_all(&temporary).ok();
+    }
+
+    /// A subagent whose declared surface cannot be resolved never starts, so
+    /// the reason names the offending declaration or it is lost: the caller
+    /// collapses the failure into an opaque runtime error one frame later.
+    #[test]
+    fn a_rejected_subagent_surface_records_the_declaration_that_caused_it() {
+        let temporary =
+            std::env::temp_dir().join(format!("agens-surface-rejection-{}", std::process::id()));
+        std::fs::remove_dir_all(&temporary).ok();
+        std::fs::create_dir_all(&temporary).expect("test data directory should be creatable");
+        let event = ProviderDiagnosticEvent {
+            reference: DiagnosticRef::new("abcd1234".to_owned()).unwrap(),
+            scope: ProviderDiagnosticScope::Subagent,
+            component: ProviderDiagnosticComponent::Subagent,
+            event: ProviderDiagnosticKind::Terminal,
+            attempt: 0,
+            max_attempts: 0,
+            delay_ms: None,
+            status: None,
+            class: Some(ProviderDiagnosticClass::Runtime),
+        };
+
+        SafeDiagnosticStore::with_capture(temporary.clone(), true)
+            .record_subagent_surface_rejection(
+                &event,
+                "permission declaration grants a tool the parent does not hold: not_a_real_tool",
+            );
+
+        let recorded = std::fs::read_dir(temporary.join("diagnostics"))
+            .expect("enabled capture should create the directory")
+            .filter_map(Result::ok)
+            .map(|entry| std::fs::read_to_string(entry.path()).unwrap_or_default())
+            .collect::<String>();
+
+        assert!(
+            recorded.contains("not_a_real_tool"),
+            "the offending declaration must survive into the record, got: {recorded}"
+        );
+        assert!(recorded.contains("surface_rejection"));
 
         std::fs::remove_dir_all(&temporary).ok();
     }
