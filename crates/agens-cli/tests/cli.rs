@@ -1603,17 +1603,21 @@ fn production_task_consolidates_durable_sessions_catalog_skills_and_isolation() 
             ),
         },
         ScriptedOpenAiResponse {
+            // The reviewer agent declares no `permissions:`, so it inherits the
+            // parent's full native surface (write/bash/webfetch included) unlike
+            // `explore`, which narrows explicitly. Only task nesting and MCP stay
+            // excluded from a child's catalog.
             required_body_fragments: vec![
                 "child request".into(),
                 "You are the isolated reviewer.".into(),
                 "Use the review checklist.".into(),
                 "gpt-4o".into(),
                 "read".into(),
+                "write".into(),
+                "bash".into(),
+                "webfetch".into(),
                 "!parent request".into(),
                 "!\"name\":\"task\"".into(),
-                "!write".into(),
-                "!bash".into(),
-                "!webfetch".into(),
                 "!mcp".into(),
             ],
             response: native_tool_call_response(
@@ -5006,17 +5010,20 @@ impl TaskStalledOpenAiMockServer {
             observed_sender
                 .send(())
                 .expect("test should receive the child request observation");
-            for forbidden in [
-                "parent task cancellation",
-                "\"name\":\"task\"",
-                "write",
-                "bash",
-                "webfetch",
-                "mcp",
-            ] {
+            // The reviewer agent declares no `permissions:`, so it inherits the
+            // parent's full native surface (write/bash/webfetch included) unlike
+            // `explore`, which narrows explicitly. Only task nesting and MCP stay
+            // excluded from a child's catalog.
+            for forbidden in ["parent task cancellation", "\"name\":\"task\"", "mcp"] {
                 assert!(
                     !child_body.contains(forbidden),
                     "child request leaked {forbidden:?}: {child_body}"
+                );
+            }
+            for expected in ["write", "bash", "webfetch"] {
+                assert!(
+                    child_body.contains(expected),
+                    "child request should inherit the parent's full native surface, missing {expected:?}: {child_body}"
                 );
             }
             child

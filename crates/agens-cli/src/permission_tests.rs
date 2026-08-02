@@ -554,13 +554,14 @@ mod tests {
         assert!(denied.prompts.is_empty());
         assert!(denied.executions.is_empty());
 
-        for (name, input) in [
-            ("native::list", "{malformed"),
-            ("native::glob", r#"{}"#),
-            ("native::unknown", r#"{"path":"src"}"#),
+        for (name, input, expected_content) in [
+            ("native::list", "{malformed", "invalid tool arguments"),
+            ("native::glob", r#"{}"#, "invalid tool arguments"),
+            ("native::unknown", r#"{"path":"src"}"#, "permission denied"),
             (
                 "native::grep",
                 r#"{"pattern":"TODO","_inject_permission_evaluator_failure":true}"#,
+                "invalid tool arguments",
             ),
         ] {
             let invalid = run_production_batch_with_policy(
@@ -579,16 +580,19 @@ mod tests {
             assert!(invalid.result.is_ok());
             assert!(invalid.prompts.is_empty());
             assert!(invalid.executions.is_empty());
-            assert!(invalid.progress.iter().any(|event| {
-                matches!(
-                    event,
-                    TurnEvent::ToolResult(MessagePart::ToolResult {
-                        is_error: true,
-                        content,
-                        ..
-                    }) if content == "invalid tool arguments"
-                )
-            }));
+            assert!(
+                invalid.progress.iter().any(|event| {
+                    matches!(
+                        event,
+                        TurnEvent::ToolResult(MessagePart::ToolResult {
+                            is_error: true,
+                            content,
+                            ..
+                        }) if content == expected_content
+                    )
+                }),
+                "{name} should report {expected_content:?}"
+            );
         }
     }
 

@@ -1021,14 +1021,15 @@ fn dangerous_override_never_precedes_hard_safety_or_reuses_authorization() {
     assert!(chat.prompts.is_empty());
     assert!(chat.executions.is_empty());
 
-    for (name, input) in [
-        ("native::write", "{malformed"),
+    for (name, input, expected_content) in [
+        ("native::write", "{malformed", "invalid tool arguments"),
         (
             "native::task",
             r#"{"agent":"worker","description":"recursive"}"#,
+            "permission denied",
         ),
-        ("mcp::server::tool", r#"{}"#),
-        ("native::unregistered", r#"{}"#),
+        ("mcp::server::tool", r#"{}"#, "permission denied"),
+        ("native::unregistered", r#"{}"#, "permission denied"),
     ] {
         let rejected = run_production_batch_with_policy(
             ProductionBatchInput::new(
@@ -1048,16 +1049,19 @@ fn dangerous_override_never_precedes_hard_safety_or_reuses_authorization() {
         );
         assert!(rejected.prompts.is_empty());
         assert!(rejected.executions.is_empty());
-        assert!(rejected.progress.iter().any(|event| {
-            matches!(
-                event,
-                TurnEvent::ToolResult(MessagePart::ToolResult {
-                    is_error: true,
-                    content,
-                    ..
-                }) if content == "invalid tool arguments"
-            )
-        }));
+        assert!(
+            rejected.progress.iter().any(|event| {
+                matches!(
+                    event,
+                    TurnEvent::ToolResult(MessagePart::ToolResult {
+                        is_error: true,
+                        content,
+                        ..
+                    }) if content == expected_content
+                )
+            }),
+            "{name} should report {expected_content:?}"
+        );
     }
 
     let calls = Arc::new(Mutex::new(Vec::new()));
