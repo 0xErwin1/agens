@@ -309,12 +309,17 @@ impl RenderedBlock {
 
     /// Block whose rows all carry the same accent bar and no bullet.
     fn accented(lines: Vec<Line<'static>>, accent: Option<RowAccent>) -> Self {
+        Self::accented_packing(lines, accent, false)
+    }
+
+    /// The same, for a block that knows whether it is in its compact form.
+    fn accented_packing(lines: Vec<Line<'static>>, accent: Option<RowAccent>, packs: bool) -> Self {
         Self {
             rows: lines
                 .into_iter()
                 .map(|line| BlockLine::new(line).accented(accent))
                 .collect(),
-            packs: false,
+            packs,
             call_id: None,
             closes_call: false,
         }
@@ -487,14 +492,14 @@ fn item_block(context: &ItemContext<'_>, item: &ConversationItem) -> RenderedBlo
         ),
         ConversationItem::Reasoning(text) => {
             let mut lines = Vec::new();
-            let accent = thinking_lines(
+            let (accent, packs) = thinking_lines(
                 &mut lines,
                 text,
                 context.state.collapse_thinking,
                 context.state.thinking_streaming,
                 context.content_width,
             );
-            RenderedBlock::accented(lines, accent)
+            RenderedBlock::accented_packing(lines, accent, packs)
         }
         ConversationItem::ToolCall {
             call_id,
@@ -1623,14 +1628,15 @@ fn bounded_visible_tool_output(output: &str) -> String {
     format!("{}{}", &output[..end], VISIBLE_TOOL_OUTPUT_MARKER)
 }
 
-/// Describes the reasoning rows and reports the accent bar they carry.
+/// Describes the reasoning rows, and reports the accent bar they carry together
+/// with whether the block is in its compact single-row form.
 fn thinking_lines(
     lines: &mut Vec<Line<'static>>,
     text: &str,
     collapsed: bool,
     streaming: bool,
     content_width: usize,
-) -> Option<RowAccent> {
+) -> (Option<RowAccent>, bool) {
     let mode = ThinkingBlock::mode(streaming, collapsed);
     if mode.shows_body() {
         lines.push(ThinkingBlock::title());
@@ -1642,10 +1648,37 @@ fn thinking_lines(
             content_width,
         );
     } else {
-        lines.push(ThinkingBlock::collapsed_title(None));
+        lines.push(ThinkingBlock::collapsed_title(
+            thinking_summary(text, content_width).as_deref(),
+            None,
+        ));
     }
-    ThinkingBlock::accent(mode)
+    // A collapsed thought is one summary row, so it packs against its
+    // neighbours for the same reason a collapsed tool call does: a run of them
+    // is a list, and a blank line between every entry of a list is a gap
+    // pretending to be structure.
+    (ThinkingBlock::accent(mode), !mode.shows_body())
 }
+
+/// What a collapsed thought says it was about.
+///
+/// A row reading only "Thought" is the shape of information without any: the
+/// reader cannot tell one from the next, and a column of them says nothing that
+/// a single count would not have said better. Providers open reasoning with a
+/// short heading, so the first line is both the cheapest summary available and
+/// the one the expanded form shows first.
+fn thinking_summary(text: &str, content_width: usize) -> Option<String> {
+    let heading = text
+        .lines()
+        .map(|line| line.trim().trim_matches(['#', '*', '_', '`', ' ']).trim())
+        .find(|line| !line.is_empty())?;
+
+    let budget = content_width.saturating_sub(THINKING_SUMMARY_CHROME);
+    (budget > 0).then(|| bounded_single_line(heading, budget))
+}
+
+/// Columns the collapsed thought's own label and separator cost the summary.
+const THINKING_SUMMARY_CHROME: usize = 12;
 
 pub(super) fn detail_lines(
     events: &[TuiRuntimeEvent],

@@ -1305,7 +1305,12 @@ fn thinking_streams_expanded_auto_collapses_on_finish_and_ctrl_t_re_expands() {
     let collapsed = rendered_text(&renderer);
     assert!(collapsed.contains("Thought"), "{collapsed:?}");
     assert!(!collapsed.contains("Thinking"), "{collapsed:?}");
-    assert!(!collapsed.contains("THOUGHTTOKEN"), "{collapsed:?}");
+    // The opening line survives as the row's label — that is what makes one
+    // collapsed thought distinguishable from the next — while the body does not.
+    assert!(
+        collapsed.contains("Thought · THOUGHTTOKEN"),
+        "{collapsed:?}"
+    );
     assert!(tui.view().collapse_thinking);
 
     tui.handle(Event::Key(Key::CtrlT));
@@ -1836,7 +1841,7 @@ fn collapsed_thinking_occupies_exactly_one_row_and_names_the_finished_thought() 
     let mut tui = Tui::new(FakeEngine);
     tui.begin_submission("request");
     tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Reasoning(
-        "THOUGHTTOKEN body".into(),
+        "Checking the timeout\nBODYTOKEN the rest of the reasoning".into(),
     )));
     tui.finish_provider_turn(agens_tui::TuiProviderOutcome::Completed("answer".into()));
 
@@ -1848,13 +1853,16 @@ fn collapsed_thinking_occupies_exactly_one_row_and_names_the_finished_thought() 
         !text.contains("collapsed"),
         "the collapsed state is the row itself, not a suffix: {text:?}"
     );
-    assert!(!text.contains("THOUGHTTOKEN"), "{text:?}");
+    assert!(
+        !text.contains("BODYTOKEN"),
+        "the body stays hidden: {text:?}"
+    );
 
     let thought_row = rendered_row(&renderer, "Thought");
     assert_eq!(
         rendered_line(&renderer, thought_row).trim(),
-        "Thought",
-        "no duration is tracked for reasoning, so the bare form renders"
+        "Thought · Checking the timeout",
+        "the opening line becomes the label, so one thought reads apart from the next"
     );
     let rows = transcript_rows(&renderer);
     assert_eq!(
@@ -1864,6 +1872,44 @@ fn collapsed_thinking_occupies_exactly_one_row_and_names_the_finished_thought() 
         1,
         "collapsed thinking is exactly one row: {rows:?}"
     );
+}
+
+/// A run of collapsed thoughts is a list, and a blank line between every entry
+/// of a list is a gap pretending to be structure.
+#[test]
+fn consecutive_collapsed_thoughts_pack_without_a_blank_row_between_them() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(72, 24)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.begin_submission("request");
+    for subject in [
+        "Reading the log",
+        "Checking the timeout",
+        "Planning the fix",
+    ] {
+        tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Reasoning(format!(
+            "{subject}\nbody"
+        ))));
+        tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text(String::new())));
+    }
+    tui.finish_provider_turn(agens_tui::TuiProviderOutcome::Completed("answer".into()));
+
+    renderer.render(tui.view()).unwrap();
+    let rows = transcript_rows(&renderer);
+    let thought_rows = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| row.contains("Thought"))
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+
+    assert!(thought_rows.len() >= 2, "several thoughts render: {rows:?}");
+    for pair in thought_rows.windows(2) {
+        assert_eq!(
+            pair[1] - pair[0],
+            1,
+            "collapsed thoughts sit on consecutive rows: {rows:?}"
+        );
+    }
 }
 
 #[test]

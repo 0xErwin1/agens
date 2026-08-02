@@ -523,7 +523,7 @@ pub fn tui_session_messages() -> Vec<Message> {
         Message {
             role: Role::Assistant,
             parts: vec![
-                MessagePart::Reasoning("previous reasoning".into()),
+                MessagePart::Reasoning("previous reasoning\nprevious reasoning body".into()),
                 MessagePart::ToolCall {
                     id: "resume-call".into(),
                     name: "read".into(),

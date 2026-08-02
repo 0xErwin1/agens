@@ -245,11 +245,34 @@ impl ThinkingBlock {
     ///
     /// The row carries no key hint: it is the quietest thing in the transcript
     /// and stays that way. Ctrl+T is documented where keys are documented.
-    pub(crate) fn collapsed_title(elapsed: Option<Duration>) -> Line<'static> {
-        Self::row(elapsed.map_or_else(
+    pub(crate) fn collapsed_title(
+        summary: Option<&str>,
+        elapsed: Option<Duration>,
+    ) -> Line<'static> {
+        let label = elapsed.map_or_else(
             || "Thought".to_owned(),
             |elapsed| format!("Thought for {}", thought_duration(elapsed)),
-        ))
+        );
+
+        let Some(summary) = summary.map(str::trim).filter(|summary| !summary.is_empty()) else {
+            return Self::row(label);
+        };
+
+        // The label is what the row is; the summary is what it was about. They
+        // carry different weight so the eye can skip the first and read the
+        // second down a column of collapsed thoughts.
+        Line::from(vec![
+            Span::styled(
+                format!("{label} · "),
+                Style::default()
+                    .fg(RolePalette::muted())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                summary.to_owned(),
+                Style::default().fg(RolePalette::muted()),
+            ),
+        ])
     }
 
     fn row(label: String) -> Line<'static> {
@@ -823,12 +846,24 @@ fn short_tool_name(name: &str) -> String {
 mod tests {
     use super::*;
 
-    /// A hidden thought names itself and nothing else. Anything appended here
-    /// is chrome on the row that exists precisely to be ignorable.
+    /// A hidden thought names itself and what it was about. A column of rows
+    /// reading only "Thought" is the shape of information without any: nothing
+    /// there tells one from the next.
     #[test]
     fn collapsed_thinking_is_one_row_naming_the_thought_and_its_duration() {
         assert_eq!(line_text(&ThinkingBlock::title()), "Thinking");
-        assert_eq!(line_text(&ThinkingBlock::collapsed_title(None)), "Thought");
+        assert_eq!(
+            line_text(&ThinkingBlock::collapsed_title(None, None)),
+            "Thought"
+        );
+        assert_eq!(
+            line_text(&ThinkingBlock::collapsed_title(
+                Some("Investigating the timeout"),
+                None
+            )),
+            "Thought · Investigating the timeout",
+            "a collapsed thought says what it was about"
+        );
         for (elapsed, expected) in [
             (Duration::from_millis(1_800), "Thought for 1.8s"),
             (Duration::from_millis(59_940), "Thought for 59.9s"),
@@ -836,7 +871,7 @@ mod tests {
             (Duration::from_secs(125), "Thought for 2m5s"),
         ] {
             assert_eq!(
-                line_text(&ThinkingBlock::collapsed_title(Some(elapsed))),
+                line_text(&ThinkingBlock::collapsed_title(None, Some(elapsed))),
                 expected
             );
         }

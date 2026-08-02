@@ -2675,8 +2675,14 @@ fn tui_resume_overlay_restores_appends_reopens_and_resets_complete_history() {
     // hidden: the "output collapsed" marker was removed with AGN-108. What the
     // assertion owes the reader is that the body is absent, which the
     // "previous result" check below already states.
+    // A collapsed thought keeps its opening line as the row's label, which is
+    // what tells one from the next; the body below it is what stays hidden.
     assert!(
-        !restored_render.contains("previous reasoning"),
+        restored_render.contains("Thought · previous reasoning"),
+        "{restored_render:?}"
+    );
+    assert!(
+        !restored_render.contains("previous reasoning body"),
         "{restored_render:?}"
     );
     assert!(
