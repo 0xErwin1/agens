@@ -8,6 +8,7 @@ mod conversation;
 #[cfg(feature = "perf-audit")]
 pub mod perf;
 mod render;
+pub mod shortcuts;
 mod terminal;
 mod widgets;
 
@@ -198,6 +199,8 @@ pub enum Key {
     CtrlD,
     /// Half-page up in the focused transcript; delete-to-line-start in the composer.
     CtrlU,
+    /// Opens the keyboard shortcut overlay from any mode.
+    CtrlQuestion,
     /// Jumps the transcript viewport to the top.
     CtrlG,
     /// Jumps the transcript viewport to the bottom.
@@ -1248,6 +1251,25 @@ impl DialogEntry {
         self
     }
 
+    /// A row that states a fact and dispatches nothing.
+    ///
+    /// It still carries an action so the list will stop on it: dialog
+    /// navigation walks actionable rows only, and a reference row the cursor
+    /// skipped would be a row the reader cannot reach with the keyboard.
+    pub fn reference(label: impl AsRef<str>, detail: impl AsRef<str>) -> Self {
+        Self {
+            label: bounded_dialog_text(label.as_ref(), 128),
+            detail: Some(bounded_dialog_text(detail.as_ref(), 256)),
+            search_text: Some(bounded_dialog_text(
+                &format!("{} {}", label.as_ref(), detail.as_ref()),
+                512,
+            )),
+            selected_detail: None,
+            action: Some(DialogEntryAction::ToggleDetails),
+            id: None,
+        }
+    }
+
     pub fn cancel(label: impl AsRef<str>) -> Self {
         Self {
             label: bounded_dialog_text(label.as_ref(), 128),
@@ -1428,6 +1450,11 @@ impl DialogView {
             selected_key_actions: Vec::new(),
             overlay_kind: widgets::OverlayKind::Picker,
         }
+    }
+
+    /// Rows the dialog actually kept, after its own bound was applied.
+    pub fn entry_count(&self) -> usize {
+        self.entries.len()
     }
 
     pub fn read_only<H>(
@@ -1773,14 +1800,6 @@ fn render_frame_content(frame: &mut ratatui::Frame<'_>, state: &ViewState<'_>) {
         if let Some(metrics) = border_metrics(state, layout.composer) {
             composer = composer.title_bottom(metrics);
         }
-        // The transcript keymap is only legible if the reader can see it is on:
-        // every key means something different here than it does in the prompt.
-        if state.focus == TranscriptFocus::Viewport {
-            composer = composer.title_top(Span::styled(
-                " NORMAL · j/k scroll · gg/G ends · {/} prompts · i insert ",
-                Style::default().fg(widgets::RolePalette::navigation()),
-            ));
-        }
         frame.render_widget(
             Paragraph::new(state.input).block(composer).scroll((
                 saturating_u16(vertical_scroll),
@@ -1811,7 +1830,14 @@ fn render_frame_content(frame: &mut ratatui::Frame<'_>, state: &ViewState<'_>) {
     }
 
     if layout.notice.height > 0 {
-        render_notice(frame, layout.notice, notice);
+        // The band belongs to whatever is most urgent. A warning outranks a
+        // legend, so the hints yield the row rather than share it.
+        let band = if notice.is_empty() {
+            hint_spans(state)
+        } else {
+            notice
+        };
+        render_notice(frame, layout.notice, band);
     }
 
     if layout.tree.height > 0 {
@@ -2662,14 +2688,7 @@ fn footer_context<'a>(state: &ViewState<'a>) -> widgets::FooterContext<'a> {
         project: state.project,
         home: state.home,
         repository: state.repository,
-        tool_detail: state.tool_detail,
-        focused_detail: state.focused_call.map(|call_id| {
-            state
-                .tool_display_modes
-                .get(call_id)
-                .copied()
-                .unwrap_or(state.tool_detail)
-        }),
+        idle: state.turn_activity == crate::activity::TurnActivity::Ready,
         unicode: state.unicode_level,
         turn_label: state.turn_activity.footer_label(),
         duration: state.turn_duration,
@@ -3522,6 +3541,66 @@ fn turn_failure_banner(state: &ViewState<'_>) -> Option<Span<'static>> {
     })
 }
 
+/// Keys worth naming for what the reader is doing at this exact moment.
+///
+/// A fixed legend is either too long to read or too short to help, and it goes
+/// stale the moment the keymap moves. This is short because it is contextual:
+/// `Enter` is only worth a slot once there is something to send, and the mode
+/// badge only exists while a mode other than typing is on. Everything not named
+/// here lives in the shortcuts overlay, which is the one list that cannot drift
+/// out of date.
+fn hint_spans(state: &ViewState<'_>) -> Vec<Span<'static>> {
+    let mut hints: Vec<(&str, &str)> = Vec::new();
+
+    if state.focus == TranscriptFocus::Viewport {
+        hints.push(("j/k", "scroll"));
+        if state.selection.is_some() {
+            hints.push(("^⇧C", "copy"));
+        }
+        if state.running {
+            hints.push(("Esc", "cancel"));
+        }
+        hints.push(("i", "insert"));
+    } else {
+        if !state.input.is_empty() && !state.running {
+            hints.push(("Enter", "send"));
+        }
+        hints.push(("Esc", if state.running { "look" } else { "normal" }));
+    }
+    hints.push(("^?", "shortcuts"));
+
+    let mut spans = Vec::new();
+    if state.focus == TranscriptFocus::Viewport {
+        spans.push(Span::styled(
+            " NORMAL ",
+            Style::default()
+                .fg(widgets::RolePalette::navigation())
+                .add_modifier(Modifier::BOLD),
+        ));
+    } else {
+        spans.push(Span::raw(" "));
+    }
+
+    for (index, (key, label)) in hints.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled(
+                "  ",
+                Style::default().fg(widgets::RolePalette::chrome()),
+            ));
+        }
+        spans.push(Span::styled(
+            (*key).to_owned(),
+            Style::default().fg(widgets::RolePalette::muted()),
+        ));
+        spans.push(Span::styled(
+            format!(":{label}"),
+            Style::default().fg(widgets::RolePalette::chrome()),
+        ));
+    }
+
+    spans
+}
+
 fn render_notice(frame: &mut ratatui::Frame<'_>, area: Rect, spans: Vec<Span<'static>>) {
     frame.render_widget(
         Paragraph::new(Line::from(spans)).wrap(Wrap { trim: false }),
@@ -3724,9 +3803,9 @@ fn tree_affordance_line(
     width: usize,
 ) -> Line<'static> {
     let text = if hidden_branches > 0 {
-        format!("+{hidden_branches} more · Tab to focus")
+        format!("+{hidden_branches} more · ↓ to focus")
     } else {
-        let mut hints = vec!["Tab focus", "Enter inspect"];
+        let mut hints = vec!["↑↓ walk", "Enter inspect"];
         if backgroundable {
             hints.push("Ctrl+B background");
         }
@@ -5580,18 +5659,17 @@ where
             .collect()
     }
 
+    /// Enters the tree at its first row, which is the one nearest the composer.
     fn focus_execution_strip(&mut self) {
-        let ids = self.execution_strip_ids();
-        self.execution_selection = match self.execution_selection {
-            None => Some(TranscriptId::Main),
-            Some(current) => ids
-                .iter()
-                .position(|id| *id == current)
-                .map(|index| ids[(index + 1) % ids.len()])
-                .or(Some(TranscriptId::Main)),
-        };
+        self.execution_selection = self.execution_strip_ids().first().copied();
     }
 
+    /// Walks the tree, treating its ends as the edges of a list rather than a
+    /// ring.
+    ///
+    /// Wrapping would make the tree a loop with no way out, and the way out is
+    /// the point: the composer sits directly above the first row, so walking up
+    /// off that row is how a reader gets back to typing.
     fn move_execution_selection(&mut self, direction: isize) {
         let ids = self.execution_strip_ids();
         let current = self.execution_selection.unwrap_or(TranscriptId::Main);
@@ -5599,11 +5677,12 @@ where
             self.execution_selection = Some(TranscriptId::Main);
             return;
         };
-        let next = index
-            .checked_add_signed(direction)
-            .map(|index| index % ids.len())
-            .unwrap_or(ids.len().saturating_sub(1));
-        self.execution_selection = ids.get(next).copied();
+
+        match index.checked_add_signed(direction) {
+            None => self.execution_selection = None,
+            Some(next) if next < ids.len() => self.execution_selection = ids.get(next).copied(),
+            Some(_) => {}
+        }
     }
 
     fn inspect_execution_selection(&mut self) {
@@ -5616,7 +5695,9 @@ where
     /// same rows the renderer paints.
     fn screen_layout(&self) -> ScreenLayout {
         let area = Rect::new(0, 0, self.size.0.max(1), self.size.1.max(1));
-        screen_layout(area, &self.input, !notice_spans(&self.view()).is_empty())
+        // The band is never empty now: without a notice it carries the hints,
+        // so it always claims the row it already reserved.
+        screen_layout(area, &self.input, true)
     }
 
     /// Selects a transcript from a click on the subagent tree.
@@ -6771,6 +6852,21 @@ where
         if !self.palette_open && !self.file_picker_open() && !self.executions.is_empty() {
             match key {
                 Key::Tab => {
+                    if self.execution_selection.is_some() {
+                        self.execution_selection = None;
+                    } else {
+                        self.focus_execution_strip();
+                    }
+                    return Action::Render;
+                }
+                // The tree hangs below the composer, so walking down out of the
+                // prompt walks into it. Only from an empty prompt: with text in
+                // it, Down belongs to the text.
+                Key::Down
+                    if self.execution_selection.is_none()
+                        && self.input.is_empty()
+                        && !self.viewport_focused() =>
+                {
                     self.focus_execution_strip();
                     return Action::Render;
                 }
@@ -6780,6 +6876,13 @@ where
                 }
                 Key::Down if self.execution_selection.is_some() => {
                     self.move_execution_selection(1);
+                    return Action::Render;
+                }
+                // Main is where the reader already is, so accepting it is a way
+                // back to the prompt rather than a transcript switch.
+                Key::Enter if self.execution_selection == Some(TranscriptId::Main) => {
+                    self.select_transcript(TranscriptId::Main);
+                    self.execution_selection = None;
                     return Action::Render;
                 }
                 Key::Enter if self.execution_selection.is_some() => {
@@ -6795,6 +6898,14 @@ where
 
         if key == Key::Escape && self.active_transcript != TranscriptId::Main {
             self.select_transcript(TranscriptId::Main);
+            return Action::Render;
+        }
+
+        // The shortcut list answers "what can I press", so it answers from
+        // wherever the question was asked — including on top of an open dialog.
+        if key == Key::CtrlQuestion {
+            self.palette_open = false;
+            self.show_selection_dialog(shortcuts::shortcuts_dialog());
             return Action::Render;
         }
 
@@ -7428,6 +7539,10 @@ where
             }
             Key::Char('m') => {
                 self.select_transcript(TranscriptId::Main);
+                Some(Action::Render)
+            }
+            Key::Char('?') => {
+                self.show_selection_dialog(shortcuts::shortcuts_dialog());
                 Some(Action::Render)
             }
             Key::Char('i' | 'a') if !self.active_record_mut().terminal => {
@@ -8219,7 +8334,9 @@ where
             .get(&call_id)
             .copied()
             .unwrap_or(record.tool_detail);
-        record.tool_display_modes.insert(call_id, current.next());
+        let next = current.next();
+        record.tool_display_modes.insert(call_id, next);
+        self.report_detail_level("block", next);
     }
 
     fn cycle_tool_detail(&mut self, forward: bool) {
@@ -8235,6 +8352,18 @@ where
         for call_id in completed_call_ids {
             record.tool_display_modes.insert(call_id, next);
         }
+        self.report_detail_level("tools", next);
+    }
+
+    /// Says where the detail cycle now rests, for as long as that is news.
+    ///
+    /// The cycle has three positions and no key that names them, so pressing it
+    /// blind is guesswork. The footer used to carry the answer permanently,
+    /// which spent a slot on an instruction that was only ever interesting in
+    /// the instant after the press — so it is announced instead, and the next
+    /// key clears it.
+    fn report_detail_level(&mut self, subject: &str, mode: widgets::DisplayMode) {
+        self.status = Some(format!("{subject} {}", mode.label()));
     }
 
     /// Absolute wrapped rows every user message of the active transcript starts on.
@@ -9898,6 +10027,12 @@ fn map_key(event: KeyEvent) -> Option<Event> {
         (KeyCode::Char('w' | 'W'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
             Key::DeletePreviousWord
         }
+        // `?` is already Shift+`/`, so a terminal reports Ctrl+? with or without
+        // the shift bit depending on how it resolves the layout. Both are the
+        // same press to the reader.
+        (KeyCode::Char('?'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+            Key::CtrlQuestion
+        }
         (KeyCode::Char('u' | 'U'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
             Key::CtrlU
         }
@@ -11486,6 +11621,133 @@ mod runtime_tests {
 
         tui.handle(Event::Key(Key::Char('j')));
         assert_eq!(tui.input(), "j", "j is a character again in the composer");
+    }
+
+    /// The legend is contextual, so it can stay short enough to actually read.
+    #[test]
+    fn the_hint_row_names_only_the_keys_the_current_state_can_use() {
+        let text = |tui: &Tui<NoopEngine>| {
+            hint_spans(&tui.view())
+                .iter()
+                .map(|span| span.content.as_ref().to_owned())
+                .collect::<String>()
+        };
+
+        let mut tui = scrollable_tui();
+        let empty = text(&tui);
+        assert!(!empty.contains("Enter"), "nothing to send yet: {empty:?}");
+        assert!(empty.contains("Esc:normal"), "{empty:?}");
+        assert!(empty.contains("^?:shortcuts"), "{empty:?}");
+
+        tui.handle(Event::Key(Key::Char('h')));
+        let typing = text(&tui);
+        assert!(typing.contains("Enter:send"), "{typing:?}");
+
+        tui.running = true;
+        let running = text(&tui);
+        assert!(!running.contains("Enter"), "a turn is already in flight");
+
+        tui.running = false;
+        tui.handle(Event::Key(Key::Escape));
+        let normal = text(&tui);
+        assert!(normal.contains("NORMAL"), "{normal:?}");
+        assert!(normal.contains("j/k:scroll"), "{normal:?}");
+        assert!(normal.contains("i:insert"), "{normal:?}");
+    }
+
+    /// The tree hangs below the composer, so the arrows walk between them as
+    /// one vertical surface. Tab used to be the only door in, and it cycled.
+    #[test]
+    fn the_arrows_walk_between_the_prompt_and_the_subagent_tree() {
+        let mut tui = scrollable_tui();
+        tui.apply_task_execution_event(
+            "bug-hunter",
+            TuiExecutionEvent::ForegroundStarted { id: 1 },
+        );
+        assert!(!tui.executions.is_empty(), "a subagent is running");
+
+        tui.handle(Event::Key(Key::Down));
+        assert_eq!(
+            tui.view().execution_selection,
+            Some(TranscriptId::Main),
+            "an empty prompt walks down into the tree"
+        );
+
+        tui.handle(Event::Key(Key::Down));
+        assert_eq!(
+            tui.view().execution_selection,
+            Some(TranscriptId::Subagent(1))
+        );
+
+        tui.handle(Event::Key(Key::Up));
+        assert_eq!(tui.view().execution_selection, Some(TranscriptId::Main));
+
+        tui.handle(Event::Key(Key::Up));
+        assert_eq!(
+            tui.view().execution_selection,
+            None,
+            "walking up off the first row returns to the prompt"
+        );
+    }
+
+    /// Down belongs to the text as soon as there is any.
+    #[test]
+    fn a_prompt_with_text_keeps_the_down_arrow() {
+        let mut tui = scrollable_tui();
+        tui.apply_task_execution_event(
+            "bug-hunter",
+            TuiExecutionEvent::ForegroundStarted { id: 1 },
+        );
+        tui.handle(Event::Key(Key::Char('x')));
+
+        tui.handle(Event::Key(Key::Down));
+        assert_eq!(tui.view().execution_selection, None);
+    }
+
+    /// Main is where the reader already is, so accepting it is a way back.
+    #[test]
+    fn enter_on_main_returns_to_the_prompt() {
+        let mut tui = scrollable_tui();
+        tui.apply_task_execution_event(
+            "bug-hunter",
+            TuiExecutionEvent::ForegroundStarted { id: 1 },
+        );
+        tui.handle(Event::Key(Key::Down));
+
+        tui.handle(Event::Key(Key::Enter));
+        assert_eq!(tui.view().execution_selection, None);
+        assert_eq!(tui.active_transcript, TranscriptId::Main);
+    }
+
+    /// The list has to be reachable from wherever the question is asked.
+    #[test]
+    fn ctrl_question_opens_the_shortcut_list_from_either_mode() {
+        let mut tui = scrollable_tui();
+        tui.handle(Event::Key(Key::CtrlQuestion));
+        assert_eq!(
+            tui.view().dialog.map(|dialog| dialog.title.clone()),
+            Some("Keyboard shortcuts".to_owned())
+        );
+
+        tui.handle(Event::Key(Key::Escape));
+        tui.handle(Event::Key(Key::Escape));
+        assert_eq!(tui.view().focus, TranscriptFocus::Viewport);
+        tui.handle(Event::Key(Key::Char('?')));
+        assert!(tui.view().dialog.is_some(), "? opens it in Normal mode");
+    }
+
+    /// A warning outranks a legend: the band is one row and cannot show both.
+    #[test]
+    fn a_notice_takes_the_band_from_the_hints() {
+        let mut tui = scrollable_tui();
+        assert!(notice_spans(&tui.view()).is_empty());
+
+        tui.handle(Event::Key(Key::CtrlC));
+        let notice = notice_spans(&tui.view())
+            .iter()
+            .map(|span| span.content.as_ref().to_owned())
+            .collect::<String>();
+        assert!(notice.contains("Ctrl+C again"), "{notice:?}");
     }
 
     /// Scrolling is not a mode switch. Ctrl+J/Ctrl+K and the wheel are reachable

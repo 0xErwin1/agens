@@ -12,7 +12,6 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthStr;
 
-use super::expand::DisplayMode;
 use super::overlay::truncate_columns;
 use super::{Glyph, RolePalette, UnicodeLevel};
 
@@ -27,10 +26,8 @@ pub(crate) struct FooterContext<'a> {
     pub home: Option<&'a str>,
     /// Branch and working-tree size, absent until the first refresh lands.
     pub repository: Option<&'a RepositoryStatus>,
-    /// Level the tool output detail cycle currently rests on.
-    pub tool_detail: DisplayMode,
-    /// Level of the block keyboard focus stands on, when navigation is active.
-    pub focused_detail: Option<DisplayMode>,
+    /// Whether no turn is in flight, so the status slot can stay empty.
+    pub idle: bool,
     /// Glyph set this terminal can draw the footer's chrome with.
     pub unicode: UnicodeLevel,
     pub turn_label: Cow<'a, str>,
@@ -88,15 +85,11 @@ impl FooterSegment {
     }
 }
 
-const RANK_DETAIL: u8 = 0;
-const RANK_CHANGES: u8 = 1;
-const RANK_BRANCH: u8 = 2;
-const RANK_EFFORT: u8 = 3;
-const RANK_DIRECTORY: u8 = 4;
-const RANK_CONTEXT: u8 = 5;
-const RANK_APPROVAL: u8 = 6;
-const RANK_STATUS: u8 = 7;
-const RANK_MODEL: u8 = 8;
+const RANK_LOCATION: u8 = 0;
+const RANK_CONTEXT: u8 = 1;
+const RANK_APPROVAL: u8 = 2;
+const RANK_STATUS: u8 = 3;
+const RANK_MODEL: u8 = 4;
 
 /// Share of the window above which the context segment stops being neutral.
 const CONTEXT_PRESSURE: f64 = 0.75;
@@ -111,15 +104,9 @@ fn chrome_style() -> Style {
 /// The order is fixed: a segment that survives a narrowing never moves, so the
 /// eye keeps finding the same datum in the same place.
 fn footer_segments(ctx: &FooterContext<'_>) -> Vec<FooterSegment> {
-    let mut segments = vec![model_segment(ctx), effort_segment(ctx)];
-    segments.push(context_segment(ctx));
-    segments.push(detail_segment(ctx));
-    segments.push(directory_segment(ctx));
-    if let Some(branch) = branch_segment(ctx) {
-        segments.push(branch);
-    }
-    if let Some(changes) = changes_segment(ctx) {
-        segments.push(changes);
+    let mut segments = vec![model_segment(ctx), context_segment(ctx)];
+    if let Some(location) = location_segment(ctx) {
+        segments.push(location);
     }
     segments.push(approval_segment(ctx));
     if let Some(status) = status_segment(ctx) {
@@ -128,6 +115,11 @@ fn footer_segments(ctx: &FooterContext<'_>) -> Vec<FooterSegment> {
     segments
 }
 
+/// Which model is answering, and how hard it is being asked to think.
+///
+/// One segment rather than two: the effort qualifies the model and is
+/// meaningless without it, so a separator between them spent a column to
+/// suggest they were independent data.
 fn model_segment(ctx: &FooterContext<'_>) -> FooterSegment {
     let model = short_model(ctx.model);
     let model = if model.is_empty() {
@@ -135,28 +127,27 @@ fn model_segment(ctx: &FooterContext<'_>) -> FooterSegment {
     } else {
         model
     };
-    FooterSegment::plain(
-        RANK_MODEL,
+
+    let mut spans = vec![Span::styled(
         model,
         Style::default()
             .fg(RolePalette::machine())
             .add_modifier(Modifier::BOLD),
-    )
+    )];
+    if let Some(effort) = ctx.effort.filter(|value| !value.is_empty()) {
+        spans.push(Span::styled(format!(" ({effort})"), chrome_style()));
+    }
+
+    FooterSegment::new(RANK_MODEL, spans)
 }
 
-fn effort_segment(ctx: &FooterContext<'_>) -> FooterSegment {
-    let effort = ctx
-        .effort
-        .filter(|value| !value.is_empty())
-        .unwrap_or("effort —");
-    FooterSegment::plain(RANK_EFFORT, effort.to_owned(), chrome_style())
-}
-
-/// Context as the exact count and the share it represents.
+/// Context as the share of the window in use, and the counts once that matters.
 ///
-/// Both are needed and neither replaces the other: the count says how much room
-/// is left in tokens, the percentage answers "am I running out" without
-/// arithmetic. The used side is padded so the footer never reflows as it grows.
+/// The percentage answers "am I running out", which is the only context
+/// question a reader has while things are going well. The exact counts answer
+/// "how much room is left", which is a question worth a permanent slot only
+/// once the answer is close to none — so they join the segment under pressure
+/// and stay out of the way before it.
 fn context_segment(ctx: &FooterContext<'_>) -> FooterSegment {
     let used = ctx
         .usage
@@ -182,104 +173,109 @@ fn context_segment(ctx: &FooterContext<'_>) -> FooterSegment {
         chrome_style()
     };
 
-    FooterSegment::plain(
-        RANK_CONTEXT,
+    let percentage = format!("{:>3}%", (share * 100.0).round() as u64);
+    let text = if share >= CONTEXT_PRESSURE {
+        // Padded, so the counts do not reflow their neighbours as they grow.
         format!(
-            "{:>4}/{} {:>3}%",
+            "{percentage} ({:>4}/{})",
             compact_count(used),
-            compact_count(window),
-            (share * 100.0).round() as u64
-        ),
-        style,
-    )
-}
-
-/// How much of every tool body is on screen, and the key that changes it.
-///
-/// Ctrl+O is a cycle rather than a toggle, so pressing it without being told
-/// where the cycle now rests is guesswork. Naming the level next to its key
-/// makes the three positions learnable from the footer alone; it sheds first
-/// because it is the only footer datum the reader can rediscover by pressing
-/// a key.
-fn detail_segment(ctx: &FooterContext<'_>) -> FooterSegment {
-    // While a block is focused the reader is acting on that block, so the slot
-    // answers the question they actually have. One slot rather than two: a
-    // footer that grows a segment per mode stops being scannable.
-    let text = match ctx.focused_detail {
-        Some(mode) => format!("block {} o · j/k walk", mode.label()),
-        None => format!("tools {} ^O", ctx.tool_detail.label()),
-    };
-    FooterSegment::plain(RANK_DETAIL, text, chrome_style())
-}
-
-fn directory_segment(ctx: &FooterContext<'_>) -> FooterSegment {
-    let directory = abbreviate_path(ctx.project, ctx.home);
-    let directory = if directory.is_empty() {
-        "dir —".to_owned()
+            compact_count(window)
+        )
     } else {
-        directory
+        percentage
     };
-    FooterSegment::plain(RANK_DIRECTORY, directory, chrome_style())
+
+    FooterSegment::plain(RANK_CONTEXT, text, style)
 }
 
-fn branch_segment(ctx: &FooterContext<'_>) -> Option<FooterSegment> {
-    let branch = ctx.repository?.branch.as_deref()?;
-    Some(FooterSegment::plain(
-        RANK_BRANCH,
-        format!("{} {branch}", Glyph::Branch.text(ctx.unicode)),
-        chrome_style(),
-    ))
-}
-
-/// How much the working tree has moved, not merely that it has.
-fn changes_segment(ctx: &FooterContext<'_>) -> Option<FooterSegment> {
-    let repository = ctx.repository?;
-    if !repository.is_dirty() {
+/// Where the agent is working: the directory, the branch, and how far the tree
+/// has moved.
+///
+/// One segment rather than three, because they answer a single question and a
+/// reader checks them together. The insertion and deletion counts join only
+/// when they are not zero: a clean-but-tracked file count already says the tree
+/// moved, and `+0 -0` spent six columns to say nothing.
+fn location_segment(ctx: &FooterContext<'_>) -> Option<FooterSegment> {
+    let directory = abbreviate_path(ctx.project, ctx.home);
+    if directory.is_empty() && ctx.repository.is_none() {
         return None;
     }
 
-    Some(FooterSegment::new(
-        RANK_CHANGES,
-        vec![
-            Span::styled(format!("{}±", repository.changed_files), chrome_style()),
-            Span::styled(
-                format!(" +{}", repository.insertions),
-                Style::default().fg(RolePalette::success()),
-            ),
-            Span::styled(
-                format!(" -{}", repository.deletions),
-                Style::default().fg(RolePalette::error()),
-            ),
-        ],
-    ))
+    let mut spans = Vec::new();
+    if !directory.is_empty() {
+        spans.push(Span::styled(directory, chrome_style()));
+    }
+
+    if let Some(repository) = ctx.repository {
+        if let Some(branch) = repository.branch.as_deref() {
+            let separator = if spans.is_empty() { "" } else { " " };
+            spans.push(Span::styled(
+                format!("{separator}{} {branch}", Glyph::Branch.text(ctx.unicode)),
+                chrome_style(),
+            ));
+        }
+        if repository.is_dirty() {
+            spans.push(Span::styled(
+                format!(" {}±", repository.changed_files),
+                chrome_style(),
+            ));
+            if repository.insertions > 0 {
+                spans.push(Span::styled(
+                    format!(" +{}", repository.insertions),
+                    Style::default().fg(RolePalette::success()),
+                ));
+            }
+            if repository.deletions > 0 {
+                spans.push(Span::styled(
+                    format!(" -{}", repository.deletions),
+                    Style::default().fg(RolePalette::error()),
+                ));
+            }
+        }
+    }
+
+    (!spans.is_empty()).then(|| FooterSegment::new(RANK_LOCATION, spans))
 }
 
-/// What the agent may do without asking, and the key that changes it.
+/// What the agent may do without asking.
 ///
 /// This segment is security-relevant, so it never borrows another datum's
-/// colour: a bypassed session must look different from a rate-limited one.
+/// colour: a bypassed session must look different from a rate-limited one. The
+/// key that changes it lives in the shortcuts overlay — a permanent instruction
+/// here competed for attention with the state it was instructing about.
 fn approval_segment(ctx: &FooterContext<'_>) -> FooterSegment {
     let (label, style) = if ctx.bypass {
         (
-            "bypass ^⇧P",
+            "bypass",
             Style::default()
                 .fg(RolePalette::error())
                 .add_modifier(Modifier::BOLD),
         )
     } else if ctx.dangerous {
         (
-            "danger ^⇧D",
+            "danger",
             Style::default()
                 .fg(RolePalette::warning())
                 .add_modifier(Modifier::BOLD),
         )
     } else {
-        ("ask ^⇧P", chrome_style())
+        ("ask", chrome_style())
     };
     FooterSegment::plain(RANK_APPROVAL, label, style)
 }
 
+/// What the current turn is doing, when it is doing anything.
+///
+/// The transcript carries its own live activity row, so the footer repeating it
+/// is only worth a slot for the states that outlive the turn. Idle is not one
+/// of them: a permanent "Ready" is the absence of news taking up room. Failure
+/// is, because once the error card scrolls away the footer is the only trace
+/// left that the last turn did not work.
 fn status_segment(ctx: &FooterContext<'_>) -> Option<FooterSegment> {
+    if ctx.idle && !ctx.failed {
+        return None;
+    }
+
     let mut status = ctx.turn_label.to_string();
     if let Some(duration) = ctx.duration {
         status.push_str(&if duration.as_secs() > 0 {
@@ -548,7 +544,6 @@ mod tests {
 
         assert!(line.contains("gpt-5.6-sol"), "model: {line:?}");
         assert!(line.contains("high"), "effort: {line:?}");
-        assert!(line.contains("15k/200k"), "context count: {line:?}");
         assert!(line.contains("8%"), "context share: {line:?}");
         assert!(line.contains("~/d/p/agens"), "directory: {line:?}");
         assert!(line.contains("feat/agn-114"), "branch: {line:?}");
@@ -556,8 +551,7 @@ mod tests {
             line.contains("+120") && line.contains("-8"),
             "changes: {line:?}"
         );
-        assert!(line.contains("ask ^⇧P"), "approval and its key: {line:?}");
-        assert!(line.contains("Ready"), "status: {line:?}");
+        assert!(line.contains("ask"), "approval: {line:?}");
         assert!(!line.contains("Enter send"), "{line:?}");
     }
 
@@ -574,68 +568,84 @@ mod tests {
 
         assert_eq!(
             at(200),
-            " gpt-5.6-sol · high ·  15k/200k   8% · tools hidden ^O · ~/d/p/agens · ⎇ feat/agn-114 · 3± +120 -8 · ask ^⇧P · Ready"
+            " gpt-5.6-sol (high) ·   8% · ~/d/p/agens ⎇ feat/agn-114 3± +120 -8 · ask"
         );
-        assert_eq!(at(120), at(200), "a wide terminal sheds nothing");
-        // the detail level, which a key press rediscovers, then changes
-        assert_eq!(
-            at(100),
-            " gpt-5.6-sol · high ·  15k/200k   8% · ~/d/p/agens · ⎇ feat/agn-114 · 3± +120 -8 · ask ^⇧P · Ready"
-        );
-        // then branch
-        assert_eq!(
-            at(80),
-            " gpt-5.6-sol · high ·  15k/200k   8% · ~/d/p/agens · ask ^⇧P · Ready"
-        );
-        // then effort, then the directory
-        assert_eq!(
-            at(64),
-            " gpt-5.6-sol ·  15k/200k   8% · ~/d/p/agens · ask ^⇧P · Ready"
-        );
-        assert_eq!(at(50), " gpt-5.6-sol ·  15k/200k   8% · ask ^⇧P · Ready");
+        assert_eq!(at(80), at(200), "a wide terminal sheds nothing");
+        // where it is working goes first: the reader chose the directory and
+        // the branch, so they are the data they already know
+        assert_eq!(at(40), " gpt-5.6-sol (high) ·   8% · ask");
         // then the context reading
-        assert_eq!(at(30), " gpt-5.6-sol · ask ^⇧P · Ready");
-        // then the approval mode, and last of all the turn status
-        assert_eq!(at(24), " gpt-5.6-sol · Ready");
-        assert_eq!(at(12), " gpt-5.6-sol");
+        assert_eq!(at(30), " gpt-5.6-sol (high) · ask");
+        // and last of all the approval mode
+        assert_eq!(at(24), " gpt-5.6-sol (high)");
         // A lone segment wider than the budget is the only thing ever clipped.
-        assert_eq!(at(11), " gpt-5.6-s…");
+        assert_eq!(at(12), " gpt-5.6-so…");
     }
 
-    /// Ctrl+O cycles rather than toggles, so the footer has to answer where the
-    /// cycle rests. A level the reader cannot name is a level they cannot aim
-    /// for, and the key belongs next to it for the same reason the approval
-    /// mode carries its own.
+    /// The footer reports state. Every key it used to name drifted out of date
+    /// the moment the keymap moved, and the shortcuts overlay is the one place
+    /// that cannot.
     #[test]
-    fn the_footer_names_the_tool_detail_level_and_the_key_that_moves_it() {
-        let at = |mode: DisplayMode| {
+    fn the_footer_carries_no_keybindings() {
+        let mut ctx = sample();
+        ctx.bypass = true;
+        let line = MetricFooter::text(200, ctx);
+
+        assert!(line.contains("bypass"), "{line:?}");
+        for key in ["^O", "^⇧P", "^⇧D", "j/k", " o ·"] {
+            assert!(!line.contains(key), "{key} still in the footer: {line:?}");
+        }
+    }
+
+    /// Idle is the absence of news, and the transcript already carries the live
+    /// activity while there is any.
+    #[test]
+    fn the_status_slot_is_empty_when_idle_and_kept_when_the_turn_failed() {
+        let idle = MetricFooter::text(200, sample());
+        assert!(!idle.contains("Ready"), "{idle:?}");
+
+        let mut running = sample();
+        running.idle = false;
+        running.turn_label = Cow::Borrowed("Reasoning");
+        assert!(MetricFooter::text(200, running).contains("Reasoning"));
+
+        let mut failed = sample();
+        failed.failed = true;
+        failed.turn_label = Cow::Borrowed("Failed");
+        assert!(MetricFooter::text(200, failed).contains("Failed"));
+    }
+
+    /// The exact counts are worth a permanent slot only once they are running
+    /// out; before that the share answers the whole question.
+    #[test]
+    fn context_counts_join_the_share_only_under_pressure() {
+        let at = |used: u64| {
+            let usage = Usage {
+                input_tokens: None,
+                output_tokens: None,
+                total_tokens: Some(used),
+                context_window: Some(200_000),
+            };
             let mut ctx = sample();
-            ctx.tool_detail = mode;
+            ctx.usage = Some(Box::leak(Box::new(usage)));
             MetricFooter::text(200, ctx)
         };
 
-        assert!(at(DisplayMode::Collapsed).contains("tools hidden ^O"));
-        assert!(at(DisplayMode::Truncated).contains("tools preview ^O"));
-        assert!(at(DisplayMode::Expanded).contains("tools full ^O"));
-    }
+        let relaxed = at(15_000);
+        assert!(relaxed.contains("8%"), "{relaxed:?}");
+        assert!(!relaxed.contains("200k"), "{relaxed:?}");
 
-    /// The slot is contextual, not additive: a reader standing on a block is
-    /// asking what that block will do, not what the transcript would do.
-    #[test]
-    fn the_detail_slot_speaks_about_the_focused_block_while_one_is_focused() {
-        let mut ctx = sample();
-        ctx.focused_detail = Some(DisplayMode::Truncated);
-        let line = MetricFooter::text(200, ctx);
-
-        assert!(line.contains("block preview o · j/k walk"), "{line:?}");
-        assert!(!line.contains("tools hidden"), "{line:?}");
+        let pressed = at(180_000);
+        assert!(pressed.contains("90%"), "{pressed:?}");
+        assert!(pressed.contains("180k/200k"), "{pressed:?}");
     }
 
     /// A value changing must not move its neighbours, or the eye loses the
-    /// place it learned to look at.
+    /// place it learned to look at. Crossing into pressure widens the segment
+    /// once, on purpose; growing inside either regime must not move anything.
     #[test]
     fn a_growing_context_count_does_not_move_the_segments_around_it() {
-        let widths = [15_000_u64, 150_000, 199_999].map(|used| {
+        let width_at = |used: u64| {
             let usage = Usage {
                 input_tokens: None,
                 output_tokens: None,
@@ -645,10 +655,11 @@ mod tests {
             let mut ctx = sample();
             ctx.usage = Some(&usage);
             MetricFooter::text(200, ctx).width()
-        });
+        };
 
-        assert_eq!(widths[0], widths[1]);
-        assert_eq!(widths[1], widths[2]);
+        assert_eq!(width_at(1_000), width_at(15_000));
+        assert_eq!(width_at(15_000), width_at(140_000));
+        assert_eq!(width_at(150_000), width_at(199_999));
     }
 
     #[test]
@@ -664,8 +675,8 @@ mod tests {
             ctx.usage = Some(&usage);
             MetricFooter::spans(200, ctx)
                 .into_iter()
-                .find(|span| span.content.contains("200k"))
-                .expect("the context segment names the window")
+                .find(|span| span.content.contains('%'))
+                .expect("the context segment names the share")
                 .style
                 .fg
         };
@@ -709,8 +720,7 @@ mod tests {
             effort: Some("high"),
             context_window: Some(200_000),
             project: "/home/iperez/dev/personal/agens",
-            tool_detail: DisplayMode::Collapsed,
-            focused_detail: None,
+            idle: true,
             unicode: UnicodeLevel::Extended,
             turn_label: Cow::Borrowed("Ready"),
             duration: None,
@@ -738,20 +748,20 @@ mod tests {
             mutate(&mut ctx);
             MetricFooter::spans(200, ctx)
                 .into_iter()
-                .find(|span| span.content.contains('⇧'))
-                .expect("the approval segment names its key")
+                .find(|span| matches!(span.content.as_ref(), "ask" | "danger" | "bypass"))
+                .expect("the approval segment names the mode")
         };
 
         let asking = approval(|_| {});
-        assert_eq!(asking.content, "ask ^⇧P");
+        assert_eq!(asking.content, "ask");
         assert_eq!(asking.style.fg, Some(RolePalette::chrome()));
 
         let dangerous = approval(|ctx| ctx.dangerous = true);
-        assert_eq!(dangerous.content, "danger ^⇧D");
+        assert_eq!(dangerous.content, "danger");
         assert_eq!(dangerous.style.fg, Some(RolePalette::warning()));
 
         let bypassed = approval(|ctx| ctx.bypass = true);
-        assert_eq!(bypassed.content, "bypass ^⇧P");
+        assert_eq!(bypassed.content, "bypass");
         assert_eq!(bypassed.style.fg, Some(RolePalette::error()));
 
         let failed_but_asking = approval(|ctx| {
@@ -789,7 +799,7 @@ mod tests {
     fn border_metadata_yields_nothing_below_the_shortest_hostable_form() {
         assert_eq!(
             border_string(MIN_BORDER_METRICS_WIDTH, sample()),
-            Some(" gpt-5.6-sol · Ready".to_owned())
+            Some(" gpt-5.6-sol (high)".to_owned())
         );
         assert_eq!(border_string(MIN_BORDER_METRICS_WIDTH - 1, sample()), None);
         assert_eq!(border_string(0, sample()), None);
