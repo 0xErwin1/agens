@@ -12,6 +12,7 @@ use std::{
 use globset::{GlobBuilder, GlobMatcher};
 
 mod permission_precedence;
+mod permission_target;
 pub mod redaction;
 mod request_config;
 
@@ -2214,13 +2215,14 @@ pub enum PermissionTargetKind {
     FreeFormText,
 }
 
-/// Classifies a native tool's permission target by name, matching either the
-/// bare form (`bash`) or the fully-qualified native identity (`native::bash`).
-/// A tool this function does not recognize as free-form text defaults to
-/// [`PermissionTargetKind::Path`], keeping segment-discipline matching for
-/// every target whose shape is not known to be free-form.
+/// Classifies a native tool's permission target by name, matching the bare
+/// form (`bash`), the fully-qualified native identity (`native::bash`) and the
+/// dispatcher's own encoding of it. A tool this function does not recognize as
+/// free-form text defaults to [`PermissionTargetKind::Path`], keeping
+/// segment-discipline matching for every target whose shape is not known to be
+/// free-form.
 pub fn permission_target_kind_for_tool(tool: &str) -> PermissionTargetKind {
-    match tool.strip_prefix("native::").unwrap_or(tool) {
+    match bare_tool_name(tool) {
         "bash" | "git_read" => PermissionTargetKind::FreeFormText,
         _ => PermissionTargetKind::Path,
     }
@@ -2353,6 +2355,10 @@ pub struct PermissionRequest {
     pub target: String,
     pub access: ToolAccess,
     outside_worktree: bool,
+    /// The invocations a shell target would run, each given as the equivalent
+    /// spellings a rule could be written against. Empty for every tool whose
+    /// target is not a command line.
+    invocations: Vec<Vec<String>>,
 }
 
 impl PermissionRequest {
@@ -2362,13 +2368,12 @@ impl PermissionRequest {
         target: impl Into<String>,
         access: ToolAccess,
     ) -> Self {
-        Self {
-            project: project.into(),
-            tool: tool.into(),
-            target: PermissionTarget::native(target).project(),
+        Self::build(
+            project.into(),
+            tool.into(),
+            PermissionTarget::native(target).project(),
             access,
-            outside_worktree: false,
-        }
+        )
     }
 
     pub fn with_target(
@@ -2377,12 +2382,31 @@ impl PermissionRequest {
         target: PermissionTarget,
         access: ToolAccess,
     ) -> Self {
+        Self::build(project.into(), tool.into(), target.project(), access)
+    }
+
+    /// Reads the raw target as what it names before any rule sees it: a path
+    /// loses the components that select nothing, and a command line is
+    /// decomposed into the invocations it would run. See
+    /// [`crate::permission_target`] for what that does and does not cover.
+    fn build(project: String, tool: String, target: String, access: ToolAccess) -> Self {
+        let target = match permission_target_kind_for_tool(&tool) {
+            PermissionTargetKind::Path => permission_target::normalized_path_target(&target),
+            PermissionTargetKind::FreeFormText => target,
+        };
+        let invocations = if bare_tool_name(&tool) == "bash" {
+            permission_target::command_invocations(&target)
+        } else {
+            Vec::new()
+        };
+
         Self {
-            project: project.into(),
-            tool: tool.into(),
-            target: target.project(),
+            project,
+            tool,
+            target,
             access,
             outside_worktree: false,
+            invocations,
         }
     }
 
@@ -2390,6 +2414,44 @@ impl PermissionRequest {
         self.outside_worktree = true;
         self
     }
+
+    /// Reports whether `pattern` selects this request's target.
+    ///
+    /// A shell target is several calls at once, so the two directions of that
+    /// question are not the same. A restrictive rule selects the command when
+    /// ANY of its invocations is selected — a deny on `rm` has to hold in
+    /// `cd /tmp && rm -rf x`. A permissive rule selects it only when EVERY
+    /// invocation is selected, because authorizing `git*` is not authorization
+    /// for whatever was chained onto it.
+    fn target_selected_by(
+        &self,
+        pattern: &PermissionPattern,
+        decision: PermissionDecision,
+    ) -> bool {
+        let selects = |forms: &Vec<String>| forms.iter().any(|form| pattern.matches(form));
+
+        match decision {
+            _ if self.invocations.is_empty() => pattern.matches(&self.target),
+            PermissionDecision::Allow => self.invocations.iter().all(selects),
+            PermissionDecision::Ask | PermissionDecision::Deny => {
+                pattern.matches(&self.target) || self.invocations.iter().any(selects)
+            }
+        }
+    }
+}
+
+/// Reduces any spelling of a tool — bare, qualified, or a dispatcher identity
+/// (`native:13:native::bash`) — to the name a rule is written against.
+fn bare_tool_name(tool: &str) -> &str {
+    let qualified = tool
+        .strip_prefix("native:")
+        .and_then(|rest| rest.split_once(':'))
+        .filter(|(length, _)| {
+            !length.is_empty() && length.bytes().all(|byte| byte.is_ascii_digit())
+        })
+        .map_or(tool, |(_, name)| name);
+
+    qualified.strip_prefix("native::").unwrap_or(qualified)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2486,7 +2548,9 @@ impl PermissionRule {
             PermissionScope::Project => self.project.as_deref() == Some(request.project.as_str()),
         };
 
-        project_matches && self.tool.matches(&request.tool) && self.target.matches(&request.target)
+        project_matches
+            && self.tool.matches(&request.tool)
+            && request.target_selected_by(&self.target, self.decision)
     }
 }
 
@@ -2625,7 +2689,7 @@ impl ProjectPermissionGrant {
     fn matches(&self, request: &PermissionRequest) -> bool {
         self.project == request.project
             && self.tool.matches(&request.tool)
-            && self.target.matches(&request.target)
+            && request.target_selected_by(&self.target, self.decision)
     }
 }
 

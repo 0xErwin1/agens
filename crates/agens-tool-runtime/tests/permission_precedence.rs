@@ -293,6 +293,72 @@ const CASES: &[Case] = &[
         target: "src/main.rs",
         expected: PermissionDecision::Allow,
     },
+    // A `bash` rule names a command, and a shell expression runs several. A
+    // deny holds when any of them matches, however the command was dressed up.
+    Case {
+        declarations: &["deny bash rm*", "allow bash"],
+        tool: "bash",
+        target: "cd /tmp && rm -rf victim.txt",
+        expected: PermissionDecision::Deny,
+    },
+    Case {
+        declarations: &["deny bash rm*", "allow bash"],
+        tool: "bash",
+        target: "/bin/rm -rf victim.txt",
+        expected: PermissionDecision::Deny,
+    },
+    Case {
+        declarations: &["deny bash rm*", "allow bash"],
+        tool: "bash",
+        target: "sudo rm -rf victim.txt",
+        expected: PermissionDecision::Deny,
+    },
+    Case {
+        declarations: &["deny bash rm*", "allow bash"],
+        tool: "bash",
+        target: "ls | xargs rm",
+        expected: PermissionDecision::Deny,
+    },
+    Case {
+        declarations: &["deny bash rm*", "allow bash"],
+        tool: "bash",
+        target: "bash -c \"rm -rf victim.txt\"",
+        expected: PermissionDecision::Deny,
+    },
+    Case {
+        declarations: &["deny bash rm*", "allow bash"],
+        tool: "bash",
+        target: "echo $(rm -rf victim.txt)",
+        expected: PermissionDecision::Deny,
+    },
+    // An allow names what it names: it authorizes a compound command only when
+    // every part of it is authorized.
+    Case {
+        declarations: &["allow bash git*"],
+        tool: "bash",
+        target: "git status && rm -rf victim.txt",
+        expected: PermissionDecision::Ask,
+    },
+    Case {
+        declarations: &["allow bash git*"],
+        tool: "bash",
+        target: "git add . && git commit",
+        expected: PermissionDecision::Allow,
+    },
+    // A path-shaped target is matched by what it names, not by the spelling the
+    // caller happened to produce.
+    Case {
+        declarations: &["deny write .env*", "allow write"],
+        tool: "write",
+        target: "./.env",
+        expected: PermissionDecision::Deny,
+    },
+    Case {
+        declarations: &["deny write src/secret/**", "allow write src/**"],
+        tool: "write",
+        target: "./src/./secret/key.txt",
+        expected: PermissionDecision::Deny,
+    },
     // A declaration matching no tool decides nothing and rejects nothing.
     Case {
         declarations: &["deny zz*"],

@@ -1330,6 +1330,184 @@ mod tests {
         }
     }
 
+    /// `allow bash *` names exactly the calls `allow bash` names, so it must
+    /// not reopen a tool an untargeted deny closed. Spelling the wildcard out
+    /// is the house style the shipped configuration teaches, which is what
+    /// made this the shape that reopened `rm`.
+    #[test]
+    fn an_explicit_wildcard_allow_cannot_reopen_an_untargeted_deny_in_either_order() {
+        for (label, declarations) in [
+            ("deny-first", ["deny bash", "allow bash *"]),
+            ("allow-first", ["allow bash *", "deny bash"]),
+        ] {
+            let temporary = agens_fixtures::session_directory(&format!("wildcard-reopen-{label}"));
+            let project_root = temporary.join("project");
+            let victim = project_root.join("probe-victim.txt");
+            std::fs::create_dir_all(&project_root).unwrap();
+            std::fs::write(&victim, "victim").unwrap();
+
+            let rules = declared(&temporary, &declarations);
+            let denied_output = single_call_turn(
+                &project_root,
+                &rules,
+                &[],
+                false,
+                "native::bash",
+                r#"{"command":"rm -rf probe-victim.txt"}"#,
+            );
+
+            assert!(
+                denied_output.contains("permission denied"),
+                "{label}: an explicit wildcard allow must not reopen an untargeted deny, \
+                 got: {denied_output}"
+            );
+            assert!(
+                victim.exists(),
+                "{label}: the denied command must never have run, yet the victim file is gone"
+            );
+
+            std::fs::remove_dir_all(temporary).unwrap();
+        }
+    }
+
+    /// A `bash` rule names a command, and a shell expression runs several. The
+    /// deny has to hold however the command was dressed up — this is the
+    /// ordinary-evasion set, not a boundary against an adversary.
+    #[test]
+    fn a_command_deny_holds_through_the_ordinary_shell_evasions() {
+        let temporary = agens_fixtures::session_directory("shell-evasions");
+        let project_root = temporary.join("project");
+        let victim = project_root.join("probe-victim.txt");
+        std::fs::create_dir_all(&project_root).unwrap();
+
+        let rules = declared(&temporary, &["deny bash rm*", "allow bash"]);
+
+        for command in [
+            "rm -rf probe-victim.txt",
+            "cd . && rm -rf probe-victim.txt",
+            "/bin/rm -rf probe-victim.txt",
+            "sudo rm -rf probe-victim.txt",
+            "echo x | xargs rm probe-victim.txt",
+            "bash -c \\\"rm -rf probe-victim.txt\\\"",
+            "echo $(rm -rf probe-victim.txt)",
+        ] {
+            std::fs::write(&victim, "victim").unwrap();
+
+            let denied_output = single_call_turn(
+                &project_root,
+                &rules,
+                &[],
+                false,
+                "native::bash",
+                &format!(r#"{{"command":"{command}"}}"#),
+            );
+
+            assert!(
+                denied_output.contains("permission denied"),
+                "{command} must be denied, got: {denied_output}"
+            );
+            assert!(
+                victim.exists(),
+                "{command} must never have run, yet the victim file is gone"
+            );
+        }
+
+        let allowed_output = single_call_turn(
+            &project_root,
+            &rules,
+            &[],
+            false,
+            "native::bash",
+            r#"{"command":"echo hi && echo there"}"#,
+        );
+        assert!(
+            !allowed_output.contains("permission denied"),
+            "a compound command the deny does not name must still run, got: {allowed_output}"
+        );
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    /// A path deny names a file, not a spelling of it.
+    #[test]
+    fn a_path_deny_holds_against_an_equivalent_spelling_of_the_same_path() {
+        let temporary = agens_fixtures::session_directory("path-spelling-deny");
+        let project_root = temporary.join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+
+        let rules = declared(&temporary, &["deny write .env*", "allow write"]);
+        let denied_output = single_call_turn(
+            &project_root,
+            &rules,
+            &[],
+            false,
+            "native::write",
+            r#"{"path":"./.env","content":"SECRET=1"}"#,
+        );
+
+        assert!(
+            denied_output.contains("permission denied"),
+            "a leading ./ must not defeat a path deny, got: {denied_output}"
+        );
+        assert!(!project_root.join(".env").exists());
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    /// A configured `ask` is an approval the operator asked for even under
+    /// bypass. A child cannot reach the prompt, so it has to refuse — what it
+    /// must never do is run the command unattended because a definition said
+    /// `allow bash`.
+    #[test]
+    fn a_configured_ask_refuses_rather_than_running_unattended_in_a_child() {
+        let temporary = agens_fixtures::session_directory("configured-ask-child");
+        let project_root = temporary.join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+
+        let configured = [PermissionRule::global(
+            PermissionDecision::Ask,
+            PermissionPattern::Exact("native::bash".into()),
+            PermissionPattern::glob_for_target_kind(
+                "git push*",
+                agens_core::PermissionTargetKind::FreeFormText,
+            )
+            .unwrap(),
+        )];
+        let rules = declared(&temporary, &["allow bash"]);
+
+        for dangerous_mode in [false, true] {
+            let denied_output = single_call_turn(
+                &project_root,
+                &rules,
+                &configured,
+                dangerous_mode,
+                "native::bash",
+                r#"{"command":"git push origin main"}"#,
+            );
+
+            assert!(
+                denied_output.contains("permission denied"),
+                "dangerous_mode={dangerous_mode}: a configured ask must not run unattended, \
+                 got: {denied_output}"
+            );
+        }
+
+        let allowed_output = single_call_turn(
+            &project_root,
+            &rules,
+            &configured,
+            false,
+            "native::bash",
+            r#"{"command":"echo hi"}"#,
+        );
+        assert!(
+            !allowed_output.contains("permission denied"),
+            "a command the configured ask does not name must still run, got: {allowed_output}"
+        );
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
     /// "Deny the secrets, allow the tree" is the canonical authoring shape for
     /// a write-scoped agent, and both of its targets are globs.
     #[test]
