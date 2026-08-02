@@ -2359,6 +2359,79 @@ impl fmt::Display for PermissionPatternError {
 
 impl std::error::Error for PermissionPatternError {}
 
+/// What a call reaches beyond the target it is named by.
+///
+/// A search is named by its pattern, which says nothing about which files it
+/// reads — that is decided by the path it is given. Reporting that path here is
+/// what lets a rule written against a file select the call that would read it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PermissionReach {
+    /// One path the call reads, matched under every spelling of it.
+    Path(String),
+    /// Every path in the worktree, for a search given no root to start from.
+    EveryPath,
+}
+
+/// One act a call performs, as the values a rule could be written against.
+///
+/// The values are alternatives rather than parts: any one of them names this
+/// act, so a rule selecting any one of them selects it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Subject {
+    /// The interchangeable spellings this act can be named by.
+    forms: Vec<String>,
+    /// Whether it also extends to everything the worktree holds, which happens
+    /// when the call named no root to start from. Nothing spells that, so a
+    /// restrictive rule always selects such an act — the call would reach
+    /// whatever that rule names — while a permissive one selects it only by
+    /// naming one of the forms above or by authorizing everything.
+    unbounded: bool,
+}
+
+impl Subject {
+    fn spelled(forms: Vec<String>) -> Self {
+        Self {
+            forms,
+            unbounded: false,
+        }
+    }
+
+    /// Folds what a call reaches into the act its target already names: a
+    /// search is one read of one file set, described by its pattern and by its
+    /// path at once, so either description names the same act.
+    fn reaching(mut forms: Vec<String>, reach: &[PermissionReach]) -> Self {
+        let mut unbounded = false;
+
+        for entry in reach {
+            match entry {
+                PermissionReach::EveryPath => unbounded = true,
+                PermissionReach::Path(path) => {
+                    let spellings = permission_target::path_target_forms(path);
+                    if spellings.first().is_some_and(|form| form == ".") {
+                        unbounded = true;
+                    } else {
+                        forms.extend(spellings);
+                    }
+                }
+            }
+        }
+
+        Self { forms, unbounded }
+    }
+
+    fn selected_by(&self, pattern: &PermissionPattern, decision: PermissionDecision) -> bool {
+        if self.forms.iter().any(|form| pattern.matches(form)) {
+            return true;
+        }
+
+        self.unbounded
+            && match decision {
+                PermissionDecision::Allow => pattern.denotes_everything(),
+                PermissionDecision::Ask | PermissionDecision::Deny => true,
+            }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PermissionRequest {
     pub project: String,
@@ -2366,12 +2439,11 @@ pub struct PermissionRequest {
     pub target: String,
     pub access: ToolAccess,
     outside_worktree: bool,
-    /// What the target names, as the subjects a rule could be written against:
-    /// one entry per invocation a command line would run, or a single entry
-    /// for a path the caller spelled in more than one equivalent way. Each
-    /// entry holds the interchangeable spellings of that one subject. Empty
-    /// whenever the target names exactly one thing under exactly one spelling.
-    subjects: Vec<Vec<String>>,
+    /// The acts this call performs, as the values a rule could be written
+    /// against: one entry per invocation a command line would run, and one
+    /// entry for a path or a search, holding every value that names it. Empty
+    /// whenever the target names exactly one act under exactly one spelling.
+    subjects: Vec<Subject>,
 }
 
 impl PermissionRequest {
@@ -2386,6 +2458,7 @@ impl PermissionRequest {
             tool.into(),
             PermissionTarget::native(target).project(),
             access,
+            &[],
         )
     }
 
@@ -2395,7 +2468,25 @@ impl PermissionRequest {
         target: PermissionTarget,
         access: ToolAccess,
     ) -> Self {
-        Self::build(project.into(), tool.into(), target.project(), access)
+        Self::build(project.into(), tool.into(), target.project(), access, &[])
+    }
+
+    /// Builds a request for a call that reaches more than the target names it
+    /// by. See [`PermissionReach`].
+    pub fn reaching(
+        project: impl Into<String>,
+        tool: impl Into<String>,
+        target: impl Into<String>,
+        access: ToolAccess,
+        reach: &[PermissionReach],
+    ) -> Self {
+        Self::build(
+            project.into(),
+            tool.into(),
+            PermissionTarget::native(target).project(),
+            access,
+            reach,
+        )
     }
 
     /// Reads the raw target as what it names before any rule sees it: a path
@@ -2403,13 +2494,25 @@ impl PermissionRequest {
     /// spelling a rule may have been written against, and a command line is
     /// decomposed into the invocations it would run. See
     /// [`crate::permission_target`] for what that does and does not cover.
-    fn build(project: String, tool: String, target: String, access: ToolAccess) -> Self {
+    ///
+    /// What a call reaches beyond its target joins the act its target already
+    /// names, rather than standing beside it as a second one: a search is one
+    /// read, described by its pattern and by its path at once.
+    fn build(
+        project: String,
+        tool: String,
+        target: String,
+        access: ToolAccess,
+        reach: &[PermissionReach],
+    ) -> Self {
         let (target, subjects) = match permission_target_kind_for_tool(&tool) {
             PermissionTargetKind::Path => {
                 let spellings = permission_target::path_target_forms(&target);
                 let normalized = spellings.first().cloned().unwrap_or(target);
-                let subjects = if spellings.len() > 1 {
-                    vec![spellings]
+                let subjects = if !reach.is_empty() {
+                    vec![Subject::reaching(spellings, reach)]
+                } else if spellings.len() > 1 {
+                    vec![Subject::spelled(spellings)]
                 } else {
                     Vec::new()
                 };
@@ -2418,7 +2521,10 @@ impl PermissionRequest {
             }
             PermissionTargetKind::FreeFormText if bare_tool_name(&tool) == "bash" => {
                 let invocations = permission_target::command_invocations(&target);
-                (target, invocations)
+                (
+                    target,
+                    invocations.into_iter().map(Subject::spelled).collect(),
+                )
             }
             PermissionTargetKind::FreeFormText => (target, Vec::new()),
         };
@@ -2447,15 +2553,20 @@ impl PermissionRequest {
     /// invocation is selected, because authorizing `git*` is not authorization
     /// for whatever was chained onto it.
     ///
-    /// A path is one subject rather than several, so both directions reduce to
-    /// the same question there: the rule selects the call when it names the
-    /// file under any of its spellings.
+    /// A path is one act rather than several, so both directions reduce to the
+    /// same question there: the rule selects the call when it names the file
+    /// under any of its spellings. A search is one act too — one read of one
+    /// file set — named by its pattern and by the path it was given at once,
+    /// so a rule naming either one selects it in either direction. What that
+    /// leaves is the search whose extent no value names, where a restrictive
+    /// rule always selects and a permissive one has to authorize everything;
+    /// see [`Subject`].
     fn target_selected_by(
         &self,
         pattern: &PermissionPattern,
         decision: PermissionDecision,
     ) -> bool {
-        let selects = |forms: &Vec<String>| forms.iter().any(|form| pattern.matches(form));
+        let selects = |subject: &Subject| subject.selected_by(pattern, decision);
 
         match decision {
             _ if self.subjects.is_empty() => pattern.matches(&self.target),

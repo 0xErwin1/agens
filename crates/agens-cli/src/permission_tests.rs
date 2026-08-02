@@ -144,7 +144,10 @@ mod tests {
             (
                 "native::grep",
                 serde_json::json!({"pattern": "permission"}),
-                NativePermissionTarget::Pattern("permission".into()),
+                NativePermissionTarget::Search {
+                    pattern: "permission".into(),
+                    path: None,
+                },
             ),
             (
                 "native::webfetch",
@@ -161,14 +164,51 @@ mod tests {
         }
     }
 
+    /// A search is named by its pattern and reads whatever its path points at.
+    /// Keeping both is what lets a rule written against the file select the
+    /// call that would read it; projecting only the pattern left every path
+    /// rule unable to reach a tool that reports the lines it matched.
     #[test]
-    fn native_permission_target_keeps_grep_path_separate_from_its_pattern() {
+    fn native_permission_target_keeps_grep_path_beside_its_pattern() {
+        let with_path = NativePermissionTarget::parse(
+            "native::grep",
+            &serde_json::json!({"pattern": "TODO", "path": "crates/agens-cli"}),
+        )
+        .expect("a grep call must parse");
+
+        assert_eq!(
+            with_path,
+            NativePermissionTarget::Search {
+                pattern: "TODO".into(),
+                path: Some("crates/agens-cli".into()),
+            }
+        );
+        assert_eq!(
+            with_path.reach(),
+            vec![agens_core::PermissionReach::Path("crates/agens-cli".into())]
+        );
+        assert_eq!(
+            NativePermissionTarget::parse("native::grep", &serde_json::json!({"pattern": "TODO"}))
+                .expect("a grep call must parse")
+                .reach(),
+            vec![agens_core::PermissionReach::EveryPath],
+            "a search given no path reads the whole worktree, which no one path names"
+        );
+    }
+
+    /// `glob` reports the paths its pattern names and never their contents, and
+    /// it takes no path argument to read a file through, so its pattern is the
+    /// whole of what it reaches.
+    #[test]
+    fn native_permission_target_gives_glob_no_reach_beyond_its_pattern() {
         assert_eq!(
             NativePermissionTarget::parse(
-                "native::grep",
-                &serde_json::json!({"pattern": "TODO", "path": "crates/agens-cli"}),
-            ),
-            Ok(NativePermissionTarget::Pattern("TODO".into()))
+                "native::glob",
+                &serde_json::json!({"pattern": "src/**/*.rs"}),
+            )
+            .expect("a glob call must parse")
+            .reach(),
+            Vec::new()
         );
     }
 

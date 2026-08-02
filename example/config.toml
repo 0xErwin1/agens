@@ -77,17 +77,23 @@ effort = "high"
 #
 # Name every tool you mean. `read`, `write` and `edit` are separately
 # registered tools, so denying a path to one says nothing about the other two.
-# `glob` and `grep` are matched on their pattern argument rather than on a
-# path, and `bash` on its command line, so a path deny never reaches them —
-# granting `bash` grants a way around every path rule below.
+# `grep` is matched on its pattern AND on the path it is given, and a deny on
+# either refuses the call — that is what makes the `grep` line below hold, and
+# it is load-bearing, because `grep` reports the lines it matched. `glob` is
+# matched on its pattern alone and `bash` on its command line, so a path deny
+# never reaches those two; granting `bash` grants a way around every path rule
+# below.
 #
-# What that costs, stated once: the denies below bound `read`, `write`,
-# `edit`, `list` and `search`, and nothing else. A delegated subagent is
-# authorized to use `grep` and `glob` without declaring anything, and `grep`
-# reports the lines it matched, so a subagent can read the contents of any
-# file in the worktree — `.env` included — whichever paths are denied here.
-# On the primary agent the same call is not denied either; it stops at the
-# approval prompt, which a subagent has no way to reach.
+# What the `grep` deny costs, stated once: a search given no path — or rooted
+# at the worktree itself — reads whatever it walks, so any `grep` deny refuses
+# it. Name a path to scope the search. A search rooted at a directory is
+# matched on that directory and not on the files under it, so a deny naming
+# one file below it does not stop a search rooted above it.
+#
+# A delegated subagent may use `read`, `list`, `search`, `grep`, `glob` and
+# `git_read` without declaring anything, and every deny below binds it exactly
+# as it binds the primary agent. What `glob` reports is file paths and never
+# their contents, and no path deny bounds it on either path.
 [permissions]
 allow = [
   "read(**)",
@@ -100,6 +106,7 @@ deny = [
   "write(**/.env)",
   "edit(**/.env)",
   "search(**/.env)",
+  "grep(**/.env)",
   "bash(rm *)",
 ]
 # Reserve `ask` for operations a human should confirm. A rule that matches is

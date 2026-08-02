@@ -1783,6 +1783,97 @@ mod tests {
         std::fs::remove_dir_all(temporary).unwrap();
     }
 
+    /// Resolves the `[permissions]` block of the configuration agens ships as
+    /// its example, verbatim, into the rules a delegated child runs under. A
+    /// probe written against a hand-built approximation of it would prove
+    /// nothing about what an operator who copied that file actually gets.
+    fn shipped_configured_rules(project_root: &Path) -> Vec<PermissionRule> {
+        let shipped = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../example/config.toml")
+            .canonicalize()
+            .expect("the shipped example configuration must exist");
+        let document = agens_config::parse_toml_document(
+            &std::fs::read_to_string(shipped).expect("the shipped example must be readable"),
+        )
+        .expect("the shipped example must be valid TOML");
+        let entries =
+            agens_config::extract_permission_rules(&document, &Default::default()).unwrap();
+
+        configured_permission_rules(
+            &entries,
+            &project_root.display().to_string(),
+            |configured| Ok(PermissionPattern::Exact(configured.to_owned())),
+        )
+        .expect("the shipped rules must resolve")
+    }
+
+    /// The whole point of a path deny, against the tool that reports what it
+    /// read: the configuration agens ships, a subagent that declares nothing,
+    /// and a real secret in a real `.env`. `grep` returns the lines it matched,
+    /// so a deny that does not reach it hands the file's contents to the model
+    /// however loudly the configuration denies reading that path.
+    #[test]
+    fn the_shipped_configuration_keeps_a_denied_file_out_of_a_grep_result() {
+        let temporary = agens_fixtures::session_directory("shipped-config-grep");
+        let project_root = temporary.join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        std::fs::write(
+            project_root.join(".env"),
+            "OPENAI_API_KEY=sk-live-probe-do-not-leak\n",
+        )
+        .unwrap();
+        std::fs::write(project_root.join("notes.md"), "OPENAI_API_KEY is set\n").unwrap();
+
+        let configured = shipped_configured_rules(&project_root);
+
+        for arguments in [
+            r#"{"pattern":"OPENAI_API_KEY","path":".env"}"#,
+            r#"{"pattern":"OPENAI_API_KEY","path":"./.env"}"#,
+            r#"{"pattern":"OPENAI_API_KEY","path":".//.env"}"#,
+            r#"{"pattern":"OPENAI_API_KEY","path":"./.env/."}"#,
+            r#"{"pattern":"OPENAI_API_KEY"}"#,
+            r#"{"pattern":"OPENAI_API_KEY","path":"."}"#,
+            r#"{"pattern":"OPENAI_API_KEY","path":"./"}"#,
+        ] {
+            let output = single_call_turn(
+                &project_root,
+                &[],
+                &configured,
+                false,
+                "native::grep",
+                arguments,
+            );
+
+            assert!(
+                output.contains("permission denied"),
+                "{arguments} must be denied under the shipped configuration, got: {output}"
+            );
+            assert!(
+                !output.contains("sk-live-probe-do-not-leak"),
+                "{arguments} handed the denied file's contents to the model: {output}"
+            );
+        }
+
+        let allowed = single_call_turn(
+            &project_root,
+            &[],
+            &configured,
+            false,
+            "native::grep",
+            r#"{"pattern":"OPENAI_API_KEY","path":"notes.md"}"#,
+        );
+        assert!(
+            !allowed.contains("permission denied"),
+            "a search of a file no rule names must still run, got: {allowed}"
+        );
+        assert!(
+            allowed.contains("OPENAI_API_KEY is set"),
+            "the allowed search must still report the lines it matched, got: {allowed}"
+        );
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
     #[test]
     fn built_in_explore_still_cannot_write_edit_bash_or_fetch_after_inheriting_the_parent_surface()
     {

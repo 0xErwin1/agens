@@ -7,11 +7,12 @@
 //! routes and previously disagreed; this table is what keeps them from
 //! drifting apart again.
 //!
-//! Only tools that carry no derived grant are used as subjects. A delegated
-//! child auto-authorizes the read-class natives, which is a child-scoped
-//! grant rather than a precedence rule, so `read`/`grep`/`list` and friends
-//! would differ between the paths for reasons that have nothing to do with
-//! precedence.
+//! Tools that carry a derived grant are used only where a rule refuses the
+//! call. A delegated child auto-authorizes the read-class natives, which is a
+//! child-scoped grant rather than a precedence rule, so a `read`/`grep`/`list`
+//! call that no rule names lands on `Allow` in a child and on `Ask` on the
+//! primary path — a difference that has nothing to do with precedence. A rule
+//! that refuses has to hold on both.
 //!
 //! [`CONFIGURED_CASES`] extends the same comparison to the parent's configured
 //! `[permissions]` block, which reaches the two paths by different routes again
@@ -22,11 +23,11 @@ use std::sync::{Arc, Mutex};
 
 use agens_config::{ConfigPermissionDecision, ConfigPermissionRule, ConfigPermissionScope};
 use agens_core::{
-    AgentDefinition, PermissionDecision, PermissionMode, PermissionPolicy, PermissionRequest,
-    PermissionRule, PermissionSession, PermissionTargetKind, ToolAccess,
+    AgentDefinition, PermissionDecision, PermissionMode, PermissionPolicy, PermissionReach,
+    PermissionRequest, PermissionRule, PermissionSession, PermissionTargetKind, ToolAccess,
     permission_target_kind_for_tool,
 };
-use agens_permissions::{configured_permission_rules, permission_policy};
+use agens_permissions::{NativePermissionTarget, configured_permission_rules, permission_policy};
 use agens_tool_runtime::child_catalog::resolve_child_surface;
 use agens_tools::{
     AgentCatalog, DispatchTool, EffectiveCapabilitySet, NativeToolCatalog, ToolDispatcher,
@@ -37,6 +38,11 @@ struct Case {
     declarations: &'static [&'static str],
     tool: &'static str,
     target: &'static str,
+    /// The `path` argument of a search call, whose target holds the pattern
+    /// instead. `None` for every other tool, and for a search that names no
+    /// path at all — which is itself a case, since such a search reads the
+    /// whole worktree.
+    path: Option<&'static str>,
     expected: PermissionDecision,
 }
 
@@ -45,24 +51,28 @@ const CASES: &[Case] = &[
         declarations: &["allow bash"],
         tool: "bash",
         target: "echo hi",
+        path: None,
         expected: PermissionDecision::Allow,
     },
     Case {
         declarations: &["deny bash"],
         tool: "bash",
         target: "echo hi",
+        path: None,
         expected: PermissionDecision::Deny,
     },
     Case {
         declarations: &["ask bash"],
         tool: "bash",
         target: "echo hi",
+        path: None,
         expected: PermissionDecision::Ask,
     },
     Case {
         declarations: &[],
         tool: "bash",
         target: "echo hi",
+        path: None,
         expected: PermissionDecision::Ask,
     },
     // "bash, except these": the broad allow trailing the narrow denies must
@@ -71,24 +81,28 @@ const CASES: &[Case] = &[
         declarations: &["deny bash rm*", "allow bash"],
         tool: "bash",
         target: "rm -rf victim.txt",
+        path: None,
         expected: PermissionDecision::Deny,
     },
     Case {
         declarations: &["deny bash rm*", "deny bash curl*", "allow bash"],
         tool: "bash",
         target: "rm -rf /tmp/victim.txt",
+        path: None,
         expected: PermissionDecision::Deny,
     },
     Case {
         declarations: &["deny bash rm*", "deny bash curl*", "allow bash"],
         tool: "bash",
         target: "curl https://example.invalid",
+        path: None,
         expected: PermissionDecision::Deny,
     },
     Case {
         declarations: &["deny bash rm*", "deny bash curl*", "allow bash"],
         tool: "bash",
         target: "echo hi",
+        path: None,
         expected: PermissionDecision::Allow,
     },
     // A wildcard tool pattern resolves to the very tools it names on both
@@ -99,12 +113,14 @@ const CASES: &[Case] = &[
         declarations: &["allow *", "deny bash"],
         tool: "bash",
         target: "echo hi",
+        path: None,
         expected: PermissionDecision::Deny,
     },
     Case {
         declarations: &["allow bash", "deny *"],
         tool: "bash",
         target: "echo hi",
+        path: None,
         expected: PermissionDecision::Deny,
     },
     // Where two rules select the same call, `deny` wins in either authoring
@@ -113,18 +129,21 @@ const CASES: &[Case] = &[
         declarations: &["deny *", "allow *"],
         tool: "bash",
         target: "echo hi",
+        path: None,
         expected: PermissionDecision::Deny,
     },
     Case {
         declarations: &["allow *", "deny *"],
         tool: "bash",
         target: "echo hi",
+        path: None,
         expected: PermissionDecision::Deny,
     },
     Case {
         declarations: &["allow bash", "deny bash"],
         tool: "bash",
         target: "echo hi",
+        path: None,
         expected: PermissionDecision::Deny,
     },
     // `ask` sits between `allow` and `deny`: the more restrictive decision
@@ -133,12 +152,14 @@ const CASES: &[Case] = &[
         declarations: &["ask bash", "allow bash"],
         tool: "bash",
         target: "echo hi",
+        path: None,
         expected: PermissionDecision::Ask,
     },
     Case {
         declarations: &["ask bash", "deny bash"],
         tool: "bash",
         target: "echo hi",
+        path: None,
         expected: PermissionDecision::Deny,
     },
     // `rm*` selects a strict subset of `*`, so the deny outranks the allow
@@ -147,36 +168,42 @@ const CASES: &[Case] = &[
         declarations: &["deny bash rm*", "allow bash *"],
         tool: "bash",
         target: "rm -rf victim.txt",
+        path: None,
         expected: PermissionDecision::Deny,
     },
     Case {
         declarations: &["allow bash *", "deny bash rm*"],
         tool: "bash",
         target: "rm -rf victim.txt",
+        path: None,
         expected: PermissionDecision::Deny,
     },
     Case {
         declarations: &["deny bash rm*", "allow bash *"],
         tool: "bash",
         target: "echo hi",
+        path: None,
         expected: PermissionDecision::Allow,
     },
     Case {
         declarations: &["deny write src/secret/**", "allow write src/**"],
         tool: "write",
         target: "src/secret/key.txt",
+        path: None,
         expected: PermissionDecision::Deny,
     },
     Case {
         declarations: &["allow write src/**", "deny write src/secret/**"],
         tool: "write",
         target: "src/secret/key.txt",
+        path: None,
         expected: PermissionDecision::Deny,
     },
     Case {
         declarations: &["deny write src/secret/**", "allow write src/**"],
         tool: "write",
         target: "src/main.rs",
+        path: None,
         expected: PermissionDecision::Allow,
     },
     // "deny X except for these": an untargeted deny must not erase a targeted
@@ -185,36 +212,42 @@ const CASES: &[Case] = &[
         declarations: &["deny bash", "allow bash git*"],
         tool: "bash",
         target: "git status",
+        path: None,
         expected: PermissionDecision::Allow,
     },
     Case {
         declarations: &["allow bash git*", "deny bash"],
         tool: "bash",
         target: "git status",
+        path: None,
         expected: PermissionDecision::Allow,
     },
     Case {
         declarations: &["deny bash", "allow bash git*"],
         tool: "bash",
         target: "echo hi",
+        path: None,
         expected: PermissionDecision::Deny,
     },
     Case {
         declarations: &["allow write src/**", "deny write"],
         tool: "write",
         target: "src/main.rs",
+        path: None,
         expected: PermissionDecision::Allow,
     },
     Case {
         declarations: &["deny write", "allow write src/**"],
         tool: "write",
         target: "src/main.rs",
+        path: None,
         expected: PermissionDecision::Allow,
     },
     Case {
         declarations: &["allow write src/**", "deny write"],
         tool: "write",
         target: "README.md",
+        path: None,
         expected: PermissionDecision::Deny,
     },
     // A targeted deny outranks an untargeted allow even when the allow names
@@ -223,12 +256,14 @@ const CASES: &[Case] = &[
         declarations: &["deny bas* rm*", "allow bash"],
         tool: "bash",
         target: "rm -rf /tmp/victim.txt",
+        path: None,
         expected: PermissionDecision::Deny,
     },
     Case {
         declarations: &["allow *", "deny bash rm*"],
         tool: "bash",
         target: "rm -rf victim.txt",
+        path: None,
         expected: PermissionDecision::Deny,
     },
     // The same shape on a path-shaped tool, whose target glob keeps segment
@@ -237,12 +272,14 @@ const CASES: &[Case] = &[
         declarations: &["deny write .env*", "allow write"],
         tool: "write",
         target: ".env",
+        path: None,
         expected: PermissionDecision::Deny,
     },
     Case {
         declarations: &["deny write .env*", "allow write"],
         tool: "write",
         target: "src/main.rs",
+        path: None,
         expected: PermissionDecision::Allow,
     },
     // An explicitly spelled wildcard names exactly the calls an absent target
@@ -251,24 +288,28 @@ const CASES: &[Case] = &[
         declarations: &["deny bash", "allow bash *"],
         tool: "bash",
         target: "rm -rf victim.txt",
+        path: None,
         expected: PermissionDecision::Deny,
     },
     Case {
         declarations: &["allow bash *", "deny bash"],
         tool: "bash",
         target: "rm -rf victim.txt",
+        path: None,
         expected: PermissionDecision::Deny,
     },
     Case {
         declarations: &["allow bash", "deny bash *"],
         tool: "bash",
         target: "echo hi",
+        path: None,
         expected: PermissionDecision::Deny,
     },
     Case {
         declarations: &["deny bash *", "allow bash"],
         tool: "bash",
         target: "echo hi",
+        path: None,
         expected: PermissionDecision::Deny,
     },
     // `**` is the path-shaped spelling of the same breadth; `*` on a path stops
@@ -277,24 +318,28 @@ const CASES: &[Case] = &[
         declarations: &["deny write", "allow write **"],
         tool: "write",
         target: ".env",
+        path: None,
         expected: PermissionDecision::Deny,
     },
     Case {
         declarations: &["allow write **", "deny write"],
         tool: "write",
         target: ".env",
+        path: None,
         expected: PermissionDecision::Deny,
     },
     Case {
         declarations: &["allow write", "deny write *"],
         tool: "write",
         target: ".env",
+        path: None,
         expected: PermissionDecision::Deny,
     },
     Case {
         declarations: &["allow write", "deny write *"],
         tool: "write",
         target: "src/main.rs",
+        path: None,
         expected: PermissionDecision::Allow,
     },
     // A `bash` rule names a command, and a shell expression runs several. A
@@ -303,42 +348,49 @@ const CASES: &[Case] = &[
         declarations: &["deny bash rm*", "allow bash"],
         tool: "bash",
         target: "cd /tmp && rm -rf victim.txt",
+        path: None,
         expected: PermissionDecision::Deny,
     },
     Case {
         declarations: &["deny bash rm*", "allow bash"],
         tool: "bash",
         target: "/bin/rm -rf victim.txt",
+        path: None,
         expected: PermissionDecision::Deny,
     },
     Case {
         declarations: &["deny bash rm*", "allow bash"],
         tool: "bash",
         target: "sudo rm -rf victim.txt",
+        path: None,
         expected: PermissionDecision::Deny,
     },
     Case {
         declarations: &["deny bash rm*", "allow bash"],
         tool: "bash",
         target: "ls | xargs rm",
+        path: None,
         expected: PermissionDecision::Deny,
     },
     Case {
         declarations: &["deny bash rm*", "allow bash"],
         tool: "bash",
         target: "bash -c \"rm -rf victim.txt\"",
+        path: None,
         expected: PermissionDecision::Deny,
     },
     Case {
         declarations: &["deny bash rm*", "allow bash"],
         tool: "bash",
         target: "echo $(rm -rf victim.txt)",
+        path: None,
         expected: PermissionDecision::Deny,
     },
     Case {
         declarations: &["deny bash rm*", "allow bash"],
         tool: "bash",
         target: r"\rm -rf victim.txt",
+        path: None,
         expected: PermissionDecision::Deny,
     },
     // An allow names what it names: it authorizes a compound command only when
@@ -347,12 +399,14 @@ const CASES: &[Case] = &[
         declarations: &["allow bash git*"],
         tool: "bash",
         target: "git status && rm -rf victim.txt",
+        path: None,
         expected: PermissionDecision::Ask,
     },
     Case {
         declarations: &["allow bash git*"],
         tool: "bash",
         target: "git add . && git commit",
+        path: None,
         expected: PermissionDecision::Allow,
     },
     // A path-shaped target is matched by what it names, not by the spelling the
@@ -361,12 +415,14 @@ const CASES: &[Case] = &[
         declarations: &["deny write .env*", "allow write"],
         tool: "write",
         target: "./.env",
+        path: None,
         expected: PermissionDecision::Deny,
     },
     Case {
         declarations: &["deny write src/secret/**", "allow write src/**"],
         tool: "write",
         target: "./src/./secret/key.txt",
+        path: None,
         expected: PermissionDecision::Deny,
     },
     // A call on the directory a deny names is inside what the deny selects,
@@ -375,12 +431,58 @@ const CASES: &[Case] = &[
         declarations: &["deny write src/secret/**", "allow write **"],
         tool: "write",
         target: "src/secret/",
+        path: None,
         expected: PermissionDecision::Deny,
     },
     Case {
         declarations: &["deny write src/secret", "allow write **"],
         tool: "write",
         target: "src/secret/",
+        path: None,
+        expected: PermissionDecision::Deny,
+    },
+    // A search is named by its pattern and reads whatever its path points at,
+    // so a rule written against either axis selects it. Only the refusals sit
+    // in this table: a child auto-authorizes `grep` while the primary agent
+    // asks for it, so a search no rule names is the one shape the two paths
+    // answer differently by design.
+    Case {
+        declarations: &["deny grep **/.env"],
+        tool: "grep",
+        target: "OPENAI_API_KEY",
+        path: Some(".env"),
+        expected: PermissionDecision::Deny,
+    },
+    Case {
+        declarations: &["deny grep **/.env", "allow grep **"],
+        tool: "grep",
+        target: "OPENAI_API_KEY",
+        path: Some(".env"),
+        expected: PermissionDecision::Deny,
+    },
+    // A search of the whole worktree reads the denied file too, however that
+    // root is spelled — and a search that names no root at all is that same
+    // call with the argument left out.
+    Case {
+        declarations: &["deny grep **/.env", "allow grep **"],
+        tool: "grep",
+        target: "OPENAI_API_KEY",
+        path: Some("."),
+        expected: PermissionDecision::Deny,
+    },
+    Case {
+        declarations: &["deny grep **/.env", "allow grep **"],
+        tool: "grep",
+        target: "OPENAI_API_KEY",
+        path: None,
+        expected: PermissionDecision::Deny,
+    },
+    // The pattern axis keeps deciding what it always decided.
+    Case {
+        declarations: &["deny grep OPENAI*", "allow grep **"],
+        tool: "grep",
+        target: "OPENAI_API_KEY",
+        path: Some("notes.md"),
         expected: PermissionDecision::Deny,
     },
     // A declaration matching no tool decides nothing and rejects nothing.
@@ -388,12 +490,14 @@ const CASES: &[Case] = &[
         declarations: &["deny zz*"],
         tool: "bash",
         target: "echo hi",
+        path: None,
         expected: PermissionDecision::Ask,
     },
     Case {
         declarations: &["deny webfetc", "allow bash"],
         tool: "bash",
         target: "echo hi",
+        path: None,
         expected: PermissionDecision::Allow,
     },
 ];
@@ -403,6 +507,8 @@ struct ConfiguredCase {
     declarations: &'static [&'static str],
     tool: &'static str,
     target: &'static str,
+    /// See [`Case::path`].
+    path: Option<&'static str>,
     expected: PermissionDecision,
 }
 
@@ -416,6 +522,7 @@ const CONFIGURED_CASES: &[ConfiguredCase] = &[
         declarations: &["allow bash"],
         tool: "bash",
         target: "echo hi",
+        path: None,
         expected: PermissionDecision::Allow,
     },
     ConfiguredCase {
@@ -423,6 +530,7 @@ const CONFIGURED_CASES: &[ConfiguredCase] = &[
         declarations: &[],
         tool: "bash",
         target: "echo hi",
+        path: None,
         expected: PermissionDecision::Deny,
     },
     // The shape the two paths used to answer oppositely: an untargeted
@@ -432,6 +540,7 @@ const CONFIGURED_CASES: &[ConfiguredCase] = &[
         declarations: &["allow bash git*"],
         tool: "bash",
         target: "git status",
+        path: None,
         expected: PermissionDecision::Deny,
     },
     ConfiguredCase {
@@ -439,6 +548,7 @@ const CONFIGURED_CASES: &[ConfiguredCase] = &[
         declarations: &["allow write src/**"],
         tool: "write",
         target: "src/main.rs",
+        path: None,
         expected: PermissionDecision::Deny,
     },
     // A targeted configured deny leaves everything it does not name to the
@@ -448,6 +558,7 @@ const CONFIGURED_CASES: &[ConfiguredCase] = &[
         declarations: &["allow bash"],
         tool: "bash",
         target: "rm -rf victim.txt",
+        path: None,
         expected: PermissionDecision::Deny,
     },
     ConfiguredCase {
@@ -455,6 +566,7 @@ const CONFIGURED_CASES: &[ConfiguredCase] = &[
         declarations: &["allow bash"],
         tool: "bash",
         target: "echo hi",
+        path: None,
         expected: PermissionDecision::Allow,
     },
     // An equally targeted declared allow cannot reopen a configured deny.
@@ -463,6 +575,7 @@ const CONFIGURED_CASES: &[ConfiguredCase] = &[
         declarations: &["allow bash rm*"],
         tool: "bash",
         target: "rm -rf victim.txt",
+        path: None,
         expected: PermissionDecision::Deny,
     },
     // Nor can a strictly narrower one.
@@ -471,6 +584,7 @@ const CONFIGURED_CASES: &[ConfiguredCase] = &[
         declarations: &["allow write src/generated/**"],
         tool: "write",
         target: "src/generated/api.rs",
+        path: None,
         expected: PermissionDecision::Deny,
     },
     // The configuration resolves against itself before any declaration sees
@@ -480,6 +594,7 @@ const CONFIGURED_CASES: &[ConfiguredCase] = &[
         declarations: &["allow bash"],
         tool: "bash",
         target: "git status",
+        path: None,
         expected: PermissionDecision::Allow,
     },
     ConfiguredCase {
@@ -487,6 +602,7 @@ const CONFIGURED_CASES: &[ConfiguredCase] = &[
         declarations: &["allow bash"],
         tool: "bash",
         target: "echo hi",
+        path: None,
         expected: PermissionDecision::Deny,
     },
     // A configured `ask` is an approval the operator asked for. A declaration
@@ -497,6 +613,7 @@ const CONFIGURED_CASES: &[ConfiguredCase] = &[
         declarations: &["allow bash"],
         tool: "bash",
         target: "git push origin main",
+        path: None,
         expected: PermissionDecision::Ask,
     },
     ConfiguredCase {
@@ -504,6 +621,7 @@ const CONFIGURED_CASES: &[ConfiguredCase] = &[
         declarations: &["allow bash"],
         tool: "bash",
         target: "echo hi",
+        path: None,
         expected: PermissionDecision::Allow,
     },
     ConfiguredCase {
@@ -511,6 +629,7 @@ const CONFIGURED_CASES: &[ConfiguredCase] = &[
         declarations: &["allow bash"],
         tool: "bash",
         target: "rm -rf victim.txt",
+        path: None,
         expected: PermissionDecision::Ask,
     },
     ConfiguredCase {
@@ -518,6 +637,7 @@ const CONFIGURED_CASES: &[ConfiguredCase] = &[
         declarations: &["allow write src/**"],
         tool: "write",
         target: "src/main.rs",
+        path: None,
         expected: PermissionDecision::Ask,
     },
     // The other half of "a declaration can narrow the configured floor
@@ -528,6 +648,7 @@ const CONFIGURED_CASES: &[ConfiguredCase] = &[
         declarations: &["deny bash"],
         tool: "bash",
         target: "rm -rf victim.txt",
+        path: None,
         expected: PermissionDecision::Deny,
     },
     ConfiguredCase {
@@ -535,6 +656,7 @@ const CONFIGURED_CASES: &[ConfiguredCase] = &[
         declarations: &["deny bash rm*"],
         tool: "bash",
         target: "rm -rf victim.txt",
+        path: None,
         expected: PermissionDecision::Deny,
     },
     ConfiguredCase {
@@ -542,7 +664,35 @@ const CONFIGURED_CASES: &[ConfiguredCase] = &[
         declarations: &["ask write"],
         tool: "write",
         target: "src/main.rs",
+        path: None,
         expected: PermissionDecision::Ask,
+    },
+    // The shape the shipped configuration is written in: a configured path
+    // deny has to reach the tool that reports the lines it matched, on both
+    // paths, and a declared `allow grep` must not reopen it.
+    ConfiguredCase {
+        configured: &["deny grep **/.env"],
+        declarations: &[],
+        tool: "grep",
+        target: "OPENAI_API_KEY",
+        path: Some(".env"),
+        expected: PermissionDecision::Deny,
+    },
+    ConfiguredCase {
+        configured: &["deny grep **/.env"],
+        declarations: &["allow grep"],
+        tool: "grep",
+        target: "OPENAI_API_KEY",
+        path: Some(".env"),
+        expected: PermissionDecision::Deny,
+    },
+    ConfiguredCase {
+        configured: &["deny grep **/.env"],
+        declarations: &["allow grep"],
+        tool: "grep",
+        target: "OPENAI_API_KEY",
+        path: None,
+        expected: PermissionDecision::Deny,
     },
 ];
 
@@ -600,15 +750,19 @@ fn every_spelling_of_a_path_decides_the_same_on_both_paths() {
 
     for case in CASES.iter().filter(|case| is_path_shaped(case.tool)) {
         for spelling in PATH_SPELLINGS {
-            let target = (spelling.rewrite)(case.target);
+            let Some((target, path)) = respelled(case.tool, case.target, case.path, spelling)
+            else {
+                continue;
+            };
+            let path = path.as_deref();
             let declarations = parsed_declarations(case.declarations);
 
-            let child = child_decision(&declarations, case.tool, &target);
-            let parent = parent_decision(&declarations, case.tool, &target);
+            let child = child_decision(&declarations, case.tool, &target, path);
+            let parent = parent_decision(&declarations, case.tool, &target, path);
 
             if child != case.expected || parent != case.expected {
                 disagreements.push(format!(
-                    "{:?} on {} {:?} spelled {} as {target:?}: expected {:?}, \
+                    "{:?} on {} {:?} spelled {} as {target:?}/{path:?}: expected {:?}, \
                      child {child:?}, parent {parent:?}",
                     case.declarations, case.tool, case.target, spelling.name, case.expected
                 ));
@@ -621,18 +775,28 @@ fn every_spelling_of_a_path_decides_the_same_on_both_paths() {
         .filter(|case| is_path_shaped(case.tool))
     {
         for spelling in PATH_SPELLINGS {
-            let target = (spelling.rewrite)(case.target);
+            let Some((target, path)) = respelled(case.tool, case.target, case.path, spelling)
+            else {
+                continue;
+            };
+            let path = path.as_deref();
             let declarations = parsed_declarations(case.declarations);
             let configured = configured_rules(case.configured);
 
-            let child = configured_child_decision(&configured, &declarations, case.tool, &target);
-            let parent =
-                configured_parent_decision(case.configured, &declarations, case.tool, &target);
+            let child =
+                configured_child_decision(&configured, &declarations, case.tool, &target, path);
+            let parent = configured_parent_decision(
+                case.configured,
+                &declarations,
+                case.tool,
+                &target,
+                path,
+            );
 
             if child != case.expected || parent != case.expected {
                 disagreements.push(format!(
-                    "config {:?} + {:?} on {} {:?} spelled {} as {target:?}: expected {:?}, \
-                     child {child:?}, parent {parent:?}",
+                    "config {:?} + {:?} on {} {:?} spelled {} as {target:?}/{path:?}: \
+                     expected {:?}, child {child:?}, parent {parent:?}",
                     case.configured,
                     case.declarations,
                     case.tool,
@@ -662,6 +826,25 @@ fn is_path_shaped(tool: &str) -> bool {
     )
 }
 
+/// Applies a spelling to the path a case names: the `path` argument of a
+/// search, or the target of every other path-shaped tool.
+///
+/// A search that names no path names no file to respell — its target is a
+/// pattern, and the spelling axis has nothing to say about one — so it is left
+/// out rather than rewritten into a case about something else.
+fn respelled(
+    tool: &str,
+    target: &str,
+    path: Option<&str>,
+    spelling: &Spelling,
+) -> Option<(String, Option<String>)> {
+    match (path, is_search_tool(tool)) {
+        (Some(path), _) => Some((target.to_owned(), Some((spelling.rewrite)(path)))),
+        (None, false) => Some(((spelling.rewrite)(target), None)),
+        (None, true) => None,
+    }
+}
+
 #[test]
 fn the_child_path_and_the_parent_path_decide_every_configured_shape_identically() {
     let mut disagreements = Vec::new();
@@ -670,9 +853,20 @@ fn the_child_path_and_the_parent_path_decide_every_configured_shape_identically(
         let declarations = parsed_declarations(case.declarations);
         let configured = configured_rules(case.configured);
 
-        let child = configured_child_decision(&configured, &declarations, case.tool, case.target);
-        let parent =
-            configured_parent_decision(case.configured, &declarations, case.tool, case.target);
+        let child = configured_child_decision(
+            &configured,
+            &declarations,
+            case.tool,
+            case.target,
+            case.path,
+        );
+        let parent = configured_parent_decision(
+            case.configured,
+            &declarations,
+            case.tool,
+            case.target,
+            case.path,
+        );
 
         if child != case.expected || parent != case.expected {
             disagreements.push(format!(
@@ -732,6 +926,7 @@ fn configured_child_decision(
     declarations: &[PermissionRule],
     tool: &str,
     target: &str,
+    path: Option<&str>,
 ) -> PermissionDecision {
     let Ok(surface) = resolve_child_surface(configured, declarations) else {
         return PermissionDecision::Deny;
@@ -748,7 +943,11 @@ fn configured_child_decision(
 
     PermissionPolicy::new(PermissionMode::Edit, surface.rules)
         .with_configured_floor(surface.configured_floor)
-        .evaluate(&request(&qualified, target), &[], &PermissionSession::new())
+        .evaluate(
+            &request(&qualified, tool, target, path),
+            &[],
+            &PermissionSession::new(),
+        )
 }
 
 fn configured_parent_decision(
@@ -756,6 +955,7 @@ fn configured_parent_decision(
     declarations: &[PermissionRule],
     tool: &str,
     target: &str,
+    path: Option<&str>,
 ) -> PermissionDecision {
     let dispatcher = Arc::new(Mutex::new(native_dispatcher()));
     let mut agent = agent_definition(&[]);
@@ -781,7 +981,11 @@ fn configured_parent_decision(
         Some(&capabilities),
     )
     .expect("the configured policy must resolve")
-    .evaluate(&request(&identity, target), &[], &PermissionSession::new())
+    .evaluate(
+        &request(&identity, tool, target, path),
+        &[],
+        &PermissionSession::new(),
+    )
 }
 
 #[test]
@@ -791,8 +995,8 @@ fn the_child_path_and_the_parent_path_decide_every_declaration_shape_identically
     for case in CASES {
         let declarations = parsed_declarations(case.declarations);
 
-        let child = child_decision(&declarations, case.tool, case.target);
-        let parent = parent_decision(&declarations, case.tool, case.target);
+        let child = child_decision(&declarations, case.tool, case.target, case.path);
+        let parent = parent_decision(&declarations, case.tool, case.target, case.path);
 
         if child != case.expected || parent != case.expected {
             disagreements.push(format!(
@@ -858,7 +1062,12 @@ fn agent_definition(declarations: &[&str]) -> AgentDefinition {
 /// Resolves a request the way a delegated child does: a tool the resolved
 /// surface omits is unreachable, which the spec requires to surface as a
 /// denial rather than as an unknown tool.
-fn child_decision(declarations: &[PermissionRule], tool: &str, target: &str) -> PermissionDecision {
+fn child_decision(
+    declarations: &[PermissionRule],
+    tool: &str,
+    target: &str,
+    path: Option<&str>,
+) -> PermissionDecision {
     let surface = resolve_child_surface(&[], declarations).expect("the child surface must resolve");
     let qualified = format!("native::{tool}");
 
@@ -871,7 +1080,7 @@ fn child_decision(declarations: &[PermissionRule], tool: &str, target: &str) -> 
     }
 
     PermissionPolicy::new(PermissionMode::Edit, surface.rules).evaluate(
-        &request(&qualified, target),
+        &request(&qualified, tool, target, path),
         &[],
         &PermissionSession::new(),
     )
@@ -883,6 +1092,7 @@ fn parent_decision(
     declarations: &[PermissionRule],
     tool: &str,
     target: &str,
+    path: Option<&str>,
 ) -> PermissionDecision {
     let dispatcher = native_dispatcher();
     let mut agent = agent_definition(&[]);
@@ -896,14 +1106,51 @@ fn parent_decision(
         .to_owned();
 
     PermissionPolicy::new(PermissionMode::Edit, capabilities.permission_rules()).evaluate(
-        &request(&identity, target),
+        &request(&identity, tool, target, path),
         &[],
         &PermissionSession::new(),
     )
 }
 
-fn request(tool: &str, target: &str) -> PermissionRequest {
-    PermissionRequest::new("project", tool, target, ToolAccess::Write)
+/// Builds the request a case describes. `identity` is the tool name the
+/// evaluating path holds — a qualified name in a child, a dispatcher identity
+/// on the primary path — while `tool` is the bare name the case is written
+/// against, which is what says whether the target is a search pattern.
+fn request(identity: &str, tool: &str, target: &str, path: Option<&str>) -> PermissionRequest {
+    PermissionRequest::reaching(
+        "project",
+        identity,
+        target,
+        ToolAccess::Write,
+        &search_reach(tool, target, path),
+    )
+}
+
+/// Projects a case's search arguments the way a dispatched call does, through
+/// the production target parser, so a row carries the same axes a real call
+/// carries rather than a hand-built approximation of them.
+fn search_reach(tool: &str, target: &str, path: Option<&str>) -> Vec<PermissionReach> {
+    if !is_search_tool(tool) {
+        assert!(
+            path.is_none(),
+            "only a search names a path beside its target"
+        );
+        return Vec::new();
+    }
+
+    let mut arguments = serde_json::Map::from_iter([("pattern".to_owned(), target.into())]);
+    if let Some(path) = path {
+        arguments.insert("path".to_owned(), path.into());
+    }
+
+    NativePermissionTarget::parse("native::grep", &serde_json::Value::Object(arguments))
+        .expect("a search call must parse")
+        .reach()
+}
+
+/// Whether a case's target is a search pattern rather than the file it reads.
+fn is_search_tool(tool: &str) -> bool {
+    tool == "grep"
 }
 
 /// A dispatcher holding exactly the natives a delegated child inherits, so

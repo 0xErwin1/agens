@@ -18,7 +18,7 @@ use std::{
 
 use agens_core::{
     EditMagnitude, Error, FactPath, HeadlessTaskTerminal, HeadlessTurnCancellationAdapter,
-    PermissionDecision, PermissionPolicy, PermissionRequest, PermissionSession,
+    PermissionDecision, PermissionPolicy, PermissionReach, PermissionRequest, PermissionSession,
     ProjectPermissionGrant, ToolAccess, ToolOutcome, ToolResultFacts, WriteMagnitude,
 };
 use globset::{Glob, GlobSet, GlobSetBuilder};
@@ -3123,6 +3123,13 @@ pub trait DispatchTool: Send {
             .ok_or_else(|| Error::Tool("tool target is required".into()))
     }
 
+    /// Projects what the exact execution arguments let the call reach beyond
+    /// [`Self::permission_target`]. A tool named by the one thing it touches
+    /// reaches nothing else, which is why this defaults to empty.
+    fn permission_reach(&self, _arguments: &Value) -> Result<Vec<PermissionReach>, Error> {
+        Ok(Vec::new())
+    }
+
     fn execute(
         &mut self,
         context: &ToolExecutionContext,
@@ -3397,11 +3404,14 @@ impl ToolDispatcher {
         let grants = agens_core::normalize_project_permission_grants(grants, |name| {
             self.aliases.get(name).map(|identity| identity.0.clone())
         });
-        let permission = PermissionRequest::new(
+        let target = registered.tool.permission_target(&request.arguments)?;
+        let reach = registered.tool.permission_reach(&request.arguments)?;
+        let permission = PermissionRequest::reaching(
             request.project_id,
             identity.0.clone(),
-            registered.tool.permission_target(&request.arguments)?,
+            target,
             registered.access,
+            &reach,
         );
         let grants: &[ProjectPermissionGrant] = if permission.project.trim().is_empty() {
             &[]

@@ -3,8 +3,8 @@ use std::time::Duration;
 use agens_core::{
     HeadlessTurnCancellation, MAX_PERMISSION_GLOB_SEGMENTS, MAX_PERMISSION_TARGET_BYTES,
     PermissionDecision, PermissionMode, PermissionPattern, PermissionPatternError,
-    PermissionPolicy, PermissionRequest, PermissionRule, PermissionScope, PermissionSession,
-    PermissionTarget, PermissionTargetKind, ProjectPermissionGrant, ToolAccess,
+    PermissionPolicy, PermissionReach, PermissionRequest, PermissionRule, PermissionScope,
+    PermissionSession, PermissionTarget, PermissionTargetKind, ProjectPermissionGrant, ToolAccess,
     permission_target_kind_for_tool,
 };
 
@@ -154,6 +154,144 @@ fn a_path_pattern_spelled_with_no_op_components_selects_what_it_names() {
             "{pattern:?} should have selected src/secret/key.txt"
         );
     }
+}
+
+/// Builds the rule set a search is decided by: one blanket `allow`, the way a
+/// delegated child's derived read grant is written, plus the rule under test.
+fn search_rules(decision: PermissionDecision, target: &str) -> Vec<PermissionRule> {
+    vec![
+        PermissionRule::global(
+            PermissionDecision::Allow,
+            PermissionPattern::Exact("grep".into()),
+            PermissionPattern::Any,
+        ),
+        PermissionRule::global(
+            decision,
+            PermissionPattern::Exact("grep".into()),
+            PermissionPattern::glob(target).expect("the rule target must compile"),
+        ),
+    ]
+}
+
+fn search_decision(
+    rules: &[PermissionRule],
+    pattern: &str,
+    path: Option<&str>,
+) -> PermissionDecision {
+    let reach = vec![path.map_or(PermissionReach::EveryPath, |path| {
+        PermissionReach::Path(path.to_owned())
+    })];
+
+    PermissionPolicy::new(PermissionMode::Edit, rules.to_vec()).evaluate(
+        &PermissionRequest::reaching("project", "grep", pattern, ToolAccess::ReadOnly, &reach),
+        &[],
+        &PermissionSession::new(),
+    )
+}
+
+/// A search reaches a file's contents through its path and through its pattern
+/// alike, so a deny naming either one has to refuse the call.
+#[test]
+fn a_search_is_refused_by_a_deny_on_its_path_or_on_its_pattern() {
+    let by_path = search_rules(PermissionDecision::Deny, "**/.env");
+    assert_eq!(
+        search_decision(&by_path, "OPENAI_API_KEY", Some(".env")),
+        PermissionDecision::Deny
+    );
+    assert_eq!(
+        search_decision(&by_path, "OPENAI_API_KEY", Some("notes.md")),
+        PermissionDecision::Allow,
+        "a file the deny does not name must still be searchable"
+    );
+
+    let by_pattern = search_rules(PermissionDecision::Deny, "OPENAI*");
+    assert_eq!(
+        search_decision(&by_pattern, "OPENAI_API_KEY", Some("notes.md")),
+        PermissionDecision::Deny,
+        "a rule written against the pattern must keep selecting the call"
+    );
+    assert_eq!(
+        search_decision(&by_pattern, "TODO", Some("notes.md")),
+        PermissionDecision::Allow
+    );
+}
+
+/// A search given no path — or rooted at the worktree, however that root is
+/// spelled — reads whatever it walks, so it fails closed against any deny on
+/// the tool rather than escaping every one of them.
+#[test]
+fn a_search_over_the_whole_worktree_fails_closed_against_a_deny() {
+    let rules = search_rules(PermissionDecision::Deny, "**/.env");
+
+    for root in [None, Some("."), Some("./"), Some(".//."), Some("././")] {
+        assert_eq!(
+            search_decision(&rules, "OPENAI_API_KEY", root),
+            PermissionDecision::Deny,
+            "a search rooted at {root:?} reads the denied file too"
+        );
+    }
+}
+
+/// A search is one read described two ways, so a rule naming either
+/// description names the same call — in the permissive direction as well.
+/// Requiring both would make every path-shaped `allow grep` dead on arrival
+/// and would silently revoke every rule already written against a pattern.
+#[test]
+fn a_search_is_authorized_by_a_rule_naming_either_its_pattern_or_its_path() {
+    let by_path = vec![PermissionRule::global(
+        PermissionDecision::Allow,
+        PermissionPattern::Exact("grep".into()),
+        PermissionPattern::glob("src/**").expect("the rule target must compile"),
+    )];
+    assert_eq!(
+        search_decision(&by_path, "OPENAI_API_KEY", Some("src/main.rs")),
+        PermissionDecision::Allow
+    );
+    assert_eq!(
+        search_decision(&by_path, "OPENAI_API_KEY", Some("notes.md")),
+        PermissionDecision::Ask
+    );
+
+    let by_pattern = vec![PermissionRule::global(
+        PermissionDecision::Allow,
+        PermissionPattern::Exact("grep".into()),
+        PermissionPattern::glob("OPENAI*").expect("the rule target must compile"),
+    )];
+    assert_eq!(
+        search_decision(&by_pattern, "OPENAI_API_KEY", Some("notes.md")),
+        PermissionDecision::Allow
+    );
+    assert_eq!(
+        search_decision(&by_pattern, "TODO", Some("notes.md")),
+        PermissionDecision::Ask
+    );
+}
+
+/// The other side of failing closed: an unbounded search is still authorized
+/// by a grant that authorizes everything, which is what keeps a subagent's
+/// derived read grant usable.
+#[test]
+fn an_unbounded_search_is_authorized_only_by_a_rule_that_authorizes_everything() {
+    let blanket = vec![PermissionRule::global(
+        PermissionDecision::Allow,
+        PermissionPattern::Exact("grep".into()),
+        PermissionPattern::Any,
+    )];
+    assert_eq!(
+        search_decision(&blanket, "OPENAI_API_KEY", None),
+        PermissionDecision::Allow
+    );
+
+    let narrow = vec![PermissionRule::global(
+        PermissionDecision::Allow,
+        PermissionPattern::Exact("grep".into()),
+        PermissionPattern::glob("src/**").expect("the rule target must compile"),
+    )];
+    assert_eq!(
+        search_decision(&narrow, "OPENAI_API_KEY", None),
+        PermissionDecision::Ask,
+        "an allow naming one subtree cannot authorize a search of every subtree"
+    );
 }
 
 #[test]

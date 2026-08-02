@@ -33,8 +33,9 @@ use agens_config::{ConfigPermissionDecision, ConfigPermissionRule, ConfigPermiss
 use agens_core::{
     ConfiguredFloor, FactPath, HeadlessPermissionGate, HeadlessPermissionResolver,
     HeadlessToolCall, HeadlessTurnCancellation, HeadlessTurnPortError, PermissionDecision,
-    PermissionMode, PermissionPattern, PermissionPolicy, PermissionRule, PermissionSession,
-    SafetyPredicate, ToolInput, ToolOutcome, ToolResultFacts, permission_target_kind_for_tool,
+    PermissionMode, PermissionPattern, PermissionPolicy, PermissionReach, PermissionRule,
+    PermissionSession, SafetyPredicate, ToolInput, ToolOutcome, ToolResultFacts,
+    permission_target_kind_for_tool,
 };
 use agens_store::PermissionGrantStore;
 use agens_tools::{
@@ -51,6 +52,14 @@ pub enum NativePermissionTarget {
     Pattern(String),
     Operation(String),
     Url(String),
+    /// A content search, which two arguments describe at once: the pattern it
+    /// is named by, and the path deciding which files it reads. Both are kept,
+    /// because either one alone is enough to reach a file's contents and a rule
+    /// may be written against either.
+    Search {
+        pattern: String,
+        path: Option<String>,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -94,11 +103,12 @@ impl NativePermissionTarget {
             "native::glob" => field("pattern").map(Self::Pattern),
             "native::git_read" => field("operation").map(Self::Operation),
             "native::grep" => {
-                if arguments.contains_key("path") {
-                    field("path")?;
-                }
+                let path = arguments
+                    .contains_key("path")
+                    .then(|| field("path"))
+                    .transpose()?;
 
-                field("pattern").map(Self::Pattern)
+                field("pattern").map(|pattern| Self::Search { pattern, path })
             }
             "native::webfetch" => field("url").map(Self::Url),
             _ => Err(NativePermissionTargetError::UnknownTool),
@@ -111,7 +121,28 @@ impl NativePermissionTarget {
             | Self::Path(value)
             | Self::Pattern(value)
             | Self::Operation(value)
-            | Self::Url(value) => value,
+            | Self::Url(value)
+            | Self::Search { pattern: value, .. } => value,
+        }
+    }
+
+    /// What the call reaches beyond the target it is named by.
+    ///
+    /// A search reads the files under the path it is given, and every file in
+    /// the worktree when it is given none — the pattern it is named by says
+    /// nothing about which those are. Every other native tool is named by the
+    /// one thing it touches.
+    pub fn reach(&self) -> Vec<PermissionReach> {
+        match self {
+            Self::Search { path, .. } => vec![
+                path.clone()
+                    .map_or(PermissionReach::EveryPath, PermissionReach::Path),
+            ],
+            Self::Command(_)
+            | Self::Path(_)
+            | Self::Pattern(_)
+            | Self::Operation(_)
+            | Self::Url(_) => Vec::new(),
         }
     }
 }
