@@ -12,13 +12,20 @@
 //! grant rather than a precedence rule, so `read`/`grep`/`list` and friends
 //! would differ between the paths for reasons that have nothing to do with
 //! precedence.
+//!
+//! [`CONFIGURED_CASES`] extends the same comparison to the parent's configured
+//! `[permissions]` block, which reaches the two paths by different routes again
+//! and has to land on one answer for the same reason.
 
 use std::fs;
+use std::sync::{Arc, Mutex};
 
+use agens_config::{ConfigPermissionDecision, ConfigPermissionRule, ConfigPermissionScope};
 use agens_core::{
     AgentDefinition, PermissionDecision, PermissionMode, PermissionPolicy, PermissionRequest,
     PermissionRule, PermissionSession, ToolAccess,
 };
+use agens_permissions::{configured_permission_rules, permission_policy};
 use agens_tool_runtime::child_catalog::resolve_child_surface;
 use agens_tools::{
     AgentCatalog, DispatchTool, EffectiveCapabilitySet, NativeToolCatalog, ToolDispatcher,
@@ -248,6 +255,223 @@ const CASES: &[Case] = &[
         expected: PermissionDecision::Allow,
     },
 ];
+
+struct ConfiguredCase {
+    configured: &'static [&'static str],
+    declarations: &'static [&'static str],
+    tool: &'static str,
+    target: &'static str,
+    expected: PermissionDecision,
+}
+
+/// The parent's configured `[permissions]` block is a floor: a declaration can
+/// narrow it further but can never reopen what it nets to `Deny`, on either
+/// path. The configured rules are resolved among themselves first, so a
+/// configured `allow` can still carve an exception out of a configured `deny`.
+const CONFIGURED_CASES: &[ConfiguredCase] = &[
+    ConfiguredCase {
+        configured: &[],
+        declarations: &["allow bash"],
+        tool: "bash",
+        target: "echo hi",
+        expected: PermissionDecision::Allow,
+    },
+    ConfiguredCase {
+        configured: &["deny bash"],
+        declarations: &[],
+        tool: "bash",
+        target: "echo hi",
+        expected: PermissionDecision::Deny,
+    },
+    // The shape the two paths used to answer oppositely: an untargeted
+    // configured deny against a targeted declared allow.
+    ConfiguredCase {
+        configured: &["deny bash"],
+        declarations: &["allow bash git*"],
+        tool: "bash",
+        target: "git status",
+        expected: PermissionDecision::Deny,
+    },
+    ConfiguredCase {
+        configured: &["deny write"],
+        declarations: &["allow write src/**"],
+        tool: "write",
+        target: "src/main.rs",
+        expected: PermissionDecision::Deny,
+    },
+    // A targeted configured deny leaves everything it does not name to the
+    // declarations.
+    ConfiguredCase {
+        configured: &["deny bash rm*"],
+        declarations: &["allow bash"],
+        tool: "bash",
+        target: "rm -rf victim.txt",
+        expected: PermissionDecision::Deny,
+    },
+    ConfiguredCase {
+        configured: &["deny bash rm*"],
+        declarations: &["allow bash"],
+        tool: "bash",
+        target: "echo hi",
+        expected: PermissionDecision::Allow,
+    },
+    // An equally targeted declared allow cannot reopen a configured deny.
+    ConfiguredCase {
+        configured: &["deny bash rm*"],
+        declarations: &["allow bash rm*"],
+        tool: "bash",
+        target: "rm -rf victim.txt",
+        expected: PermissionDecision::Deny,
+    },
+    // Nor can a strictly narrower one.
+    ConfiguredCase {
+        configured: &["deny write src/**"],
+        declarations: &["allow write src/generated/**"],
+        tool: "write",
+        target: "src/generated/api.rs",
+        expected: PermissionDecision::Deny,
+    },
+    // The configuration resolves against itself before any declaration sees
+    // it, so a configured carve-out survives.
+    ConfiguredCase {
+        configured: &["deny bash", "allow bash git*"],
+        declarations: &["allow bash"],
+        tool: "bash",
+        target: "git status",
+        expected: PermissionDecision::Allow,
+    },
+    ConfiguredCase {
+        configured: &["deny bash", "allow bash git*"],
+        declarations: &["allow bash"],
+        tool: "bash",
+        target: "echo hi",
+        expected: PermissionDecision::Deny,
+    },
+];
+
+#[test]
+fn the_child_path_and_the_parent_path_decide_every_configured_shape_identically() {
+    let mut disagreements = Vec::new();
+
+    for case in CONFIGURED_CASES {
+        let declarations = parsed_declarations(case.declarations);
+        let configured = configured_rules(case.configured);
+
+        let child = configured_child_decision(&configured, &declarations, case.tool, case.target);
+        let parent =
+            configured_parent_decision(case.configured, &declarations, case.tool, case.target);
+
+        if child != case.expected || parent != case.expected {
+            disagreements.push(format!(
+                "config {:?} + {:?} on {} {:?}: expected {:?}, child {child:?}, parent {parent:?}",
+                case.configured, case.declarations, case.tool, case.target, case.expected
+            ));
+        }
+    }
+
+    assert!(
+        disagreements.is_empty(),
+        "{} of {} cases disagreed:\n{}",
+        disagreements.len(),
+        CONFIGURED_CASES.len(),
+        disagreements.join("\n")
+    );
+}
+
+/// Parses `decision tool [target]` into a configured `[permissions]` entry,
+/// deliberately reusing the declaration spelling so a case reads as one rule
+/// set written in two places.
+fn configured_entries(entries: &[&str]) -> Vec<ConfigPermissionRule> {
+    entries
+        .iter()
+        .map(|entry| {
+            let mut parts = entry.split_whitespace();
+            let decision = match parts.next() {
+                Some("allow") => ConfigPermissionDecision::Allow,
+                Some("deny") => ConfigPermissionDecision::Deny,
+                Some("ask") => ConfigPermissionDecision::Ask,
+                other => panic!("unsupported configured decision {other:?}"),
+            };
+            ConfigPermissionRule {
+                scope: ConfigPermissionScope::Global,
+                decision,
+                tool_pattern: parts.next().expect("a configured rule names a tool").into(),
+                target_pattern: parts.next().map(str::to_owned),
+            }
+        })
+        .collect()
+}
+
+/// Resolves configured entries the way a delegated child does: the qualified
+/// tool name is kept because the child's dispatcher does not exist yet.
+fn configured_rules(entries: &[&str]) -> Vec<PermissionRule> {
+    configured_permission_rules(&configured_entries(entries), "project", |configured| {
+        Ok(agens_core::PermissionPattern::Exact(configured.to_owned()))
+    })
+    .expect("configured rules must resolve")
+}
+
+/// A resolution error means no child turn ever starts, which denies every call
+/// the delegation would have made.
+fn configured_child_decision(
+    configured: &[PermissionRule],
+    declarations: &[PermissionRule],
+    tool: &str,
+    target: &str,
+) -> PermissionDecision {
+    let Ok(surface) = resolve_child_surface(configured, declarations) else {
+        return PermissionDecision::Deny;
+    };
+    let qualified = format!("native::{tool}");
+
+    if !surface
+        .tools
+        .iter()
+        .any(|entry| entry.qualified_name == qualified)
+    {
+        return PermissionDecision::Deny;
+    }
+
+    PermissionPolicy::with_safety_predicates(
+        PermissionMode::Edit,
+        surface.rules,
+        surface.safety_predicates,
+    )
+    .evaluate(&request(&qualified, target), &[], &PermissionSession::new())
+}
+
+fn configured_parent_decision(
+    configured: &[&str],
+    declarations: &[PermissionRule],
+    tool: &str,
+    target: &str,
+) -> PermissionDecision {
+    let dispatcher = Arc::new(Mutex::new(native_dispatcher()));
+    let mut agent = agent_definition(&[]);
+    agent.permission_rules = declarations.to_vec();
+
+    let capabilities = {
+        let dispatcher = dispatcher.lock().expect("dispatcher must be available");
+        EffectiveCapabilitySet::from_agent(&agent, "project", &dispatcher)
+    };
+    let identity = dispatcher
+        .lock()
+        .expect("dispatcher must be available")
+        .canonical_identity(&format!("native::{tool}"))
+        .expect("the probe dispatcher must hold the subject tool")
+        .as_str()
+        .to_owned();
+
+    permission_policy(
+        &configured_entries(configured),
+        "project",
+        PermissionMode::Edit,
+        &dispatcher,
+        Some(&capabilities),
+    )
+    .expect("the configured policy must resolve")
+    .evaluate(&request(&identity, target), &[], &PermissionSession::new())
+}
 
 #[test]
 fn the_child_path_and_the_parent_path_decide_every_declaration_shape_identically() {

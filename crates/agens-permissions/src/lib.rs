@@ -33,8 +33,9 @@ use agens_config::{ConfigPermissionDecision, ConfigPermissionRule, ConfigPermiss
 use agens_core::{
     FactPath, HeadlessPermissionGate, HeadlessPermissionResolver, HeadlessToolCall,
     HeadlessTurnCancellation, HeadlessTurnPortError, PermissionDecision, PermissionMode,
-    PermissionPattern, PermissionPolicy, PermissionRule, PermissionSession, ToolInput, ToolOutcome,
-    ToolResultFacts, ordered_permission_rules, permission_target_kind_for_tool,
+    PermissionPattern, PermissionPolicy, PermissionRule, PermissionSession, SafetyPredicate,
+    ToolInput, ToolOutcome, ToolResultFacts, ordered_permission_rules,
+    permission_target_kind_for_tool,
 };
 use agens_store::PermissionGrantStore;
 use agens_tools::{
@@ -545,10 +546,19 @@ pub fn permission_policy(
             .map(|identity| PermissionPattern::Exact(identity.as_str().to_owned()))
             .ok_or_else(|| CliError::configuration("permission configuration is invalid"))
     })?;
+    let configured_floor = ordered_permission_rules(rules.clone());
     if let Some(capabilities) = effective_capabilities {
         rules.extend(capabilities.permission_rules());
     }
-    Ok(PermissionPolicy::new(mode, ordered_permission_rules(rules)))
+    Ok(PermissionPolicy::with_safety_predicates(
+        mode,
+        ordered_permission_rules(rules),
+        vec![
+            SafetyPredicate::WorktreeEscape,
+            SafetyPredicate::ChatWrite,
+            SafetyPredicate::ConfiguredDenial(configured_floor),
+        ],
+    ))
 }
 
 /// Converts configured `[permissions]` entries into policy rules, resolving

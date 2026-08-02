@@ -2555,6 +2555,16 @@ pub enum SafetyPredicate {
     WorktreeEscape,
     ChatWrite,
     GlobalDeny(Box<GlobalDenyPredicate>),
+    /// The operator's configured `[permissions]` rules, resolved among
+    /// themselves by [`ordered_permission_rules`] and held above the policy.
+    ///
+    /// Configuration is a floor rather than one voice among many: an agent
+    /// definition can narrow it further, but a declaration must never reopen a
+    /// call the configuration nets to `Deny`, whether the call is made by a
+    /// primary agent or by a delegated child. Resolving the configured rules
+    /// against each other first is what keeps a configured `allow` able to
+    /// carve an exception out of a configured `deny`.
+    ConfiguredDenial(Vec<PermissionRule>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2606,8 +2616,16 @@ impl PermissionPolicy {
             normalize_tool_pattern(&mut rule.tool, &aliases);
         }
         for predicate in &mut policy.safety_predicates {
-            if let SafetyPredicate::GlobalDeny(deny) = predicate {
-                normalize_tool_pattern(&mut deny.tool, &aliases);
+            match predicate {
+                SafetyPredicate::GlobalDeny(deny) => {
+                    normalize_tool_pattern(&mut deny.tool, &aliases);
+                }
+                SafetyPredicate::ConfiguredDenial(rules) => {
+                    for rule in rules {
+                        normalize_tool_pattern(&mut rule.tool, &aliases);
+                    }
+                }
+                SafetyPredicate::WorktreeEscape | SafetyPredicate::ChatWrite => {}
             }
         }
         policy
@@ -2699,6 +2717,8 @@ impl PermissionPolicy {
                 || matches!(predicate, SafetyPredicate::GlobalDeny(global_deny)
                     if global_deny.tool.matches(&request.tool)
                         && global_deny.target.matches(&request.target))
+                || matches!(predicate, SafetyPredicate::ConfiguredDenial(rules)
+                    if configured_denial(rules, request))
         })
     }
 
@@ -2712,6 +2732,19 @@ impl PermissionPolicy {
             decision
         }
     }
+}
+
+/// Resolves the configured rules against each other alone and reports whether
+/// they leave the request denied. The rules are ordered by
+/// [`ordered_permission_rules`] before they get here, so this is the same
+/// last-match-wins resolution the policy applies to its own static rules.
+fn configured_denial(rules: &[PermissionRule], request: &PermissionRequest) -> bool {
+    rules
+        .iter()
+        .filter(|rule| rule.matches(request))
+        .map(|rule| rule.decision)
+        .next_back()
+        == Some(PermissionDecision::Deny)
 }
 
 pub fn normalize_project_permission_grants(

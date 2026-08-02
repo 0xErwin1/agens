@@ -20,7 +20,7 @@
 //! ones and cannot disagree about a declaration set.
 
 use agens_core::{
-    GlobalDenyPredicate, PermissionDecision, PermissionPattern, PermissionRule, SafetyPredicate,
+    PermissionDecision, PermissionPattern, PermissionRule, SafetyPredicate,
     declarations_deny_every_target, ordered_permission_rules, permission_target_kind_for_tool,
 };
 use agens_error::CliError;
@@ -52,20 +52,25 @@ pub struct ChildToolSurface {
 ///
 /// `parent_rules` bound the result and are never a source of authority: only a
 /// declaration can authorize a child tool, so a configured `allow` grants the
-/// child nothing on its own. A configured `deny`, in contrast, is enforced
-/// three ways — the tool leaves the catalog when the deny covers every target,
-/// a declaration that would reopen it is a hard error, and the deny is
-/// re-emitted as a hard safety predicate so no declaration can outrank it on
-/// the child's own policy.
+/// child nothing on its own. It can, however, carve an exception out of a
+/// configured `deny`, because the configured rules are resolved against each
+/// other before any declaration sees them.
+///
+/// Where that resolution nets to a denial it is enforced three ways — the tool
+/// leaves the catalog when no call to it could survive, a declaration that
+/// would reopen such a tool is a hard error, and the whole configured set is
+/// carried as a [`SafetyPredicate::ConfiguredDenial`] so no declaration can
+/// outrank it on the child's own policy. The primary path holds the same
+/// predicate over the same rules, which is what keeps the two from answering
+/// a configured deny differently.
 pub fn resolve_child_surface(
     parent_rules: &[PermissionRule],
     declarations: &[PermissionRule],
 ) -> Result<ChildToolSurface, CliError> {
     let metadata = NativeToolCatalog::metadata();
 
-    let parent_denials = parent_rules
+    let parent_rules = parent_rules
         .iter()
-        .filter(|rule| rule.decision == PermissionDecision::Deny)
         .cloned()
         .flat_map(|rule| normalize_declared_tool(rule, &metadata))
         .collect::<Vec<_>>();
@@ -85,7 +90,7 @@ pub fn resolve_child_surface(
         }
         if let Some(entry) = metadata.iter().find(|entry| {
             declaration_names_tool(declaration, entry)
-                && declarations_deny_every_target(&parent_denials, &entry.qualified_name)
+                && declarations_deny_every_target(&parent_rules, &entry.qualified_name)
         }) {
             return Err(CliError::configuration(format!(
                 "permission declaration grants a tool the configuration denies: {}",
@@ -104,7 +109,7 @@ pub fn resolve_child_surface(
         .into_iter()
         .filter(|entry| {
             !declarations_deny_every_target(&normalized_declarations, &entry.qualified_name)
-                && !declarations_deny_every_target(&parent_denials, &entry.qualified_name)
+                && !declarations_deny_every_target(&parent_rules, &entry.qualified_name)
         })
         .collect::<Vec<_>>();
 
@@ -120,15 +125,9 @@ pub fn resolve_child_surface(
         .collect::<Vec<_>>();
     rules.extend(normalized_declarations);
 
-    let safety_predicates = parent_denials
-        .into_iter()
-        .map(|rule| {
-            SafetyPredicate::GlobalDeny(Box::new(GlobalDenyPredicate {
-                tool: rule.tool,
-                target: rule.target,
-            }))
-        })
-        .collect();
+    let safety_predicates = vec![SafetyPredicate::ConfiguredDenial(ordered_permission_rules(
+        parent_rules,
+    ))];
 
     Ok(ChildToolSurface {
         tools,
@@ -404,10 +403,38 @@ mod tests {
         assert!(
             surface.safety_predicates.iter().any(|predicate| matches!(
                 predicate,
-                SafetyPredicate::GlobalDeny(deny)
-                    if deny.tool.matches("native::bash") && deny.target.matches("rm -rf /tmp/x")
+                SafetyPredicate::ConfiguredDenial(rules)
+                    if rules.iter().any(|rule| rule.decision == PermissionDecision::Deny
+                        && rule.tool.matches("native::bash")
+                        && rule.target.matches("rm -rf /tmp/x"))
             )),
             "the configured deny must survive as a hard safety predicate"
+        );
+    }
+
+    /// The configured rules resolve against each other before any declaration
+    /// sees them, so a configured `allow` still carves an exception out of a
+    /// configured `deny` — while granting the child nothing on its own.
+    #[test]
+    fn a_configured_carve_out_survives_into_the_child_predicate() {
+        let carve_out = PermissionRule::global(
+            PermissionDecision::Allow,
+            PermissionPattern::Exact("native::bash".into()),
+            PermissionPattern::glob_for_target_kind(
+                "git*",
+                permission_target_kind_for_tool("bash"),
+            )
+            .unwrap(),
+        );
+        let surface = resolve_child_surface(
+            &[parent_deny("bash", None), carve_out],
+            &[rule(PermissionDecision::Allow, "bash")],
+        )
+        .expect("a configured carve-out must not reject the delegation");
+
+        assert!(
+            tool_names(&surface).contains(&"native::bash".to_owned()),
+            "a tool the configuration still allows for some target must stay in the catalog"
         );
     }
 
