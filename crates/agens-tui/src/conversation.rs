@@ -250,6 +250,14 @@ impl Conversation {
                         let MessagePart::Text(text) = part else {
                             return Err(ConversationError::InvalidMessageOrder);
                         };
+                        // A turn the runtime scheduled had no user prompt when it
+                        // ran. Restoring its coordination text as a user message
+                        // puts words in the reader's mouth — words that say, in
+                        // their own text, that the user did not send them.
+                        if let Some(notice) = crate::runtime_scheduled_notice(text) {
+                            conversation.apply(ConversationEvent::Info(notice))?;
+                            continue;
+                        }
                         conversation.user.push_str(text);
                         let item = ConversationItem::User(text.clone());
                         conversation.items.push(item);

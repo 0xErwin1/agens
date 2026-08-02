@@ -8688,10 +8688,40 @@ fn auto_turn_prompt(finished: usize) -> String {
 }
 
 fn auto_turn_notice(finished: usize) -> String {
-    format!(
-        "Continuing automatically: {} finished.",
-        auto_turn_subject(finished)
-    )
+    auto_turn_notice_for(&auto_turn_subject(finished))
+}
+
+fn auto_turn_notice_for(subject: &str) -> String {
+    format!("Continuing automatically: {subject} finished.")
+}
+
+/// The notice a runtime-scheduled prompt should be shown as, if it is one.
+///
+/// A scheduled turn opens with no user prompt at all: the live path records a
+/// notice and leaves the prompt empty. The coordination text exists only
+/// because the provider has to be told, and the provider is told in a user-role
+/// message — which is what the session store keeps. Replaying that verbatim on
+/// resume attributed to the reader a prompt whose own words say the user did
+/// not send it.
+///
+/// The subject is read back out of the prompt so the restored notice says the
+/// same thing the live one did. It sits next to the generator on purpose: the
+/// two formats have to move together.
+pub fn runtime_scheduled_notice(prompt: &str) -> Option<String> {
+    if !is_runtime_scheduled_prompt(prompt) {
+        return None;
+    }
+
+    let subject = prompt
+        .split_once('\n')
+        .and_then(|(_, body)| body.split_once(" finished."))
+        .map(|(subject, _)| subject.trim())
+        .filter(|subject| !subject.is_empty());
+
+    Some(subject.map_or_else(
+        || "Continued automatically after background work finished.".to_owned(),
+        auto_turn_notice_for,
+    ))
 }
 
 fn status_matches_execution(status: SubagentStatus, state: TuiExecutionState) -> bool {

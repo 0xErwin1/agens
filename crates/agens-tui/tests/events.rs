@@ -3548,6 +3548,41 @@ fn a_finished_background_subagent_fires_one_main_turn_while_idle() {
     assert!(tui.take_ready_auto_turn().is_none());
 }
 
+/// The provider is told about a scheduled turn in a user-role message, so that
+/// is what the session store keeps. Replaying it verbatim showed the reader a
+/// prompt of their own that said the user had not sent it.
+#[test]
+fn a_restored_runtime_turn_reads_as_a_notice_rather_than_a_user_prompt() {
+    let mut tui = Tui::new(FakeEngine::default());
+    finish_background_child(&mut tui, 7);
+    let prompt = tui.take_ready_auto_turn().expect("idle schedules the turn");
+
+    let restored = Conversation::from_messages(&[
+        Message {
+            role: Role::User,
+            parts: vec![MessagePart::Text(prompt)],
+        },
+        Message {
+            role: Role::Assistant,
+            parts: vec![MessagePart::Text("summary".into())],
+        },
+    ])
+    .expect("a scheduled turn restores");
+
+    let turn = restored.last().expect("one restored turn");
+    assert_eq!(turn.user, "", "no prompt is attributed to the reader");
+
+    let rendered = format!("{:?}", turn);
+    assert!(
+        rendered.contains("Continuing automatically: 1 background subagent finished."),
+        "the restored turn keeps the notice the live one recorded: {rendered:?}"
+    );
+    assert!(
+        !rendered.contains("coordination source=runtime"),
+        "the coordination text is not shown back to the reader: {rendered:?}"
+    );
+}
+
 #[test]
 fn a_finished_foreground_subagent_never_fires_a_main_turn() {
     let mut tui = Tui::new(FakeEngine::default());
