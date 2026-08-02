@@ -1617,9 +1617,10 @@ mod tests {
     }
 
     /// A project-supplied definition can declare `allow bash`, so the parent's
-    /// own configured deny has to outrank it. Enforced as a hard safety
-    /// predicate rather than as a policy rule, because a declaration would
-    /// otherwise be the more specific match and win.
+    /// own configured deny has to outrank it. Held in the configured floor
+    /// rather than merged into the declared rule set, because merging the two
+    /// would let a narrower declaration such as `allow bash git*` outrank the
+    /// configured deny by containment.
     #[test]
     fn a_configured_deny_outranks_a_declared_allow_inside_the_child() {
         let temporary = agens_fixtures::session_directory("configured-deny-outranks");

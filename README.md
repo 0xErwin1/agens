@@ -80,7 +80,7 @@ The TUI accepts normal prompts and these slash commands:
 
 Keyboard controls shown by the TUI include Enter to send, Shift+Enter for a newline, Ctrl+C to cancel or quit, Page Up/Page Down to scroll, and End to follow.
 
-`/bypass` and `Ctrl+Shift+P` upgrade `Ask` decisions to `Allow` for the rest of the session; a footer `BYPASS` segment shows while it is active. The toggle never writes configuration and never overrides an explicit `deny` rule or the unconditional safety checks (worktree escapes, writes in chat mode). Subagents launched from the TUI inherit the active session's bypass; a subagent the model launches itself through the `task` tool does not. Setting `agent.bypass_permission_prompts = true` in the GLOBAL configuration turns bypass on by default for every new session and for `/new`; a project `.agens/config.toml` cannot enable it, and `agens config doctor` warns if one declares it anyway. Resuming a session restores whatever value that session last recorded, regardless of the current configuration.
+`/bypass` and `Ctrl+Shift+P` upgrade `Ask` decisions to `Allow` for the rest of the session; a footer `BYPASS` segment shows while it is active. The toggle never writes configuration and decides only calls that no rule and no grant matches: a matched `deny` or `ask`, configured or declared by an agent, still decides, as do the unconditional safety checks (worktree escapes, writes in chat mode). Subagents launched from the TUI inherit the active session's bypass; a subagent the model launches itself through the `task` tool does not. Setting `agent.bypass_permission_prompts = true` in the GLOBAL configuration turns bypass on by default for every new session and for `/new`; a project `.agens/config.toml` cannot enable it, and `agens config doctor` warns if one declares it anyway. Resuming a session restores whatever value that session last recorded, regardless of the current configuration.
 
 ## Configuration
 
@@ -123,6 +123,40 @@ Inspect resolved paths and validation status with:
 ./target/debug/agens config doctor
 ```
 
+## Subagents
+
+The `task` tool delegates work to a subagent, which runs its own turn loop with its own tool dispatcher and cannot delegate further.
+
+**What a subagent can reach.** It inherits the parent's native tool surface — `read`, `list`, `search`, `grep`, `glob`, `git_read`, `write`, `edit`, `bash`, `webfetch` — plus `task_control` and `task_message` for reporting back. The read-class tools (`read`, `list`, `search`, `grep`, `glob`, `git_read`) are authorized automatically. `write`, `edit`, `bash` and `webfetch` are present but unauthorized: a call to one is refused unless the agent definition declares `allow`, or the session is in dangerous mode. `webfetch` is excluded from the automatic grant deliberately — it is network egress rather than a worktree read.
+
+**Narrowing and granting.** Agent definitions are markdown files with YAML frontmatter, discovered in `<project-root>/.agens/agents/` and in `agents/` beside the global configuration. A `permissions:` list adjusts the inherited surface:
+
+```markdown
+---
+name: reviewer
+description: Review a change without modifying it
+mode: subagent
+permissions:
+  - deny write
+  - deny edit
+  - deny bash
+  - deny webfetch
+---
+```
+
+Each entry is `<allow|deny|ask> <tool> [target]`, split on whitespace, so a multi-word target such as `rm -rf /**` cannot be written here and belongs in the TOML `[permissions]` block instead.
+
+| Declaration | Effect in the subagent |
+|-------------|------------------------|
+| `allow <tool>` | Authorizes the tool with no approval prompt. |
+| `deny <tool>` | Removes the tool from the catalog entirely — the subagent is never told it exists. |
+| `deny <tool> <target>` | Keeps the tool; precedence decides each call, so the narrower rule wins. |
+| `ask <tool>` | Refused. A subagent cannot reach a human, and the denial says the prompt was unreachable rather than pretending to be a plain `deny`. |
+
+**Ceilings a declaration cannot raise.** A declaration only narrows. An `allow` naming a tool the parent does not hold, or one the operator's `[permissions]` block denies outright, fails the delegation and names the offending tool rather than silently clamping it. Configured rules always reach the subagent: a configured `deny` or `ask` holds there even against a declared `allow`, while a configured `allow` grants a subagent nothing it did not declare for itself.
+
+Built-in `explore` ships with `deny write`, `deny edit`, `deny bash` and `deny webfetch`, so it stays read-only across upgrades. Granting `bash` to a subagent grants the same unconfined shell described under "Persistence and security".
+
 ## Persistence and security
 
 Credentials live in `auth.json` under the selected config home, keyed by provider. Each
@@ -137,7 +171,9 @@ Mutable runtime state lives under `[options].data_dir` or `${XDG_DATA_HOME:-~/.l
 - Project-scoped permission grants.
 - The last model and reasoning effort chosen in the terminal UI. A new session reuses them only when neither a CLI flag nor configuration names a model.
 
-Credential and runtime-state directories/files are created with restrictive Unix permissions. CLI diagnostics and transport errors are designed to avoid exposing secret values. Native filesystem operations are confined beneath the project root, and process tools remain permission-gated and bounded.
+Credential and runtime-state directories/files are created with restrictive Unix permissions. CLI diagnostics and transport errors are designed to avoid exposing secret values. The native filesystem tools — `read`, `write`, `edit`, `list`, `search`, `grep`, `glob` — are confined beneath the project root.
+
+`bash` is not. It is permission-gated and time-bounded, and it starts in the project root, but a granted command can still reach paths outside it. The `[permissions]` rules are the only bound on what it runs, and they are pattern matching over the command line rather than containment: they see through chained commands, wrappers such as `sudo`, and `/bin/rm` versus `rm`, but a command written to obscure which binary it invokes can still evade them. Grant `bash` deliberately, and treat any `deny` rule on a path as unenforced against it.
 
 Hand-authored TOML is configuration, not a runtime database. Do not store mutable sessions or grants in TOML.
 
@@ -183,7 +219,7 @@ nix develop --no-pure-eval -c just verify
 ## Known limitations
 
 - `agens models` is reserved in the command surface but currently reports that the capability is unavailable.
-- The production tool catalog currently wires native tools and configured MCP tools. Skill discovery and sub-agent contracts exist in `agens-tools` but are not exposed as production tools yet.
+- The production tool catalog wires native tools, configured MCP tools, and the `skill` and `task` tools. A delegated subagent reaches native tools only; MCP tools are not passed through to it.
 - TUI model and reasoning-effort palettes are not implemented; use configuration or `agens chat --model` for model selection.
 - Packaging, release automation, and editor protocol integrations are not provided.
 
