@@ -593,10 +593,14 @@ pub fn configured_permission_rules(
         .collect()
 }
 
+/// Qualifies a bare configured tool name. Each name maps to the tool it
+/// actually names: `edit` and `write` are separately registered tools, so a
+/// rule naming one must never be retargeted at the other.
 fn configured_tool_name(name: &str) -> Result<String, CliError> {
     match name {
         "read" => Ok("native::read".to_owned()),
-        "write" | "edit" => Ok("native::write".to_owned()),
+        "write" => Ok("native::write".to_owned()),
+        "edit" => Ok("native::edit".to_owned()),
         "list" => Ok("native::list".to_owned()),
         "search" => Ok("native::search".to_owned()),
         "bash" => Ok("native::bash".to_owned()),
@@ -815,6 +819,61 @@ mod tests {
                 "deny bash({target_pattern}) should have denied {command:?}, got {outcome:?}"
             );
         }
+    }
+
+    /// `edit` is a registered tool of its own, not a spelling of `write`, so a
+    /// configured rule naming it has to reach it. Resolving it to
+    /// `native::write` left `native::edit` unaffected by its own deny and
+    /// silently retargeted the rule at a different tool.
+    #[test]
+    fn a_configured_rule_naming_edit_reaches_the_edit_tool() {
+        let mut dispatcher = ToolDispatcher::new();
+        for tool in ["native::write", "native::edit"] {
+            dispatcher
+                .register_native(tool, ToolAccess::Write, StubBashTool)
+                .expect("native tool should register");
+        }
+        let dispatcher: SharedToolDispatcher = Arc::new(Mutex::new(dispatcher));
+
+        let policy = permission_policy(
+            &[ConfigPermissionRule {
+                scope: ConfigPermissionScope::Global,
+                decision: ConfigPermissionDecision::Deny,
+                tool_pattern: "edit".into(),
+                target_pattern: None,
+            }],
+            "project",
+            PermissionMode::Edit,
+            &dispatcher,
+            None,
+        )
+        .expect("a configured deny rule should resolve");
+
+        let decision = |tool: &str| {
+            dispatcher
+                .lock()
+                .expect("dispatcher should remain available")
+                .evaluate(
+                    &policy,
+                    &[],
+                    &PermissionSession::new(),
+                    ToolDispatchRequest::new(
+                        "project",
+                        tool,
+                        serde_json::json!({"target": "notes.md"}),
+                    ),
+                )
+                .expect("configured deny should evaluate")
+        };
+
+        assert!(
+            matches!(decision("native::edit"), ToolEvaluationOutcome::Denied),
+            "a configured deny naming edit must deny the edit tool"
+        );
+        assert!(
+            !matches!(decision("native::write"), ToolEvaluationOutcome::Denied),
+            "a configured deny naming edit must not deny a different tool"
+        );
     }
 
     struct StubBashTool;
