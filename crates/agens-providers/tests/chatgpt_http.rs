@@ -425,15 +425,15 @@ fn subscription_transport_accepts_terminal_variants_without_waiting_for_connecti
 
 #[test]
 fn subscription_transport_keeps_cancellation_and_timeout_distinct() {
-    for (behavior, cancellation, expected) in [
+    for (behavior, deadline, expected) in [
         (
             ServerBehavior::WaitForClientClose,
-            HeadlessTurnCancellation::new(),
+            None,
             HeadlessTurnPortError::Cancelled,
         ),
         (
             ServerBehavior::WaitForClientClose,
-            HeadlessTurnCancellation::with_deadline(Duration::from_millis(25)),
+            Some(Duration::from_millis(250)),
             HeadlessTurnPortError::TimedOut,
         ),
     ] {
@@ -442,6 +442,14 @@ fn subscription_transport_keeps_cancellation_and_timeout_distinct() {
         let mut server = LocalServer::start(behavior);
         let observed_request = server.take_observed_request();
         let mut provider = provider(&credentials, &server.base_url());
+        // The cancellation's deadline is captured at construction, so it must
+        // be built here rather than in the loop header, or the previous
+        // iteration's full round trip would be charged against this one's
+        // budget.
+        let cancellation = match deadline {
+            Some(deadline) => HeadlessTurnCancellation::with_deadline(deadline),
+            None => HeadlessTurnCancellation::new(),
+        };
         let canceller = cancellation.clone();
         let cancellation_thread = thread::spawn(move || {
             observed_request
