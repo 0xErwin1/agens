@@ -182,6 +182,11 @@ fn load_built_ins(
                 .diagnostics
                 .push(diagnostic(source.clone(), "agent model is unavailable"));
         }
+        for message in permission_diagnostics(agent) {
+            discovery
+                .diagnostics
+                .push(diagnostic(source.clone(), message));
+        }
         discovery.catalog.insert(agent.clone(), source);
     }
 }
@@ -240,6 +245,11 @@ fn load_root(
                         document.source().into(),
                         "agent model is unavailable",
                     ));
+                }
+                for message in permission_diagnostics(&agent) {
+                    discovery
+                        .diagnostics
+                        .push(diagnostic(document.source().into(), message));
                 }
                 if let Some(previous) = discovery
                     .catalog
@@ -358,6 +368,55 @@ fn diagnostic(path: PathBuf, message: impl Into<String>) -> AgentDiagnostic {
     }
 }
 
+/// Soft, load-time-only checks over an agent's `permission_rules`: neither
+/// finding rejects the definition, because both are only ever partial
+/// information at load time. A rule matching no native tool might still
+/// match an MCP tool discovered later on the primary path; a declared `ask`
+/// is only unreachable once this agent is actually delegated as a child.
+fn permission_diagnostics(agent: &AgentDefinition) -> Vec<String> {
+    let metadata = crate::NativeToolCatalog::metadata();
+    let mut diagnostics = Vec::new();
+
+    for rule in &agent.permission_rules {
+        let matches_a_native_tool = metadata.iter().any(|entry| {
+            let bare = entry
+                .qualified_name
+                .strip_prefix("native::")
+                .unwrap_or(entry.qualified_name.as_str());
+            rule.tool.matches(&entry.qualified_name) || rule.tool.matches(bare)
+        });
+        if !matches_a_native_tool {
+            diagnostics.push(format!(
+                "permission rule matches no known native tool: {}",
+                permission_rule_tool_label(&rule.tool)
+            ));
+        }
+    }
+
+    if agent.mode == AgentMode::Subagent
+        && agent
+            .permission_rules
+            .iter()
+            .any(|rule| rule.decision == PermissionDecision::Ask)
+    {
+        diagnostics.push(
+            "a subagent-mode definition declares ask, which is unreachable in a delegated \
+             child and resolves to deny"
+                .into(),
+        );
+    }
+
+    diagnostics
+}
+
+fn permission_rule_tool_label(pattern: &PermissionPattern) -> String {
+    match pattern {
+        PermissionPattern::Any => "*".to_owned(),
+        PermissionPattern::Exact(value) => value.clone(),
+        PermissionPattern::Glob(_) => pattern.glob_source().unwrap_or("*").to_owned(),
+    }
+}
+
 #[cfg(test)]
 mod with_appended_instructions_tests {
     use super::*;
@@ -434,5 +493,129 @@ mod with_appended_instructions_tests {
         let unchanged = catalog.clone().with_appended_instructions("");
 
         assert_eq!(unchanged, catalog);
+    }
+}
+
+#[cfg(test)]
+mod permission_diagnostics_tests {
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    static NEXT_CASE: AtomicUsize = AtomicUsize::new(0);
+
+    fn temp_root(name: &str) -> PathBuf {
+        let suffix = NEXT_CASE.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "agens-agent-permission-diagnostics-{name}-{}-{suffix}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_agent(root: &std::path::Path, name: &str, contents: &str) {
+        fs::write(root.join(format!("{name}.md")), contents).unwrap();
+    }
+
+    #[test]
+    fn a_permission_rule_matching_no_known_tool_is_retained_with_a_diagnostic() {
+        let root = temp_root("typo");
+        write_agent(
+            &root,
+            "typo-agent",
+            "---\nname: typo-agent\ndescription: probe\nmode: subagent\npermissions: [\"deny webfetc\"]\n---\nBody.\n",
+        );
+
+        let discovery = AgentCatalog::discover(&[], &PathBuf::from("/nonexistent"), &root).unwrap();
+
+        let agent = discovery
+            .catalog()
+            .agent("typo-agent")
+            .expect("a rule matching no tool must not reject the definition");
+        assert_eq!(agent.permission_rules.len(), 1);
+        assert!(
+            discovery
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.message().contains("webfetc")),
+            "expected a diagnostic naming the unmatched rule, got: {:?}",
+            discovery.diagnostics()
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_subagent_declaring_ask_is_retained_with_a_diagnostic() {
+        let root = temp_root("ask");
+        write_agent(
+            &root,
+            "ask-agent",
+            "---\nname: ask-agent\ndescription: probe\nmode: subagent\npermissions: [\"ask bash\"]\n---\nBody.\n",
+        );
+
+        let discovery = AgentCatalog::discover(&[], &PathBuf::from("/nonexistent"), &root).unwrap();
+
+        let agent = discovery
+            .catalog()
+            .agent("ask-agent")
+            .expect("a declared ask must not reject the definition");
+        assert_eq!(agent.permission_rules[0].decision, PermissionDecision::Ask);
+        assert!(
+            discovery
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.message().contains("unreachable")),
+            "expected a diagnostic about an unreachable ask, got: {:?}",
+            discovery.diagnostics()
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_declared_ask_on_an_all_mode_agent_is_not_flagged() {
+        let root = temp_root("ask-all");
+        write_agent(
+            &root,
+            "ask-all-agent",
+            "---\nname: ask-all-agent\ndescription: probe\nmode: all\npermissions: [\"ask bash\"]\n---\nBody.\n",
+        );
+
+        let discovery = AgentCatalog::discover(&[], &PathBuf::from("/nonexistent"), &root).unwrap();
+
+        assert!(
+            discovery
+                .diagnostics()
+                .iter()
+                .all(|diagnostic| !diagnostic.message().contains("unreachable")),
+            "an ask reachable on the primary path must not be flagged, got: {:?}",
+            discovery.diagnostics()
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_well_formed_declaration_produces_no_diagnostic() {
+        let root = temp_root("clean");
+        write_agent(
+            &root,
+            "clean-agent",
+            "---\nname: clean-agent\ndescription: probe\nmode: subagent\npermissions: [\"deny bash\"]\n---\nBody.\n",
+        );
+
+        let discovery = AgentCatalog::discover(&[], &PathBuf::from("/nonexistent"), &root).unwrap();
+
+        assert!(
+            discovery.diagnostics().is_empty(),
+            "a well-formed declaration must not produce a diagnostic, got: {:?}",
+            discovery.diagnostics()
+        );
+
+        fs::remove_dir_all(root).unwrap();
     }
 }

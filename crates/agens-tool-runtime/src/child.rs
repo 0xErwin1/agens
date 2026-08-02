@@ -22,6 +22,7 @@ use agens_tools::{
 };
 
 use crate::block_on_headless_turn;
+use crate::child_catalog::resolve_child_surface;
 use crate::runtime::production_child_tool_runtime;
 use agens_bootstrap::Bootstrap;
 use agens_core::DiscardCompletedTurnRepository;
@@ -156,10 +157,12 @@ pub fn run_production_task(
             parts: vec![MessagePart::Text(request.description().to_owned())],
         },
     ];
+    let surface =
+        resolve_child_surface(request.permission_rules()).map_err(|_| ChildRunError::Runtime)?;
     let (provider_tools, tool_runtime) = production_child_tool_runtime(
         project_root,
         bootstrap.tool_limits(),
-        dangerous_mode,
+        &surface,
         task_registry.clone(),
         execution_id,
     )
@@ -199,13 +202,16 @@ pub fn run_production_task(
             run_isolated_task_turn(
                 provider,
                 tool_runtime,
-                project_root,
-                dangerous_mode,
-                cancellation,
-                progress,
-                TaskMailboxContext {
-                    registry: task_registry.clone(),
-                    target: TaskMessageTarget::Execution(execution_id),
+                IsolatedTaskTurnContext {
+                    project_root,
+                    dangerous_mode,
+                    cancellation,
+                    progress,
+                    surface_rules: &surface.rules,
+                    mailbox: TaskMailboxContext {
+                        registry: task_registry.clone(),
+                        target: TaskMessageTarget::Execution(execution_id),
+                    },
                 },
             )
         }
@@ -231,13 +237,16 @@ pub fn run_production_task(
             run_isolated_task_turn(
                 provider,
                 tool_runtime,
-                project_root,
-                dangerous_mode,
-                cancellation,
-                progress,
-                TaskMailboxContext {
-                    registry: task_registry.clone(),
-                    target: TaskMessageTarget::Execution(execution_id),
+                IsolatedTaskTurnContext {
+                    project_root,
+                    dangerous_mode,
+                    cancellation,
+                    progress,
+                    surface_rules: &surface.rules,
+                    mailbox: TaskMailboxContext {
+                        registry: task_registry.clone(),
+                        target: TaskMessageTarget::Execution(execution_id),
+                    },
                 },
             )
         }
@@ -264,13 +273,16 @@ pub fn run_production_task(
             run_isolated_task_turn(
                 provider,
                 tool_runtime,
-                project_root,
-                dangerous_mode,
-                cancellation,
-                progress,
-                TaskMailboxContext {
-                    registry: task_registry.clone(),
-                    target: TaskMessageTarget::Execution(execution_id),
+                IsolatedTaskTurnContext {
+                    project_root,
+                    dangerous_mode,
+                    cancellation,
+                    progress,
+                    surface_rules: &surface.rules,
+                    mailbox: TaskMailboxContext {
+                        registry: task_registry.clone(),
+                        target: TaskMessageTarget::Execution(execution_id),
+                    },
                 },
             )
         }
@@ -365,6 +377,15 @@ struct TaskMailboxContext {
     target: TaskMessageTarget,
 }
 
+struct IsolatedTaskTurnContext<'a> {
+    project_root: &'a Path,
+    dangerous_mode: bool,
+    cancellation: &'a HeadlessTurnCancellation,
+    progress: Option<&'a TurnProgressSink>,
+    surface_rules: &'a [PermissionRule],
+    mailbox: TaskMailboxContext,
+}
+
 /// Runs a subagent's isolated turn with no session attempt of its own, so the
 /// facts it emits carry no `session_id`/`attempt_id`.
 fn configured_task_max_iterations(registry: &TaskExecutionRegistry) -> usize {
@@ -374,34 +395,34 @@ fn configured_task_max_iterations(registry: &TaskExecutionRegistry) -> usize {
 fn run_isolated_task_turn<P>(
     provider: P,
     tool_runtime: SharedToolDispatcher,
-    project_root: &Path,
-    dangerous_mode: bool,
-    cancellation: &HeadlessTurnCancellation,
-    progress: Option<&TurnProgressSink>,
-    mailbox: TaskMailboxContext,
+    context: IsolatedTaskTurnContext<'_>,
 ) -> Result<String, ChildRunError>
 where
     P: ProgressAwareProvider + Send,
 {
+    let IsolatedTaskTurnContext {
+        project_root,
+        dangerous_mode,
+        cancellation,
+        progress,
+        surface_rules,
+        mailbox,
+    } = context;
     let max_iterations = configured_task_max_iterations(&mailbox.registry);
     let mut provider = TaskMailboxProvider::new(provider, Some(mailbox.registry), mailbox.target);
-    let policy = PermissionPolicy::new(
-        PermissionMode::Edit,
-        [
-            "native::read",
-            "native::task_control",
-            "native::task_message",
-        ]
-        .into_iter()
-        .map(|tool| {
-            PermissionRule::global(
-                PermissionDecision::Allow,
-                PermissionPattern::Exact(tool.into()),
-                PermissionPattern::Any,
-            )
-        })
-        .collect(),
+    let mut rules = surface_rules.to_vec();
+    rules.extend(
+        ["native::task_control", "native::task_message"]
+            .into_iter()
+            .map(|tool| {
+                PermissionRule::global(
+                    PermissionDecision::Allow,
+                    PermissionPattern::Exact(tool.into()),
+                    PermissionPattern::Any,
+                )
+            }),
     );
+    let policy = PermissionPolicy::new(PermissionMode::Edit, rules);
     let grants = Arc::new(Mutex::new(Vec::new()));
     let session = PermissionSession::new();
     let pending = Arc::new(Mutex::new(BTreeMap::new()));
@@ -535,13 +556,18 @@ mod tests {
                 requests: Arc::clone(&requests),
             },
             Arc::new(Mutex::new(dispatcher)),
-            Path::new("."),
-            false,
-            &HeadlessTurnCancellation::new(),
-            None,
-            TaskMailboxContext {
-                registry,
-                target: TaskMessageTarget::Main,
+            IsolatedTaskTurnContext {
+                project_root: Path::new("."),
+                dangerous_mode: false,
+                cancellation: &HeadlessTurnCancellation::new(),
+                progress: None,
+                surface_rules: &crate::child_catalog::resolve_child_surface(&[])
+                    .unwrap()
+                    .rules,
+                mailbox: TaskMailboxContext {
+                    registry,
+                    target: TaskMessageTarget::Main,
+                },
             },
         );
 
@@ -671,13 +697,18 @@ mod tests {
                 calls: AtomicUsize::new(0),
             },
             Arc::new(Mutex::new(dispatcher)),
-            Path::new("."),
-            false,
-            &HeadlessTurnCancellation::new(),
-            None,
-            TaskMailboxContext {
-                registry,
-                target: TaskMessageTarget::Main,
+            IsolatedTaskTurnContext {
+                project_root: Path::new("."),
+                dangerous_mode: false,
+                cancellation: &HeadlessTurnCancellation::new(),
+                progress: None,
+                surface_rules: &crate::child_catalog::resolve_child_surface(&[])
+                    .unwrap()
+                    .rules,
+                mailbox: TaskMailboxContext {
+                    registry,
+                    target: TaskMessageTarget::Main,
+                },
             },
         );
 
@@ -698,5 +729,271 @@ mod tests {
             output.contains("facts=true"),
             "expected denial_facts to accompany the denial, got: {output}"
         );
+    }
+
+    struct SingleToolCallProvider {
+        calls: std::sync::atomic::AtomicUsize,
+        name: String,
+        input: String,
+    }
+
+    impl TurnProvider for SingleToolCallProvider {
+        fn next_parts(
+            &mut self,
+            events: &[TurnEvent],
+            _cancellation: &HeadlessTurnCancellation,
+        ) -> impl std::future::Future<Output = Result<Vec<MessagePart>, HeadlessTurnPortError>> + Send
+        {
+            use std::sync::atomic::Ordering;
+
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            let parts = if call == 0 {
+                vec![MessagePart::ToolCall {
+                    id: "call-1".into(),
+                    name: self.name.clone(),
+                    input: self.input.clone(),
+                }]
+            } else {
+                let content = events
+                    .iter()
+                    .find_map(|event| match event {
+                        TurnEvent::ToolResult(MessagePart::ToolResult { content, .. }) => {
+                            Some(content.clone())
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                vec![MessagePart::Text(content)]
+            };
+
+            std::future::ready(Ok(parts))
+        }
+    }
+
+    impl ProgressAwareProvider for SingleToolCallProvider {
+        fn with_progress_sink(self, _progress: TurnProgressSink) -> Self {
+            self
+        }
+    }
+
+    fn single_call_turn(
+        project_root: &Path,
+        declarations: &[PermissionRule],
+        dangerous_mode: bool,
+        tool_name: &str,
+        input: &str,
+    ) -> String {
+        let surface = crate::child_catalog::resolve_child_surface(declarations).unwrap();
+        let registry = TaskExecutionRegistry::with_limits(agens_tools::TaskExecutionLimits {
+            max_iterations: 3,
+            max_concurrency: 1,
+            max_output_chars: 4_096,
+        });
+        let execution_id = registry
+            .admit(agens_tools::TaskLaunchMode::Foreground)
+            .unwrap();
+        let (_, tool_runtime) = production_child_tool_runtime(
+            project_root,
+            agens_config::ToolLimitSettings::default(),
+            &surface,
+            registry.clone(),
+            execution_id,
+        )
+        .unwrap();
+
+        match run_isolated_task_turn(
+            SingleToolCallProvider {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                name: tool_name.to_owned(),
+                input: input.to_owned(),
+            },
+            tool_runtime,
+            IsolatedTaskTurnContext {
+                project_root,
+                dangerous_mode,
+                cancellation: &HeadlessTurnCancellation::new(),
+                progress: None,
+                surface_rules: &surface.rules,
+                mailbox: TaskMailboxContext {
+                    registry,
+                    target: TaskMessageTarget::Main,
+                },
+            },
+        ) {
+            Ok(output) => output,
+            Err(_) => panic!("a single scripted tool call must not fail the turn"),
+        }
+    }
+
+    #[test]
+    fn an_agent_with_no_declarations_reaches_the_inherited_read_class_tools() {
+        let temporary = agens_fixtures::session_directory("no-declarations");
+        let project_root = temporary.join("project");
+
+        let output = single_call_turn(
+            &project_root,
+            &[],
+            false,
+            "native::grep",
+            r#"{"pattern":"anything"}"#,
+        );
+
+        assert!(
+            !output.contains("permission denied"),
+            "an inherited read-class tool must not be denied, got: {output}"
+        );
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn a_read_only_agent_is_denied_write_regardless_of_dangerous_mode() {
+        let read_only_rules = [
+            PermissionRule::global(
+                PermissionDecision::Deny,
+                PermissionPattern::glob("write").unwrap(),
+                PermissionPattern::Any,
+            ),
+            PermissionRule::global(
+                PermissionDecision::Deny,
+                PermissionPattern::glob("edit").unwrap(),
+                PermissionPattern::Any,
+            ),
+            PermissionRule::global(
+                PermissionDecision::Deny,
+                PermissionPattern::glob("bash").unwrap(),
+                PermissionPattern::Any,
+            ),
+            PermissionRule::global(
+                PermissionDecision::Deny,
+                PermissionPattern::glob("webfetch").unwrap(),
+                PermissionPattern::Any,
+            ),
+        ];
+
+        for dangerous_mode in [false, true] {
+            let temporary =
+                agens_fixtures::session_directory(&format!("read-only-dangerous-{dangerous_mode}"));
+            let project_root = temporary.join("project");
+
+            let output = single_call_turn(
+                &project_root,
+                &read_only_rules,
+                dangerous_mode,
+                "native::write",
+                r#"{"path":"denied.txt","content":"x"}"#,
+            );
+
+            assert!(
+                output.contains("permission denied"),
+                "a declared-omitted tool must stay denied with dangerous_mode={dangerous_mode}, \
+                 got: {output}"
+            );
+
+            std::fs::remove_dir_all(temporary).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_write_granted_agent_actually_writes_the_file() {
+        let temporary = agens_fixtures::session_directory("write-granted");
+        let project_root = temporary.join("project");
+
+        let output = single_call_turn(
+            &project_root,
+            &[
+                PermissionRule::global(
+                    PermissionDecision::Allow,
+                    PermissionPattern::glob("write").unwrap(),
+                    PermissionPattern::Any,
+                ),
+                PermissionRule::global(
+                    PermissionDecision::Allow,
+                    PermissionPattern::glob("edit").unwrap(),
+                    PermissionPattern::Any,
+                ),
+            ],
+            false,
+            "native::write",
+            r#"{"path":"granted.txt","content":"hello from a declared allow"}"#,
+        );
+
+        assert!(
+            !output.contains("permission denied"),
+            "a declared allow write must not be denied, got: {output}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(project_root.join("granted.txt")).unwrap(),
+            "hello from a declared allow"
+        );
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn a_bash_granted_agent_executes_unattended() {
+        let temporary = agens_fixtures::session_directory("bash-granted");
+        let project_root = temporary.join("project");
+
+        let output = single_call_turn(
+            &project_root,
+            &[PermissionRule::global(
+                PermissionDecision::Allow,
+                PermissionPattern::glob("bash").unwrap(),
+                PermissionPattern::Any,
+            )],
+            false,
+            "native::bash",
+            r#"{"command":"echo marker > bash-marker.txt"}"#,
+        );
+
+        assert!(
+            !output.contains("permission denied"),
+            "a declared allow bash must not be denied, got: {output}"
+        );
+        assert!(
+            project_root.join("bash-marker.txt").exists(),
+            "the declared-allow bash call must have actually run"
+        );
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn built_in_explore_still_cannot_write_edit_bash_or_fetch_after_inheriting_the_parent_surface()
+    {
+        let temporary = agens_fixtures::session_directory("explore-narrowing");
+        let bootstrap = agens_fixtures::session_bootstrap(&temporary, &[]);
+        let project_root = agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap);
+        let catalog =
+            agens_agents::discover_agent_catalog(&bootstrap, &project_root, None).unwrap();
+        let explore = catalog
+            .agent("explore")
+            .expect("explore is a built-in agent");
+
+        let surface = resolve_child_surface(&explore.permission_rules).unwrap();
+        let tool_names = surface
+            .tools
+            .iter()
+            .map(|entry| entry.qualified_name.clone())
+            .collect::<Vec<_>>();
+
+        for denied in [
+            "native::write",
+            "native::edit",
+            "native::bash",
+            "native::webfetch",
+        ] {
+            assert!(
+                !tool_names.contains(&denied.to_owned()),
+                "{denied} must be absent from explore's inherited surface, got: {tool_names:?}"
+            );
+        }
+        assert!(
+            tool_names.contains(&"native::read".to_owned()),
+            "explore must still inherit the read-class tools it relies on"
+        );
+
+        std::fs::remove_dir_all(temporary).unwrap();
     }
 }

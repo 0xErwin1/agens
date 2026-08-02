@@ -1,6 +1,6 @@
 use agens_core::{
-    AgentDefinition, AgentMode, Error, HeadlessTaskTerminal, RequestConfig, TaskProviderFailure,
-    TaskSkillRejection,
+    AgentDefinition, AgentMode, Error, HeadlessTaskTerminal, PermissionRule, RequestConfig,
+    TaskProviderFailure, TaskSkillRejection,
 };
 use serde_json::Value;
 use std::{
@@ -858,6 +858,7 @@ pub struct TaskTurnRequest {
     skills: Vec<TaskSkill>,
     description: String,
     fallback_warning: Option<String>,
+    permission_rules: Vec<PermissionRule>,
 }
 
 impl TaskTurnRequest {
@@ -887,6 +888,10 @@ impl TaskTurnRequest {
 
     pub fn description(&self) -> &str {
         &self.description
+    }
+
+    pub fn permission_rules(&self) -> &[PermissionRule] {
+        &self.permission_rules
     }
 }
 
@@ -1199,6 +1204,7 @@ impl<R: TaskRunner> TaskTool<R> {
             skills,
             description: invocation.description,
             fallback_warning,
+            permission_rules: agent.permission_rules.clone(),
         })
     }
 

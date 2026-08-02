@@ -217,36 +217,6 @@ pub fn production_tool_runtime_with_parent_task_runner<R: TaskRunner>(
     Ok((provider_tools.into_values().collect(), runtime.dispatcher))
 }
 
-fn production_read_only_tool_runtime(
-    project_root: &Path,
-    tool_limits: ToolLimitSettings,
-) -> Result<(Vec<OpenAiFunctionTool>, SharedToolDispatcher), CliError> {
-    let catalog = Arc::new(Mutex::new(NativeToolCatalog::new(open_native_tools(
-        project_root,
-        tool_limits,
-    )?)));
-    let metadata = NativeToolCatalog::metadata()
-        .into_iter()
-        .find(|metadata| metadata.qualified_name == "native::read")
-        .ok_or_else(|| CliError::configuration("native read tool is unavailable"))?;
-    let name = native_model_tool_name(&metadata.qualified_name)?;
-    let tool = OpenAiFunctionTool::new(name.clone(), metadata.description, metadata.input_schema)
-        .map_err(|_| CliError::configuration("native tools are unavailable"))?;
-    let mut dispatcher = ToolDispatcher::new();
-    dispatcher
-        .register_native(
-            "native::read",
-            metadata.access,
-            RegisteredNativeTool {
-                name: "native::read".into(),
-                catalog,
-            },
-        )
-        .map_err(|_| CliError::configuration("tool catalog is invalid"))?;
-
-    Ok((vec![tool], Arc::new(Mutex::new(dispatcher))))
-}
-
 pub fn production_dangerous_child_tool_runtime(
     project_root: &Path,
     tool_limits: ToolLimitSettings,
@@ -292,15 +262,39 @@ pub fn production_dangerous_child_tool_runtime(
 pub fn production_child_tool_runtime(
     project_root: &Path,
     tool_limits: ToolLimitSettings,
-    dangerous_mode: bool,
+    surface: &crate::child_catalog::ChildToolSurface,
     task_registry: TaskExecutionRegistry,
     execution_id: agens_tools::TaskExecutionId,
 ) -> Result<(Vec<OpenAiFunctionTool>, SharedToolDispatcher), CliError> {
-    let (mut provider_tools, dispatcher) = if dangerous_mode {
-        production_dangerous_child_tool_runtime(project_root, tool_limits)
-    } else {
-        production_read_only_tool_runtime(project_root, tool_limits)
-    }?;
+    let catalog = Arc::new(Mutex::new(NativeToolCatalog::new(open_native_tools(
+        project_root,
+        tool_limits,
+    )?)));
+    let mut provider_tools = Vec::with_capacity(surface.tools.len());
+    let mut dispatcher = ToolDispatcher::new();
+
+    for metadata in &surface.tools {
+        let model_name = native_model_tool_name(&metadata.qualified_name)?;
+        provider_tools.push(
+            OpenAiFunctionTool::new(
+                model_name,
+                metadata.description.clone(),
+                metadata.input_schema.clone(),
+            )
+            .map_err(|_| CliError::configuration("native tools are unavailable"))?,
+        );
+        dispatcher
+            .register_native(
+                metadata.qualified_name.clone(),
+                metadata.access,
+                RegisteredNativeTool {
+                    name: metadata.qualified_name.clone(),
+                    catalog: Arc::clone(&catalog),
+                },
+            )
+            .map_err(|_| CliError::configuration("tool catalog is invalid"))?;
+    }
+
     provider_tools.push(
         OpenAiFunctionTool::new(
             "task_control",
@@ -317,10 +311,7 @@ pub fn production_child_tool_runtime(
         )
         .map_err(|_| CliError::configuration("task message tool is unavailable"))?,
     );
-    let mut dispatcher_guard = dispatcher
-        .lock()
-        .map_err(|_| CliError::configuration("tool catalog is unavailable"))?;
-    dispatcher_guard
+    dispatcher
         .register_native(
             "native::task_control",
             agens_core::ToolAccess::Write,
@@ -330,16 +321,15 @@ pub fn production_child_tool_runtime(
             ),
         )
         .map_err(|_| CliError::configuration("tool catalog is invalid"))?;
-    dispatcher_guard
+    dispatcher
         .register_native(
             "native::task_message",
             agens_core::ToolAccess::Write,
             TaskMessageTool::new(task_registry, TaskMessageSource::Execution(execution_id)),
         )
         .map_err(|_| CliError::configuration("tool catalog is invalid"))?;
-    drop(dispatcher_guard);
 
-    Ok((provider_tools, dispatcher))
+    Ok((provider_tools, Arc::new(Mutex::new(dispatcher))))
 }
 
 #[cfg(test)]
@@ -489,30 +479,122 @@ mod tests {
         }
         drop(dispatcher);
 
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn child_catalog_inherits_the_parents_surface_by_default() {
+        let temporary = tui_session_directory("child-catalog-default");
+        let project_root = temporary.join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+
+        let surface = crate::child_catalog::resolve_child_surface(&[]).unwrap();
         let task_registry = TaskExecutionRegistry::new();
         let execution_id = task_registry.admit(TaskLaunchMode::Foreground).unwrap();
-        let (mode_off_tools, mode_off_dispatcher) = production_child_tool_runtime(
+        let (tools, dispatcher) = production_child_tool_runtime(
             &project_root,
             ToolLimitSettings::default(),
-            false,
+            &surface,
             task_registry,
             execution_id,
         )
         .unwrap();
+
         assert_eq!(
-            mode_off_tools
-                .iter()
-                .map(|tool| tool.name())
-                .collect::<Vec<_>>(),
-            ["read", "task_control", "task_message"]
+            tools.iter().map(|tool| tool.name()).collect::<Vec<_>>(),
+            [
+                "read",
+                "write",
+                "edit",
+                "list",
+                "search",
+                "grep",
+                "glob",
+                "bash",
+                "git_read",
+                "webfetch",
+                "task_control",
+                "task_message",
+            ]
         );
-        assert!(
-            mode_off_dispatcher
-                .lock()
-                .unwrap()
-                .canonical_identity("native::read")
-                .is_some()
+        let dispatcher = dispatcher.lock().unwrap();
+        for name in ["native::read", "native::write", "native::bash"] {
+            assert!(
+                dispatcher.canonical_identity(name).is_some(),
+                "{name} must be reachable when nothing narrows the inherited surface"
+            );
+        }
+        drop(dispatcher);
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn child_catalog_omits_a_declared_deny() {
+        let temporary = tui_session_directory("child-catalog-narrowed");
+        let project_root = temporary.join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+
+        let surface = crate::child_catalog::resolve_child_surface(&[
+            PermissionRule::global(
+                PermissionDecision::Deny,
+                PermissionPattern::glob("write").unwrap(),
+                PermissionPattern::Any,
+            ),
+            PermissionRule::global(
+                PermissionDecision::Deny,
+                PermissionPattern::glob("edit").unwrap(),
+                PermissionPattern::Any,
+            ),
+            PermissionRule::global(
+                PermissionDecision::Deny,
+                PermissionPattern::glob("bash").unwrap(),
+                PermissionPattern::Any,
+            ),
+            PermissionRule::global(
+                PermissionDecision::Deny,
+                PermissionPattern::glob("webfetch").unwrap(),
+                PermissionPattern::Any,
+            ),
+        ])
+        .unwrap();
+        let task_registry = TaskExecutionRegistry::new();
+        let execution_id = task_registry.admit(TaskLaunchMode::Foreground).unwrap();
+        let (tools, dispatcher) = production_child_tool_runtime(
+            &project_root,
+            ToolLimitSettings::default(),
+            &surface,
+            task_registry,
+            execution_id,
+        )
+        .unwrap();
+
+        assert_eq!(
+            tools.iter().map(|tool| tool.name()).collect::<Vec<_>>(),
+            [
+                "read",
+                "list",
+                "search",
+                "grep",
+                "glob",
+                "git_read",
+                "task_control",
+                "task_message",
+            ]
         );
+        let dispatcher = dispatcher.lock().unwrap();
+        for name in [
+            "native::write",
+            "native::edit",
+            "native::bash",
+            "native::webfetch",
+        ] {
+            assert!(
+                dispatcher.canonical_identity(name).is_none(),
+                "{name} must be absent from a narrowed child catalog"
+            );
+        }
+        drop(dispatcher);
 
         std::fs::remove_dir_all(temporary).unwrap();
     }
