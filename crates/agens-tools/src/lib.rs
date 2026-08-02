@@ -29,6 +29,7 @@ use serde::de::{self, DeserializeSeed, Deserializer, IgnoredAny, MapAccess, Visi
 use serde_json::Value;
 
 mod agents;
+mod ask_user;
 mod capabilities;
 mod git_read;
 mod http_mcp;
@@ -43,6 +44,7 @@ pub use agents::{
     AgentCatalog, AgentDiagnostic, AgentDiscovery, AgentModelValidationError, AgentModelValidator,
     AgentShadow,
 };
+pub use ask_user::AskUserTool;
 pub use capabilities::{EffectiveCapabilityDescriptor, EffectiveCapabilitySet};
 pub use git_read::{GitReadInput, GitReadOperation};
 pub use http_mcp::{McpHttpTransport, McpSseTransport};

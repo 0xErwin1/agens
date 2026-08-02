@@ -431,6 +431,7 @@ mod tests {
     };
     use agens_agents::ensure_active_agent_runtime;
     use agens_callcount::{Counts, counts as call_counts, reset as reset_call_counts};
+    use agens_core::ask_user::UnavailableAskUserPort;
     use agens_headless::{HeadlessChatRequest, apply_session_to_request};
     use agens_session::attempt::attempt_failure_status;
     use agens_session::turns::{completed_session_turn_from_events, next_session_metadata};
@@ -502,6 +503,7 @@ mod tests {
             agens_core::RequestConfig::default(),
             "confinement-check".to_owned(),
             false,
+            Box::new(UnavailableAskUserPort),
         )
         .unwrap();
         ensure_active_agent_runtime(&resume_bootstrap, &session, &runtime.dispatcher).unwrap();
@@ -1037,6 +1039,7 @@ mod tests {
             agens_core::RequestConfig::default(),
             "abc12345".to_owned(),
             false,
+            Box::new(UnavailableAskUserPort),
         )
         .unwrap();
         ensure_active_agent_runtime(&bootstrap, &session, &runtime.dispatcher).unwrap();

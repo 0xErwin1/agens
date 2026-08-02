@@ -202,6 +202,26 @@ impl OverlaySizing {
         })
     }
 
+    /// Centered overlay for a structured question set and its context pane.
+    ///
+    /// Wider and taller than [`Self::dialog`] because the frame has to hold a
+    /// header, an option list with a sub-line under every option, the action
+    /// rows, and — above the two-column threshold — a context pane beside all
+    /// of that. At `dialog()`'s 96 columns the context pane would never be
+    /// wide enough to show a diagram without cutting it.
+    pub(crate) const fn ask_user() -> Self {
+        Self {
+            width_pct: 90,
+            min_width: 48,
+            max_width: 120,
+            max_height: 24,
+            v_margin: 0,
+            h_pad: 1,
+            v_pad: 0,
+            anchor: OverlayAnchor::Center,
+        }
+    }
+
     /// Full-width strip pinned directly above the composer.
     pub(crate) const fn palette(composer: Rect) -> Self {
         Self {
@@ -436,7 +456,7 @@ fn top_border(width: u16, title: &str) -> Line<'static> {
 }
 
 /// Truncates to at most `budget` display columns, marking the cut with `…`.
-pub(super) fn truncate_columns(text: &str, budget: usize) -> String {
+pub(crate) fn truncate_columns(text: &str, budget: usize) -> String {
     if budget == 0 {
         return String::new();
     }

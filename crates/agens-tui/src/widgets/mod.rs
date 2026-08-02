@@ -23,7 +23,7 @@ pub(crate) use glyph::StatusGlyph;
 pub(crate) use hyperlink::{apply_hyperlinks, hyperlinks_enabled};
 pub(crate) use overlay::{
     OverlayConfig, OverlayFrame, OverlayKind, OverlayLayout, OverlayShell, OverlayShortcut,
-    OverlaySizing,
+    OverlaySizing, truncate_columns,
 };
 pub(crate) use overlay_list::{OverlayList, OverlayRow};
 pub(crate) use role_palette::RolePalette;
