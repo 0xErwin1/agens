@@ -98,8 +98,6 @@ The headless `--system` flag is the one exception: it fully **replaces** the bas
 
 The built-in `explore` and `general` subagents never receive the base layer: their one-line role prompts already state an identity, and they are unreachable by `[agent].system_prompt`, so composing there would widen the breaking surface with no benefit.
 
-Two optional instruction files are appended after the agent prompt, in a fixed order.
-
 | Source | Location |
 |---|---|
 | Global | `AGENTS.md` beside the resolved global config (honors `$AGENS_CONFIG_HOME` / `$XDG_CONFIG_HOME`) |
