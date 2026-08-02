@@ -1668,17 +1668,59 @@ fn thinking_lines(
 /// short heading, so the first line is both the cheapest summary available and
 /// the one the expanded form shows first.
 fn thinking_summary(text: &str, content_width: usize) -> Option<String> {
-    let heading = text
-        .lines()
-        .map(|line| line.trim().trim_matches(['#', '*', '_', '`', ' ']).trim())
-        .find(|line| !line.is_empty())?;
+    let heading = opening_bold_span(text).or_else(|| {
+        text.lines()
+            .map(|line| line.trim().trim_matches(['#', '_', '`', ' ']).trim())
+            .find(|line| !line.is_empty())
+    })?;
 
     let budget = content_width.saturating_sub(THINKING_SUMMARY_CHROME);
     (budget > 0).then(|| bounded_single_line(heading, budget))
 }
 
+/// The `**bold**` title a stretch of reasoning opens with, when it opens with one.
+///
+/// Providers title each stretch and then emit the next one straight after it, so
+/// several titles routinely share a line. Reading the line would run them
+/// together into a sentence nobody wrote — `A****B****C` — which is what the
+/// first version of this did.
+fn opening_bold_span(text: &str) -> Option<&str> {
+    let (heading, _) = text.trim_start().strip_prefix("**")?.split_once("**")?;
+    let heading = heading.trim();
+    (!heading.is_empty()).then_some(heading)
+}
+
 /// Columns the collapsed thought's own label and separator cost the summary.
 const THINKING_SUMMARY_CHROME: usize = 12;
+
+#[cfg(test)]
+mod thinking_summary_tests {
+    use super::*;
+
+    /// Providers title each stretch of reasoning and emit the next straight
+    /// after it, so several titles share one line. Reading the line ran them
+    /// together into `A****B****C`.
+    #[test]
+    fn back_to_back_titles_summarize_as_the_first_one_alone() {
+        assert_eq!(
+            thinking_summary(
+                "**Clarifying worker cancel rationale**Analyzing task routing**Reassessing writes**",
+                80
+            )
+            .as_deref(),
+            Some("Clarifying worker cancel rationale")
+        );
+    }
+
+    #[test]
+    fn unformatted_reasoning_summarizes_as_its_first_line() {
+        assert_eq!(
+            thinking_summary("Checking the timeout\nthe rest of it", 80).as_deref(),
+            Some("Checking the timeout")
+        );
+        assert_eq!(thinking_summary("   \n\n", 80), None);
+    }
+}
 
 pub(super) fn detail_lines(
     events: &[TuiRuntimeEvent],

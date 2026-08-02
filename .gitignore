@@ -3,7 +3,8 @@
 .codegraph/
 .logs/
 .direnv/
-/.devenv/
+.devenv/
+.claude/
 
 # Build outputs
 /agens

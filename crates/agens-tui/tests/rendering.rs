@@ -1169,20 +1169,22 @@ fn user_turns_have_a_distinct_identity_rail_and_compact_separation() {
 
 #[test]
 fn live_assistant_content_uses_the_user_body_column_at_normal_width() {
-    assert_conversation_content_column(56, false);
+    assert_conversation_content_column(60, false);
 }
 
 #[test]
 fn restored_assistant_content_uses_the_user_body_column_at_narrow_width() {
-    assert_conversation_content_column(24, true);
+    assert_conversation_content_column(28, true);
 }
 
 fn assert_conversation_content_column(width: u16, restored: bool) {
     let terminal = Terminal::new(TestBackend::new(width, 40)).unwrap();
     let mut renderer = RatatuiRenderer::new(terminal);
     let mut tui = Tui::new(FakeEngine);
-    // Four columns of transcript margin plus the two-column shared row gutter.
-    let content_width = usize::from(width - 6);
+    // Four columns of transcript margin, the two-column shared row gutter, and
+    // the four the transcript now keeps on the right so prose cannot outrun the
+    // composer below it.
+    let content_width = usize::from(width - 10);
     let first_line = format!(
         "ASSISTANT_FIRST{}",
         "x".repeat(content_width - "ASSISTANT_FIRST".len())
@@ -1859,10 +1861,12 @@ fn collapsed_thinking_occupies_exactly_one_row_and_names_the_finished_thought() 
     );
 
     let thought_row = rendered_row(&renderer, "Thought");
-    assert_eq!(
-        rendered_line(&renderer, thought_row).trim(),
-        "Thought · Checking the timeout",
-        "the opening line becomes the label, so one thought reads apart from the next"
+    assert!(
+        rendered_line(&renderer, thought_row)
+            .trim()
+            .ends_with("Thought · Checking the timeout"),
+        "the opening line becomes the label, so one thought reads apart from the next: {:?}",
+        rendered_line(&renderer, thought_row)
     );
     let rows = transcript_rows(&renderer);
     assert_eq!(
@@ -2275,6 +2279,7 @@ fn no_header_row_and_the_working_indicator_lives_at_the_end_of_the_chat() {
     let text = rendered_text(&renderer);
     assert!(
         rendered_line(&renderer, 0)
+            .trim_end()
             .chars()
             .all(|glyph| glyph == '─'),
         "the first row is transcript content chrome, not a header strip: {:?}",
@@ -2505,7 +2510,7 @@ fn narrow_terminals_elide_long_summaries_on_a_word_boundary_instead_of_slicing_t
     renderer.render(tui.view()).unwrap();
     let text = rendered_text(&renderer);
     assert!(
-        text.contains("Explore · Investiga este proyecto…"),
+        text.contains("Explore · Investiga este…"),
         "the card keeps a first-sentence title elided on a word boundary: {text:?}"
     );
     assert!(
@@ -3152,12 +3157,12 @@ fn renderer_recovers_complete_long_output_through_production_scroll_offsets() {
 
 #[test]
 fn renderer_retains_completed_turns_while_streaming_and_scrolling_the_next_turn() {
-    let backend = TestBackend::new(52, 16);
+    let backend = TestBackend::new(56, 16);
     let terminal = Terminal::new(backend).unwrap();
     let mut renderer = RatatuiRenderer::new(terminal);
     let mut tui = Tui::new(FakeEngine);
     tui.handle(Event::Resize {
-        width: 52,
+        width: 56,
         height: 16,
     });
 
@@ -4698,7 +4703,7 @@ impl FixedPtyHarness {
 
 #[test]
 fn structural_pty_resize_scroll_stream_and_dialog_contract() {
-    let mut harness = FixedPtyHarness::new(52, 14);
+    let mut harness = FixedPtyHarness::new(56, 14);
     let mut tui = Tui::new(FakeEngine);
 
     tui.begin_submission("streaming request");
@@ -5773,7 +5778,7 @@ fn a_user_turn_is_a_band_that_spans_the_transcript_width() {
 
     assert_eq!(
         banded,
-        usize::from(buffer.area.width) - CONTENT_COLUMN,
+        usize::from(buffer.area.width) - CONTENT_COLUMN - usize::from(CHROME_GUTTER),
         "the band fills the row past the end of the prompt text"
     );
     assert_eq!(

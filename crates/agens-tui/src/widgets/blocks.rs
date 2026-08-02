@@ -225,8 +225,12 @@ impl ThinkingBlock {
     pub(crate) const fn accent(mode: ExpandMode) -> Option<RowAccent> {
         match mode {
             ExpandMode::Streaming => Some(RowAccent::Wave(RowState::Running.color())),
-            ExpandMode::Expanded => Some(RowAccent::Still(RolePalette::muted())),
-            ExpandMode::Collapsed => None,
+            // Collapsed keeps the rail. Every other block sits on the gutter, and
+            // a single row that does not reads as belonging to something else
+            // rather than as the quiet member of the same list.
+            ExpandMode::Expanded | ExpandMode::Collapsed => {
+                Some(RowAccent::Still(RolePalette::muted()))
+            }
         }
     }
 
@@ -1434,8 +1438,8 @@ mod tests {
         );
         assert_eq!(
             ThinkingBlock::accent(ExpandMode::Collapsed),
-            None,
-            "a hidden thought is finished chrome and carries no bar"
+            Some(RowAccent::Still(RolePalette::muted())),
+            "a hidden thought keeps the gutter every other block sits on"
         );
     }
 

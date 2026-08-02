@@ -3469,9 +3469,16 @@ fn screen_layout(area: Rect, input: &str) -> ScreenLayout {
 
     let gutter = Margin::new(chrome_gutter(area.width), 0);
     let bands = chrome.placed(chunks[2].inner(gutter));
+    // The transcript keeps its own left indent, so only the right edge is owed
+    // the gutter. Without it the prose ran past the composer it belongs to, and
+    // a line that outruns the box you typed it into reads as a different column.
+    let transcript = Rect {
+        width: chunks[0].width.saturating_sub(chrome_gutter(area.width)),
+        ..chunks[0]
+    };
 
     ScreenLayout {
-        transcript: chunks[0],
+        transcript,
         composer: chunks[1].inner(gutter),
         notice: bands.notice,
         tree: bands.tree,
@@ -12382,8 +12389,12 @@ mod runtime_tests {
             assert_eq!(band.x, CHROME_GUTTER, "{band:?}");
             assert_eq!(band.width, 120 - 2 * CHROME_GUTTER, "{band:?}");
         }
+        // The transcript indents its own content on the left, so it owes the
+        // gutter only on the right — where prose would otherwise outrun the
+        // composer it belongs to.
         assert_eq!(layout.transcript.x, 0);
-        assert_eq!(layout.transcript.width, 120);
+        assert_eq!(layout.transcript.right(), 120 - CHROME_GUTTER);
+        assert_eq!(layout.composer.right(), layout.transcript.right());
 
         assert_eq!(
             [0_u16, 1, 24, 26, 28, 30, 32, 120].map(chrome_gutter),
