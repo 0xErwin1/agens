@@ -1,15 +1,18 @@
+use agens_core::ask_user::{
+    AskUserMode, AskUserOption, AskUserQuestion, AskUserReply, AskUserRequest, AskUserUnavailable,
+};
 use agens_core::{
     HeadlessTurnCancellation, Message, MessagePart, Role, ToolInput, TurnEvent, TurnState,
 };
 use agens_core::{NoticeSeverity, SubagentErrorKind, SubagentStatus};
 use agens_tui::{
-    Action, AppEvent, AppState, BridgeCancel, BridgeTx, Command, Conversation, ConversationError,
-    ConversationEvent, Dialog, DialogEntry, DialogView, DiffLine, DiffLineKind, DisplayMode,
-    Effect, Engine, Event, Key, PaletteEntry, PaletteEntryKind, PublishOutcome, RatatuiRenderer,
-    Renderer, Runtime, SessionDialogCursor, SessionDialogRequest, SessionDialogScope,
-    TranscriptEntry, TranscriptFocus, TranscriptId, Tui, TuiExecutionEvent, TuiExecutionState,
-    TuiPermissionBridge, TuiPermissionReply, TuiPresentation, TuiProviderOutcome, TuiRouteProgress,
-    TuiRuntimeEvent, TuiSubagentEvent, TuiSubmissionOutcome,
+    Action, AppEvent, AppState, AskUserEditing, AskUserRowSnapshot, BridgeCancel, BridgeTx,
+    Command, Conversation, ConversationError, ConversationEvent, Dialog, DialogEntry, DialogView,
+    DiffLine, DiffLineKind, DisplayMode, Effect, Engine, Event, Key, PaletteEntry,
+    PaletteEntryKind, PublishOutcome, RatatuiRenderer, Renderer, Runtime, SessionDialogCursor,
+    SessionDialogRequest, SessionDialogScope, TranscriptEntry, TranscriptFocus, TranscriptId, Tui,
+    TuiExecutionEvent, TuiExecutionState, TuiPermissionBridge, TuiPermissionReply, TuiPresentation,
+    TuiProviderOutcome, TuiRouteProgress, TuiRuntimeEvent, TuiSubagentEvent, TuiSubmissionOutcome,
 };
 use ratatui::{Terminal, backend::TestBackend};
 use std::{
@@ -4048,5 +4051,394 @@ fn a_cancelled_background_subagent_does_not_schedule_a_turn_of_its_own() {
     assert!(
         tui.take_ready_auto_turn().is_some(),
         "a subagent that finished with a result is still worth continuing on"
+    );
+}
+
+fn ask_user_option(id: &str, label: &str) -> AskUserOption {
+    AskUserOption::new(id, label, None, None)
+}
+
+#[allow(clippy::fn_params_excessive_bools)]
+fn ask_user_question(
+    id: &str,
+    mode: AskUserMode,
+    options: Vec<AskUserOption>,
+    allow_other: bool,
+    allow_note: bool,
+    allow_discuss: bool,
+) -> AskUserQuestion {
+    AskUserQuestion::new(
+        id,
+        format!("prompt for {id}"),
+        None,
+        mode,
+        options,
+        allow_other,
+        allow_note,
+        allow_discuss,
+    )
+}
+
+fn three_question_ask_user_request() -> AskUserRequest {
+    AskUserRequest::new(
+        None,
+        vec![
+            ask_user_question(
+                "q1",
+                AskUserMode::Single,
+                vec![ask_user_option("a", "A"), ask_user_option("b", "B")],
+                true,
+                true,
+                false,
+            ),
+            ask_user_question(
+                "q2",
+                AskUserMode::Multiple,
+                vec![ask_user_option("a", "A"), ask_user_option("b", "B")],
+                false,
+                false,
+                false,
+            ),
+            ask_user_question(
+                "q3",
+                AskUserMode::Single,
+                vec![ask_user_option("a", "A")],
+                false,
+                false,
+                false,
+            ),
+        ],
+    )
+    .expect("three bounded questions form a valid request")
+}
+
+fn single_question_ask_user_request(
+    allow_other: bool,
+    allow_note: bool,
+    allow_discuss: bool,
+) -> AskUserRequest {
+    AskUserRequest::new(
+        None,
+        vec![ask_user_question(
+            "q1",
+            AskUserMode::Single,
+            vec![ask_user_option("a", "A"), ask_user_option("b", "B")],
+            allow_other,
+            allow_note,
+            allow_discuss,
+        )],
+    )
+    .expect("one bounded question forms a valid request")
+}
+
+fn type_into_buffer(tui: &mut Tui<FakeEngine>, open_key: char, text: &str) {
+    tui.handle(Event::Key(Key::Char(open_key)));
+    for character in text.chars() {
+        tui.handle(Event::Key(Key::Char(character)));
+    }
+    tui.handle(Event::Key(Key::Enter));
+}
+
+#[test]
+fn ask_user_navigation_preserves_a_valid_answer_on_the_first_question() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.open_ask_user(1, three_question_ask_user_request());
+
+    tui.handle(Event::Key(Key::Down));
+    tui.handle(Event::Key(Key::Enter));
+    type_into_buffer(&mut tui, 'o', "extra");
+    type_into_buffer(&mut tui, 'n', "fyi");
+
+    tui.handle(Event::Key(Key::Tab));
+    tui.handle(Event::Key(Key::Tab));
+    tui.handle(Event::Key(Key::Left));
+    tui.handle(Event::Key(Key::Left));
+
+    let snapshot = tui.ask_user_snapshot().expect("ask-user still open");
+    assert_eq!(snapshot.question_index, 0);
+    assert_eq!(snapshot.selected, vec![1]);
+    assert_eq!(snapshot.other, "extra");
+    assert_eq!(snapshot.note, "fyi");
+}
+
+#[test]
+fn ask_user_single_choice_replaces_previous_selection() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.open_ask_user(1, three_question_ask_user_request());
+
+    tui.handle(Event::Key(Key::Enter));
+    tui.handle(Event::Key(Key::Down));
+    tui.handle(Event::Key(Key::Enter));
+
+    let snapshot = tui.ask_user_snapshot().expect("ask-user still open");
+    assert_eq!(snapshot.selected, vec![1]);
+}
+
+#[test]
+fn ask_user_multiple_choice_toggles_selections() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.open_ask_user(1, three_question_ask_user_request());
+
+    tui.handle(Event::Key(Key::Tab));
+    tui.handle(Event::Key(Key::Enter));
+    tui.handle(Event::Key(Key::Down));
+    tui.handle(Event::Key(Key::Char(' ')));
+    tui.handle(Event::Key(Key::Up));
+    tui.handle(Event::Key(Key::Enter));
+
+    let snapshot = tui.ask_user_snapshot().expect("ask-user still open");
+    assert_eq!(snapshot.question_index, 1);
+    assert_eq!(snapshot.selected, vec![1]);
+}
+
+#[test]
+fn ask_user_char_o_opens_free_text_only_when_allowed() {
+    let mut disallowed = Tui::new(FakeEngine::default());
+    disallowed.open_ask_user(1, single_question_ask_user_request(false, false, false));
+    assert_eq!(
+        disallowed.handle(Event::Key(Key::Char('o'))),
+        Action::Unchanged
+    );
+    assert_eq!(
+        disallowed.ask_user_snapshot().unwrap().editing,
+        AskUserEditing::Browsing
+    );
+
+    let mut allowed = Tui::new(FakeEngine::default());
+    allowed.open_ask_user(1, single_question_ask_user_request(true, false, false));
+    assert_eq!(allowed.handle(Event::Key(Key::Char('o'))), Action::Render);
+    assert_eq!(
+        allowed.ask_user_snapshot().unwrap().editing,
+        AskUserEditing::Other
+    );
+}
+
+#[test]
+fn ask_user_char_n_opens_note_only_when_allowed() {
+    let mut disallowed = Tui::new(FakeEngine::default());
+    disallowed.open_ask_user(1, single_question_ask_user_request(false, false, false));
+    assert_eq!(
+        disallowed.handle(Event::Key(Key::Char('n'))),
+        Action::Unchanged
+    );
+
+    let mut allowed = Tui::new(FakeEngine::default());
+    allowed.open_ask_user(1, single_question_ask_user_request(false, true, false));
+    assert_eq!(allowed.handle(Event::Key(Key::Char('n'))), Action::Render);
+    assert_eq!(
+        allowed.ask_user_snapshot().unwrap().editing,
+        AskUserEditing::Note
+    );
+}
+
+#[test]
+fn ask_user_typed_buffer_commits_on_enter_survives_escape_then_second_escape_cancels() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.open_ask_user(7, single_question_ask_user_request(true, false, false));
+
+    tui.handle(Event::Key(Key::Char('o')));
+    tui.handle(Event::Key(Key::Char('h')));
+    tui.handle(Event::Key(Key::Char('i')));
+    tui.handle(Event::Key(Key::Enter));
+
+    let after_commit = tui.ask_user_snapshot().expect("ask-user still open");
+    assert_eq!(after_commit.other, "hi");
+    assert_eq!(after_commit.editing, AskUserEditing::Browsing);
+
+    tui.handle(Event::Key(Key::Char('o')));
+    tui.handle(Event::Key(Key::Char('!')));
+    let escaped = tui.handle(Event::Key(Key::Escape));
+    assert_eq!(escaped, Action::Render);
+
+    let after_escape = tui
+        .ask_user_snapshot()
+        .expect("leaving entry mode does not resolve the prompt");
+    assert_eq!(after_escape.other, "hi!");
+    assert_eq!(after_escape.editing, AskUserEditing::Browsing);
+
+    let cancelled = tui.handle(Event::Key(Key::Escape));
+    assert_eq!(
+        cancelled,
+        Action::AskUserReply {
+            id: 7,
+            reply: AskUserReply::Cancelled,
+        }
+    );
+    assert!(tui.ask_user_snapshot().is_none());
+}
+
+#[test]
+fn ask_user_submit_while_incomplete_sets_incomplete_index_without_resolving() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.open_ask_user(1, single_question_ask_user_request(false, false, false));
+
+    tui.handle(Event::Key(Key::Down));
+    tui.handle(Event::Key(Key::Down));
+    let action = tui.handle(Event::Key(Key::Enter));
+
+    assert_eq!(action, Action::Render);
+    let snapshot = tui
+        .ask_user_snapshot()
+        .expect("submit failed, not resolved");
+    assert_eq!(snapshot.incomplete, Some(0));
+    assert_eq!(snapshot.row, AskUserRowSnapshot::Submit);
+}
+
+#[test]
+fn ask_user_incomplete_flag_clears_once_the_flagged_question_becomes_answered() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.open_ask_user(1, single_question_ask_user_request(false, false, false));
+
+    tui.handle(Event::Key(Key::Down));
+    tui.handle(Event::Key(Key::Down));
+    let flagged = tui.handle(Event::Key(Key::Enter));
+    assert_eq!(flagged, Action::Render);
+    assert_eq!(tui.ask_user_snapshot().unwrap().incomplete, Some(0));
+
+    tui.handle(Event::Key(Key::Up));
+    tui.handle(Event::Key(Key::Up));
+    let answered = tui.handle(Event::Key(Key::Enter));
+    assert_eq!(answered, Action::Render);
+
+    let snapshot = tui.ask_user_snapshot().expect("ask-user still open");
+    assert_eq!(
+        snapshot.incomplete, None,
+        "answering the flagged question must clear the flag without a second submit attempt"
+    );
+}
+
+#[test]
+fn ask_user_submit_when_complete_resolves_answered_in_request_order() {
+    let request = single_question_ask_user_request(true, true, false);
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.open_ask_user(9, request.clone());
+
+    tui.handle(Event::Key(Key::Enter));
+    type_into_buffer(&mut tui, 'o', "more");
+    type_into_buffer(&mut tui, 'n', "nb");
+    tui.handle(Event::Key(Key::Down));
+    tui.handle(Event::Key(Key::Down));
+    let action = tui.handle(Event::Key(Key::Enter));
+
+    match action {
+        Action::AskUserReply {
+            id,
+            reply: AskUserReply::Answered(answers),
+        } => {
+            assert_eq!(id, 9);
+            assert_eq!(answers.len(), 1);
+            assert_eq!(answers[0].question_id, "q1");
+            assert_eq!(answers[0].selected, vec!["a".to_owned()]);
+            assert_eq!(answers[0].other.as_deref(), Some("more"));
+            assert_eq!(answers[0].note.as_deref(), Some("nb"));
+
+            let reply = AskUserReply::Answered(answers);
+            assert!(
+                request.validate_reply(&reply).is_ok(),
+                "a reply built by this reducer must pass core's own reply validation"
+            );
+        }
+        other => panic!("expected an answered reply, got {other:?}"),
+    }
+    assert!(tui.ask_user_snapshot().is_none());
+}
+
+#[test]
+fn ask_user_discuss_row_only_available_when_allowed_and_resolves_without_fabricating_answers() {
+    let mut without_discuss = Tui::new(FakeEngine::default());
+    without_discuss.open_ask_user(1, single_question_ask_user_request(false, false, false));
+    without_discuss.handle(Event::Key(Key::Down));
+    without_discuss.handle(Event::Key(Key::Down));
+    without_discuss.handle(Event::Key(Key::Down));
+    let snapshot = without_discuss.ask_user_snapshot().unwrap();
+    assert_eq!(snapshot.row, AskUserRowSnapshot::Cancel);
+    assert!(!snapshot.discuss_available);
+
+    let mut with_discuss = Tui::new(FakeEngine::default());
+    with_discuss.open_ask_user(2, single_question_ask_user_request(false, false, true));
+    with_discuss.handle(Event::Key(Key::Down));
+    with_discuss.handle(Event::Key(Key::Down));
+    with_discuss.handle(Event::Key(Key::Down));
+    let snapshot = with_discuss.ask_user_snapshot().unwrap();
+    assert_eq!(snapshot.row, AskUserRowSnapshot::Discuss);
+    assert!(snapshot.discuss_available);
+
+    let action = with_discuss.handle(Event::Key(Key::Enter));
+    match action {
+        Action::AskUserReply {
+            id,
+            reply: AskUserReply::Discuss { question_id, note },
+        } => {
+            assert_eq!(id, 2);
+            assert_eq!(question_id, "q1");
+            assert_eq!(note, None);
+        }
+        other => panic!("expected a discuss reply, got {other:?}"),
+    }
+    assert!(with_discuss.ask_user_snapshot().is_none());
+}
+
+#[test]
+fn ask_user_ctrl_c_resolves_cancelled_once_ahead_of_the_ordinary_quit_arming_path() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.open_ask_user(3, three_question_ask_user_request());
+
+    let action = tui.handle(Event::Key(Key::CtrlC));
+    assert_eq!(
+        action,
+        Action::AskUserReply {
+            id: 3,
+            reply: AskUserReply::Cancelled,
+        }
+    );
+    assert!(tui.ask_user_snapshot().is_none());
+
+    let second_press = tui.handle(Event::Key(Key::CtrlC));
+    assert_eq!(second_press, Action::Render);
+}
+
+#[test]
+fn ask_user_no_op_keys_report_unchanged() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.open_ask_user(1, three_question_ask_user_request());
+    assert_eq!(tui.handle(Event::Key(Key::Up)), Action::Unchanged);
+
+    let mut single_question = Tui::new(FakeEngine::default());
+    single_question.open_ask_user(1, single_question_ask_user_request(false, false, false));
+    assert_eq!(
+        single_question.handle(Event::Key(Key::Tab)),
+        Action::Unchanged
+    );
+
+    let mut reselect = Tui::new(FakeEngine::default());
+    reselect.open_ask_user(1, single_question_ask_user_request(false, false, false));
+    reselect.handle(Event::Key(Key::Enter));
+    assert_eq!(reselect.handle(Event::Key(Key::Enter)), Action::Unchanged);
+}
+
+#[test]
+fn ask_user_unavailable_reply_debug_never_carries_answer_content() {
+    let reply = AskUserReply::Unavailable(AskUserUnavailable::NoInteractiveSurface);
+    let action = Action::AskUserReply { id: 1, reply };
+    let rendered = format!("{action:?}");
+    assert_eq!(rendered, "AskUserReply { id: 1, status: \"unavailable\" }");
+}
+
+#[test]
+fn ask_user_answered_reply_debug_never_carries_answer_content() {
+    let request = single_question_ask_user_request(false, false, false);
+    let reply = AskUserReply::Answered(vec![agens_core::ask_user::AskUserAnswer {
+        question_id: "q1".to_owned(),
+        selected: vec!["a".to_owned()],
+        other: None,
+        note: None,
+    }]);
+    assert!(request.validate_reply(&reply).is_ok());
+    let action = Action::AskUserReply { id: 42, reply };
+    let rendered = format!("{action:?}");
+    assert_eq!(rendered, "AskUserReply { id: 42, status: \"answered\" }");
+    assert!(
+        !rendered.contains('q'),
+        "debug must not leak the question id"
     );
 }

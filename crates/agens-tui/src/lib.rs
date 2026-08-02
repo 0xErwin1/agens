@@ -2,6 +2,7 @@
 
 mod activity;
 mod app;
+mod ask_user;
 mod bridge;
 mod conversation;
 #[cfg(feature = "perf-audit")]
@@ -17,6 +18,7 @@ pub use agens_core::{
     TuiExecutionState, TuiRuntimeEvent, TuiSubagentEvent,
 };
 pub use app::{AppEvent, AppState, Command, Dialog, Effect, Runtime};
+pub use ask_user::{AskUserEditing, AskUserRowSnapshot, AskUserSnapshot};
 pub use bridge::{TuiPermissionBridge, TuiPermissionReply, TuiPermissionRequest};
 pub use conversation::{
     ActionableError, Conversation, ConversationError, ConversationEvent, SubagentCard, ToolBatch,
@@ -43,7 +45,9 @@ use std::{
 
 use agens_core::SubagentStatus;
 use agens_core::SubmitOrigin;
+use agens_core::ask_user::{AskUserReply, AskUserRequest};
 use agens_core::{MessagePart, TurnEvent, TurnState, Usage};
+use ask_user::{AskUserOutcome, AskUserState};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use crossterm::{
     cursor::{Hide as HideCursor, Show as ShowCursor},
@@ -306,6 +310,11 @@ pub enum Action {
     CopyDeviceAuthCode,
     /// A local route was cancelled before its result could be applied.
     CancelRoute,
+    /// Resolves the open ask-user interaction with a validated terminal reply.
+    AskUserReply {
+        id: u64,
+        reply: AskUserReply,
+    },
     /// End the terminal event loop.
     Quit,
 }
@@ -548,8 +557,27 @@ impl std::fmt::Debug for Action {
             Self::CopyDeviceAuthUrl => formatter.write_str("CopyDeviceAuthUrl"),
             Self::CopyDeviceAuthCode => formatter.write_str("CopyDeviceAuthCode"),
             Self::CancelRoute => formatter.write_str("CancelRoute"),
+            Self::AskUserReply { id, reply } => formatter
+                .debug_struct("AskUserReply")
+                .field("id", id)
+                .field("status", &ask_user_reply_status(reply))
+                .finish(),
             Self::Quit => formatter.write_str("Quit"),
         }
+    }
+}
+
+/// The reply's terminal status only, for `Action`'s debug rendering.
+///
+/// Answers, notes and free text never reach a debug rendering: only the
+/// closed set of statuses the tool layer itself encodes does.
+const fn ask_user_reply_status(reply: &AskUserReply) -> &'static str {
+    match reply {
+        AskUserReply::Answered(_) => "answered",
+        AskUserReply::Discuss { .. } => "discuss",
+        AskUserReply::Cancelled => "cancelled",
+        AskUserReply::Unavailable(_) => "unavailable",
+        AskUserReply::Expired => "expired",
     }
 }
 
@@ -3803,6 +3831,7 @@ pub struct Tui<E> {
     dialog: Option<DialogView>,
     secret_entry: Option<SecretEntryState>,
     device_auth: Option<DeviceAuthState>,
+    ask_user: Option<AskUserState>,
     palette_entries: Vec<PaletteEntry>,
     palette_open: bool,
     palette_selected: usize,
@@ -3884,6 +3913,7 @@ where
             dialog: None,
             secret_entry: None,
             device_auth: None,
+            ask_user: None,
             palette_entries: Vec::new(),
             palette_open: false,
             palette_selected: 0,
@@ -5775,6 +5805,32 @@ where
         Action::Render
     }
 
+    /// Opens a bounded structured question set as a dedicated modal
+    /// interaction, sibling to secret entry and device authentication.
+    pub fn open_ask_user(&mut self, id: u64, request: AskUserRequest) {
+        self.ask_user = Some(AskUserState::new(id, request));
+    }
+
+    /// A read-only snapshot of the open ask-user interaction, if one exists.
+    pub fn ask_user_snapshot(&self) -> Option<AskUserSnapshot> {
+        self.ask_user.as_ref().map(AskUserState::snapshot)
+    }
+
+    fn handle_ask_user_key(&mut self, key: Key) -> Action {
+        let Some(state) = self.ask_user.as_mut() else {
+            return Action::Render;
+        };
+        match state.reduce(key) {
+            AskUserOutcome::Unchanged => Action::Unchanged,
+            AskUserOutcome::Changed => Action::Render,
+            AskUserOutcome::Resolved(reply) => {
+                let id = state.id();
+                self.ask_user = None;
+                Action::AskUserReply { id, reply }
+            }
+        }
+    }
+
     fn handle_key(&mut self, key: Key) -> Action {
         if key != Key::CtrlC {
             self.quit_armed_until = None;
@@ -5790,6 +5846,9 @@ where
         }
         if self.secret_entry.is_some() {
             return self.handle_secret_key(key);
+        }
+        if self.ask_user.is_some() {
+            return self.handle_ask_user_key(key);
         }
         if key == Key::Escape && self.session_loading {
             return Action::CancelRoute;
@@ -6440,6 +6499,16 @@ where
     }
 
     fn handle_control_c(&mut self) -> Action {
+        // An open ask-user interaction resolves here, ahead of the copy and
+        // quit-arming logic below and ahead of the bridge's own cancellation
+        // poll, so Ctrl+C cancels it deterministically on a single press.
+        if let Some(state) = self.ask_user.take() {
+            return Action::AskUserReply {
+                id: state.id(),
+                reply: AskUserReply::Cancelled,
+            };
+        }
+
         // Mouse capture takes the terminal's own selection away, so the only
         // copy the user has is ours. Many terminals also swallow Ctrl+Shift+C
         // for themselves, which left a made selection with no way to reach the
@@ -7777,7 +7846,8 @@ where
             | Action::CopyDeviceAuthUrl
             | Action::CopyDeviceAuthCode
             | Action::Cancel
-            | Action::CancelRoute => renderer.render(tui.view())?,
+            | Action::CancelRoute
+            | Action::AskUserReply { .. } => renderer.render(tui.view())?,
         }
     }
 }
@@ -7855,7 +7925,8 @@ where
             | Action::CopyDeviceAuthUrl
             | Action::CopyDeviceAuthCode
             | Action::Cancel
-            | Action::CancelRoute => renderer.render(tui.view())?,
+            | Action::CancelRoute
+            | Action::AskUserReply { .. } => renderer.render(tui.view())?,
         }
     }
 }
@@ -8485,6 +8556,11 @@ where
                 runtime_terminal.copy_selection(&text)?;
             }
             Action::Unchanged => {}
+            // No bridge is wired into this entry point yet: the ask-user
+            // reply already resolved the interaction locally, so a bare
+            // render is all this loop can offer until the run entry point
+            // that owns a `TuiAskUserBridge` replaces this arm.
+            Action::AskUserReply { .. } => {}
             Action::Render | Action::Cancel => {
                 if cancel_permission
                     && let (Some(id), Some(permission_bridge)) =
