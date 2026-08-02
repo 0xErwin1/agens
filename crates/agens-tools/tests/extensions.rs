@@ -1058,6 +1058,12 @@ fn task_reports_exact_terminal_taxonomy_without_runner_details() {
             "task: child execution failed",
             HeadlessTaskTerminal::ChildFailure,
         ),
+        (
+            TerminalTaskRunner::DeclarationRejected,
+            "task: agent permission declaration rejected \
+             [declaration: native::bash; the configuration denies it]",
+            HeadlessTaskTerminal::DeclarationRejected,
+        ),
     ] {
         let mut task = task_tool(runner);
         let output = task.execute(&task_context(), task_arguments()).unwrap();
@@ -1066,6 +1072,24 @@ fn task_reports_exact_terminal_taxonomy_without_runner_details() {
         assert_eq!(output.terminal(), Some(terminal));
         assert!(!output.content.contains("secret panic payload"));
     }
+}
+
+/// A rejected declaration is the one failure the operator can act on directly,
+/// so the offending name reaches the model-visible result instead of only the
+/// diagnostics log. A name that is not shaped like a tool identity is withheld,
+/// because a terminal message bypasses the failure sanitizer entirely.
+#[test]
+fn a_rejected_declaration_names_the_offending_tool_and_withholds_an_unsafe_one() {
+    let mut task = task_tool(TerminalTaskRunner::DeclarationRejectedWithUnsafeName);
+    let output = task.execute(&task_context(), task_arguments()).unwrap();
+
+    assert!(output.is_error);
+    assert_eq!(
+        output.content,
+        "task: agent permission declaration rejected \
+         [declaration: [redacted]; the parent does not hold it]"
+    );
+    assert!(!output.content.contains("secret"));
 }
 
 #[test]
@@ -2142,6 +2166,8 @@ enum TerminalTaskRunner {
     Provider,
     Child,
     Panic,
+    DeclarationRejected,
+    DeclarationRejectedWithUnsafeName,
 }
 
 impl TaskRunner for TerminalTaskRunner {
@@ -2164,6 +2190,14 @@ impl TaskRunner for TerminalTaskRunner {
             )),
             Self::Child => Err(TaskRunnerError::ChildFailure),
             Self::Panic => panic!("secret panic payload"),
+            Self::DeclarationRejected => Err(TaskRunnerError::DeclarationRejected {
+                reason: agens_tools::TaskDeclarationRejection::ConfigurationDenies,
+                tool: "native::bash".into(),
+            }),
+            Self::DeclarationRejectedWithUnsafeName => Err(TaskRunnerError::DeclarationRejected {
+                reason: agens_tools::TaskDeclarationRejection::ExceedsParentSurface,
+                tool: "/home/secret user/tools".into(),
+            }),
         }
     }
 }
@@ -2248,7 +2282,7 @@ impl TaskRunner for LifecycleTaskRunner {
             assert!(lifecycle.transition_to_background());
         }
         self.observed.lock().unwrap().push(lifecycle);
-        if let Some(error) = self.terminal {
+        if let Some(error) = self.terminal.clone() {
             return Err(error);
         }
         Ok(TaskTurnResult {

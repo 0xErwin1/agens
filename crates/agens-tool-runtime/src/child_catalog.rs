@@ -23,8 +23,33 @@ use agens_core::{
     PermissionDecision, PermissionPattern, PermissionRule, SafetyPredicate,
     declarations_deny_every_target, ordered_permission_rules, permission_target_kind_for_tool,
 };
-use agens_error::CliError;
-use agens_tools::{NativeToolCatalog, NativeToolMetadata};
+use agens_tools::{NativeToolCatalog, NativeToolMetadata, TaskDeclarationRejection};
+
+/// A declaration that cannot be delegated, kept structured rather than
+/// formatted so the offending name survives all the way to the parent's tool
+/// result instead of only reaching the diagnostics log.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChildSurfaceRejection {
+    pub reason: TaskDeclarationRejection,
+    pub tool: String,
+}
+
+impl ChildSurfaceRejection {
+    /// The operator-facing form, recorded in the diagnostics log. The parent's
+    /// tool result carries the same two facts through
+    /// [`agens_tools::TaskDeclarationRejection`] instead of this string,
+    /// because a terminal message bypasses the output sanitizer.
+    pub fn message(&self) -> String {
+        let subject = match self.reason {
+            TaskDeclarationRejection::ExceedsParentSurface => "the parent does not hold",
+            TaskDeclarationRejection::ConfigurationDenies => "the configuration denies",
+        };
+        format!(
+            "permission declaration grants a tool {subject}: {}",
+            self.tool
+        )
+    }
+}
 
 /// Native tool identities auto-authorized for every delegated child: bounded
 /// filesystem and VCS reads. `native::webfetch` is deliberately excluded —
@@ -66,7 +91,7 @@ pub struct ChildToolSurface {
 pub fn resolve_child_surface(
     parent_rules: &[PermissionRule],
     declarations: &[PermissionRule],
-) -> Result<ChildToolSurface, CliError> {
+) -> Result<ChildToolSurface, ChildSurfaceRejection> {
     let metadata = NativeToolCatalog::metadata();
 
     let parent_rules = parent_rules
@@ -83,19 +108,19 @@ pub fn resolve_child_surface(
             .iter()
             .any(|entry| declaration_names_tool(declaration, entry))
         {
-            return Err(CliError::configuration(format!(
-                "permission declaration grants a tool the parent does not hold: {}",
-                declaration_tool_label(&declaration.tool)
-            )));
+            return Err(ChildSurfaceRejection {
+                reason: TaskDeclarationRejection::ExceedsParentSurface,
+                tool: declaration_tool_label(&declaration.tool),
+            });
         }
         if let Some(entry) = metadata.iter().find(|entry| {
             declaration_names_tool(declaration, entry)
                 && declarations_deny_every_target(&parent_rules, &entry.qualified_name)
         }) {
-            return Err(CliError::configuration(format!(
-                "permission declaration grants a tool the configuration denies: {}",
-                entry.qualified_name
-            )));
+            return Err(ChildSurfaceRejection {
+                reason: TaskDeclarationRejection::ConfigurationDenies,
+                tool: entry.qualified_name.clone(),
+            });
         }
     }
 
@@ -294,11 +319,18 @@ mod tests {
 
     #[test]
     fn an_allow_naming_an_unknown_tool_errors_naming_it() {
-        let error =
+        let rejection =
             resolve_child_surface(&[], &[rule(PermissionDecision::Allow, "not_a_real_tool")])
                 .unwrap_err();
 
-        assert!(format!("{error:?}").contains("not_a_real_tool"));
+        assert_eq!(
+            rejection,
+            ChildSurfaceRejection {
+                reason: TaskDeclarationRejection::ExceedsParentSurface,
+                tool: "not_a_real_tool".into(),
+            }
+        );
+        assert!(rejection.message().contains("not_a_real_tool"));
     }
 
     /// The subset invariant governs what a declaration would GRANT. A `deny`
@@ -379,13 +411,20 @@ mod tests {
 
     #[test]
     fn a_declared_allow_cannot_reopen_a_tool_the_configuration_denies() {
-        let error = resolve_child_surface(
+        let rejection = resolve_child_surface(
             &[parent_deny("bash", None)],
             &[rule(PermissionDecision::Allow, "bash")],
         )
         .unwrap_err();
 
-        assert!(format!("{error:?}").contains("bash"));
+        assert_eq!(
+            rejection,
+            ChildSurfaceRejection {
+                reason: TaskDeclarationRejection::ConfigurationDenies,
+                tool: "native::bash".into(),
+            }
+        );
+        assert!(rejection.message().contains("native::bash"));
     }
 
     /// A targeted configured deny leaves the tool reachable, so it has to be

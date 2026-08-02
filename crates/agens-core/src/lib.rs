@@ -1319,6 +1319,11 @@ pub enum HeadlessTaskTerminal {
     ConcurrencyLimit,
     ProviderFailure,
     ChildFailure,
+    /// The delegated agent's own `permissions:` declarations could not be
+    /// resolved into a tool surface, so no child turn started. Distinct from
+    /// [`Self::ChildFailure`] because the operator can fix it by editing the
+    /// agent definition, which an opaque runtime failure never tells them.
+    DeclarationRejected,
 }
 
 impl HeadlessTaskTerminal {
@@ -1335,6 +1340,7 @@ impl HeadlessTaskTerminal {
             Self::ConcurrencyLimit => "task: concurrent child limit reached",
             Self::ProviderFailure => "task: provider failure",
             Self::ChildFailure => "task: child execution failed",
+            Self::DeclarationRejected => "task: agent permission declaration rejected",
         }
     }
 }

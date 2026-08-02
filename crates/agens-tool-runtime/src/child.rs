@@ -23,7 +23,7 @@ use agens_tools::{
 };
 
 use crate::block_on_headless_turn;
-use crate::child_catalog::resolve_child_surface;
+use crate::child_catalog::{ChildSurfaceRejection, resolve_child_surface};
 use crate::runtime::production_child_tool_runtime;
 use agens_bootstrap::Bootstrap;
 use agens_bootstrap::session_config::SessionConfig;
@@ -37,7 +37,13 @@ use agens_permissions::{
     ProductionPermissionGate, SharedToolDispatcher, configured_permission_rules,
 };
 
-#[derive(Clone, Copy)]
+/// Why a delegated child turn ended without a result.
+///
+/// Every variant but [`Self::DeclarationRejected`] is payload-free on purpose:
+/// the parent is told a class, never host detail. A rejected declaration is the
+/// exception because the operator wrote the offending name themselves and
+/// cannot act on the failure without seeing which one it was.
+#[derive(Clone)]
 pub enum ChildRunError {
     Authentication,
     Cancelled,
@@ -52,10 +58,11 @@ pub enum ChildRunError {
     Tool,
     IterationLimit,
     Runtime,
+    DeclarationRejected(ChildSurfaceRejection),
 }
 
 impl ChildRunError {
-    pub const fn diagnostic_class(self) -> ProviderDiagnosticClass {
+    pub const fn diagnostic_class(&self) -> ProviderDiagnosticClass {
         match self {
             Self::Authentication => ProviderDiagnosticClass::Authentication,
             Self::Cancelled => ProviderDiagnosticClass::Cancelled,
@@ -68,11 +75,13 @@ impl ChildRunError {
             Self::Rejected => ProviderDiagnosticClass::Rejected,
             Self::Server => ProviderDiagnosticClass::Server,
             Self::Tool => ProviderDiagnosticClass::Tool,
-            Self::IterationLimit | Self::Runtime => ProviderDiagnosticClass::Runtime,
+            Self::IterationLimit | Self::Runtime | Self::DeclarationRejected(_) => {
+                ProviderDiagnosticClass::Runtime
+            }
         }
     }
 
-    pub const fn tui_kind(self) -> Option<SubagentErrorKind> {
+    pub const fn tui_kind(&self) -> Option<SubagentErrorKind> {
         match self {
             Self::Cancelled | Self::TimedOut => None,
             Self::Authentication => Some(SubagentErrorKind::Authentication),
@@ -85,11 +94,11 @@ impl ChildRunError {
             Self::Server => Some(SubagentErrorKind::Server),
             Self::Tool => Some(SubagentErrorKind::Tool),
             Self::IterationLimit => Some(SubagentErrorKind::IterationLimit),
-            Self::Runtime => Some(SubagentErrorKind::Runtime),
+            Self::Runtime | Self::DeclarationRejected(_) => Some(SubagentErrorKind::Runtime),
         }
     }
 
-    pub const fn task_runner_error(self) -> TaskRunnerError {
+    pub fn task_runner_error(self) -> TaskRunnerError {
         match self {
             Self::Cancelled => TaskRunnerError::Cancelled,
             Self::TimedOut => TaskRunnerError::TimedOut,
@@ -106,6 +115,10 @@ impl ChildRunError {
             Self::Server => TaskRunnerError::ProviderFailure(TaskProviderFailure::Server),
             Self::Tool | Self::Runtime => TaskRunnerError::ChildFailure,
             Self::IterationLimit => TaskRunnerError::IterationLimit,
+            Self::DeclarationRejected(rejection) => TaskRunnerError::DeclarationRejected {
+                reason: rejection.reason,
+                tool: rejection.tool,
+            },
         }
     }
 }
@@ -190,9 +203,13 @@ pub fn run_production_task(
         ChildRunError::Runtime
     })?;
     let surface =
-        resolve_child_surface(&parent_rules, request.permission_rules()).map_err(|error| {
-            record_subagent_surface_rejection(bootstrap, diagnostic_reference, &error.message);
-            ChildRunError::Runtime
+        resolve_child_surface(&parent_rules, request.permission_rules()).map_err(|rejection| {
+            record_subagent_surface_rejection(
+                bootstrap,
+                diagnostic_reference,
+                &rejection.message(),
+            );
+            ChildRunError::DeclarationRejected(rejection)
         })?;
     let (provider_tools, tool_runtime) = production_child_tool_runtime(
         project_root,

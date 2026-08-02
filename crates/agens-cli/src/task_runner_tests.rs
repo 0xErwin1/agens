@@ -18,8 +18,10 @@ use agens_dispatch::{TaskLaunchOutcome, TuiSelectedTaskLaunch};
 use agens_session::context::CompletedSubagentTurn;
 use agens_session::context::SessionContext;
 use agens_tool_runtime::child::ChildRunError;
+use agens_tool_runtime::child_catalog::ChildSurfaceRejection;
 use agens_tool_runtime::launch_selected_task as launch_selected_tui_task;
 use agens_tool_runtime::runner::{ProductionTaskRunner, TuiTaskControls, TuiTaskLifecycleBridge};
+use agens_tools::TaskDeclarationRejection;
 use agens_tools::{SkillCatalog, TaskLaunchMode, TaskProviderFailure, TaskRunnerError};
 
 use agens_store::SessionStore;
@@ -497,6 +499,20 @@ fn production_runner_error_publication_orders_sanitized_typed_failure_before_ter
             "failed",
         ),
         (
+            ChildRunError::DeclarationRejected(ChildSurfaceRejection {
+                reason: TaskDeclarationRejection::ConfigurationDenies,
+                tool: "native::bash".into(),
+            }),
+            TaskRunnerError::DeclarationRejected {
+                reason: TaskDeclarationRejection::ConfigurationDenies,
+                tool: "native::bash".into(),
+            },
+            Some(SubagentErrorKind::Runtime),
+            TuiExecutionEvent::Failed { id: 1 },
+            SubagentStatus::Failure,
+            "failed",
+        ),
+        (
             ChildRunError::Cancelled,
             TaskRunnerError::Cancelled,
             None,
@@ -531,7 +547,7 @@ fn production_runner_error_publication_orders_sanitized_typed_failure_before_ter
             ProductionTaskRunner::with_failure_probe(
                 bootstrap.clone(),
                 agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap),
-                source,
+                source.clone(),
                 "provider-token=super-secret-error-detail",
             )
             .with_lifecycle_bridge(lifecycle_bridge),
@@ -550,7 +566,7 @@ fn production_runner_error_publication_orders_sanitized_typed_failure_before_ter
             ..SessionContext::fresh()
         }));
 
-        let reported = match expected_error {
+        let reported = match &expected_error {
             TaskRunnerError::Cancelled => HeadlessTaskTerminal::Cancelled.message().to_owned(),
             TaskRunnerError::TimedOut => HeadlessTaskTerminal::TimedOut.message().to_owned(),
             TaskRunnerError::ProviderFailure(cause) => format!(
@@ -564,6 +580,11 @@ fn production_runner_error_publication_orders_sanitized_typed_failure_before_ter
             TaskRunnerError::ChildFailure => {
                 HeadlessTaskTerminal::ChildFailure.message().to_owned()
             }
+            TaskRunnerError::DeclarationRejected { reason, tool } => format!(
+                "{} [declaration: {tool}; {}]",
+                HeadlessTaskTerminal::DeclarationRejected.message(),
+                reason.label()
+            ),
         };
         assert_eq!(
             launch_selected_tui_task(
