@@ -582,4 +582,121 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn a_call_to_a_tool_absent_from_the_child_catalog_is_denied_honestly_with_facts() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct UnregisteredToolProbeProvider {
+            calls: AtomicUsize,
+        }
+
+        impl TurnProvider for UnregisteredToolProbeProvider {
+            fn next_parts(
+                &mut self,
+                events: &[TurnEvent],
+                _cancellation: &HeadlessTurnCancellation,
+            ) -> impl std::future::Future<Output = Result<Vec<MessagePart>, HeadlessTurnPortError>> + Send
+            {
+                let call = self.calls.fetch_add(1, Ordering::SeqCst);
+
+                let parts = if call == 0 {
+                    vec![MessagePart::ToolCall {
+                        id: "call-1".into(),
+                        name: "native::write".into(),
+                        input: r#"{"path":"b.txt","content":"x"}"#.into(),
+                    }]
+                } else {
+                    let content = events
+                        .iter()
+                        .find_map(|event| match event {
+                            TurnEvent::ToolResult(MessagePart::ToolResult { content, .. }) => {
+                                Some(content.clone())
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or_default();
+                    let has_facts = events
+                        .iter()
+                        .any(|event| matches!(event, TurnEvent::ToolResultFacts { .. }));
+
+                    vec![MessagePart::Text(format!("{content}|facts={has_facts}"))]
+                };
+
+                std::future::ready(Ok(parts))
+            }
+        }
+
+        impl ProgressAwareProvider for UnregisteredToolProbeProvider {
+            fn with_progress_sink(self, _progress: TurnProgressSink) -> Self {
+                self
+            }
+        }
+
+        struct ReadTool;
+
+        impl agens_tools::DispatchTool for ReadTool {
+            fn permission_target(
+                &self,
+                arguments: &serde_json::Value,
+            ) -> Result<String, agens_core::Error> {
+                arguments
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .ok_or_else(|| agens_core::Error::Tool("invalid read arguments".into()))
+            }
+
+            fn execute(
+                &mut self,
+                _context: &agens_tools::ToolExecutionContext,
+                _arguments: serde_json::Value,
+            ) -> Result<agens_tools::ToolOutput, agens_core::Error> {
+                Ok(agens_tools::ToolOutput::success("read"))
+            }
+        }
+
+        let registry = TaskExecutionRegistry::with_limits(agens_tools::TaskExecutionLimits {
+            max_iterations: 3,
+            max_concurrency: 1,
+            max_output_chars: 1_024,
+        });
+        let mut dispatcher = agens_tools::ToolDispatcher::new();
+        dispatcher
+            .register_native("native::read", agens_core::ToolAccess::ReadOnly, ReadTool)
+            .unwrap();
+
+        let result = run_isolated_task_turn(
+            UnregisteredToolProbeProvider {
+                calls: AtomicUsize::new(0),
+            },
+            Arc::new(Mutex::new(dispatcher)),
+            Path::new("."),
+            false,
+            &HeadlessTurnCancellation::new(),
+            None,
+            TaskMailboxContext {
+                registry,
+                target: TaskMessageTarget::Main,
+            },
+        );
+
+        let output = match result {
+            Ok(output) => output,
+            Err(_) => panic!("a denied tool call must not fail the turn"),
+        };
+        assert!(
+            output.contains("permission denied"),
+            "expected a denial naming permission denied, got: {output}"
+        );
+        assert!(
+            !output.contains("invalid tool arguments"),
+            "a call to a tool absent from the catalog must never surface as an argument error, \
+             got: {output}"
+        );
+        assert!(
+            output.contains("facts=true"),
+            "expected denial_facts to accompany the denial, got: {output}"
+        );
+    }
 }

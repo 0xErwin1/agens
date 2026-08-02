@@ -241,6 +241,10 @@ impl HeadlessPermissionGate for ProductionPermissionGate {
                     .lock()
                     .map_err(|_| HeadlessTurnPortError::Permission)
                     .and_then(|dispatcher| {
+                        if dispatcher.canonical_identity(&call.name).is_none() {
+                            return Ok(ToolEvaluationOutcome::Denied);
+                        }
+
                         dispatcher
                             .evaluate_with_policy_override(
                                 &self.policy,
@@ -616,4 +620,62 @@ pub fn contains_sensitive_marker(value: &str) -> bool {
     ["api_key", "authorization", "password", "secret", "token"]
         .iter()
         .any(|marker| value.contains(marker))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
+
+    use agens_core::{
+        HeadlessPermissionGate, HeadlessToolCall, HeadlessTurnCancellation, HeadlessTurnPortError,
+        PermissionDecision, PermissionMode, PermissionPolicy, PermissionSession,
+    };
+    use agens_tools::ToolDispatcher;
+
+    use super::{ProductionPermissionGate, SharedToolDispatcher};
+
+    fn run_ready<T>(
+        future: impl std::future::Future<Output = Result<T, HeadlessTurnPortError>>,
+    ) -> Result<T, HeadlessTurnPortError> {
+        let mut future = std::pin::pin!(future);
+        let context = &mut std::task::Context::from_waker(std::task::Waker::noop());
+
+        match future.as_mut().poll(context) {
+            std::task::Poll::Ready(result) => result,
+            std::task::Poll::Pending => {
+                panic!("production permission ports must complete synchronously")
+            }
+        }
+    }
+
+    #[test]
+    fn evaluate_denies_a_call_to_a_tool_absent_from_the_dispatcher() {
+        let dispatcher: SharedToolDispatcher = Arc::new(Mutex::new(ToolDispatcher::new()));
+        let grants = Arc::new(Mutex::new(Vec::new()));
+        let allowed = Arc::new(Mutex::new(BTreeMap::new()));
+        let prompts = Arc::new(Mutex::new(BTreeMap::new()));
+
+        let mut gate = ProductionPermissionGate::new(
+            PermissionPolicy::new(PermissionMode::Edit, Vec::new()),
+            grants,
+            PermissionSession::new(),
+            "project".into(),
+            dispatcher,
+            allowed,
+            prompts,
+        );
+
+        let call = HeadlessToolCall {
+            id: "current".into(),
+            name: "native::write".into(),
+            input: r#"{"path":"notes.md"}"#.into(),
+        };
+        let cancellation = HeadlessTurnCancellation::new();
+
+        assert_eq!(
+            run_ready(gate.evaluate(&call, &cancellation)),
+            Ok(PermissionDecision::Deny)
+        );
+    }
 }
