@@ -1,0 +1,21 @@
+[package]
+name = "agens-perf"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+enabled = ["dep:tracing", "dep:tracing-subscriber", "dep:tracing-chrome"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = { version = "0.1", optional = true }
+tracing-subscriber = { version = "0.3", optional = true, default-features = false, features = [
+  "registry",
+] }
+tracing-chrome = { version = "0.7", optional = true }

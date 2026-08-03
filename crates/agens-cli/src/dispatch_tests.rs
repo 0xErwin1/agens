@@ -19,6 +19,7 @@ use agens_tool_runtime::{
 };
 
 use agens_config::ToolLimitSettings;
+use agens_core::ask_user::UnavailableAskUserPort;
 use agens_core::{
     DiscardCompletedTurnRepository, HeadlessPermissionResolver, HeadlessToolCall,
     HeadlessToolDispatcher, HeadlessToolOutput, HeadlessTurnCancellation, MessagePart,
@@ -302,6 +303,7 @@ fn u15_c1c_backgrounded_success_skips_the_parent_provider_and_history_path() {
             Arc::clone(&probe),
         )
         .with_lifecycle_bridge(lifecycle_bridge.clone()),
+        Box::new(UnavailableAskUserPort),
     )
     .unwrap();
     runtime.authorized.gate.policy = PermissionPolicy::new(
@@ -353,11 +355,13 @@ fn u15_c1c_backgrounded_success_skips_the_parent_provider_and_history_path() {
     );
     assert_eq!(
         next_event(std::time::Duration::from_secs(1)),
-        TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::started(
+        TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::started_on(
             1,
             "reviewer",
             "review task",
             agens_tui::TuiExecutionState::ForegroundRunning,
+            Some("gpt-4.1"),
+            None,
         ))
     );
     assert!(controls.transition_to_background(1));
@@ -424,6 +428,7 @@ fn u15_a1b2_permission_cardinality_is_exact_for_allow_ask_and_deny() {
             agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap),
             Arc::clone(&probe),
         ),
+        Box::new(UnavailableAskUserPort),
     )
     .unwrap();
     let cancellation = HeadlessTurnCancellation::new();
@@ -507,6 +512,7 @@ fn u15_bypass_upgrades_ask_to_allow_on_the_authorized_launch_path_and_no_bypass_
             Arc::clone(&probe),
         )
         .with_bypass(true),
+        Box::new(UnavailableAskUserPort),
     )
     .unwrap();
     bypassed_runtime.authorized.gate.policy = ask_policy();
@@ -548,6 +554,7 @@ fn u15_bypass_upgrades_ask_to_allow_on_the_authorized_launch_path_and_no_bypass_
             Arc::clone(&probe),
         )
         .with_bypass(false),
+        Box::new(UnavailableAskUserPort),
     )
     .unwrap();
     unbypassed_runtime.authorized.gate.policy = ask_policy();
@@ -604,6 +611,7 @@ fn u15_the_production_wrapper_threads_its_bypass_flag_into_the_authorized_gate()
         agens_core::RequestConfig::default(),
         "bypass-wrapper-check".to_owned(),
         true,
+        Box::new(UnavailableAskUserPort),
     )
     .unwrap();
     runtime.authorized.gate.policy = PermissionPolicy::new(PermissionMode::Edit, Vec::new());
@@ -650,6 +658,7 @@ fn u15_a1b2_rejections_leave_the_concrete_runner_and_grants_unchanged() {
             agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap),
             Arc::clone(&probe),
         ),
+        Box::new(UnavailableAskUserPort),
     )
     .unwrap();
     let selected = || {

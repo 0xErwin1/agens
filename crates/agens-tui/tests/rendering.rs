@@ -1,12 +1,14 @@
 use agens_core::{SubagentErrorKind, SubagentStatus};
 use std::time::Duration;
 
+use agens_core::ask_user::{AskUserMode, AskUserOption, AskUserQuestion, AskUserRequest};
 use agens_core::{Message, MessagePart, Role, TurnEvent, TurnRetryReason, Usage};
 use agens_tui::{
-    Action, ConversationEvent, DialogEntry, DialogView, DiffLine, DiffLineKind, Engine, Event, Key,
-    PaletteEntry, PaletteEntryKind, RatatuiRenderer, Renderer, SessionDialogCursor,
-    SessionDialogRequest, ToolResultState, TranscriptId, Tui, TuiExecutionEvent, TuiExecutionState,
-    TuiPresentation, TuiRuntimeEvent, TuiSubagentEvent, TuiSubmissionOutcome,
+    Action, ColorLevel, ConversationEvent, DialogEntry, DialogView, DiffLine, DiffLineKind,
+    DisplayMode, Engine, Event, Key, PaletteEntry, PaletteEntryKind, RatatuiRenderer, Renderer,
+    RepositoryStatus, SessionDialogCursor, SessionDialogRequest, ToolResultState, TranscriptId,
+    Tui, TuiExecutionEvent, TuiExecutionState, TuiPresentation, TuiRuntimeEvent, TuiSubagentEvent,
+    TuiSubmissionOutcome, UnicodeLevel,
 };
 use ratatui::{
     Terminal,
@@ -21,7 +23,16 @@ impl Engine for FakeEngine {
     fn cancel(&mut self) {}
 }
 
+/// What the terminal shows, with the hyperlink sequences taken back out.
+///
+/// A cell may carry an OSC 8 payload it never displays, so a test asserting on
+/// what the reader sees has to read past it. Tests about the links themselves
+/// use [`rendered_raw`].
 fn rendered_text(renderer: &RatatuiRenderer<TestBackend>) -> String {
+    strip_osc8(&rendered_raw(renderer))
+}
+
+fn rendered_raw(renderer: &RatatuiRenderer<TestBackend>) -> String {
     renderer
         .terminal()
         .backend()
@@ -30,6 +41,21 @@ fn rendered_text(renderer: &RatatuiRenderer<TestBackend>) -> String {
         .iter()
         .map(|cell| cell.symbol())
         .collect()
+}
+
+fn strip_osc8(text: &str) -> String {
+    let mut stripped = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("\u{1b}]8;;") {
+        stripped.push_str(&rest[..start]);
+        let after = &rest[start..];
+        match after.find("\u{1b}\\") {
+            Some(end) => rest = &after[end + 2..],
+            None => return stripped,
+        }
+    }
+    stripped.push_str(rest);
+    stripped
 }
 
 fn apply_subagent(tui: &mut Tui<FakeEngine>, event: TuiSubagentEvent) {
@@ -51,10 +77,11 @@ fn rendered_row(renderer: &RatatuiRenderer<TestBackend>, text: &str) -> usize {
 fn rendered_line(renderer: &RatatuiRenderer<TestBackend>, row: usize) -> String {
     let buffer = renderer.terminal().backend().buffer();
     let width = usize::from(buffer.area.width);
-    buffer.content[row * width..(row + 1) * width]
+    let raw: String = buffer.content[row * width..(row + 1) * width]
         .iter()
         .map(|cell| cell.symbol())
-        .collect()
+        .collect();
+    strip_osc8(&raw)
 }
 
 fn rendered_column(renderer: &RatatuiRenderer<TestBackend>, text: &str) -> usize {
@@ -127,14 +154,380 @@ fn transcript_drag_selection_paints_exact_cells_and_preserves_original_text() {
 
     assert_eq!(tui.selected_text(), Some("café"));
     for offset in 0..4 {
+        let cell = &renderer.terminal().backend().buffer()[(column + offset, row)];
+        assert_eq!(cell.bg, Color::Rgb(0x1b, 0x33, 0x30));
         assert_eq!(
-            renderer.terminal().backend().buffer()[(column + offset, row)].bg,
-            Color::Rgb(0x95, 0xe6, 0xcb)
+            cell.fg,
+            Color::Rgb(0xd6, 0xd4, 0xcd),
+            "selected text must take the selection foreground; leaving the \
+             original colour under a selection wash is how it became unreadable"
         );
     }
     let rendered = rendered_text(&renderer);
     assert!(rendered.contains("alpha café"), "{rendered:?}");
     assert!(rendered.contains("omega"), "{rendered:?}");
+}
+
+/// Wrapping is a fact about the terminal, not about the text. A paragraph that
+/// happened to need three rows must come back off the clipboard as the one line
+/// it was, or every quoted answer arrives with the viewport's width baked into
+/// it.
+#[test]
+fn copying_a_wrapped_paragraph_reconstructs_the_logical_line() {
+    let paragraph = "ALPHA the assistant wrote one continuous paragraph that has to \
+survive being folded across several terminal rows before it reaches OMEGA";
+    let terminal = Terminal::new(TestBackend::new(48, 24)).unwrap();
+    let mut renderer = RatatuiRenderer::new(terminal);
+    let mut tui = Tui::new(FakeEngine);
+    tui.handle(Event::Resize {
+        width: 48,
+        height: 24,
+    });
+    tui.begin_submission("prompt");
+    tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text(
+        paragraph.to_owned(),
+    )));
+    tui.apply_progress(TurnEvent::StateChanged(agens_core::TurnState::Completed));
+    renderer.render(tui.view()).unwrap();
+
+    let first_row = rendered_row(&renderer, "ALPHA") as u16;
+    let first_column = rendered_column(&renderer, "ALPHA") as u16;
+    let last_row = rendered_row(&renderer, "OMEGA") as u16;
+    let last_column = rendered_column(&renderer, "OMEGA") as u16 + 4;
+    assert!(last_row > first_row, "the paragraph has to actually wrap");
+
+    tui.handle(Event::MouseDown {
+        column: first_column,
+        row: first_row,
+    });
+    tui.handle(Event::MouseDrag {
+        column: last_column,
+        row: last_row,
+    });
+    tui.handle(Event::MouseUp {
+        column: last_column,
+        row: last_row,
+    });
+
+    assert_eq!(tui.selected_text(), Some(paragraph));
+}
+
+/// The seam inside a word carries no separator, so rejoining must not invent
+/// one. A path broken across rows has to come back as one path, not two.
+#[test]
+fn copying_a_word_broken_mid_token_does_not_invent_a_separator() {
+    let token = format!("ALPHA{}OMEGA", "x".repeat(45));
+    let token = token.as_str();
+    let terminal = Terminal::new(TestBackend::new(40, 24)).unwrap();
+    let mut renderer = RatatuiRenderer::new(terminal);
+    let mut tui = Tui::new(FakeEngine);
+    tui.handle(Event::Resize {
+        width: 40,
+        height: 24,
+    });
+    tui.begin_submission("prompt");
+    tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text(token.to_owned())));
+    tui.apply_progress(TurnEvent::StateChanged(agens_core::TurnState::Completed));
+    renderer.render(tui.view()).unwrap();
+
+    let first_row = rendered_row(&renderer, "ALPHA") as u16;
+    let first_column = rendered_column(&renderer, "ALPHA") as u16;
+    let last_row = rendered_row(&renderer, "OMEGA") as u16;
+    let last_column = rendered_column(&renderer, "OMEGA") as u16 + 4;
+    assert!(
+        last_row > first_row,
+        "the token has to actually break mid-word: {:?}",
+        rendered_text(&renderer)
+    );
+
+    tui.handle(Event::MouseDown {
+        column: first_column,
+        row: first_row,
+    });
+    tui.handle(Event::MouseDrag {
+        column: last_column,
+        row: last_row,
+    });
+    tui.handle(Event::MouseUp {
+        column: last_column,
+        row: last_row,
+    });
+
+    assert_eq!(tui.selected_text(), Some(token));
+}
+
+/// Folding old work is only worth a row when it hides more than it costs, and
+/// the fold has to be reversible from the row itself — a reader who scrolls to
+/// the top has to find the way back, not a dead end.
+#[test]
+fn a_long_transcript_folds_its_settled_turns_behind_a_reversible_count() {
+    let turns = |count: usize| {
+        (0..count)
+            .flat_map(|turn| {
+                [
+                    Message {
+                        role: Role::User,
+                        parts: vec![MessagePart::Text(format!("user-{turn:02}"))],
+                    },
+                    Message {
+                        role: Role::Assistant,
+                        parts: vec![MessagePart::Text(format!("answer-{turn:02}"))],
+                    },
+                ]
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(60, 60)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.handle(Event::Resize {
+        width: 60,
+        height: 60,
+    });
+
+    // Seven settled turns is one over the visible window: folding a single turn
+    // would trade one row for one row, so nothing is folded.
+    tui.replace_history(&turns(7)).unwrap();
+    renderer.render(tui.view()).unwrap();
+    let short = rendered_text(&renderer);
+    assert!(short.contains("user-00"), "{short:?}");
+    assert!(!short.contains("earlier turn"), "{short:?}");
+
+    tui.replace_history(&turns(11)).unwrap();
+    tui.handle(Event::Key(Key::Home));
+    renderer.render(tui.view()).unwrap();
+    let folded = rendered_text(&renderer);
+    assert!(
+        folded.contains("… 5 earlier turns · ^Y to show"),
+        "{folded:?}"
+    );
+    assert!(!folded.contains("user-00"), "{folded:?}");
+    assert!(
+        folded.contains("user-10"),
+        "the recent turns stay: {folded:?}"
+    );
+
+    tui.handle(Event::Key(Key::CtrlY));
+    tui.handle(Event::Key(Key::Home));
+    renderer.render(tui.view()).unwrap();
+    let unfolded = rendered_text(&renderer);
+    assert!(unfolded.contains("user-00"), "{unfolded:?}");
+    assert!(!unfolded.contains("earlier turns"), "{unfolded:?}");
+
+    tui.handle(Event::Key(Key::CtrlY));
+    tui.handle(Event::Key(Key::Home));
+    renderer.render(tui.view()).unwrap();
+    assert!(
+        rendered_text(&renderer).contains("… 5 earlier turns"),
+        "the fold closes again"
+    );
+}
+
+/// A path the agent touched is the thing the reader most often wants to open,
+/// and a link is only worth having if it costs the text nothing: the row must
+/// read exactly the same with the sequence spliced in as without it.
+#[test]
+fn a_path_in_a_tool_row_becomes_an_openable_link_without_changing_the_row() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(100, 24)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.handle(Event::Resize {
+        width: 100,
+        height: 24,
+    });
+    tui.set_hyperlinks(true);
+    tui.set_project("/home/iperez/dev/personal/agens");
+    tui.begin_submission("inspect");
+    tui.apply_progress(TurnEvent::ToolCallRequested {
+        id: "read-1".into(),
+        name: "native::read".into(),
+        input: "crates/agens-tui/src/lib.rs".into(),
+    });
+    tui.apply_progress(TurnEvent::ToolResult(MessagePart::ToolResult {
+        tool_call_id: "read-1".into(),
+        content: "body".into(),
+        is_error: false,
+    }));
+    renderer.render(tui.view()).unwrap();
+
+    let raw = rendered_raw(&renderer);
+    assert!(
+        raw.contains(
+            "\u{1b}]8;;file:///home/iperez/dev/personal/agens/crates/agens-tui/src/lib.rs\u{1b}\\"
+        ),
+        "{raw:?}"
+    );
+    assert!(
+        raw.contains("\u{1b}]8;;\u{1b}\\"),
+        "the link closes: {raw:?}"
+    );
+
+    let visible = rendered_text(&renderer);
+    assert!(
+        visible.contains("read crates/agens-tui/src/lib.rs"),
+        "{visible:?}"
+    );
+    assert!(!visible.contains('\u{1b}'), "{visible:?}");
+}
+
+/// A palette that resolves to one undifferentiated colour, or chrome that
+/// resolves to replacement characters, is not a degraded transcript — it is an
+/// unreadable one. Both fallbacks are judged by what survives them: the
+/// distinctions, and the column each glyph occupies.
+#[test]
+fn the_transcript_stays_legible_on_sixteen_colours_and_without_extended_glyphs() {
+    let render = |color: ColorLevel, unicode: UnicodeLevel| {
+        let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(80, 24)).unwrap());
+        let mut tui = Tui::new(FakeEngine);
+        tui.handle(Event::Resize {
+            width: 80,
+            height: 24,
+        });
+        tui.set_capabilities(color, unicode);
+        tui.begin_submission("request");
+        tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text(
+            "assistant body".into(),
+        )));
+        tui.apply_progress(TurnEvent::ToolCallRequested {
+            id: "read-1".into(),
+            name: "native::read".into(),
+            input: "src/lib.rs".into(),
+        });
+        tui.apply_progress(TurnEvent::ToolResult(MessagePart::ToolResult {
+            tool_call_id: "read-1".into(),
+            content: "body".into(),
+            is_error: false,
+        }));
+        tui.finish_provider_turn(agens_tui::TuiProviderOutcome::Completed("answer".into()));
+        renderer.render(tui.view()).unwrap();
+        renderer
+    };
+
+    let truecolor = render(ColorLevel::TrueColor, UnicodeLevel::Extended);
+    let colours_of = |renderer: &RatatuiRenderer<TestBackend>| {
+        let mut seen = Vec::new();
+        for cell in &renderer.terminal().backend().buffer().content {
+            if !seen.contains(&cell.fg) {
+                seen.push(cell.fg);
+            }
+        }
+        seen
+    };
+    let rich = colours_of(&truecolor).len();
+
+    for level in [ColorLevel::Ansi256, ColorLevel::Ansi16] {
+        let renderer = render(level, UnicodeLevel::Extended);
+        let seen = colours_of(&renderer);
+        assert!(
+            seen.iter().all(|colour| !matches!(colour, Color::Rgb(..))),
+            "{level:?} still sends 24-bit colour: {seen:?}"
+        );
+        assert!(
+            seen.len() * 2 >= rich,
+            "{level:?} collapsed {rich} distinctions into {}",
+            seen.len()
+        );
+    }
+
+    let plain = render(ColorLevel::None, UnicodeLevel::Extended);
+    assert!(
+        colours_of(&plain)
+            .iter()
+            .all(|colour| *colour == Color::Reset),
+        "the terminal's own colours are the whole palette here"
+    );
+
+    // The ASCII transcript says the same things in the same columns.
+    let extended = render(ColorLevel::TrueColor, UnicodeLevel::Extended);
+    let ascii = render(ColorLevel::TrueColor, UnicodeLevel::Ascii);
+    let text = rendered_text(&ascii);
+    assert!(text.contains("assistant body"), "{text:?}");
+    assert!(text.contains("read src/lib.rs"), "{text:?}");
+    for glyph in ['┃', '◆', '❯', '●'] {
+        assert!(
+            !text.contains(glyph),
+            "{glyph} survived the fallback: {text:?}"
+        );
+    }
+    assert_eq!(
+        rendered_column(&ascii, "assistant body"),
+        rendered_column(&extended, "assistant body"),
+        "the content column does not move with the locale"
+    );
+}
+
+/// Hover is an accelerator over the keyboard path, never a second one. It sets
+/// the focus `j`/`k` set and opens nothing by itself, so a session with mouse
+/// capture off loses speed and no capability.
+#[test]
+fn hovering_a_block_focuses_it_and_adds_nothing_the_keyboard_cannot_do() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(80, 24)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.handle(Event::Resize {
+        width: 80,
+        height: 24,
+    });
+    tui.begin_submission("request");
+    for id in ["read-1", "read-2"] {
+        tui.apply_progress(TurnEvent::ToolCallRequested {
+            id: id.into(),
+            name: "native::read".into(),
+            input: format!("{id}.log"),
+        });
+        tui.apply_progress(TurnEvent::ToolResult(MessagePart::ToolResult {
+            tool_call_id: id.into(),
+            content: format!("body of {id}"),
+            is_error: false,
+        }));
+    }
+    tui.finish_provider_turn(agens_tui::TuiProviderOutcome::Completed("answer".into()));
+    renderer.render(tui.view()).unwrap();
+
+    assert_eq!(tui.view().focused_call, None);
+
+    let second = rendered_row(&renderer, "read-2.log") as u16;
+    tui.handle(Event::MouseMove {
+        column: 10,
+        row: second,
+    });
+    assert_eq!(tui.view().focused_call, Some("read-2"));
+    assert!(
+        !tui.view().tool_display_modes.contains_key("read-2")
+            || tui.view().tool_display_modes.get("read-2") == Some(&DisplayMode::Collapsed),
+        "hover moves focus; opening still costs a deliberate press"
+    );
+
+    // Movement that lands on the block already under the cursor changes
+    // nothing a reader could see, and must not cost a repaint: pointer events
+    // arrive dozens of times per second and almost all of them are this one.
+    assert_eq!(
+        tui.handle(Event::MouseMove {
+            column: 14,
+            row: second,
+        }),
+        Action::Unchanged
+    );
+
+    let first = rendered_row(&renderer, "read-1.log") as u16;
+    assert_eq!(
+        tui.handle(Event::MouseMove {
+            column: 10,
+            row: first,
+        }),
+        Action::Render
+    );
+    assert_eq!(tui.view().focused_call, Some("read-1"));
+
+    // Off the transcript there is nothing to focus, and nothing is claimed.
+    tui.handle(Event::MouseMove { column: 10, row: 0 });
+    assert_eq!(tui.view().focused_call, Some("read-1"));
+
+    // Every capability hover reaches is one the keyboard already had.
+    tui.handle(Event::Key(Key::Escape));
+    tui.handle(Event::Key(Key::Char('o')));
+    assert_eq!(
+        tui.view().tool_display_modes.get("read-1"),
+        Some(&DisplayMode::Truncated)
+    );
 }
 
 #[test]
@@ -198,7 +591,7 @@ fn bottom_chrome_bands_share_one_gutter_and_the_composer_keeps_both_edges_free()
     }
 
     assert_eq!(
-        rendered_column(&renderer, "Tab focus"),
+        rendered_column(&renderer, "↑↓ walk"),
         usize::from(CHROME_GUTTER),
         "the subagent tree starts at the shared gutter"
     );
@@ -239,7 +632,7 @@ fn responsive_layout_saturates_heights_one_through_six() {
         assert!(!text.contains("agens safe"), "height {height}: {text:?}");
         if height >= 12 {
             assert!(
-                text.contains("Ready") || text.contains("gpt"),
+                text.contains("model —") || text.contains("gpt"),
                 "height {height}: expected footer metrics: {text:?}"
             );
         }
@@ -290,9 +683,11 @@ fn conversational_surface_uses_full_width_and_moves_context_to_footer() {
             assert!(text.contains("gpt-4.1"), "footer model: {text:?}");
             assert!(text.contains("high"), "footer effort: {text:?}");
             assert!(text.contains("agens"), "footer project basename: {text:?}");
-            assert!(text.contains("8/128"), "footer usage: {text:?}");
-            assert!(text.contains('%'), "footer percent: {text:?}");
-            assert!(text.contains("Ready"), "{text:?}");
+            assert!(text.contains("6%"), "footer context share: {text:?}");
+            assert!(
+                !text.contains("8/128"),
+                "counts wait for pressure: {text:?}"
+            );
             assert!(!text.contains("Enter send"), "{text:?}");
         }
     }
@@ -313,11 +708,24 @@ fn footer_shows_compact_tokens_used_over_window_without_header_ctx() {
     renderer.render(tui.view()).unwrap();
     let text = rendered_text(&renderer);
 
-    assert!(text.contains("15/8.2k"), "{text:?}");
-    assert!(text.contains('%'), "{text:?}");
+    // Well below pressure, the share is the whole answer and the raw counts
+    // stay out of the border.
+    assert!(text.contains("0%"), "{text:?}");
+    assert!(!text.contains("15/8.2k"), "{text:?}");
     assert!(!text.contains("ctx 15/8192"), "{text:?}");
     assert!(!text.contains("context 8192"), "{text:?}");
     assert!(!text.contains("unavailable"), "{text:?}");
+
+    tui.apply_runtime_event(TuiRuntimeEvent::Usage(Usage {
+        input_tokens: Some(7_000),
+        output_tokens: Some(5),
+        total_tokens: Some(7_000),
+        context_window: Some(8_192),
+    }));
+    renderer.render(tui.view()).unwrap();
+    let pressed = rendered_text(&renderer);
+    assert!(pressed.contains("85%"), "{pressed:?}");
+    assert!(pressed.contains("7.0k/8.2k"), "{pressed:?}");
 }
 
 #[test]
@@ -334,7 +742,7 @@ fn footer_keeps_five_fields_and_usage_across_submission_start() {
     renderer.render(tui.view()).unwrap();
     let before_usage = rendered_text(&renderer);
     assert!(
-        before_usage.contains("gpt-4.1 · high · 0/200k (0%) · agens · Ready"),
+        before_usage.contains("gpt-4.1 (high) ·   0% · ~/d/p/agens · ask"),
         "{before_usage:?}"
     );
     assert!(!before_usage.contains("model · default · ctx —"));
@@ -354,7 +762,7 @@ fn footer_keeps_five_fields_and_usage_across_submission_start() {
     renderer.render(tui.view()).unwrap();
     let next_turn = rendered_text(&renderer);
     assert!(
-        next_turn.contains("gpt-4.1 · high · 71k/200k (36%) · agens"),
+        next_turn.contains("gpt-4.1 (high) ·  36% · ~/d/p/agens"),
         "{next_turn:?}"
     );
 }
@@ -367,7 +775,7 @@ fn footer_uses_explicit_fallbacks_without_inventing_values() {
     renderer.render(tui.view()).unwrap();
     let text = rendered_text(&renderer);
 
-    assert!(text.contains("model — · effort — · ctx —"), "{text:?}");
+    assert!(text.contains("model — · ctx —"), "{text:?}");
     assert!(!text.contains("model · default · ctx —"), "{text:?}");
 }
 
@@ -383,8 +791,9 @@ fn active_status_glyph_advances_with_tick_and_idle_stays_static() {
     renderer.render(tui.view()).unwrap();
     let idle_later = rendered_text(&renderer);
 
-    assert!(idle_early.contains("Ready"), "{idle_early:?}");
-    assert!(idle_later.contains("Ready"), "{idle_later:?}");
+    // Idle is the absence of news; the footer keeps the slot empty for it.
+    assert!(!idle_early.contains("Ready"), "{idle_early:?}");
+    assert!(!idle_later.contains("Ready"), "{idle_later:?}");
     assert!(!idle_early.contains("⠋"), "{idle_early:?}");
     assert!(!idle_later.contains("⠼"), "{idle_later:?}");
     assert_eq!(
@@ -506,7 +915,9 @@ fn a_settled_turn_keeps_what_it_took_and_what_it_billed() {
     let rendered = rendered_text(&renderer);
 
     assert!(rendered.contains("14s"), "{rendered:?}");
-    assert!(rendered.contains("3.2k tok in"), "{rendered:?}");
+    // Two rounds of 1.2k and 2.0k prompt tokens are one 2.0k conversation, not
+    // a 3.2k one: the second round resent the first.
+    assert!(rendered.contains("2.0k tok context"), "{rendered:?}");
     assert!(rendered.contains("1.0k tok out"), "{rendered:?}");
 }
 
@@ -651,7 +1062,7 @@ fn composer_dock_and_footer_degrade_without_detached_bands() {
         );
         if expects_footer {
             assert!(
-                text.contains("Ready") || text.contains("Responding"),
+                text.contains("model —") || text.contains("Responding"),
                 "height {height}: expected operational footer: {text:?}"
             );
         }
@@ -758,20 +1169,22 @@ fn user_turns_have_a_distinct_identity_rail_and_compact_separation() {
 
 #[test]
 fn live_assistant_content_uses_the_user_body_column_at_normal_width() {
-    assert_conversation_content_column(56, false);
+    assert_conversation_content_column(60, false);
 }
 
 #[test]
 fn restored_assistant_content_uses_the_user_body_column_at_narrow_width() {
-    assert_conversation_content_column(24, true);
+    assert_conversation_content_column(28, true);
 }
 
 fn assert_conversation_content_column(width: u16, restored: bool) {
     let terminal = Terminal::new(TestBackend::new(width, 40)).unwrap();
     let mut renderer = RatatuiRenderer::new(terminal);
     let mut tui = Tui::new(FakeEngine);
-    // Four columns of transcript margin plus the two-column shared row gutter.
-    let content_width = usize::from(width - 6);
+    // Four columns of transcript margin, the two-column shared row gutter, and
+    // the four the transcript now keeps on the right so prose cannot outrun the
+    // composer below it.
+    let content_width = usize::from(width - 10);
     let first_line = format!(
         "ASSISTANT_FIRST{}",
         "x".repeat(content_width - "ASSISTANT_FIRST".len())
@@ -808,8 +1221,8 @@ fn assert_conversation_content_column(width: u16, restored: bool) {
             },
         ])
         .unwrap();
-        // Finished restored history: thinking-first, then tools.
-        tui.handle(Event::Key(Key::CtrlO));
+        // Finished restored history: reasoning and tool output, one key each.
+        tui.handle(Event::Key(Key::CtrlT));
         tui.handle(Event::Key(Key::CtrlO));
     } else {
         tui.begin_submission("USER_BODY");
@@ -840,7 +1253,6 @@ fn assert_conversation_content_column(width: u16, restored: bool) {
         "ASSISTANT_FIRST",
         "ASSISTANT_WRAPPED",
         "THINKING_BODY",
-        "TOOL_BODY",
         "• ASSISTANT_LIST",
         "read {}",
     ] {
@@ -851,6 +1263,13 @@ fn assert_conversation_content_column(width: u16, restored: bool) {
             rendered_column(&renderer, content)
         );
     }
+    // A tool's output sits right of the call it belongs to, so a reader can
+    // tell what the agent printed from what it ran without reading either.
+    assert_eq!(
+        rendered_column(&renderer, "TOOL_BODY"),
+        rendered_column(&renderer, "read {}") + 2,
+        "{text:?}"
+    );
     // A fenced body sits inside its own panel rail, which owns the content column.
     assert!(
         rendered_column(&renderer, "ASSISTANT_CODE") <= 8,
@@ -861,7 +1280,7 @@ fn assert_conversation_content_column(width: u16, restored: bool) {
 }
 
 #[test]
-fn thinking_streams_expanded_auto_collapses_on_finish_and_ctrl_o_re_expands() {
+fn thinking_streams_expanded_auto_collapses_on_finish_and_ctrl_t_re_expands() {
     let terminal = Terminal::new(TestBackend::new(64, 24)).unwrap();
     let mut renderer = RatatuiRenderer::new(terminal);
     let mut tui = Tui::new(FakeEngine);
@@ -888,10 +1307,15 @@ fn thinking_streams_expanded_auto_collapses_on_finish_and_ctrl_o_re_expands() {
     let collapsed = rendered_text(&renderer);
     assert!(collapsed.contains("Thought"), "{collapsed:?}");
     assert!(!collapsed.contains("Thinking"), "{collapsed:?}");
-    assert!(!collapsed.contains("THOUGHTTOKEN"), "{collapsed:?}");
+    // The opening line survives as the row's label — that is what makes one
+    // collapsed thought distinguishable from the next — while the body does not.
+    assert!(
+        collapsed.contains("Thought · THOUGHTTOKEN"),
+        "{collapsed:?}"
+    );
     assert!(tui.view().collapse_thinking);
 
-    tui.handle(Event::Key(Key::CtrlO));
+    tui.handle(Event::Key(Key::CtrlT));
     renderer.render(tui.view()).unwrap();
     let reexpanded = rendered_text(&renderer);
     assert!(reexpanded.contains("THOUGHTTOKEN"), "{reexpanded:?}");
@@ -1311,7 +1735,7 @@ fn typed_tool_headers_render_per_kind_and_keep_raw_arguments_behind_expand() {
         "Read src/main.rs",
         "$ cargo test",
         "Grep needle in src",
-        "foo__bar {path, limit}",
+        "foo__bar {limit=10, path=/etc/hosts-sentinel}",
     ] {
         assert!(text.contains(header), "missing {header:?}: {text:?}");
     }
@@ -1319,7 +1743,6 @@ fn typed_tool_headers_render_per_kind_and_keep_raw_arguments_behind_expand() {
         !text.contains("\"path\":"),
         "no raw JSON on the scan path: {text:?}"
     );
-    assert!(!text.contains("/etc/hosts-sentinel"), "{text:?}");
 
     tui.handle(Event::Key(Key::CtrlO));
     tui.handle(Event::Key(Key::CtrlO));
@@ -1420,7 +1843,7 @@ fn collapsed_thinking_occupies_exactly_one_row_and_names_the_finished_thought() 
     let mut tui = Tui::new(FakeEngine);
     tui.begin_submission("request");
     tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Reasoning(
-        "THOUGHTTOKEN body".into(),
+        "Checking the timeout\nBODYTOKEN the rest of the reasoning".into(),
     )));
     tui.finish_provider_turn(agens_tui::TuiProviderOutcome::Completed("answer".into()));
 
@@ -1432,13 +1855,18 @@ fn collapsed_thinking_occupies_exactly_one_row_and_names_the_finished_thought() 
         !text.contains("collapsed"),
         "the collapsed state is the row itself, not a suffix: {text:?}"
     );
-    assert!(!text.contains("THOUGHTTOKEN"), "{text:?}");
+    assert!(
+        !text.contains("BODYTOKEN"),
+        "the body stays hidden: {text:?}"
+    );
 
     let thought_row = rendered_row(&renderer, "Thought");
-    assert_eq!(
-        rendered_line(&renderer, thought_row).trim(),
-        "Thought",
-        "no duration is tracked for reasoning, so the bare form renders"
+    assert!(
+        rendered_line(&renderer, thought_row)
+            .trim()
+            .ends_with("Thought · Checking the timeout"),
+        "the opening line becomes the label, so one thought reads apart from the next: {:?}",
+        rendered_line(&renderer, thought_row)
     );
     let rows = transcript_rows(&renderer);
     assert_eq!(
@@ -1448,6 +1876,44 @@ fn collapsed_thinking_occupies_exactly_one_row_and_names_the_finished_thought() 
         1,
         "collapsed thinking is exactly one row: {rows:?}"
     );
+}
+
+/// A run of collapsed thoughts is a list, and a blank line between every entry
+/// of a list is a gap pretending to be structure.
+#[test]
+fn consecutive_collapsed_thoughts_pack_without_a_blank_row_between_them() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(72, 24)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.begin_submission("request");
+    for subject in [
+        "Reading the log",
+        "Checking the timeout",
+        "Planning the fix",
+    ] {
+        tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Reasoning(format!(
+            "{subject}\nbody"
+        ))));
+        tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text(String::new())));
+    }
+    tui.finish_provider_turn(agens_tui::TuiProviderOutcome::Completed("answer".into()));
+
+    renderer.render(tui.view()).unwrap();
+    let rows = transcript_rows(&renderer);
+    let thought_rows = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| row.contains("Thought"))
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+
+    assert!(thought_rows.len() >= 2, "several thoughts render: {rows:?}");
+    for pair in thought_rows.windows(2) {
+        assert_eq!(
+            pair[1] - pair[0],
+            1,
+            "collapsed thoughts sit on consecutive rows: {rows:?}"
+        );
+    }
 }
 
 #[test]
@@ -1813,16 +2279,17 @@ fn no_header_row_and_the_working_indicator_lives_at_the_end_of_the_chat() {
     let text = rendered_text(&renderer);
     assert!(
         rendered_line(&renderer, 0)
+            .trim_end()
             .chars()
             .all(|glyph| glyph == '─'),
         "the first row is transcript content chrome, not a header strip: {:?}",
         rendered_line(&renderer, 0)
     );
     assert!(text.contains("12s"), "{text:?}");
-    assert!(text.contains("3400 tok"), "{text:?}");
+    assert!(text.contains("3.4k tok"), "{text:?}");
 
     let body_row = rendered_row(&renderer, "assistant body");
-    let indicator_row = rendered_row(&renderer, "3400 tok");
+    let indicator_row = rendered_row(&renderer, "3.4k tok");
     let footer_row = rendered_row(&renderer, "model —");
     assert!(
         body_row < indicator_row && indicator_row < footer_row,
@@ -1835,6 +2302,114 @@ fn no_header_row_and_the_working_indicator_lives_at_the_end_of_the_chat() {
     assert!(
         !idle.contains("3400 tok"),
         "the working indicator disappears when idle: {idle:?}"
+    );
+}
+
+/// Supervising delegated work means comparing branches against each other. A
+/// row that reports only a state and a second count cannot be compared: elapsed
+/// time is meaningless without knowing what each branch runs on, and raw
+/// seconds past a minute are arithmetic rather than a reading.
+#[test]
+fn three_running_subagents_report_which_is_slowest_and_what_each_runs_on() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(100, 50)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.handle(Event::Resize {
+        width: 100,
+        height: 50,
+    });
+    tui.begin_submission("delegate");
+
+    for (id, agent, model) in [
+        (9_u64, "explore", "gpt-5.6-sol"),
+        (10, "plan", "claude-opus-5"),
+        (11, "build", "gpt-5.6-mini"),
+    ] {
+        tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
+            agent: agent.into(),
+            event: TuiExecutionEvent::ForegroundStarted { id },
+        });
+        apply_subagent(
+            &mut tui,
+            TuiSubagentEvent::started_on(
+                id,
+                agent,
+                "task",
+                TuiExecutionState::ForegroundRunning,
+                Some(model),
+                Some("high"),
+            ),
+        );
+    }
+    tui.tick(Duration::from_secs(253));
+
+    renderer.render(tui.view()).unwrap();
+    let text = rendered_text(&renderer);
+
+    for model in ["gpt-5.6-sol", "claude-opus-5", "gpt-5.6-mini"] {
+        assert!(text.contains(model), "missing {model:?}: {text:?}");
+    }
+    assert!(
+        text.contains("4m 13s"),
+        "elapsed changes unit rather than growing: {text:?}"
+    );
+    assert!(!text.contains("253s"), "{text:?}");
+    assert!(
+        text.contains("Main · 3 running"),
+        "the root answers how much is in flight before any branch is read: {text:?}"
+    );
+}
+
+/// Cancelling is the one panel action with a consequence outside the screen, so
+/// the hint and the key have to agree: advertised exactly where a press would
+/// cancel something, absent where it would do nothing.
+#[test]
+fn the_tree_offers_cancel_only_over_a_running_branch_and_the_key_cancels_it() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(100, 50)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.handle(Event::Resize {
+        width: 100,
+        height: 50,
+    });
+    tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
+        agent: "explore".into(),
+        event: TuiExecutionEvent::ForegroundStarted { id: 9 },
+    });
+    apply_subagent(
+        &mut tui,
+        TuiSubagentEvent::started(9, "explore", "task", TuiExecutionState::ForegroundRunning),
+    );
+
+    renderer.render(tui.view()).unwrap();
+    assert!(
+        !rendered_text(&renderer).contains("x cancel"),
+        "nothing is selected yet, so the key would act on nothing"
+    );
+
+    tui.handle(Event::Key(Key::Escape));
+    tui.handle(Event::Key(Key::Char(']')));
+    assert_eq!(tui.view().active_transcript, TranscriptId::Subagent(9));
+
+    renderer.render(tui.view()).unwrap();
+    assert!(
+        rendered_text(&renderer).contains("x cancel"),
+        "{:?}",
+        rendered_text(&renderer)
+    );
+
+    assert_eq!(
+        tui.handle(Event::Key(Key::Char('x'))),
+        Action::CancelExecution(9)
+    );
+
+    tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
+        agent: "explore".into(),
+        event: TuiExecutionEvent::Cancelled { id: 9 },
+    });
+    renderer.render(tui.view()).unwrap();
+    assert!(
+        !rendered_text(&renderer).contains("x cancel"),
+        "a cancelled branch cannot be cancelled again: {:?}",
+        rendered_text(&renderer)
     );
 }
 
@@ -1879,13 +2454,13 @@ fn subagent_tree_renders_below_the_composer_and_owns_the_navigation_hints() {
     assert!(!text.contains("secret-child-input"), "{text:?}");
 
     assert_eq!(
-        text.matches("Tab focus · Enter inspect · Ctrl+B background")
+        text.matches("↑↓ walk · Enter inspect · Ctrl+B background")
             .count(),
         1,
         "the navigation hints live with the tree only: {text:?}"
     );
     let body_row = rendered_row(&renderer, "assistant body");
-    let tree_row = rendered_row(&renderer, "Tab focus");
+    let tree_row = rendered_row(&renderer, "↑↓ walk");
     let footer_row = rendered_row(&renderer, "model —");
     assert!(
         body_row < footer_row && footer_row < tree_row,
@@ -1935,7 +2510,7 @@ fn narrow_terminals_elide_long_summaries_on_a_word_boundary_instead_of_slicing_t
     renderer.render(tui.view()).unwrap();
     let text = rendered_text(&renderer);
     assert!(
-        text.contains("Explore · Investiga este proyecto…"),
+        text.contains("Explore · Investiga este…"),
         "the card keeps a first-sentence title elided on a word boundary: {text:?}"
     );
     assert!(
@@ -1947,7 +2522,7 @@ fn narrow_terminals_elide_long_summaries_on_a_word_boundary_instead_of_slicing_t
         "a tree branch label is elided instead of sliced: {text:?}"
     );
     assert!(
-        text.contains("Tab focus · Enter inspect…"),
+        text.contains("↑↓ walk · Enter inspect…"),
         "the tree affordance row is elided instead of sliced: {text:?}"
     );
 }
@@ -2401,7 +2976,10 @@ fn renderer_projects_conversation_losslessly_by_call_id() {
             output: "```text\nread result\n```".into(),
             is_error: false,
         },
-        ConversationEvent::Diff(vec![DiffLine::new(8, DiffLineKind::Added, "new line")]),
+        ConversationEvent::Diff {
+            call_id: "edit-1".into(),
+            lines: vec![DiffLine::new(8, DiffLineKind::Added, "new line")],
+        },
         ConversationEvent::Error {
             message: "Request failed safely".into(),
             action: "Check credentials and retry.".into(),
@@ -2435,7 +3013,7 @@ fn renderer_projects_conversation_losslessly_by_call_id() {
         "write result",
         "12ms",
         "new line",
-        "8/128",
+        "6%",
         "Request failed safely",
         "Action: Check credentials and retry.",
     ] {
@@ -2482,7 +3060,7 @@ fn lifecycle_metrics_render_in_footer_without_transcript_rows() {
     assert!(!text.contains("USAGE"));
     assert!(text.contains("Completed"));
     assert!(text.contains("25ms"));
-    assert!(text.contains("15/8.2k"), "{text:?}");
+    assert!(text.contains("0%"), "{text:?}");
     assert!(!text.contains("context 8192"), "{text:?}");
     assert!(!text.contains("unavailable"), "{text:?}");
 }
@@ -2579,12 +3157,12 @@ fn renderer_recovers_complete_long_output_through_production_scroll_offsets() {
 
 #[test]
 fn renderer_retains_completed_turns_while_streaming_and_scrolling_the_next_turn() {
-    let backend = TestBackend::new(52, 16);
+    let backend = TestBackend::new(56, 16);
     let terminal = Terminal::new(backend).unwrap();
     let mut renderer = RatatuiRenderer::new(terminal);
     let mut tui = Tui::new(FakeEngine);
     tui.handle(Event::Resize {
-        width: 52,
+        width: 56,
         height: 16,
     });
 
@@ -2683,12 +3261,22 @@ fn restored_history_scroll_stays_fixed_while_streaming_and_end_resumes_follow() 
     assert!(streamed.contains("restored-user-10"), "{streamed:?}");
     assert!(!tui.following_bottom());
 
-    tui.handle(Event::Key(Key::Home));
+    // The top of a long transcript is the elision row, not its oldest turn:
+    // scrolling there is exactly where the key that unfolds it has to be found.
+    tui.handle(Event::Key(Key::CtrlG));
+    renderer.render(tui.view()).unwrap();
+    let top = rendered_text(&renderer);
+    assert!(!top.contains("restored-user-00"), "{top:?}");
+    assert!(top.contains("earlier turns · ^Y to show"), "{top:?}");
+    assert!(!tui.following_bottom());
+
+    tui.handle(Event::Key(Key::CtrlY));
+    tui.handle(Event::Key(Key::CtrlG));
     renderer.render(tui.view()).unwrap();
     assert!(rendered_text(&renderer).contains("restored-user-00"));
     assert!(!tui.following_bottom());
 
-    tui.handle(Event::Key(Key::End));
+    tui.handle(Event::Key(Key::CtrlShiftG));
     renderer.render(tui.view()).unwrap();
     assert!(rendered_text(&renderer).contains("streaming-line-19"));
     assert!(tui.following_bottom());
@@ -2727,8 +3315,8 @@ fn restored_messages_render_every_turn_and_typed_part_in_persisted_order() {
         message(Role::Assistant, text("second answer")),
     ];
     tui.replace_history(&messages).unwrap();
-    // Thinking-first then tools for restored finished history.
-    tui.handle(Event::Key(Key::CtrlO));
+    // Reasoning and tool output for restored finished history, one key each.
+    tui.handle(Event::Key(Key::CtrlT));
     tui.handle(Event::Key(Key::CtrlO));
     renderer.render(tui.view()).unwrap();
     let text = rendered_text(&renderer);
@@ -3116,6 +3704,7 @@ fn subagent_inspect_dialog_renders_through_the_overlay_shell() {
 
     tui.handle(Event::Key(Key::Escape));
     tui.handle(Event::Key(Key::Char('g')));
+    tui.handle(Event::Key(Key::Char('t')));
     renderer.render(tui.view()).unwrap();
     let inspect = rendered_text(&renderer);
 
@@ -3396,7 +3985,7 @@ fn renderer_shows_complete_rich_turn_details_without_truncation() {
         "12ms",
         "old line",
         "new line",
-        "8/128",
+        "6%",
     ] {
         assert!(text.contains(expected), "missing {expected:?} in {text:?}");
     }
@@ -3488,12 +4077,19 @@ fn physical_cursor_follows_main_composer_focus_and_overlay_ownership() {
     renderer.render(tui.view()).unwrap();
     assert!(renderer.terminal().backend().cursor_visible());
 
+    // Scrolling reads the transcript without leaving the prompt, so the cursor
+    // stays where the typing still goes.
     tui.handle(Event::Key(Key::PageUp));
     for _ in 0..3 {
         renderer.render(tui.view()).unwrap();
-        assert!(!renderer.terminal().backend().cursor_visible());
+        assert!(renderer.terminal().backend().cursor_visible());
     }
     tui.handle(Event::Key(Key::ScrollUp));
+    renderer.render(tui.view()).unwrap();
+    assert!(renderer.terminal().backend().cursor_visible());
+
+    // Focusing the transcript does leave it, and takes the cursor with it.
+    tui.handle(Event::Key(Key::Escape));
     renderer.render(tui.view()).unwrap();
     assert!(!renderer.terminal().backend().cursor_visible());
 
@@ -4107,7 +4703,7 @@ impl FixedPtyHarness {
 
 #[test]
 fn structural_pty_resize_scroll_stream_and_dialog_contract() {
-    let mut harness = FixedPtyHarness::new(52, 14);
+    let mut harness = FixedPtyHarness::new(56, 14);
     let mut tui = Tui::new(FakeEngine);
 
     tui.begin_submission("streaming request");
@@ -4138,7 +4734,8 @@ fn structural_pty_resize_scroll_stream_and_dialog_contract() {
     assert!(!streamed.contains("streamed-after-scroll-sentinel") || !tui.following_bottom());
     assert!(!tui.following_bottom());
 
-    tui.handle(Event::Key(Key::End));
+    // End edits the prompt; re-following the stream is the composer-safe jump.
+    tui.handle(Event::Key(Key::CtrlShiftG));
     let refollowed = harness.render(&tui);
     assert!(refollowed.contains("streamed-after-scroll-sentinel"));
     assert!(tui.following_bottom());
@@ -4240,14 +4837,14 @@ fn active_transcript_render_keeps_child_rows_out_of_main_and_renders_owner_navig
     assert!(main.contains("child-final-sentinel"), "{main:?}");
 
     tui.select_transcript(TranscriptId::Subagent(7));
-    // Ctrl+O is thinking-first, then tools.
-    tui.handle(Event::Key(Key::CtrlO));
+    // Ctrl+T shows the reasoning, Ctrl+O the tool output.
+    tui.handle(Event::Key(Key::CtrlT));
     tui.handle(Event::Key(Key::CtrlO));
     renderer.render(tui.view()).unwrap();
     let child = rendered_text(&renderer);
     assert!(child.contains("Subagent 7 · reviewer"), "{child:?}");
     assert!(
-        child.contains("g select · m Main · h/l sibling"),
+        child.contains("gt select · m Main · [/] sibling"),
         "{child:?}"
     );
     assert!(
@@ -4346,15 +4943,15 @@ fn reserved_bottom_chrome_parks_the_composer_and_keeps_it_stable() {
         "notices and the subagent tree must not move the composer"
     );
     let notice_row = rendered_row(&renderer, "notice-sentinel") as u16;
-    let tree_row = rendered_row(&renderer, "Tab focus") as u16;
+    let tree_row = rendered_row(&renderer, "↑↓ walk") as u16;
     let footer_row = rendered_row(&renderer, "model —") as u16;
     assert_eq!(
         footer_row, idle_bottom,
         "the metadata stays glued to the composer border"
     );
     assert!(
-        idle_bottom < notice_row && notice_row < tree_row,
-        "bottom chrome order below the composer is notice then tree: {notice_row} {tree_row}"
+        idle_bottom < tree_row && tree_row < notice_row,
+        "bottom chrome order below the composer is tree then notice: {tree_row} {notice_row}"
     );
 
     tui.handle(Event::Key(Key::Escape));
@@ -4377,7 +4974,7 @@ fn tree_affordance_advertises_background_only_while_a_branch_runs_in_foreground(
 
     renderer.render(tui.view()).unwrap();
     assert!(
-        rendered_text(&renderer).contains("Tab focus · Enter inspect · Ctrl+B background"),
+        rendered_text(&renderer).contains("↑↓ walk · Enter inspect · Ctrl+B background"),
         "a foreground branch can still be backgrounded: {:?}",
         rendered_text(&renderer)
     );
@@ -4389,7 +4986,7 @@ fn tree_affordance_advertises_background_only_while_a_branch_runs_in_foreground(
     renderer.render(tui.view()).unwrap();
     let backgrounded = rendered_text(&renderer);
     assert!(
-        backgrounded.contains("Tab focus · Enter inspect"),
+        backgrounded.contains("↑↓ walk · Enter inspect"),
         "focus and inspect always apply: {backgrounded:?}"
     );
     assert!(
@@ -4400,7 +4997,7 @@ fn tree_affordance_advertises_background_only_while_a_branch_runs_in_foreground(
     start_execution(&mut tui, 10, "plan");
     renderer.render(tui.view()).unwrap();
     assert!(
-        rendered_text(&renderer).contains("Tab focus · Enter inspect · Ctrl+B background"),
+        rendered_text(&renderer).contains("↑↓ walk · Enter inspect · Ctrl+B background"),
         "a new foreground branch brings the hint back: {:?}",
         rendered_text(&renderer)
     );
@@ -4438,14 +5035,13 @@ fn bottom_chrome_flushes_the_subagent_tree_under_the_composer() {
         "showing a notice must not move the composer"
     );
     assert_eq!(
-        rendered_row(&renderer, "notice-sentinel") as u16,
-        bottom + 1,
-        "an active notice owns the row under the composer"
-    );
-    assert_eq!(
         rendered_row(&renderer, "Main") as u16,
-        bottom + 2,
-        "the tree follows the notice without a gap"
+        bottom + 1,
+        "the tree keeps the row under the composer, because Down walks into it"
+    );
+    assert!(
+        rendered_row(&renderer, "notice-sentinel") as u16 > bottom + 1,
+        "the notice band sits under the tree, not between it and the composer"
     );
     assert_eq!(
         rendered_row(&renderer, "model —") as u16,
@@ -4484,8 +5080,8 @@ fn composer_bottom_border_hosts_the_metadata_right_aligned() {
     assert_eq!(
         rendered_line(&renderer, usize::from(bottom)),
         format!(
-            "    └{} model — · effort — · ctx — · agens · Ready ┘    ",
-            "─".repeat(46)
+            "    └{} model — · ctx — · agens · ask ┘    ",
+            "─".repeat(59)
         ),
         "the metadata is spliced into the composer border, one gap off the corner"
     );
@@ -4525,11 +5121,12 @@ fn composer_bottom_border_hosts_the_metadata_right_aligned() {
 
 #[test]
 fn border_metadata_drops_segments_as_the_composer_narrows() {
+    // Where it is working sheds first, then the context reading. The full shed
+    // ladder is exercised against the footer directly, because the border stops
+    // hosting metadata at all before the narrowest rungs are reachable.
     for (width, present, absent) in [
-        (100_u16, "model — · effort — · ctx — · agens · Ready", ""),
-        (52, "model — · effort — · ctx — · Ready", "agens"),
-        (42, "model — · effort — · Ready", "ctx —"),
-        (36, "model — · Ready", "effort —"),
+        (100_u16, "model — · ctx — · agens · ask", ""),
+        (40, "model — · ctx — · ask", "agens"),
     ] {
         let (mut renderer, tui) = docked_renderer(width, 20);
         renderer.render(tui.view()).unwrap();
@@ -4624,12 +5221,12 @@ fn elided_subagent_tree_keeps_a_running_branch_and_the_affordance_as_its_last_ro
         "a finished branch is elided before a running one: {text:?}"
     );
     assert_eq!(
-        rendered_row(&renderer, "Tab to focus"),
+        rendered_row(&renderer, "↓ to focus"),
         rendered_row(&renderer, "Plan #10") + 1,
         "the affordance survives elision as the last tree row: {text:?}"
     );
     assert!(
-        rendered_row(&renderer, "Tab to focus") < usize::from(height - 1),
+        rendered_row(&renderer, "↓ to focus") < usize::from(height - 1),
         "the elided tree stays inside its reserved band: {text:?}"
     );
     assert!(
@@ -4652,7 +5249,7 @@ fn elided_subagent_tree_reports_the_hidden_branch_count() {
     let text = rendered_text(&renderer);
 
     assert!(
-        text.contains("+2 more · Tab to focus"),
+        text.contains("+2 more · ↓ to focus"),
         "the elision row states the hidden branch count and keeps the affordance: {text:?}"
     );
 }
@@ -4739,7 +5336,7 @@ fn active_transcript_render_keeps_terminal_child_renderable_after_expiry_and_swi
     assert!(expired.contains("expired-child-sentinel"), "{expired:?}");
     assert!(expired.contains("expired-final-sentinel"), "{expired:?}");
 
-    tui.handle(Event::Key(Key::Char('l')));
+    tui.handle(Event::Key(Key::Char(']')));
     renderer.render(tui.view()).unwrap();
     let sibling = rendered_text(&renderer);
     assert!(sibling.contains("Subagent 8 · writer"), "{sibling:?}");
@@ -4834,7 +5431,8 @@ fn bypass_is_compact_footer_metadata_instead_of_a_dedicated_notice() {
 
     assert_eq!(rendered.matches("bypass").count(), 1, "{rendered:?}");
     assert!(!rendered.contains("BYPASS"), "{rendered:?}");
-    assert!(!rendered.contains("· Waiting"), "{rendered:?}");
+    // The mode is its own segment, so it no longer costs the turn its status.
+    assert!(rendered.contains("bypass · Waiting"), "{rendered:?}");
 }
 
 #[test]
@@ -5163,4 +5761,915 @@ fn a_wrapped_error_card_keeps_its_gutter_on_every_row() {
         continuation.trim_start().starts_with('│'),
         "{continuation:?}"
     );
+}
+
+#[test]
+fn a_user_turn_is_a_band_that_spans_the_transcript_width() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(50, 14)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.begin_submission("un pedido que no llega a llenar la fila");
+
+    renderer.render(tui.view()).unwrap();
+    let row = rendered_row(&renderer, "pedido");
+    let buffer = renderer.terminal().backend().buffer();
+    let banded = (0..buffer.area.width)
+        .filter(|column| buffer[(*column, row as u16)].bg != Color::Reset)
+        .count();
+
+    assert_eq!(
+        banded,
+        usize::from(buffer.area.width) - CONTENT_COLUMN - usize::from(CHROME_GUTTER),
+        "the band fills the row past the end of the prompt text"
+    );
+    assert_eq!(
+        buffer[(ACCENT_COLUMN as u16, row as u16)].symbol(),
+        "┃",
+        "the rail carries the same meaning where no background is drawn"
+    );
+}
+
+#[test]
+fn only_the_user_turn_is_banded() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(50, 14)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.begin_submission("pedido");
+    tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text(
+        "ANSWER_SENTINEL".into(),
+    )));
+
+    renderer.render(tui.view()).unwrap();
+    let answer = rendered_row(&renderer, "ANSWER_SENTINEL");
+    let buffer = renderer.terminal().backend().buffer();
+
+    assert!(
+        (0..buffer.area.width).all(|column| buffer[(column, answer as u16)].bg == Color::Reset),
+        "prose carries no band, so the band means one thing only"
+    );
+}
+
+#[test]
+fn the_transcript_greys_run_from_prose_to_tool_header_to_tool_output() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(70, 20)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.begin_submission("go");
+    tui.apply_runtime_event(TuiRuntimeEvent::ToolStarted {
+        call_id: "call-1".into(),
+        name: "native::read".into(),
+        input: "{\"path\":\"PATH_SENTINEL\"}".into(),
+        parsed: agens_core::ToolInput::Read {
+            path: "PATH_SENTINEL".into(),
+        },
+    });
+    tui.apply_progress(TurnEvent::ToolCallRequested {
+        id: "call-1".into(),
+        name: "native::read".into(),
+        input: "{\"path\":\"PATH_SENTINEL\"}".into(),
+    });
+    tui.apply_progress(TurnEvent::ToolResult(MessagePart::ToolResult {
+        tool_call_id: "call-1".into(),
+        content: "OUTPUT_SENTINEL".into(),
+        is_error: false,
+    }));
+    tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text(
+        "PROSE_SENTINEL".into(),
+    )));
+    tui.handle(Event::Key(Key::CtrlO));
+
+    renderer.render(tui.view()).unwrap();
+
+    let luminance = |text: &str| -> u32 {
+        match cell_for_text(&renderer, text).fg {
+            Color::Rgb(red, green, blue) => u32::from(red) + u32::from(green) + u32::from(blue),
+            other => panic!("{text} is painted {other:?}"),
+        }
+    };
+
+    assert!(
+        luminance("PROSE_SENTINEL") > luminance("path="),
+        "the answer reads louder than what the agent ran"
+    );
+    assert!(
+        luminance("path=") > luminance("OUTPUT_SENTINEL"),
+        "what the agent ran reads louder than what it printed"
+    );
+}
+
+#[test]
+fn the_footer_answers_its_questions_at_every_real_terminal_width() {
+    for width in [80_u16, 120, 200] {
+        let mut renderer =
+            RatatuiRenderer::new(Terminal::new(TestBackend::new(width, 14)).unwrap());
+        let mut tui = Tui::new(FakeEngine);
+        tui.apply_presentation(
+            TuiPresentation::new("openai-api", "gpt-5.6-sol", "session #1")
+                .with_effort("high")
+                .with_context_window(Some(200_000)),
+        );
+        tui.set_project("/home/iperez/dev/personal/deep/nested/workspace/agens");
+        tui.set_repository_probe(std::sync::Arc::new(|| {
+            Some(RepositoryStatus {
+                branch: Some("feat/agn-114".to_owned()),
+                changed_files: 3,
+                insertions: 120,
+                deletions: 8,
+            })
+        }));
+        tui.apply_runtime_event(TuiRuntimeEvent::Usage(Usage {
+            input_tokens: Some(70_000),
+            output_tokens: Some(1_000),
+            total_tokens: Some(71_000),
+            context_window: Some(200_000),
+        }));
+
+        renderer.render(tui.view()).unwrap();
+        let text = rendered_text(&renderer);
+
+        // What survives at 80 columns is the floor every wider terminal keeps.
+        for datum in ["gpt-5.6-sol", "36%", "ask"] {
+            assert!(
+                text.contains(datum),
+                "width {width} lost {datum:?}: {text:?}"
+            );
+        }
+        // Where it is working is one segment now, so it sheds as a unit and only
+        // the widths that can afford the whole of it show any of it.
+        assert!(!text.contains("/personal/deep"), "width {width}: {text:?}");
+        if width >= 120 {
+            assert!(text.contains("/agens"), "width {width}: {text:?}");
+            assert!(text.contains("feat/agn-114"), "width {width}: {text:?}");
+            assert!(text.contains("+120"), "width {width}: {text:?}");
+        }
+    }
+}
+
+#[test]
+fn a_subagent_card_names_the_model_and_effort_it_runs_on() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(100, 16)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.begin_submission("delegate");
+    tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
+        agent: "explore".into(),
+        event: TuiExecutionEvent::BackgroundStarted { id: 1 },
+    });
+    apply_subagent(
+        &mut tui,
+        TuiSubagentEvent::started_on(
+            1,
+            "explore",
+            "sweep the repository",
+            TuiExecutionState::BackgroundRunning,
+            Some("gpt-5.6-sol"),
+            Some("high"),
+        ),
+    );
+
+    renderer.render(tui.view()).unwrap();
+    let text = rendered_text(&renderer);
+
+    assert!(text.contains("gpt-5.6-sol"), "{text:?}");
+    assert!(text.contains("high"), "{text:?}");
+}
+
+#[test]
+fn a_background_subagent_keeps_the_surface_repainting_after_its_turn_ends() {
+    let mut tui = Tui::new(FakeEngine);
+    tui.begin_submission("delegate");
+    tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
+        agent: "explore".into(),
+        event: TuiExecutionEvent::BackgroundStarted { id: 1 },
+    });
+    apply_subagent(
+        &mut tui,
+        TuiSubagentEvent::started(1, "explore", "sweep", TuiExecutionState::BackgroundRunning),
+    );
+    tui.apply_progress(TurnEvent::StateChanged(agens_core::TurnState::Completed));
+
+    assert!(
+        !tui.view().running,
+        "the parent turn is what finished, not the delegation"
+    );
+    assert!(
+        tui.has_live_work(),
+        "a running background subagent still owes the reader a moving clock"
+    );
+
+    tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
+        agent: "explore".into(),
+        event: TuiExecutionEvent::Completed { id: 1 },
+    });
+
+    assert!(
+        !tui.has_live_work(),
+        "nothing running means nothing to repaint for"
+    );
+}
+
+#[test]
+fn the_turn_status_row_is_separated_from_what_the_agent_just_said() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(70, 14)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.begin_submission("ask");
+    tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text(
+        "ANSWER_SENTINEL".into(),
+    )));
+
+    renderer.render(tui.view()).unwrap();
+    let answer = rendered_row(&renderer, "ANSWER_SENTINEL");
+    let status = rendered_row(&renderer, "Responding…");
+
+    assert_eq!(
+        status,
+        answer + 2,
+        "a blank row separates the answer from the row reporting on it"
+    );
+}
+
+#[test]
+fn consecutive_tool_rows_pack_without_blank_rows_between_them() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(90, 20)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.begin_submission("go");
+    for index in 0..3 {
+        let call_id = format!("call-{index}");
+        let name = format!("mcp_server_tool_{index}");
+        tui.apply_runtime_event(TuiRuntimeEvent::ToolStarted {
+            call_id: call_id.clone(),
+            name: name.clone(),
+            input: "{}".into(),
+            parsed: agens_core::ToolInput::Other {
+                name: name.clone(),
+                raw: "{}".into(),
+            },
+        });
+        tui.apply_progress(TurnEvent::ToolCallRequested {
+            id: call_id.clone(),
+            name,
+            input: "{}".into(),
+        });
+        tui.apply_progress(TurnEvent::ToolResult(MessagePart::ToolResult {
+            tool_call_id: call_id.clone(),
+            content: "ok".into(),
+            is_error: false,
+        }));
+        tui.apply_runtime_event(TuiRuntimeEvent::ToolEnded {
+            call_id,
+            duration: Some(Duration::from_millis(9)),
+            result: ToolResultState::Success,
+        });
+    }
+
+    renderer.render(tui.view()).unwrap();
+    let first = rendered_row(&renderer, "mcp_server_tool_0");
+    let last = rendered_row(&renderer, "mcp_server_tool_2");
+    let blank_rows = (first..=last)
+        .filter(|row| rendered_line(&renderer, *row).trim().is_empty())
+        .count();
+
+    assert!(last > first, "the three calls render in order");
+    assert_eq!(
+        blank_rows, 0,
+        "a run of one-line tool rows spends no rows saying nothing"
+    );
+}
+
+#[test]
+fn a_long_turn_reports_its_time_in_units_a_reader_sizes_up() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(90, 14)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.begin_submission("ask");
+    tui.apply_runtime_event(TuiRuntimeEvent::Usage(Usage {
+        input_tokens: Some(90_000),
+        output_tokens: Some(359),
+        total_tokens: Some(90_359),
+        context_window: Some(200_000),
+    }));
+    tui.tick(Duration::from_secs(253));
+
+    renderer.render(tui.view()).unwrap();
+    let text = rendered_text(&renderer);
+
+    assert!(text.contains("4m 13s"), "{text:?}");
+    assert!(!text.contains("253s"), "{text:?}");
+    assert!(text.contains("90.4k tok"), "{text:?}");
+    assert!(!text.contains("90359"), "{text:?}");
+}
+
+#[test]
+fn typed_input_sits_in_the_same_column_as_the_prose_above_it() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(60, 14)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.handle(Event::Resize {
+        width: 60,
+        height: 14,
+    });
+    tui.begin_submission("ask");
+    tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text(
+        "ANSWER_SENTINEL".into(),
+    )));
+    tui.apply_progress(TurnEvent::StateChanged(agens_core::TurnState::Completed));
+    for character in "INPUT_SENTINEL".chars() {
+        tui.handle(Event::Key(Key::Char(character)));
+    }
+
+    renderer.render(tui.view()).unwrap();
+
+    assert_eq!(
+        rendered_column(&renderer, "INPUT_SENTINEL"),
+        rendered_column(&renderer, "ANSWER_SENTINEL"),
+        "what the user types lines up with what the agent said"
+    );
+}
+
+// --- `native::ask_user` two-column contextual layout ---------------------------
+
+/// Terminal width whose overlay resolves wide enough for two columns.
+const ASK_USER_WIDE_TERMINAL: u16 = 100;
+/// Terminal width whose overlay is forced to stack the context below the list.
+const ASK_USER_NARROW_TERMINAL: u16 = 56;
+
+fn ask_user_option(
+    id: &str,
+    label: &str,
+    explanation: &str,
+    context: Option<&str>,
+) -> AskUserOption {
+    AskUserOption::new(
+        id,
+        label,
+        Some(explanation.to_owned()),
+        context.map(str::to_owned),
+    )
+}
+
+fn ask_user_request_with_context() -> AskUserRequest {
+    AskUserRequest::new(
+        Some("Pick a rollout".to_owned()),
+        vec![AskUserQuestion::new(
+            "plan",
+            "How should the migration land?",
+            Some("Both options keep the old table readable.".to_owned()),
+            AskUserMode::Single,
+            vec![
+                ask_user_option(
+                    "big-bang",
+                    "BIGBANG_LABEL",
+                    "BIGBANG_EXPLAIN one shot",
+                    Some("BIGBANG_CONTEXT cuts over in a single deploy window."),
+                ),
+                ask_user_option(
+                    "phased",
+                    "PHASED_LABEL",
+                    "PHASED_EXPLAIN two steps",
+                    Some("PHASED_CONTEXT dual writes first, then a backfill."),
+                ),
+            ],
+            false,
+            false,
+            false,
+        )],
+    )
+    .expect("a bounded single question forms a valid request")
+}
+
+fn three_question_ask_user_request() -> AskUserRequest {
+    let question = |id: &str| {
+        AskUserQuestion::new(
+            id,
+            format!("PROMPT_{id}"),
+            None,
+            AskUserMode::Single,
+            vec![
+                ask_user_option("a", &format!("{id}_A"), "first", Some("CTX_A")),
+                ask_user_option("b", &format!("{id}_B"), "second", Some("CTX_B")),
+            ],
+            true,
+            true,
+            false,
+        )
+    };
+    AskUserRequest::new(None, vec![question("q1"), question("q2"), question("q3")])
+        .expect("three bounded questions form a valid request")
+}
+
+fn open_ask_user(
+    width: u16,
+    height: u16,
+    request: AskUserRequest,
+) -> (Tui<FakeEngine>, RatatuiRenderer<TestBackend>) {
+    let mut tui = Tui::new(FakeEngine);
+    tui.open_ask_user(1, request);
+    let renderer = rendered_at(&mut tui, width, height);
+    (tui, renderer)
+}
+
+/// Re-renders the same interaction into a terminal of a different size.
+///
+/// `TestBackend` cannot be resized behind the renderer, so the frame is
+/// rebuilt; the [`Tui`] is the same one, which is what the assertion about
+/// preserved state is actually about.
+fn rendered_at(tui: &mut Tui<FakeEngine>, width: u16, height: u16) -> RatatuiRenderer<TestBackend> {
+    let mut renderer =
+        RatatuiRenderer::new(Terminal::new(TestBackend::new(width, height)).unwrap());
+    tui.handle(Event::Resize { width, height });
+    renderer.render(tui.view()).unwrap();
+    renderer
+}
+
+#[test]
+fn ask_user_wide_layout_puts_context_beside_the_options_and_follows_the_highlight() {
+    let (mut tui, mut renderer) =
+        open_ask_user(ASK_USER_WIDE_TERMINAL, 30, ask_user_request_with_context());
+
+    let text = rendered_text(&renderer);
+    assert!(text.contains("BIGBANG_LABEL"), "{text:?}");
+    assert!(text.contains("BIGBANG_EXPLAIN"), "{text:?}");
+    assert!(text.contains("PHASED_LABEL"), "{text:?}");
+    assert!(
+        text.contains("BIGBANG_CONTEXT"),
+        "the highlighted option's context is shown: {text:?}"
+    );
+    assert!(
+        !text.contains("PHASED_CONTEXT"),
+        "only the highlighted option's context is shown: {text:?}"
+    );
+    assert!(
+        rendered_column(&renderer, "BIGBANG_CONTEXT") > rendered_column(&renderer, "BIGBANG_LABEL"),
+        "context sits in the right column, beside the options"
+    );
+    assert_eq!(
+        rendered_row(&renderer, "BIGBANG_CONTEXT"),
+        rendered_row(&renderer, "BIGBANG_LABEL"),
+        "the first context row is level with the first option row"
+    );
+
+    tui.handle(Event::Key(Key::Down));
+    renderer.render(tui.view()).unwrap();
+
+    let text = rendered_text(&renderer);
+    assert!(
+        text.contains("PHASED_CONTEXT"),
+        "moving the highlight changes the context pane: {text:?}"
+    );
+    assert!(!text.contains("BIGBANG_CONTEXT"), "{text:?}");
+}
+
+#[test]
+fn ask_user_narrow_layout_stacks_context_below_the_options_with_a_visible_affordance() {
+    let (_tui, renderer) = open_ask_user(
+        ASK_USER_NARROW_TERMINAL,
+        30,
+        ask_user_request_with_context(),
+    );
+
+    let text = rendered_text(&renderer);
+    assert!(text.contains("BIGBANG_LABEL"), "{text:?}");
+    assert!(
+        text.contains("BIGBANG_CONTEXT"),
+        "context stays reachable when the overlay is too narrow for two columns: {text:?}"
+    );
+    assert!(
+        rendered_row(&renderer, "BIGBANG_CONTEXT") > rendered_row(&renderer, "BIGBANG_LABEL"),
+        "context moves below the option list"
+    );
+    assert!(
+        text.contains("context"),
+        "the stacked section names itself so the reader knows it can be scrolled: {text:?}"
+    );
+    assert!(
+        text.contains("pgup/pgdn"),
+        "the keys that reach it are on screen: {text:?}"
+    );
+}
+
+#[test]
+fn ask_user_resizing_across_the_layout_threshold_preserves_every_interaction_state() {
+    let (mut tui, _wide) = open_ask_user(
+        ASK_USER_WIDE_TERMINAL,
+        30,
+        three_question_ask_user_request(),
+    );
+
+    tui.handle(Event::Key(Key::Tab));
+    tui.handle(Event::Key(Key::Down));
+    tui.handle(Event::Key(Key::Enter));
+    for character in "oOTHER_TEXT".chars() {
+        tui.handle(Event::Key(Key::Char(character)));
+    }
+    tui.handle(Event::Key(Key::Enter));
+    tui.handle(Event::Key(Key::Char('n')));
+    for character in "NOTE_TEXT".chars() {
+        tui.handle(Event::Key(Key::Char(character)));
+    }
+    let before = tui.ask_user_snapshot().expect("ask-user still open");
+    assert_eq!(before.question_index, 1);
+    assert_eq!(before.selected, vec![1]);
+    assert_eq!(before.other, "OTHER_TEXT");
+    assert_eq!(before.note, "NOTE_TEXT");
+
+    let renderer = rendered_at(&mut tui, ASK_USER_NARROW_TERMINAL, 30);
+    assert_eq!(
+        tui.ask_user_snapshot().expect("ask-user still open"),
+        before,
+        "no interaction state may be derived from terminal width"
+    );
+    let narrow = rendered_text(&renderer);
+    assert!(narrow.contains("OTHER_TEXT"), "{narrow:?}");
+    assert!(narrow.contains("NOTE_TEXT"), "{narrow:?}");
+    assert!(narrow.contains("CTX_B"), "{narrow:?}");
+
+    let renderer = rendered_at(&mut tui, ASK_USER_WIDE_TERMINAL, 30);
+    assert_eq!(
+        tui.ask_user_snapshot().expect("ask-user still open"),
+        before,
+        "returning to the wide layout restores nothing because nothing was lost"
+    );
+    let wide = rendered_text(&renderer);
+    assert!(wide.contains("OTHER_TEXT"), "{wide:?}");
+    assert!(wide.contains("q2_B"), "{wide:?}");
+}
+
+fn long_context_request() -> AskUserRequest {
+    let context = (0..60)
+        .map(|index| format!("CTXLINE{index:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let second = (0..60)
+        .map(|index| format!("BCTXLINE{index:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    AskUserRequest::new(
+        None,
+        vec![AskUserQuestion::new(
+            "q1",
+            "long context",
+            None,
+            AskUserMode::Single,
+            vec![
+                ask_user_option("a", "A_LABEL", "first", Some(&context)),
+                ask_user_option("b", "B_LABEL", "second", Some(&second)),
+            ],
+            false,
+            false,
+            false,
+        )],
+    )
+    .expect("a bounded question forms a valid request")
+}
+
+#[test]
+fn ask_user_context_pane_scrolls_by_keyboard_and_end_leaves_a_reachable_last_page() {
+    let (mut tui, mut renderer) = open_ask_user(ASK_USER_WIDE_TERMINAL, 30, long_context_request());
+    let text = rendered_text(&renderer);
+    assert!(text.contains("CTXLINE00"), "{text:?}");
+
+    tui.handle(Event::Key(Key::PageDown));
+    renderer.render(tui.view()).unwrap();
+    let scrolled = rendered_text(&renderer);
+    assert!(!scrolled.contains("CTXLINE00"), "{scrolled:?}");
+
+    tui.handle(Event::Key(Key::End));
+    renderer.render(tui.view()).unwrap();
+    let bottom = rendered_text(&renderer);
+    assert!(
+        bottom.contains("CTXLINE59"),
+        "End reaches the last context row: {bottom:?}"
+    );
+
+    tui.handle(Event::Key(Key::PageUp));
+    renderer.render(tui.view()).unwrap();
+    let stepped_back = rendered_text(&renderer);
+    assert_ne!(
+        stepped_back, bottom,
+        "a single PageUp after End must move the pane, not walk back from a sentinel"
+    );
+    assert!(
+        !stepped_back.contains("CTXLINE59"),
+        "one page back from the bottom leaves the last row: {stepped_back:?}"
+    );
+
+    tui.handle(Event::Key(Key::Home));
+    renderer.render(tui.view()).unwrap();
+    assert!(rendered_text(&renderer).contains("CTXLINE00"));
+}
+
+#[test]
+fn ask_user_context_scroll_resets_between_options_but_survives_an_action_row_move() {
+    let (mut tui, mut renderer) = open_ask_user(ASK_USER_WIDE_TERMINAL, 30, long_context_request());
+    tui.handle(Event::Key(Key::PageDown));
+    let scrolled = tui.ask_user_snapshot().unwrap().context_scroll;
+    assert!(scrolled > 0);
+
+    tui.handle(Event::Key(Key::Down));
+    assert_eq!(
+        tui.ask_user_snapshot().unwrap().context_scroll,
+        0,
+        "a different option shows different context, so its scroll starts at the top"
+    );
+
+    tui.handle(Event::Key(Key::PageDown));
+    let before_action_rows = tui.ask_user_snapshot().unwrap().context_scroll;
+    assert_eq!(before_action_rows, scrolled);
+
+    tui.handle(Event::Key(Key::Down));
+    renderer.render(tui.view()).unwrap();
+    let on_submit = rendered_text(&renderer);
+    assert_eq!(
+        tui.ask_user_snapshot().unwrap().context_scroll,
+        before_action_rows,
+        "walking down to the action rows does not change what the context pane shows"
+    );
+    assert!(
+        on_submit.contains("BCTXLINE1"),
+        "the last highlighted option keeps the pane while the cursor is on an action row: \
+         {on_submit:?}"
+    );
+
+    tui.handle(Event::Key(Key::Down));
+    assert_eq!(
+        tui.ask_user_snapshot().unwrap().context_scroll,
+        before_action_rows,
+        "moving between action rows does not change what the context pane shows"
+    );
+}
+
+#[test]
+fn ask_user_context_keeps_diagram_rows_and_truncates_an_unbreakable_line() {
+    let context = format!(
+        "  ┌──────────┐\n  │ small    │\n  └──────────┘\nWIDE ┌{0}┐ ───▶ ┌{0}┐\nRULE{1}",
+        "─".repeat(30),
+        "─".repeat(72)
+    );
+    let request = AskUserRequest::new(
+        None,
+        vec![AskUserQuestion::new(
+            "q1",
+            "diagram",
+            None,
+            AskUserMode::Single,
+            vec![ask_user_option("a", "A_LABEL", "first", Some(&context))],
+            false,
+            false,
+            false,
+        )],
+    )
+    .expect("a bounded question forms a valid request");
+    let (_tui, renderer) = open_ask_user(ASK_USER_WIDE_TERMINAL, 30, request);
+
+    let text = rendered_text(&renderer);
+    assert!(
+        text.contains("┌──────────┐"),
+        "a diagram row that fits is painted verbatim: {text:?}"
+    );
+    assert!(
+        text.contains("│ small    │"),
+        "interior spacing is preserved: {text:?}"
+    );
+    let wide_row = rendered_row(&renderer, "WIDE");
+    assert!(
+        rendered_line(&renderer, wide_row).contains('…'),
+        "a diagram row wider than the column is cut even though it has spaces \
+         in it — word-wrapping a diagram misaligns every row below it: {:?}",
+        rendered_line(&renderer, wide_row)
+    );
+    assert!(
+        !rendered_line(&renderer, wide_row + 1).contains("───▶"),
+        "the cut row's remainder never re-flows onto the next row: {:?}",
+        rendered_line(&renderer, wide_row + 1)
+    );
+
+    let rule_row = rendered_row(&renderer, "RULE");
+    assert!(
+        rendered_line(&renderer, rule_row).contains('…'),
+        "an unbreakable row wider than the column is cut: {:?}",
+        rendered_line(&renderer, rule_row)
+    );
+    assert!(
+        !rendered_line(&renderer, rule_row + 1).contains("──────"),
+        "the remainder is dropped, never re-flowed onto the next row: {:?}",
+        rendered_line(&renderer, rule_row + 1)
+    );
+}
+
+#[test]
+fn ask_user_header_reports_completion_and_names_the_question_that_blocks_submission() {
+    let (mut tui, mut renderer) = open_ask_user(
+        ASK_USER_WIDE_TERMINAL,
+        30,
+        three_question_ask_user_request(),
+    );
+    tui.handle(Event::Key(Key::Enter));
+    renderer.render(tui.view()).unwrap();
+    let answered_one = rendered_text(&renderer);
+    assert!(answered_one.contains("1 of 3 answered"), "{answered_one:?}");
+
+    for _ in 0..2 {
+        tui.handle(Event::Key(Key::Down));
+    }
+    tui.handle(Event::Key(Key::Enter));
+    renderer.render(tui.view()).unwrap();
+
+    let blocked = rendered_text(&renderer);
+    assert!(
+        blocked.contains("answer question 2 first"),
+        "an incomplete submission names the question that blocks it: {blocked:?}"
+    );
+    assert!(tui.ask_user_snapshot().is_some(), "nothing was submitted");
+}
+
+/// The settled render cache is only bypassed when something actually moved, so
+/// an ask-user key that changes nothing has to say so. Scroll keys are the ones
+/// at risk: before the pane's real extent was measured, `End` always reported a
+/// change because it stored a sentinel no pane could ever be as tall as.
+#[test]
+fn ask_user_scroll_keys_report_unchanged_when_the_context_pane_cannot_move() {
+    let mut tui = Tui::new(FakeEngine);
+    tui.handle(Event::Resize {
+        width: ASK_USER_WIDE_TERMINAL,
+        height: 30,
+    });
+    tui.open_ask_user(1, ask_user_request_with_context());
+
+    for key in [Key::End, Key::PageDown, Key::Home, Key::PageUp] {
+        assert_eq!(
+            tui.handle(Event::Key(key)),
+            Action::Unchanged,
+            "{key:?} on a context that fits its pane changes nothing a reader can see"
+        );
+    }
+
+    let mut scrollable = Tui::new(FakeEngine);
+    scrollable.handle(Event::Resize {
+        width: ASK_USER_WIDE_TERMINAL,
+        height: 30,
+    });
+    scrollable.open_ask_user(1, long_context_request());
+    assert_eq!(scrollable.handle(Event::Key(Key::End)), Action::Render);
+    assert_eq!(
+        scrollable.handle(Event::Key(Key::End)),
+        Action::Unchanged,
+        "a second End is already at the bottom"
+    );
+}
+
+fn single_context_request(context: &str) -> AskUserRequest {
+    AskUserRequest::new(
+        None,
+        vec![AskUserQuestion::new(
+            "q1",
+            "context shape",
+            None,
+            AskUserMode::Single,
+            vec![ask_user_option("a", "A_LABEL", "first", Some(context))],
+            false,
+            false,
+            false,
+        )],
+    )
+    .expect("a bounded question forms a valid request")
+}
+
+#[test]
+fn ask_user_context_freezes_ascii_diagrams_and_still_wraps_ordinary_prose() {
+    let context = "\
+ASCII |   ingest    |   -->    |   transform |   -->    |    store    |
++--------+   +-----------+   +---------+   +----------+   +----------+
+FITS |  a  |  -->  |  b  |
+PROSE the well-known trade-off here is a pipe | and a hyphen - in ordinary \
+prose that has to keep wrapping across several rows of the pane instead of \
+being frozen and cut";
+    let (_tui, renderer) =
+        open_ask_user(ASK_USER_WIDE_TERMINAL, 30, single_context_request(context));
+
+    let ascii_row = rendered_row(&renderer, "ASCII");
+    let ascii_line = rendered_line(&renderer, ascii_row);
+    assert!(
+        ascii_line.contains("|   ingest    |"),
+        "an ASCII diagram's interior spacing is load-bearing and must survive \
+         verbatim up to the cut: {ascii_line:?}"
+    );
+    assert!(
+        ascii_line.contains('…'),
+        "an over-wide ASCII diagram row is cut, not re-flowed: {ascii_line:?}"
+    );
+    assert!(
+        !rendered_line(&renderer, ascii_row + 1).contains("store"),
+        "the cut row's remainder never re-flows onto the next row: {:?}",
+        rendered_line(&renderer, ascii_row + 1)
+    );
+
+    let rule_row = rendered_row(&renderer, "+--------+");
+    assert!(
+        rendered_line(&renderer, rule_row).contains('…'),
+        "a pure-ASCII rule of boxes is a drawing too: {:?}",
+        rendered_line(&renderer, rule_row)
+    );
+
+    let fits_line = rendered_line(&renderer, rendered_row(&renderer, "FITS"));
+    assert!(
+        fits_line.contains("|  a  |  -->  |  b  |"),
+        "a drawing that fits is painted exactly as authored: {fits_line:?}"
+    );
+
+    let prose_row = rendered_row(&renderer, "PROSE");
+    let prose_line = rendered_line(&renderer, prose_row);
+    assert!(
+        !prose_line.contains('…'),
+        "prose that merely contains a hyphen and a pipe is not a drawing and \
+         must wrap, not freeze: {prose_line:?}"
+    );
+    let text = rendered_text(&renderer);
+    assert!(
+        text.contains("instead of"),
+        "the tail of the wrapped paragraph is still on screen: {text:?}"
+    );
+}
+
+#[test]
+fn ask_user_context_wraps_wide_glyphs_by_display_width_without_losing_characters() {
+    let body = "設計上の判断をここに書き並べておくための長い日本語の段落である".repeat(3);
+    let (_tui, renderer) = open_ask_user(
+        ASK_USER_WIDE_TERMINAL,
+        30,
+        single_context_request(&format!("始{body}終")),
+    );
+
+    let text = rendered_text(&renderer);
+    assert!(text.contains('始'), "the head of the paragraph is shown");
+    assert!(
+        text.contains('終'),
+        "text with no ASCII space still has to wrap; truncating it to one row \
+         puts characters in no buffer that any keypress can reach: {text:?}"
+    );
+    assert!(
+        rendered_row(&renderer, "終") > rendered_row(&renderer, "始"),
+        "a paragraph wider than the pane occupies more than one row"
+    );
+}
+
+#[test]
+fn ask_user_context_wraps_double_width_emoji_without_dropping_the_tail() {
+    let (_tui, renderer) = open_ask_user(
+        ASK_USER_WIDE_TERMINAL,
+        30,
+        single_context_request(&format!("START{}END", "🙂".repeat(160))),
+    );
+
+    let text = rendered_text(&renderer);
+    assert!(text.contains("START"), "{text:?}");
+    assert!(
+        text.contains("END"),
+        "wrapping measured in characters rather than display columns builds \
+         rows twice as wide as the pane, and everything past the pane's width \
+         is silently clipped: {text:?}"
+    );
+}
+
+/// The scroll-position row is reserved out of the pane only when the pane is
+/// tall enough to spare it. Painting it unconditionally writes one row below
+/// the pane — onto the footer, or onto the overlay's own border — which no
+/// panic ever reports.
+fn assert_ask_user_frame_is_not_corrupted(renderer: &RatatuiRenderer<TestBackend>, label: &str) {
+    let height = renderer.terminal().backend().buffer().area.height;
+    for row in 0..height {
+        let line = rendered_line(renderer, usize::from(row));
+        let footer = line.contains("↑↓ move") || line.contains("esc cancel");
+        let position = line.contains(" of ") && line.contains("pgup/pgdn");
+        assert!(
+            !(footer && position),
+            "{label}: the context position row escaped its pane onto the \
+             footer: {line:?}"
+        );
+        assert!(
+            line.matches("pgup/pgdn").count() <= 1,
+            "{label}: the context position row was painted over another row: {line:?}"
+        );
+    }
+}
+
+#[test]
+fn ask_user_overlay_never_panics_or_corrupts_its_frame_at_degenerate_sizes() {
+    let long = (0..40)
+        .map(|index| format!("CTXLINE{index:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for (width, height) in [
+        (1, 1),
+        (8, 4),
+        (34, 10),
+        (12, 3),
+        (200, 3),
+        (100, 5),
+        (100, 6),
+        (100, 7),
+        (100, 8),
+        (100, 9),
+        (56, 7),
+        (56, 16),
+    ] {
+        let (_tui, renderer) = open_ask_user(width, height, ask_user_request_with_context());
+        assert_ask_user_frame_is_not_corrupted(&renderer, &format!("{width}x{height} short"));
+
+        let (_tui, renderer) = open_ask_user(width, height, single_context_request(&long));
+        assert_ask_user_frame_is_not_corrupted(&renderer, &format!("{width}x{height} long"));
+    }
 }

@@ -908,14 +908,17 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use agens_config::{ConfigPermissionDecision, ConfigPermissionRule, ConfigPermissionScope};
+    use agens_core::ask_user::UnavailableAskUserPort;
     use agens_core::{
         Error, HeadlessPermissionGate, HeadlessToolCall, HeadlessTurnCancellation,
-        HeadlessTurnPortError, PermissionDecision, PermissionMode, PermissionPolicy,
-        PermissionSession, ToolAccess,
+        HeadlessTurnPortError, PermissionDecision, PermissionMode, PermissionPattern,
+        PermissionPolicy, PermissionSession, ToolAccess,
     };
-    use agens_tools::{DispatchTool, ToolDispatchRequest, ToolDispatcher, ToolEvaluationOutcome};
+    use agens_tools::{
+        AskUserTool, DispatchTool, ToolDispatchRequest, ToolDispatcher, ToolEvaluationOutcome,
+    };
 
-    use super::{ProductionPermissionGate, SharedToolDispatcher, permission_policy};
+    use super::*;
 
     fn run_ready<T>(
         future: impl std::future::Future<Output = Result<T, HeadlessTurnPortError>>,
@@ -1220,5 +1223,92 @@ mod tests {
         ) -> Result<agens_tools::ToolOutput, Error> {
             unreachable!("test tool is never executed")
         }
+    }
+
+    #[test]
+    fn native_ask_user_is_not_a_dangerous_child_native_tool() {
+        assert!(!is_dangerous_child_native_tool("native::ask_user"));
+        assert!(!is_dangerous_child_native_tool("ask_user"));
+    }
+
+    /// Registers the REAL `agens_tools::AskUserTool` — not a self-describing stub — so
+    /// `permission_target` and `execute` are the actual production behavior, not a hand-rolled
+    /// double that trivially agrees with itself.
+    ///
+    /// The `ToolAccess::ReadOnly` argument below is still supplied by this test, not read back
+    /// from production wiring: `agens-permissions` is a DEPENDENCY of `agens-tool-runtime` (see
+    /// `agens-tool-runtime/Cargo.toml`), so it cannot see or call the production registration
+    /// site (`register_native("native::ask_user", ToolAccess::ReadOnly, ...)` in
+    /// `crates/agens-tool-runtime/src/runtime.rs`) — that direction of proof belongs in
+    /// `agens-tool-runtime`'s own tests, which DO call the real production builder:
+    /// `agens-tool-runtime/src/runtime.rs::tests::ask_user_is_registered_read_only_and_survives_chat_mode_hard_safety`.
+    /// What THIS test proves is narrower and still real: the permission-evaluation machinery
+    /// authorizes the actual `AskUserTool` type exactly like it authorizes any other read-only
+    /// native tool, mirroring the codebase's established convention for "authorized under the
+    /// default policy with no rule configured" (see `agens-tools/tests/runtime_contracts.rs`) —
+    /// an empty rule set under `PermissionMode::Edit` resolves every tool to `Ask` UNLESS the
+    /// session carries a temporary bypass, at which point `Ask` resolves to `Allow`.
+    #[test]
+    fn native_ask_user_is_authorized_with_no_prompt_when_the_session_bypasses_prompts() {
+        let mut dispatcher = ToolDispatcher::new();
+        dispatcher
+            .register_native(
+                "native::ask_user",
+                agens_core::ToolAccess::ReadOnly,
+                AskUserTool::new(Box::new(UnavailableAskUserPort)),
+            )
+            .unwrap();
+        let policy = PermissionPolicy::new(PermissionMode::Edit, vec![]);
+
+        let outcome = dispatcher
+            .evaluate(
+                &policy,
+                &[],
+                &agens_core::PermissionSession::with_temporary_bypass(),
+                ToolDispatchRequest::new("project", "native::ask_user", serde_json::json!({})),
+            )
+            .unwrap();
+
+        assert!(
+            matches!(outcome, ToolEvaluationOutcome::Authorized(_)),
+            "native::ask_user should authorize like any other read-only native tool, saw {outcome:?}"
+        );
+    }
+
+    /// Same real-type rationale as above: registers the actual `agens_tools::AskUserTool`.
+    /// `hard_safety_allows` denies a `ToolAccess::Write` tool outright in
+    /// `PermissionMode::Chat`. `native::ask_user` is registered `ReadOnly` here (see the
+    /// dependency-direction note above — the production registration itself is proven in
+    /// `agens-tool-runtime`), so it must survive that hard-safety check even without any
+    /// matching rule.
+    #[test]
+    fn native_ask_user_is_not_hard_denied_in_chat_mode() {
+        let mut dispatcher = ToolDispatcher::new();
+        dispatcher
+            .register_native(
+                "native::ask_user",
+                agens_core::ToolAccess::ReadOnly,
+                AskUserTool::new(Box::new(UnavailableAskUserPort)),
+            )
+            .unwrap();
+        let policy = PermissionPolicy::new(
+            PermissionMode::Chat,
+            vec![PermissionRule::global(
+                PermissionDecision::Allow,
+                PermissionPattern::Exact("native::ask_user".into()),
+                PermissionPattern::Any,
+            )],
+        );
+
+        let outcome = dispatcher
+            .evaluate(
+                &policy,
+                &[],
+                &agens_core::PermissionSession::new(),
+                ToolDispatchRequest::new("project", "native::ask_user", serde_json::json!({})),
+            )
+            .unwrap();
+
+        assert!(matches!(outcome, ToolEvaluationOutcome::Authorized(_)));
     }
 }

@@ -17,6 +17,9 @@ path = "src/main.rs"
 name = "agens-cli-fake-mcp-child"
 path = "../agens-tools/src/bin/fake-mcp-child.rs"
 
+[features]
+perf-audit = ["agens-tui-app/perf-audit"]
+
 [dependencies]
 agens-config = { path = "../agens-config" }
 agens-agents = { path = "../agens-agents" }

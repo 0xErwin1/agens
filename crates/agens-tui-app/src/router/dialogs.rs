@@ -245,6 +245,9 @@ impl TuiRuntimeRouter {
                 Some(render_tui_help(&self.palette_entries()?)),
                 Vec::new(),
             ),
+            // The catalogue lives in the surface crate that owns the keymap, so
+            // a binding cannot change without its description in the same diff.
+            "keys" => agens_tui::shortcuts::shortcuts_dialog(),
             "mcp" => mcp_status_dialog(self.mcp_status.snapshot()),
             "mcp:reload" => {
                 self.reload_non_ready_mcp_servers()?;

@@ -35,6 +35,7 @@ fn a_live_task_runtime_pins_the_headless_turn_to_its_own_session_root_not_the_pr
     use agens_store::SessionStore;
     use agens_tools::SkillCatalog;
 
+    use agens_core::ask_user::UnavailableAskUserPort;
     use agens_tool_runtime::runner::{TuiTaskControls, TuiTaskLifecycleBridge};
     use agens_tool_runtime::task::production_tui_task_runtime;
     use agens_tui_app::permission_prompt::{
@@ -83,6 +84,7 @@ fn a_live_task_runtime_pins_the_headless_turn_to_its_own_session_root_not_the_pr
         agens_core::RequestConfig::default(),
         "headless-root-check".to_owned(),
         false,
+        Box::new(UnavailableAskUserPort),
     )
     .unwrap();
 
@@ -186,6 +188,96 @@ fn a_headless_turns_permission_policy_is_scoped_to_its_own_root_not_the_bootstra
 
     std::fs::remove_dir_all(&temporary).ok();
     std::fs::remove_dir_all(bootstrap_from_root_b.data_directory()).ok();
+}
+
+/// Exercises `production_tool_runtime_for_parent` — the exact builder
+/// `agens-headless/src/turn.rs` calls for a headless turn — end to end through
+/// `native::ask_user`, proving the headless composition keeps the default
+/// `UnavailableAskUserPort` wiring: no interactive surface, no blocking wait, no
+/// translation into a permission `DenyOnce`.
+#[test]
+fn a_headless_ask_user_call_returns_unavailable_within_a_bounded_deadline_and_never_blocks() {
+    use std::time::{Duration, Instant};
+
+    use agens_tool_runtime::runtime::production_tool_runtime_for_parent;
+    use agens_tools::{ToolDispatchRequest, ToolEvaluationOutcome, ToolExecutionContext};
+
+    let temporary = std::env::temp_dir().join(format!(
+        "agens-headless-ask-user-unavailable-{}",
+        std::process::id()
+    ));
+    let project_root = temporary.join("project");
+    std::fs::create_dir_all(project_root.join(".git")).unwrap();
+
+    let bootstrap = bootstrap(&CliDependencies::for_test(
+        project_root.clone(),
+        Some(temporary.join("home")),
+        BTreeMap::from([(
+            "AGENS_CONFIG_HOME".to_owned(),
+            temporary.join("config").display().to_string(),
+        )]),
+        BTreeMap::from([(
+            temporary.join("config/config.toml"),
+            "[provider]\ntype = \"openai-api\"\nmodel = \"gpt-4.1\"\n".to_owned(),
+        )]),
+    ))
+    .unwrap();
+
+    let (_, dispatcher) = production_tool_runtime_for_parent(
+        &bootstrap,
+        &project_root,
+        None,
+        "gpt-4.1".to_owned(),
+        agens_core::RequestConfig::default(),
+        None,
+    )
+    .unwrap();
+
+    let policy = agens_core::PermissionPolicy::new(PermissionMode::Edit, vec![]);
+    let mut dispatcher = dispatcher.lock().unwrap();
+    let ToolEvaluationOutcome::Authorized(handle) = dispatcher
+        .evaluate(
+            &policy,
+            &[],
+            &agens_core::PermissionSession::with_temporary_bypass(),
+            ToolDispatchRequest::new(
+                "project",
+                "native::ask_user",
+                serde_json::json!({
+                    "questions": [{
+                        "id": "q",
+                        "prompt": "p",
+                        "mode": "single",
+                        "options": [{"id": "a", "label": "A"}]
+                    }]
+                }),
+            ),
+        )
+        .unwrap()
+    else {
+        panic!("native::ask_user should authorize under a bypassed session");
+    };
+
+    let deadline_budget = Duration::from_secs(30);
+    let started = Instant::now();
+    let output = dispatcher
+        .execute(handle, &ToolExecutionContext::with_timeout(deadline_budget))
+        .unwrap();
+    let elapsed = started.elapsed();
+
+    assert!(!output.is_error, "{output:?}");
+    assert_eq!(
+        output.content,
+        "{\"status\":\"unavailable\",\"reason\":\"no interactive surface\"}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "a headless ask_user call must return immediately, not wait toward its deadline budget; \
+         took {elapsed:?}"
+    );
+
+    std::fs::remove_dir_all(&temporary).ok();
+    std::fs::remove_dir_all(bootstrap.data_directory()).ok();
 }
 
 /// Covers BOTH `system_prompt` fallback sites in
@@ -455,13 +547,140 @@ fn a_headless_turns_own_system_prompt_is_unchanged_when_no_agents_md_exists() {
     std::fs::remove_dir_all(bootstrap.data_directory()).ok();
 }
 
+/// Pins the direct-`SessionConfig` path's own composition: with `explicit` absent,
+/// `headless_turn_own_system_prompt` must fall back through `headless_turn_system_prompt`
+/// into `agens_core::prompt::base_system_prompt`, composing the built-in base with a
+/// configured `[agent].system_prompt` rather than replacing it. The catalog path's half of
+/// this same composition is already pinned in `rotation_tests.rs`.
+#[test]
+fn a_headless_turns_own_system_prompt_composes_a_configured_prompt_after_the_base_on_the_direct_path()
+ {
+    let temporary = std::env::temp_dir().join(format!(
+        "agens-headless-own-system-prompt-configured-{}",
+        std::process::id()
+    ));
+    let config_home = temporary.join("config");
+    let project_root = temporary.join("project");
+    std::fs::create_dir_all(&project_root).expect("project root should be created");
+
+    let mut files = BTreeMap::new();
+    files.insert(
+        project_root.join(".agens/config.toml"),
+        "[agent]\nsystem_prompt = \"You are the project's own assistant.\"\n".to_owned(),
+    );
+
+    let bootstrap = bootstrap(&CliDependencies::for_test(
+        project_root.clone(),
+        Some(temporary.join("home")),
+        BTreeMap::from([(
+            "AGENS_CONFIG_HOME".to_owned(),
+            config_home.display().to_string(),
+        )]),
+        files,
+    ))
+    .unwrap();
+
+    let prompt = headless_turn_own_system_prompt(&bootstrap, &project_root, None).unwrap();
+
+    assert_eq!(
+        prompt, "You are Agens, a helpful coding agent.\n\nYou are the project's own assistant.",
+        "the direct SessionConfig path must compose the configured prompt after the built-in \
+         base, not replace it"
+    );
+
+    std::fs::remove_dir_all(&temporary).ok();
+    std::fs::remove_dir_all(bootstrap.data_directory()).ok();
+}
+
+/// Pins the full fixed layer order from the spec's "All layers present" scenario in a single
+/// assertion: built-in base, then the configured agent prompt, then the AGENTS.md
+/// `## Instructions from` block, then the delegation discipline block. This is exactly the
+/// sequence `run_production_headless_chat_with_progress` performs for a genuinely new turn
+/// whose catalog reports a subagent: `headless_turn_own_system_prompt` produces the first
+/// three layers, and `explicit_task_delegation_prompt` appends the fourth.
+#[test]
+fn all_four_prompt_layers_are_assembled_in_the_fixed_order() {
+    let temporary = std::env::temp_dir().join(format!(
+        "agens-headless-all-layers-order-{}",
+        std::process::id()
+    ));
+    let config_home = temporary.join("config");
+    let project_root = temporary.join("project");
+    std::fs::create_dir_all(&project_root).expect("project root should be created");
+    std::fs::write(project_root.join("AGENTS.md"), "PROJECT-INSTRUCTIONS")
+        .expect("project AGENTS.md should be written");
+
+    let mut files = BTreeMap::new();
+    files.insert(
+        project_root.join(".agens/config.toml"),
+        "[agent]\nsystem_prompt = \"You are the project's own assistant.\"\n".to_owned(),
+    );
+
+    let bootstrap = bootstrap(&CliDependencies::for_test(
+        project_root.clone(),
+        Some(temporary.join("home")),
+        BTreeMap::from([(
+            "AGENS_CONFIG_HOME".to_owned(),
+            config_home.display().to_string(),
+        )]),
+        files,
+    ))
+    .unwrap();
+
+    let composed = headless_turn_own_system_prompt(&bootstrap, &project_root, None).unwrap();
+    let prompt = explicit_task_delegation_prompt(&composed);
+
+    let canonical = std::fs::canonicalize(project_root.join("AGENTS.md")).unwrap();
+    assert_eq!(
+        prompt,
+        format!(
+            "You are Agens, a helpful coding agent.\n\nYou are the project's own assistant.\n\n\
+             ## Instructions from {}\nPROJECT-INSTRUCTIONS\n\nWhen the user explicitly asks for \
+             subagent delegation, use the `task` tool instead of completing the delegated work \
+             inline. Use `task_control` to inspect, background, or cancel a live execution and \
+             `task_message` to send bounded coordination without waiting for completion. \
+             Subagent delegation is a routing decision, not a search for an agent that happens \
+             to work. Route a task to the agent whose declared role covers it. When no declared \
+             role covers the work, or the assigned agent reports it cannot proceed, report that \
+             and the evidence to the user; do not substitute another agent to get past a block. \
+             Judge tool availability only from the agent actually assigned — a surface reported \
+             by one agent says nothing about another. Never invent context (identifiers, \
+             workflow state, artifacts) to make a request routable to an agent that would \
+             otherwise reject it. Do not cancel a running execution on circumstantial evidence: \
+             a file, diff, or log line appearing while it runs is correlation, not proof — use \
+             `task_control` to inspect and `task_message` to ask what it touched, and cancel \
+             only on a confirmed scope violation or irreversible-action risk. Keep one change \
+             with one agent start to finish; if an execution was interrupted, resume the same \
+             role with full context instead of compensating with a different agent.",
+            canonical.display()
+        ),
+        "the base must precede the configured prompt, which must precede the AGENTS.md \
+         instructions, which must precede the delegation discipline block"
+    );
+
+    std::fs::remove_dir_all(&temporary).ok();
+    std::fs::remove_dir_all(bootstrap.data_directory()).ok();
+}
+
 #[test]
 fn primary_task_instruction_requires_explicit_delegation_and_is_idempotent() {
     let prompt = explicit_task_delegation_prompt("Base instructions.");
 
-    assert_eq!(
-        prompt,
-        "Base instructions.\n\nWhen the user explicitly asks for subagent delegation, use the `task` tool instead of completing the delegated work inline. Use `task_control` to inspect, background, or cancel a live execution and `task_message` to send bounded coordination without waiting for completion."
+    assert!(
+        prompt.starts_with(
+            "Base instructions.\n\nWhen the user explicitly asks for subagent delegation, use \
+             the `task` tool instead of completing the delegated work inline. Use \
+             `task_control` to inspect, background, or cancel a live execution and \
+             `task_message` to send bounded coordination without waiting for completion."
+        ),
+        "the routing instruction must still open the appended block: {prompt}"
+    );
+    assert!(
+        prompt.contains(
+            "Subagent delegation is a routing decision, not a search for an agent that happens \
+             to work."
+        ),
+        "the delegation discipline text must be appended in the same block: {prompt}"
     );
     assert_eq!(explicit_task_delegation_prompt(&prompt), prompt);
 }
@@ -772,7 +991,9 @@ fn production_resumed_headless_turn_replays_typed_history_and_appends_to_the_sam
         serde_json::json!([
             {"role": "user", "content": [{"type": "input_text", "text": "first input"}]},
             {"type": "reasoning", "summary": [{"type": "summary_text", "text": "first reasoning"}]},
-            {"type": "function_call", "call_id": "call-history", "name": "native::read", "arguments": "{\"path\":\"notes.md\"}"},
+            // Recorded history keeps the dispatcher's name; the wire never sees
+            // it, because the provider rejects the whole request over it.
+            {"type": "function_call", "call_id": "call-history", "name": "read", "arguments": "{\"path\":\"notes.md\"}"},
             {"role": "assistant", "content": [{"type": "output_text", "text": "calling the tool"}]},
             {"type": "function_call_output", "call_id": "call-history", "output": "file contents"},
             {"role": "system", "content": [{"type": "input_text", "text": "Agent capabilities expanded: primary -> reviewer."}]},

@@ -28,7 +28,14 @@ pub enum ConversationEvent {
         output: String,
         is_error: bool,
     },
-    Diff(Vec<DiffLine>),
+    /// The edit whose result this diff describes, and the diff itself.
+    ///
+    /// The call id travels with the lines because the diff alone cannot say
+    /// what file it belongs to, and a diff with no file has no language.
+    Diff {
+        call_id: String,
+        lines: Vec<DiffLine>,
+    },
     Error {
         message: String,
         action: String,
@@ -76,6 +83,9 @@ pub struct SubagentCard {
     pub agent: String,
     pub task_summary: String,
     pub presentation: TuiExecutionState,
+    /// What the subagent runs on, when the runtime reported it.
+    pub model: Option<String>,
+    pub effort: Option<String>,
     pub tool_calls: Vec<ToolCall>,
     pub tool_uses: usize,
     pub activities: Vec<String>,
@@ -113,26 +123,38 @@ pub(super) enum ConversationItem {
         output: String,
         is_error: bool,
     },
-    Diff(Vec<DiffLine>),
+    Diff {
+        call_id: String,
+        lines: Vec<DiffLine>,
+    },
     Error(ActionableError),
     SubagentCard(u64),
 }
 
 /// What one turn cost: wall time, and the tokens its provider rounds billed.
 ///
-/// Tokens are summed across every round of the turn, not taken from the last
-/// one: a turn that ran tools bills one usage report per round, and reporting
-/// only the last would understate a long turn by most of its cost.
+/// The two token figures a turn can report, each aggregated the only way it
+/// means anything.
+///
+/// A turn that runs tools bills one usage report per round. Output is new text
+/// every round, so summing it answers how much the turn produced. Input is not:
+/// every round resends the whole conversation, so round N's prompt already
+/// contains rounds 1..N-1 and summing counts the same tokens once per round.
+/// That is how a seven-minute turn over a 130k context came to claim 2.6M
+/// tokens in. The prompt figure is therefore the high-water mark — how large
+/// the conversation actually grew — and is named for what it is.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TurnCost {
     pub duration: Option<Duration>,
-    pub input_tokens: Option<u64>,
+    /// Largest prompt the turn sent, which is the size the conversation reached.
+    pub context_tokens: Option<u64>,
+    /// Every token the turn generated, summed across its rounds.
     pub output_tokens: Option<u64>,
 }
 
 impl TurnCost {
     pub(crate) const fn is_empty(self) -> bool {
-        self.duration.is_none() && self.input_tokens.is_none() && self.output_tokens.is_none()
+        self.duration.is_none() && self.context_tokens.is_none() && self.output_tokens.is_none()
     }
 }
 
@@ -228,6 +250,14 @@ impl Conversation {
                         let MessagePart::Text(text) = part else {
                             return Err(ConversationError::InvalidMessageOrder);
                         };
+                        // A turn the runtime scheduled had no user prompt when it
+                        // ran. Restoring its coordination text as a user message
+                        // puts words in the reader's mouth — words that say, in
+                        // their own text, that the user did not send them.
+                        if let Some(notice) = crate::runtime_scheduled_notice(text) {
+                            conversation.apply(ConversationEvent::Info(notice))?;
+                            continue;
+                        }
                         conversation.user.push_str(text);
                         let item = ConversationItem::User(text.clone());
                         conversation.items.push(item);
@@ -380,9 +410,9 @@ impl Conversation {
                     is_error,
                 });
             }
-            ConversationEvent::Diff(lines) => {
+            ConversationEvent::Diff { call_id, lines } => {
                 self.diffs.extend(lines.clone());
-                self.items.push(ConversationItem::Diff(lines));
+                self.items.push(ConversationItem::Diff { call_id, lines });
             }
             ConversationEvent::Error { message, action } => {
                 let error = ActionableError::sanitized(message, action);
@@ -399,12 +429,16 @@ impl Conversation {
                 agent,
                 task_summary,
                 presentation,
+                model,
+                effort,
             } if self.subagent_cards.iter().all(|card| card.id != event.id) => {
                 self.subagent_cards.push(SubagentCard {
                     id: event.id,
                     agent,
                     task_summary,
                     presentation,
+                    model,
+                    effort,
                     tool_calls: Vec::new(),
                     tool_uses: 0,
                     activities: Vec::new(),
@@ -554,6 +588,10 @@ impl Conversation {
             agent,
             task_summary,
             presentation: TuiExecutionState::CompletedRecent,
+            // A restored card carries only what history recorded, and the
+            // model a finished subagent ran on was never persisted.
+            model: None,
+            effort: None,
             tool_calls: Vec::new(),
             tool_uses,
             activities: Vec::new(),

@@ -568,7 +568,7 @@ mod tests {
             Message {
                 role: Role::Assistant,
                 parts: vec![
-                    MessagePart::Reasoning("previous reasoning".into()),
+                    MessagePart::Reasoning("previous reasoning\nprevious reasoning body".into()),
                     MessagePart::ToolCall {
                         id: "call-1".into(),
                         name: "native::read".into(),

@@ -1,15 +1,18 @@
+use agens_core::ask_user::{
+    AskUserMode, AskUserOption, AskUserQuestion, AskUserReply, AskUserRequest, AskUserUnavailable,
+};
 use agens_core::{
     HeadlessTurnCancellation, Message, MessagePart, Role, ToolInput, TurnEvent, TurnState,
 };
 use agens_core::{NoticeSeverity, SubagentErrorKind, SubagentStatus};
 use agens_tui::{
-    Action, AppEvent, AppState, BridgeCancel, BridgeTx, Command, Conversation, ConversationError,
-    ConversationEvent, Dialog, DialogEntry, DialogView, DiffLine, DiffLineKind, DisplayMode,
-    Effect, Engine, Event, Key, PaletteEntry, PaletteEntryKind, PublishOutcome, RatatuiRenderer,
-    Renderer, Runtime, SessionDialogCursor, SessionDialogRequest, SessionDialogScope,
-    TranscriptEntry, TranscriptFocus, TranscriptId, Tui, TuiExecutionEvent, TuiExecutionState,
-    TuiPermissionBridge, TuiPermissionReply, TuiPresentation, TuiProviderOutcome, TuiRouteProgress,
-    TuiRuntimeEvent, TuiSubagentEvent, TuiSubmissionOutcome,
+    Action, AppEvent, AppState, AskUserEditing, AskUserRowSnapshot, BridgeCancel, BridgeTx,
+    Command, Conversation, ConversationError, ConversationEvent, Dialog, DialogEntry, DialogView,
+    DiffLine, DiffLineKind, DisplayMode, Effect, Engine, Event, Key, PaletteEntry,
+    PaletteEntryKind, PublishOutcome, RatatuiRenderer, Renderer, Runtime, SessionDialogCursor,
+    SessionDialogRequest, SessionDialogScope, TranscriptEntry, TranscriptFocus, TranscriptId, Tui,
+    TuiExecutionEvent, TuiExecutionState, TuiPermissionBridge, TuiPermissionReply, TuiPresentation,
+    TuiProviderOutcome, TuiRouteProgress, TuiRuntimeEvent, TuiSubagentEvent, TuiSubmissionOutcome,
 };
 use ratatui::{Terminal, backend::TestBackend};
 use std::{
@@ -516,13 +519,14 @@ fn transcript_navigation_restores_focus_and_routes_live_child_composer_to_mailbo
     }
 
     tui.handle(Event::Key(Key::Escape));
-    assert_eq!(tui.handle(Event::Key(Key::Char('g'))), Action::Render);
+    tui.handle(Event::Key(Key::Char('g')));
+    assert_eq!(tui.handle(Event::Key(Key::Char('t'))), Action::Render);
     assert!(tui.view().dialog.is_some());
     tui.handle(Event::Key(Key::Enter));
     assert_eq!(tui.view().active_transcript, TranscriptId::Subagent(7));
-    tui.handle(Event::Key(Key::Char('h')));
+    tui.handle(Event::Key(Key::Char('[')));
     assert_eq!(tui.view().active_transcript, TranscriptId::Subagent(7));
-    tui.handle(Event::Key(Key::Char('l')));
+    tui.handle(Event::Key(Key::Char(']')));
     assert_eq!(tui.view().active_transcript, TranscriptId::Subagent(8));
     tui.handle(Event::Key(Key::Char('l')));
     assert_eq!(tui.view().active_transcript, TranscriptId::Subagent(8));
@@ -557,13 +561,16 @@ fn transcript_navigation_restores_focus_and_routes_live_child_composer_to_mailbo
     tui.handle(Event::Key(Key::Char('i')));
     assert_eq!(tui.view().focus, TranscriptFocus::Composer);
     assert!(!tui.view().collapse_thinking);
-    assert!(tui.view().following_bottom);
+    // Main was detached by the Escape that focused it at the top of this test:
+    // entering the transcript keymap pins the viewport so a running turn cannot
+    // scroll the row being read out from under it.
+    assert!(!tui.view().following_bottom);
     assert!(tui.view().tool_display_modes.is_empty());
     tui.handle(Event::Key(Key::Char('m')));
     assert_eq!(tui.input(), "m");
 
     tui.handle(Event::Key(Key::Escape));
-    tui.handle(Event::Key(Key::Char('l')));
+    tui.handle(Event::Key(Key::Char(']')));
     assert!(tui.view().collapse_thinking);
     assert!(!tui.view().following_bottom);
     assert_eq!(tui.handle(Event::Paste(" blocked".into())), Action::Render);
@@ -577,7 +584,7 @@ fn transcript_navigation_restores_focus_and_routes_live_child_composer_to_mailbo
         }
     );
     assert_eq!(tui.input(), "");
-    tui.handle(Event::Key(Key::Char('l')));
+    tui.handle(Event::Key(Key::Char(']')));
     tui.handle(Event::Key(Key::CtrlO));
     tui.handle(Event::Key(Key::CtrlO));
     tui.handle(Event::Key(Key::PageUp));
@@ -588,7 +595,7 @@ fn transcript_navigation_restores_focus_and_routes_live_child_composer_to_mailbo
     // absent here (state isolation), not a "seven" collapse claim.
     assert!(!tui.view().tool_display_modes.contains_key("seven"));
 
-    tui.handle(Event::Key(Key::Char('h')));
+    tui.handle(Event::Key(Key::Char('[')));
     assert_eq!(tui.view().scroll_offset, child_seven_offset);
     assert!(!is_collapsed(tui.view().tool_display_modes, "seven"));
 
@@ -706,7 +713,7 @@ fn child_activity_reorders_executions_and_background_transition_keeps_parent_run
 }
 
 #[test]
-fn transcript_picker_outcome_and_g_use_the_same_main_and_child_entries() {
+fn transcript_picker_outcome_and_gt_use_the_same_main_and_child_entries() {
     let mut tui = Tui::new(FakeEngine::default());
     start_child(&mut tui, 7);
     tui.apply_runtime_event(TuiRuntimeEvent::SubagentExecution(
@@ -719,13 +726,14 @@ fn transcript_picker_outcome_and_g_use_the_same_main_and_child_entries() {
     ));
 
     tui.handle(Event::Key(Key::Escape));
-    assert_eq!(tui.handle(Event::Key(Key::Char('g'))), Action::Render);
-    let from_g = format!("{:?}", tui.view().dialog);
+    tui.handle(Event::Key(Key::Char('g')));
+    assert_eq!(tui.handle(Event::Key(Key::Char('t'))), Action::Render);
+    let from_gt = format!("{:?}", tui.view().dialog);
     tui.handle(Event::Key(Key::Escape));
     tui.apply_submission_outcome(TuiSubmissionOutcome::TranscriptDialog);
     let from_command = format!("{:?}", tui.view().dialog);
 
-    assert_eq!(from_command, from_g);
+    assert_eq!(from_command, from_gt);
     assert!(from_command.contains("Main"));
     assert!(from_command.contains("Reviewer"));
 }
@@ -742,12 +750,13 @@ fn vim_modes_remove_all_function_key_routes() {
 
     tui.select_transcript(TranscriptId::Subagent(7));
     assert_eq!(tui.handle(Event::Key(Key::Char('g'))), Action::Render);
+    assert_eq!(tui.handle(Event::Key(Key::Char('t'))), Action::Render);
     assert!(tui.view().dialog.is_some());
     tui.handle(Event::Key(Key::Escape));
 
-    assert_eq!(tui.handle(Event::Key(Key::Char('l'))), Action::Render);
+    assert_eq!(tui.handle(Event::Key(Key::Char(']'))), Action::Render);
     assert_eq!(tui.view().active_transcript, TranscriptId::Subagent(8));
-    assert_eq!(tui.handle(Event::Key(Key::Char('h'))), Action::Render);
+    assert_eq!(tui.handle(Event::Key(Key::Char('['))), Action::Render);
     assert_eq!(tui.view().active_transcript, TranscriptId::Subagent(7));
     assert_eq!(tui.handle(Event::Key(Key::Char('m'))), Action::Render);
     assert_eq!(tui.view().active_transcript, TranscriptId::Main);
@@ -773,7 +782,7 @@ fn viewport_vim_routes_preserve_per_transcript_state() {
     }
 
     tui.handle(Event::Key(Key::Escape));
-    tui.handle(Event::Key(Key::Char('l')));
+    tui.handle(Event::Key(Key::Char(']')));
     assert_eq!(tui.view().active_transcript, TranscriptId::Subagent(7));
     tui.handle(Event::Key(Key::CtrlO));
     tui.handle(Event::Key(Key::PageUp));
@@ -784,7 +793,7 @@ fn viewport_vim_routes_preserve_per_transcript_state() {
         is_collapsed(tui.view().tool_display_modes, "seven"),
     );
 
-    tui.handle(Event::Key(Key::Char('l')));
+    tui.handle(Event::Key(Key::Char(']')));
     assert_eq!(tui.view().active_transcript, TranscriptId::Subagent(8));
     assert!(tui.view().following_bottom);
     assert_eq!(tui.view().focus, TranscriptFocus::Viewport);
@@ -795,7 +804,7 @@ fn viewport_vim_routes_preserve_per_transcript_state() {
     tui.handle(Event::Key(Key::PageUp));
     let child_eight_offset = tui.view().scroll_offset;
 
-    tui.handle(Event::Key(Key::Char('h')));
+    tui.handle(Event::Key(Key::Char('[')));
     assert_eq!(tui.view().active_transcript, TranscriptId::Subagent(7));
     assert_eq!(
         (
@@ -807,7 +816,7 @@ fn viewport_vim_routes_preserve_per_transcript_state() {
         child_seven
     );
 
-    tui.handle(Event::Key(Key::Char('l')));
+    tui.handle(Event::Key(Key::Char(']')));
     assert_eq!(tui.view().scroll_offset, child_eight_offset);
     assert!(!is_collapsed(tui.view().tool_display_modes, "eight"));
     tui.handle(Event::Key(Key::Char('m')));
@@ -869,7 +878,9 @@ fn ctrl_o_toggles_bounded_detail_without_viewport_motion() {
             .contains("retained-tail-sentinel")
     );
 
-    tui.handle(Event::Key(Key::End));
+    // Scrolling no longer moves focus, so returning to the bottom from the
+    // composer is the composer-safe jump rather than End.
+    tui.handle(Event::Key(Key::CtrlShiftG));
 
     let backend = TestBackend::new(48, 12);
     let terminal = Terminal::new(backend).unwrap();
@@ -895,6 +906,253 @@ fn ctrl_o_toggles_bounded_detail_without_viewport_motion() {
     // Collapsed cycle.
     tui.handle(Event::Key(Key::CtrlO));
     assert!(is_collapsed(tui.view().tool_display_modes, "read-1"));
+}
+
+/// Builds a finished turn carrying both reasoning and one settled tool call —
+/// the state in which the two detail axes can be told apart.
+fn turn_with_reasoning_and_a_settled_call() -> Tui<FakeEngine> {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.begin_submission("request");
+    tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Reasoning(
+        "REASONING_BODY".into(),
+    )));
+    tui.apply_progress(TurnEvent::ToolCallRequested {
+        id: "read-1".into(),
+        name: "native::read".into(),
+        input: "large.log".into(),
+    });
+    tui.apply_progress(TurnEvent::ToolResult(MessagePart::ToolResult {
+        tool_call_id: "read-1".into(),
+        content: "TOOL_BODY".into(),
+        is_error: false,
+    }));
+    tui.finish_provider_turn(agens_tui::TuiProviderOutcome::Completed("answer".into()));
+    tui
+}
+
+/// One key drove both reasoning and tool output through an implicit precedence,
+/// which had a trap in it: once reasoning was expanded and any call had settled,
+/// every further press went to the tools and the thought could never be hidden
+/// again. Each axis owning its own key is what makes both reversible.
+#[test]
+fn each_detail_axis_moves_under_its_own_key_and_reverses() {
+    let mut tui = turn_with_reasoning_and_a_settled_call();
+    assert!(tui.view().collapse_thinking);
+
+    tui.handle(Event::Key(Key::CtrlT));
+    assert!(!tui.view().collapse_thinking, "Ctrl+T shows the reasoning");
+    assert!(
+        is_collapsed(tui.view().tool_display_modes, "read-1"),
+        "and leaves the tool output where it was"
+    );
+
+    tui.handle(Event::Key(Key::CtrlO));
+    assert!(
+        !is_collapsed(tui.view().tool_display_modes, "read-1"),
+        "Ctrl+O moves the tool output"
+    );
+    assert!(
+        !tui.view().collapse_thinking,
+        "and leaves the reasoning where it was"
+    );
+
+    tui.handle(Event::Key(Key::CtrlT));
+    assert!(
+        tui.view().collapse_thinking,
+        "the thought hides again even with a settled call on screen"
+    );
+}
+
+/// Three levels the reader can aim for are only three levels if overshooting
+/// one costs a single key rather than a full lap.
+#[test]
+fn the_tool_detail_cycle_walks_both_ways_through_its_three_levels() {
+    let mut tui = turn_with_reasoning_and_a_settled_call();
+    assert_eq!(tui.view().tool_detail, DisplayMode::Collapsed);
+
+    tui.handle(Event::Key(Key::CtrlO));
+    assert_eq!(tui.view().tool_detail, DisplayMode::Truncated);
+    tui.handle(Event::Key(Key::CtrlO));
+    assert_eq!(tui.view().tool_detail, DisplayMode::Expanded);
+    tui.handle(Event::Key(Key::CtrlO));
+    assert_eq!(tui.view().tool_detail, DisplayMode::Collapsed);
+
+    tui.handle(Event::Key(Key::CtrlShiftO));
+    assert_eq!(tui.view().tool_detail, DisplayMode::Expanded);
+    tui.handle(Event::Key(Key::CtrlShiftO));
+    assert_eq!(tui.view().tool_detail, DisplayMode::Truncated);
+    assert_eq!(
+        tui.view().tool_display_modes.get("read-1"),
+        Some(&DisplayMode::Truncated),
+        "the settled call follows the level, not its own history"
+    );
+}
+
+/// AGN-109 collapses every settled call, so the detail it hides has to be
+/// reachable one block at a time — a transcript-wide cycle answers "how much of
+/// everything", not "what is in this one".
+#[test]
+fn block_focus_walks_settled_calls_and_opens_only_the_one_it_stands_on() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.handle(Event::Resize {
+        width: 80,
+        height: 24,
+    });
+    tui.begin_submission("request");
+    for id in ["read-1", "read-2", "read-3"] {
+        tui.apply_progress(TurnEvent::ToolCallRequested {
+            id: id.into(),
+            name: "native::read".into(),
+            input: format!("{id}.log"),
+        });
+        tui.apply_progress(TurnEvent::ToolResult(MessagePart::ToolResult {
+            tool_call_id: id.into(),
+            content: format!("body of {id}"),
+            is_error: false,
+        }));
+    }
+    tui.finish_provider_turn(agens_tui::TuiProviderOutcome::Completed("answer".into()));
+
+    tui.handle(Event::Key(Key::Escape));
+    assert_eq!(tui.view().focus, TranscriptFocus::Viewport);
+
+    // Focus enters at the newest block, which is the one a reader just watched
+    // happen.
+    // j and k scroll rows now, so walking blocks moved up a case.
+    tui.handle(Event::Key(Key::Char('K')));
+    assert_eq!(tui.view().focused_call, Some("read-3"));
+    tui.handle(Event::Key(Key::Char('K')));
+    assert_eq!(tui.view().focused_call, Some("read-2"));
+    tui.handle(Event::Key(Key::Char('J')));
+    assert_eq!(tui.view().focused_call, Some("read-3"));
+
+    tui.handle(Event::Key(Key::Char('K')));
+    tui.handle(Event::Key(Key::Char('o')));
+    assert_eq!(
+        tui.view().tool_display_modes.get("read-2"),
+        Some(&DisplayMode::Truncated),
+        "the focused block opens"
+    );
+    assert!(
+        is_collapsed(tui.view().tool_display_modes, "read-1"),
+        "and its neighbours stay as they were"
+    );
+    assert!(is_collapsed(tui.view().tool_display_modes, "read-3"));
+    assert_eq!(
+        tui.view().tool_detail,
+        DisplayMode::Collapsed,
+        "opening one block is not a statement about all of them"
+    );
+}
+
+/// Detail that arrives by pushing the transcript around costs the reader the
+/// place they were reading. Opening a block must leave every row above it where
+/// it was.
+#[test]
+fn opening_a_focused_block_does_not_move_the_rows_above_it() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.handle(Event::Resize {
+        width: 80,
+        height: 16,
+    });
+    tui.begin_submission("request");
+    tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text(
+        "anchor-line\n".repeat(40),
+    )));
+    tui.apply_progress(TurnEvent::ToolCallRequested {
+        id: "read-1".into(),
+        name: "native::read".into(),
+        input: "big.log".into(),
+    });
+    tui.apply_progress(TurnEvent::ToolResult(MessagePart::ToolResult {
+        tool_call_id: "read-1".into(),
+        content: "body\n".repeat(200),
+        is_error: false,
+    }));
+    tui.finish_provider_turn(agens_tui::TuiProviderOutcome::Completed("answer".into()));
+
+    tui.handle(Event::Key(Key::Escape));
+    tui.handle(Event::Key(Key::Char('K')));
+    assert_eq!(tui.view().focused_call, Some("read-1"));
+    let anchored = tui.view().scroll_offset;
+    assert!(!tui.view().following_bottom, "navigation detaches the view");
+
+    tui.handle(Event::Key(Key::Char('o')));
+    assert_eq!(
+        tui.view().scroll_offset,
+        anchored,
+        "the rows above the block do not move when it opens"
+    );
+}
+
+/// Parent turn events keep arriving while the reader watches a subagent, so
+/// "which transcript does this call belong to" and "which transcript am I
+/// looking at" are different questions. Answering the first with the second
+/// filed the parent's presentation state under the child, and left the parent
+/// call with nothing recorded at all — leaning the render on a fallback that is
+/// meant to be a safety net.
+#[test]
+fn a_parent_call_settling_under_a_child_transcript_records_against_the_parent() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.begin_submission("request");
+    start_child(&mut tui, 7);
+    tui.select_transcript(TranscriptId::Subagent(7));
+
+    tui.apply_progress(TurnEvent::ToolCallRequested {
+        id: "parent-read".into(),
+        name: "native::read".into(),
+        input: "parent.log".into(),
+    });
+    tui.apply_progress(TurnEvent::ToolResult(MessagePart::ToolResult {
+        tool_call_id: "parent-read".into(),
+        content: "PARENT_BODY".into(),
+        is_error: false,
+    }));
+
+    assert!(
+        !tui.view().tool_display_modes.contains_key("parent-read"),
+        "the child's record has no business holding a parent call: {:?}",
+        tui.view().tool_display_modes
+    );
+
+    tui.select_transcript(TranscriptId::Main);
+    assert_eq!(
+        tui.view().tool_display_modes.get("parent-read"),
+        Some(&DisplayMode::Collapsed)
+    );
+}
+
+/// The level is what the footer names, so it has to be true before anything has
+/// settled — and a call that settles afterwards has to join its neighbours
+/// rather than arrive hidden among expanded ones.
+#[test]
+fn a_call_settling_after_the_level_moved_arrives_at_that_level() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.begin_submission("request");
+
+    tui.handle(Event::Key(Key::CtrlO));
+    tui.handle(Event::Key(Key::CtrlO));
+    assert_eq!(
+        tui.view().tool_detail,
+        DisplayMode::Expanded,
+        "the level moves with nothing settled yet"
+    );
+
+    tui.apply_progress(TurnEvent::ToolCallRequested {
+        id: "read-late".into(),
+        name: "native::read".into(),
+        input: "late.log".into(),
+    });
+    tui.apply_progress(TurnEvent::ToolResult(MessagePart::ToolResult {
+        tool_call_id: "read-late".into(),
+        content: "LATE_BODY".into(),
+        is_error: false,
+    }));
+
+    assert_eq!(
+        tui.view().tool_display_modes.get("read-late"),
+        Some(&DisplayMode::Expanded)
+    );
 }
 
 #[test]
@@ -1002,8 +1260,8 @@ fn child_ordered_stream_preserves_visible_child_rows_and_isolates_parent_summari
     assert!(!parent.contains("Subagent tool execution failed."));
 
     tui.select_transcript(TranscriptId::Subagent(7));
-    // Thinking-first detail path, then tool outputs.
-    tui.handle(Event::Key(Key::CtrlO));
+    // Reasoning and tool output are separate axes: one key each.
+    tui.handle(Event::Key(Key::CtrlT));
     tui.handle(Event::Key(Key::CtrlO));
     renderer.render(tui.view()).unwrap();
     let child = renderer
@@ -1099,7 +1357,7 @@ fn main_and_child_hierarchy_renders_each_event_once() {
         "{child_seven:?}"
     );
 
-    tui.handle(Event::Key(Key::Char('l')));
+    tui.handle(Event::Key(Key::Char(']')));
     assert_eq!(tui.view().active_transcript, TranscriptId::Subagent(8));
     renderer.render(tui.view()).unwrap();
     let child_eight = renderer
@@ -1143,11 +1401,10 @@ fn conversation_retains_complete_live_final_markdown_reasoning_diffs_and_errors(
         conversation.apply(event).unwrap();
     }
     conversation
-        .apply(ConversationEvent::Diff(vec![DiffLine::new(
-            7,
-            DiffLineKind::Added,
-            "+ typed",
-        )]))
+        .apply(ConversationEvent::Diff {
+            call_id: "edit-1".into(),
+            lines: vec![DiffLine::new(7, DiffLineKind::Added, "+ typed")],
+        })
         .unwrap();
     conversation
         .apply(ConversationEvent::Error {
@@ -2538,12 +2795,20 @@ fn double_control_c_exits_without_clearing_composer_input() {
 }
 
 #[test]
-fn escape_cancels_running_without_arming_quit() {
+fn escape_leaves_the_composer_then_cancels_without_arming_quit() {
     let mut tui = Tui::new(FakeEngine::default());
     tui.set_running(true);
 
+    // Stopping to read must not cost the turn, so the first Escape only moves
+    // focus and the second is the one that reaches the engine.
+    assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Render);
+    assert_eq!(tui.view().focus, TranscriptFocus::Viewport);
+    assert_eq!(tui.engine().cancellations, 0);
+    assert!(!tui.view().quit_armed);
+
     assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Cancel);
     assert_eq!(tui.engine().cancellations, 1);
+    assert!(!tui.view().quit_armed);
 }
 
 #[test]
@@ -2656,7 +2921,9 @@ fn multiline_editing_and_scroll_follow_are_deterministic() {
 
     assert_eq!(tui.input(), "ab");
     assert!(!tui.following_bottom());
-    assert_eq!(tui.handle(Event::Key(Key::End)), Action::Render);
+    // End edits the prompt; following the transcript again is the
+    // composer-safe jump, since scrolling no longer moves focus.
+    assert_eq!(tui.handle(Event::Key(Key::CtrlShiftG)), Action::Render);
     assert!(tui.following_bottom());
     assert_eq!(
         tui.handle(Event::Key(Key::Enter)),
@@ -2798,6 +3065,7 @@ fn ratatui_active_turn_row_distinguishes_waiting_responding_cancelling_and_failu
         .collect::<String>();
     assert!(responding.contains("Responding"));
 
+    assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Render);
     assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Cancel);
     renderer.render(tui.view()).unwrap();
     let cancelling = renderer
@@ -2859,7 +3127,10 @@ fn plain_jk_insert_while_ctrl_timeline_nav_scrolls_and_jumps() {
         "Ctrl+k must scroll the timeline up"
     );
     assert!(!tui.view().following_bottom);
-    assert_eq!(tui.view().focus, TranscriptFocus::Viewport);
+    // Ctrl+j and Ctrl+k are the composer-safe scroll: they detach the viewport
+    // and leave the prompt taking text, which is the whole point of having them
+    // alongside the plain motions.
+    assert_eq!(tui.view().focus, TranscriptFocus::Composer);
     assert_eq!(tui.input(), "jk");
 
     let after_up = tui.view().scroll_offset;
@@ -2890,7 +3161,7 @@ fn plain_jk_insert_while_ctrl_timeline_nav_scrolls_and_jumps() {
 }
 
 #[test]
-fn viewport_owner_keys_remain_g_m_h_l_with_ctrl_timeline_nav() {
+fn viewport_owner_keys_are_gt_m_and_brackets_with_ctrl_timeline_nav() {
     let mut tui = Tui::new(FakeEngine::default());
     start_child(&mut tui, 7);
     tui.apply_runtime_event(TuiRuntimeEvent::SubagentExecution(
@@ -2903,22 +3174,28 @@ fn viewport_owner_keys_remain_g_m_h_l_with_ctrl_timeline_nav() {
 
     tui.handle(Event::Key(Key::Escape));
     assert_eq!(tui.view().focus, TranscriptFocus::Viewport);
+    // `g` is a chord prefix now, so the picker costs its second key.
     assert_eq!(tui.handle(Event::Key(Key::Char('g'))), Action::Render);
+    assert!(tui.view().dialog.is_none(), "g alone opens nothing");
+    assert_eq!(tui.handle(Event::Key(Key::Char('t'))), Action::Render);
     assert!(tui.view().dialog.is_some());
     tui.handle(Event::Key(Key::Escape));
 
-    tui.handle(Event::Key(Key::Char('l')));
+    // h and l are horizontal motions in a vim keymap, so sibling navigation
+    // moved to the bracket pair.
+    tui.handle(Event::Key(Key::Char(']')));
     assert_eq!(tui.view().active_transcript, TranscriptId::Subagent(7));
-    tui.handle(Event::Key(Key::Char('l')));
+    tui.handle(Event::Key(Key::Char(']')));
     assert_eq!(tui.view().active_transcript, TranscriptId::Subagent(8));
-    tui.handle(Event::Key(Key::Char('h')));
+    tui.handle(Event::Key(Key::Char('[')));
     assert_eq!(tui.view().active_transcript, TranscriptId::Subagent(7));
     tui.handle(Event::Key(Key::Char('m')));
     assert_eq!(tui.view().active_transcript, TranscriptId::Main);
 
-    // Ctrl timeline keys must not steal plain owner navigation characters.
-    tui.handle(Event::Key(Key::Char('j')));
-    assert_eq!(tui.input(), "j");
+    // A focused transcript swallows what it does not claim. Letting the key
+    // through is what used to make reading a transcript type into the prompt.
+    tui.handle(Event::Key(Key::Char('z')));
+    assert_eq!(tui.input(), "");
 }
 
 fn permission_confirm_entries(request_id: u64) -> Vec<DialogEntry> {
@@ -3271,6 +3548,41 @@ fn a_finished_background_subagent_fires_one_main_turn_while_idle() {
     assert!(tui.take_ready_auto_turn().is_none());
 }
 
+/// The provider is told about a scheduled turn in a user-role message, so that
+/// is what the session store keeps. Replaying it verbatim showed the reader a
+/// prompt of their own that said the user had not sent it.
+#[test]
+fn a_restored_runtime_turn_reads_as_a_notice_rather_than_a_user_prompt() {
+    let mut tui = Tui::new(FakeEngine::default());
+    finish_background_child(&mut tui, 7);
+    let prompt = tui.take_ready_auto_turn().expect("idle schedules the turn");
+
+    let restored = Conversation::from_messages(&[
+        Message {
+            role: Role::User,
+            parts: vec![MessagePart::Text(prompt)],
+        },
+        Message {
+            role: Role::Assistant,
+            parts: vec![MessagePart::Text("summary".into())],
+        },
+    ])
+    .expect("a scheduled turn restores");
+
+    let turn = restored.last().expect("one restored turn");
+    assert_eq!(turn.user, "", "no prompt is attributed to the reader");
+
+    let rendered = format!("{:?}", turn);
+    assert!(
+        rendered.contains("Continuing automatically: 1 background subagent finished."),
+        "the restored turn keeps the notice the live one recorded: {rendered:?}"
+    );
+    assert!(
+        !rendered.contains("coordination source=runtime"),
+        "the coordination text is not shown back to the reader: {rendered:?}"
+    );
+}
+
 #[test]
 fn a_finished_foreground_subagent_never_fires_a_main_turn() {
     let mut tui = Tui::new(FakeEngine::default());
@@ -3355,6 +3667,7 @@ fn the_auto_turn_is_cancellable_and_never_fabricates_a_user_prompt() {
             .any(|entry| matches!(entry, TranscriptEntry::User(_)))
     );
 
+    assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Render);
     assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Cancel);
     assert_eq!(tui.engine().cancellations, 1);
     assert_eq!(tui.view().turn_state, Some(TurnState::Cancelled));
@@ -3765,5 +4078,430 @@ fn a_child_event_that_cannot_be_projected_is_recorded_instead_of_discarded() {
     assert!(
         errors[0].message.contains("never-requested"),
         "the discarded event has to name itself: {errors:?}"
+    );
+}
+
+/// Cancelling a duplicate subagent is how the model stops it from answering.
+/// Waking the model because it was cancelled made it answer anyway.
+#[test]
+fn a_cancelled_background_subagent_does_not_schedule_a_turn_of_its_own() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.begin_submission("delegate");
+    tui.apply_progress(TurnEvent::StateChanged(TurnState::Completed));
+    tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
+        agent: "scout".into(),
+        event: TuiExecutionEvent::BackgroundStarted { id: 1 },
+    });
+    tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
+        agent: "scout".into(),
+        event: TuiExecutionEvent::BackgroundStarted { id: 2 },
+    });
+
+    tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
+        agent: "scout".into(),
+        event: TuiExecutionEvent::Cancelled { id: 2 },
+    });
+    assert_eq!(
+        tui.take_ready_auto_turn(),
+        None,
+        "a cancellation is a decision already taken, not news to act on"
+    );
+
+    tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
+        agent: "scout".into(),
+        event: TuiExecutionEvent::Completed { id: 1 },
+    });
+    assert!(
+        tui.take_ready_auto_turn().is_some(),
+        "a subagent that finished with a result is still worth continuing on"
+    );
+}
+
+fn ask_user_option(id: &str, label: &str) -> AskUserOption {
+    AskUserOption::new(id, label, None, None)
+}
+
+#[allow(clippy::fn_params_excessive_bools)]
+fn ask_user_question(
+    id: &str,
+    mode: AskUserMode,
+    options: Vec<AskUserOption>,
+    allow_other: bool,
+    allow_note: bool,
+    allow_discuss: bool,
+) -> AskUserQuestion {
+    AskUserQuestion::new(
+        id,
+        format!("prompt for {id}"),
+        None,
+        mode,
+        options,
+        allow_other,
+        allow_note,
+        allow_discuss,
+    )
+}
+
+fn three_question_ask_user_request() -> AskUserRequest {
+    AskUserRequest::new(
+        None,
+        vec![
+            ask_user_question(
+                "q1",
+                AskUserMode::Single,
+                vec![ask_user_option("a", "A"), ask_user_option("b", "B")],
+                true,
+                true,
+                false,
+            ),
+            ask_user_question(
+                "q2",
+                AskUserMode::Multiple,
+                vec![ask_user_option("a", "A"), ask_user_option("b", "B")],
+                false,
+                false,
+                false,
+            ),
+            ask_user_question(
+                "q3",
+                AskUserMode::Single,
+                vec![ask_user_option("a", "A")],
+                false,
+                false,
+                false,
+            ),
+        ],
+    )
+    .expect("three bounded questions form a valid request")
+}
+
+fn single_question_ask_user_request(
+    allow_other: bool,
+    allow_note: bool,
+    allow_discuss: bool,
+) -> AskUserRequest {
+    AskUserRequest::new(
+        None,
+        vec![ask_user_question(
+            "q1",
+            AskUserMode::Single,
+            vec![ask_user_option("a", "A"), ask_user_option("b", "B")],
+            allow_other,
+            allow_note,
+            allow_discuss,
+        )],
+    )
+    .expect("one bounded question forms a valid request")
+}
+
+fn type_into_buffer(tui: &mut Tui<FakeEngine>, open_key: char, text: &str) {
+    tui.handle(Event::Key(Key::Char(open_key)));
+    for character in text.chars() {
+        tui.handle(Event::Key(Key::Char(character)));
+    }
+    tui.handle(Event::Key(Key::Enter));
+}
+
+#[test]
+fn ask_user_navigation_preserves_a_valid_answer_on_the_first_question() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.open_ask_user(1, three_question_ask_user_request());
+
+    tui.handle(Event::Key(Key::Down));
+    tui.handle(Event::Key(Key::Enter));
+    type_into_buffer(&mut tui, 'o', "extra");
+    type_into_buffer(&mut tui, 'n', "fyi");
+
+    tui.handle(Event::Key(Key::Tab));
+    tui.handle(Event::Key(Key::Tab));
+    tui.handle(Event::Key(Key::Left));
+    tui.handle(Event::Key(Key::Left));
+
+    let snapshot = tui.ask_user_snapshot().expect("ask-user still open");
+    assert_eq!(snapshot.question_index, 0);
+    assert_eq!(snapshot.selected, vec![1]);
+    assert_eq!(snapshot.other, "extra");
+    assert_eq!(snapshot.note, "fyi");
+}
+
+#[test]
+fn ask_user_single_choice_replaces_previous_selection() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.open_ask_user(1, three_question_ask_user_request());
+
+    tui.handle(Event::Key(Key::Enter));
+    tui.handle(Event::Key(Key::Down));
+    tui.handle(Event::Key(Key::Enter));
+
+    let snapshot = tui.ask_user_snapshot().expect("ask-user still open");
+    assert_eq!(snapshot.selected, vec![1]);
+}
+
+#[test]
+fn ask_user_multiple_choice_toggles_selections() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.open_ask_user(1, three_question_ask_user_request());
+
+    tui.handle(Event::Key(Key::Tab));
+    tui.handle(Event::Key(Key::Enter));
+    tui.handle(Event::Key(Key::Down));
+    tui.handle(Event::Key(Key::Char(' ')));
+    tui.handle(Event::Key(Key::Up));
+    tui.handle(Event::Key(Key::Enter));
+
+    let snapshot = tui.ask_user_snapshot().expect("ask-user still open");
+    assert_eq!(snapshot.question_index, 1);
+    assert_eq!(snapshot.selected, vec![1]);
+}
+
+#[test]
+fn ask_user_char_o_opens_free_text_only_when_allowed() {
+    let mut disallowed = Tui::new(FakeEngine::default());
+    disallowed.open_ask_user(1, single_question_ask_user_request(false, false, false));
+    assert_eq!(
+        disallowed.handle(Event::Key(Key::Char('o'))),
+        Action::Unchanged
+    );
+    assert_eq!(
+        disallowed.ask_user_snapshot().unwrap().editing,
+        AskUserEditing::Browsing
+    );
+
+    let mut allowed = Tui::new(FakeEngine::default());
+    allowed.open_ask_user(1, single_question_ask_user_request(true, false, false));
+    assert_eq!(allowed.handle(Event::Key(Key::Char('o'))), Action::Render);
+    assert_eq!(
+        allowed.ask_user_snapshot().unwrap().editing,
+        AskUserEditing::Other
+    );
+}
+
+#[test]
+fn ask_user_char_n_opens_note_only_when_allowed() {
+    let mut disallowed = Tui::new(FakeEngine::default());
+    disallowed.open_ask_user(1, single_question_ask_user_request(false, false, false));
+    assert_eq!(
+        disallowed.handle(Event::Key(Key::Char('n'))),
+        Action::Unchanged
+    );
+
+    let mut allowed = Tui::new(FakeEngine::default());
+    allowed.open_ask_user(1, single_question_ask_user_request(false, true, false));
+    assert_eq!(allowed.handle(Event::Key(Key::Char('n'))), Action::Render);
+    assert_eq!(
+        allowed.ask_user_snapshot().unwrap().editing,
+        AskUserEditing::Note
+    );
+}
+
+#[test]
+fn ask_user_typed_buffer_commits_on_enter_survives_escape_then_second_escape_cancels() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.open_ask_user(7, single_question_ask_user_request(true, false, false));
+
+    tui.handle(Event::Key(Key::Char('o')));
+    tui.handle(Event::Key(Key::Char('h')));
+    tui.handle(Event::Key(Key::Char('i')));
+    tui.handle(Event::Key(Key::Enter));
+
+    let after_commit = tui.ask_user_snapshot().expect("ask-user still open");
+    assert_eq!(after_commit.other, "hi");
+    assert_eq!(after_commit.editing, AskUserEditing::Browsing);
+
+    tui.handle(Event::Key(Key::Char('o')));
+    tui.handle(Event::Key(Key::Char('!')));
+    let escaped = tui.handle(Event::Key(Key::Escape));
+    assert_eq!(escaped, Action::Render);
+
+    let after_escape = tui
+        .ask_user_snapshot()
+        .expect("leaving entry mode does not resolve the prompt");
+    assert_eq!(after_escape.other, "hi!");
+    assert_eq!(after_escape.editing, AskUserEditing::Browsing);
+
+    let cancelled = tui.handle(Event::Key(Key::Escape));
+    assert_eq!(
+        cancelled,
+        Action::AskUserReply {
+            id: 7,
+            reply: AskUserReply::Cancelled,
+        }
+    );
+    assert!(tui.ask_user_snapshot().is_none());
+}
+
+#[test]
+fn ask_user_submit_while_incomplete_sets_incomplete_index_without_resolving() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.open_ask_user(1, single_question_ask_user_request(false, false, false));
+
+    tui.handle(Event::Key(Key::Down));
+    tui.handle(Event::Key(Key::Down));
+    let action = tui.handle(Event::Key(Key::Enter));
+
+    assert_eq!(action, Action::Render);
+    let snapshot = tui
+        .ask_user_snapshot()
+        .expect("submit failed, not resolved");
+    assert_eq!(snapshot.incomplete, Some(0));
+    assert_eq!(snapshot.row, AskUserRowSnapshot::Submit);
+}
+
+#[test]
+fn ask_user_incomplete_flag_clears_once_the_flagged_question_becomes_answered() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.open_ask_user(1, single_question_ask_user_request(false, false, false));
+
+    tui.handle(Event::Key(Key::Down));
+    tui.handle(Event::Key(Key::Down));
+    let flagged = tui.handle(Event::Key(Key::Enter));
+    assert_eq!(flagged, Action::Render);
+    assert_eq!(tui.ask_user_snapshot().unwrap().incomplete, Some(0));
+
+    tui.handle(Event::Key(Key::Up));
+    tui.handle(Event::Key(Key::Up));
+    let answered = tui.handle(Event::Key(Key::Enter));
+    assert_eq!(answered, Action::Render);
+
+    let snapshot = tui.ask_user_snapshot().expect("ask-user still open");
+    assert_eq!(
+        snapshot.incomplete, None,
+        "answering the flagged question must clear the flag without a second submit attempt"
+    );
+}
+
+#[test]
+fn ask_user_submit_when_complete_resolves_answered_in_request_order() {
+    let request = single_question_ask_user_request(true, true, false);
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.open_ask_user(9, request.clone());
+
+    tui.handle(Event::Key(Key::Enter));
+    type_into_buffer(&mut tui, 'o', "more");
+    type_into_buffer(&mut tui, 'n', "nb");
+    tui.handle(Event::Key(Key::Down));
+    tui.handle(Event::Key(Key::Down));
+    let action = tui.handle(Event::Key(Key::Enter));
+
+    match action {
+        Action::AskUserReply {
+            id,
+            reply: AskUserReply::Answered(answers),
+        } => {
+            assert_eq!(id, 9);
+            assert_eq!(answers.len(), 1);
+            assert_eq!(answers[0].question_id, "q1");
+            assert_eq!(answers[0].selected, vec!["a".to_owned()]);
+            assert_eq!(answers[0].other.as_deref(), Some("more"));
+            assert_eq!(answers[0].note.as_deref(), Some("nb"));
+
+            let reply = AskUserReply::Answered(answers);
+            assert!(
+                request.validate_reply(&reply).is_ok(),
+                "a reply built by this reducer must pass core's own reply validation"
+            );
+        }
+        other => panic!("expected an answered reply, got {other:?}"),
+    }
+    assert!(tui.ask_user_snapshot().is_none());
+}
+
+#[test]
+fn ask_user_discuss_row_only_available_when_allowed_and_resolves_without_fabricating_answers() {
+    let mut without_discuss = Tui::new(FakeEngine::default());
+    without_discuss.open_ask_user(1, single_question_ask_user_request(false, false, false));
+    without_discuss.handle(Event::Key(Key::Down));
+    without_discuss.handle(Event::Key(Key::Down));
+    without_discuss.handle(Event::Key(Key::Down));
+    let snapshot = without_discuss.ask_user_snapshot().unwrap();
+    assert_eq!(snapshot.row, AskUserRowSnapshot::Cancel);
+    assert!(!snapshot.discuss_available);
+
+    let mut with_discuss = Tui::new(FakeEngine::default());
+    with_discuss.open_ask_user(2, single_question_ask_user_request(false, false, true));
+    with_discuss.handle(Event::Key(Key::Down));
+    with_discuss.handle(Event::Key(Key::Down));
+    with_discuss.handle(Event::Key(Key::Down));
+    let snapshot = with_discuss.ask_user_snapshot().unwrap();
+    assert_eq!(snapshot.row, AskUserRowSnapshot::Discuss);
+    assert!(snapshot.discuss_available);
+
+    let action = with_discuss.handle(Event::Key(Key::Enter));
+    match action {
+        Action::AskUserReply {
+            id,
+            reply: AskUserReply::Discuss { question_id, note },
+        } => {
+            assert_eq!(id, 2);
+            assert_eq!(question_id, "q1");
+            assert_eq!(note, None);
+        }
+        other => panic!("expected a discuss reply, got {other:?}"),
+    }
+    assert!(with_discuss.ask_user_snapshot().is_none());
+}
+
+#[test]
+fn ask_user_ctrl_c_resolves_cancelled_once_ahead_of_the_ordinary_quit_arming_path() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.open_ask_user(3, three_question_ask_user_request());
+
+    let action = tui.handle(Event::Key(Key::CtrlC));
+    assert_eq!(
+        action,
+        Action::AskUserReply {
+            id: 3,
+            reply: AskUserReply::Cancelled,
+        }
+    );
+    assert!(tui.ask_user_snapshot().is_none());
+
+    let second_press = tui.handle(Event::Key(Key::CtrlC));
+    assert_eq!(second_press, Action::Render);
+}
+
+#[test]
+fn ask_user_no_op_keys_report_unchanged() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.open_ask_user(1, three_question_ask_user_request());
+    assert_eq!(tui.handle(Event::Key(Key::Up)), Action::Unchanged);
+
+    let mut single_question = Tui::new(FakeEngine::default());
+    single_question.open_ask_user(1, single_question_ask_user_request(false, false, false));
+    assert_eq!(
+        single_question.handle(Event::Key(Key::Tab)),
+        Action::Unchanged
+    );
+
+    let mut reselect = Tui::new(FakeEngine::default());
+    reselect.open_ask_user(1, single_question_ask_user_request(false, false, false));
+    reselect.handle(Event::Key(Key::Enter));
+    assert_eq!(reselect.handle(Event::Key(Key::Enter)), Action::Unchanged);
+}
+
+#[test]
+fn ask_user_unavailable_reply_debug_never_carries_answer_content() {
+    let reply = AskUserReply::Unavailable(AskUserUnavailable::NoInteractiveSurface);
+    let action = Action::AskUserReply { id: 1, reply };
+    let rendered = format!("{action:?}");
+    assert_eq!(rendered, "AskUserReply { id: 1, status: \"unavailable\" }");
+}
+
+#[test]
+fn ask_user_answered_reply_debug_never_carries_answer_content() {
+    let request = single_question_ask_user_request(false, false, false);
+    let reply = AskUserReply::Answered(vec![agens_core::ask_user::AskUserAnswer {
+        question_id: "q1".to_owned(),
+        selected: vec!["a".to_owned()],
+        other: None,
+        note: None,
+    }]);
+    assert!(request.validate_reply(&reply).is_ok());
+    let action = Action::AskUserReply { id: 42, reply };
+    let rendered = format!("{action:?}");
+    assert_eq!(rendered, "AskUserReply { id: 42, status: \"answered\" }");
+    assert!(
+        !rendered.contains('q'),
+        "debug must not leak the question id"
     );
 }

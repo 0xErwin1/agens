@@ -102,6 +102,7 @@ jq -e '
     "agens-models": [
       "agens-core"
     ],
+    "agens-perf": [],
     "agens-permissions": [
       "agens-config",
       "agens-core",
@@ -152,7 +153,8 @@ jq -e '
     ],
     "agens-tui": [
       "agens-bus",
-      "agens-core"
+      "agens-core",
+      "agens-perf"
     ],
     "agens-tui-app": [
       "agens-agents",
@@ -168,6 +170,7 @@ jq -e '
       "agens-fixtures",
       "agens-headless",
       "agens-models",
+      "agens-perf",
       "agens-permissions",
       "agens-providers",
       "agens-session",

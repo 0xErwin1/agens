@@ -30,6 +30,7 @@ use serde::de::{self, DeserializeSeed, Deserializer, IgnoredAny, MapAccess, Visi
 use serde_json::Value;
 
 mod agents;
+mod ask_user;
 mod capabilities;
 mod git_read;
 mod http_mcp;
@@ -44,6 +45,7 @@ pub use agents::{
     AgentCatalog, AgentDiagnostic, AgentDiscovery, AgentModelValidationError, AgentModelValidator,
     AgentShadow,
 };
+pub use ask_user::AskUserTool;
 pub use capabilities::{EffectiveCapabilityDescriptor, EffectiveCapabilitySet};
 pub use git_read::{GitReadInput, GitReadOperation};
 pub use http_mcp::{McpHttpTransport, McpSseTransport};
@@ -3775,8 +3777,15 @@ impl ToolDispatcher {
 
         match registered.tool.execute(&context, handle.arguments) {
             Ok(output) => {
-                if let Err(status) = context.check() {
-                    return Ok(sanitized_execution_status(status));
+                // A deadline that expired while the tool ran does not unmake
+                // its result: the work is already paid for and the caller is
+                // better served by it than by a failure. Reporting a timeout
+                // over a finished call is how a long subagent came back as
+                // "tool execution timed out" and got launched a second time.
+                // Cancellation is different — it is a decision, and its result
+                // must not be acted on.
+                if context.is_cancelled() {
+                    return Ok(sanitized_execution_status(ToolExecutionStatus::Cancelled));
                 }
                 Ok(output)
             }

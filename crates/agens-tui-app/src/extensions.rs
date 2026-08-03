@@ -17,6 +17,7 @@ pub const RESERVED_TUI_COMMANDS: &[&str] = &[
     "diagnostics",
     "effort",
     "help",
+    "keys",
     "login",
     "mcp",
     "model",
@@ -71,6 +72,7 @@ const TUI_PALETTE_BUILT_INS: &[(&str, &str, &str, Option<&str>)] = &[
         Some("dangerous"),
     ),
     ("help", "Show commands and skills", "", Some("help")),
+    ("keys", "Show keyboard shortcuts", "", Some("keys")),
     ("mcp", "Show configured MCP servers", "", Some("mcp")),
     ("select", "Select a project file", "", Some("select")),
     (
@@ -684,6 +686,7 @@ mod tests {
                 "bypass",
                 "dangerous",
                 "help",
+                "keys",
                 "mcp",
                 "select",
                 "subagent-profiles",

@@ -38,7 +38,13 @@ const MAX_SSE_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_CHATGPT_ERROR_BODY_BYTES: usize = 8 * 1024;
 const MAX_TOOL_OUTPUT_BYTES: usize = 8 * 1024;
 const MAX_OPENAI_TOOL_CONTINUATION_ROUNDS: usize = 128;
-const MAX_CHATGPT_REPLAY_ITEMS: usize = 512;
+/// Items one request may replay.
+///
+/// The byte budgets below are what actually protect the request; this bounds
+/// the pathological case of many tiny items. At 512 it was the binding limit
+/// instead: a session of roughly 250 tool calls died here while using a tenth
+/// of the model's context window, and said so in the model's name.
+const MAX_CHATGPT_REPLAY_ITEMS: usize = 4096;
 const MAX_CHATGPT_REPLAY_ITEM_BYTES: usize = 64 * 1024;
 const MAX_CHATGPT_REPLAY_HISTORY_BYTES: usize = 4 * 1024 * 1024;
 const PROACTIVE_REFRESH_WINDOW: Duration = Duration::from_secs(5 * 60);
@@ -436,6 +442,41 @@ pub struct OpenAiFunctionTool {
     name: String,
     description: String,
     parameters: Value,
+}
+
+/// A tool name the Responses API will accept, derived from `name`.
+///
+/// The API constrains function names to `^[a-zA-Z0-9_-]+$` and rejects the
+/// WHOLE request when a replayed history item breaks it — one bad name kills
+/// the turn, not just the call. History outlives the code that wrote it, so
+/// this is enforced at the wire boundary rather than trusted upstream: a
+/// session recorded before a naming fix must still be replayable.
+pub fn wire_tool_name(name: &str) -> String {
+    // `native::` is the dispatcher's own namespace, never a wire name. A
+    // history item carrying it is reporting the same call the model made as
+    // `read` or `task`, so the prefix is dropped rather than mangled.
+    let name = name.strip_prefix("native::").unwrap_or(name);
+    if name
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    {
+        return name.to_owned();
+    }
+
+    let mut wire = String::with_capacity(name.len());
+    let mut pending_separator = false;
+    for character in name.chars() {
+        if character.is_ascii_alphanumeric() || character == '_' || character == '-' {
+            if pending_separator && !wire.is_empty() {
+                wire.push('_');
+            }
+            pending_separator = false;
+            wire.push(character);
+        } else {
+            pending_separator = true;
+        }
+    }
+    wire
 }
 
 impl OpenAiFunctionTool {
@@ -1489,6 +1530,8 @@ fn diagnostic_class_for_port_error(error: HeadlessTurnPortError) -> ProviderDiag
         HeadlessTurnPortError::Cancelled => ProviderDiagnosticClass::Cancelled,
         HeadlessTurnPortError::TimedOut => ProviderDiagnosticClass::Deadline,
         HeadlessTurnPortError::ProviderContext => ProviderDiagnosticClass::Context,
+        HeadlessTurnPortError::ProviderHistoryBudget => ProviderDiagnosticClass::Context,
+        HeadlessTurnPortError::ProviderToolRounds => ProviderDiagnosticClass::Runtime,
         HeadlessTurnPortError::ProviderNetwork => ProviderDiagnosticClass::Network,
         HeadlessTurnPortError::ProviderRateLimited => ProviderDiagnosticClass::RateLimited,
         HeadlessTurnPortError::ProviderRejected => ProviderDiagnosticClass::Rejected,
@@ -1669,7 +1712,7 @@ impl TurnProvider for ChatGptResponsesProvider {
                     return Err(local_chatgpt_failure(
                         self.diagnostics.as_ref(),
                         ProviderDiagnosticKind::ContinuationLimitExceeded,
-                        HeadlessTurnPortError::ProviderContext,
+                        HeadlessTurnPortError::ProviderToolRounds,
                     ));
                 }
                 let Some(new_events) = events.get(event_cursor..) else {
@@ -1692,7 +1735,7 @@ impl TurnProvider for ChatGptResponsesProvider {
                     local_chatgpt_failure(
                         self.diagnostics.as_ref(),
                         ProviderDiagnosticKind::ReplayLimitExceeded,
-                        HeadlessTurnPortError::ProviderContext,
+                        HeadlessTurnPortError::ProviderHistoryBudget,
                     )
                 })?;
                 (self.request_payload(replay_history.clone()), replay_history)
@@ -1767,7 +1810,7 @@ impl TurnProvider for ChatGptResponsesProvider {
             return Err(local_chatgpt_failure(
                 self.diagnostics.as_ref(),
                 ProviderDiagnosticKind::ReplayLimitExceeded,
-                HeadlessTurnPortError::ProviderContext,
+                HeadlessTurnPortError::ProviderHistoryBudget,
             ));
         }
 
@@ -1778,7 +1821,7 @@ impl TurnProvider for ChatGptResponsesProvider {
             return Err(local_chatgpt_failure(
                 self.diagnostics.as_ref(),
                 ProviderDiagnosticKind::ReplayLimitExceeded,
-                HeadlessTurnPortError::ProviderContext,
+                HeadlessTurnPortError::ProviderHistoryBudget,
             ));
         }
         if response.pending_calls.is_empty() {
@@ -1961,8 +2004,12 @@ impl OpenAiResponsesProvider {
 /// layer therefore forwards what it was given, bounded against runaway size. Collapsing a
 /// failure to a generic string here would drop the failing command's own output — the detail
 /// the model needs in order to recover — and would make the same event look different to the
-/// model depending on the dialect and on whether the session had been resumed, since the
-/// resumed-history encoder replays the stored content verbatim.
+/// model depending on the dialect and on whether the session had been resumed.
+///
+/// The resumed-history encoder routes through here for the same reason: the store keeps a tool
+/// result at full length for the transcript, so replaying it verbatim produced items past the
+/// per-item replay budget and made a session that had run fine live permanently unresumable.
+/// Bounding both paths with one budget keeps a replayed turn byte-identical to the live one.
 fn model_visible_tool_output(content: &str) -> String {
     bounded_tool_output(content)
 }
@@ -2602,7 +2649,7 @@ pub fn encode_openai_response_request_with_messages(
                             input.push(serde_json::json!({
                                 "type": "function_call",
                                 "call_id": id,
-                                "name": name,
+                                "name": wire_tool_name(name),
                                 "arguments": arguments,
                             }));
                         }
@@ -2633,7 +2680,7 @@ pub fn encode_openai_response_request_with_messages(
                     input.push(serde_json::json!({
                         "type": "function_call_output",
                         "call_id": tool_call_id,
-                        "output": content,
+                        "output": model_visible_tool_output(content),
                     }));
                 }
             }
@@ -3440,6 +3487,19 @@ mod tests {
     use super::*;
     use std::fs;
 
+    /// The Responses API rejects the whole request over one bad name, so a
+    /// history item recorded by older code must not be able to poison a resumed
+    /// session.
+    #[test]
+    fn a_history_tool_name_is_made_acceptable_before_it_reaches_the_wire() {
+        assert_eq!(wire_tool_name("task"), "task");
+        assert_eq!(wire_tool_name("mcp_server_tool-1"), "mcp_server_tool-1");
+        assert_eq!(wire_tool_name("native::task"), "task");
+        assert_eq!(wire_tool_name("native::git_read"), "git_read");
+        assert_eq!(wire_tool_name("atlas.search"), "atlas_search");
+        assert_eq!(wire_tool_name("weird name/here"), "weird_name_here");
+    }
+
     #[test]
     fn provider_failure_detail_records_and_takes_once() {
         let detail = ProviderFailureDetail::new();
@@ -3681,7 +3741,9 @@ mod tests {
                 serde_json::json!({
                     "type": "function_call",
                     "call_id": "call-1",
-                    "name": "native::read",
+                    // Recorded as `native::read`; the wire only ever sees a name
+                    // the provider's own pattern accepts.
+                    "name": "read",
                     "arguments": r#"{"path":"notes.md"}"#,
                 }),
                 serde_json::json!({
@@ -3730,6 +3792,37 @@ mod tests {
                 .collect::<String>(),
             text
         );
+    }
+
+    #[test]
+    fn resumed_tool_results_stay_inside_the_replay_item_budget() {
+        let stored = "x".repeat(MAX_CHATGPT_REPLAY_ITEM_BYTES * 2);
+        let messages = vec![
+            Message {
+                role: Role::Assistant,
+                parts: vec![MessagePart::ToolCall {
+                    id: "call-1".into(),
+                    name: "native::read".into(),
+                    input: r#"{"path":"notes.md"}"#.into(),
+                }],
+            },
+            Message {
+                role: Role::Tool,
+                parts: vec![MessagePart::ToolResult {
+                    tool_call_id: "call-1".into(),
+                    content: stored.clone(),
+                    is_error: false,
+                }],
+            },
+        ];
+
+        let input = resumed_input("test-model", &messages, &[]).expect("history should encode");
+
+        assert_eq!(
+            input[1]["output"].as_str(),
+            Some(model_visible_tool_output(&stored).as_str())
+        );
+        assert!(validate_chatgpt_replay_history(&input).is_ok());
     }
 
     #[test]

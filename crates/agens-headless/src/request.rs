@@ -194,10 +194,22 @@ pub fn seed_configured_reasoning_effort(request: &mut HeadlessChatRequest, boots
     request.request_config = config;
 }
 
-pub fn explicit_task_delegation_prompt(base: &str) -> String {
-    const INSTRUCTION: &str = "When the user explicitly asks for subagent delegation, use the `task` tool instead of completing the delegated work inline. Use `task_control` to inspect, background, or cancel a live execution and `task_message` to send bounded coordination without waiting for completion.";
+/// The distinctive opening-sentence prefix of the discipline paragraph inside
+/// [`INSTRUCTION`], used as the idempotence guard for
+/// [`explicit_task_delegation_prompt`] instead of a full-text `contains`
+/// check. A short marker inverts the risk of a full-text guard: as
+/// `INSTRUCTION` grows or gets reflowed, a full-text match risks a false
+/// negative (silent duplication), while this marker risks only a false
+/// positive if a user pastes it verbatim into their own configured prompt or
+/// `AGENTS.md` — accepted, since that text can already countermand the block
+/// in prose regardless of whether the block itself is present.
+const DELEGATION_MARKER: &str =
+    "Subagent delegation is a routing decision, not a search for an agent that happens to work.";
 
-    if base.contains(INSTRUCTION) {
+const INSTRUCTION: &str = "When the user explicitly asks for subagent delegation, use the `task` tool instead of completing the delegated work inline. Use `task_control` to inspect, background, or cancel a live execution and `task_message` to send bounded coordination without waiting for completion. Subagent delegation is a routing decision, not a search for an agent that happens to work. Route a task to the agent whose declared role covers it. When no declared role covers the work, or the assigned agent reports it cannot proceed, report that and the evidence to the user; do not substitute another agent to get past a block. Judge tool availability only from the agent actually assigned — a surface reported by one agent says nothing about another. Never invent context (identifiers, workflow state, artifacts) to make a request routable to an agent that would otherwise reject it. Do not cancel a running execution on circumstantial evidence: a file, diff, or log line appearing while it runs is correlation, not proof — use `task_control` to inspect and `task_message` to ask what it touched, and cancel only on a confirmed scope violation or irreversible-action risk. Keep one change with one agent start to finish; if an execution was interrupted, resume the same role with full context instead of compensating with a different agent.";
+
+pub fn explicit_task_delegation_prompt(base: &str) -> String {
+    if base.contains(DELEGATION_MARKER) {
         base.to_owned()
     } else {
         format!("{base}\n\n{INSTRUCTION}")
@@ -358,5 +370,21 @@ mod tests {
         let request = apply_session_to_request(&context, request);
 
         assert!(request.dangerously_allow_all);
+    }
+
+    #[test]
+    fn the_delegation_marker_is_a_prefix_of_the_instruction_it_guards() {
+        assert!(
+            INSTRUCTION.contains(DELEGATION_MARKER),
+            "the idempotence marker must be tied to the block it guards"
+        );
+    }
+
+    #[test]
+    fn applying_the_delegation_prompt_twice_is_a_no_op_the_second_time() {
+        let once = explicit_task_delegation_prompt("Base instructions.");
+        let twice = explicit_task_delegation_prompt(&once);
+
+        assert_eq!(twice, once);
     }
 }

@@ -313,10 +313,7 @@ mod tests {
         configure_tui_project_identity(&mut known_tui, &known_bootstrap);
         let known = render_tui_test_backend(&known_tui, 140, 14);
 
-        assert!(
-            known.contains("gpt-5.6-sol · medium · 0/1.1m (0%)"),
-            "{known:?}"
-        );
+        assert!(known.contains("gpt-5.6-sol (medium) ·   0%"), "{known:?}");
         assert!(!known.contains("model · default · ctx —"), "{known:?}");
 
         let unknown_root = tui_session_directory("fresh-presentation-unknown");
@@ -331,14 +328,8 @@ mod tests {
         ));
         let unknown = render_tui_test_backend(&unknown_tui, 140, 14);
 
-        assert!(
-            unknown.contains("gpt-future-1 · effort — · ctx —"),
-            "{unknown:?}"
-        );
-        assert!(
-            !unknown.contains("gpt-future-1 · effort — · 0/"),
-            "{unknown:?}"
-        );
+        assert!(unknown.contains("gpt-future-1 · ctx —"), "{unknown:?}");
+        assert!(!unknown.contains("gpt-future-1 · 0/"), "{unknown:?}");
 
         std::fs::remove_dir_all(known_root).unwrap();
         std::fs::remove_dir_all(unknown_root).unwrap();
