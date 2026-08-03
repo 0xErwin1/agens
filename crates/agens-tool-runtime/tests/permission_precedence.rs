@@ -1493,15 +1493,34 @@ fn configured_parent_policy(
     (policy, identity)
 }
 
+/// Both paths must read a declaration the same way. The one place they are
+/// allowed to part is where no declaration reads at all: the parent turns an
+/// undecided call into a question, and a delegated execution has no surface to
+/// put a question on, so the child decides it instead of stalling on a prompt
+/// nobody can answer.
+///
+/// That exemption is deliberately narrow — it applies only where the parent
+/// itself reached `Ask`, and only to turn it into `Allow`. Any other
+/// divergence, in either direction, is the two paths disagreeing about what a
+/// rule means, which is the thing this table exists to catch.
 #[test]
 fn the_child_path_and_the_parent_path_decide_every_declaration_shape_identically() {
     let mut disagreements = Vec::new();
+    let mut undecided = 0usize;
 
     for case in CASES {
         let declarations = parsed_declarations(case.declarations);
 
         let child = child_decision(&declarations, case.tool, case.target, case.path);
         let parent = parent_decision(&declarations, case.tool, case.target, case.path);
+
+        if parent == case.expected
+            && parent == PermissionDecision::Ask
+            && child == PermissionDecision::Allow
+        {
+            undecided += 1;
+            continue;
+        }
 
         if child != case.expected || parent != case.expected {
             disagreements.push(format!(
@@ -1517,6 +1536,11 @@ fn the_child_path_and_the_parent_path_decide_every_declaration_shape_identically
         disagreements.len(),
         CASES.len(),
         disagreements.join("\n")
+    );
+    assert!(
+        undecided > 0,
+        "the table must still cover calls no declaration decides, or the one sanctioned \
+         difference between the two paths is going untested"
     );
 }
 

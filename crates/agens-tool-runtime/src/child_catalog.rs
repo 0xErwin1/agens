@@ -7,6 +7,15 @@
 //! a silent clamp. A `deny` or `ask` naming an unheld tool exceeds nothing, so
 //! it is retained inert instead — see [`normalize_declared_tool`].
 //!
+//! What the child keeps, it may use. Nothing here can be resolved by asking:
+//! a delegated execution has no surface to put a prompt on, so an undecided
+//! call is a denied call. Authorizing only a read-shaped subset and leaving
+//! the rest undecided therefore did not make a child cautious, it made every
+//! writing role inert — it could see `bash` in its catalog, call it, and be
+//! refused for a prompt nobody could ever answer. Narrowing a child is done by
+//! saying so, in the configured `[permissions]` or the agent's own
+//! declarations, both of which are enforced below.
+//!
 //! A tool is omitted from the catalog exactly when the declarations leave no
 //! call to it that the policy could answer with anything but `Deny`. Every
 //! other narrowing — a target-scoped `deny bash rm*`, or a `deny bash` beside
@@ -50,20 +59,6 @@ impl ChildSurfaceRejection {
         )
     }
 }
-
-/// Native tool identities auto-authorized for every delegated child: bounded
-/// filesystem and VCS reads. `native::webfetch` is deliberately excluded —
-/// it is `ToolAccess::ReadOnly` too, but that flag classifies worktree
-/// impact, not network egress, so treating it as read-class here would grant
-/// unattended network access with no declaration.
-const AUTO_ALLOW_NATIVE_TOOLS: [&str; 6] = [
-    "native::read",
-    "native::list",
-    "native::search",
-    "native::grep",
-    "native::glob",
-    "native::git_read",
-];
 
 /// Native tools a delegated child holds beside the catalog's. Their
 /// implementations are bound to the execution they coordinate rather than to
@@ -165,9 +160,28 @@ pub fn resolve_child_surface(
         .filter(|tool| reachable(tool))
         .collect::<Vec<_>>();
 
-    let mut rules = AUTO_ALLOW_NATIVE_TOOLS
-        .into_iter()
+    // A tool the child still holds is authorized outright, because a child
+    // cannot be asked: leaving it undecided would only mean the model calls it
+    // and the gate answers `Ask` into a surface with nobody on it.
+    //
+    // Unless the definition allowed that tool itself. An `allow bash git*` is
+    // an author enumerating the calls this agent may make, and a blanket allow
+    // beside it would not narrow to `git*`, it would erase it — the agent
+    // would hold unrestricted bash because its author took the trouble to
+    // restrict it. A `deny` or `ask` composes the other way: it subtracts from
+    // whatever it sits beside, so the blanket allow stays and the declaration
+    // carves out of it.
+    let enumerated = |tool: &str| {
+        normalized_declarations
+            .iter()
+            .any(|rule| rule.decision == PermissionDecision::Allow && rule.tool.matches(tool))
+    };
+
+    let mut rules = tools
+        .iter()
+        .map(|entry| entry.qualified_name.as_str())
         .chain(coordination_tools.iter().copied())
+        .filter(|tool| !enumerated(tool))
         .map(|tool| {
             PermissionRule::global(
                 PermissionDecision::Allow,
@@ -543,35 +557,98 @@ mod tests {
         );
     }
 
+    fn authorizes(surface: &ChildToolSurface, tool: &str) -> bool {
+        surface
+            .rules
+            .iter()
+            .any(|rule| rule.decision == PermissionDecision::Allow && rule.tool.matches(tool))
+    }
+
+    /// A subagent nobody narrowed can do the work it was delegated. This is the
+    /// whole of the default: an agent definition that says nothing about
+    /// permissions gets the surface, because the alternative is a role that
+    /// reads files, calls `bash`, and is refused for a prompt no delegated
+    /// execution can ever display.
     #[test]
-    fn a_configured_allow_grants_the_child_nothing_on_its_own() {
+    fn an_undeclared_child_is_authorized_for_every_tool_it_holds() {
+        let surface = resolve_child_surface(&[], &[]).unwrap();
+
+        for tool in ["native::bash", "native::write", "native::edit"] {
+            assert!(
+                authorizes(&surface, tool),
+                "a child with no declarations must be able to use {tool}"
+            );
+        }
+        for tool in CHILD_COORDINATION_TOOLS {
+            assert!(authorizes(&surface, tool));
+        }
+    }
+
+    /// The one tool whose reach leaves the machine. It follows the same default
+    /// as the rest — `ToolAccess` classifies worktree impact, not egress, so
+    /// nothing here distinguishes it — which means an unattended subagent can
+    /// make network requests unless a declaration says otherwise. Pinned so
+    /// that stays a decision somebody made rather than a detail that drifted.
+    #[test]
+    fn an_undeclared_child_may_reach_the_network_and_a_declaration_is_what_stops_it() {
+        assert!(authorizes(
+            &resolve_child_surface(&[], &[]).unwrap(),
+            "native::webfetch"
+        ));
+
+        let declared = resolve_child_surface(&[], &[rule(PermissionDecision::Deny, "webfetch")])
+            .expect("surface must resolve");
+
+        assert!(
+            !authorizes(&declared, "native::webfetch"),
+            "a declared deny must still take the network away"
+        );
+        assert!(
+            !tool_names(&declared).contains(&"native::webfetch".to_owned()),
+            "and take it out of the catalog, so the model is not offered it at all"
+        );
+    }
+
+    /// A definition that enumerates what it may run keeps its enumeration. The
+    /// blanket authorization exists for definitions that said nothing; adding
+    /// it beside an `allow bash git*` would not narrow that agent to git, it
+    /// would hand it unrestricted `bash` as a reward for having been careful.
+    #[test]
+    fn a_declared_allow_is_not_widened_by_the_blanket_authorization() {
         let surface = resolve_child_surface(
+            &[],
             &[PermissionRule::global(
                 PermissionDecision::Allow,
-                PermissionPattern::Exact("native::bash".into()),
-                PermissionPattern::Any,
+                PermissionPattern::Exact("bash".into()),
+                PermissionPattern::glob("git*").expect("valid target glob"),
             )],
-            &[],
         )
         .expect("surface must resolve");
 
         assert!(
             !surface.rules.iter().any(|rule| {
-                rule.decision == PermissionDecision::Allow && rule.tool.matches("native::bash")
+                rule.decision == PermissionDecision::Allow
+                    && rule.tool.matches("native::bash")
+                    && rule.target == PermissionPattern::Any
             }),
-            "only a declaration authorizes a child tool, never the parent's configuration"
+            "the scoped allow must not be joined by an unscoped one"
+        );
+        assert!(
+            authorizes(&surface, "native::write"),
+            "scoping one tool must not disturb the tools the definition left alone"
         );
     }
 
+    /// The configured floor outranks the blanket authorization, which is the
+    /// property that keeps `[permissions]` meaningful now that a child
+    /// authorizes itself: a tool the configuration denies outright is gone from
+    /// the catalog, not merely allowed-then-overruled.
     #[test]
-    fn webfetch_is_excluded_from_the_derived_allow_set() {
-        let surface = resolve_child_surface(&[], &[]).unwrap();
+    fn the_configured_floor_still_outranks_what_the_child_authorizes_itself() {
+        let surface =
+            resolve_child_surface(&[parent_deny("bash", None)], &[]).expect("surface must resolve");
 
-        assert!(
-            !surface.rules.iter().any(|rule| {
-                rule.decision == PermissionDecision::Allow && rule.tool.matches("native::webfetch")
-            }),
-            "webfetch must require an explicit declaration, never a derived allow"
-        );
+        assert!(!authorizes(&surface, "native::bash"));
+        assert!(!tool_names(&surface).contains(&"native::bash".to_owned()));
     }
 }
