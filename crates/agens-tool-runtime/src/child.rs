@@ -34,8 +34,11 @@ use agens_diagnostics::{diagnostic_store, record_subagent_surface_rejection};
 use agens_dispatch::ProductionToolDispatcher;
 use agens_error::CliError;
 use agens_permissions::{
-    ProductionPermissionGate, SharedToolDispatcher, configured_permission_rules,
+    PermissionPrompter, ProductionPermissionGate, ProductionPermissionResolver,
+    ProductionPromptAuthorization, SharedToolDispatcher, configured_permission_rules,
 };
+use agens_store::PermissionGrantStore;
+use std::path::PathBuf;
 
 /// Why a delegated child turn ended without a result.
 ///
@@ -175,6 +178,9 @@ pub struct ProductionTaskExecutionContext<'a> {
     /// The parent's connected MCP registry, shared so this child dispatches
     /// through the same servers instead of standing up its own.
     pub mcp_registry: Option<Arc<Mutex<agens_tools::McpRegistry>>>,
+    /// Builds this execution's prompter onto the parent's surface. `None` is a
+    /// delegation with nobody to ask.
+    pub permission_prompter: Option<crate::runner::PrompterFactory>,
 }
 
 pub fn run_production_task(
@@ -191,6 +197,7 @@ pub fn run_production_task(
         task_registry,
         execution_id,
         mcp_registry,
+        permission_prompter,
     } = context;
     let messages = vec![
         Message {
@@ -281,6 +288,8 @@ pub fn run_production_task(
                         registry: task_registry.clone(),
                         target: TaskMessageTarget::Execution(execution_id),
                     },
+                    permission_prompter: permission_prompter.clone(),
+                    grant_store_root: bootstrap.data_directory().to_path_buf(),
                 },
             )
         }
@@ -316,6 +325,8 @@ pub fn run_production_task(
                         registry: task_registry.clone(),
                         target: TaskMessageTarget::Execution(execution_id),
                     },
+                    permission_prompter: permission_prompter.clone(),
+                    grant_store_root: bootstrap.data_directory().to_path_buf(),
                 },
             )
         }
@@ -352,6 +363,8 @@ pub fn run_production_task(
                         registry: task_registry.clone(),
                         target: TaskMessageTarget::Execution(execution_id),
                     },
+                    permission_prompter: permission_prompter.clone(),
+                    grant_store_root: bootstrap.data_directory().to_path_buf(),
                 },
             )
         }
@@ -453,6 +466,8 @@ struct IsolatedTaskTurnContext<'a> {
     progress: Option<&'a TurnProgressSink>,
     surface: &'a crate::child_catalog::ChildToolSurface,
     mailbox: TaskMailboxContext,
+    permission_prompter: Option<crate::runner::PrompterFactory>,
+    grant_store_root: PathBuf,
 }
 
 /// Runs a subagent's isolated turn with no session attempt of its own, so the
@@ -476,6 +491,8 @@ where
         progress,
         surface,
         mailbox,
+        permission_prompter,
+        grant_store_root,
     } = context;
     let max_iterations = configured_task_max_iterations(&mailbox.registry);
     let mut provider = TaskMailboxProvider::new(provider, Some(mailbox.registry), mailbox.target);
@@ -487,6 +504,7 @@ where
     .with_configured_floor(surface.configured_floor.clone());
     let grants = Arc::new(Mutex::new(Vec::new()));
     let session = PermissionSession::new();
+    let resolver_session = session;
     let pending = Arc::new(Mutex::new(BTreeMap::new()));
     let prompts = Arc::new(Mutex::new(BTreeMap::new()));
     let mut repository = DiscardCompletedTurnRepository;
@@ -501,7 +519,28 @@ where
         Arc::clone(&prompts),
     )
     .with_dangerous_override(dangerous_mode);
-    let mut resolver = ChildPermissionResolver;
+    let mut resolver = match permission_prompter.and_then(|build| {
+        PermissionGrantStore::open(&grant_store_root)
+            .ok()
+            .map(|store| (build(), store))
+    }) {
+        Some((prompter, store)) => {
+            ChildPermissionResolver::Prompting(Box::new(ProductionPermissionResolver::new(
+                prompter,
+                store,
+                Arc::clone(&grants),
+                Arc::clone(&prompts),
+                ProductionPromptAuthorization {
+                    policy: policy.clone(),
+                    session: resolver_session,
+                    project: project.clone(),
+                    dispatcher: Arc::clone(&tool_runtime),
+                    allowed: Arc::clone(&pending),
+                },
+            )))
+        }
+        None => ChildPermissionResolver::Unreachable,
+    };
     let mut dispatcher = ProductionToolDispatcher::new(tool_runtime, pending);
     let snapshot =
         block_on_headless_turn(run_isolated_headless_turn_with_max_iterations_and_progress(
@@ -528,28 +567,182 @@ where
         .collect())
 }
 
-struct ChildPermissionResolver;
+/// How a delegated execution answers a call the policy left undecided.
+///
+/// [`Self::Unreachable`] is the honest answer when nobody is listening: a
+/// delegation with no surface behind it cannot ask, so it denies. It is not
+/// the honest answer when there IS a surface — the parent is sitting at one,
+/// the child runs on a thread of the parent's own process, and the prompt
+/// bridge it would use is the same object. Denying there answered a question
+/// on the user's behalf that they were available to answer themselves.
+enum ChildPermissionResolver {
+    Unreachable,
+    /// Boxed because the production resolver carries a grant store and a
+    /// policy, and this enum is constructed once per turn either way.
+    Prompting(Box<ProductionPermissionResolver<Box<dyn PermissionPrompter>>>),
+}
 
 impl HeadlessPermissionResolver for ChildPermissionResolver {
-    fn resolve(
+    async fn resolve(
         &mut self,
-        _: &HeadlessToolCall,
-        _: &HeadlessTurnCancellation,
-    ) -> impl std::future::Future<Output = Result<PermissionDecision, HeadlessTurnPortError>> + Send
-    {
-        std::future::ready(Ok(PermissionDecision::Deny))
+        call: &HeadlessToolCall,
+        cancellation: &HeadlessTurnCancellation,
+    ) -> Result<PermissionDecision, HeadlessTurnPortError> {
+        match self {
+            Self::Unreachable => Ok(PermissionDecision::Deny),
+            Self::Prompting(resolver) => resolver.resolve(call, cancellation).await,
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agens_core::HeadlessPermissionGate;
+
+    /// A prompter that records what it was asked and answers as scripted,
+    /// standing in for the person at the parent's terminal.
+    struct ScriptedPrompter {
+        answer: agens_permissions::PermissionPromptAnswer,
+        asked: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl PermissionPrompter for ScriptedPrompter {
+        fn prompt(
+            &mut self,
+            context: &agens_tools::PermissionPromptContext,
+            _: &HeadlessTurnCancellation,
+        ) -> Result<agens_permissions::PermissionPromptAnswer, HeadlessTurnPortError> {
+            self.asked
+                .lock()
+                .expect("the record must be available")
+                .push(context.target_identifier.clone());
+            Ok(self.answer)
+        }
+    }
+
+    /// These ports all answer synchronously, so one poll is the whole future.
+    fn poll_once<T>(future: impl std::future::Future<Output = T>) -> T {
+        let mut future = std::pin::pin!(future);
+        let context = &mut std::task::Context::from_waker(std::task::Waker::noop());
+        match future.as_mut().poll(context) {
+            std::task::Poll::Ready(value) => value,
+            std::task::Poll::Pending => panic!("this fixture's ports complete synchronously"),
+        }
+    }
+
+    /// The behaviour this whole channel exists for. A delegated execution runs
+    /// on a thread of the parent's process, and the parent is sitting at a
+    /// surface; answering `Deny` on the user's behalf was inventing a decision
+    /// they were available to make. Both directions are pinned, because a
+    /// channel that only ever says yes would pass an allow-only assertion.
+    #[test]
+    fn a_child_with_a_surface_asks_the_person_instead_of_denying_for_them() {
+        use agens_permissions::PermissionPromptAnswer;
+
+        let temporary = std::env::temp_dir().join(format!(
+            "agens-child-prompt-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&temporary).expect("the store root must exist");
+
+        for (answer, expected) in [
+            (PermissionPromptAnswer::AllowOnce, PermissionDecision::Allow),
+            (PermissionPromptAnswer::DenyOnce, PermissionDecision::Deny),
+        ] {
+            let (_tools, dispatcher) = crate::runtime::production_child_tool_runtime(
+                &temporary,
+                agens_config::ToolLimitSettings::default(),
+                &crate::child_catalog::resolve_child_surface(&[], &[], &[]).unwrap(),
+                TaskExecutionRegistry::new(),
+                agens_tools::TaskExecutionId::from_value(1),
+                None,
+                None,
+            )
+            .expect("the child runtime must build");
+
+            let call = HeadlessToolCall {
+                id: "call-1".into(),
+                name: "native::write".into(),
+                input: r#"{"path":"notes.md","contents":"hi"}"#.into(),
+            };
+            let prompts = Arc::new(Mutex::new(BTreeMap::new()));
+            let asked = Arc::new(Mutex::new(Vec::new()));
+
+            // The gate is what parks a call as a pending prompt; the resolver
+            // only answers one, so it has to be driven through the gate the
+            // same way a real turn drives it.
+            let mut gate = ProductionPermissionGate::new(
+                agens_core::PermissionPolicy::new(PermissionMode::Edit, Vec::new()),
+                Arc::new(Mutex::new(Vec::new())),
+                PermissionSession::new(),
+                "project".into(),
+                Arc::clone(&dispatcher),
+                Arc::new(Mutex::new(BTreeMap::new())),
+                Arc::clone(&prompts),
+            );
+            let cancellation = HeadlessTurnCancellation::new();
+            let evaluated =
+                poll_once(gate.evaluate(&call, &cancellation)).expect("the gate decides");
+            assert_eq!(
+                evaluated,
+                PermissionDecision::Ask,
+                "an unruled write must be the undecided case this channel is about"
+            );
+
+            let mut resolver =
+                ChildPermissionResolver::Prompting(Box::new(ProductionPermissionResolver::new(
+                    Box::new(ScriptedPrompter {
+                        answer,
+                        asked: Arc::clone(&asked),
+                    }) as Box<dyn PermissionPrompter>,
+                    PermissionGrantStore::open(&temporary).expect("the grant store must open"),
+                    Arc::new(Mutex::new(Vec::new())),
+                    Arc::clone(&prompts),
+                    ProductionPromptAuthorization {
+                        policy: agens_core::PermissionPolicy::new(PermissionMode::Edit, Vec::new()),
+                        session: PermissionSession::new(),
+                        project: "project".into(),
+                        dispatcher: Arc::clone(&dispatcher),
+                        allowed: Arc::new(Mutex::new(BTreeMap::new())),
+                    },
+                )));
+            let decision =
+                poll_once(resolver.resolve(&call, &cancellation)).expect("the resolver decides");
+
+            assert_eq!(decision, expected, "the person's answer is the decision");
+            assert_eq!(
+                asked.lock().unwrap().len(),
+                1,
+                "the question must reach the surface exactly once"
+            );
+        }
+
+        let mut unreachable = ChildPermissionResolver::Unreachable;
+        let call = HeadlessToolCall {
+            id: "call-2".into(),
+            name: "native::write".into(),
+            input: "{}".into(),
+        };
+        let decision = poll_once(unreachable.resolve(&call, &HeadlessTurnCancellation::new()))
+            .expect("the resolver decides");
+        assert_eq!(
+            decision,
+            PermissionDecision::Deny,
+            "with nobody to ask, denying is still the only honest answer"
+        );
+
+        std::fs::remove_dir_all(&temporary).ok();
+    }
 
     /// Pins the subagent-scope split (`PermissionSession::new()` above, never
-    /// `with_temporary_bypass()`): a model-launched child's own resolver fails closed on every
-    /// `Ask`, unconditionally and regardless of which tool or arguments produced it. A future edit
-    /// that forwards a session's bypass into `run_production_task` (see `ProductionTaskRunner`'s
-    /// doc comment on `with_bypass`) must not make this resolver return anything but `Deny`.
+    /// `with_temporary_bypass()`): a child never inherits a bypass, so a
+    /// session that turned prompting off for itself does not turn it off for
+    /// everything it delegates. That is about bypass, not about asking — a
+    /// child with a surface behind it now asks, and
+    /// [`a_child_with_a_surface_asks_the_person_instead_of_denying_for_them`]
+    /// pins that half.
     #[test]
     fn isolated_turn_stops_at_the_task_registrys_configured_iteration_limit() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -629,6 +822,8 @@ mod tests {
                     registry,
                     target: TaskMessageTarget::Main,
                 },
+                permission_prompter: None,
+                grant_store_root: std::env::temp_dir(),
             },
         );
 
@@ -656,7 +851,7 @@ mod tests {
                 input: "{}".into(),
             },
         ] {
-            let mut resolver = ChildPermissionResolver;
+            let mut resolver = ChildPermissionResolver::Unreachable;
             let decision = block_on_headless_turn(resolver.resolve(&call, &cancellation))
                 .unwrap()
                 .unwrap();
@@ -771,6 +966,8 @@ mod tests {
                         registry,
                         target: TaskMessageTarget::Main,
                     },
+                    permission_prompter: None,
+                    grant_store_root: std::env::temp_dir(),
                 },
             );
 
@@ -907,6 +1104,8 @@ mod tests {
                     registry,
                     target: TaskMessageTarget::Main,
                 },
+                permission_prompter: None,
+                grant_store_root: std::env::temp_dir(),
             },
         ) {
             Ok(output) => output,
