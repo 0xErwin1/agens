@@ -1613,7 +1613,7 @@ struct PerFileProbe {
     still_reports: &'static str,
 }
 
-/// One native tool, classified by the two facts that decide whether a path deny
+/// One native tool, classified by the facts that decide whether a path deny
 /// binds it.
 struct SurfaceEntry {
     tool: &'static str,
@@ -1625,21 +1625,36 @@ struct SurfaceEntry {
     /// The call that reports files it never named, present when the tool asks
     /// the same rules once per file while it runs.
     decided_per_file: Option<PerFileProbe>,
+    /// Why no path rule reaches what this tool can return. Required of exactly
+    /// the rows neither mechanism covers, and forbidden of the rest, so an
+    /// exception is written down rather than inferred from an absence.
+    unbound: Option<&'static str>,
+    /// The shape a rule's target is matched under, which decides whether a bare
+    /// `*` crosses a `/`. `None` where the target is neither a path nor a
+    /// command line, so the question does not arise.
+    matched_as: Option<PermissionTargetKind>,
 }
 
-/// The whole native surface, classified.
+/// The whole registered native surface, classified.
 ///
 /// This table exists because the enumeration is what keeps being got wrong: a
 /// tool that returns the contents of a file and is decided neither way is a
-/// path deny that does not bind, and three separate passes over this surface
+/// path deny that does not bind, and repeated passes over this surface each
 /// missed one. Adding a native tool without adding a row here fails the test
 /// below, which is the point — the classification is the decision, and it has
 /// to be made deliberately rather than inherited.
 ///
-/// A row's per-file claim is executed rather than restated: it carries the call
-/// that proves it, run by
-/// [`every_tool_this_table_says_asks_per_file_withholds_a_denied_file`]. What
-/// each rule decides is pinned separately, by [`REPORTED_FILE_CASES`] and by the
+/// **What is proven and what is claimed.** `decided_per_file` is executed: the
+/// row carries the call that proves it, run by
+/// [`every_tool_this_table_says_asks_per_file_withholds_a_denied_file`], and a
+/// row cannot assert the per-file question without supplying it. `matched_as`
+/// is checked against `permission_target_kind_for_tool`. The tool list is read
+/// off the production dispatchers rather than restated.
+/// `returns_file_contents`, `decided_on_its_target` and `unbound` are CLAIMS,
+/// asserted against each other but against no execution: a row could assert
+/// `decided_on_its_target` for a tool whose target parses to something other
+/// than a path and nothing here would contradict it. What each rule then
+/// decides is pinned separately, by [`REPORTED_FILE_CASES`] and by the
 /// shipped-configuration turns in `child.rs`.
 const TOOL_SURFACE: &[SurfaceEntry] = &[
     SurfaceEntry {
@@ -1647,12 +1662,16 @@ const TOOL_SURFACE: &[SurfaceEntry] = &[
         returns_file_contents: true,
         decided_on_its_target: true,
         decided_per_file: None,
+        unbound: None,
+        matched_as: Some(PermissionTargetKind::Path),
     },
     SurfaceEntry {
         tool: "native::write",
         returns_file_contents: false,
         decided_on_its_target: true,
         decided_per_file: None,
+        unbound: None,
+        matched_as: Some(PermissionTargetKind::Path),
     },
     // `edit` reports the region it rewrote, which is the file's own text.
     SurfaceEntry {
@@ -1660,12 +1679,16 @@ const TOOL_SURFACE: &[SurfaceEntry] = &[
         returns_file_contents: true,
         decided_on_its_target: true,
         decided_per_file: None,
+        unbound: None,
+        matched_as: Some(PermissionTargetKind::Path),
     },
     SurfaceEntry {
         tool: "native::list",
         returns_file_contents: false,
         decided_on_its_target: true,
         decided_per_file: None,
+        unbound: None,
+        matched_as: Some(PermissionTargetKind::Path),
     },
     SurfaceEntry {
         tool: "native::search",
@@ -1676,6 +1699,8 @@ const TOOL_SURFACE: &[SurfaceEntry] = &[
             denies: "**/secrets.md",
             still_reports: "OPENAI_API_KEY is set",
         }),
+        unbound: None,
+        matched_as: Some(PermissionTargetKind::Path),
     },
     SurfaceEntry {
         tool: "native::grep",
@@ -1686,6 +1711,8 @@ const TOOL_SURFACE: &[SurfaceEntry] = &[
             denies: "**/secrets.md",
             still_reports: "OPENAI_API_KEY is set",
         }),
+        unbound: None,
+        matched_as: Some(PermissionTargetKind::Path),
     },
     // `glob` reports the paths its pattern names and never their contents. Its
     // pattern is matched as text rather than as the set it denotes, which is a
@@ -1695,6 +1722,8 @@ const TOOL_SURFACE: &[SurfaceEntry] = &[
         returns_file_contents: false,
         decided_on_its_target: false,
         decided_per_file: None,
+        unbound: None,
+        matched_as: Some(PermissionTargetKind::Path),
     },
     // `git_read` is named by an operation keyword, so no rule written against
     // it selects a file; the files its `diff` reports are decided one by one.
@@ -1707,6 +1736,8 @@ const TOOL_SURFACE: &[SurfaceEntry] = &[
             denies: "**/secrets.md",
             still_reports: "notes: second",
         }),
+        unbound: None,
+        matched_as: Some(PermissionTargetKind::Path),
     },
     // `webfetch` returns HTTP and HTTPS responses and cannot address a file.
     SurfaceEntry {
@@ -1714,63 +1745,200 @@ const TOOL_SURFACE: &[SurfaceEntry] = &[
         returns_file_contents: false,
         decided_on_its_target: false,
         decided_per_file: None,
+        unbound: None,
+        matched_as: Some(PermissionTargetKind::Path),
     },
-    // `bash` prints whatever the command it runs prints, and its target is that
-    // command line rather than a path. It is the one tool no path deny binds.
     SurfaceEntry {
         tool: "native::bash",
         returns_file_contents: true,
         decided_on_its_target: false,
         decided_per_file: None,
+        unbound: Some(
+            "a rule written for bash is matched against the command line rather than against \
+             any path, and the command chooses what it prints. The exception is total, and it \
+             is the accepted cost of granting a shell at all.",
+        ),
+        matched_as: Some(PermissionTargetKind::FreeFormText),
+    },
+    // Registered directly on the primary path, beside the catalog rather than
+    // out of it.
+    SurfaceEntry {
+        tool: "native::skill",
+        returns_file_contents: true,
+        decided_on_its_target: false,
+        decided_per_file: None,
+        unbound: Some(
+            "a skill call is named by a skill name, and no rule written against a path selects \
+             one. The exception is bounded rather than closed, and deliberately not papered \
+             over with a reach that could not be matched: a skill's files are opened relative \
+             to that skill's own directory descriptor, under a single normal filename with no \
+             traversal, rejecting symbolic links and files carrying more than one link, so the \
+             only files it can return are the ones installed as that skill's own assets. A \
+             global skill has no project-relative path for a rule to name at all. It is absent \
+             from every delegated child.",
+        ),
+        matched_as: None,
+    },
+    // Registered directly on the primary path. A delegated child never holds
+    // it, which is what keeps delegation from nesting.
+    SurfaceEntry {
+        tool: "native::task",
+        returns_file_contents: true,
+        decided_on_its_target: false,
+        decided_per_file: None,
+        unbound: Some(
+            "a task call is named by a description, so no rule written against a path selects \
+             it, and what it returns is whatever the child reports. No rule reaches that text \
+             here — but the child read those files under these same configured rules, resolved \
+             into its own surface by `resolve_child_surface`, so a file this configuration \
+             denies was already withheld before the report was written.",
+        ),
+        matched_as: None,
+    },
+    // Registered directly by a delegated child's runtime. Both report on the
+    // execution rather than on the worktree.
+    SurfaceEntry {
+        tool: "native::task_control",
+        returns_file_contents: false,
+        decided_on_its_target: false,
+        decided_per_file: None,
+        unbound: None,
+        matched_as: None,
+    },
+    SurfaceEntry {
+        tool: "native::task_message",
+        returns_file_contents: false,
+        decided_on_its_target: false,
+        decided_per_file: None,
+        unbound: None,
+        matched_as: None,
     },
 ];
 
+/// Every native the production dispatchers register, gathered from the
+/// dispatchers themselves.
+///
+/// The catalog is not the surface. `skill` and `task` are registered directly
+/// beside the catalog's ten on the primary path, and a delegated child
+/// registers `task_control` and `task_message` the same way, so a table
+/// compared against `NativeToolCatalog::metadata()` leaves four tools
+/// unclassified while reading as complete.
+fn registered_native_surface() -> Vec<String> {
+    struct InertTaskRunner;
+
+    impl agens_tools::TaskRunner for InertTaskRunner {
+        fn run(
+            &self,
+            request: agens_tools::TaskTurnRequest,
+            _: &agens_tools::TaskRunContext,
+        ) -> Result<agens_tools::TaskTurnResult, agens_tools::TaskRunnerError> {
+            Ok(agens_tools::TaskTurnResult {
+                output: request.description().to_owned(),
+                iterations: 1,
+            })
+        }
+    }
+
+    let temporary = agens_fixtures::session_directory("registered-native-surface");
+    let bootstrap = agens_fixtures::session_bootstrap(&temporary, &[]);
+    let project_root = agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap);
+
+    let (_, parent) = agens_tool_runtime::runtime::production_tool_runtime_with_task_runner(
+        &bootstrap,
+        &project_root,
+        Some(&agens_tools::SkillCatalog::default()),
+        InertTaskRunner,
+    )
+    .expect("the parent runtime must build");
+
+    let surface = resolve_child_surface(&[], &[]).expect("the child surface must resolve");
+    let registry = agens_tools::TaskExecutionRegistry::new();
+    let execution = registry
+        .admit(agens_tools::TaskLaunchMode::Foreground)
+        .expect("a foreground execution must be admissible");
+    let (_, child) = agens_tool_runtime::runtime::production_child_tool_runtime(
+        &project_root,
+        agens_config::ToolLimitSettings::default(),
+        &surface,
+        registry,
+        execution,
+    )
+    .expect("the child runtime must build");
+
+    let (_, dangerous) = agens_tool_runtime::runtime::production_dangerous_child_tool_runtime(
+        &project_root,
+        agens_config::ToolLimitSettings::default(),
+    )
+    .expect("the dangerous child runtime must build");
+
+    let mut registered = [parent, child, dangerous]
+        .iter()
+        .flat_map(|dispatcher| {
+            dispatcher
+                .lock()
+                .expect("dispatcher must be available")
+                .registered_native_names()
+        })
+        .collect::<Vec<_>>();
+    registered.sort_unstable();
+    registered.dedup();
+
+    fs::remove_dir_all(temporary).unwrap();
+
+    registered
+}
+
 /// The surface the table classifies has to be the surface that exists, and
 /// every tool on it that can return the contents of a file has to be decided
-/// one of the two ways — with `bash` named as the single exception rather than
-/// left implicit.
+/// one of the two ways — or carry a written reason why neither reaches it.
 #[test]
 fn every_native_tool_that_returns_file_contents_is_reached_by_a_path_rule() {
     let mut classified = TOOL_SURFACE
         .iter()
-        .map(|entry| entry.tool)
-        .collect::<Vec<_>>();
-    let mut registered = NativeToolCatalog::metadata()
-        .into_iter()
-        .map(|entry| entry.qualified_name)
+        .map(|entry| entry.tool.to_owned())
         .collect::<Vec<_>>();
     classified.sort_unstable();
-    registered.sort_unstable();
 
     assert_eq!(
-        classified, registered,
-        "every native tool must be classified here, and every row must name a real tool"
+        classified,
+        registered_native_surface(),
+        "every native tool the production dispatchers register must be classified here, \
+         and every row must name a real tool"
     );
 
-    let unreached = TOOL_SURFACE
+    let mismatched = TOOL_SURFACE
         .iter()
         .filter(|entry| {
-            entry.returns_file_contents
-                && !entry.decided_on_its_target
-                && entry.decided_per_file.is_none()
+            let reached = entry.decided_on_its_target || entry.decided_per_file.is_some();
+            entry.returns_file_contents && !reached != entry.unbound.is_some()
         })
         .map(|entry| entry.tool)
         .collect::<Vec<_>>();
 
-    assert_eq!(
-        unreached,
-        vec!["native::bash"],
+    assert!(
+        mismatched.is_empty(),
         "a tool that returns the contents of a file and is decided neither on its target \
-         nor per file is a path deny that does not bind"
+         nor per file is a path deny that does not bind, and has to say why that is \
+         acceptable; a tool a rule does reach must claim no exception: {mismatched:?}"
+    );
+
+    let unbound = TOOL_SURFACE
+        .iter()
+        .filter(|entry| entry.unbound.is_some())
+        .map(|entry| entry.tool)
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        unbound,
+        vec!["native::bash", "native::skill", "native::task"],
+        "adding an exception to this list is a deliberate act and has to show up in the diff"
     );
 
     for entry in TOOL_SURFACE {
-        let bare = entry.tool.trim_start_matches("native::");
-        let expected = if bare == "bash" {
-            PermissionTargetKind::FreeFormText
-        } else {
-            PermissionTargetKind::Path
+        let Some(expected) = entry.matched_as else {
+            continue;
         };
+        let bare = entry.tool.trim_start_matches("native::");
 
         assert_eq!(
             permission_target_kind_for_tool(bare),

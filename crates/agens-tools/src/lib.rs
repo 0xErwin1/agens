@@ -3396,6 +3396,30 @@ impl ToolDispatcher {
         self.aliases.get(alias)
     }
 
+    /// The qualified names of every native tool registered here.
+    ///
+    /// A dispatcher is the only authority on what it holds. Deriving the native
+    /// surface from a catalog instead misses every tool registered directly
+    /// beside one — which is exactly how a tool arrives on the surface without
+    /// being classified against the rules that are supposed to reach it.
+    pub fn registered_native_names(&self) -> Vec<String> {
+        self.tools
+            .keys()
+            .filter_map(|identity| {
+                identity
+                    .0
+                    .strip_prefix("native:")
+                    .and_then(|rest| rest.split_once(':'))
+                    .filter(|(length, name)| {
+                        length
+                            .parse::<usize>()
+                            .is_ok_and(|length| length == name.len())
+                    })
+                    .map(|(_, name)| format!("native::{name}"))
+            })
+            .collect()
+    }
+
     pub(crate) fn capability_snapshot(&self) -> capabilities::CapabilitySnapshot {
         capabilities::CapabilitySnapshot {
             identities: self
