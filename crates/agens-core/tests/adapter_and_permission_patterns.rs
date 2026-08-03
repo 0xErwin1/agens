@@ -78,10 +78,10 @@ fn a_bare_star_target_does_not_cross_a_slash_for_a_path_shaped_target() {
     assert!(path_aware.matches("rm -rf /tmp/x"));
 }
 
-/// `bash` (and `git_read`'s operation keyword) are free-form text, not
-/// filesystem paths, even though a shell command routinely contains `/`.
-/// Regression-pins the previously silent failure of the most common
-/// deny-by-prefix rules a user would write for `bash`.
+/// A `bash` command line is free-form text, not a filesystem path, even though
+/// a shell command routinely contains `/`. Regression-pins the previously
+/// silent failure of the most common deny-by-prefix rules a user would write
+/// for `bash`.
 #[test]
 fn a_bare_star_target_crosses_a_slash_for_a_free_form_command_target() {
     let cases = [
@@ -103,9 +103,15 @@ fn a_bare_star_target_crosses_a_slash_for_a_free_form_command_target() {
     }
 }
 
+/// `bash` is the one tool whose target is not shaped like a path. `git_read` is
+/// classified as a path even though the value it is *called* with is an
+/// operation keyword, because a rule written against a file decides which files
+/// its diff may report and has to select them under the same segment discipline
+/// `read(**/.env)` uses. The keywords carry no `/`, so a rule written against an
+/// operation selects exactly what it selected before.
 #[test]
-fn permission_target_kind_classifies_bash_and_git_read_as_free_form_and_everything_else_as_path() {
-    for tool in ["bash", "native::bash", "git_read", "native::git_read"] {
+fn permission_target_kind_classifies_only_bash_as_free_form_and_everything_else_as_path() {
+    for tool in ["bash", "native::bash"] {
         assert_eq!(
             permission_target_kind_for_tool(tool),
             PermissionTargetKind::FreeFormText,
@@ -124,6 +130,8 @@ fn permission_target_kind_classifies_bash_and_git_read_as_free_form_and_everythi
         "native::glob",
         "grep",
         "native::grep",
+        "git_read",
+        "native::git_read",
         "webfetch",
         "native::webfetch",
     ] {

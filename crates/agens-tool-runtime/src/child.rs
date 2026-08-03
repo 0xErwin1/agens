@@ -2038,6 +2038,290 @@ mod tests {
         std::fs::remove_dir_all(temporary).unwrap();
     }
 
+    /// Runs one git command in a probe worktree, with an identity of its own so
+    /// the machine's configuration cannot decide whether the probe can commit.
+    fn git(root: &Path, arguments: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(arguments)
+            .current_dir(root)
+            .env("GIT_AUTHOR_NAME", "agens")
+            .env("GIT_AUTHOR_EMAIL", "agens@example.invalid")
+            .env("GIT_COMMITTER_NAME", "agens")
+            .env("GIT_COMMITTER_EMAIL", "agens@example.invalid")
+            .output()
+            .expect("git must be available to probe git_read");
+
+        assert!(
+            output.status.success(),
+            "git {arguments:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// The secrets a `git_read diff` could reach, one per place a diff can read
+    /// from: the working tree, the index, and history at either end of a
+    /// revision range. Each one is a distinct string so a probe that leaks says
+    /// which shape leaked it.
+    const GIT_READ_SECRETS: &[&str] = &[
+        "sk-live-gitread-worktree-do-not-leak",
+        "sk-live-gitread-staged-do-not-leak",
+        "sk-live-gitread-history-do-not-leak",
+    ];
+
+    /// A repository holding a secret in `.env` and ordinary prose in `notes.md`
+    /// at every point a diff can be taken from: the `base` branch, `main`, the
+    /// index and the working tree. A probe over it can tell a diff that
+    /// withheld the secret from one that returned nothing at all.
+    fn repository_with_a_denied_secret(project_root: &Path) {
+        std::fs::create_dir_all(project_root).unwrap();
+        git(project_root, &["init", "--initial-branch=main", "--quiet"]);
+
+        std::fs::write(project_root.join(".env"), "OPENAI_API_KEY=placeholder\n").unwrap();
+        std::fs::write(project_root.join("notes.md"), "notes: first\n").unwrap();
+        git(project_root, &["add", "-A"]);
+        git(project_root, &["commit", "--quiet", "-m", "first"]);
+        git(project_root, &["branch", "base"]);
+
+        std::fs::write(
+            project_root.join(".env"),
+            "OPENAI_API_KEY=sk-live-gitread-history-do-not-leak\n",
+        )
+        .unwrap();
+        std::fs::write(project_root.join("notes.md"), "notes: second\n").unwrap();
+        git(project_root, &["add", "-A"]);
+        git(project_root, &["commit", "--quiet", "-m", "second"]);
+
+        std::fs::write(
+            project_root.join(".env"),
+            "OPENAI_API_KEY=sk-live-gitread-staged-do-not-leak\n",
+        )
+        .unwrap();
+        std::fs::write(project_root.join("notes.md"), "notes: third\n").unwrap();
+        git(project_root, &["add", "-A"]);
+
+        std::fs::write(
+            project_root.join(".env"),
+            "OPENAI_API_KEY=sk-live-gitread-worktree-do-not-leak\n",
+        )
+        .unwrap();
+        std::fs::write(project_root.join("notes.md"), "notes: fourth\n").unwrap();
+    }
+
+    /// `git_read diff` hands the model the contents of the files it names, so a
+    /// path deny that does not reach it is a deny in name only — the shipped
+    /// configuration would refuse `read`, `grep` and `search` on `.env` while a
+    /// one-word tool swap printed the same bytes.
+    ///
+    /// Every place a diff reads from is probed, because fixing the working-tree
+    /// shape alone would leave the index and every revision range open.
+    #[test]
+    fn the_shipped_configuration_keeps_a_denied_file_out_of_a_git_read_diff() {
+        let temporary = agens_fixtures::session_directory("shipped-config-git-read");
+        let project_root = temporary.join("project");
+        repository_with_a_denied_secret(&project_root);
+
+        let configured = shipped_configured_rules(&project_root);
+
+        for (arguments, expected) in [
+            (r#"{"operation":"diff"}"#, "notes: fourth"),
+            (r#"{"operation":"diff","staged":true}"#, "notes: third"),
+            (r#"{"operation":"diff","base":"base"}"#, "notes: fourth"),
+            (
+                r#"{"operation":"diff","base":"base","head":"main"}"#,
+                "notes: second",
+            ),
+        ] {
+            let output = single_call_turn(
+                &project_root,
+                &[],
+                &configured,
+                false,
+                "native::git_read",
+                arguments,
+            );
+
+            for secret in GIT_READ_SECRETS {
+                assert!(
+                    !output.contains(secret),
+                    "git_read {arguments} handed a denied file's contents to the model: {output}"
+                );
+            }
+            assert!(
+                output.contains(expected),
+                "git_read {arguments} must still show the files no rule denies, got: {output}"
+            );
+            assert_eq!(
+                withheld_notice(&output),
+                Some(WITHHELD_FILES_NOTICE),
+                "git_read {arguments} must say its result is not the whole patch, \
+                 and say it without naming or counting what it withheld: {output}"
+            );
+        }
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    /// The operations that report names or refs rather than contents are left
+    /// alone: `status` reports the same paths `list` and `glob` already report
+    /// under the shipped configuration, and `log`, `branch_merged` and
+    /// `merge_base` report commit subjects and ref names. Filtering them would
+    /// cost the operator the notice on a result that never held a file.
+    #[test]
+    fn the_git_read_operations_that_report_no_file_contents_are_answered_in_full() {
+        let temporary = agens_fixtures::session_directory("git-read-nameless-operations");
+        let project_root = temporary.join("project");
+        repository_with_a_denied_secret(&project_root);
+
+        let configured = shipped_configured_rules(&project_root);
+
+        for (arguments, expected) in [
+            (r#"{"operation":"status"}"#, ".env"),
+            (r#"{"operation":"log"}"#, "second"),
+            (r#"{"operation":"branch_merged","base":"main"}"#, "base"),
+            (
+                r#"{"operation":"merge_base","base":"base","head":"main"}"#,
+                "\n",
+            ),
+        ] {
+            let output = single_call_turn(
+                &project_root,
+                &[],
+                &configured,
+                false,
+                "native::git_read",
+                arguments,
+            );
+
+            for secret in GIT_READ_SECRETS {
+                assert!(
+                    !output.contains(secret),
+                    "git_read {arguments} reported a denied file's contents: {output}"
+                );
+            }
+            assert!(
+                output.contains(expected),
+                "git_read {arguments} must still answer in full, got: {output}"
+            );
+            assert_eq!(
+                withheld_notice(&output),
+                None,
+                "git_read {arguments} reports no file contents, so it withholds nothing \
+                 and must not claim otherwise: {output}"
+            );
+        }
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    /// A rename is one change reported under two names, so a rule naming either
+    /// name has to withhold the whole of it. Withholding only the name the rule
+    /// matched leaves git unable to pair the two sides and printing the file it
+    /// was supposed to withhold, in full, as a new file under the other name.
+    #[test]
+    fn a_diff_that_renames_a_denied_file_reports_neither_side_of_it() {
+        let temporary = agens_fixtures::session_directory("git-read-rename");
+        let project_root = temporary.join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        git(&project_root, &["init", "--initial-branch=main", "--quiet"]);
+
+        std::fs::write(
+            project_root.join(".env"),
+            "OPENAI_API_KEY=sk-live-gitread-renamed-do-not-leak\nregion=eu\n",
+        )
+        .unwrap();
+        std::fs::write(project_root.join("notes.md"), "notes: first\n").unwrap();
+        git(&project_root, &["add", "-A"]);
+        git(&project_root, &["commit", "--quiet", "-m", "first"]);
+
+        git(&project_root, &["mv", ".env", "settings.ini"]);
+        std::fs::write(
+            project_root.join("settings.ini"),
+            "OPENAI_API_KEY=sk-live-gitread-renamed-do-not-leak\nregion=us\n",
+        )
+        .unwrap();
+        std::fs::write(project_root.join("notes.md"), "notes: second\n").unwrap();
+        git(&project_root, &["add", "-A"]);
+
+        let output = single_call_turn(
+            &project_root,
+            &[],
+            &shipped_configured_rules(&project_root),
+            false,
+            "native::git_read",
+            r#"{"operation":"diff","staged":true}"#,
+        );
+
+        assert!(
+            !output.contains("sk-live-gitread-renamed-do-not-leak"),
+            "a denied file renamed out of the shape the rule names still leaked: {output}"
+        );
+        assert!(
+            !output.contains("settings.ini"),
+            "the other side of the rename must go with it: {output}"
+        );
+        assert!(
+            output.contains("notes: second"),
+            "the files no rule denies must still be reported: {output}"
+        );
+        assert_eq!(
+            withheld_notice(&output),
+            Some(WITHHELD_FILES_NOTICE),
+            "the caller must be told the patch is not the whole patch: {output}"
+        );
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    /// The target of a `git_read` call is still the operation it names, so a
+    /// rule reading `deny git_read(diff)` denies diffs and nothing else. The
+    /// per-file question is asked under the same tool name but against paths,
+    /// and the two value spaces do not collide.
+    #[test]
+    fn a_deny_written_against_a_git_read_operation_still_denies_that_operation() {
+        let temporary = agens_fixtures::session_directory("git-read-operation-deny");
+        let project_root = temporary.join("project");
+        repository_with_a_denied_secret(&project_root);
+
+        let mut configured = shipped_configured_rules(&project_root);
+        configured.push(PermissionRule::global(
+            PermissionDecision::Deny,
+            PermissionPattern::glob("git_read").unwrap(),
+            PermissionPattern::glob_for_target_kind(
+                "diff",
+                agens_core::permission_target_kind_for_tool("git_read"),
+            )
+            .unwrap(),
+        ));
+
+        let denied = single_call_turn(
+            &project_root,
+            &[],
+            &configured,
+            false,
+            "native::git_read",
+            r#"{"operation":"diff"}"#,
+        );
+        assert!(
+            denied.contains("permission denied"),
+            "deny git_read(diff) must refuse a diff outright, got: {denied}"
+        );
+
+        let allowed = single_call_turn(
+            &project_root,
+            &[],
+            &configured,
+            false,
+            "native::git_read",
+            r#"{"operation":"status"}"#,
+        );
+        assert!(
+            !allowed.contains("permission denied"),
+            "deny git_read(diff) must say nothing about any other operation, got: {allowed}"
+        );
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
     #[test]
     fn built_in_explore_still_cannot_write_edit_bash_or_fetch_after_inheriting_the_parent_surface()
     {

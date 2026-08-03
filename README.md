@@ -129,9 +129,31 @@ The `task` tool delegates work to a subagent, which runs its own turn loop with 
 
 **What a subagent can reach.** It inherits the parent's native tool surface — `read`, `list`, `search`, `grep`, `glob`, `git_read`, `write`, `edit`, `bash`, `webfetch` — plus `task_control` and `task_message` for reporting back. The read-class tools (`read`, `list`, `search`, `grep`, `glob`, `git_read`) are authorized automatically. `write`, `edit`, `bash` and `webfetch` are present but unauthorized: a call to one is refused unless the agent definition declares `allow`, or the session is in dangerous mode. `webfetch` is excluded from the automatic grant deliberately — it is network egress rather than a worktree read.
 
-**What the automatic grant costs.** The read-class grant is bounded by the `[permissions]` rules that name each tool, and by nothing else. `read` and `list` are matched on the path they are given. `search` and `grep` report the lines they matched, so they are bounded twice: on what the call names — `search` on its path, `grep` on its pattern and on the path it is given — and again on every file the search actually reads. A rule names one tool, so `deny grep(**/.env)` keeps a subagent out of that file while `deny read(**/.env)` alone does not, and neither covers `search`. Two shapes are not reached by a path rule at all: `glob`, which is matched on its pattern and reports file paths rather than their contents, and `bash`, which is matched on its command line. Granting `bash` grants a way around every path rule.
+**What the automatic grant costs.** The read-class grant is bounded by the `[permissions]` rules that name each tool, and by nothing else. A rule names one tool, so `deny grep(**/.env)` keeps a subagent out of that file while `deny read(**/.env)` alone does not, and neither covers `search`.
 
-**Bounding a search.** A search rooted above a file a rule denies still runs. It returns every match it is allowed to return, omits the denied file, and ends with one line saying some files were not read — a line that names nothing and counts nothing, so it cannot be used to locate what was withheld. A call that names the denied file directly is refused outright instead, because the rule denies the whole of what that call asked for. A search given no path at all is named by its pattern alone; what it may read is decided file by file.
+**Which tools a path deny reaches.** A path deny reaches a tool when that tool asks the rules about the file. There are exactly two ways it can, and every tool that returns the contents of a file uses one of them:
+
+1. **The call names the file.** The path the call is given is the target the rule is matched against, so a deny refuses the call outright.
+2. **The call reports files it never named.** The tool asks the same rules once per file, while it runs, and omits what they deny.
+
+That is the test to apply to any tool added later: if it can return the contents of a file and does neither, a path deny does not bind it.
+
+| Tool | Returns file contents | How a path deny reaches it |
+|------|-----------------------|----------------------------|
+| `read` | yes | the target is the file |
+| `list` | no — names only | the target is the directory |
+| `glob` | no — names only | not as a path; its target is the pattern, matched as text |
+| `search` | yes | the target is the root it is given, and again per file |
+| `grep` | yes | the target is its pattern and the root it is given, and again per file |
+| `git_read` | yes, `diff` only | per file; the target is the operation keyword |
+| `write` | no | the target is the file |
+| `edit` | the region it rewrote | the target is the file |
+| `webfetch` | no — `http`/`https` responses | not as a path; its target is the URL |
+| `bash` | whatever it chooses to print | **it does not** — the target is the command line |
+
+Two limits follow from the table rather than from an exception list. Granting `bash` grants a way around every path rule. And `glob`'s pattern denotes a set while a rule is matched as text, so `deny glob(**/.env)` does not stop `glob(**)` from listing that name — it discloses a name, which `list(**)` already discloses, not what the file holds.
+
+**Bounding a call that reads files it never named.** Such a call still runs. It returns everything it is allowed to return, omits the denied files, and ends with one line saying some files were not read — a line that names nothing and counts nothing, so it cannot be used to locate what was withheld. A call that names the denied file directly is refused outright instead, because the rule denies the whole of what that call asked for. This is why `deny git_read(**/.env)` is written against a path while `deny git_read(diff)` is written against an operation: the first decides the files a diff reports, the second decides whether the diff runs at all.
 
 **Narrowing and granting.** Agent definitions are markdown files with YAML frontmatter, discovered in `<project-root>/.agens/agents/` and in `agents/` beside the global configuration. A `permissions:` list adjusts the inherited surface:
 

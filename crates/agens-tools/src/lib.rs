@@ -1930,6 +1930,16 @@ impl ToolExecutionContext {
             .is_none_or(|filter| filter.permits(path))
     }
 
+    /// Whether any file this call reads can be withheld at all.
+    ///
+    /// A tool that has to spend work — a second process, a second walk —
+    /// before it can ask [`Self::permits_read`] anything asks this first, so
+    /// the caller that carries no filter pays none of it and behaves exactly
+    /// as it did before there was one.
+    pub fn filters_reads(&self) -> bool {
+        self.read_filter.is_some()
+    }
+
     /// Adapts core's opaque turn cancellation view without exposing its internals.
     pub fn from_headless_adapter(cancellation: HeadlessTurnCancellationAdapter) -> Self {
         let deadline = cancellation

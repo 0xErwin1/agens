@@ -463,7 +463,7 @@ const CASES: &[Case] = &[
     // A search of the whole worktree names no file, however that root is
     // spelled — and a search that names no root at all is that same call with
     // the argument left out. Neither can be decided on the root, so both run
-    // and are decided file by file; see [`ROOTED_SEARCH_CASES`].
+    // and are decided file by file; see [`REPORTED_FILE_CASES`].
     Case {
         declarations: &["deny grep **/.env", "allow grep **"],
         tool: "grep",
@@ -697,83 +697,96 @@ const CONFIGURED_CASES: &[ConfiguredCase] = &[
     },
 ];
 
-/// One rooted search plus one file it walks into.
+/// One authorized call plus one file whose contents that call would report.
 ///
-/// The tables above decide calls, and a search rooted above a file is a single
-/// authorized call that reads many of them — so what a rule naming one of those
+/// The tables above decide calls. A call that reports the contents of a file
+/// set it was not named by — a rooted search, a `git_read` diff — is a single
+/// authorized call that reads many files, so what a rule naming one of those
 /// files does cannot be written as a row there. It is written here instead, and
 /// it has to come out the same on both paths for the same reason every other
 /// row does.
-struct RootedSearchCase {
+struct ReportedFileCase {
     configured: &'static [&'static str],
     declarations: &'static [&'static str],
-    /// The root the search was given, `None` for a search that named none.
+    /// The tool making the call. Its per-file question is asked under this name,
+    /// so a rule has to be written against this tool to reach the files.
+    tool: &'static str,
+    /// The path argument the call was given, `None` when it named none. A
+    /// `git_read` call has no path argument at all, so it is always `None`.
     root: Option<&'static str>,
-    /// A file under that root, as the search reaches it.
+    /// A file the call reaches, as it reaches it.
     file: &'static str,
     /// Whether what that file holds may reach the caller.
     reported: bool,
 }
 
-const ROOTED_SEARCH_CASES: &[RootedSearchCase] = &[
+const REPORTED_FILE_CASES: &[ReportedFileCase] = &[
     // The shape the shipped configuration is written in, entered from above the
     // file it denies — the whole point of deciding per file.
-    RootedSearchCase {
+    ReportedFileCase {
         configured: &["deny grep **/.env"],
         declarations: &[],
+        tool: "grep",
         root: None,
         file: ".env",
         reported: false,
     },
-    RootedSearchCase {
+    ReportedFileCase {
         configured: &["deny grep **/.env"],
         declarations: &[],
+        tool: "grep",
         root: None,
         file: "notes.md",
         reported: true,
     },
-    RootedSearchCase {
+    ReportedFileCase {
         configured: &["deny grep **/.env"],
         declarations: &[],
+        tool: "grep",
         root: Some("."),
         file: "src/.env",
         reported: false,
     },
-    RootedSearchCase {
+    ReportedFileCase {
         configured: &["deny grep **/.env"],
         declarations: &[],
+        tool: "grep",
         root: Some("src"),
         file: "src/.env",
         reported: false,
     },
-    RootedSearchCase {
+    ReportedFileCase {
         configured: &["deny grep **/.env"],
         declarations: &[],
+        tool: "grep",
         root: Some("src"),
         file: "src/main.rs",
         reported: true,
     },
     // A declaration reaches the files a search reads exactly as a configured
     // rule does, and on a path that has nothing to do with `.env`.
-    RootedSearchCase {
+    ReportedFileCase {
         configured: &[],
         declarations: &["deny grep src/secret/**", "allow grep **"],
+        tool: "grep",
         root: Some("src"),
         file: "src/secret/key",
         reported: false,
     },
-    RootedSearchCase {
+    ReportedFileCase {
         configured: &[],
         declarations: &["deny grep src/secret/**", "allow grep **"],
+        tool: "grep",
         root: Some("src"),
         file: "src/main.rs",
         reported: true,
     },
     // An `ask` withholds beside a `deny`: the prompt that would settle it is
     // not reachable once the call it belongs to is already running.
-    RootedSearchCase {
+    ReportedFileCase {
         configured: &[],
         declarations: &["ask grep src/secret/**", "allow grep **"],
+        tool: "grep",
         root: Some("src"),
         file: "src/secret/key",
         reported: false,
@@ -782,44 +795,134 @@ const ROOTED_SEARCH_CASES: &[RootedSearchCase] = &[
     // here is the worktree, because a search rooted at `src` names a path the
     // broad deny selects and is refused outright — which is the correct answer
     // for a root a rule names, and a different question from this one.
-    RootedSearchCase {
+    ReportedFileCase {
         configured: &[],
         declarations: &[
             "deny grep src/**",
             "allow grep src/generated/**",
             "allow grep **",
         ],
+        tool: "grep",
         root: Some("."),
         file: "src/generated/schema.rs",
         reported: true,
     },
-    RootedSearchCase {
+    ReportedFileCase {
         configured: &[],
         declarations: &[
             "deny grep src/**",
             "allow grep src/generated/**",
             "allow grep **",
         ],
+        tool: "grep",
         root: Some("."),
+        file: "src/main.rs",
+        reported: false,
+    },
+    // The same axis for `git_read`, whose diff reports the contents of files
+    // the call never named — its target is an operation keyword. A rule reaches
+    // those files only by naming them, which is what these rows check, starting
+    // with the shape the shipped configuration is written in.
+    ReportedFileCase {
+        configured: &["deny git_read **/.env"],
+        declarations: &[],
+        tool: "git_read",
+        root: None,
+        file: ".env",
+        reported: false,
+    },
+    ReportedFileCase {
+        configured: &["deny git_read **/.env"],
+        declarations: &[],
+        tool: "git_read",
+        root: None,
+        file: "src/.env",
+        reported: false,
+    },
+    ReportedFileCase {
+        configured: &["deny git_read **/.env"],
+        declarations: &[],
+        tool: "git_read",
+        root: None,
+        file: "notes.md",
+        reported: true,
+    },
+    ReportedFileCase {
+        configured: &[],
+        declarations: &["deny git_read src/secret/**", "allow git_read **"],
+        tool: "git_read",
+        root: None,
+        file: "src/secret/key",
+        reported: false,
+    },
+    ReportedFileCase {
+        configured: &[],
+        declarations: &["deny git_read src/secret/**", "allow git_read **"],
+        tool: "git_read",
+        root: None,
+        file: "src/main.rs",
+        reported: true,
+    },
+    ReportedFileCase {
+        configured: &[],
+        declarations: &["ask git_read src/secret/**", "allow git_read **"],
+        tool: "git_read",
+        root: None,
+        file: "src/secret/key",
+        reported: false,
+    },
+    ReportedFileCase {
+        configured: &[],
+        declarations: &[
+            "deny git_read src/**",
+            "allow git_read src/generated/**",
+            "allow git_read **",
+        ],
+        tool: "git_read",
+        root: None,
+        file: "src/generated/schema.rs",
+        reported: true,
+    },
+    ReportedFileCase {
+        configured: &[],
+        declarations: &[
+            "deny git_read src/**",
+            "allow git_read src/generated/**",
+            "allow git_read **",
+        ],
+        tool: "git_read",
+        root: None,
         file: "src/main.rs",
         reported: false,
     },
 ];
 
-/// The pattern every rooted-search row is searched for. The rows are written
-/// against paths, so the pattern is held fixed and named by no rule.
-const ROOTED_SEARCH_PATTERN: &str = "OPENAI_API_KEY";
+/// The value a call is named by, held fixed per tool so every row is about the
+/// file rather than about the target.
+///
+/// A search is named by a pattern no rule mentions. A `git_read` call is named
+/// by an operation keyword, and `diff` is the one operation that reports what a
+/// file holds — the others report paths, commit subjects or refs and have no
+/// per-file question to ask.
+fn call_target(tool: &str) -> &'static str {
+    match tool {
+        "grep" => "OPENAI_API_KEY",
+        "git_read" => "diff",
+        other => panic!("{other} does not report the contents of a file set"),
+    }
+}
 
-/// What one path answers about a rooted search: whether the search runs at all,
-/// and whether one of the files under its root may be reported.
-fn rooted_search_answer(
+/// What one path answers about a call that reads a file set: whether the call
+/// runs at all, and whether one of the files it reaches may be reported.
+fn reported_file_answer(
     policy: PermissionPolicy,
     identity: &str,
+    tool: &str,
     root: Option<&str>,
     file: &str,
 ) -> (PermissionDecision, bool) {
     let call = policy.evaluate(
-        &request(identity, "grep", ROOTED_SEARCH_PATTERN, root),
+        &request(identity, tool, call_target(tool), root),
         &[],
         &PermissionSession::new(),
     );
@@ -835,31 +938,31 @@ fn rooted_search_answer(
     (call, permits)
 }
 
-/// Compares one rooted-search row across both paths, under one spelling of its
-/// root and of the file it walks into.
-fn rooted_search_disagreements(
-    case: &RootedSearchCase,
+/// Compares one row across both paths, under one spelling of the path the call
+/// was given and of the file it reaches.
+fn reported_file_disagreements(
+    case: &ReportedFileCase,
     root: Option<&str>,
     file: &str,
     spelling: &str,
 ) -> Vec<String> {
     let declarations = parsed_declarations(case.declarations);
     let configured = configured_rules(case.configured);
+    let tool = case.tool;
 
-    let (child_policy, child_identity) =
-        configured_child_policy(&configured, &declarations, "grep")
-            .expect("a delegated child must be able to reach grep");
+    let (child_policy, child_identity) = configured_child_policy(&configured, &declarations, tool)
+        .unwrap_or_else(|| panic!("a delegated child must be able to reach {tool}"));
     let (parent_policy, parent_identity) =
-        configured_parent_policy(case.configured, &declarations, "grep");
+        configured_parent_policy(case.configured, &declarations, tool);
 
     let answers = [
         (
             "child",
-            rooted_search_answer(child_policy, &child_identity, root, file),
+            reported_file_answer(child_policy, &child_identity, tool, root, file),
         ),
         (
             "parent",
-            rooted_search_answer(parent_policy, &parent_identity, root, file),
+            reported_file_answer(parent_policy, &parent_identity, tool, root, file),
         ),
     ];
 
@@ -867,7 +970,7 @@ fn rooted_search_disagreements(
         .into_iter()
         .filter_map(|(path, (call, permits))| {
             let fault = if call == PermissionDecision::Deny {
-                "refused the whole search instead of the file"
+                "refused the whole call instead of the file"
             } else if permits && !case.reported {
                 "reported a file a rule names"
             } else if !permits && case.reported {
@@ -877,7 +980,7 @@ fn rooted_search_disagreements(
             };
 
             Some(format!(
-                "config {:?} + {:?} rooted at {root:?} over {file:?} spelled {spelling}: \
+                "config {:?} + {:?} on {tool} given {root:?} over {file:?} spelled {spelling}: \
                  the {path} path {fault}",
                 case.configured, case.declarations
             ))
@@ -885,39 +988,39 @@ fn rooted_search_disagreements(
         .collect()
 }
 
-/// A search rooted above a file it may not report has to run and withhold that
+/// A call that reaches a file it may not report has to run and withhold that
 /// file, on both paths. Refusing the call instead is the answer this table
-/// exists to rule out: it would make every recursive search useless under any
-/// configuration that denies one file.
+/// exists to rule out: it would make every recursive search and every diff
+/// useless under any configuration that denies one file.
 #[test]
-fn a_rooted_search_reports_the_same_files_on_both_paths() {
-    let disagreements = ROOTED_SEARCH_CASES
+fn a_call_that_reads_a_file_set_reports_the_same_files_on_both_paths() {
+    let disagreements = REPORTED_FILE_CASES
         .iter()
-        .flat_map(|case| rooted_search_disagreements(case, case.root, case.file, "as written"))
+        .flat_map(|case| reported_file_disagreements(case, case.root, case.file, "as written"))
         .collect::<Vec<_>>();
 
     assert!(
         disagreements.is_empty(),
-        "{} of {} rooted searches disagreed:\n{}",
+        "{} of {} file-set calls disagreed:\n{}",
         disagreements.len(),
-        ROOTED_SEARCH_CASES.len(),
+        REPORTED_FILE_CASES.len(),
         disagreements.join("\n")
     );
 }
 
 /// The spelling axis reaches the per-file question too. A rule names a file,
-/// and neither the spelling of that file nor the spelling of the root the
-/// search was given may change what the search is allowed to report.
+/// and neither the spelling of that file nor the spelling of the path the call
+/// was given may change what the call is allowed to report.
 #[test]
-fn every_spelling_of_a_rooted_search_reports_the_same_files() {
+fn every_spelling_of_a_file_a_call_reads_reports_the_same_files() {
     let mut disagreements = Vec::new();
 
-    for case in ROOTED_SEARCH_CASES {
+    for case in REPORTED_FILE_CASES {
         for spelling in PATH_SPELLINGS {
             let root = case.root.map(|root| (spelling.rewrite)(root));
             let file = (spelling.rewrite)(case.file);
 
-            disagreements.extend(rooted_search_disagreements(
+            disagreements.extend(reported_file_disagreements(
                 case,
                 root.as_deref(),
                 &file,
@@ -928,7 +1031,7 @@ fn every_spelling_of_a_rooted_search_reports_the_same_files() {
 
     assert!(
         disagreements.is_empty(),
-        "{} spellings of a rooted search disagreed:\n{}",
+        "{} spellings of a file a call reads disagreed:\n{}",
         disagreements.len(),
         disagreements.join("\n")
     );
@@ -1390,31 +1493,197 @@ fn request(identity: &str, tool: &str, target: &str, path: Option<&str>) -> Perm
     )
 }
 
-/// Projects a case's search arguments the way a dispatched call does, through
-/// the production target parser, so a row carries the same axes a real call
-/// carries rather than a hand-built approximation of them.
+/// Projects a case's arguments the way a dispatched call does, through the
+/// production target parser, so a row carries the same axes a real call carries
+/// rather than a hand-built approximation of them.
+///
+/// Only a search names a path beside the target it is named by. A `git_read`
+/// call is named by an operation and names no path at all, so what its diff may
+/// report is settled per file rather than by anything the call reached for.
 fn search_reach(tool: &str, target: &str, path: Option<&str>) -> Vec<PermissionReach> {
-    if !is_search_tool(tool) {
-        assert!(
-            path.is_none(),
-            "only a search names a path beside its target"
-        );
-        return Vec::new();
-    }
+    let arguments = match tool {
+        "grep" => {
+            let mut arguments = serde_json::Map::from_iter([("pattern".to_owned(), target.into())]);
+            if let Some(path) = path {
+                arguments.insert("path".to_owned(), path.into());
+            }
+            arguments
+        }
+        "git_read" => {
+            assert!(path.is_none(), "a git_read call names no path");
+            serde_json::Map::from_iter([("operation".to_owned(), target.into())])
+        }
+        _ => {
+            assert!(
+                path.is_none(),
+                "only a search names a path beside its target"
+            );
+            return Vec::new();
+        }
+    };
 
-    let mut arguments = serde_json::Map::from_iter([("pattern".to_owned(), target.into())]);
-    if let Some(path) = path {
-        arguments.insert("path".to_owned(), path.into());
-    }
-
-    NativePermissionTarget::parse("native::grep", &serde_json::Value::Object(arguments))
-        .expect("a search call must parse")
-        .reach()
+    NativePermissionTarget::parse(
+        &format!("native::{tool}"),
+        &serde_json::Value::Object(arguments),
+    )
+    .expect("a dispatched call must parse")
+    .reach()
 }
 
 /// Whether a case's target is a search pattern rather than the file it reads.
 fn is_search_tool(tool: &str) -> bool {
     tool == "grep"
+}
+
+/// One native tool, classified by the two facts that decide whether a path deny
+/// binds it.
+struct SurfaceEntry {
+    tool: &'static str,
+    /// Whether the tool can return what a file holds, as opposed to its name.
+    returns_file_contents: bool,
+    /// Whether the path the call is given is the target a rule is matched
+    /// against, so a deny refuses the call outright.
+    decided_on_its_target: bool,
+    /// Whether the call reports files it never named, so the same rules are
+    /// asked once per file while it runs.
+    decided_per_file: bool,
+}
+
+/// The whole native surface, classified.
+///
+/// This table exists because the enumeration is what keeps being got wrong: a
+/// tool that returns the contents of a file and is decided neither way is a
+/// path deny that does not bind, and three separate passes over this surface
+/// missed one. Adding a native tool without adding a row here fails the test
+/// below, which is the point — the classification is the decision, and it has
+/// to be made deliberately rather than inherited.
+///
+/// The rows say what the classification is; that the per-file ones actually ask
+/// is pinned elsewhere: [`REPORTED_FILE_CASES`] for `grep` and `git_read`, and
+/// the shipped-configuration turns in `child.rs` for all three.
+const TOOL_SURFACE: &[SurfaceEntry] = &[
+    SurfaceEntry {
+        tool: "native::read",
+        returns_file_contents: true,
+        decided_on_its_target: true,
+        decided_per_file: false,
+    },
+    SurfaceEntry {
+        tool: "native::write",
+        returns_file_contents: false,
+        decided_on_its_target: true,
+        decided_per_file: false,
+    },
+    // `edit` reports the region it rewrote, which is the file's own text.
+    SurfaceEntry {
+        tool: "native::edit",
+        returns_file_contents: true,
+        decided_on_its_target: true,
+        decided_per_file: false,
+    },
+    SurfaceEntry {
+        tool: "native::list",
+        returns_file_contents: false,
+        decided_on_its_target: true,
+        decided_per_file: false,
+    },
+    SurfaceEntry {
+        tool: "native::search",
+        returns_file_contents: true,
+        decided_on_its_target: true,
+        decided_per_file: true,
+    },
+    SurfaceEntry {
+        tool: "native::grep",
+        returns_file_contents: true,
+        decided_on_its_target: true,
+        decided_per_file: true,
+    },
+    // `glob` reports the paths its pattern names and never their contents. Its
+    // pattern is matched as text rather than as the set it denotes, which is a
+    // separate limitation over names, not over contents.
+    SurfaceEntry {
+        tool: "native::glob",
+        returns_file_contents: false,
+        decided_on_its_target: false,
+        decided_per_file: false,
+    },
+    // `git_read` is named by an operation keyword, so no rule written against
+    // it selects a file; the files its `diff` reports are decided one by one.
+    SurfaceEntry {
+        tool: "native::git_read",
+        returns_file_contents: true,
+        decided_on_its_target: false,
+        decided_per_file: true,
+    },
+    // `webfetch` returns HTTP and HTTPS responses and cannot address a file.
+    SurfaceEntry {
+        tool: "native::webfetch",
+        returns_file_contents: false,
+        decided_on_its_target: false,
+        decided_per_file: false,
+    },
+    // `bash` prints whatever the command it runs prints, and its target is that
+    // command line rather than a path. It is the one tool no path deny binds.
+    SurfaceEntry {
+        tool: "native::bash",
+        returns_file_contents: true,
+        decided_on_its_target: false,
+        decided_per_file: false,
+    },
+];
+
+/// The surface the table classifies has to be the surface that exists, and
+/// every tool on it that can return the contents of a file has to be decided
+/// one of the two ways — with `bash` named as the single exception rather than
+/// left implicit.
+#[test]
+fn every_native_tool_that_returns_file_contents_is_reached_by_a_path_rule() {
+    let mut classified = TOOL_SURFACE
+        .iter()
+        .map(|entry| entry.tool)
+        .collect::<Vec<_>>();
+    let mut registered = NativeToolCatalog::metadata()
+        .into_iter()
+        .map(|entry| entry.qualified_name)
+        .collect::<Vec<_>>();
+    classified.sort_unstable();
+    registered.sort_unstable();
+
+    assert_eq!(
+        classified, registered,
+        "every native tool must be classified here, and every row must name a real tool"
+    );
+
+    let unreached = TOOL_SURFACE
+        .iter()
+        .filter(|entry| {
+            entry.returns_file_contents && !entry.decided_on_its_target && !entry.decided_per_file
+        })
+        .map(|entry| entry.tool)
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        unreached,
+        vec!["native::bash"],
+        "a tool that returns the contents of a file and is decided neither on its target \
+         nor per file is a path deny that does not bind"
+    );
+
+    for entry in TOOL_SURFACE {
+        let bare = entry.tool.trim_start_matches("native::");
+        let expected = if bare == "bash" {
+            PermissionTargetKind::FreeFormText
+        } else {
+            PermissionTargetKind::Path
+        };
+
+        assert_eq!(
+            permission_target_kind_for_tool(bare),
+            expected,
+            "{bare} is matched under the wrong target shape"
+        );
+    }
 }
 
 /// A dispatcher holding exactly the natives a delegated child inherits, so

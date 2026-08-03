@@ -2214,15 +2214,15 @@ pub enum PermissionTargetKind {
     /// paths, `glob`'s own file-glob argument, `grep`'s search pattern, and
     /// `webfetch` URLs (a URL's scheme/host/path components are themselves
     /// hierarchical, so treating `/` as a path-segment boundary there gives
-    /// the same predictable, non-surprising behavior as an actual path).
+    /// the same predictable, non-surprising behavior as an actual path), and
+    /// the files a `git_read` diff reports.
     /// `/` is a meaningful segment boundary that a bare `*` never crosses;
     /// only an explicit `**` segment matches across it.
     Path,
     /// A free-form target that is not shaped like a path even though it may
-    /// contain `/` incidentally: `bash`'s shell command line and
-    /// `git_read`'s operation keyword. `/` is an ordinary character here, so
-    /// a bare `*` crosses it, matching a user's plain-English expectation
-    /// that `rm*` denies `rm -rf /tmp/x`.
+    /// contain `/` incidentally: `bash`'s shell command line. `/` is an
+    /// ordinary character here, so a bare `*` crosses it, matching a user's
+    /// plain-English expectation that `rm*` denies `rm -rf /tmp/x`.
     FreeFormText,
 }
 
@@ -2232,9 +2232,16 @@ pub enum PermissionTargetKind {
 /// free-form text defaults to [`PermissionTargetKind::Path`], keeping
 /// segment-discipline matching for every target whose shape is not known to be
 /// free-form.
+///
+/// `git_read` is path-shaped even though the target it is *called* with is an
+/// operation keyword. `diff` reports what the files it names hold, so a rule
+/// written against a file decides each of those files ([`PermissionReadFilter`])
+/// and has to select them under the same segment discipline `read(**/.env)`
+/// does. The keywords carry no `/`, so classifying them as paths leaves
+/// `git_read(diff)` selecting exactly the diffs it already selected.
 pub fn permission_target_kind_for_tool(tool: &str) -> PermissionTargetKind {
     match bare_tool_name(tool) {
-        "bash" | "git_read" => PermissionTargetKind::FreeFormText,
+        "bash" => PermissionTargetKind::FreeFormText,
         _ => PermissionTargetKind::Path,
     }
 }
