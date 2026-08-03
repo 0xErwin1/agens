@@ -136,7 +136,13 @@ The `task` tool delegates work to a subagent, which runs its own turn loop with 
 1. **The call names the file.** The path the call is given is the target the rule is matched against, so a deny refuses the call outright.
 2. **The call reports files it never named.** The tool asks the same rules once per file, while it runs, and omits what they deny.
 
-Every tool that returns the contents of a file does one of the two, with one exception: `bash` does neither, because a rule written for it is matched against the command line rather than against any path. That is also the test to apply to any tool added later — if it can return the contents of a file and does neither, a path deny does not bind it, exactly as none binds `bash`.
+Three tools that can return the contents of a file do neither, and each is an exception for its own reason:
+
+- **`bash`** — a rule written for it is matched against the command line rather than against any path, and the command chooses what it prints. The exception is total.
+- **`skill`** — a skill call is named by a skill name, so no path rule selects one. The exception is bounded by what the tool can open: a skill's files are read relative to that skill's own directory, under a single plain filename with no traversal, refusing symbolic links and files carrying more than one link. It can return that skill's own installed assets and nothing else, and a subagent never holds it at all.
+- **`task`** — a task call is named by a description, and what it returns is whatever the subagent reports. No rule here reaches that text, but the subagent read those files under these same rules, so a file this configuration denies was already withheld before the report was written.
+
+That is the test to apply to any tool added later: if it can return the contents of a file and does neither of the two, a path deny does not bind it, and it belongs on this list with the reason written down.
 
 | Tool | Returns file contents | How a path deny reaches it |
 |------|-----------------------|----------------------------|
@@ -150,10 +156,15 @@ Every tool that returns the contents of a file does one of the two, with one exc
 | `edit` | the region it rewrote | the target is the file |
 | `webfetch` | no — `http`/`https` responses | not as a path; its target is the URL |
 | `bash` | whatever it chooses to print | **it does not** — the target is the command line |
+| `skill` (primary only) | yes — a skill's own files | **it does not** — the target is the skill name; bounded as above |
+| `task` (primary only) | what the subagent reports | **not here** — the subagent read under these same rules |
+| `task_control`, `task_message` | no — execution state only | not as a path; they never address a file |
 
-Two limits follow. The `bash` exception is total: granting `bash` grants a way around every path rule. And `glob`'s pattern denotes a set while a rule is matched as text, so `deny glob(**/.env)` does not stop `glob(**)` from listing that name — it discloses a name, which `list(**)` already discloses, not what the file holds.
+The remaining limit is over names rather than contents: `glob`'s pattern denotes a set while a rule is matched as text, so `deny glob(**/.env)` does not stop `glob(**)` from listing that name — it discloses a name, which `list(**)` already discloses, not what the file holds.
 
 **Bounding a call that reads files it never named.** Such a call still runs. It returns everything it is allowed to return, omits the denied files, and ends with one line saying some files were not read. That line carries no path, no count and no root, so a single call discloses only that something under what it reached was withheld. It does not make the withheld file unfindable: a caller free to re-scope the call narrows it down — by searching from a narrower root, down to a directory, or by diffing a narrower revision range, down to a single commit. A call that names the denied file directly is refused outright instead, because the rule denies the whole of what that call asked for. This is why `deny git_read(**/.env)` is written against a path while `deny git_read(diff)` is written against an operation: the first decides the files a diff reports, the second decides whether the diff runs at all.
+
+The notice answers for every file the call walked, not only for the files it reported. `grep`'s own `glob` argument narrows what comes back and never what the rules were asked about, so `grep(pattern, glob="*.rs")` in a tree holding a denied `.env` still says a file was withheld — the `.rs` results are complete even so. That order is deliberate: deciding after the caller's filter would make the notice exact and would also turn the filter into a way of narrowing the withheld set one filename at a time, which is the limit above.
 
 **Narrowing and granting.** Agent definitions are markdown files with YAML frontmatter, discovered in `<project-root>/.agens/agents/` and in `agents/` beside the global configuration. A `permissions:` list adjusts the inherited surface:
 
