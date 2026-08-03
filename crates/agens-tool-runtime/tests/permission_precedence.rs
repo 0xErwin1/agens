@@ -1545,6 +1545,10 @@ fn is_search_tool(tool: &str) -> bool {
 struct PerFileProbe {
     /// The arguments of one call that reaches the denied file.
     arguments: &'static str,
+    /// The target of the rule denying that file, so a row picks a file its own
+    /// tool actually reaches rather than inheriting one that may not exist for
+    /// it.
+    denies: &'static str,
     /// A line the same call must still return, so a tool cannot pass the probe
     /// by returning nothing at all.
     still_reports: &'static str,
@@ -1610,6 +1614,7 @@ const TOOL_SURFACE: &[SurfaceEntry] = &[
         decided_on_its_target: true,
         decided_per_file: Some(PerFileProbe {
             arguments: r#"{"path":".","query":"OPENAI_API_KEY"}"#,
+            denies: "**/secrets.md",
             still_reports: "OPENAI_API_KEY is set",
         }),
     },
@@ -1619,6 +1624,7 @@ const TOOL_SURFACE: &[SurfaceEntry] = &[
         decided_on_its_target: true,
         decided_per_file: Some(PerFileProbe {
             arguments: r#"{"pattern":"OPENAI_API_KEY"}"#,
+            denies: "**/secrets.md",
             still_reports: "OPENAI_API_KEY is set",
         }),
     },
@@ -1639,6 +1645,7 @@ const TOOL_SURFACE: &[SurfaceEntry] = &[
         decided_on_its_target: false,
         decided_per_file: Some(PerFileProbe {
             arguments: r#"{"operation":"diff"}"#,
+            denies: "**/secrets.md",
             still_reports: "notes: second",
         }),
     },
@@ -1742,9 +1749,15 @@ fn probe_git(root: &Path, arguments: &[&str]) {
     );
 }
 
-/// A worktree every probe can be run over: `.env` holds the secret and
+/// A worktree every probe can be run over: `secrets.md` holds the secret and
 /// `notes.md` holds a line naming the same key, both reachable by a walk, by a
 /// pattern and by a diff against the commit that holds neither.
+///
+/// The file holding the secret is deliberately not a dotfile. `grep` and `glob`
+/// walk with hidden entries excluded, so a probe denying `**/.env` would come
+/// back without the secret whether or not the tool ever asked the rules — the
+/// walker would have answered for it, and deleting the tool's own check would
+/// leave the probe green.
 ///
 /// The repository keeps its metadata outside the worktree, because a probe that
 /// walks every file under the root would otherwise walk git's own storage and
@@ -1762,13 +1775,17 @@ fn worktree_holding_a_denied_secret(project_root: &Path, git_dir: &Path) {
         ],
     );
 
-    fs::write(project_root.join(".env"), "OPENAI_API_KEY=placeholder\n").unwrap();
+    fs::write(
+        project_root.join("secrets.md"),
+        "OPENAI_API_KEY=placeholder\n",
+    )
+    .unwrap();
     fs::write(project_root.join("notes.md"), "notes: first\n").unwrap();
     probe_git(project_root, &["add", "-A"]);
     probe_git(project_root, &["commit", "--quiet", "-m", "first"]);
 
     fs::write(
-        project_root.join(".env"),
+        project_root.join("secrets.md"),
         format!("OPENAI_API_KEY={PER_FILE_PROBE_SECRET}\n"),
     )
     .unwrap();
@@ -1801,7 +1818,7 @@ fn every_tool_this_table_says_asks_per_file_withholds_a_denied_file() {
         };
 
         let bare = entry.tool.trim_start_matches("native::");
-        let rule = format!("deny {bare} **/.env");
+        let rule = format!("deny {bare} {}", probe.denies);
         let (policy, identity) = configured_child_policy(&configured_rules(&[&rule]), &[], bare)
             .unwrap_or_else(|| panic!("a delegated child must be able to reach {bare}"));
 
