@@ -2081,6 +2081,12 @@ fn registered_native_surface() -> Vec<String> {
 /// dispatcher identity. Only this direction catches that — a name in a list and
 /// in no dispatcher already fails the classification above, while a name in a
 /// dispatcher and in no list failed nothing.
+///
+/// Neither comparison can catch a list that SHRINKS, because the same list
+/// drives the registration and both sides shrink together. The child's two are
+/// therefore named here outright: a subagent reports its progress and its
+/// result through them, so a child registering neither cannot answer the
+/// delegation that launched it.
 #[test]
 fn every_native_registered_beside_the_catalog_is_named_by_the_list_that_resolves_it() {
     let catalog = NativeToolCatalog::metadata()
@@ -2093,6 +2099,7 @@ fn every_native_registered_beside_the_catalog_is_named_by_the_list_that_resolves
             .filter(|tool| !catalog.contains(tool))
             .collect::<Vec<_>>()
     };
+    let child = registered_child_natives();
 
     assert_eq!(
         beside(registered_native_surface()),
@@ -2101,33 +2108,69 @@ fn every_native_registered_beside_the_catalog_is_named_by_the_list_that_resolves
          qualified"
     );
     assert_eq!(
-        beside(registered_child_natives()),
+        beside(child.clone()),
         agens_tool_runtime::child_catalog::CHILD_COORDINATION_TOOLS,
         "a native a child registers outside the catalog has to be named where declarations are \
          expanded"
     );
+
+    for tool in ["native::task_control", "native::task_message"] {
+        assert!(
+            child.iter().any(|registered| registered == tool),
+            "a delegated child has to hold {tool} to report back at all: {child:?}"
+        );
+    }
 }
 
+/// The access class each native registered beside the catalog is registered
+/// under, and what that class decides.
+///
+/// These four have no catalog entry to be compared against: each declares its
+/// access at its own registration site, and until it is written down somewhere
+/// that declaration answers to nothing. Access decides what a call no rule
+/// matched falls back to, and read-class is what a delegated subagent may use
+/// without declaring anything — so registering `native::task` as `ReadOnly`
+/// would quietly fold every delegation into that automatic grant.
+const ACCESS_OF_THE_NATIVES_REGISTERED_BESIDE_THE_CATALOG: [(&str, ToolAccess); 4] = [
+    // Returns a skill's own installed files and changes nothing.
+    ("native::skill", ToolAccess::ReadOnly),
+    // Launches a subagent holding a tool surface of its own, which is not
+    // something a call falls into for want of a rule naming it.
+    ("native::task", ToolAccess::Write),
+    // Both act on a live execution — backgrounding it, cancelling it, queueing
+    // a message onto it — rather than reading anything.
+    ("native::task_control", ToolAccess::Write),
+    ("native::task_message", ToolAccess::Write),
+];
+
 /// The probe dispatcher holds each native under the access class production
-/// holds it by, not merely under the same name.
+/// registers it by, not merely under the same name.
 ///
 /// Access decides what an unmatched call falls back to, so a harness holding a
 /// write tool as read-class answers a whole region of cases differently from
-/// the session it stands in for. Only the catalog's own tools can be checked
-/// this way — the four registered beside it declare their access at the
-/// registration site and have nothing to compare against.
+/// the session it stands in for. This asks the probe dispatcher itself, and
+/// compares its answers against two statements neither it nor
+/// [`production_parent_natives`] is derived from: the catalog's own declared
+/// access for the ten it holds, and
+/// [`ACCESS_OF_THE_NATIVES_REGISTERED_BESIDE_THE_CATALOG`] for the four it does
+/// not.
 #[test]
-fn the_probe_dispatcher_holds_every_catalog_tool_under_its_production_access() {
-    let held = production_parent_natives();
+fn the_probe_dispatcher_holds_every_native_under_the_access_production_registers_it_by() {
+    let dispatcher = native_dispatcher();
+    let declared = NativeToolCatalog::metadata()
+        .into_iter()
+        .map(|entry| (entry.qualified_name, entry.access))
+        .chain(
+            ACCESS_OF_THE_NATIVES_REGISTERED_BESIDE_THE_CATALOG
+                .iter()
+                .map(|(name, access)| ((*name).to_owned(), *access)),
+        );
 
-    for entry in NativeToolCatalog::metadata() {
+    for (name, access) in declared {
         assert_eq!(
-            held.iter()
-                .find(|(name, _)| *name == entry.qualified_name)
-                .map(|(_, access)| *access),
-            Some(entry.access),
-            "{} must be held under the access the catalog declares",
-            entry.qualified_name
+            dispatcher.native_access(&name),
+            Some(access),
+            "{name} must be held under the access it is registered by"
         );
     }
 }
