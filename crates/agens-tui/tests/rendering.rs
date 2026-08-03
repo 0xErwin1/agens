@@ -3848,8 +3848,11 @@ fn renderer_draws_a_bounded_palette_overlay_without_reflowing_the_conversation()
         Color::Rgb(0x6c, 0x73, 0x80)
     );
     assert!(palette.contains("▌ /review"), "{palette:?}");
-    assert!(palette.contains("navigate"), "{palette:?}");
-    assert!(palette.contains("close"), "{palette:?}");
+    assert!(palette.contains("move"), "{palette:?}");
+    assert!(
+        palette.contains("close"),
+        "the way out of the overlay must survive the narrowest layout: {palette:?}"
+    );
     assert_eq!(
         cell_for_text(&renderer, "/review").bg,
         Color::Rgb(0x1b, 0x33, 0x30)
@@ -6176,6 +6179,69 @@ fn rendered_at(tui: &mut Tui<FakeEngine>, width: u16, height: u16) -> RatatuiRen
 }
 
 #[test]
+fn ask_user_names_the_action_the_row_actually_performs_on_each_question() {
+    let (mut tui, mut renderer) = open_ask_user(
+        ASK_USER_WIDE_TERMINAL,
+        30,
+        three_question_ask_user_request(),
+    );
+
+    let text = rendered_text(&renderer);
+    assert!(text.contains("Next question"), "{text:?}");
+    assert!(
+        !text.contains("Submit answers"),
+        "nothing can be submitted from the first of three questions: {text:?}"
+    );
+
+    tui.handle(Event::Key(Key::Tab));
+    tui.handle(Event::Key(Key::Tab));
+    renderer.render(tui.view()).unwrap();
+
+    let text = rendered_text(&renderer);
+    assert!(text.contains("Submit answers"), "{text:?}");
+    assert!(!text.contains("Next question"), "{text:?}");
+}
+
+/// The complaint this pins: typing past the width of the row left the reader
+/// unable to see what they were typing, because the row was truncated from the
+/// left edge regardless of where the caret had got to.
+#[test]
+fn ask_user_note_row_follows_the_caret_instead_of_truncating_it_away() {
+    let (mut tui, mut renderer) = open_ask_user(
+        ASK_USER_WIDE_TERMINAL,
+        30,
+        three_question_ask_user_request(),
+    );
+
+    tui.handle(Event::Key(Key::Char('n')));
+    let long_note = format!("HEAD{}TAIL", "x".repeat(200));
+    for character in long_note.chars() {
+        tui.handle(Event::Key(Key::Char(character)));
+    }
+    renderer.render(tui.view()).unwrap();
+
+    let text = rendered_text(&renderer);
+    assert!(
+        text.contains("TAIL"),
+        "the end being typed must stay on screen: {text:?}"
+    );
+    assert!(
+        !text.contains("HEAD"),
+        "a note far longer than the row cannot show both ends: {text:?}"
+    );
+
+    tui.handle(Event::Key(Key::Home));
+    renderer.render(tui.view()).unwrap();
+
+    let text = rendered_text(&renderer);
+    assert!(
+        text.contains("HEAD"),
+        "moving the caret home must bring the start of the note into view: {text:?}"
+    );
+    assert!(!text.contains("TAIL"), "{text:?}");
+}
+
+#[test]
 fn ask_user_wide_layout_puts_context_beside_the_options_and_follows_the_highlight() {
     let (mut tui, mut renderer) =
         open_ask_user(ASK_USER_WIDE_TERMINAL, 30, ask_user_request_with_context());
@@ -6462,6 +6528,10 @@ fn ask_user_header_reports_completion_and_names_the_question_that_blocks_submiss
     let answered_one = rendered_text(&renderer);
     assert!(answered_one.contains("1 of 3 answered"), "{answered_one:?}");
 
+    // Submission lives on the last question, so that is where an incomplete
+    // set is refused.
+    tui.handle(Event::Key(Key::Tab));
+    tui.handle(Event::Key(Key::Tab));
     for _ in 0..2 {
         tui.handle(Event::Key(Key::Down));
     }

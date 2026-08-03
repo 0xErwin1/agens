@@ -7,7 +7,9 @@ use agens_core::ask_user::{
 use agens_core::{Error, HeadlessTurnCancellation};
 use serde_json::{Map, Value};
 
-use crate::{DispatchTool, ToolExecutionContext, ToolOutput, sanitized_execution_status};
+use crate::{
+    DispatchTool, ToolExecutionContext, ToolExecutionStatus, ToolOutput, sanitized_execution_status,
+};
 
 /// The provider-visible native tool that opens a bounded structured prompt on
 /// whichever interactive surface `port` is bound to.
@@ -81,13 +83,22 @@ impl DispatchTool for AskUserTool {
         Ok("ask_user".to_string())
     }
 
+    /// Asking a person something is the one tool call that is not on the
+    /// clock.
+    ///
+    /// Every other tool inherits this context's deadline, and a context built
+    /// from a turn that set none inherits the bash fallback instead — which is
+    /// how a question a reader was still reading used to be answered
+    /// "expired" after two minutes. This call therefore reads only the
+    /// cancellation half of the context, before and after the wait: a
+    /// cancelled turn still ends the question, an elapsed deadline never does.
     fn execute(
         &mut self,
         context: &ToolExecutionContext,
         arguments: Value,
     ) -> Result<ToolOutput, Error> {
-        if let Err(status) = context.check() {
-            return Ok(sanitized_execution_status(status));
+        if context.is_cancelled() {
+            return Ok(sanitized_execution_status(ToolExecutionStatus::Cancelled));
         }
 
         let request = parse_request(&arguments)
@@ -95,7 +106,7 @@ impl DispatchTool for AskUserTool {
 
         let cancellation = HeadlessTurnCancellation::with_cancellation_and_deadline(
             context.cancellation_handle(),
-            Some(context.deadline()),
+            None,
         );
 
         let reply = self.port.ask(&request, &cancellation);
@@ -104,8 +115,8 @@ impl DispatchTool for AskUserTool {
             return Ok(ToolOutput::failure("ask_user: reply is invalid"));
         }
 
-        if let Err(status) = context.check() {
-            return Ok(sanitized_execution_status(status));
+        if context.is_cancelled() {
+            return Ok(sanitized_execution_status(ToolExecutionStatus::Cancelled));
         }
 
         Ok(ToolOutput::success(encode_reply(&request, &reply)))
@@ -238,7 +249,6 @@ fn encode_reply(request: &AskUserRequest, reply: &AskUserReply) -> String {
         AskUserReply::Discuss { question_id, note } => encode_discuss(question_id, note.as_deref()),
         AskUserReply::Cancelled => "{\"status\":\"cancelled\"}".to_string(),
         AskUserReply::Unavailable(reason) => encode_unavailable(*reason),
-        AskUserReply::Expired => "{\"status\":\"expired\"}".to_string(),
     }
 }
 

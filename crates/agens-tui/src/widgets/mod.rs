@@ -25,5 +25,5 @@ pub(crate) use overlay::{
     OverlayConfig, OverlayFrame, OverlayKind, OverlayLayout, OverlayShell, OverlayShortcut,
     OverlaySizing, truncate_columns,
 };
-pub(crate) use overlay_list::{OverlayList, OverlayRow};
+pub(crate) use overlay_list::{OverlayList, OverlayRow, ROW_LABEL_RESERVE};
 pub(crate) use role_palette::RolePalette;

@@ -4194,6 +4194,22 @@ fn single_question_ask_user_request(
     .expect("one bounded question forms a valid request")
 }
 
+/// Moves the cursor down onto the proceed row of whatever question is open.
+///
+/// Bounded rather than "press Down until it arrives": `Down` saturates on the
+/// last row, so a reducer that stopped producing a proceed row would hang the
+/// test instead of failing it.
+fn walk_to_proceed_row(tui: &mut Tui<FakeEngine>) {
+    for _ in 0..8 {
+        if tui.ask_user_snapshot().map(|snapshot| snapshot.row) == Some(AskUserRowSnapshot::Proceed)
+        {
+            return;
+        }
+        tui.handle(Event::Key(Key::Down));
+    }
+    panic!("the proceed row must be reachable with Down from any option row");
+}
+
 fn type_into_buffer(tui: &mut Tui<FakeEngine>, open_key: char, text: &str) {
     tui.handle(Event::Key(Key::Char(open_key)));
     for character in text.chars() {
@@ -4344,7 +4360,12 @@ fn ask_user_submit_while_incomplete_sets_incomplete_index_without_resolving() {
         .ask_user_snapshot()
         .expect("submit failed, not resolved");
     assert_eq!(snapshot.incomplete, Some(0));
-    assert_eq!(snapshot.row, AskUserRowSnapshot::Submit);
+    assert_eq!(
+        snapshot.row,
+        AskUserRowSnapshot::Option(0),
+        "a refused submission must put the cursor on the question it is refusing over, \
+         not merely name it"
+    );
 }
 
 #[test]
@@ -4404,6 +4425,175 @@ fn ask_user_submit_when_complete_resolves_answered_in_request_order() {
         other => panic!("expected an answered reply, got {other:?}"),
     }
     assert!(tui.ask_user_snapshot().is_none());
+}
+
+/// Walks the proceed row down the whole question set. On every question but
+/// the last it may only advance — never resolve — and on the last it is the
+/// submission.
+#[test]
+fn ask_user_proceed_row_advances_until_the_last_question_where_it_submits() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.open_ask_user(4, three_question_ask_user_request());
+
+    // Advancing is not a submission attempt, so it must move on even with
+    // nothing answered anywhere. This is what separates a `Next` row from a
+    // `Submit` row that happens to land on the next unanswered question.
+    walk_to_proceed_row(&mut tui);
+    assert_eq!(tui.handle(Event::Key(Key::Enter)), Action::Render);
+    let snapshot = tui.ask_user_snapshot().expect("still open");
+    assert_eq!(
+        snapshot.question_index, 1,
+        "proceeding must advance without answering anything"
+    );
+    assert_eq!(
+        snapshot.incomplete, None,
+        "advancing must not refuse anything, so it must not flag anything"
+    );
+
+    tui.handle(Event::Key(Key::Tab));
+    tui.handle(Event::Key(Key::Tab));
+    assert_eq!(
+        tui.ask_user_snapshot().expect("still open").question_index,
+        0
+    );
+
+    let proceed = |tui: &mut Tui<FakeEngine>| {
+        tui.handle(Event::Key(Key::Enter));
+        walk_to_proceed_row(tui);
+        tui.handle(Event::Key(Key::Enter))
+    };
+
+    assert_eq!(proceed(&mut tui), Action::Render);
+    assert_eq!(
+        tui.ask_user_snapshot().expect("still open").question_index,
+        1,
+        "proceeding from the first question must move to the second, not submit"
+    );
+
+    assert_eq!(proceed(&mut tui), Action::Render);
+    assert_eq!(
+        tui.ask_user_snapshot().expect("still open").question_index,
+        2
+    );
+
+    match proceed(&mut tui) {
+        Action::AskUserReply {
+            id,
+            reply: AskUserReply::Answered(answers),
+        } => {
+            assert_eq!(id, 4);
+            assert_eq!(answers.len(), 3, "every question is answered once");
+        }
+        other => panic!("the last question's proceed row must submit, got {other:?}"),
+    }
+    assert!(tui.ask_user_snapshot().is_none());
+}
+
+/// A refused submission has to hand the reader the question it is refusing
+/// over, across the whole set — naming it while leaving them parked three
+/// questions away is the dead end this pins.
+#[test]
+fn ask_user_submit_from_the_last_question_moves_to_the_unanswered_one() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.open_ask_user(5, three_question_ask_user_request());
+
+    tui.handle(Event::Key(Key::Tab));
+    tui.handle(Event::Key(Key::Enter));
+    tui.handle(Event::Key(Key::Tab));
+    tui.handle(Event::Key(Key::Enter));
+    tui.handle(Event::Key(Key::Tab));
+
+    let snapshot = tui.ask_user_snapshot().expect("still open");
+    assert_eq!(snapshot.question_index, 0, "Tab wraps back to the first");
+
+    tui.handle(Event::Key(Key::Tab));
+    tui.handle(Event::Key(Key::Tab));
+    walk_to_proceed_row(&mut tui);
+    let action = tui.handle(Event::Key(Key::Enter));
+
+    assert_eq!(action, Action::Render, "an incomplete set must not resolve");
+    let snapshot = tui.ask_user_snapshot().expect("still open");
+    assert_eq!(snapshot.incomplete, Some(0));
+    assert_eq!(
+        snapshot.question_index, 0,
+        "the refused submission must take the reader to the unanswered question"
+    );
+    assert_eq!(snapshot.row, AskUserRowSnapshot::Option(0));
+}
+
+/// The note field is a text field, and a text field whose caret only ever
+/// sits after the last character is one the reader cannot correct.
+#[test]
+fn ask_user_note_edits_at_the_caret_like_the_composer_does() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.open_ask_user(6, single_question_ask_user_request(false, true, false));
+
+    tui.handle(Event::Key(Key::Char('n')));
+    for character in "hello world".chars() {
+        tui.handle(Event::Key(Key::Char(character)));
+    }
+
+    tui.handle(Event::Key(Key::Left));
+    tui.handle(Event::Key(Key::Left));
+    tui.handle(Event::Key(Key::Char('X')));
+    assert_eq!(
+        tui.ask_user_snapshot().expect("still editing").note,
+        "hello worXld",
+        "a character must land at the caret, not at the end"
+    );
+
+    tui.handle(Event::Key(Key::Delete));
+    assert_eq!(
+        tui.ask_user_snapshot().expect("still editing").note,
+        "hello worXd",
+        "Delete must remove the character in front of the caret"
+    );
+
+    tui.handle(Event::Key(Key::DeletePreviousWord));
+    assert_eq!(
+        tui.ask_user_snapshot().expect("still editing").note,
+        "hello d",
+        "ctrl-w must delete the word before the caret"
+    );
+
+    tui.handle(Event::Key(Key::Home));
+    assert_eq!(
+        tui.ask_user_snapshot().expect("still editing").entry_cursor,
+        0
+    );
+    tui.handle(Event::Key(Key::Char('>')));
+    assert_eq!(
+        tui.ask_user_snapshot().expect("still editing").note,
+        ">hello d",
+        "Home must move the caret, not scroll the context pane beside it"
+    );
+
+    tui.handle(Event::Key(Key::End));
+    assert_eq!(
+        tui.ask_user_snapshot().expect("still editing").entry_cursor,
+        ">hello d".chars().count()
+    );
+}
+
+/// Reopening a buffer to correct it must not force the reader to walk the
+/// caret back to where they stopped.
+#[test]
+fn ask_user_reopening_a_buffer_puts_the_caret_after_what_was_typed() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.open_ask_user(8, single_question_ask_user_request(true, false, false));
+
+    type_into_buffer(&mut tui, 'o', "draft");
+    tui.handle(Event::Key(Key::Char('o')));
+
+    let snapshot = tui.ask_user_snapshot().expect("still open");
+    assert_eq!(snapshot.editing, AskUserEditing::Other);
+    assert_eq!(snapshot.entry_cursor, "draft".chars().count());
+
+    tui.handle(Event::Key(Key::Char('!')));
+    assert_eq!(
+        tui.ask_user_snapshot().expect("still editing").other,
+        "draft!"
+    );
 }
 
 #[test]

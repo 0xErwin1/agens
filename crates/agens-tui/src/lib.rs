@@ -576,6 +576,7 @@ struct AskUserRender<'a> {
     other: &'a str,
     note: &'a str,
     entry: AskUserEntry,
+    entry_cursor: usize,
     context_option: usize,
     context_scroll: u16,
     incomplete: Option<usize>,
@@ -592,6 +593,7 @@ impl<'a> AskUserRender<'a> {
             other: state.current_other(),
             note: state.current_note(),
             entry: state.entry(),
+            entry_cursor: state.entry_cursor(),
             context_option: state.context_option(),
             context_scroll: state.context_scroll(),
             incomplete: state.incomplete(),
@@ -679,7 +681,6 @@ const fn ask_user_reply_status(reply: &AskUserReply) -> &'static str {
         AskUserReply::Discuss { .. } => "discuss",
         AskUserReply::Cancelled => "cancelled",
         AskUserReply::Unavailable(_) => "unavailable",
-        AskUserReply::Expired => "expired",
     }
 }
 
@@ -1959,13 +1960,17 @@ fn ask_user_context_text<'a>(render: &AskUserRender<'a>) -> &'a str {
 
 fn ask_user_shortcuts(render: &AskUserRender<'_>) -> Vec<widgets::OverlayShortcut<'static>> {
     let question = render.current();
+    if render.entry != AskUserEntry::Browsing {
+        return ask_user_entry_shortcuts(ask_user_has_context(render));
+    }
+
     let mut shortcuts = vec![
         widgets::OverlayShortcut {
             key: "↑↓",
             label: "move",
         },
         widgets::OverlayShortcut {
-            key: "⏎",
+            key: "Enter",
             label: "choose",
         },
     ];
@@ -1997,6 +2002,39 @@ fn ask_user_shortcuts(render: &AskUserRender<'_>) -> Vec<widgets::OverlayShortcu
         key: "esc",
         label: "cancel",
     });
+    shortcuts
+}
+
+/// What the footer says while a free-form buffer is open.
+///
+/// The browsing shortcuts are actively wrong here — `⏎` does not choose an
+/// option, `esc` does not cancel the question, and the arrows do not move
+/// between rows — so the row is replaced rather than appended to.
+fn ask_user_entry_shortcuts(has_context: bool) -> Vec<widgets::OverlayShortcut<'static>> {
+    let mut shortcuts = vec![
+        widgets::OverlayShortcut {
+            key: "←→",
+            label: "move",
+        },
+        widgets::OverlayShortcut {
+            key: "ctrl-w",
+            label: "word",
+        },
+        widgets::OverlayShortcut {
+            key: "Enter",
+            label: "done",
+        },
+        widgets::OverlayShortcut {
+            key: "esc",
+            label: "back",
+        },
+    ];
+    if has_context {
+        shortcuts.push(widgets::OverlayShortcut {
+            key: ASK_USER_CONTEXT_KEYS,
+            label: "context",
+        });
+    }
     shortcuts
 }
 
@@ -2179,7 +2217,14 @@ fn ask_user_header_lines(render: &AskUserRender<'_>, width: u16) -> Vec<Line<'st
 
 /// The option list, its per-option sub-lines, the free-form buffers and the
 /// action rows, plus the index of the row the cursor stands on.
-fn ask_user_rows<'a>(render: &AskUserRender<'a>) -> (Vec<widgets::OverlayRow<'a>>, usize) {
+///
+/// `width` is the list column's own width, which only the buffer rows consult:
+/// they are the only rows whose content depends on how much room there is to
+/// show it.
+fn ask_user_rows<'a>(
+    render: &AskUserRender<'a>,
+    width: u16,
+) -> (Vec<widgets::OverlayRow<'a>>, usize) {
     let question = render.current();
     let multiple = question.mode() == AskUserMode::Multiple;
     let mut rows: Vec<widgets::OverlayRow<'a>> = Vec::new();
@@ -2217,20 +2262,23 @@ fn ask_user_rows<'a>(render: &AskUserRender<'a>) -> (Vec<widgets::OverlayRow<'a>
         rows.push(ask_user_buffer_row(
             "other",
             render.other,
-            render.entry == AskUserEntry::Other,
+            (render.entry == AskUserEntry::Other).then_some(render.entry_cursor),
             "press o to type your own answer",
+            width,
         ));
     }
     if question.allow_note() {
         rows.push(ask_user_buffer_row(
             "note",
             render.note,
-            render.entry == AskUserEntry::Note,
+            (render.entry == AskUserEntry::Note).then_some(render.entry_cursor),
             "press n to add a note",
+            width,
         ));
     }
 
     rows.push(widgets::OverlayRow::new(""));
+    let last = render.question + 1 == render.request.questions().len();
     let blocked = render.answered < render.request.questions().len();
     let mut action = |row: AskUserRow, label: &'static str, right: Option<&'static str>| {
         let highlighted = render.row == row;
@@ -2245,11 +2293,17 @@ fn ask_user_rows<'a>(render: &AskUserRender<'a>) -> (Vec<widgets::OverlayRow<'a>
             ..widgets::OverlayRow::default()
         });
     };
-    action(
-        AskUserRow::Submit,
-        "Submit answers",
-        blocked.then_some("incomplete"),
-    );
+    // Only the last question can submit, so only there can the set be
+    // incomplete in a way this row is about.
+    if last {
+        action(
+            AskUserRow::Proceed,
+            "Submit answers",
+            blocked.then_some("incomplete"),
+        );
+    } else {
+        action(AskUserRow::Proceed, "Next question", None);
+    }
     if question.allow_discuss() {
         action(AskUserRow::Discuss, "Discuss this in chat instead", None);
     }
@@ -2258,24 +2312,99 @@ fn ask_user_rows<'a>(render: &AskUserRender<'a>) -> (Vec<widgets::OverlayRow<'a>
     (rows, selected_row)
 }
 
+/// The caret drawn at the insertion point of an open buffer.
+const ASK_USER_CARET: &str = "▏";
+
+/// One free-form buffer row — `other` or `note` — for a list `width` columns
+/// wide.
+///
+/// `cursor` is `Some` exactly while this is the buffer being typed into, and
+/// carries the caret's `char` index. That is what makes the row width-aware:
+/// an unedited buffer may simply run past the edge and be truncated like any
+/// other label, but the row someone is typing in has to keep showing the part
+/// they are typing, which is only decidable against the columns available.
 fn ask_user_buffer_row<'a>(
     field: &str,
     buffer: &str,
-    editing: bool,
+    cursor: Option<usize>,
     hint: &str,
+    width: u16,
 ) -> widgets::OverlayRow<'a> {
-    let label = if editing {
-        format!("{field}: {buffer}▏")
-    } else if buffer.is_empty() {
-        format!("{field}: {hint}")
-    } else {
-        format!("{field}: {buffer}")
+    let Some(cursor) = cursor else {
+        let label = if buffer.is_empty() {
+            format!("{field}: {hint}")
+        } else {
+            format!("{field}: {buffer}")
+        };
+        return widgets::OverlayRow {
+            label: Cow::Owned(label),
+            dimmed: buffer.is_empty(),
+            ..widgets::OverlayRow::default()
+        };
     };
+
+    let prefix = format!("{field}: ");
+    let available = usize::from(width.saturating_sub(widgets::ROW_LABEL_RESERVE))
+        .saturating_sub(prefix.width() + ASK_USER_CARET.width());
+    let (visible, caret_offset) = ask_user_entry_window(buffer, cursor, available);
+
+    let mut label = prefix;
+    label.extend(visible.chars().take(caret_offset));
+    label.push_str(ASK_USER_CARET);
+    label.extend(visible.chars().skip(caret_offset));
+
     widgets::OverlayRow {
         label: Cow::Owned(label),
-        dimmed: !editing && buffer.is_empty(),
         ..widgets::OverlayRow::default()
     }
+}
+
+/// Chooses the slice of `buffer` to show in `available` columns, returning it
+/// with the caret's `char` offset inside that slice.
+///
+/// The caret is always inside the returned slice: that is the whole point of
+/// the window. Trailing text is served first, up to half the room, so moving
+/// the caret back into a long answer shows what follows it instead of pinning
+/// it to the right edge; the rest of the room goes to the text before the
+/// caret, and anything left over back to the text after it.
+fn ask_user_entry_window(buffer: &str, cursor: usize, available: usize) -> (String, usize) {
+    let characters: Vec<char> = buffer.chars().collect();
+    let cursor = cursor.min(characters.len());
+    if available == 0 {
+        return (String::new(), 0);
+    }
+
+    let mut used = 0usize;
+    let mut end = cursor;
+    while end < characters.len() {
+        let columns = UnicodeWidthChar::width(characters[end]).unwrap_or(0);
+        if used + columns > available / 2 {
+            break;
+        }
+        used += columns;
+        end += 1;
+    }
+
+    let mut start = cursor;
+    while start > 0 {
+        let columns = UnicodeWidthChar::width(characters[start - 1]).unwrap_or(0);
+        if used + columns > available {
+            break;
+        }
+        used += columns;
+        start -= 1;
+    }
+
+    while end < characters.len() {
+        let columns = UnicodeWidthChar::width(characters[end]).unwrap_or(0);
+        if used + columns > available {
+            break;
+        }
+        used += columns;
+        end += 1;
+    }
+
+    (characters[start..end].iter().collect(), cursor - start)
 }
 
 /// Keeps the cursor's row on screen with the least scrolling that achieves it.
@@ -2307,7 +2436,7 @@ fn ask_user_frame<'a>(area: Rect, render: &AskUserRender<'a>) -> Option<AskUserF
     };
 
     let header_lines = ask_user_header_lines(render, inner);
-    let (rows, selected_row) = ask_user_rows(render);
+    let (rows, selected_row) = ask_user_rows(render, list_width);
     let context_lines = if has_context {
         ask_user_context_lines(ask_user_context_text(render), context_width)
     } else {
@@ -2719,13 +2848,18 @@ fn border_metrics(state: &ViewState<'_>, composer: Rect) -> Option<Line<'static>
 /// Content width below which the palette drops the description column entirely.
 const PALETTE_DESCRIPTION_MIN_WIDTH: u16 = 40;
 
+/// Spelling the Enter key out costs four columns over the glyph, and the
+/// footer drops whole shortcuts rather than wrapping past two rows — in the
+/// narrowest palette that was enough to push `esc close` off the overlay
+/// entirely. `move` buys those columns back, and matches what every other
+/// overlay in this file already calls the same motion.
 const PALETTE_SHORTCUTS: [widgets::OverlayShortcut<'static>; 3] = [
     widgets::OverlayShortcut {
         key: "↑↓",
-        label: "navigate",
+        label: "move",
     },
     widgets::OverlayShortcut {
-        key: "⏎",
+        key: "Enter",
         label: "run",
     },
     widgets::OverlayShortcut {
@@ -2793,7 +2927,7 @@ const FILE_PICKER_SHORTCUTS: [widgets::OverlayShortcut<'static>; 3] = [
         label: "navigate",
     },
     widgets::OverlayShortcut {
-        key: "⏎",
+        key: "Enter",
         label: "insert",
     },
     widgets::OverlayShortcut {
@@ -3203,9 +3337,9 @@ fn dialog_shortcut_labels(dialog: &DialogView) -> DialogShortcutLabels {
                 SessionDialogScope::AllProjects => "current project",
             }),
         ));
-        labels.push((Cow::Borrowed("⏎"), Cow::Borrowed("resume")));
+        labels.push((Cow::Borrowed("Enter"), Cow::Borrowed("resume")));
     } else if dialog.interactive {
-        labels.push((Cow::Borrowed("⏎"), Cow::Borrowed("select")));
+        labels.push((Cow::Borrowed("Enter"), Cow::Borrowed("select")));
     }
     // While search is armed Escape only disarms it, and every letter key is
     // filter text, so advertising the letter bindings there would be a lie.
@@ -12325,7 +12459,7 @@ mod runtime_tests {
             dialog_shortcut_labels(&picker),
             vec![
                 (Cow::Borrowed("↑↓ jk"), Cow::Borrowed("navigate")),
-                (Cow::Borrowed("⏎"), Cow::Borrowed("select")),
+                (Cow::Borrowed("Enter"), Cow::Borrowed("select")),
                 (Cow::Borrowed("/"), Cow::Borrowed("search")),
                 (Cow::Borrowed("esc"), Cow::Borrowed("close")),
             ]
@@ -12334,7 +12468,7 @@ mod runtime_tests {
             dialog_shortcut_labels(&arm_search(picker)),
             vec![
                 (Cow::Borrowed("↑↓"), Cow::Borrowed("navigate")),
-                (Cow::Borrowed("⏎"), Cow::Borrowed("select")),
+                (Cow::Borrowed("Enter"), Cow::Borrowed("select")),
                 (Cow::Borrowed("esc"), Cow::Borrowed("exit search")),
             ],
             "armed search must not advertise the letter bindings it swallows"
@@ -12360,7 +12494,7 @@ mod runtime_tests {
             "{first_page:?}"
         );
         assert!(
-            first_page.contains(&(Cow::Borrowed("⏎"), Cow::Borrowed("resume"))),
+            first_page.contains(&(Cow::Borrowed("Enter"), Cow::Borrowed("resume"))),
             "{first_page:?}"
         );
 
@@ -12600,31 +12734,35 @@ mod runtime_tests {
         assert!(!bridge.is_pending(id));
     }
 
-    /// The spec's "surface closes" scenario as seen by the running loop: a
-    /// deadline firing releases the parked tool thread as expected, but the
-    /// bug this pins is that nothing DROVE the overlay closed on the UI side
-    /// — before this fix, `self.ask_user` stayed populated, kept answering
-    /// keys instead of routing them anywhere real, and no later UI action
-    /// could ever resolve the (already-resolved) request again.
+    /// The spec's "surface closes" scenario as seen by the running loop: the
+    /// bridge resolving a request on its own releases the parked tool thread
+    /// as expected, but the bug this pins is that nothing DROVE the overlay
+    /// closed on the UI side — before this fix, `self.ask_user` stayed
+    /// populated, kept answering keys instead of routing them anywhere real,
+    /// and no later UI action could ever resolve the (already-resolved)
+    /// request again.
+    ///
+    /// Cancellation is the trigger because it is the only self-triggered
+    /// resolution left: a question no longer resolves itself on a deadline.
     #[test]
-    fn bridge_side_expiry_dismisses_the_open_overlay_and_releases_the_keyboard() {
+    fn bridge_side_cancellation_dismisses_the_open_overlay_and_releases_the_keyboard() {
         let (bridge, requests) = TuiAskUserBridge::channel();
-        let cancellation = agens_core::HeadlessTurnCancellation::with_deadline(
-            std::time::Duration::from_millis(15),
-        );
+        let cancellation = agens_core::HeadlessTurnCancellation::new();
         let waiting_bridge = bridge.clone();
+        let waiting_cancellation = cancellation.clone();
 
         let waiter = thread::spawn(move || {
-            waiting_bridge.wait_for_reply(runtime_glue_ask_user_request(), &cancellation)
+            waiting_bridge.wait_for_reply(runtime_glue_ask_user_request(), &waiting_cancellation)
         });
 
         let mut tui = Tui::new(NoopEngine);
         let id = open_first_ask_user_request(&mut tui, &bridge, &requests);
         assert!(tui.ask_user_snapshot().is_some());
 
+        cancellation.cancel();
         assert_eq!(
             waiter.join().expect("waiter thread should not panic"),
-            AskUserReply::Expired
+            AskUserReply::Cancelled
         );
 
         assert!(
@@ -12635,7 +12773,7 @@ mod runtime_tests {
 
         assert!(
             dismissed,
-            "an expired request must release the overlay it opened, not leave it stuck \
+            "a cancelled request must release the overlay it opened, not leave it stuck \
              answering a turn that already ended"
         );
         assert!(

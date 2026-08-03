@@ -197,6 +197,13 @@ pub enum AskUserUnavailable {
     SurfaceClosed,
 }
 
+/// Every way an ask-user interaction can end.
+///
+/// There is deliberately no elapsed-time outcome. A question put to a person
+/// blocks until that person answers it, walks away from it, or loses the
+/// surface it was drawn on; a deadline that resolved it on their behalf would
+/// be inventing an answer nobody gave. Cancellation still ends it, because
+/// that is the user acting, not a clock.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AskUserReply {
     Answered(Vec<AskUserAnswer>),
@@ -206,7 +213,6 @@ pub enum AskUserReply {
     },
     Cancelled,
     Unavailable(AskUserUnavailable),
-    Expired,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -317,9 +323,7 @@ impl AskUserRequest {
             AskUserReply::Discuss { question_id, note } => {
                 self.validate_discuss_reply(question_id, note.as_deref())
             }
-            AskUserReply::Cancelled | AskUserReply::Unavailable(_) | AskUserReply::Expired => {
-                Ok(())
-            }
+            AskUserReply::Cancelled | AskUserReply::Unavailable(_) => Ok(()),
         }
     }
 

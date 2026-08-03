@@ -45,6 +45,37 @@ impl AskUserPort for ScriptedPort {
     }
 }
 
+/// Reports whether the cancellation the tool handed down was already on a
+/// clock that had run out.
+///
+/// A port that ignores its cancellation — as [`ScriptedPort`] does — cannot
+/// tell whether the tool passed a deadline along, so it cannot pin that the
+/// tool stopped doing so. A real surface parks on that value; this one only
+/// looks at it.
+struct DeadlineSpyPort {
+    handed_an_expired_deadline: Arc<AtomicBool>,
+}
+
+impl DeadlineSpyPort {
+    fn new() -> (Self, Arc<AtomicBool>) {
+        let seen = Arc::new(AtomicBool::new(false));
+        (
+            Self {
+                handed_an_expired_deadline: Arc::clone(&seen),
+            },
+            seen,
+        )
+    }
+}
+
+impl AskUserPort for DeadlineSpyPort {
+    fn ask(&self, _: &AskUserRequest, cancellation: &HeadlessTurnCancellation) -> AskUserReply {
+        self.handed_an_expired_deadline
+            .store(cancellation.is_expired(), Ordering::Release);
+        AskUserReply::Cancelled
+    }
+}
+
 fn two_question_request() -> AskUserRequest {
     let plan_options = vec![
         AskUserOption::new("a", "Option A", None, None),
@@ -345,16 +376,6 @@ fn surface_closed_unavailable_envelope_has_the_exact_documented_bytes() {
 }
 
 #[test]
-fn expired_envelope_has_the_exact_documented_bytes() {
-    let (port, _) = ScriptedPort::new(AskUserReply::Expired);
-
-    let output = execute_with_port(request_value(), port, &ready_context()).expect("executed");
-
-    assert!(!output.is_error);
-    assert_eq!(output.content, "{\"status\":\"expired\"}");
-}
-
-#[test]
 fn already_cancelled_context_short_circuits_before_the_port_is_invoked() {
     let (port, calls) = ScriptedPort::new(AskUserReply::Answered(vec![]));
     let context =
@@ -366,16 +387,62 @@ fn already_cancelled_context_short_circuits_before_the_port_is_invoked() {
     assert_eq!(calls.load(Ordering::Acquire), 0);
 }
 
+/// The tool must not merely survive an elapsed deadline — it must not pass one
+/// down at all. A surface parks on the cancellation it is given, so handing it
+/// a deadline is handing it a timeout, whatever this side then does with the
+/// result.
 #[test]
-fn expired_deadline_context_short_circuits_before_the_port_is_invoked() {
-    let (port, calls) = ScriptedPort::new(AskUserReply::Answered(vec![]));
+fn the_surface_is_never_handed_a_deadline_to_park_on() {
+    let (port, handed_an_expired_deadline) = DeadlineSpyPort::new();
+    let context = ToolExecutionContext::with_timeout(Duration::from_millis(1));
+    thread::sleep(Duration::from_millis(10));
+
+    execute_with_port(request_value(), port, &context).expect("executed");
+
+    assert!(
+        !handed_an_expired_deadline.load(Ordering::Acquire),
+        "the question reached the surface carrying a deadline that had already run out"
+    );
+}
+
+/// Every tool inherits this context's deadline, and a turn that set none of
+/// its own hands over the bash fallback instead — which is how a question
+/// somebody was still reading used to come back "expired" after two minutes.
+/// An elapsed deadline must therefore neither stop the question being asked
+/// nor discard the answer it collected on the way back.
+#[test]
+fn an_expired_deadline_still_asks_the_question_and_still_returns_the_answer() {
+    let reply = AskUserReply::Answered(vec![
+        AskUserAnswer {
+            question_id: "plan".into(),
+            selected: vec!["a".into()],
+            other: None,
+            note: None,
+        },
+        AskUserAnswer {
+            question_id: "steps".into(),
+            selected: vec!["x".into()],
+            other: None,
+            note: None,
+        },
+    ]);
+    let (port, calls) = ScriptedPort::new(reply);
     let context = ToolExecutionContext::with_timeout(Duration::from_millis(1));
     thread::sleep(Duration::from_millis(10));
 
     let output = execute_with_port(request_value(), port, &context).expect("executed");
 
-    assert!(output.is_error);
-    assert_eq!(calls.load(Ordering::Acquire), 0);
+    assert_eq!(
+        calls.load(Ordering::Acquire),
+        1,
+        "an elapsed deadline must not stop the question reaching the surface"
+    );
+    assert!(!output.is_error);
+    assert!(
+        output.content.contains("\"status\":\"answered\""),
+        "the answer must survive the return trip past the same deadline: {}",
+        output.content
+    );
 }
 
 #[test]
