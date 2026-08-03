@@ -347,6 +347,9 @@ pub struct ProductionTaskRunner {
     /// reach the same person through the same bridge without contending for a
     /// lock while one of them is parked on an answer.
     permission_prompter: Option<PrompterFactory>,
+    /// How deep the runtime that owns this runner sits. The parent turn is 0,
+    /// so the executions this runner launches are at `depth + 1`.
+    depth: usize,
     #[cfg(any(test, feature = "probe"))]
     probe: Option<ProductionTaskProbe>,
     #[cfg(any(test, feature = "probe"))]
@@ -366,6 +369,7 @@ impl ProductionTaskRunner {
             task_registry: None,
             mcp_registry: None,
             permission_prompter: None,
+            depth: 0,
             #[cfg(any(test, feature = "probe"))]
             probe: None,
             #[cfg(any(test, feature = "probe"))]
@@ -398,6 +402,23 @@ impl ProductionTaskRunner {
         self
     }
 
+    /// Places this runner in the delegation chain. Only a child's own runtime
+    /// sets it; the parent turn's runner is at the default 0.
+    #[must_use]
+    pub const fn with_depth(mut self, depth: usize) -> Self {
+        self.depth = depth;
+        self
+    }
+
+    /// Admits this runner's executions into an existing registry, so a whole
+    /// delegation chain shares one set of concurrency and iteration bounds
+    /// rather than each level getting its own allowance.
+    #[must_use]
+    pub fn with_task_registry(mut self, registry: TaskExecutionRegistry) -> Self {
+        self.task_registry = Some(registry);
+        self
+    }
+
     /// Marks that this runner's own permission-authorization session (built in
     /// `task.rs` for the parent's `task` tool call) should bypass `Ask`. This never
     /// reaches the launched child's own tool session in `child.rs`, which stays
@@ -425,6 +446,7 @@ impl ProductionTaskRunner {
             task_registry: None,
             mcp_registry: None,
             permission_prompter: None,
+            depth: 0,
             probe: Some(probe),
             progress_probe: None,
             failure_probe: None,
@@ -447,6 +469,7 @@ impl ProductionTaskRunner {
             task_registry: None,
             mcp_registry: None,
             permission_prompter: None,
+            depth: 0,
             probe: Some(probe),
             progress_probe: Some(progress),
             failure_probe: None,
@@ -469,6 +492,7 @@ impl ProductionTaskRunner {
             task_registry: None,
             mcp_registry: None,
             permission_prompter: None,
+            depth: 0,
             probe: None,
             progress_probe: None,
             failure_probe: Some(TestTaskFailure {
@@ -597,6 +621,7 @@ impl TaskRunner for ProductionTaskRunner {
                         execution_id: context.execution().expect("registered task execution").id(),
                         mcp_registry: self.mcp_registry.clone(),
                         permission_prompter: self.permission_prompter.clone(),
+                        depth: self.depth + 1,
                     },
                 )
             });
@@ -614,6 +639,7 @@ impl TaskRunner for ProductionTaskRunner {
                 execution_id: context.execution().expect("registered task execution").id(),
                 mcp_registry: self.mcp_registry.clone(),
                 permission_prompter: self.permission_prompter.clone(),
+                depth: self.depth + 1,
             },
         );
         if let Err(error) = &result {

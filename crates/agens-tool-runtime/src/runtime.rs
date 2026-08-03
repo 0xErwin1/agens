@@ -324,6 +324,26 @@ pub fn production_dangerous_child_tool_runtime(
 /// without a second connection to any of them. Which of those tools the child
 /// is actually offered is `surface.remote_tools`, already narrowed by the same
 /// declarations that narrowed the natives.
+/// How far delegation may go: the parent turn is depth 0, so its child is 1
+/// and that child's child is 2. A runtime at [`MAX_DELEGATION_DEPTH`] holds no
+/// `task` tool, which is what stops the chain — an agent that cannot see the
+/// tool cannot call it, so the limit is enforced by absence rather than by a
+/// refusal the model would be free to retry.
+pub const MAX_DELEGATION_DEPTH: usize = 2;
+
+/// What a child runtime needs to be able to delegate one level further.
+///
+/// `None` where a runtime must not delegate at all, which is every caller that
+/// is not a real subagent execution.
+pub struct ChildDelegation<'a> {
+    pub bootstrap: &'a Bootstrap,
+    pub depth: usize,
+    /// The child's own model and request config, which its grandchildren
+    /// inherit the same way this child inherited the parent's.
+    pub parent: TaskParentSelection,
+    pub permission_prompter: Option<crate::runner::PrompterFactory>,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn production_child_tool_runtime(
     project_root: &Path,
@@ -333,6 +353,7 @@ pub fn production_child_tool_runtime(
     execution_id: agens_tools::TaskExecutionId,
     skills: Option<&SkillCatalog>,
     mcp_registry: Option<Arc<Mutex<agens_tools::McpRegistry>>>,
+    delegation: Option<ChildDelegation<'_>>,
 ) -> Result<(Vec<OpenAiFunctionTool>, SharedToolDispatcher), CliError> {
     let catalog = Arc::new(Mutex::new(NativeToolCatalog::new(open_native_tools(
         project_root,
@@ -417,9 +438,43 @@ pub fn production_child_tool_runtime(
             .register_native(
                 "native::task_message",
                 agens_core::ToolAccess::Write,
-                TaskMessageTool::new(task_registry, TaskMessageSource::Execution(execution_id)),
+                TaskMessageTool::new(
+                    task_registry.clone(),
+                    TaskMessageSource::Execution(execution_id),
+                ),
             )
             .map_err(|_| CliError::configuration("tool catalog is invalid"))?;
+    }
+
+    if let Some(delegation) = delegation
+        && delegation.depth < MAX_DELEGATION_DEPTH
+    {
+        let mut runner =
+            ProductionTaskRunner::new(delegation.bootstrap.clone(), project_root.to_path_buf())
+                .with_depth(delegation.depth)
+                .with_task_registry(task_registry.clone());
+        if let Some(prompter) = delegation.permission_prompter {
+            runner = runner.with_permission_prompter(prompter);
+        }
+        if let Some(registry) = mcp_registry.as_ref() {
+            runner.share_mcp_registry(Arc::clone(registry));
+        }
+
+        // `register_production_task_tool` writes into the parent path's
+        // keyed map; this path collects a list, so the entries are moved
+        // across once it has decided whether there is a tool at all — it
+        // registers nothing when no subagent is eligible.
+        let mut nested = BTreeMap::new();
+        crate::task::register_delegating_task_tool(
+            delegation.bootstrap,
+            project_root,
+            skills.unwrap_or(&SkillCatalog::default()),
+            &mut dispatcher,
+            &mut nested,
+            delegation.parent,
+            runner,
+        )?;
+        provider_tools.extend(nested.into_values());
     }
 
     let Some(mcp_registry) = mcp_registry else {
@@ -604,6 +659,74 @@ mod tests {
         std::fs::remove_dir_all(temporary).unwrap();
     }
 
+    /// The chain stops by absence, not by refusal: a great-grandchild is not
+    /// offered `task` at all, so there is no call for it to make and retry.
+    /// Both ends are pinned — a limit that also removed the tool from the
+    /// child would read as "enforced" while quietly banning delegation
+    /// outright.
+    #[test]
+    fn delegation_reaches_a_grandchild_and_stops_there() {
+        let temporary = tui_session_directory("delegation-depth");
+        let bootstrap = tui_session_bootstrap(
+            &temporary,
+            &[(
+                "worker",
+                "---\nname: worker\ndescription: work\nmode: subagent\npermissions: []\n---\nWork.\n",
+            )],
+        );
+        let project_root = agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap);
+
+        let offers_task = |depth: usize| {
+            let surface = crate::child_catalog::resolve_child_surface(&[], &[], &[]).unwrap();
+            let task_registry = TaskExecutionRegistry::new();
+            let execution_id = task_registry.admit(TaskLaunchMode::Foreground).unwrap();
+            let (tools, dispatcher) = production_child_tool_runtime(
+                &project_root,
+                ToolLimitSettings::default(),
+                &surface,
+                task_registry,
+                execution_id,
+                Some(&SkillCatalog::default()),
+                None,
+                Some(ChildDelegation {
+                    bootstrap: &bootstrap,
+                    depth,
+                    parent: TaskParentSelection {
+                        model: "gpt-5.5".into(),
+                        request_config: agens_core::RequestConfig::default(),
+                        diagnostic_reference: None,
+                    },
+                    permission_prompter: None,
+                }),
+            )
+            .expect("the child runtime must build");
+
+            let offered = tools.iter().any(|tool| tool.name() == "task");
+            let dispatches = dispatcher
+                .lock()
+                .unwrap()
+                .canonical_identity("native::task")
+                .is_some();
+            assert_eq!(
+                offered, dispatches,
+                "a tool offered to the model and one the dispatcher resolves must be the same set"
+            );
+            offered
+        };
+
+        // Literal depths, never `MAX_DELEGATION_DEPTH`: the requirement is
+        // about concrete levels — parent, child, grandchild — so asserting
+        // against the constant would only prove the code agrees with itself,
+        // and would keep passing if the limit moved.
+        assert!(offers_task(1), "a child may delegate to a grandchild");
+        assert!(
+            !offers_task(2),
+            "a grandchild is where the chain ends: no great-grandchild"
+        );
+
+        std::fs::remove_dir_all(temporary).ok();
+    }
+
     /// A scripted MCP server that answers exactly one connection's worth of
     /// handshake, so a second connection attempt runs out of responses and
     /// fails loudly instead of quietly working.
@@ -725,6 +848,7 @@ mod tests {
             execution_id,
             None,
             Some(Arc::clone(&shared)),
+            None,
         )
         .unwrap();
 
@@ -788,6 +912,7 @@ mod tests {
             execution_id,
             Some(&skills),
             None,
+            None,
         )
         .unwrap();
 
@@ -848,6 +973,7 @@ mod tests {
             &surface,
             task_registry,
             execution_id,
+            None,
             None,
             None,
         )
@@ -926,6 +1052,7 @@ mod tests {
             execution_id,
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -987,6 +1114,7 @@ mod tests {
             &surface,
             task_registry,
             execution_id,
+            None,
             None,
             None,
         )
@@ -1369,6 +1497,7 @@ mod tests {
             &surface,
             task_registry,
             execution_id,
+            None,
             None,
             None,
         )
