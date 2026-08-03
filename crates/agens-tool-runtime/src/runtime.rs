@@ -148,7 +148,7 @@ pub fn production_tool_runtime_with_parent_task_runner_and_ask_user<R: TaskRunne
     parent_model: String,
     parent_request_config: agens_core::RequestConfig,
     model_resolution_reference: Option<String>,
-    task_runner: R,
+    mut task_runner: R,
     ask_user: Box<dyn AskUserPort>,
 ) -> Result<(Vec<OpenAiFunctionTool>, SharedToolDispatcher), CliError> {
     agens_callcount::note_tool_runtime_build();
@@ -161,6 +161,9 @@ pub fn production_tool_runtime_with_parent_task_runner_and_ask_user<R: TaskRunne
         bootstrap,
         project_root,
     )));
+    // Handed over before the task tool is built, so every child this runner
+    // launches dispatches through these connections rather than its own.
+    task_runner.share_mcp_registry(Arc::clone(&mcp_registry));
     let mut dispatcher = ToolDispatcher::new();
     dispatcher.declare_mcp_servers(
         bootstrap
@@ -315,6 +318,13 @@ pub fn production_dangerous_child_tool_runtime(
 /// it: "this agent has no skills installed" and "this agent cannot load the
 /// skills its own instructions name" are different failures, and only the
 /// first one is a configuration.
+/// `mcp_registry` is the parent's own, shared rather than rebuilt: the child
+/// runs on a thread of this process, and the registry's discovery is
+/// idempotent, so sharing it registers the servers' tools on this dispatcher
+/// without a second connection to any of them. Which of those tools the child
+/// is actually offered is `surface.remote_tools`, already narrowed by the same
+/// declarations that narrowed the natives.
+#[allow(clippy::too_many_arguments)]
 pub fn production_child_tool_runtime(
     project_root: &Path,
     tool_limits: ToolLimitSettings,
@@ -322,6 +332,7 @@ pub fn production_child_tool_runtime(
     task_registry: TaskExecutionRegistry,
     execution_id: agens_tools::TaskExecutionId,
     skills: Option<&SkillCatalog>,
+    mcp_registry: Option<Arc<Mutex<agens_tools::McpRegistry>>>,
 ) -> Result<(Vec<OpenAiFunctionTool>, SharedToolDispatcher), CliError> {
     let catalog = Arc::new(Mutex::new(NativeToolCatalog::new(open_native_tools(
         project_root,
@@ -411,7 +422,36 @@ pub fn production_child_tool_runtime(
             .map_err(|_| CliError::configuration("tool catalog is invalid"))?;
     }
 
-    Ok((provider_tools, Arc::new(Mutex::new(dispatcher))))
+    let Some(mcp_registry) = mcp_registry else {
+        return Ok((provider_tools, Arc::new(Mutex::new(dispatcher))));
+    };
+
+    let declared = mcp_registry
+        .lock()
+        .map_err(|_| CliError::configuration("MCP tools are unavailable"))?
+        .configured_server_names();
+    dispatcher.declare_mcp_servers(declared);
+
+    let mut runtime = ProductionMcpRuntime {
+        registry: mcp_registry,
+        dispatcher: Arc::new(Mutex::new(dispatcher)),
+    };
+    // Idempotent against the shared registry: the parent already connected
+    // these servers, so this synchronizes their tools onto this dispatcher
+    // without a second connection. A server that failed for the parent is
+    // already failed here and simply contributes nothing; surfacing its report
+    // again is the parent's job, not this child's.
+    let (remote_tools, _reports) = runtime.discover_configured_tools()?;
+
+    for metadata in remote_tools {
+        if !surface.remote_tools.contains(&metadata.qualified_name) {
+            continue;
+        }
+        let model_name = mcp_model_tool_name(&metadata);
+        provider_tools.push(remote_function_tool(&metadata, model_name)?);
+    }
+
+    Ok((provider_tools, runtime.dispatcher))
 }
 
 #[cfg(test)]
@@ -564,6 +604,153 @@ mod tests {
         std::fs::remove_dir_all(temporary).unwrap();
     }
 
+    /// A scripted MCP server that answers exactly one connection's worth of
+    /// handshake, so a second connection attempt runs out of responses and
+    /// fails loudly instead of quietly working.
+    struct ScriptedTransport {
+        responses: std::cell::RefCell<std::collections::VecDeque<agens_tools::McpResponse>>,
+    }
+
+    impl agens_tools::McpTransport for ScriptedTransport {
+        fn execute(
+            &mut self,
+            _: agens_tools::McpRequest,
+            _: &agens_tools::McpOperationContext,
+        ) -> Result<agens_tools::McpResponse, agens_tools::McpTransportError> {
+            self.responses
+                .borrow_mut()
+                .pop_front()
+                .ok_or_else(|| agens_tools::McpTransportError::Protocol("exhausted".into()))
+        }
+
+        fn notify(
+            &mut self,
+            _: agens_tools::McpRequest,
+            _: &agens_tools::McpOperationContext,
+        ) -> Result<(), agens_tools::McpTransportError> {
+            Ok(())
+        }
+
+        fn close(
+            &mut self,
+            _: &agens_tools::McpOperationContext,
+        ) -> Result<(), agens_tools::McpTransportError> {
+            Ok(())
+        }
+    }
+
+    /// The whole reason a child shares the parent's registry rather than
+    /// loading one from the same configuration: a loaded-again registry has
+    /// attempted nothing, so every subagent would connect to every server
+    /// afresh. The connection counter is the assertion — the tool showing up
+    /// only proves the child can see it, not that seeing it was free.
+    #[test]
+    fn a_child_reaches_the_parents_mcp_tools_without_connecting_again() {
+        let temporary = tui_session_directory("child-mcp-shared");
+        let project_root = temporary.join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+
+        let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let factory_connections = Arc::clone(&connections);
+        let mut registry = agens_tools::McpRegistry::new();
+        registry
+            .configure_server(
+                "engram",
+                move || {
+                    factory_connections.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    Ok(Box::new(ScriptedTransport {
+                        responses: std::cell::RefCell::new(
+                            [
+                                agens_tools::McpResponse::Initialized(
+                                    agens_tools::McpInitializeResult::new(
+                                        agens_tools::MCP_PROTOCOL_VERSION,
+                                        serde_json::json!({"tools": {}}),
+                                    ),
+                                ),
+                                agens_tools::McpResponse::ToolsListed(
+                                    agens_tools::McpToolsPage::new(
+                                        vec![agens_tools::McpToolDefinition {
+                                            name: "mem_save".into(),
+                                            description: Some("save".into()),
+                                            input_schema: serde_json::json!({"type": "object"}),
+                                            annotations: agens_tools::McpToolAnnotations {
+                                                read_only_hint: Some(false),
+                                            },
+                                        }],
+                                        None,
+                                    ),
+                                ),
+                            ]
+                            .into(),
+                        ),
+                    }) as Box<dyn agens_tools::McpTransport>)
+                },
+                agens_tools::McpTimeouts::new(
+                    std::time::Duration::from_millis(50),
+                    std::time::Duration::from_millis(50),
+                    std::time::Duration::from_millis(50),
+                )
+                .unwrap(),
+                agens_tools::McpLimits::new(8, 16).unwrap(),
+            )
+            .expect("the probe server must configure");
+
+        // The parent's own discovery, which is what a real session does at
+        // startup.
+        assert!(!registry.discover_server("engram").is_failed());
+        assert_eq!(
+            connections.load(std::sync::atomic::Ordering::Acquire),
+            1,
+            "the parent connects once"
+        );
+
+        let shared = Arc::new(Mutex::new(registry));
+        let remote = shared
+            .lock()
+            .unwrap()
+            .tools()
+            .into_iter()
+            .map(|tool| tool.qualified_name.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(remote, vec!["engram::mem_save".to_owned()]);
+
+        let surface = crate::child_catalog::resolve_child_surface(&[], &[], &remote).unwrap();
+        let task_registry = TaskExecutionRegistry::new();
+        let execution_id = task_registry.admit(TaskLaunchMode::Foreground).unwrap();
+        let (tools, dispatcher) = production_child_tool_runtime(
+            &project_root,
+            ToolLimitSettings::default(),
+            &surface,
+            task_registry,
+            execution_id,
+            None,
+            Some(Arc::clone(&shared)),
+        )
+        .unwrap();
+
+        assert!(
+            tools.iter().any(|tool| tool.name().contains("mem_save")),
+            "the child must be offered the parent's MCP tool: {:?}",
+            tools.iter().map(|tool| tool.name()).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            connections.load(std::sync::atomic::Ordering::Acquire),
+            1,
+            "the child must reuse the parent's connection, not open a second one"
+        );
+        assert!(
+            dispatcher
+                .lock()
+                .unwrap()
+                .canonical_identity("engram::mem_save")
+                .is_some(),
+            "the child's dispatcher must resolve the remote tool it was offered"
+        );
+
+        drop(dispatcher);
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
     /// Holding `skill` is only half of it: the tool has to read the same
     /// installation the parent reads, or an agent told to open its own skill
     /// still cannot. This drives the catalog in through the runtime rather
@@ -590,7 +777,7 @@ mod tests {
         .catalog()
         .clone();
 
-        let surface = crate::child_catalog::resolve_child_surface(&[], &[]).unwrap();
+        let surface = crate::child_catalog::resolve_child_surface(&[], &[], &[]).unwrap();
         let task_registry = TaskExecutionRegistry::new();
         let execution_id = task_registry.admit(TaskLaunchMode::Foreground).unwrap();
         let (tools, dispatcher) = production_child_tool_runtime(
@@ -600,6 +787,7 @@ mod tests {
             task_registry,
             execution_id,
             Some(&skills),
+            None,
         )
         .unwrap();
 
@@ -651,7 +839,7 @@ mod tests {
         let project_root = temporary.join("project");
         std::fs::create_dir_all(&project_root).unwrap();
 
-        let surface = crate::child_catalog::resolve_child_surface(&[], &[]).unwrap();
+        let surface = crate::child_catalog::resolve_child_surface(&[], &[], &[]).unwrap();
         let task_registry = TaskExecutionRegistry::new();
         let execution_id = task_registry.admit(TaskLaunchMode::Foreground).unwrap();
         let (tools, dispatcher) = production_child_tool_runtime(
@@ -660,6 +848,7 @@ mod tests {
             &surface,
             task_registry,
             execution_id,
+            None,
             None,
         )
         .unwrap();
@@ -724,6 +913,7 @@ mod tests {
                     PermissionPattern::Any,
                 ),
             ],
+            &[],
         )
         .unwrap();
         let task_registry = TaskExecutionRegistry::new();
@@ -734,6 +924,7 @@ mod tests {
             &surface,
             task_registry,
             execution_id,
+            None,
             None,
         )
         .unwrap();
@@ -785,6 +976,7 @@ mod tests {
                 PermissionPattern::glob("task_control").unwrap(),
                 PermissionPattern::Any,
             )],
+            &[],
         )
         .unwrap();
         let task_registry = TaskExecutionRegistry::new();
@@ -795,6 +987,7 @@ mod tests {
             &surface,
             task_registry,
             execution_id,
+            None,
             None,
         )
         .unwrap();
@@ -1167,7 +1360,7 @@ mod tests {
                 .is_none()
         );
 
-        let surface = crate::child_catalog::resolve_child_surface(&[], &[]).unwrap();
+        let surface = crate::child_catalog::resolve_child_surface(&[], &[], &[]).unwrap();
         let task_registry = TaskExecutionRegistry::new();
         let execution_id = task_registry.admit(TaskLaunchMode::Foreground).unwrap();
         let (child_tools, child_dispatcher) = production_child_tool_runtime(
@@ -1176,6 +1369,7 @@ mod tests {
             &surface,
             task_registry,
             execution_id,
+            None,
             None,
         )
         .unwrap();
