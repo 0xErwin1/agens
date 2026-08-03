@@ -61,22 +61,33 @@ impl ChildSurfaceRejection {
 }
 
 /// Native tools a delegated child holds beside the catalog's. Their
-/// implementations are bound to the execution they coordinate rather than to
-/// the worktree, so the child's runtime constructs and registers them itself
-/// instead of reading them out of [`NativeToolCatalog::metadata`].
+/// implementations are bound to the execution or the installation they read
+/// from rather than to the worktree, so the child's runtime constructs and
+/// registers them itself instead of reading them out of
+/// [`NativeToolCatalog::metadata`].
 ///
 /// They are enumerated here all the same, because a declaration is resolved
 /// against whatever this module calls the child's surface. A tool the surface
 /// omits is a tool no declaration can name — the rule survives as a pattern
 /// that never matches the dispatcher identity, and reads as enforced while
 /// deciding nothing.
-pub const CHILD_COORDINATION_TOOLS: [&str; 2] = ["native::task_control", "native::task_message"];
+///
+/// `native::skill` is here because an agent definition that tells its executor
+/// to read a skill, as the SDD phase definitions do, is describing a tool that
+/// executor has to hold. Withholding it did not restrict anything: it left
+/// those instructions unexecutable while the parent that wrote them could read
+/// the same skill freely.
+pub const CHILD_NON_CATALOG_TOOLS: [&str; 3] = [
+    "native::skill",
+    "native::task_control",
+    "native::task_message",
+];
 
 #[derive(Debug)]
 pub struct ChildToolSurface {
     pub tools: Vec<NativeToolMetadata>,
     /// The coordination tools the declarations leave reachable, in
-    /// [`CHILD_COORDINATION_TOOLS`] order.
+    /// [`CHILD_NON_CATALOG_TOOLS`] order.
     pub coordination_tools: Vec<&'static str>,
     pub rules: Vec<PermissionRule>,
     pub configured_floor: ConfiguredFloor,
@@ -85,11 +96,11 @@ pub struct ChildToolSurface {
 /// Resolves the surface a delegated child runs under from the parent's own
 /// configured `[permissions]` rules and the agent definition's declarations.
 ///
-/// `parent_rules` bound the result and are never a source of authority: only a
-/// declaration can authorize a child tool, so a configured `allow` grants the
-/// child nothing on its own. It can, however, carve an exception out of a
-/// configured `deny`, because the configured rules are resolved against each
-/// other before any declaration sees them.
+/// `parent_rules` bound the result and are never a source of authority: a
+/// configured `allow` widens nothing, because the child already authorizes
+/// whatever the narrowing leaves it. It can, however, carve an exception out
+/// of a configured `deny`, because the configured rules are resolved against
+/// each other before any declaration sees them.
 ///
 /// Where that resolution nets to a denial it is enforced three ways — the tool
 /// leaves the catalog when no call to it could survive, a declaration that
@@ -108,7 +119,7 @@ pub fn resolve_child_surface(
     let surface = metadata
         .iter()
         .map(|entry| entry.qualified_name.as_str())
-        .chain(CHILD_COORDINATION_TOOLS)
+        .chain(CHILD_NON_CATALOG_TOOLS)
         .collect::<Vec<_>>();
 
     let parent_rules = parent_rules
@@ -155,7 +166,7 @@ pub fn resolve_child_surface(
         .into_iter()
         .filter(|entry| reachable(&entry.qualified_name))
         .collect::<Vec<_>>();
-    let coordination_tools = CHILD_COORDINATION_TOOLS
+    let coordination_tools = CHILD_NON_CATALOG_TOOLS
         .into_iter()
         .filter(|tool| reachable(tool))
         .collect::<Vec<_>>();
@@ -579,7 +590,7 @@ mod tests {
                 "a child with no declarations must be able to use {tool}"
             );
         }
-        for tool in CHILD_COORDINATION_TOOLS {
+        for tool in CHILD_NON_CATALOG_TOOLS {
             assert!(authorizes(&surface, tool));
         }
     }

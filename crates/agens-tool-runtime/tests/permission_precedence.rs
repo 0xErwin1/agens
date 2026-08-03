@@ -2070,6 +2070,7 @@ fn registered_child_native_access() -> Vec<(String, ToolAccess)> {
         &surface,
         registry,
         execution,
+        None,
     )
     .expect("the child runtime must build");
 
@@ -2184,7 +2185,7 @@ fn every_native_registered_beside_the_catalog_is_named_by_the_list_that_resolves
     );
     assert_eq!(
         beside(child.clone()),
-        agens_tool_runtime::child_catalog::CHILD_COORDINATION_TOOLS,
+        agens_tool_runtime::child_catalog::CHILD_NON_CATALOG_TOOLS,
         "a native a child registers outside the catalog has to be named where declarations are \
          expanded"
     );
@@ -2216,7 +2217,7 @@ fn every_native_registered_beside_the_catalog_is_named_by_the_list_that_resolves
 /// unmatched override, the session's bypass and the mode, none of which read
 /// access; and the automatic grant a delegated subagent runs under is a list of
 /// names in `child_catalog` rather than a class — `AUTO_ALLOW_NATIVE_TOOLS`'
-/// six, plus whichever of the two `CHILD_COORDINATION_TOOLS` this delegation's
+/// six, plus whichever of the two `CHILD_NON_CATALOG_TOOLS` this delegation's
 /// own rules leave reachable, so eight at most and six at least. It excludes
 /// `native::webfetch` precisely because that tool is `ReadOnly` and the class
 /// is the wrong predicate for it.
@@ -2269,7 +2270,7 @@ fn every_native_beside_the_catalog_has_its_access_written_down_and_held_by_the_c
     );
 
     let child = registered_child_native_access();
-    for tool in agens_tool_runtime::child_catalog::CHILD_COORDINATION_TOOLS {
+    for tool in agens_tool_runtime::child_catalog::CHILD_NON_CATALOG_TOOLS {
         let expected = ACCESS_OF_THE_NATIVES_REGISTERED_BESIDE_THE_CATALOG
             .iter()
             .find(|(name, _)| *name == tool)

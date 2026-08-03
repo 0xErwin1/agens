@@ -211,12 +211,15 @@ pub fn run_production_task(
             );
             ChildRunError::DeclarationRejected(rejection)
         })?;
+    let skills = agens_bootstrap::discover_skill_catalog(bootstrap, project_root)
+        .map_err(|_| ChildRunError::Runtime)?;
     let (provider_tools, tool_runtime) = production_child_tool_runtime(
         project_root,
         bootstrap.tool_limits(),
         &surface,
         task_registry.clone(),
         execution_id,
+        Some(skills.catalog()),
     )
     .map_err(|_| ChildRunError::Runtime)?;
     let diagnostic_store = diagnostic_store(bootstrap);
@@ -868,6 +871,7 @@ mod tests {
             &surface,
             registry.clone(),
             execution_id,
+            None,
         )
         .unwrap();
 
