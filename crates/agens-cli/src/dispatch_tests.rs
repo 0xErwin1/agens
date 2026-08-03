@@ -19,6 +19,7 @@ use agens_tool_runtime::{
 };
 
 use agens_config::ToolLimitSettings;
+use agens_core::ask_user::UnavailableAskUserPort;
 use agens_core::{
     DiscardCompletedTurnRepository, HeadlessPermissionResolver, HeadlessToolCall,
     HeadlessToolDispatcher, HeadlessToolOutput, HeadlessTurnCancellation, MessagePart,
@@ -302,6 +303,7 @@ fn u15_c1c_backgrounded_success_skips_the_parent_provider_and_history_path() {
             Arc::clone(&probe),
         )
         .with_lifecycle_bridge(lifecycle_bridge.clone()),
+        Box::new(UnavailableAskUserPort),
     )
     .unwrap();
     runtime.authorized.gate.policy = PermissionPolicy::new(
@@ -353,11 +355,13 @@ fn u15_c1c_backgrounded_success_skips_the_parent_provider_and_history_path() {
     );
     assert_eq!(
         next_event(std::time::Duration::from_secs(1)),
-        TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::started(
+        TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::started_on(
             1,
             "reviewer",
             "review task",
             agens_tui::TuiExecutionState::ForegroundRunning,
+            Some("gpt-4.1"),
+            None,
         ))
     );
     assert!(controls.transition_to_background(1));
@@ -424,6 +428,7 @@ fn u15_a1b2_permission_cardinality_is_exact_for_allow_ask_and_deny() {
             agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap),
             Arc::clone(&probe),
         ),
+        Box::new(UnavailableAskUserPort),
     )
     .unwrap();
     let cancellation = HeadlessTurnCancellation::new();
@@ -470,21 +475,20 @@ fn u15_a1b2_permission_cardinality_is_exact_for_allow_ask_and_deny() {
 }
 
 /// Pins the CRITICAL fix for the TUI-launched-subagent path: a runner carrying
-/// `with_bypass(true)` must resolve an `Ask` decision to `Allow` on `runtime.authorized`
-/// without prompting, and a runner with `with_bypass(false)` must still prompt. This is the
-/// exact seam `production_tui_task_runtime_with_runner_and_parent_config` feeds and
-/// `crates/agens-tui-app/src/engine.rs`'s selected-subagent-launch runtime must be built through.
+/// `with_bypass(true)` must resolve an *unmatched* call's fallback `Ask` to `Allow` on
+/// `runtime.authorized` without prompting, and a runner with `with_bypass(false)` must still
+/// prompt. This is the exact seam `production_tui_task_runtime_with_runner_and_parent_config`
+/// feeds and `crates/agens-tui-app/src/engine.rs`'s selected-subagent-launch runtime must be
+/// built through.
+///
+/// The policy here carries no rule for `native::task` on purpose: a matched declared decision
+/// (from a static rule or a grant) now outranks bypass unconditionally, so testing the
+/// bypass-fallback wiring needs an unmatched call, exactly as `native::task` is in production
+/// unless an agent explicitly declares a rule for it.
 #[test]
 fn u15_bypass_upgrades_ask_to_allow_on_the_authorized_launch_path_and_no_bypass_still_prompts() {
     fn ask_policy() -> PermissionPolicy {
-        PermissionPolicy::new(
-            PermissionMode::Edit,
-            vec![PermissionRule::global(
-                PermissionDecision::Ask,
-                PermissionPattern::Exact("native::task".into()),
-                PermissionPattern::Any,
-            )],
-        )
+        PermissionPolicy::new(PermissionMode::Edit, Vec::new())
     }
 
     let temporary = tui_session_directory("selected-task-bypass");
@@ -508,6 +512,7 @@ fn u15_bypass_upgrades_ask_to_allow_on_the_authorized_launch_path_and_no_bypass_
             Arc::clone(&probe),
         )
         .with_bypass(true),
+        Box::new(UnavailableAskUserPort),
     )
     .unwrap();
     bypassed_runtime.authorized.gate.policy = ask_policy();
@@ -549,6 +554,7 @@ fn u15_bypass_upgrades_ask_to_allow_on_the_authorized_launch_path_and_no_bypass_
             Arc::clone(&probe),
         )
         .with_bypass(false),
+        Box::new(UnavailableAskUserPort),
     )
     .unwrap();
     unbypassed_runtime.authorized.gate.policy = ask_policy();
@@ -579,6 +585,10 @@ fn u15_bypass_upgrades_ask_to_allow_on_the_authorized_launch_path_and_no_bypass_
 /// Pins the actual production entry point `crates/agens-tui-app/src/engine.rs` calls for the
 /// selected-subagent-launch runtime (before this fix, `production_tui_task_runtime` had no
 /// parameter to carry the session's bypass at all, so the flag could never reach `authorized`).
+///
+/// The gate's policy carries no rule for `native::task`: a matched declared decision now
+/// outranks bypass unconditionally, so this has to be an unmatched call to exercise the
+/// bypass-fallback wiring being pinned here.
 #[test]
 fn u15_the_production_wrapper_threads_its_bypass_flag_into_the_authorized_gate() {
     let temporary = tui_session_directory("selected-task-bypass-wrapper");
@@ -601,16 +611,10 @@ fn u15_the_production_wrapper_threads_its_bypass_flag_into_the_authorized_gate()
         agens_core::RequestConfig::default(),
         "bypass-wrapper-check".to_owned(),
         true,
+        Box::new(UnavailableAskUserPort),
     )
     .unwrap();
-    runtime.authorized.gate.policy = PermissionPolicy::new(
-        PermissionMode::Edit,
-        vec![PermissionRule::global(
-            PermissionDecision::Ask,
-            PermissionPattern::Exact("native::task".into()),
-            PermissionPattern::Any,
-        )],
-    );
+    runtime.authorized.gate.policy = PermissionPolicy::new(PermissionMode::Edit, Vec::new());
     let call = HeadlessToolCall {
         id: "call-1".into(),
         name: "native::task".into(),
@@ -654,6 +658,7 @@ fn u15_a1b2_rejections_leave_the_concrete_runner_and_grants_unchanged() {
             agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap),
             Arc::clone(&probe),
         ),
+        Box::new(UnavailableAskUserPort),
     )
     .unwrap();
     let selected = || {
@@ -945,6 +950,12 @@ fn canonical_filesystem_reasons_survive_sanitization() {
     );
 }
 
+/// A declared policy decision now outranks the dangerous-mode fallback: the
+/// fallback only ever fires for a call that matched no static rule and no
+/// grant. `dangerous_override` used to short-circuit an ordinary declared
+/// `Deny` straight to `Authorized`; it no longer reaches a matched rule at
+/// all, so a declared `deny native::write` still denies with dangerous mode
+/// on.
 #[test]
 fn dangerous_override_never_precedes_hard_safety_or_reuses_authorization() {
     let ordinary_deny = PermissionPolicy::new(
@@ -970,7 +981,10 @@ fn dangerous_override_never_precedes_hard_safety_or_reuses_authorization() {
     );
     assert!(ordinary.result.is_ok());
     assert!(ordinary.prompts.is_empty());
-    assert_eq!(ordinary.executions, ["notes.md"]);
+    assert!(
+        ordinary.executions.is_empty(),
+        "a declared deny must survive dangerous mode, not just hard safety predicates"
+    );
 
     let hard_global_deny = PermissionPolicy::with_safety_predicates(
         PermissionMode::Edit,
@@ -1016,14 +1030,19 @@ fn dangerous_override_never_precedes_hard_safety_or_reuses_authorization() {
     assert!(chat.prompts.is_empty());
     assert!(chat.executions.is_empty());
 
-    for (name, input) in [
-        ("native::write", "{malformed"),
+    let missing_tool = "tool call refused: this session has no tool by that name; it was not \
+                        denied and its arguments are not at fault, so no rewriting of this call \
+                        can reach a tool; call one of the tools you were given instead";
+    for (name, input, expected_content) in [
+        ("native::write", "{malformed", "invalid tool arguments"),
         (
             "native::task",
             r#"{"agent":"worker","description":"recursive"}"#,
+            "permission denied",
         ),
-        ("mcp::server::tool", r#"{}"#),
-        ("native::unregistered", r#"{}"#),
+        ("edit", r#"{"path":"notes.md"}"#, "permission denied"),
+        ("mcp::server::tool", r#"{}"#, missing_tool),
+        ("native::unregistered", r#"{}"#, missing_tool),
     ] {
         let rejected = run_production_batch_with_policy(
             ProductionBatchInput::new(
@@ -1043,16 +1062,19 @@ fn dangerous_override_never_precedes_hard_safety_or_reuses_authorization() {
         );
         assert!(rejected.prompts.is_empty());
         assert!(rejected.executions.is_empty());
-        assert!(rejected.progress.iter().any(|event| {
-            matches!(
-                event,
-                TurnEvent::ToolResult(MessagePart::ToolResult {
-                    is_error: true,
-                    content,
-                    ..
-                }) if content == "invalid tool arguments"
-            )
-        }));
+        assert!(
+            rejected.progress.iter().any(|event| {
+                matches!(
+                    event,
+                    TurnEvent::ToolResult(MessagePart::ToolResult {
+                        is_error: true,
+                        content,
+                        ..
+                    }) if content == expected_content
+                )
+            }),
+            "{name} should report {expected_content:?}"
+        );
     }
 
     let calls = Arc::new(Mutex::new(Vec::new()));

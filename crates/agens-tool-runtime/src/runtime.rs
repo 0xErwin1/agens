@@ -7,9 +7,10 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use agens_config::{SubagentSettings, ToolLimitSettings};
+use agens_core::ask_user::{AskUserPort, UnavailableAskUserPort};
 use agens_providers::OpenAiFunctionTool;
 use agens_tools::{
-    NativeToolCatalog, NativeTools, SkillCatalog, SkillResourceTool, TaskControlTool,
+    AskUserTool, NativeToolCatalog, NativeTools, SkillCatalog, SkillResourceTool, TaskControlTool,
     TaskExecutionRegistry, TaskMessageSource, TaskMessageTool, TaskRunner, ToolDispatcher,
 };
 
@@ -123,6 +124,33 @@ pub fn production_tool_runtime_with_parent_task_runner<R: TaskRunner>(
     model_resolution_reference: Option<String>,
     task_runner: R,
 ) -> Result<(Vec<OpenAiFunctionTool>, SharedToolDispatcher), CliError> {
+    production_tool_runtime_with_parent_task_runner_and_ask_user(
+        bootstrap,
+        project_root,
+        skills,
+        parent_model,
+        parent_request_config,
+        model_resolution_reference,
+        task_runner,
+        Box::new(UnavailableAskUserPort),
+    )
+}
+
+/// Same as [`production_tool_runtime_with_parent_task_runner`], but lets the caller supply the
+/// `ask_user` port instead of always defaulting to [`UnavailableAskUserPort`]. Kept as a
+/// separate function rather than adding a parameter to the existing one, so every one of that
+/// function's ~20 existing callers keeps compiling unchanged.
+#[allow(clippy::too_many_arguments)]
+pub fn production_tool_runtime_with_parent_task_runner_and_ask_user<R: TaskRunner>(
+    bootstrap: &Bootstrap,
+    project_root: &Path,
+    skills: Option<&SkillCatalog>,
+    parent_model: String,
+    parent_request_config: agens_core::RequestConfig,
+    model_resolution_reference: Option<String>,
+    task_runner: R,
+    ask_user: Box<dyn AskUserPort>,
+) -> Result<(Vec<OpenAiFunctionTool>, SharedToolDispatcher), CliError> {
     agens_callcount::note_tool_runtime_build();
 
     let native_catalog = Arc::new(Mutex::new(NativeToolCatalog::new(open_native_tools(
@@ -134,6 +162,12 @@ pub fn production_tool_runtime_with_parent_task_runner<R: TaskRunner>(
         project_root,
     )));
     let mut dispatcher = ToolDispatcher::new();
+    dispatcher.declare_mcp_servers(
+        bootstrap
+            .mcp_servers
+            .iter()
+            .map(|server| server.name.clone()),
+    );
     let mut provider_tools = BTreeMap::new();
     let discovered_skills;
     let skills = match skills {
@@ -178,7 +212,24 @@ pub fn production_tool_runtime_with_parent_task_runner<R: TaskRunner>(
         .register_native(
             "native::skill",
             agens_core::ToolAccess::ReadOnly,
-            SkillResourceTool::new(skills.clone()),
+            SkillResourceTool::new(skills.clone(), project_root),
+        )
+        .map_err(|_| CliError::configuration("tool catalog is invalid"))?;
+
+    provider_tools.insert(
+        "ask_user".into(),
+        OpenAiFunctionTool::new(
+            "ask_user",
+            "Ask the person at the terminal one or more bounded structured questions",
+            AskUserTool::input_schema(),
+        )
+        .map_err(|_| CliError::configuration("ask_user tool is unavailable"))?,
+    );
+    dispatcher
+        .register_native(
+            "native::ask_user",
+            agens_core::ToolAccess::ReadOnly,
+            AskUserTool::new(ask_user),
         )
         .map_err(|_| CliError::configuration("tool catalog is invalid"))?;
 
@@ -215,36 +266,6 @@ pub fn production_tool_runtime_with_parent_task_runner<R: TaskRunner>(
     }
 
     Ok((provider_tools.into_values().collect(), runtime.dispatcher))
-}
-
-fn production_read_only_tool_runtime(
-    project_root: &Path,
-    tool_limits: ToolLimitSettings,
-) -> Result<(Vec<OpenAiFunctionTool>, SharedToolDispatcher), CliError> {
-    let catalog = Arc::new(Mutex::new(NativeToolCatalog::new(open_native_tools(
-        project_root,
-        tool_limits,
-    )?)));
-    let metadata = NativeToolCatalog::metadata()
-        .into_iter()
-        .find(|metadata| metadata.qualified_name == "native::read")
-        .ok_or_else(|| CliError::configuration("native read tool is unavailable"))?;
-    let name = native_model_tool_name(&metadata.qualified_name)?;
-    let tool = OpenAiFunctionTool::new(name.clone(), metadata.description, metadata.input_schema)
-        .map_err(|_| CliError::configuration("native tools are unavailable"))?;
-    let mut dispatcher = ToolDispatcher::new();
-    dispatcher
-        .register_native(
-            "native::read",
-            metadata.access,
-            RegisteredNativeTool {
-                name: "native::read".into(),
-                catalog,
-            },
-        )
-        .map_err(|_| CliError::configuration("tool catalog is invalid"))?;
-
-    Ok((vec![tool], Arc::new(Mutex::new(dispatcher))))
 }
 
 pub fn production_dangerous_child_tool_runtime(
@@ -292,54 +313,81 @@ pub fn production_dangerous_child_tool_runtime(
 pub fn production_child_tool_runtime(
     project_root: &Path,
     tool_limits: ToolLimitSettings,
-    dangerous_mode: bool,
+    surface: &crate::child_catalog::ChildToolSurface,
     task_registry: TaskExecutionRegistry,
     execution_id: agens_tools::TaskExecutionId,
 ) -> Result<(Vec<OpenAiFunctionTool>, SharedToolDispatcher), CliError> {
-    let (mut provider_tools, dispatcher) = if dangerous_mode {
-        production_dangerous_child_tool_runtime(project_root, tool_limits)
-    } else {
-        production_read_only_tool_runtime(project_root, tool_limits)
-    }?;
-    provider_tools.push(
-        OpenAiFunctionTool::new(
-            "task_control",
-            "Inspect, background, or cancel this subagent execution",
-            TaskControlTool::input_schema(),
-        )
-        .map_err(|_| CliError::configuration("task control tool is unavailable"))?,
-    );
-    provider_tools.push(
-        OpenAiFunctionTool::new(
-            "task_message",
-            "Queue a bounded coordination message for the main agent",
-            TaskMessageTool::input_schema(),
-        )
-        .map_err(|_| CliError::configuration("task message tool is unavailable"))?,
-    );
-    let mut dispatcher_guard = dispatcher
-        .lock()
-        .map_err(|_| CliError::configuration("tool catalog is unavailable"))?;
-    dispatcher_guard
-        .register_native(
-            "native::task_control",
-            agens_core::ToolAccess::Write,
-            TaskControlTool::new(
-                task_registry.clone(),
-                TaskMessageSource::Execution(execution_id),
-            ),
-        )
-        .map_err(|_| CliError::configuration("tool catalog is invalid"))?;
-    dispatcher_guard
-        .register_native(
-            "native::task_message",
-            agens_core::ToolAccess::Write,
-            TaskMessageTool::new(task_registry, TaskMessageSource::Execution(execution_id)),
-        )
-        .map_err(|_| CliError::configuration("tool catalog is invalid"))?;
-    drop(dispatcher_guard);
+    let catalog = Arc::new(Mutex::new(NativeToolCatalog::new(open_native_tools(
+        project_root,
+        tool_limits,
+    )?)));
+    let mut provider_tools = Vec::with_capacity(surface.tools.len());
+    let mut dispatcher = ToolDispatcher::new();
 
-    Ok((provider_tools, dispatcher))
+    for metadata in &surface.tools {
+        let model_name = native_model_tool_name(&metadata.qualified_name)?;
+        provider_tools.push(
+            OpenAiFunctionTool::new(
+                model_name,
+                metadata.description.clone(),
+                metadata.input_schema.clone(),
+            )
+            .map_err(|_| CliError::configuration("native tools are unavailable"))?,
+        );
+        dispatcher
+            .register_native(
+                metadata.qualified_name.clone(),
+                metadata.access,
+                RegisteredNativeTool {
+                    name: metadata.qualified_name.clone(),
+                    catalog: Arc::clone(&catalog),
+                },
+            )
+            .map_err(|_| CliError::configuration("tool catalog is invalid"))?;
+    }
+
+    let holds = |tool: &str| surface.coordination_tools.contains(&tool);
+
+    if holds("native::task_control") {
+        provider_tools.push(
+            OpenAiFunctionTool::new(
+                "task_control",
+                "Inspect, background, or cancel this subagent execution",
+                TaskControlTool::input_schema(),
+            )
+            .map_err(|_| CliError::configuration("task control tool is unavailable"))?,
+        );
+        dispatcher
+            .register_native(
+                "native::task_control",
+                agens_core::ToolAccess::Write,
+                TaskControlTool::new(
+                    task_registry.clone(),
+                    TaskMessageSource::Execution(execution_id),
+                ),
+            )
+            .map_err(|_| CliError::configuration("tool catalog is invalid"))?;
+    }
+
+    if holds("native::task_message") {
+        provider_tools.push(
+            OpenAiFunctionTool::new(
+                "task_message",
+                "Queue a bounded coordination message for the main agent",
+                TaskMessageTool::input_schema(),
+            )
+            .map_err(|_| CliError::configuration("task message tool is unavailable"))?,
+        );
+        dispatcher
+            .register_native(
+                "native::task_message",
+                agens_core::ToolAccess::Write,
+                TaskMessageTool::new(task_registry, TaskMessageSource::Execution(execution_id)),
+            )
+            .map_err(|_| CliError::configuration("tool catalog is invalid"))?;
+    }
+
+    Ok((provider_tools, Arc::new(Mutex::new(dispatcher))))
 }
 
 #[cfg(test)]
@@ -489,30 +537,169 @@ mod tests {
         }
         drop(dispatcher);
 
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn child_catalog_inherits_the_parents_surface_by_default() {
+        let temporary = tui_session_directory("child-catalog-default");
+        let project_root = temporary.join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+
+        let surface = crate::child_catalog::resolve_child_surface(&[], &[]).unwrap();
         let task_registry = TaskExecutionRegistry::new();
         let execution_id = task_registry.admit(TaskLaunchMode::Foreground).unwrap();
-        let (mode_off_tools, mode_off_dispatcher) = production_child_tool_runtime(
+        let (tools, dispatcher) = production_child_tool_runtime(
             &project_root,
             ToolLimitSettings::default(),
-            false,
+            &surface,
             task_registry,
             execution_id,
         )
         .unwrap();
+
         assert_eq!(
-            mode_off_tools
-                .iter()
-                .map(|tool| tool.name())
-                .collect::<Vec<_>>(),
-            ["read", "task_control", "task_message"]
+            tools.iter().map(|tool| tool.name()).collect::<Vec<_>>(),
+            [
+                "read",
+                "write",
+                "edit",
+                "list",
+                "search",
+                "grep",
+                "glob",
+                "bash",
+                "git_read",
+                "webfetch",
+                "task_control",
+                "task_message",
+            ]
         );
+        let dispatcher = dispatcher.lock().unwrap();
+        for name in ["native::read", "native::write", "native::bash"] {
+            assert!(
+                dispatcher.canonical_identity(name).is_some(),
+                "{name} must be reachable when nothing narrows the inherited surface"
+            );
+        }
+        drop(dispatcher);
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn child_catalog_omits_a_declared_deny() {
+        let temporary = tui_session_directory("child-catalog-narrowed");
+        let project_root = temporary.join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+
+        let surface = crate::child_catalog::resolve_child_surface(
+            &[],
+            &[
+                PermissionRule::global(
+                    PermissionDecision::Deny,
+                    PermissionPattern::glob("write").unwrap(),
+                    PermissionPattern::Any,
+                ),
+                PermissionRule::global(
+                    PermissionDecision::Deny,
+                    PermissionPattern::glob("edit").unwrap(),
+                    PermissionPattern::Any,
+                ),
+                PermissionRule::global(
+                    PermissionDecision::Deny,
+                    PermissionPattern::glob("bash").unwrap(),
+                    PermissionPattern::Any,
+                ),
+                PermissionRule::global(
+                    PermissionDecision::Deny,
+                    PermissionPattern::glob("webfetch").unwrap(),
+                    PermissionPattern::Any,
+                ),
+            ],
+        )
+        .unwrap();
+        let task_registry = TaskExecutionRegistry::new();
+        let execution_id = task_registry.admit(TaskLaunchMode::Foreground).unwrap();
+        let (tools, dispatcher) = production_child_tool_runtime(
+            &project_root,
+            ToolLimitSettings::default(),
+            &surface,
+            task_registry,
+            execution_id,
+        )
+        .unwrap();
+
+        assert_eq!(
+            tools.iter().map(|tool| tool.name()).collect::<Vec<_>>(),
+            [
+                "read",
+                "list",
+                "search",
+                "grep",
+                "glob",
+                "git_read",
+                "task_control",
+                "task_message",
+            ]
+        );
+        let dispatcher = dispatcher.lock().unwrap();
+        for name in [
+            "native::write",
+            "native::edit",
+            "native::bash",
+            "native::webfetch",
+        ] {
+            assert!(
+                dispatcher.canonical_identity(name).is_none(),
+                "{name} must be absent from a narrowed child catalog"
+            );
+        }
+        drop(dispatcher);
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    /// A coordination tool is registered by this function rather than read out
+    /// of the catalog, which is exactly why a declaration naming one used to
+    /// decide nothing. `deny` has to remove it as it removes any other tool.
+    #[test]
+    fn child_catalog_omits_a_declared_deny_on_a_coordination_tool() {
+        let temporary = tui_session_directory("child-catalog-coordination");
+        let project_root = temporary.join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+
+        let surface = crate::child_catalog::resolve_child_surface(
+            &[],
+            &[PermissionRule::global(
+                PermissionDecision::Deny,
+                PermissionPattern::glob("task_control").unwrap(),
+                PermissionPattern::Any,
+            )],
+        )
+        .unwrap();
+        let task_registry = TaskExecutionRegistry::new();
+        let execution_id = task_registry.admit(TaskLaunchMode::Foreground).unwrap();
+        let (tools, dispatcher) = production_child_tool_runtime(
+            &project_root,
+            ToolLimitSettings::default(),
+            &surface,
+            task_registry,
+            execution_id,
+        )
+        .unwrap();
+
+        assert!(tools.iter().all(|tool| tool.name() != "task_control"));
+        assert!(tools.iter().any(|tool| tool.name() == "task_message"));
+        let dispatcher = dispatcher.lock().unwrap();
+        assert_eq!(dispatcher.canonical_identity("native::task_control"), None);
         assert!(
-            mode_off_dispatcher
-                .lock()
-                .unwrap()
-                .canonical_identity("native::read")
-                .is_some()
+            dispatcher
+                .canonical_identity("native::task_message")
+                .is_some(),
+            "denying one coordination tool must leave the other reachable"
         );
+        drop(dispatcher);
 
         std::fs::remove_dir_all(temporary).unwrap();
     }
@@ -702,6 +889,193 @@ mod tests {
         assert_eq!(dispatcher.canonical_identity("native::task"), None);
         drop(dispatcher);
         std::fs::remove_dir_all(override_temporary).unwrap();
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn ask_user_has_exactly_one_provider_definition_named_ask_user_not_native_prefixed() {
+        let temporary = tui_session_directory("ask-user-provider-definition");
+        let bootstrap = tui_session_bootstrap(&temporary, &[]);
+        let project_root = agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap);
+
+        let (provider_tools, dispatcher) = production_tool_runtime_for_parent(
+            &bootstrap,
+            &project_root,
+            Some(&SkillCatalog::default()),
+            "gpt-4.1".to_owned(),
+            agens_core::RequestConfig::default(),
+            None,
+        )
+        .unwrap();
+
+        let matches: Vec<_> = provider_tools
+            .iter()
+            .filter(|tool| tool.name() == "ask_user")
+            .collect();
+        assert_eq!(
+            matches.len(),
+            1,
+            "exactly one provider tool must be named ask_user, saw {:?}",
+            provider_tools
+                .iter()
+                .map(|tool| tool.name())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            provider_tools
+                .iter()
+                .all(|tool| tool.name() != "native::ask_user"),
+            "the provider-visible name must have the native:: prefix stripped"
+        );
+        assert!(
+            dispatcher
+                .lock()
+                .unwrap()
+                .canonical_identity("native::ask_user")
+                .is_some(),
+            "the dispatch identity native::ask_user must be registered"
+        );
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    /// `hard_safety_allows` denies a `ToolAccess::Write` tool outright in `PermissionMode::Chat`
+    /// regardless of any matching rule. Proving a matching Allow rule still authorizes
+    /// `native::ask_user` under Chat mode is therefore proof the tool is registered
+    /// `ToolAccess::ReadOnly`, since a `Write` registration would be hard-denied here even with
+    /// the rule present.
+    #[test]
+    fn ask_user_is_registered_read_only_and_survives_chat_mode_hard_safety() {
+        let temporary = tui_session_directory("ask-user-read-only-classification");
+        let bootstrap = tui_session_bootstrap(&temporary, &[]);
+        let project_root = agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap);
+
+        let (_, dispatcher) = production_tool_runtime_for_parent(
+            &bootstrap,
+            &project_root,
+            Some(&SkillCatalog::default()),
+            "gpt-4.1".to_owned(),
+            agens_core::RequestConfig::default(),
+            None,
+        )
+        .unwrap();
+
+        let policy = PermissionPolicy::new(
+            PermissionMode::Chat,
+            vec![PermissionRule::global(
+                PermissionDecision::Allow,
+                PermissionPattern::Exact("native::ask_user".into()),
+                PermissionPattern::Any,
+            )],
+        );
+        let outcome = dispatcher
+            .lock()
+            .unwrap()
+            .evaluate(
+                &policy,
+                &[],
+                &PermissionSession::new(),
+                ToolDispatchRequest::new("project", "native::ask_user", serde_json::json!({})),
+            )
+            .unwrap();
+
+        assert!(
+            matches!(outcome, ToolEvaluationOutcome::Authorized(_)),
+            "a ReadOnly tool with a matching Allow rule must not be hard-denied in Chat mode, saw {outcome:?}"
+        );
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn ask_user_default_wiring_yields_unavailable_without_blocking() {
+        let temporary = tui_session_directory("ask-user-default-unavailable");
+        let bootstrap = tui_session_bootstrap(&temporary, &[]);
+        let project_root = agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap);
+
+        let (_, dispatcher) = production_tool_runtime_for_parent(
+            &bootstrap,
+            &project_root,
+            Some(&SkillCatalog::default()),
+            "gpt-4.1".to_owned(),
+            agens_core::RequestConfig::default(),
+            None,
+        )
+        .unwrap();
+
+        let policy = PermissionPolicy::new(PermissionMode::Edit, vec![]);
+        let cancellation = HeadlessTurnCancellation::new();
+        let context = ToolExecutionContext::from_headless_adapter(cancellation.adapter_view());
+        let mut dispatcher = dispatcher.lock().unwrap();
+        let ToolEvaluationOutcome::Authorized(handle) = dispatcher
+            .evaluate(
+                &policy,
+                &[],
+                &PermissionSession::with_temporary_bypass(),
+                ToolDispatchRequest::new(
+                    "project",
+                    "native::ask_user",
+                    serde_json::json!({
+                        "questions": [{
+                            "id": "q",
+                            "prompt": "p",
+                            "mode": "single",
+                            "options": [{"id": "a", "label": "A"}]
+                        }]
+                    }),
+                ),
+            )
+            .unwrap()
+        else {
+            panic!("ask_user should authorize under a bypassed session");
+        };
+
+        let output = dispatcher.execute(handle, &context).unwrap();
+        assert!(!output.is_error);
+        assert_eq!(
+            output.content,
+            "{\"status\":\"unavailable\",\"reason\":\"no interactive surface\"}"
+        );
+    }
+
+    #[test]
+    fn ask_user_is_absent_from_every_child_runtime() {
+        let temporary = tui_session_directory("ask-user-absent-from-child-runtimes");
+        let project_root = temporary.join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+
+        let (dangerous_tools, dangerous_dispatcher) =
+            production_dangerous_child_tool_runtime(&project_root, ToolLimitSettings::default())
+                .unwrap();
+        assert!(dangerous_tools.iter().all(|tool| tool.name() != "ask_user"));
+        assert!(
+            dangerous_dispatcher
+                .lock()
+                .unwrap()
+                .canonical_identity("native::ask_user")
+                .is_none()
+        );
+
+        let surface = crate::child_catalog::resolve_child_surface(&[], &[]).unwrap();
+        let task_registry = TaskExecutionRegistry::new();
+        let execution_id = task_registry.admit(TaskLaunchMode::Foreground).unwrap();
+        let (child_tools, child_dispatcher) = production_child_tool_runtime(
+            &project_root,
+            ToolLimitSettings::default(),
+            &surface,
+            task_registry,
+            execution_id,
+        )
+        .unwrap();
+        assert!(child_tools.iter().all(|tool| tool.name() != "ask_user"));
+        assert!(
+            child_dispatcher
+                .lock()
+                .unwrap()
+                .canonical_identity("native::ask_user")
+                .is_none()
+        );
 
         std::fs::remove_dir_all(temporary).unwrap();
     }

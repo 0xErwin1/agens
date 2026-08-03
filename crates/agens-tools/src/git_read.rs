@@ -132,13 +132,148 @@ impl crate::NativeTools {
             ));
         }
 
-        let arguments = match subcommand_arguments(&input) {
-            Ok(arguments) => arguments,
-            Err(output) => return Ok(output),
+        match self.run_git_read(&input) {
+            Ok(output) => Ok(output),
+            Err(GitRunError::Reported(output)) => Ok(output),
+            Err(GitRunError::Fatal(error)) => Err(error),
+        }
+    }
+
+    fn run_git_read(&self, input: &GitReadInput) -> Result<ToolOutput, GitRunError> {
+        let mut arguments = subcommand_arguments(input)?;
+        let withheld = self.exclude_denied_files(input, &mut arguments)?;
+        let outcome = run_git(&self.project_root, &arguments, input)?;
+
+        Ok(rendered_output(input.operation, outcome, withheld))
+    }
+
+    /// Keeps the files a rule denies out of the patch, and reports whether any
+    /// were kept out.
+    ///
+    /// `diff` is the only operation that reports what a file holds: `status`
+    /// reports paths and status letters, `log` reports commit subjects, and
+    /// `branch_merged` and `merge_base` report refs. Paths are what `list` and
+    /// `glob` already report under any configuration that allows them, so the
+    /// rules bind contents here and the other four operations answer in full.
+    ///
+    /// The change set is read first, as paths, and every entry holding a
+    /// denied path is excluded from the patch by pathspec. Both sides of a
+    /// rename go together: excluding only the denied side leaves git printing
+    /// the same bytes under the other name.
+    fn exclude_denied_files(
+        &self,
+        input: &GitReadInput,
+        arguments: &mut Vec<String>,
+    ) -> Result<bool, GitRunError> {
+        if input.operation != GitReadOperation::Diff {
+            return Ok(false);
+        }
+        let Some(context) = input
+            .execution_context
+            .as_ref()
+            .filter(|context| context.filters_reads())
+        else {
+            return Ok(false);
         };
 
-        run_git(&self.project_root, &arguments, &input)
+        let prefix = self.repository_prefix(input)?;
+        let exclusions = self
+            .change_set(input)?
+            .into_iter()
+            .filter(|paths| {
+                paths
+                    .iter()
+                    .any(|path| !permits_reporting(context, &prefix, path))
+            })
+            .flatten()
+            .map(|path| format!(":(exclude,top,literal){path}"))
+            .collect::<Vec<_>>();
+
+        let withheld = !exclusions.is_empty();
+        arguments.extend(exclusions);
+
+        Ok(withheld)
     }
+
+    /// Where the project root sits inside the repository, as git spells it:
+    /// empty at the top, `sub/dir/` below it. The change set is reported
+    /// relative to the repository, and every permission rule is written
+    /// relative to the project root, so one of the two has to be translated
+    /// into the other before a rule can be asked about a file.
+    fn repository_prefix(&self, input: &GitReadInput) -> Result<String, GitRunError> {
+        let arguments = ["rev-parse".to_owned(), "--show-prefix".to_owned()];
+        let outcome = run_git(&self.project_root, &arguments, input)?;
+
+        if !outcome.success {
+            return Err(failure(input.operation, "the repository could not be located").into());
+        }
+
+        Ok(String::from_utf8_lossy(&outcome.output.stdout)
+            .trim_end_matches(['\r', '\n'])
+            .to_owned())
+    }
+
+    /// The files the patch would report, one entry per change and one path per
+    /// side of it, exactly as the patch itself selects them.
+    fn change_set(&self, input: &GitReadInput) -> Result<Vec<Vec<String>>, GitRunError> {
+        let mut arguments = subcommand_arguments(input)?;
+        arguments.splice(1..1, ["--raw".to_owned(), "-z".to_owned()]);
+
+        let outcome = run_git(&self.project_root, &arguments, input)?;
+        let undecidable = || {
+            GitRunError::from(failure(
+                input.operation,
+                "the files it would report could not be decided against the permission rules",
+            ))
+        };
+
+        if !outcome.success || outcome.output.truncated {
+            return Err(undecidable());
+        }
+
+        change_set_entries(&outcome.output.stdout).ok_or_else(undecidable)
+    }
+}
+
+/// Whether one file the patch would report may reach the caller, asked in the
+/// spelling the rules are written in.
+///
+/// A file outside the project root is withheld: no project-relative rule can
+/// name it, and every other native tool is confined beneath that root, so
+/// reporting it would be the one way to read past the confinement.
+fn permits_reporting(context: &ToolExecutionContext, prefix: &str, path: &str) -> bool {
+    path.strip_prefix(prefix)
+        .is_some_and(|relative| context.permits_read(relative))
+}
+
+/// Splits `git diff --raw -z` output into one entry per change, holding the
+/// paths that change reports: one for an ordinary change, two for a rename or
+/// a copy.
+///
+/// Reports `None` for anything it cannot read, including a path that is not
+/// UTF-8, so the caller refuses rather than reporting a file it could not ask
+/// about.
+fn change_set_entries(stdout: &[u8]) -> Option<Vec<Vec<String>>> {
+    let mut entries = Vec::new();
+    let mut fields = stdout
+        .split(|byte| *byte == 0)
+        .filter(|field| !field.is_empty());
+
+    while let Some(metadata) = fields.next() {
+        let status = std::str::from_utf8(metadata)
+            .ok()?
+            .strip_prefix(':')?
+            .rsplit(' ')
+            .next()?;
+        let sides = if status.starts_with(['R', 'C']) { 2 } else { 1 };
+
+        let paths = (0..sides)
+            .map(|_| String::from_utf8(fields.next()?.to_vec()).ok())
+            .collect::<Option<Vec<_>>>()?;
+        entries.push(paths);
+    }
+
+    Some(entries)
 }
 
 /// Builds the full argv after the hardening prefix. Revisions reach it only
@@ -253,11 +388,57 @@ fn validated_revision(operation: GitReadOperation, revision: &str) -> Result<Str
     Ok(revision.to_owned())
 }
 
+/// One completed `git` invocation, before it is turned into something the
+/// model reads. A single `git_read` call runs more than one of them.
+struct GitOutcome {
+    success: bool,
+    code: Option<i32>,
+    output: CappedOutput,
+}
+
+/// Why a `git_read` call stopped early: with an answer for the model, or with
+/// a failure of the runtime itself that no answer can stand in for.
+enum GitRunError {
+    Reported(ToolOutput),
+    Fatal(Error),
+}
+
+impl From<ToolOutput> for GitRunError {
+    fn from(output: ToolOutput) -> Self {
+        Self::Reported(output)
+    }
+}
+
+impl From<Error> for GitRunError {
+    fn from(error: Error) -> Self {
+        Self::Fatal(error)
+    }
+}
+
+fn rendered_output(operation: GitReadOperation, outcome: GitOutcome, withheld: bool) -> ToolOutput {
+    let rendered = render_streams(&outcome.output);
+    let notice = if withheld {
+        crate::WITHHELD_FILES_NOTICE
+    } else {
+        ""
+    };
+
+    if outcome.success {
+        ToolOutput::success(format!("{rendered}{notice}"))
+    } else {
+        ToolOutput::failure(format!(
+            "git_read {}: git exited with {}\n{rendered}{notice}",
+            operation.label(),
+            output_status(outcome.code)
+        ))
+    }
+}
+
 fn run_git(
     project_root: &std::path::Path,
     arguments: &[String],
     input: &GitReadInput,
-) -> Result<ToolOutput, Error> {
+) -> Result<GitOutcome, GitRunError> {
     let operation = input.operation;
     let mut command = Command::new("git");
 
@@ -277,11 +458,11 @@ fn run_git(
     }
 
     let Ok(mut child) = command.spawn() else {
-        return Ok(failure(operation, "failed to start git"));
+        return Err(failure(operation, "failed to start git").into());
     };
     let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
         let _ = terminate_process_group(&mut child);
-        return Ok(failure(operation, "output setup failed"));
+        return Err(failure(operation, "output setup failed").into());
     };
     let stdout_reader = read_capped(stdout);
     let stderr_reader = read_capped(stderr);
@@ -295,18 +476,19 @@ fn run_git(
 
         if cancelled || Instant::now() >= deadline {
             if terminate_process_group(&mut child).is_err() {
-                return Ok(failure(operation, "process cleanup failed"));
+                return Err(failure(operation, "process cleanup failed").into());
             }
             if wait_for_readers(stdout_reader, stderr_reader).is_err() {
-                return Ok(failure(operation, "process cleanup failed"));
+                return Err(failure(operation, "process cleanup failed").into());
             }
             if cancelled {
-                return Err(Error::Cancelled);
+                return Err(Error::Cancelled.into());
             }
-            return Ok(failure(
+            return Err(failure(
                 operation,
                 &format!("timed out after {}ms", input.timeout.as_millis()),
-            ));
+            )
+            .into());
         }
 
         let status = match child.try_wait() {
@@ -314,12 +496,12 @@ fn run_git(
             Err(_) => {
                 let _ = terminate_process_group(&mut child);
                 let _ = wait_for_readers(stdout_reader, stderr_reader);
-                return Ok(failure(operation, "wait failed"));
+                return Err(failure(operation, "wait failed").into());
             }
         };
         if let Some(status) = status {
             if kill_process_group(child.id()).is_err() {
-                return Ok(failure(operation, "process cleanup failed"));
+                return Err(failure(operation, "process cleanup failed").into());
             }
             break status;
         }
@@ -329,17 +511,12 @@ fn run_git(
 
     let output = wait_for_readers(stdout_reader, stderr_reader)
         .map_err(|_| Error::Tool("git_read: output reader failed".into()))?;
-    let rendered = render_streams(&output);
 
-    if status.success() {
-        Ok(ToolOutput::success(rendered))
-    } else {
-        Ok(ToolOutput::failure(format!(
-            "git_read {}: git exited with {}\n{rendered}",
-            operation.label(),
-            output_status(status.code())
-        )))
-    }
+    Ok(GitOutcome {
+        success: status.success(),
+        code: status.code(),
+        output,
+    })
 }
 
 /// Options that hold the read to a read, each one measured against the

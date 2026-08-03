@@ -2671,12 +2671,18 @@ fn tui_resume_overlay_restores_appends_reopens_and_resets_complete_history() {
         1,
         "{restored_render:?}"
     );
+    // A restored call is hidden by being one row, not by announcing that it is
+    // hidden: the "output collapsed" marker was removed with AGN-108. What the
+    // assertion owes the reader is that the body is absent, which the
+    // "previous result" check below already states.
+    // A collapsed thought keeps its opening line as the row's label, which is
+    // what tells one from the next; the body below it is what stays hidden.
     assert!(
-        restored_render.contains("output collapsed"),
+        restored_render.contains("Thought · previous reasoning"),
         "{restored_render:?}"
     );
     assert!(
-        !restored_render.contains("previous reasoning"),
+        !restored_render.contains("previous reasoning body"),
         "{restored_render:?}"
     );
     assert!(
@@ -2695,8 +2701,8 @@ fn tui_resume_overlay_restores_appends_reopens_and_resets_complete_history() {
         tui.view().focus,
     );
 
-    // Ctrl+O is thinking-first: expand collapsed reasoning before tool bodies.
-    tui.handle(Event::Key(Key::CtrlO));
+    // Ctrl+T owns the reasoning axis; tool bodies stay where they were.
+    tui.handle(Event::Key(Key::CtrlT));
     assert_eq!(
         (
             tui.view().following_bottom,
@@ -3130,13 +3136,28 @@ fn persisted_selection_updates_and_resume_are_atomic_and_credential_fresh() {
     std::fs::remove_dir_all(temporary).unwrap();
 }
 
+/// A tool call whose permission target cannot be read is a call that must not
+/// run — but the turn survives it. Since AGN's tool-failure recovery the runtime
+/// hands the model an actionable refusal instead of aborting, so the agent can
+/// correct itself. Which refusal depends on what was wrong: a call whose
+/// arguments do not parse is told so, while a call naming no tool this session
+/// holds is told that instead, because rewriting its arguments would not help.
+/// What stays absolute across all of them is that nothing dispatches and no
+/// argument of the rejected call is echoed anywhere.
 #[test]
-fn permission_error_mapping_is_sanitized_and_fails_closed() {
+fn an_unreadable_permission_target_dispatches_nothing_and_echoes_nothing() {
     let secret_input = r#"{"command":"SENTINEL_COMMAND","token":"SENTINEL_TOKEN"}"#;
-    for (name, input) in [
-        ("native::read", "{malformed"),
-        ("native::read", secret_input),
-        ("native::unknown", r#"{"path":"SENTINEL_PATH"}"#),
+    let missing_tool = "tool call refused: this session has no tool by that name; it was not \
+                        denied and its arguments are not at fault, so no rewriting of this call \
+                        can reach a tool; call one of the tools you were given instead";
+    for (name, input, expected) in [
+        ("native::read", "{malformed", "invalid tool arguments"),
+        ("native::read", secret_input, "invalid tool arguments"),
+        (
+            "native::unknown",
+            r#"{"path":"SENTINEL_PATH"}"#,
+            missing_tool,
+        ),
     ] {
         let outcome = run_production_batch(
             "permission-evaluation-invalid",
@@ -3151,8 +3172,50 @@ fn permission_error_mapping_is_sanitized_and_fails_closed() {
             false,
         );
 
-        assert_eq!(outcome.result, Err(HeadlessTurnError::PermissionEvaluation));
-        assert!(outcome.executions.is_empty());
+        assert!(outcome.executions.is_empty(), "{name}: {input}");
+        assert!(
+            outcome.prompts.is_empty(),
+            "an unreadable target is never asked about: {name}"
+        );
+
+        let snapshot = outcome
+            .result
+            .as_ref()
+            .expect("the turn recovers rather than aborting");
+        assert!(
+            snapshot.events().iter().any(|event| matches!(
+                event,
+                agens_core::TurnEvent::ToolResult(MessagePart::ToolResult {
+                    tool_call_id,
+                    content,
+                    is_error: true,
+                }) if tool_call_id == "invalid" && content == expected
+            )),
+            "the model is told, in words that carry none of the call: {:?}",
+            snapshot.events()
+        );
+
+        // The call's own arguments travel with the call — that is the
+        // conversation, not a leak. What must carry none of them is the
+        // rejection the runtime writes itself.
+        let rejection = snapshot
+            .events()
+            .iter()
+            .filter_map(|event| match event {
+                agens_core::TurnEvent::ToolResult(MessagePart::ToolResult {
+                    content,
+                    is_error: true,
+                    ..
+                }) => Some(content.clone()),
+                _ => None,
+            })
+            .collect::<String>();
+        for sentinel in ["SENTINEL_COMMAND", "SENTINEL_TOKEN", "SENTINEL_PATH"] {
+            assert!(
+                !rejection.contains(sentinel),
+                "{sentinel} leaked into the rejection: {rejection}"
+            );
+        }
     }
 
     for (turn_error, expected) in [

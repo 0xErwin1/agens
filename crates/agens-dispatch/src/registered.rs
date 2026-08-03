@@ -24,6 +24,15 @@ impl DispatchTool for RegisteredNativeTool {
             .map_err(|error| agens_core::Error::Tool(error.to_string()))
     }
 
+    fn permission_reach(
+        &self,
+        arguments: &serde_json::Value,
+    ) -> Result<Vec<agens_core::PermissionReach>, agens_core::Error> {
+        NativePermissionTarget::parse(&self.name, arguments)
+            .map(|target| target.reach())
+            .map_err(|error| agens_core::Error::Tool(error.to_string()))
+    }
+
     fn execute(
         &mut self,
         context: &ToolExecutionContext,

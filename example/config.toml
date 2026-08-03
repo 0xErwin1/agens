@@ -55,8 +55,142 @@ max_retries = 0
 model = "gpt-5.5"
 effort = "high"
 
-# Rules are evaluated in global-then-project order. A target in parentheses
-# is a glob. Keep destructive operations denied explicitly.
+# A target in parentheses is a glob; a tool named without one matches every
+# target, so `deny bash` and `deny bash(*)` name the same calls.
+#
+# What decides a call is the rule that selects the fewest calls, never the file
+# a rule was written in or its position in the list. A project rule beats a
+# global one only because it selects fewer calls. Because the narrower rule
+# wins, a narrow `allow` deliberately carves an exception out of a broad `deny`:
+# `deny write(src/**)` beside `allow write(src/generated/**)` permits the
+# generated subtree and nothing else under `src`.
+#
+# Where neither rule is narrower the two tie, and the more restrictive decision
+# wins: deny, then ask, then allow. Three shapes tie. Two rules selecting the
+# same calls tie — `deny bash` and `deny bash(*)` name one set written two ways.
+# Two selections that overlap without either containing the other tie, so
+# `deny read(**/.env)` beside `allow read(config/**)` denies `config/.env`,
+# which neither rule alone settles. And where containment cannot be established
+# at all the answer is conservative: the check under-approximates rather than
+# guesses, reports no containment, and the tie-break decides.
+#
+# Every target except `bash`'s is path-shaped: a bare `*` never crosses a `/`,
+# and only an explicit `**` segment does. That includes `git_read`, whose
+# operation keywords carry no `/` and are selected the same either way. `bash`
+# targets are free-form command text, so a bare `*` there does cross `/` —
+# `bash(rm *)` already matches `rm -rf /tmp/x`. A `bash` rule is matched
+# against each command in a chained line (`&&`, `||`, `;`, `|`, `$(...)`,
+# `sh -c`), seeing through wrappers such as `sudo` and reducing `/bin/rm` to
+# `rm`. That closes the ordinary evasions; it is pattern matching, not a
+# sandbox, and a command written to hide which binary it runs still can.
+#
+# Name every tool you mean. `read`, `write` and `edit` are separately
+# registered tools, so denying a path to one says nothing about the other two,
+# and a deny written for `grep` says nothing about `search`.
+#
+# A path deny reaches a tool when that tool asks these rules about the file.
+# There are two ways it can:
+#
+#   1. The call names the file. The path it is given is the target the rule is
+#      matched against, so a deny refuses the call outright. `read`, `write`,
+#      `edit` and `list` work this way, and so does `search` on its root and
+#      `grep` on its pattern and its root.
+#   2. The call reports files it never named. The tool asks these same rules
+#      once per file while it runs and omits what they deny. `search` and `grep`
+#      do this beneath their root; `git_read` does it for the files its `diff`
+#      reports, which is why the deny below is written `git_read(**/.env)` — a
+#      `git_read` call is named by an operation keyword, so `git_read(diff)`
+#      decides whether the diff runs at all and says nothing about which files
+#      it may report.
+#
+# Four kinds of call that can return the contents of a file do neither, each for
+# its own reason:
+#
+#   * `bash` — a rule written for it is matched against the command line rather
+#     than against any path, and the command chooses what it prints. Granting it
+#     grants a way around every rule below.
+#   * `skill` — a skill call is named by a skill name, so no rule here selects
+#     one by its target. Skills come from two roots. A skill installed under
+#     `<project-root>/.agens/skills/` reports the file the call would open, so
+#     `deny skill(**/.agens/**)` refuses it. A skill installed beside this file
+#     normally has no path a rule here can name, and there the exception stands
+#     — bounded by what the tool can open: a skill's files are read relative to
+#     that skill's own directory, under a single plain filename with no
+#     traversal, refusing symbolic links and files carrying more than one link.
+#     It returns that skill's own installed assets and nothing else. The
+#     exception is a property of the two paths, not of the origin: where this
+#     file's own directory sits under the session's root, a global skill has a
+#     project-relative path too and a deny here binds it.
+#   * `task` — named by the subagent it resolves to, so `deny task(reviewer)`
+#     refuses every delegation to that agent and no rule written against a path
+#     selects one. What it returns is whatever the subagent reports, which no
+#     rule here reaches — but the subagent read those files under these same
+#     rules, so a file denied below was already withheld before the report was
+#     written.
+#   * MCP tools — a remote tool is named `<server>::<tool>`, and what its
+#     arguments mean is defined by the server serving it, so agens cannot tell
+#     which file, if any, a call would read. There is no path to decide, and a
+#     rule written against one binds the tool and then selects none of its
+#     calls: `deny filesystem::read_text_file(**/.env)` resolves and matches
+#     nothing ever after. The rule that binds names the tool and no target —
+#     `deny filesystem::read_text_file`. So if a configured server can read
+#     files, it can read the ones denied below, and nothing in this block stops
+#     it; see the `[mcp.*]` examples further down.
+#     That tool answers to a second name too: `<server>_<tool>`, the one the
+#     model is advertised, which a rule may also be written in. Prefer the `::`
+#     spelling — it is the only one that says on its own that the name is
+#     remote, since `filesystem_read_text_file` is shaped exactly like a bare
+#     native name.
+#     Either spelling is resolved against what this session reached. A server
+#     that failed to start, or one marked `disabled`, contributes no tools, so
+#     the rule is kept as written and binds again the moment the server is
+#     reachable. What allows that is an `[mcp.*]` block below naming the server:
+#     a rule for a server this file never declares is indistinguishable from a
+#     typo, as is a tool name misspelt against a server that IS running, and as
+#     is a misspelt native name. Written as `deny` or `ask`, such a rule is
+#     rejected. Written as `allow`, it is dropped instead: it could only widen,
+#     and a grant for a tool nothing can call grants nothing. That matters
+#     because `[permissions]` may live in a project file committed to a
+#     repository while `[mcp.*]` may not, so a stale `allow` can reach a
+#     checkout whose global configuration never declared the server it names.
+#     A rejected name is refused when the permission policy is built, naming
+#     the rule and what could not be resolved about it. For `agens chat` that
+#     is the turn it was asked to run, so the command fails. The TUI builds it
+#     per submission, so agens starts and then fails every prompt you send
+#     until the rule is fixed.
+#     The allow side of the same fact: a prompt for a remote tool can show only
+#     that tool's name, so answering "Allow always" stores a grant matching
+#     every future call to it. For `bash` such a grant is remembered per
+#     command, for `task` per subagent, for `skill` per skill — a remote tool
+#     is the one class with nothing to scope it by.
+#
+# Apply the same test to any tool added later — if it can return the contents of
+# a file and does neither of the two, no deny here binds it, and it belongs on
+# that list with its reason written down.
+#
+# A call bounded the second way still runs. It returns everything it may return,
+# omits the rest, and ends with a line saying some files were not read. That
+# line carries no path, no count and no root, so a single call discloses only
+# that something under what it reached was withheld; a caller free to re-scope
+# the call — a narrower search root, a narrower revision range — narrows that
+# down to a directory or to one commit.
+#
+# That line answers for every file the call walked, not only for the ones it
+# reported. `grep`'s own `glob` argument narrows what comes back and never what
+# these rules were asked about, so `grep(pattern, glob="*.rs")` in a tree
+# holding a denied `.env` still says a file was withheld — the `.rs` results are
+# complete even so. Deciding after the caller's filter would make the line exact
+# and would also turn the filter into a way of narrowing the withheld set one
+# filename at a time.
+#
+# One limit remains, and it is over names rather than contents: `glob` reports
+# file paths, never what they hold. Its pattern denotes a set while a rule is
+# matched as text, so `deny glob(**/.env)` does not stop `glob(**)` from listing
+# that name — a name `list(**)` already discloses.
+#
+# A delegated subagent may use `read`, `list`, `search`, `grep`, `glob` and
+# `git_read` without declaring anything, and every deny below binds it exactly
+# as it binds the primary agent.
 [permissions]
 allow = [
   "read(**)",
@@ -67,11 +201,32 @@ allow = [
 deny = [
   "read(**/.env)",
   "write(**/.env)",
+  "edit(**/.env)",
+  "search(**/.env)",
+  "grep(**/.env)",
+  "git_read(**/.env)",
   "bash(rm *)",
+]
+# Reserve `ask` for operations a human should confirm. A rule that matches is
+# never upgraded by `/bypass`, `--dangerously-allow-all`, or dangerous mode;
+# those only decide calls no rule names. A delegated subagent cannot reach the
+# prompt, so an `ask` refuses there, saying the prompt was unreachable.
+ask = [
+  "bash(git commit*)",
+  "bash(git push*)",
 ]
 
 # MCP server definitions are global-only. Uncomment and adapt one or more of
 # these examples in the global configuration.
+#
+# A server you configure here is trusted to the extent of what it can do. No
+# `deny` in the `[permissions]` block above reaches its tools by path — the
+# filesystem server below can read every file denied there, because agens cannot
+# tell which file one of its calls names. The rules that reach it name its tools
+# instead, one to a rule: `deny filesystem::read_text_file`. Such a rule may
+# name a server that is not running — the `disabled` one at the end among them.
+# It is kept as written and binds when that server returns; startup does not
+# fail over it.
 #
 # [mcp.filesystem]
 # transport = "stdio"

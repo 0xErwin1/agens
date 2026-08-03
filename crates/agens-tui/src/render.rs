@@ -23,8 +23,9 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::conversation::ConversationItem;
 use crate::widgets::{
-    ACCENT_WIDTH, BlockContent, BlockLine, DisplayMode, GUTTER_WIDTH, RolePalette, RowAccent,
-    RowBullet, RowState, StatusGlyph, ThinkingBlock, ToolCallBlock, ToolResultBlock, VerbGroup,
+    ACCENT_WIDTH, BlockContent, BlockLine, DisplayMode, GUTTER_WIDTH, Glyph, RolePalette,
+    RowAccent, RowBullet, RowState, StatusGlyph, ThinkingBlock, ToolCallBlock, ToolResultBlock,
+    UnicodeLevel, VerbGroup,
 };
 use crate::{Conversation, DiffLine, DiffLineKind, ToolResultState, TuiRuntimeEvent};
 
@@ -32,6 +33,8 @@ const MAX_VISIBLE_TOOL_OUTPUT_BYTES: usize = 4 * 1024;
 const VISIBLE_TOOL_OUTPUT_MARKER: &str = "\n… visible output truncated";
 /// Closes a code-panel row whose source line was wider than the panel.
 const CODE_CLIP_MARKER: &str = "…";
+/// Columns a tool's output sits right of the call header that produced it.
+const TOOL_BODY_INDENT: usize = 2;
 const SETTLED_CONVERSATION_CACHE_MAX_ENTRIES: usize = 96;
 const SYNTAX_CACHE_MAX_ENTRIES: usize = 64;
 const SYNTAX_CACHE_MAX_BYTES: usize = 4 * 1024 * 1024;
@@ -39,11 +42,15 @@ const SYNTAX_DEFER_SOURCE_BYTES: usize = 4 * 1024;
 const SYNTAX_MAX_SOURCE_BYTES: usize = 32 * 1024;
 
 #[derive(Clone, Copy)]
-pub(super) struct ConversationRenderState {
+pub(super) struct ConversationRenderState<'a> {
     pub collapse_thinking: bool,
     pub thinking_streaming: bool,
     pub assistant_streaming: bool,
     pub now: Duration,
+    /// Call id keyboard focus is standing on, when any.
+    pub focused_call: Option<&'a str>,
+    /// Glyph set this terminal can draw the transcript's chrome with.
+    pub unicode: UnicodeLevel,
 }
 
 /// Identifies one settled conversation across frames.
@@ -63,29 +70,46 @@ struct SettledConversationKey {
     display_modes: u64,
 }
 
+/// A settled conversation's painted output, cached whole.
+///
+/// The painter produces the rows and their owning calls in one pass, so
+/// caching only the rows means anything that needs owners — hit-testing the
+/// pointer, most of all — repeats the entire pass on a conversation that by
+/// definition cannot have changed.
+#[derive(Clone)]
+pub(super) struct SettledBlocks {
+    pub lines: Arc<[Line<'static>]>,
+    pub owners: Arc<[Option<String>]>,
+}
+
 thread_local! {
     static SETTLED_CONVERSATION_CACHE: std::cell::RefCell<
-        VecDeque<(SettledConversationKey, Arc<[Line<'static>]>)>,
+        VecDeque<(SettledConversationKey, SettledBlocks)>,
     > = const { std::cell::RefCell::new(VecDeque::new()) };
 }
 
-/// Described lines for a conversation that can no longer change, reused across frames.
-///
-/// The transcript is rebuilt on every frame, so without this a long session pays
-/// a full markdown parse and layout pass for its whole history on each animation
-/// tick. A conversation only qualifies once nothing in it is still animating:
-/// any unfinished tool call or subagent card keeps its rows tied to the frame
-/// clock, and those are described live.
-pub(super) fn settled_conversation_lines(
+pub(super) fn settled_conversation_blocks(
     identity: SettledConversation,
     conversation: &Conversation,
     tool_display_modes: &BTreeMap<String, DisplayMode>,
     content_width: u16,
-    state: ConversationRenderState,
-) -> Arc<[Line<'static>]> {
+    state: ConversationRenderState<'_>,
+) -> SettledBlocks {
+    let _perf_settled = agens_perf::span!(
+        "tui.transcript.settled_turn",
+        index = identity.index as u64,
+        content_width = content_width,
+        cache_hit = agens_perf::Pending,
+    );
+
     if !is_settled(conversation) {
-        return conversation_lines(conversation, &[], tool_display_modes, content_width, state)
-            .into();
+        agens_perf::field!(cache_hit = false);
+        let painted =
+            painted_conversation(conversation, &[], tool_display_modes, content_width, state);
+        return SettledBlocks {
+            lines: painted.lines.into(),
+            owners: painted.owners.into(),
+        };
     }
 
     let mut hasher = DefaultHasher::new();
@@ -93,6 +117,9 @@ pub(super) fn settled_conversation_lines(
         call_id.hash(&mut hasher);
         std::mem::discriminant(mode).hash(&mut hasher);
     }
+    // Focus paints a row, so a settled turn cached without it would keep
+    // showing the mark after focus moved on.
+    state.focused_call.hash(&mut hasher);
     let key = SettledConversationKey {
         conversation: identity,
         content_width,
@@ -105,25 +132,30 @@ pub(super) fn settled_conversation_lines(
         cache
             .iter()
             .find(|(entry, _)| *entry == key)
-            .map(|(_, lines)| Arc::clone(lines))
+            .map(|(_, blocks)| blocks.clone())
     });
-    if let Some(lines) = cached {
-        return lines;
+    if let Some(blocks) = cached {
+        agens_perf::field!(cache_hit = true);
+        return blocks;
     }
 
     #[cfg(test)]
     SETTLED_CONVERSATION_RENDERS.with(|renders| renders.set(renders.get() + 1));
 
-    let lines: Arc<[Line<'static>]> =
-        conversation_lines(conversation, &[], tool_display_modes, content_width, state).into();
+    let painted = painted_conversation(conversation, &[], tool_display_modes, content_width, state);
+    let blocks = SettledBlocks {
+        lines: painted.lines.into(),
+        owners: painted.owners.into(),
+    };
     SETTLED_CONVERSATION_CACHE.with_borrow_mut(|cache| {
         while cache.len() >= SETTLED_CONVERSATION_CACHE_MAX_ENTRIES {
             cache.pop_front();
         }
-        cache.push_back((key, Arc::clone(&lines)));
+        cache.push_back((key, blocks.clone()));
     });
 
-    lines
+    agens_perf::field!(cache_hit = false);
+    blocks
 }
 
 /// Whether every row of a conversation is frozen: no spinner, no live elapsed time.
@@ -139,13 +171,37 @@ fn is_settled(conversation: &Conversation) -> bool {
             .all(|call| call.result.is_some())
 }
 
-pub(super) fn conversation_lines(
+#[cfg(test)]
+fn conversation_lines(
     conversation: &Conversation,
     events: &[TuiRuntimeEvent],
     tool_display_modes: &BTreeMap<String, DisplayMode>,
     content_width: u16,
-    state: ConversationRenderState,
+    state: ConversationRenderState<'_>,
 ) -> Vec<Line<'static>> {
+    painted_conversation(
+        conversation,
+        events,
+        tool_display_modes,
+        content_width,
+        state,
+    )
+    .lines
+}
+
+pub(super) fn painted_conversation(
+    conversation: &Conversation,
+    events: &[TuiRuntimeEvent],
+    tool_display_modes: &BTreeMap<String, DisplayMode>,
+    content_width: u16,
+    state: ConversationRenderState<'_>,
+) -> PaintedBlocks {
+    let _perf_build = agens_perf::span!(
+        "tui.transcript.build_blocks",
+        items = conversation.items.len() as u64,
+        content_width = content_width,
+    );
+
     let context = ItemContext {
         conversation,
         events,
@@ -155,7 +211,10 @@ pub(super) fn conversation_lines(
             .max(1),
         state,
     };
-    let plan = plan_verb_groups(conversation, tool_display_modes);
+    let plan = {
+        let _perf_plan_groups = agens_perf::span!("tui.transcript.plan_groups");
+        plan_verb_groups(conversation, tool_display_modes)
+    };
     let mut blocks = Vec::new();
 
     for (index, item) in conversation.items.iter().enumerate() {
@@ -173,7 +232,7 @@ pub(super) fn conversation_lines(
         blocks.push(RenderedBlock::plain(rows));
     }
 
-    paint_blocks(blocks, state.now)
+    paint_blocks(blocks, state.now, state.unicode)
 }
 
 /// The closing row of a settled turn: what it took and what it billed.
@@ -191,8 +250,8 @@ fn turn_cost_rows(conversation: &Conversation) -> Option<Vec<Line<'static>>> {
     if let Some(duration) = cost.duration {
         parts.push(elapsed_label(duration));
     }
-    if let Some(input) = cost.input_tokens {
-        parts.push(format!("{} in", compact_tokens(input)));
+    if let Some(context) = cost.context_tokens {
+        parts.push(format!("{} context", compact_tokens(context)));
     }
     if let Some(output) = cost.output_tokens {
         parts.push(format!("{} out", compact_tokens(output)));
@@ -222,7 +281,7 @@ struct ItemContext<'a> {
     events: &'a [TuiRuntimeEvent],
     tool_display_modes: &'a BTreeMap<String, DisplayMode>,
     content_width: usize,
-    state: ConversationRenderState,
+    state: ConversationRenderState<'a>,
 }
 
 /// One conversation item's rows plus what the vertical-gap policy needs.
@@ -250,12 +309,17 @@ impl RenderedBlock {
 
     /// Block whose rows all carry the same accent bar and no bullet.
     fn accented(lines: Vec<Line<'static>>, accent: Option<RowAccent>) -> Self {
+        Self::accented_packing(lines, accent, false)
+    }
+
+    /// The same, for a block that knows whether it is in its compact form.
+    fn accented_packing(lines: Vec<Line<'static>>, accent: Option<RowAccent>, packs: bool) -> Self {
         Self {
             rows: lines
                 .into_iter()
                 .map(|line| BlockLine::new(line).accented(accent))
                 .collect(),
-            packs: false,
+            packs,
             call_id: None,
             closes_call: false,
         }
@@ -279,8 +343,9 @@ struct Neighbour {
 /// separated by exactly one. A tool result never detaches from the call it
 /// closes, even when the user expanded its body. Blocks that render nothing are
 /// transparent, so a hidden item can neither force nor absorb a gap.
-fn paint_blocks(blocks: Vec<RenderedBlock>, now: Duration) -> Vec<Line<'static>> {
+fn paint_blocks(blocks: Vec<RenderedBlock>, now: Duration, unicode: UnicodeLevel) -> PaintedBlocks {
     let mut lines = Vec::new();
+    let mut owners = Vec::new();
     let mut previous: Option<Neighbour> = None;
 
     for block in blocks.into_iter().filter(|block| !block.rows.is_empty()) {
@@ -289,21 +354,30 @@ fn paint_blocks(blocks: Vec<RenderedBlock>, now: Duration) -> Vec<Line<'static>>
             .is_some_and(|previous| separates(previous, &block))
         {
             lines.push(Line::default());
+            owners.push(None);
         }
+        let call_id = block.call_id;
         previous = Some(Neighbour {
             packs: block.packs,
-            call_id: block.call_id,
+            call_id: call_id.clone(),
         });
-        lines.extend(
-            block
-                .rows
-                .into_iter()
-                .enumerate()
-                .map(|(row, line)| painted_row(line, row, now)),
-        );
+        for (row, line) in block.rows.into_iter().enumerate() {
+            lines.push(painted_row(line, row, now, unicode));
+            owners.push(call_id.clone());
+        }
     }
 
-    lines
+    PaintedBlocks { lines, owners }
+}
+
+/// Painted rows and, per row, the tool call that owns it.
+///
+/// The ownership is kept beside the rows rather than derived from them later:
+/// once a block becomes lines, nothing in a line says which call produced it,
+/// and reconstructing that by reading the text back would be guessing.
+pub(super) struct PaintedBlocks {
+    pub lines: Vec<Line<'static>>,
+    pub owners: Vec<Option<String>>,
 }
 
 fn separates(previous: &Neighbour, block: &RenderedBlock) -> bool {
@@ -317,7 +391,12 @@ fn separates(previous: &Neighbour, block: &RenderedBlock) -> bool {
 ///
 /// `row` is the row's index inside its own block, which is what makes the accent
 /// wave travel down a block instead of blinking in unison.
-fn painted_row(row: BlockLine, index: usize, now: Duration) -> Line<'static> {
+fn painted_row(
+    row: BlockLine,
+    index: usize,
+    now: Duration,
+    unicode: UnicodeLevel,
+) -> Line<'static> {
     if row.bullet.is_none()
         && row.accent.is_none()
         && row.line.spans.iter().all(|span| span.content.is_empty())
@@ -328,10 +407,12 @@ fn painted_row(row: BlockLine, index: usize, now: Duration) -> Line<'static> {
     let mut spans = vec![
         row.accent.map_or_else(
             || Span::raw(" ".repeat(ACCENT_WIDTH)),
-            |accent| accent.span(index, now),
+            |accent| accent.span(index, now, unicode),
         ),
-        row.bullet
-            .map_or_else(|| Span::raw(" ".repeat(GUTTER_WIDTH)), RowBullet::span),
+        row.bullet.map_or_else(
+            || Span::raw(" ".repeat(GUTTER_WIDTH)),
+            |bullet| bullet.span(unicode),
+        ),
     ];
     spans.extend(row.line.spans);
     Line::from(spans)
@@ -347,6 +428,46 @@ pub(super) fn unaccented_row(line: Line<'static>) -> Line<'static> {
     let mut spans = vec![Span::raw(" ".repeat(ACCENT_WIDTH))];
     spans.extend(line.spans);
     Line::from(spans)
+}
+
+/// Marks the header row of the block keyboard focus is standing on.
+///
+/// The mark is a repaint and never a character: the block has to look focused
+/// without occupying a column it did not occupy before, or moving focus would
+/// reflow the transcript under the reader's eyes.
+fn mark_focused_row(rows: &mut [BlockLine]) {
+    let Some(row) = rows.first_mut() else {
+        return;
+    };
+    for span in &mut row.line.spans {
+        span.style = span
+            .style
+            .fg(RolePalette::navigation())
+            .add_modifier(Modifier::BOLD);
+    }
+}
+
+/// The one row standing in for the settled turns the transcript folded away.
+///
+/// It carries its own key because it is the only row for which that key does
+/// anything, and it exists only while something is actually hidden — so the
+/// hint is never advertising a press that would do nothing.
+pub(super) fn history_elision_row(
+    elided: usize,
+    row_width: u16,
+    unicode: UnicodeLevel,
+) -> Line<'static> {
+    let noun = if elided == 1 { "turn" } else { "turns" };
+    unaccented_row(Line::from(Span::styled(
+        bounded_single_line(
+            &format!(
+                "{} {elided} earlier {noun} · ^Y to show",
+                Glyph::Ellipsis.text(unicode)
+            ),
+            usize::from(row_width),
+        ),
+        Style::default().fg(RolePalette::muted()),
+    )))
 }
 
 fn item_block(context: &ItemContext<'_>, item: &ConversationItem) -> RenderedBlock {
@@ -371,14 +492,14 @@ fn item_block(context: &ItemContext<'_>, item: &ConversationItem) -> RenderedBlo
         ),
         ConversationItem::Reasoning(text) => {
             let mut lines = Vec::new();
-            let accent = thinking_lines(
+            let (accent, packs) = thinking_lines(
                 &mut lines,
                 text,
                 context.state.collapse_thinking,
                 context.state.thinking_streaming,
                 context.content_width,
             );
-            RenderedBlock::accented(lines, accent)
+            RenderedBlock::accented_packing(lines, accent, packs)
         }
         ConversationItem::ToolCall {
             call_id,
@@ -392,9 +513,17 @@ fn item_block(context: &ItemContext<'_>, item: &ConversationItem) -> RenderedBlo
             output,
             is_error,
         } => tool_result_body_block(context, call_id, output, *is_error),
-        ConversationItem::Diff(diff) => {
+        ConversationItem::Diff {
+            call_id,
+            lines: diff,
+        } => {
             let mut lines = Vec::new();
-            render_diff(&mut lines, diff, context.content_width);
+            render_diff(
+                &mut lines,
+                diff,
+                diff_language(context.conversation, call_id),
+                context.content_width,
+            );
             RenderedBlock::plain(lines)
         }
         ConversationItem::Error(error) => {
@@ -445,9 +574,19 @@ fn tool_call_block(
         .copied()
         .unwrap_or_else(|| block.default_mode());
 
+    let mut rows = block.lines(mode);
+    if context.state.focused_call == Some(call_id) {
+        mark_focused_row(&mut rows);
+    }
+
     RenderedBlock {
-        rows: block.lines(mode),
-        packs: block.is_groupable() && (mode == DisplayMode::Collapsed || result.is_none()),
+        rows,
+        // Any call showing a single summary row packs against its neighbours.
+        // Packing used to require the call be verb-foldable, which is a
+        // different question: an MCP call cannot fold into "Read files ×3" but
+        // it is still one row, and a run of them separated by blank rows
+        // spends half a screen saying nothing.
+        packs: mode == DisplayMode::Collapsed || result.is_none(),
         call_id: Some(call_id.to_owned()),
         closes_call: false,
     }
@@ -479,7 +618,11 @@ fn tool_result_body_block(
 
     let (result_state, _) = tool_state(context.events, call_id, is_error);
     let failed = result_state == ToolResultState::Failure;
-    let full_body = tool_result_body(call_id, output, context.content_width, failed);
+    let body_width = context
+        .content_width
+        .saturating_sub(TOOL_BODY_INDENT)
+        .max(1);
+    let full_body = tool_result_body(call_id, output, body_width, failed);
     let body = match mode {
         DisplayMode::Collapsed => Vec::new(),
         DisplayMode::Truncated => crate::widgets::bounded_tool_preview(&full_body),
@@ -491,7 +634,7 @@ fn tool_result_body_block(
     RenderedBlock {
         rows: body
             .into_iter()
-            .map(|line| BlockLine::new(line).accented(accent))
+            .map(|line| BlockLine::new(indent_line(line, TOOL_BODY_INDENT)).accented(accent))
             .collect(),
         packs: false,
         call_id: Some(call_id.to_owned()),
@@ -516,7 +659,7 @@ fn assistant_block(text: &str, content_width: usize, highlight_syntax: bool) -> 
             if index == 0 {
                 BlockLine::with_bullet(
                     line,
-                    RowBullet::Identity("●", RolePalette::assistant_identity()),
+                    RowBullet::Identity(Glyph::AssistantBullet, RolePalette::assistant_identity()),
                 )
             } else {
                 BlockLine::new(line)
@@ -532,6 +675,38 @@ fn assistant_block(text: &str, content_width: usize, highlight_syntax: bool) -> 
     }
 }
 
+/// Fills a row's remaining width with the band background, so the prompt reads
+/// as one block of colour rather than as a ragged right edge.
+///
+/// The band is what makes a turn findable without reading it. It is additive:
+/// the identity rail and the `❯` bullet still carry the same meaning on a
+/// terminal that renders no background at all.
+fn band_row(line: Line<'static>, content_width: usize) -> Line<'static> {
+    let padding = content_width.saturating_sub(line.width());
+    if padding == 0 {
+        return line;
+    }
+
+    let mut spans = line.spans;
+    spans.push(Span::styled(
+        " ".repeat(padding),
+        Style::default().bg(RolePalette::user_band()),
+    ));
+    Line::from(spans)
+}
+
+/// Shifts a rendered row right, keeping any background it already carries.
+fn indent_line(line: Line<'static>, columns: usize) -> Line<'static> {
+    let style = line
+        .spans
+        .first()
+        .and_then(|span| span.style.bg)
+        .map_or_else(Style::default, |background| Style::default().bg(background));
+    let mut spans = vec![Span::styled(" ".repeat(columns), style)];
+    spans.extend(line.spans);
+    Line::from(spans)
+}
+
 /// The user's own prompt, wrapped here rather than left to the transcript
 /// widget.
 ///
@@ -544,6 +719,7 @@ fn user_block(text: &str, content_width: usize) -> RenderedBlock {
     let accent = Some(RowAccent::Still(RolePalette::user_identity()));
     let style = Style::default()
         .fg(RolePalette::assistant())
+        .bg(RolePalette::user_band())
         .add_modifier(Modifier::BOLD);
 
     for source_line in text.split('\n') {
@@ -552,12 +728,15 @@ fn user_block(text: &str, content_width: usize) -> RenderedBlock {
             content_width,
             &[],
         );
-        for line in wrapped {
+        for line in wrapped
+            .into_iter()
+            .map(|line| band_row(line, content_width))
+        {
             rows.push(
                 if rows.is_empty() {
                     BlockLine::with_bullet(
                         line,
-                        RowBullet::Identity("❯", RolePalette::user_identity()),
+                        RowBullet::Identity(Glyph::UserBullet, RolePalette::user_identity()),
                     )
                 } else {
                     BlockLine::new(line)
@@ -630,8 +809,14 @@ pub(super) fn turn_status_line(status: TurnStatus<'_>, content_width: usize) -> 
         if !right.is_empty() {
             right.push_str(" · ");
         }
-        right.push_str(&format!("{tokens} tok"));
+        right.push_str(&compact_tokens(tokens));
     }
+    // Stopping is the one thing a reader may want from a turn while it runs, so
+    // the row that reports the turn is where its key belongs.
+    if !right.is_empty() {
+        right.push_str(" · ");
+    }
+    right.push_str("esc stop");
 
     // The metadata never takes the whole row: the label keeps at least the
     // spinner cell and the gap that separates the two halves.
@@ -661,9 +846,20 @@ pub(super) fn turn_status_line(status: TurnStatus<'_>, content_width: usize) -> 
     Line::from(spans)
 }
 
-fn elapsed_label(elapsed: Duration) -> String {
-    if elapsed.as_secs() > 0 {
-        format!("{}s", elapsed.as_secs())
+/// A duration a reader can size up without counting digits.
+///
+/// Past a minute the seconds stop being a quantity anyone reads — `253s` is
+/// arithmetic, `4m 13s` is a fact — so the label changes unit rather than
+/// growing.
+pub(super) fn elapsed_label(elapsed: Duration) -> String {
+    let seconds = elapsed.as_secs();
+    if seconds >= 3_600 {
+        let minutes = (seconds % 3_600) / 60;
+        format!("{}h {minutes}m", seconds / 3_600)
+    } else if seconds >= 60 {
+        format!("{}m {}s", seconds / 60, seconds % 60)
+    } else if seconds > 0 {
+        format!("{seconds}s")
     } else {
         format!("{}ms", elapsed.as_millis())
     }
@@ -730,11 +926,7 @@ fn collect_group(
     tool_display_modes: &BTreeMap<String, DisplayMode>,
     start: usize,
 ) -> Option<(FoldedGroup, usize)> {
-    let verb = foldable_call(
-        conversation,
-        tool_display_modes,
-        conversation.items.get(start)?,
-    )?;
+    let verb = foldable_call(tool_display_modes, conversation.items.get(start)?)?;
     let mut members = BTreeSet::new();
     let mut count = 0usize;
     let mut failed = 0usize;
@@ -745,7 +937,7 @@ fn collect_group(
         match item {
             ConversationItem::ToolCall { name, .. } if is_task_tool_name(name) => {}
             ConversationItem::ToolCall { call_id, .. } => {
-                if foldable_call(conversation, tool_display_modes, item) != Some(verb) {
+                if foldable_call(tool_display_modes, item) != Some(verb) {
                     break;
                 }
                 members.insert(call_id.as_str());
@@ -772,7 +964,6 @@ fn collect_group(
 }
 
 fn foldable_call(
-    conversation: &Conversation,
     tool_display_modes: &BTreeMap<String, DisplayMode>,
     item: &ConversationItem,
 ) -> Option<VerbGroup> {
@@ -783,11 +974,17 @@ fn foldable_call(
         return None;
     };
     let verb = VerbGroup::of(parsed)?;
-    let settled = match tool_display_modes.get(call_id) {
+
+    // An absent mode is not a state of its own: nothing recorded means nobody
+    // expanded this call, so it folds. The arm cannot compare against
+    // `default_mode()` instead — a running call defaults to `Truncated`
+    // precisely so live work keeps a preview when it stands alone, and that
+    // must not stop it from folding into a group.
+    let folds = match tool_display_modes.get(call_id) {
         Some(mode) => *mode == DisplayMode::Collapsed,
-        None => !call_has_result(conversation, call_id),
+        None => true,
     };
-    settled.then_some(verb)
+    folds.then_some(verb)
 }
 
 fn call_result<'a>(conversation: &'a Conversation, call_id: &str) -> Option<&'a crate::ToolResult> {
@@ -797,10 +994,6 @@ fn call_result<'a>(conversation: &'a Conversation, call_id: &str) -> Option<&'a 
         .flat_map(|batch| &batch.calls)
         .find(|call| call.call_id == call_id)
         .and_then(|call| call.result.as_ref())
-}
-
-fn call_has_result(conversation: &Conversation, call_id: &str) -> bool {
-    call_result(conversation, call_id).is_some()
 }
 
 fn call_is_groupable(conversation: &Conversation, call_id: &str) -> bool {
@@ -893,6 +1086,13 @@ fn tool_result_body(
     content_width: usize,
     failed: bool,
 ) -> Arc<[Line<'static>]> {
+    let _perf_tool_body = agens_perf::span!(
+        "tui.tool_body",
+        content_width = content_width as u64,
+        failed = failed,
+        cache_hit = agens_perf::Pending,
+    );
+
     let mut hasher = DefaultHasher::new();
     output.hash(&mut hasher);
     let output_hash = hasher.finish();
@@ -909,6 +1109,7 @@ fn tool_result_body(
             .map(|(_, body)| Arc::clone(body))
     });
     if let Some(body) = cached {
+        agens_perf::field!(cache_hit = true);
         return body;
     }
 
@@ -943,6 +1144,7 @@ fn tool_result_body(
         ));
     });
 
+    agens_perf::field!(cache_hit = false);
     body
 }
 
@@ -1193,7 +1395,7 @@ fn subagent_card_block(
     }
     rows.push(BlockLine::with_bullet(
         Line::from(title),
-        RowBullet::Identity("●", subagent_status_color(card.status)),
+        RowBullet::Identity(Glyph::AssistantBullet, subagent_status_color(card.status)),
     ));
 
     let status = match card.status {
@@ -1215,11 +1417,18 @@ fn subagent_card_block(
     let elapsed = card
         .started_at
         .map(|started| card.terminal_at.unwrap_or(now).saturating_sub(started));
+    let mut meta = format!("{status} · {presentation}{}", duration_label(elapsed));
+    // What the delegation actually runs on. A subagent routinely differs from
+    // its parent in model and effort, and that difference explains both its
+    // speed and its answers.
+    if let Some(model) = card.model.as_deref() {
+        meta.push_str(&format!(" · {model}"));
+    }
+    if let Some(effort) = card.effort.as_deref() {
+        meta.push_str(&format!(" · {effort}"));
+    }
     rows.push(BlockLine::new(Line::from(Span::styled(
-        bounded_single_line(
-            &format!("{status} · {presentation}{}", duration_label(elapsed)),
-            content_width,
-        ),
+        bounded_single_line(&meta, content_width),
         Style::default().fg(RolePalette::muted()),
     ))));
     rows.extend(subagent_failure_row(card, content_width));
@@ -1419,14 +1628,15 @@ fn bounded_visible_tool_output(output: &str) -> String {
     format!("{}{}", &output[..end], VISIBLE_TOOL_OUTPUT_MARKER)
 }
 
-/// Describes the reasoning rows and reports the accent bar they carry.
+/// Describes the reasoning rows, and reports the accent bar they carry together
+/// with whether the block is in its compact single-row form.
 fn thinking_lines(
     lines: &mut Vec<Line<'static>>,
     text: &str,
     collapsed: bool,
     streaming: bool,
     content_width: usize,
-) -> Option<RowAccent> {
+) -> (Option<RowAccent>, bool) {
     let mode = ThinkingBlock::mode(streaming, collapsed);
     if mode.shows_body() {
         lines.push(ThinkingBlock::title());
@@ -1438,9 +1648,78 @@ fn thinking_lines(
             content_width,
         );
     } else {
-        lines.push(ThinkingBlock::collapsed_title(None));
+        lines.push(ThinkingBlock::collapsed_title(
+            thinking_summary(text, content_width).as_deref(),
+            None,
+        ));
     }
-    ThinkingBlock::accent(mode)
+    // A collapsed thought is one summary row, so it packs against its
+    // neighbours for the same reason a collapsed tool call does: a run of them
+    // is a list, and a blank line between every entry of a list is a gap
+    // pretending to be structure.
+    (ThinkingBlock::accent(mode), !mode.shows_body())
+}
+
+/// What a collapsed thought says it was about.
+///
+/// A row reading only "Thought" is the shape of information without any: the
+/// reader cannot tell one from the next, and a column of them says nothing that
+/// a single count would not have said better. Providers open reasoning with a
+/// short heading, so the first line is both the cheapest summary available and
+/// the one the expanded form shows first.
+fn thinking_summary(text: &str, content_width: usize) -> Option<String> {
+    let heading = opening_bold_span(text).or_else(|| {
+        text.lines()
+            .map(|line| line.trim().trim_matches(['#', '_', '`', ' ']).trim())
+            .find(|line| !line.is_empty())
+    })?;
+
+    let budget = content_width.saturating_sub(THINKING_SUMMARY_CHROME);
+    (budget > 0).then(|| bounded_single_line(heading, budget))
+}
+
+/// The `**bold**` title a stretch of reasoning opens with, when it opens with one.
+///
+/// Providers title each stretch and then emit the next one straight after it, so
+/// several titles routinely share a line. Reading the line would run them
+/// together into a sentence nobody wrote — `A****B****C` — which is what the
+/// first version of this did.
+fn opening_bold_span(text: &str) -> Option<&str> {
+    let (heading, _) = text.trim_start().strip_prefix("**")?.split_once("**")?;
+    let heading = heading.trim();
+    (!heading.is_empty()).then_some(heading)
+}
+
+/// Columns the collapsed thought's own label and separator cost the summary.
+const THINKING_SUMMARY_CHROME: usize = 12;
+
+#[cfg(test)]
+mod thinking_summary_tests {
+    use super::*;
+
+    /// Providers title each stretch of reasoning and emit the next straight
+    /// after it, so several titles share one line. Reading the line ran them
+    /// together into `A****B****C`.
+    #[test]
+    fn back_to_back_titles_summarize_as_the_first_one_alone() {
+        assert_eq!(
+            thinking_summary(
+                "**Clarifying worker cancel rationale**Analyzing task routing**Reassessing writes**",
+                80
+            )
+            .as_deref(),
+            Some("Clarifying worker cancel rationale")
+        );
+    }
+
+    #[test]
+    fn unformatted_reasoning_summarizes_as_its_first_line() {
+        assert_eq!(
+            thinking_summary("Checking the timeout\nthe rest of it", 80).as_deref(),
+            Some("Checking the timeout")
+        );
+        assert_eq!(thinking_summary("   \n\n", 80), None);
+    }
 }
 
 pub(super) fn detail_lines(
@@ -2331,6 +2610,26 @@ fn clip_spans(spans: &mut Vec<Span<'static>>, max_width: usize) {
     *spans = kept;
 }
 
+/// Marks a rendered row as continuing into the next one.
+///
+/// Wrapping is a fact about the terminal, not about the text, so the copy path
+/// has to be able to undo it. The marker is `U+2060 WORD JOINER`: zero width and
+/// dropped by the buffer, so it reaches the selection snapshot without reaching
+/// the screen. It closes the row it marks rather than opening the next one, so
+/// the wrapper's "has anything been placed yet" checks keep meaning what they
+/// meant.
+/// Break taken between words, where the text had a space the row could not fit.
+pub(super) const WRAP_JOINER_SPACE: &str = "\u{2060}";
+
+/// Break taken inside a word too long for any row. Rejoining must not invent a
+/// separator the text never had, or a wrapped path comes back off the clipboard
+/// as two paths.
+pub(super) const WRAP_JOINER_TIGHT: &str = "\u{2061}";
+
+fn wrap_joiner_span(marker: &'static str) -> Span<'static> {
+    Span::raw(marker)
+}
+
 fn wrap_styled_spans(
     spans: Vec<Span<'static>>,
     max_width: usize,
@@ -2366,6 +2665,7 @@ fn wrap_styled_spans(
                 continuation_width
             });
             if chunk_width <= line_capacity && used.saturating_add(chunk_width) > max_width {
+                current.push(wrap_joiner_span(WRAP_JOINER_SPACE));
                 lines.push(Line::from(std::mem::take(&mut current)));
                 current.extend_from_slice(continuation);
                 used = continuation_width;
@@ -2374,6 +2674,7 @@ fn wrap_styled_spans(
             for grapheme in chunk.graphemes(true) {
                 let grapheme_width = grapheme.width();
                 if used.saturating_add(grapheme_width) > max_width && !current.is_empty() {
+                    current.push(wrap_joiner_span(WRAP_JOINER_TIGHT));
                     lines.push(Line::from(std::mem::take(&mut current)));
                     current.extend_from_slice(continuation);
                     used = continuation_width;
@@ -2752,7 +3053,15 @@ fn normalized_code_language(token: &str) -> String {
 }
 
 fn syntax_tokens(language: &str, source: &str) -> Option<Arc<[SyntaxToken]>> {
+    let _perf_syntax = agens_perf::span!(
+        "tui.syntax.tokens",
+        language = language,
+        source_bytes = source.len() as u64,
+        outcome = agens_perf::Pending,
+    );
+
     if source.len() > SYNTAX_MAX_SOURCE_BYTES {
+        agens_perf::field!(outcome = "oversize");
         return None;
     }
 
@@ -2767,8 +3076,14 @@ fn syntax_tokens(language: &str, source: &str) -> Option<Arc<[SyntaxToken]>> {
             source.len() >= SYNTAX_DEFER_SOURCE_BYTES,
         );
     match lookup {
-        SyntaxCacheLookup::Ready(tokens) => return tokens,
-        SyntaxCacheLookup::Deferred => return None,
+        SyntaxCacheLookup::Ready(tokens) => {
+            agens_perf::field!(outcome = "ready");
+            return tokens;
+        }
+        SyntaxCacheLookup::Deferred => {
+            agens_perf::field!(outcome = "deferred");
+            return None;
+        }
         SyntaxCacheLookup::Parse => {}
     }
 
@@ -2798,10 +3113,12 @@ fn syntax_tokens(language: &str, source: &str) -> Option<Arc<[SyntaxToken]>> {
             )
         });
 
-    syntax_token_cache()
+    let result = syntax_token_cache()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .complete(hash, language, source, tokens)
+        .complete(hash, language, source, tokens);
+    agens_perf::field!(outcome = "parse");
+    result
 }
 
 fn syntax_theme() -> &'static Theme {
@@ -2883,7 +3200,7 @@ fn take_visible_width(text: &str, max_width: usize) -> String {
 
 /// Panel background for fenced/inline code — slightly elevated over the default terminal bg.
 const fn code_block_background() -> Color {
-    Color::Rgb(0x1a, 0x1f, 0x29)
+    RolePalette::code_panel_bg()
 }
 
 const MAX_DIFF_ROWS: usize = 200;
@@ -2903,7 +3220,159 @@ fn result_size_label(output: &str) -> String {
 /// so unchanged runs are inferred from line-number jumps and rendered as a
 /// single `… N unchanged lines` marker. No `+`/`-` markers are drawn; the
 /// gutter position and row background encode insert vs. delete.
-fn render_diff(lines: &mut Vec<Line<'static>>, diff: &[DiffLine], content_width: usize) {
+/// The grammar to read an edit's diff with, taken from the file it edits.
+///
+/// The extension is the only signal available here and it is not always right,
+/// so an unrecognized one yields `None` and the diff keeps its plain
+/// red-and-green reading rather than being coloured by a guess.
+fn diff_language(conversation: &Conversation, call_id: &str) -> Option<&'static str> {
+    let path = conversation
+        .tool_batches
+        .iter()
+        .flat_map(|batch| &batch.calls)
+        .find(|call| call.call_id == call_id)
+        .and_then(|call| match &call.parsed {
+            agens_core::ToolInput::Edit { path } | agens_core::ToolInput::Write { path } => {
+                Some(path.as_str())
+            }
+            _ => None,
+        })?;
+
+    let extension = path.rsplit_once('.').map(|(_, extension)| extension)?;
+    language_for_extension(&extension.to_ascii_lowercase())
+}
+
+/// Extensions mapped only to grammars this build actually carries.
+///
+/// Naming a language the `GrammarStore` cannot load would cost a failed parse
+/// on every diff row for no colour, so the table and the enabled feature list
+/// are kept in step deliberately.
+fn language_for_extension(extension: &str) -> Option<&'static str> {
+    Some(match extension {
+        "rs" => "rust",
+        "go" => "go",
+        "py" => "python",
+        "js" | "mjs" | "cjs" => "javascript",
+        "ts" | "mts" | "cts" => "typescript",
+        "tsx" | "jsx" => "tsx",
+        "c" | "h" => "c",
+        "cc" | "cpp" | "cxx" | "hpp" | "hh" => "cpp",
+        "cs" => "c-sharp",
+        "java" => "java",
+        "css" => "css",
+        "html" | "htm" => "html",
+        "json" => "json",
+        "md" | "markdown" => "markdown",
+        "nix" => "nix",
+        "sh" | "bash" | "zsh" => "bash",
+        "sql" => "sql",
+        "toml" => "toml",
+        "yaml" | "yml" => "yaml",
+        _ => return None,
+    })
+}
+
+/// Styled spans for one diff row's text, coloured by the language when the
+/// run it belongs to could be parsed.
+///
+/// Highlighting runs over a contiguous run of same-kind rows rather than over
+/// the whole diff: consecutive added rows are contiguous new-file content and
+/// parse as such, while an added row sitting next to the removed row it
+/// replaces is not a program and would parse as neither.
+/// A parsed run: the source its rows were joined into, and its tokens.
+type ParsedRun = (String, Arc<[SyntaxToken]>);
+
+/// Where one diff row sits inside the run that was parsed for it.
+type RowHighlight = (Arc<ParsedRun>, usize);
+
+fn diff_text_spans(
+    text: &str,
+    highlighted: Option<&ParsedRun>,
+    offset: usize,
+    base: Style,
+) -> Vec<Span<'static>> {
+    let Some((source, tokens)) = highlighted else {
+        return vec![Span::styled(text.to_owned(), base)];
+    };
+
+    let line_end = offset.saturating_add(text.len());
+    let mut spans = Vec::new();
+    let mut cursor = offset;
+
+    for token in tokens.iter() {
+        let start = token.start.max(offset).max(cursor);
+        let end = token.end.min(line_end);
+        if start >= end {
+            continue;
+        }
+        if cursor < start
+            && let Some(gap) = source.get(cursor..start)
+        {
+            spans.push(Span::styled(gap.to_owned(), base));
+        }
+        if let Some(slice) = source.get(start..end) {
+            spans.push(Span::styled(
+                slice.to_owned(),
+                base.fg(token.style.fg.unwrap_or(RolePalette::assistant())),
+            ));
+        }
+        cursor = end;
+    }
+
+    if cursor < line_end
+        && let Some(gap) = source.get(cursor..line_end)
+    {
+        spans.push(Span::styled(gap.to_owned(), base));
+    }
+
+    if spans.is_empty() {
+        spans.push(Span::styled(text.to_owned(), base));
+    }
+    spans
+}
+
+/// Parses each contiguous run of same-kind rows, returning per-row the source
+/// its run was parsed from and the row's byte offset into it.
+fn diff_run_highlights(diff: &[DiffLine], language: Option<&str>) -> Vec<Option<RowHighlight>> {
+    let mut highlights = vec![None; diff.len()];
+    let Some(language) = language else {
+        return highlights;
+    };
+
+    let mut start = 0;
+    while start < diff.len() {
+        let mut end = start + 1;
+        while end < diff.len() && diff[end].kind == diff[start].kind {
+            end += 1;
+        }
+
+        let mut source = String::new();
+        let mut offsets = Vec::with_capacity(end - start);
+        for change in &diff[start..end] {
+            offsets.push(source.len());
+            source.push_str(&change.text);
+            source.push('\n');
+        }
+
+        if let Some(tokens) = syntax_tokens(language, &source) {
+            let parsed = Arc::new((source, tokens));
+            for (index, offset) in offsets.into_iter().enumerate() {
+                highlights[start + index] = Some((Arc::clone(&parsed), offset));
+            }
+        }
+
+        start = end;
+    }
+
+    highlights
+}
+
+fn render_diff(
+    lines: &mut Vec<Line<'static>>,
+    diff: &[DiffLine],
+    language: Option<&str>,
+    content_width: usize,
+) {
     let gutter_width = diff
         .iter()
         .map(|change| digit_width(change.number))
@@ -2911,6 +3380,7 @@ fn render_diff(lines: &mut Vec<Line<'static>>, diff: &[DiffLine], content_width:
         .unwrap_or(1)
         .max(1);
 
+    let highlights = diff_run_highlights(diff, language);
     let mut old_cursor: Option<u32> = None;
     let mut new_cursor: Option<u32> = None;
 
@@ -2953,10 +3423,15 @@ fn render_diff(lines: &mut Vec<Line<'static>>, diff: &[DiffLine], content_width:
             ),
             DiffLineKind::Context => (Some(change.number), Some(change.number), None),
         };
+        let highlight = highlights
+            .get(index)
+            .and_then(Option::as_ref)
+            .map(|(parsed, offset)| (parsed.as_ref(), *offset));
         lines.push(diff_change_line(
             old_number,
             new_number,
             &change.text,
+            highlight,
             background,
             gutter_width,
             content_width,
@@ -2991,6 +3466,7 @@ fn diff_change_line(
     old: Option<u32>,
     new: Option<u32>,
     text: &str,
+    highlight: Option<(&ParsedRun, usize)>,
     background: Option<Color>,
     gutter_width: usize,
     content_width: usize,
@@ -3004,10 +3480,13 @@ fn diff_change_line(
         text_style = text_style.bg(color);
     }
 
-    let mut spans = vec![
-        Span::styled(gutter.clone(), gutter_style),
-        Span::styled(text.to_owned(), text_style),
-    ];
+    let mut spans = vec![Span::styled(gutter.clone(), gutter_style)];
+    spans.extend(diff_text_spans(
+        text,
+        highlight.map(|(parsed, _)| parsed),
+        highlight.map_or(0, |(_, offset)| offset),
+        text_style,
+    ));
 
     if let Some(color) = background {
         let used = gutter.width().saturating_add(text.width());
@@ -3032,9 +3511,9 @@ fn diff_note_line(text: &str, gutter_width: usize) -> Line<'static> {
 
 fn diff_line(lines: &mut Vec<Line<'static>>, number: u32, kind: DiffLineKind, text: &str) {
     let (marker, color) = match kind {
-        DiffLineKind::Added => ('+', Color::Green),
-        DiffLineKind::Removed => ('-', Color::Red),
-        DiffLineKind::Context => (' ', Color::Gray),
+        DiffLineKind::Added => ('+', RolePalette::success()),
+        DiffLineKind::Removed => ('-', RolePalette::error()),
+        DiffLineKind::Context => (' ', RolePalette::muted()),
     };
     lines.push(Line::from(vec![
         Span::styled(
@@ -3105,13 +3584,7 @@ fn line(lines: &mut Vec<Line<'static>>, label: &str, color: Color, text: impl In
 }
 
 fn duration_label(duration: Option<Duration>) -> String {
-    duration.map_or_else(String::new, |value| {
-        if value.as_secs() > 0 {
-            format!(" · {}s", value.as_secs())
-        } else {
-            format!(" · {}ms", value.as_millis())
-        }
-    })
+    duration.map_or_else(String::new, |value| format!(" · {}", elapsed_label(value)))
 }
 
 fn result_color(result: ToolResultState) -> Color {
@@ -3229,12 +3702,14 @@ mod tests {
         assert_eq!(text(&lines[3]), "└ Action: Retry.");
     }
 
-    fn conversation_state(assistant_streaming: bool) -> ConversationRenderState {
+    fn conversation_state(assistant_streaming: bool) -> ConversationRenderState<'static> {
         ConversationRenderState {
             collapse_thinking: false,
             thinking_streaming: false,
             assistant_streaming,
             now: Duration::ZERO,
+            focused_call: None,
+            unicode: UnicodeLevel::Extended,
         }
     }
 
@@ -3289,6 +3764,8 @@ mod tests {
                 thinking_streaming: false,
                 assistant_streaming: false,
                 now,
+                focused_call: None,
+                unicode: UnicodeLevel::Extended,
             },
         ))
     }
@@ -3307,6 +3784,8 @@ mod tests {
                 thinking_streaming: false,
                 assistant_streaming: false,
                 now: Duration::ZERO,
+                focused_call: None,
+                unicode: UnicodeLevel::Extended,
             },
         )
     }
@@ -3532,6 +4011,42 @@ mod tests {
         assert_eq!(thinking.style.fg, Some(RolePalette::muted()));
     }
 
+    /// The recorded mode is a reader override, so its absence has to mean "the
+    /// reader asked for nothing", not a fourth state. A settled run used to
+    /// render collapsed and refuse to fold at the same time, which is the one
+    /// combination the group summary exists to prevent.
+    #[test]
+    fn a_settled_run_folds_whether_or_not_a_mode_was_ever_recorded_for_it() {
+        let mut settled = read_conversation(&["a.rs", "b.rs"]);
+        for path in ["a.rs", "b.rs"] {
+            settled
+                .apply(crate::ConversationEvent::ToolResult {
+                    call_id: path.to_owned(),
+                    output: "ok".into(),
+                    is_error: false,
+                })
+                .expect("result should project");
+        }
+
+        let unrecorded = lines_at(&settled, &BTreeMap::new());
+        assert!(
+            unrecorded
+                .iter()
+                .any(|line| line_text(line).contains("Read 2 files")),
+            "{unrecorded:?}"
+        );
+
+        let mut expanded = BTreeMap::new();
+        expanded.insert("a.rs".to_owned(), DisplayMode::Expanded);
+        let opened = lines_at(&settled, &expanded);
+        assert!(
+            !opened
+                .iter()
+                .any(|line| line_text(line).contains("Read 2 files")),
+            "a call the reader opened stays out of the group: {opened:?}"
+        );
+    }
+
     #[test]
     fn collapsed_groupable_neighbours_pack_and_everything_else_keeps_one_blank_row() {
         let mut conversation = read_conversation(&["a.rs"]);
@@ -3753,8 +4268,9 @@ mod tests {
     ///
     /// Neutral prose and chrome remain dominant while a compact Markdown palette
     /// distinguishes headings, strong text, inline code, and navigation markers.
-    const SETTLED_PALETTE: [Color; 7] = [
+    const SETTLED_PALETTE: [Color; 8] = [
         RolePalette::assistant(),
+        RolePalette::machine(),
         RolePalette::muted(),
         RolePalette::user_identity(),
         RolePalette::success(),
@@ -3809,6 +4325,8 @@ mod tests {
                 thinking_streaming: false,
                 assistant_streaming: false,
                 now: Duration::ZERO,
+                focused_call: None,
+                unicode: UnicodeLevel::Extended,
             },
         )
     }
@@ -3817,7 +4335,7 @@ mod tests {
         conversation: &Conversation,
         identity: SettledConversation,
     ) -> Arc<[Line<'static>]> {
-        settled_conversation_lines(
+        settled_conversation_blocks(
             identity,
             conversation,
             &BTreeMap::new(),
@@ -3827,8 +4345,11 @@ mod tests {
                 thinking_streaming: false,
                 assistant_streaming: false,
                 now: Duration::ZERO,
+                focused_call: None,
+                unicode: UnicodeLevel::Extended,
             },
         )
+        .lines
     }
 
     fn settled_identity(index: usize, generation: u64) -> SettledConversation {
@@ -3973,7 +4494,7 @@ mod tests {
         );
         assert_eq!(
             span_style(&succeeded, "cargo test").fg,
-            Some(RolePalette::assistant()),
+            Some(RolePalette::machine()),
             "tool operands stay neutral so lifecycle colours remain exclusive"
         );
         assert_eq!(
@@ -4146,6 +4667,7 @@ mod tests {
                 crate::DiffLine::new(7, DiffLineKind::Removed, "old line"),
                 crate::DiffLine::new(8, DiffLineKind::Added, "new line"),
             ],
+            None,
             40,
         );
         assert_eq!(lines.len(), 2);
@@ -4179,6 +4701,78 @@ mod tests {
         );
     }
 
+    /// A large diff painted only in red and green is a wall: the eye has no
+    /// second signal to find the changed identifier by. The language supplies
+    /// that signal without displacing the first — the wash still says added or
+    /// removed, and the foreground says what the line is.
+    #[test]
+    fn a_rust_diff_is_coloured_by_the_language_on_top_of_its_wash() {
+        let _guard = SYNTAX_CACHE_TESTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_syntax_cache();
+
+        let diff = [
+            crate::DiffLine::new(7, DiffLineKind::Removed, "let total = 0;"),
+            crate::DiffLine::new(7, DiffLineKind::Added, "let total = compute(items);"),
+        ];
+
+        let mut plain = Vec::new();
+        render_diff(&mut plain, &diff, None, 60);
+        let mut highlighted = Vec::new();
+        render_diff(&mut highlighted, &diff, Some("rust"), 60);
+
+        assert_eq!(
+            plain.iter().map(line_text).collect::<Vec<_>>(),
+            highlighted.iter().map(line_text).collect::<Vec<_>>(),
+            "highlighting repaints the diff, it does not rewrite it"
+        );
+
+        let colours = |lines: &[Line<'static>]| {
+            let mut seen = Vec::new();
+            for colour in lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .filter_map(|span| span.style.fg)
+            {
+                if !seen.contains(&colour) {
+                    seen.push(colour);
+                }
+            }
+            seen
+        };
+        assert!(
+            colours(&highlighted).len() > colours(&plain).len(),
+            "the language adds foreground distinctions the wash alone cannot make"
+        );
+
+        assert!(
+            highlighted
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| span.style.bg == Some(RolePalette::diff_insert_bg())),
+            "the added row keeps its wash: {highlighted:?}"
+        );
+        assert!(
+            highlighted
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| span.style.bg == Some(RolePalette::diff_delete_bg())),
+            "the removed row keeps its wash: {highlighted:?}"
+        );
+    }
+
+    /// An extension the build carries no grammar for must leave the diff alone
+    /// rather than name a language the store cannot load.
+    #[test]
+    fn only_extensions_backed_by_a_grammar_resolve_to_a_language() {
+        assert_eq!(language_for_extension("rs"), Some("rust"));
+        assert_eq!(language_for_extension("tsx"), Some("tsx"));
+        assert_eq!(language_for_extension("yml"), Some("yaml"));
+        assert_eq!(language_for_extension("swift"), None);
+        assert_eq!(language_for_extension(""), None);
+    }
+
     #[test]
     fn render_diff_collapses_unchanged_runs_into_a_gap_marker() {
         let mut lines = Vec::new();
@@ -4188,6 +4782,7 @@ mod tests {
                 crate::DiffLine::new(3, DiffLineKind::Added, "first change"),
                 crate::DiffLine::new(20, DiffLineKind::Added, "second change"),
             ],
+            None,
             40,
         );
         let joined: String = lines
@@ -4208,7 +4803,7 @@ mod tests {
             })
             .collect();
         let mut lines = Vec::new();
-        render_diff(&mut lines, &diff, 40);
+        render_diff(&mut lines, &diff, None, 40);
         let joined: String = lines
             .iter()
             .map(|line| line_text(line))

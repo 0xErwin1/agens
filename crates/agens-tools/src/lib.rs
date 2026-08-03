@@ -18,8 +18,9 @@ use std::{
 
 use agens_core::{
     EditMagnitude, Error, FactPath, HeadlessTaskTerminal, HeadlessTurnCancellationAdapter,
-    PermissionDecision, PermissionPolicy, PermissionRequest, PermissionSession,
-    ProjectPermissionGrant, ToolAccess, ToolOutcome, ToolResultFacts, WriteMagnitude,
+    PermissionDecision, PermissionPolicy, PermissionReach, PermissionReadFilter, PermissionRequest,
+    PermissionSession, ProjectPermissionGrant, ToolAccess, ToolOutcome, ToolResultFacts,
+    WriteMagnitude,
 };
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use ignore::WalkBuilder;
@@ -29,6 +30,7 @@ use serde::de::{self, DeserializeSeed, Deserializer, IgnoredAny, MapAccess, Visi
 use serde_json::Value;
 
 mod agents;
+mod ask_user;
 mod capabilities;
 mod git_read;
 mod http_mcp;
@@ -43,6 +45,7 @@ pub use agents::{
     AgentCatalog, AgentDiagnostic, AgentDiscovery, AgentModelValidationError, AgentModelValidator,
     AgentShadow,
 };
+pub use ask_user::AskUserTool;
 pub use capabilities::{EffectiveCapabilityDescriptor, EffectiveCapabilitySet};
 pub use git_read::{GitReadInput, GitReadOperation};
 pub use http_mcp::{McpHttpTransport, McpSseTransport};
@@ -53,11 +56,12 @@ pub use mcp_status::{
 };
 pub use stdio_mcp::{McpStdioTransport, McpStdioTransportConfig};
 pub use task::{
-    TaskControlAction, TaskControlTool, TaskExecutionEvent, TaskExecutionId,
-    TaskExecutionLifecycle, TaskExecutionLimits, TaskExecutionRegistry, TaskExecutionSnapshot,
-    TaskInvocation, TaskLaunchMode, TaskMessage, TaskMessageSource, TaskMessageTarget,
-    TaskMessageTool, TaskModelResolutionError, TaskRegistryError, TaskRunContext, TaskRunner,
-    TaskRunnerError, TaskSkill, TaskTerminalState, TaskTool, TaskTurnRequest, TaskTurnResult,
+    TaskControlAction, TaskControlTool, TaskDeclarationRejection, TaskExecutionEvent,
+    TaskExecutionId, TaskExecutionLifecycle, TaskExecutionLimits, TaskExecutionRegistry,
+    TaskExecutionSnapshot, TaskInvocation, TaskLaunchMode, TaskMessage, TaskMessageSource,
+    TaskMessageTarget, TaskMessageTool, TaskModelResolutionError, TaskRegistryError,
+    TaskRunContext, TaskRunner, TaskRunnerError, TaskSkill, TaskTerminalState, TaskTool,
+    TaskTurnRequest, TaskTurnResult,
 };
 
 #[cfg(unix)]
@@ -71,6 +75,14 @@ const DEFAULT_WEBFETCH_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_WEBFETCH_BYTES: usize = 100 * 1024;
 const MAX_WEBFETCH_REDIRECTS: usize = 5;
 const WEBFETCH_TRUNCATED_MARKER: &str = "\n[webfetch output truncated]";
+/// Told to the caller when a search walked into files a rule refuses to let it
+/// report, so the result is not silently passed off as the whole corpus.
+///
+/// It carries no path and no count deliberately. Either would answer questions
+/// about the files being withheld, and a caller that can re-root the same
+/// search could turn a count into a way of locating them.
+const WITHHELD_FILES_NOTICE: &str =
+    "[some files were not read: a permission rule denies reading them]\n";
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const DEFAULT_MAX_LIST_ENTRIES: usize = 1_000;
 const DEFAULT_MAX_SEARCH_ENTRIES: usize = 10_000;
@@ -202,6 +214,15 @@ impl SkillResourceClass {
             Self::Reference => "references",
             Self::Script => "scripts",
             Self::Asset => "assets",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "reference" => Some(Self::Reference),
+            "script" => Some(Self::Script),
+            "asset" => Some(Self::Asset),
+            _ => None,
         }
     }
 }
@@ -498,12 +519,31 @@ impl Skill {
     pub fn source(&self) -> &Path {
         &self.source
     }
+
+    /// The directory holding this skill's manifest and its resource classes.
+    /// Every file the skill can return is a child of it.
+    pub fn directory(&self) -> &Path {
+        &self.directory
+    }
 }
+
+/// Where a project's own skills live, relative to that project's root.
+///
+/// A catalog records the directory it discovered them in, while a holder of that
+/// catalog is handed a project root. The two are only paired with each other
+/// when they agree through this, which is what makes the pairing checkable at
+/// all rather than merely conventional.
+pub const PROJECT_SKILLS_DIRECTORY: &str = ".agens/skills";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SkillCatalog {
     skills: Vec<Skill>,
     positions: BTreeMap<String, usize>,
+    /// The root the project half of this catalog was discovered under, kept so
+    /// a holder can tell a project skill from a global one by where it came
+    /// from rather than by guessing from its path. Absent only from a catalog
+    /// that discovered nothing.
+    project_root: Option<PathBuf>,
 }
 
 impl SkillCatalog {
@@ -513,7 +553,10 @@ impl SkillCatalog {
     ) -> Result<SkillDiscovery, SkillDiscoveryError> {
         let global = load_skill_root(global_root.as_ref())?;
         let project = load_skill_root(project_root.as_ref())?;
-        let mut catalog = Self::default();
+        let mut catalog = Self {
+            project_root: Some(project_root.as_ref().to_path_buf()),
+            ..Self::default()
+        };
         let mut diagnostics = global.diagnostics;
         let mut shadowed = Vec::new();
 
@@ -558,6 +601,31 @@ impl SkillCatalog {
         self.skills.iter()
     }
 
+    /// Whether this skill was discovered under the project root rather than
+    /// beside the global configuration.
+    ///
+    /// The distinction decides whether a skill's files have a project-relative
+    /// spelling a permission rule can name, which is why it is answered from
+    /// where the skill was discovered rather than from where its directory
+    /// happens to sit.
+    pub fn is_project_skill(&self, skill: &Skill) -> bool {
+        self.project_root
+            .as_ref()
+            .is_some_and(|root| skill.directory().starts_with(root))
+    }
+
+    /// Whether this catalog's project half was discovered under `project_root`.
+    ///
+    /// Answered by equality against the one directory a project's skills are
+    /// discovered in, rather than by containment: a root that merely contains
+    /// the discovered one still strips off every project skill's path, and
+    /// would yield a spelling relative to a root no rule is written against.
+    pub fn is_paired_with_project_root(&self, project_root: &Path) -> bool {
+        self.project_root
+            .as_ref()
+            .is_some_and(|root| root == &project_root.join(PROJECT_SKILLS_DIRECTORY))
+    }
+
     fn insert(&mut self, skill: Skill) {
         if let Some(position) = self.positions.get(skill.name()).copied() {
             self.skills[position] = skill;
@@ -572,11 +640,73 @@ impl SkillCatalog {
 #[derive(Clone, Debug)]
 pub struct SkillResourceTool {
     catalog: SkillCatalog,
+    project_root: PathBuf,
 }
 
 impl SkillResourceTool {
-    pub fn new(catalog: SkillCatalog) -> Self {
-        Self { catalog }
+    pub fn new(catalog: SkillCatalog, project_root: impl Into<PathBuf>) -> Self {
+        Self {
+            catalog,
+            project_root: project_root.into(),
+        }
+    }
+
+    /// The project-relative file one call would return, when the skill it names
+    /// has such a spelling.
+    ///
+    /// A skill discovered under the project root always has one. A skill
+    /// discovered beside the global configuration normally does not, and
+    /// reports nothing, so no rule written against a path selects the call; it
+    /// reports one on the single occasion it has one, which is a global skills
+    /// root that happens to sit under the project root.
+    ///
+    /// The catalog and the root reach this tool as independent arguments and
+    /// can therefore disagree. A project skill answered under a root the
+    /// catalog was not discovered under is that disagreement, and it is refused
+    /// rather than answered. Refusing on the pairing rather than on whether the
+    /// root strips off is what covers a root ABOVE the true one: there the
+    /// prefix comes off cleanly and the call would be answered with a reach
+    /// spelled relative to a root no rule is written against — `deny
+    /// skill(**/.agens/**)` would survive on its leading wildcard while `deny
+    /// skill(.agens/skills/**)` silently stopped selecting anything.
+    ///
+    /// The refusal is an [`Error::Permission`] rather than an
+    /// [`Error::Tool`]: the arguments are well formed and the caller cannot
+    /// repair the disagreement by rewriting them, so it must not arrive as
+    /// the argument error that asks it to.
+    fn reached_file(&self, arguments: &Value) -> Result<Option<PathBuf>, Error> {
+        let Some(skill) = arguments
+            .get("skill")
+            .and_then(Value::as_str)
+            .and_then(|name| self.catalog.skill(name))
+        else {
+            return Ok(None);
+        };
+        if self.catalog.is_project_skill(skill)
+            && !self.catalog.is_paired_with_project_root(&self.project_root)
+        {
+            return Err(Error::Permission(
+                "skill catalog was discovered under a different project root".into(),
+            ));
+        }
+
+        let Ok(directory) = skill.directory().strip_prefix(&self.project_root) else {
+            return Ok(None);
+        };
+
+        let reached = match (
+            arguments.get("resource_class").and_then(Value::as_str),
+            arguments.get("resource").and_then(Value::as_str),
+        ) {
+            (None, None) => Some(directory.join(SKILL_MANIFEST_NAME)),
+            (Some(class), Some(resource)) if is_normal_filename(resource) => {
+                SkillResourceClass::parse(class)
+                    .map(|class| directory.join(class.directory()).join(resource))
+            }
+            _ => None,
+        };
+
+        Ok(reached)
     }
 
     pub fn input_schema() -> Value {
@@ -603,6 +733,14 @@ impl DispatchTool for SkillResourceTool {
             .ok_or_else(|| Error::Tool("skill arguments are invalid".into()))
     }
 
+    fn permission_reach(&self, arguments: &Value) -> Result<Vec<PermissionReach>, Error> {
+        Ok(self
+            .reached_file(arguments)?
+            .map(|path| PermissionReach::Path(path.to_string_lossy().into_owned()))
+            .into_iter()
+            .collect())
+    }
+
     fn execute(&mut self, _: &ToolExecutionContext, arguments: Value) -> Result<ToolOutput, Error> {
         let Some(arguments) = arguments.as_object().filter(|arguments| {
             arguments
@@ -627,11 +765,8 @@ impl DispatchTool for SkillResourceTool {
         ) {
             (None, None) => skill.load_instructions(),
             (Some(class), Some(resource)) => {
-                let class = match class {
-                    "reference" => SkillResourceClass::Reference,
-                    "script" => SkillResourceClass::Script,
-                    "asset" => SkillResourceClass::Asset,
-                    _ => return Ok(ToolOutput::failure("skill resource class is invalid")),
+                let Some(class) = SkillResourceClass::parse(class) else {
+                    return Ok(ToolOutput::failure("skill resource class is invalid"));
                 };
                 skill.load_resource(class, resource)
             }
@@ -1877,6 +2012,7 @@ pub struct ToolExecutionContext {
     cancellation: Option<Arc<AtomicBool>>,
     headless_cancellation: Option<HeadlessTurnCancellationAdapter>,
     deadline: Instant,
+    read_filter: Option<PermissionReadFilter>,
 }
 
 impl ToolExecutionContext {
@@ -1893,7 +2029,40 @@ impl ToolExecutionContext {
             cancellation: Some(cancellation),
             headless_cancellation: None,
             deadline,
+            read_filter: None,
         }
+    }
+
+    /// Carries the per-file decision for one authorized call to the tool that
+    /// performs it. Set by [`ToolDispatcher::execute`], which is where a call
+    /// stops being a decision and starts reading files.
+    #[must_use]
+    pub fn with_read_filter(mut self, filter: PermissionReadFilter) -> Self {
+        self.read_filter = Some(filter);
+        self
+    }
+
+    /// Whether the call may report what the project-relative `path` holds.
+    ///
+    /// A context built without a filter permits everything: it belongs to a
+    /// caller that never went through a permission decision at all, such as a
+    /// direct test of a tool, and inventing a refusal there would withhold
+    /// files no rule was ever consulted about. Every dispatched call carries
+    /// one.
+    pub fn permits_read(&self, path: &str) -> bool {
+        self.read_filter
+            .as_ref()
+            .is_none_or(|filter| filter.permits(path))
+    }
+
+    /// Whether any file this call reads can be withheld at all.
+    ///
+    /// A tool that has to spend work — a second process, a second walk —
+    /// before it can ask [`Self::permits_read`] anything asks this first, so
+    /// the caller that carries no filter pays none of it and behaves exactly
+    /// as it did before there was one.
+    pub fn filters_reads(&self) -> bool {
+        self.read_filter.is_some()
     }
 
     /// Adapts core's opaque turn cancellation view without exposing its internals.
@@ -1905,6 +2074,7 @@ impl ToolExecutionContext {
             cancellation: None,
             headless_cancellation: Some(cancellation),
             deadline,
+            read_filter: None,
         }
     }
 
@@ -3112,14 +3282,52 @@ impl ToolOutput {
     }
 }
 
+/// A tool as the dispatcher holds it: what a call projects onto for a
+/// permission decision, and how it runs once that decision allows it.
+///
+/// # Which error a projection fails with
+///
+/// The two projection methods carry a reserved distinction, because the variant
+/// they return decides what the model is told and therefore what it does next:
+///
+/// - [`Error::Tool`] means **the arguments are malformed**. The model reads
+///   this as `invalid tool arguments`, which invites it to rewrite them and
+///   call again. Use it whenever rewriting the arguments could produce a call
+///   that works.
+/// - [`Error::Permission`] means **the arguments are well formed and no
+///   permission decision can be made for this call at all** — the tool is
+///   misconfigured in this session, not misused. The model is told so in its
+///   own words, and told that repeating the call will not change it. Nothing
+///   the model can write repairs this, so it must never arrive wearing the
+///   wording that asks it to try.
+///
+/// Every other error variant is classified with [`Error::Tool`]. A projection
+/// that cannot decide must fail one of these two ways rather than answer: an
+/// empty target or an empty reach is a positive claim that the call touches
+/// nothing, and every rule written against it stops selecting the call while
+/// the call goes on doing what it does.
 pub trait DispatchTool: Send {
     /// Projects the exact execution arguments into the permission target.
+    ///
+    /// See the trait's own documentation for which error variant to fail with:
+    /// the choice is part of this method's contract, and the default body's
+    /// [`Error::Tool`] is the malformed-arguments case rather than the general
+    /// one.
     fn permission_target(&self, arguments: &Value) -> Result<String, Error> {
         arguments
             .get("target")
             .and_then(Value::as_str)
             .map(str::to_owned)
             .ok_or_else(|| Error::Tool("tool target is required".into()))
+    }
+
+    /// Projects what the exact execution arguments let the call reach beyond
+    /// [`Self::permission_target`]. A tool named by the one thing it touches
+    /// reaches nothing else, which is why this defaults to empty.
+    ///
+    /// Fails under the same contract as [`Self::permission_target`].
+    fn permission_reach(&self, _arguments: &Value) -> Result<Vec<PermissionReach>, Error> {
+        Ok(Vec::new())
     }
 
     fn execute(
@@ -3153,7 +3361,13 @@ impl ToolDispatchRequest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PermissionPromptContext {
     pub project_id: String,
-    pub qualified_tool_name: String,
+    /// The dispatcher's own identity for the tool (`native:4:bash`), which is
+    /// what policy compares against and what a grant is stored under.
+    ///
+    /// It is deliberately not a qualified name: it equals no spelling a rule or
+    /// a person writes, so anything deciding on it — a redaction, a display —
+    /// has to reduce it through [`agens_core::bare_tool_name`] first.
+    pub tool_identity: String,
     pub target_identifier: String,
     pub access: ToolAccess,
     pub reason: String,
@@ -3163,7 +3377,7 @@ impl PermissionPromptContext {
     fn from_request(request: &PermissionRequest) -> Self {
         Self {
             project_id: request.project.clone(),
-            qualified_tool_name: request.tool.clone(),
+            tool_identity: request.tool.clone(),
             target_identifier: request.target.clone(),
             access: request.access,
             reason: "permission policy requires confirmation".into(),
@@ -3196,6 +3410,9 @@ pub struct AuthorizedToolCall {
     access: ToolAccess,
     arguments: Value,
     arguments_digest: u64,
+    /// The rules that authorized this call, kept so a tool that reads a whole
+    /// file set can ask them about each file. See [`PermissionReadFilter`].
+    read_filter: PermissionReadFilter,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -3228,6 +3445,7 @@ struct RegisteredDispatchTool {
 pub struct ToolDispatcher {
     tools: BTreeMap<ToolIdentity, RegisteredDispatchTool>,
     aliases: BTreeMap<String, ToolIdentity>,
+    declared_mcp_servers: BTreeSet<String>,
     dispatcher_id: u64,
     next_version: u64,
 }
@@ -3248,6 +3466,7 @@ impl ToolDispatcher {
             next_version: 1,
             tools: BTreeMap::new(),
             aliases: BTreeMap::new(),
+            declared_mcp_servers: BTreeSet::new(),
         }
     }
 
@@ -3341,6 +3560,87 @@ impl ToolDispatcher {
         self.aliases.get(alias)
     }
 
+    /// Records the MCP servers this session's configuration names, whether or
+    /// not any of them was ever reached.
+    ///
+    /// A configured rule may name a remote tool by either of the two names it
+    /// answers to, and only one of them says so on its own. `<server>::<tool>`
+    /// is self-identifying; `<server>_<tool>` — the name the model is actually
+    /// advertised, and the one `register_mcp` installs alongside it — is shaped
+    /// exactly like a bare native name. Nothing in `engram_mem_save`
+    /// distinguishes it from a misspelt `webfetc`, so a caller resolving it has
+    /// to ask what this session set out to run rather than what it reached.
+    pub fn declare_mcp_servers(&mut self, servers: impl IntoIterator<Item = String>) {
+        self.declared_mcp_servers
+            .extend(servers.into_iter().filter(|server| !server.is_empty()));
+    }
+
+    /// Whether this session's configuration names `server` at all.
+    pub fn declares_mcp_server(&self, server: &str) -> bool {
+        self.declared_mcp_servers.contains(server)
+    }
+
+    /// Every server name this session's configuration declares.
+    ///
+    /// A caller resolving a `<server>_<tool>` name has no separator to split on
+    /// and cannot recover the server from the name alone — a server called `a`
+    /// serving `b_c` and a server called `a_b` serving `c` are advertised under
+    /// the same name — so it matches the name against the declared set instead.
+    pub fn declared_mcp_servers(&self) -> impl Iterator<Item = &str> {
+        self.declared_mcp_servers.iter().map(String::as_str)
+    }
+
+    /// Whether this dispatcher holds any tool served by `server`.
+    ///
+    /// A caller resolving a configured rule that names a remote tool needs to
+    /// tell a misspelt tool name — which a live server's own surface can refuse
+    /// — from a name for a server that is not here at all, which nothing here
+    /// can answer for. Discovery is what puts a server's tools in this map, so a
+    /// server absent from it is a server this session never reached.
+    pub fn holds_mcp_server(&self, server: &str) -> bool {
+        let prefix = format!("mcp:{}:{server}:", server.len());
+
+        self.tools
+            .keys()
+            .any(|identity| identity.0.starts_with(&prefix))
+    }
+
+    /// The qualified names of every native tool registered here.
+    ///
+    /// A dispatcher is the only authority on what it holds. Deriving the native
+    /// surface from a catalog instead misses every tool registered directly
+    /// beside one — which is exactly how a tool arrives on the surface without
+    /// being classified against the rules that are supposed to reach it.
+    pub fn registered_native_names(&self) -> Vec<String> {
+        self.tools
+            .keys()
+            .filter_map(|identity| {
+                identity
+                    .0
+                    .strip_prefix("native:")
+                    .and_then(|rest| rest.split_once(':'))
+                    .filter(|(length, name)| {
+                        length
+                            .parse::<usize>()
+                            .is_ok_and(|length| length == name.len())
+                    })
+                    .map(|(_, name)| format!("native::{name}"))
+            })
+            .collect()
+    }
+
+    /// The access class one registered native was registered under.
+    ///
+    /// Paired with [`Self::registered_native_names`], this describes a
+    /// dispatcher's native surface without reference to any catalog — which is
+    /// what a harness modelling the production surface needs in order to model
+    /// it rather than remember it.
+    pub fn native_access(&self, qualified_name: &str) -> Option<ToolAccess> {
+        let identity = self.canonical_identity(qualified_name)?;
+
+        self.tools.get(identity).map(|registered| registered.access)
+    }
+
     pub(crate) fn capability_snapshot(&self) -> capabilities::CapabilitySnapshot {
         capabilities::CapabilitySnapshot {
             identities: self
@@ -3366,15 +3666,21 @@ impl ToolDispatcher {
         self.evaluate_with_policy_override(policy, grants, session, request, false)
     }
 
-    /// Evaluates identity, arguments, target projection, and hard safety before an optional
-    /// caller-owned override of ordinary policy decisions.
+    /// Evaluates identity, arguments, target projection, and hard safety
+    /// before consulting policy.
+    ///
+    /// `unmatched_allow` never overrides a matched rule or grant decision —
+    /// a declared `deny` or `ask` stays exactly that, even when this flag is
+    /// set. It only decides what happens when nothing matched at all, which
+    /// is the same fallback role `temporary_bypass` plays in the policy
+    /// layer.
     pub fn evaluate_with_policy_override(
         &self,
         policy: &PermissionPolicy,
         grants: &[ProjectPermissionGrant],
         session: &PermissionSession,
         request: ToolDispatchRequest,
-        override_ordinary_policy: bool,
+        unmatched_allow: bool,
     ) -> Result<ToolEvaluationOutcome, Error> {
         let identity = self
             .aliases
@@ -3390,11 +3696,14 @@ impl ToolDispatcher {
         let grants = agens_core::normalize_project_permission_grants(grants, |name| {
             self.aliases.get(name).map(|identity| identity.0.clone())
         });
-        let permission = PermissionRequest::new(
+        let target = registered.tool.permission_target(&request.arguments)?;
+        let reach = registered.tool.permission_reach(&request.arguments)?;
+        let permission = PermissionRequest::reaching(
             request.project_id,
             identity.0.clone(),
-            registered.tool.permission_target(&request.arguments)?,
+            target,
             registered.access,
+            &reach,
         );
         let grants: &[ProjectPermissionGrant] = if permission.project.trim().is_empty() {
             &[]
@@ -3406,24 +3715,26 @@ impl ToolDispatcher {
             return Ok(ToolEvaluationOutcome::Denied);
         }
 
-        if override_ordinary_policy {
-            return Ok(ToolEvaluationOutcome::Authorized(AuthorizedToolCall {
-                dispatcher_id: self.dispatcher_id,
-                registration_version: registered.version,
-                identity: identity.clone(),
-                projected_target: permission.target,
-                access: permission.access,
-                arguments_digest: digest_arguments(&request.arguments),
-                arguments: request.arguments,
-            }));
-        }
-
-        match policy.evaluate(&permission, grants, session) {
+        match policy.evaluate_with_unmatched_override(
+            &permission,
+            grants,
+            &[],
+            session,
+            unmatched_allow,
+        ) {
             PermissionDecision::Deny => Ok(ToolEvaluationOutcome::Denied),
             PermissionDecision::Ask => Ok(ToolEvaluationOutcome::PromptRequired(
                 PermissionPromptContext::from_request(&permission),
             )),
             PermissionDecision::Allow => {
+                let read_filter = PermissionReadFilter::new(
+                    policy,
+                    grants.to_vec(),
+                    permission.project.clone(),
+                    identity.0.clone(),
+                    permission.access,
+                );
+
                 Ok(ToolEvaluationOutcome::Authorized(AuthorizedToolCall {
                     dispatcher_id: self.dispatcher_id,
                     registration_version: registered.version,
@@ -3432,6 +3743,7 @@ impl ToolDispatcher {
                     access: permission.access,
                     arguments_digest: digest_arguments(&request.arguments),
                     arguments: request.arguments,
+                    read_filter,
                 }))
             }
         }
@@ -3461,10 +3773,19 @@ impl ToolDispatcher {
             return Err(Error::Tool("stale authorized tool call".into()));
         }
 
-        match registered.tool.execute(context, handle.arguments) {
+        let context = context.clone().with_read_filter(handle.read_filter);
+
+        match registered.tool.execute(&context, handle.arguments) {
             Ok(output) => {
-                if let Err(status) = context.check() {
-                    return Ok(sanitized_execution_status(status));
+                // A deadline that expired while the tool ran does not unmake
+                // its result: the work is already paid for and the caller is
+                // better served by it than by a failure. Reporting a timeout
+                // over a finished call is how a long subagent came back as
+                // "tool execution timed out" and got launched a second time.
+                // Cancellation is different — it is a decision, and its result
+                // must not be acted on.
+                if context.is_cancelled() {
+                    return Ok(sanitized_execution_status(ToolExecutionStatus::Cancelled));
                 }
                 Ok(output)
             }
@@ -4042,6 +4363,14 @@ impl NativeTools {
     }
 
     pub fn search(&self, input: SearchInput) -> Result<ToolOutput, Error> {
+        self.search_with_context(input, None)
+    }
+
+    pub fn search_with_context(
+        &self,
+        input: SearchInput,
+        context: Option<&ToolExecutionContext>,
+    ) -> Result<ToolOutput, Error> {
         if input.query.is_empty() {
             return Ok(ToolOutput::failure("search: query is required"));
         }
@@ -4055,15 +4384,27 @@ impl NativeTools {
             return Ok(ToolOutput::failure("search: path is not a directory"));
         }
 
-        let mut results = Vec::new();
-        let mut budget = SearchBudget::new(&self.limits, "search");
-        if let Err(output) =
-            self.search_directory(&path, &input.query, 0, &mut budget, &mut results)
-        {
+        let mut walk = SearchWalk {
+            query: &input.query,
+            context,
+            budget: SearchBudget::new(&self.limits, "search"),
+            results: Vec::new(),
+            withheld: false,
+        };
+        if let Err(output) = self.search_directory(&path, 0, &mut walk) {
             return Ok(output);
         }
 
+        let SearchWalk {
+            mut results,
+            withheld,
+            ..
+        } = walk;
         let match_count = results.len();
+        if withheld {
+            results.push(WITHHELD_FILES_NOTICE.to_owned());
+        }
+
         Ok(
             ToolOutput::success(results.join("")).with_facts(ToolResultFacts::Search {
                 outcome: ToolOutcome::Succeeded,
@@ -4074,6 +4415,14 @@ impl NativeTools {
     }
 
     pub fn grep(&self, input: GrepInput) -> Result<ToolOutput, Error> {
+        self.grep_with_context(input, None)
+    }
+
+    pub fn grep_with_context(
+        &self,
+        input: GrepInput,
+        context: Option<&ToolExecutionContext>,
+    ) -> Result<ToolOutput, Error> {
         if input.pattern.is_empty() {
             return Ok(ToolOutput::failure("grep: pattern is required"));
         }
@@ -4113,6 +4462,7 @@ impl NativeTools {
         }
 
         let mut results = Vec::new();
+        let mut withheld = false;
         for path in files {
             if let Err(output) = budget.check_deadline() {
                 return Ok(output);
@@ -4120,6 +4470,10 @@ impl NativeTools {
             let relative = path
                 .strip_prefix(&self.project_root)
                 .map_err(|_| Error::Tool("path: outside project root".into()))?;
+            if !permits_read(context, relative) {
+                withheld = true;
+                continue;
+            }
             if file_glob
                 .as_ref()
                 .is_some_and(|glob| !glob.is_match(relative))
@@ -4162,6 +4516,9 @@ impl NativeTools {
                 if regex.is_match(text) {
                     if results.len() == self.limits.max_search_results {
                         let match_count = results.len();
+                        if withheld {
+                            results.push(WITHHELD_FILES_NOTICE.to_owned());
+                        }
                         results.push(format!(
                             "[grep output truncated after {} results]\n",
                             self.limits.max_search_results
@@ -4180,6 +4537,10 @@ impl NativeTools {
         }
 
         let match_count = results.len();
+        if withheld {
+            results.push(WITHHELD_FILES_NOTICE.to_owned());
+        }
+
         Ok(
             ToolOutput::success(results.join("")).with_facts(ToolResultFacts::Search {
                 outcome: ToolOutcome::Succeeded,
@@ -4413,6 +4774,24 @@ impl NativeTools {
         }
     }
 
+    /// Runs a shell command with its working directory set to the project
+    /// root; nothing else confines it. Unlike `read`/`write`/`edit`/`grep`,
+    /// which resolve through a `*_confined` helper before touching disk, a
+    /// granted `bash` call can read or write anywhere the OS process can
+    /// reach — an absolute path, `cd ..`, or a relative `../` escapes the
+    /// project root exactly as it would in an interactive shell. This is a
+    /// deliberate, accepted property of granting `bash`, not an oversight.
+    ///
+    /// The declared guardrail against this is a target-pattern rule on the
+    /// command text, e.g. `deny bash rm*`, evaluated by `PermissionPolicy`
+    /// before this method ever runs. That guardrail is pattern matching over
+    /// a raw shell string, not a security boundary: it does not stop
+    /// `/bin/rm`, `sudo rm`, `cd foo && rm`, `xargs rm`, or any other way to
+    /// reach the same effect through different text. Unlike a path target,
+    /// a `bash` target is classified `PermissionTargetKind::FreeFormText`
+    /// (see `permission_target_kind_for_tool`), so a bare `*` crosses `/`
+    /// there: `deny bash rm*` already catches `rm -rf /tmp/x`, not just a
+    /// slash-free `rm` command.
     pub fn bash(&self, input: BashInput) -> Result<ToolOutput, Error> {
         if input.command.trim().is_empty() {
             return Ok(ToolOutput::failure("bash: command is required"));
@@ -4546,23 +4925,21 @@ impl NativeTools {
     fn search_directory(
         &self,
         directory: &Path,
-        query: &str,
         depth: usize,
-        budget: &mut SearchBudget,
-        results: &mut Vec<String>,
+        walk: &mut SearchWalk<'_>,
     ) -> Result<(), ToolOutput> {
         let directory_entries = fs::read_dir(directory)
             .map_err(|error| ToolOutput::failure(format!("search: {error}")))?;
         let mut entries = Vec::new();
 
         for entry in directory_entries {
-            budget.consume_entry()?;
+            walk.budget.consume_entry()?;
             entries.push(entry.map_err(|error| ToolOutput::failure(format!("search: {error}")))?);
         }
         entries.sort_by_key(|entry| entry.file_name());
 
         for entry in entries {
-            budget.check_deadline()?;
+            walk.budget.check_deadline()?;
 
             let path = entry.path();
             let metadata = fs::symlink_metadata(&path)
@@ -4580,7 +4957,7 @@ impl NativeTools {
                         self.limits.max_search_depth
                     )));
                 }
-                self.search_directory(&path, query, next_depth, budget, results)?;
+                self.search_directory(&path, next_depth, walk)?;
                 continue;
             }
 
@@ -4588,22 +4965,29 @@ impl NativeTools {
                 continue;
             }
 
-            let content = fs::read_to_string(&path)
-                .map_err(|error| ToolOutput::failure(format!("search: {error}")))?;
             let relative = path
                 .strip_prefix(&self.project_root)
                 .map_err(|_| ToolOutput::failure("path: outside project root"))?;
 
+            if !permits_read(walk.context, relative) {
+                walk.withheld = true;
+                continue;
+            }
+
+            let content = fs::read_to_string(&path)
+                .map_err(|error| ToolOutput::failure(format!("search: {error}")))?;
+
             for (line, text) in content.lines().enumerate() {
-                budget.check_deadline()?;
-                if text.contains(query) {
-                    if results.len() == self.limits.max_search_results {
+                walk.budget.check_deadline()?;
+                if text.contains(walk.query) {
+                    if walk.results.len() == self.limits.max_search_results {
                         return Err(ToolOutput::failure(format!(
                             "search: result limit of {} exceeded",
                             self.limits.max_search_results
                         )));
                     }
-                    results.push(format!("{}:{}:{text}\n", relative.display(), line + 1));
+                    walk.results
+                        .push(format!("{}:{}:{text}\n", relative.display(), line + 1));
                 }
             }
         }
@@ -4905,6 +5289,28 @@ fn visible_html_text(html: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// The native tools registered beside [`NativeToolCatalog::metadata`] rather
+/// than out of it.
+///
+/// Each is constructed from something the catalog holds no handle on — the
+/// skill catalog, the agent catalog, the registry a live delegation is
+/// coordinated through, the port an interactive surface answers a question on —
+/// so the runtime that owns those constructs and registers the tool itself.
+/// Which of them a given dispatcher ends up holding depends on what that
+/// runtime is for and on how the session is configured.
+///
+/// They are enumerated here all the same, because anything resolving a name
+/// against "the native tools" resolves it against a surface these belong to. A
+/// name left out survives as a pattern that never matches a dispatcher
+/// identity: the rule reads as enforced and decides nothing.
+pub const NATIVE_TOOLS_REGISTERED_OUTSIDE_THE_CATALOG: [&str; 5] = [
+    "native::ask_user",
+    "native::skill",
+    "native::task",
+    "native::task_control",
+    "native::task_message",
+];
+
 /// Canonical production catalog for the built-in project-confined tools.
 #[derive(Debug)]
 pub struct NativeToolCatalog {
@@ -5020,9 +5426,10 @@ impl NativeToolCatalog {
             "native::list" => self
                 .tools
                 .list_directory(ListDirectoryInput::new(string("path")?))?,
-            "native::search" => self
-                .tools
-                .search(SearchInput::new(string("path")?, string("query")?))?,
+            "native::search" => self.tools.search_with_context(
+                SearchInput::new(string("path")?, string("query")?),
+                Some(context),
+            )?,
             "native::grep" => {
                 let mut input = GrepInput::new(string("pattern")?);
                 if let Some(path) = arguments.get("path").and_then(Value::as_str) {
@@ -5036,7 +5443,7 @@ impl NativeToolCatalog {
                 {
                     input = input.with_case_insensitive(case_insensitive);
                 }
-                self.tools.grep(input)?
+                self.tools.grep_with_context(input, Some(context))?
             }
             "native::glob" => self.tools.glob(GlobInput::new(string("pattern")?))?,
             "native::git_read" => {
@@ -5144,6 +5551,17 @@ fn validate_limits(limits: &NativeToolLimits) -> Result<(), Error> {
     Ok(())
 }
 
+/// Asks the rules that authorized a search whether it may report what one of
+/// the files it walked into holds.
+///
+/// A search is authorized on its pattern and on the root it was given, neither
+/// of which names the files under that root, so this is asked once per file
+/// actually read. A caller holding no context — a direct use of the tool
+/// outside any permission decision — reads everything.
+fn permits_read(context: Option<&ToolExecutionContext>, relative: &Path) -> bool {
+    context.is_none_or(|context| context.permits_read(&relative.to_string_lossy()))
+}
+
 fn build_glob_set(pattern: &str, tool: &str) -> Result<GlobSet, ToolOutput> {
     validate_relative_glob_pattern(pattern, tool)?;
 
@@ -5180,6 +5598,16 @@ fn validate_relative_glob_pattern(pattern: &str, tool: &str) -> Result<(), ToolO
     }
 
     Ok(())
+}
+
+/// What one `search` call carries through its traversal: what it looks for,
+/// what it is allowed to read, and what it has found so far.
+struct SearchWalk<'a> {
+    query: &'a str,
+    context: Option<&'a ToolExecutionContext>,
+    budget: SearchBudget,
+    results: Vec<String>,
+    withheld: bool,
 }
 
 struct SearchBudget {

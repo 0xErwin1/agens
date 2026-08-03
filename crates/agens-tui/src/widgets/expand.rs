@@ -31,7 +31,7 @@ impl ExpandMode {
         }
     }
 
-    /// Shared Ctrl+O detail path. Streaming is left alone (still live).
+    /// Shared detail toggle. Streaming is left alone (still live).
     pub(crate) const fn toggle_detail(self) -> Self {
         match self {
             Self::Collapsed => Self::Expanded,
@@ -64,6 +64,29 @@ impl DisplayMode {
             Self::Collapsed => Self::Truncated,
             Self::Truncated => Self::Expanded,
             Self::Expanded => Self::Collapsed,
+        }
+    }
+
+    /// Walks the cycle backwards, so overshooting a level costs one key rather
+    /// than a full lap.
+    pub(crate) const fn previous(self) -> Self {
+        match self {
+            Self::Collapsed => Self::Expanded,
+            Self::Truncated => Self::Collapsed,
+            Self::Expanded => Self::Truncated,
+        }
+    }
+
+    /// What the level is called where the reader can see it.
+    ///
+    /// The names describe how much of the body is on screen, not the internal
+    /// state: a reader who never opens the source still has to be able to tell
+    /// the three levels apart from the footer alone.
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Collapsed => "hidden",
+            Self::Truncated => "preview",
+            Self::Expanded => "full",
         }
     }
 }
@@ -122,6 +145,31 @@ mod tests {
         assert_eq!(DisplayMode::Truncated.next(), DisplayMode::Expanded);
         assert_eq!(DisplayMode::Expanded.next(), DisplayMode::Collapsed);
         assert_eq!(DisplayMode::default(), DisplayMode::Collapsed);
+    }
+
+    /// Every level has to be reachable in both directions, or overshooting the
+    /// one the reader wanted means walking the whole cycle again.
+    #[test]
+    fn display_mode_previous_undoes_next_from_every_level() {
+        for mode in [
+            DisplayMode::Collapsed,
+            DisplayMode::Truncated,
+            DisplayMode::Expanded,
+        ] {
+            assert_eq!(mode.next().previous(), mode);
+            assert_eq!(mode.previous().next(), mode);
+        }
+    }
+
+    #[test]
+    fn every_display_mode_names_itself_distinctly() {
+        let labels = [
+            DisplayMode::Collapsed.label(),
+            DisplayMode::Truncated.label(),
+            DisplayMode::Expanded.label(),
+        ];
+
+        assert_eq!(labels, ["hidden", "preview", "full"]);
     }
 
     #[test]

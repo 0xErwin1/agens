@@ -8,7 +8,9 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use agens_bootstrap::Bootstrap;
-use agens_core::{AgentDefinition, HeadlessTurnError};
+use agens_core::{
+    AgentDefinition, HeadlessTurnError, PermissionDecision, PermissionPattern, PermissionRule,
+};
 use agens_error::CliError;
 use agens_session::context::AgentRotationError;
 use agens_session::context::SessionContext;
@@ -95,11 +97,10 @@ pub fn discover_agent_catalog(
 ) -> Result<AgentCatalog, CliError> {
     let session_root =
         agens_bootstrap::session_root::SessionRoot::confined_to(project_root.to_path_buf());
-    let system_prompt =
+    let system_prompt = agens_core::prompt::base_system_prompt(
         agens_bootstrap::session_config::SessionConfig::resolve(&session_root, bootstrap)?
-            .system_prompt()
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(|| "You are Agens, a helpful coding agent.".into());
+            .system_prompt(),
+    );
     let instructions =
         agens_bootstrap::session_config::SessionInstructions::resolve(&session_root, bootstrap);
     let primary = AgentDefinition {
@@ -122,7 +123,7 @@ pub fn discover_agent_catalog(
         reasoning_effort: None,
         system_prompt: "You are the read-only exploration subagent. Inspect the codebase without modifying files and return concise, grounded findings."
             .into(),
-        permission_rules: Vec::new(),
+        permission_rules: explore_permission_rules(),
         skills: Vec::new(),
     };
     let general = AgentDefinition {
@@ -154,6 +155,22 @@ pub fn discover_agent_catalog(
                 .with_appended_instructions(instructions.text().unwrap_or(""))
         })
         .map_err(|_| CliError::configuration("agent catalog is unavailable"))
+}
+
+/// The built-in `explore` subagent's narrowing, declared explicitly so an
+/// upgrade never silently widens it: `explore` inherits the parent's native
+/// surface like any other subagent unless it says otherwise here.
+fn explore_permission_rules() -> Vec<PermissionRule> {
+    ["write", "edit", "bash", "webfetch"]
+        .into_iter()
+        .map(|tool| {
+            PermissionRule::global(
+                PermissionDecision::Deny,
+                PermissionPattern::glob(tool).expect("built-in tool name is a valid glob"),
+                PermissionPattern::Any,
+            )
+        })
+        .collect()
 }
 
 pub fn agent_rotation_error(error: AgentRotationError) -> CliError {

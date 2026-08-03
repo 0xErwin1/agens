@@ -136,7 +136,17 @@ impl TuiTaskLifecycleBridge {
             },
         });
         self.publish(TuiRuntimeEvent::SubagentExecution(
-            TuiSubagentEvent::started(id, &agent, request.description(), presentation),
+            TuiSubagentEvent::started_on(
+                id,
+                &agent,
+                request.description(),
+                presentation,
+                Some(request.model()),
+                request
+                    .request_config()
+                    .reasoning_effort()
+                    .map(|effort| effort.as_str()),
+            ),
         ));
         let events = self.events.clone();
         let registry = self.controls.0.clone();
@@ -532,7 +542,7 @@ impl TaskRunner for ProductionTaskRunner {
         let result = self
             .failure_probe
             .as_ref()
-            .map(|failure| Err(failure.error))
+            .map(|failure| Err(failure.error.clone()))
             .unwrap_or_else(|| {
                 run_production_task(
                     request,

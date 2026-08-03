@@ -8,6 +8,7 @@
 use std::sync::{Arc, Mutex};
 
 use agens_bus::BridgeTx;
+use agens_core::ask_user::UnavailableAskUserPort;
 use agens_core::{
     HeadlessTaskTerminal, HeadlessToolOutput, HeadlessTurnCancellation, HeadlessTurnError,
     MessagePart, PermissionDecision, PermissionMode, PermissionPattern, PermissionPolicy,
@@ -18,8 +19,10 @@ use agens_dispatch::{TaskLaunchOutcome, TuiSelectedTaskLaunch};
 use agens_session::context::CompletedSubagentTurn;
 use agens_session::context::SessionContext;
 use agens_tool_runtime::child::ChildRunError;
+use agens_tool_runtime::child_catalog::ChildSurfaceRejection;
 use agens_tool_runtime::launch_selected_task as launch_selected_tui_task;
 use agens_tool_runtime::runner::{ProductionTaskRunner, TuiTaskControls, TuiTaskLifecycleBridge};
+use agens_tools::TaskDeclarationRejection;
 use agens_tools::{SkillCatalog, TaskLaunchMode, TaskProviderFailure, TaskRunnerError};
 
 use agens_store::SessionStore;
@@ -86,6 +89,7 @@ fn p1c1_terminal_observer_excludes_non_completed_matrix() {
                 Arc::new(Mutex::new(Vec::new())),
             )
             .with_lifecycle_bridge(lifecycle_bridge),
+            Box::new(UnavailableAskUserPort),
         )
         .unwrap();
         runtime.authorized.gate.policy = PermissionPolicy::new(
@@ -171,6 +175,7 @@ fn u15_a1b2_selected_launch_uses_the_registered_production_task_runner() {
             agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap),
             Arc::clone(&probe),
         ),
+        Box::new(UnavailableAskUserPort),
     )
     .unwrap();
     let session = Arc::new(Mutex::new(SessionContext {
@@ -222,11 +227,24 @@ fn u15_a1b2_selected_launch_uses_the_registered_production_task_runner() {
         launch_selected_tui_task(&mut runtime, &session, "review task", false, &cancellation),
         Ok(TuiSelectedTaskLaunch::Dispatched)
     );
-    let probe = probe.lock().unwrap();
-    assert_eq!(probe.len(), 2);
-    assert_eq!(probe[0].1, TaskLaunchMode::Background);
-    assert_eq!(probe[1].1, TaskLaunchMode::Foreground);
-    assert_ne!(probe[0].0, probe[1].0);
+    // A background dispatch reaches the runner on its own thread while the
+    // foreground one reaches it inline, so which lands first is not a
+    // guarantee this design makes. Wait for both, then compare without
+    // ordering.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while probe.lock().unwrap().len() < 2 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "both task dispatches should reach the runner, saw {:?}",
+            *probe.lock().unwrap()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let mut observed = probe.lock().unwrap().clone();
+    observed.sort_by_key(|entry| entry.0);
+    assert_eq!(observed[0].1, TaskLaunchMode::Background);
+    assert_eq!(observed[1].1, TaskLaunchMode::Foreground);
+    assert_ne!(observed[0].0, observed[1].0);
     assert!(reply.join().unwrap());
 
     std::fs::remove_dir_all(temporary).unwrap();
@@ -276,6 +294,7 @@ fn p1c1_p1b_authorized_runner_persists_one_completed_subagent_turn() {
             ],
         )
         .with_lifecycle_bridge(lifecycle_bridge),
+        Box::new(UnavailableAskUserPort),
     )
     .unwrap();
     runtime.authorized.gate.policy = PermissionPolicy::new(
@@ -309,11 +328,13 @@ fn p1c1_p1b_authorized_runner_persists_one_completed_subagent_turn() {
                 agent: "reviewer".into(),
                 event: TuiExecutionEvent::ForegroundStarted { id: 1 },
             },
-            TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::started(
+            TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::started_on(
                 1,
                 "reviewer",
                 "review task",
                 agens_core::TuiExecutionState::ForegroundRunning,
+                Some("gpt-4.1"),
+                None,
             )),
             TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::reasoning(1, "inspect")),
             TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::text(1, "partial")),
@@ -497,6 +518,20 @@ fn production_runner_error_publication_orders_sanitized_typed_failure_before_ter
             "failed",
         ),
         (
+            ChildRunError::DeclarationRejected(ChildSurfaceRejection {
+                reason: TaskDeclarationRejection::ConfigurationDenies,
+                tool: "native::bash".into(),
+            }),
+            TaskRunnerError::DeclarationRejected {
+                reason: TaskDeclarationRejection::ConfigurationDenies,
+                tool: "native::bash".into(),
+            },
+            Some(SubagentErrorKind::Runtime),
+            TuiExecutionEvent::Failed { id: 1 },
+            SubagentStatus::Failure,
+            "failed",
+        ),
+        (
             ChildRunError::Cancelled,
             TaskRunnerError::Cancelled,
             None,
@@ -531,10 +566,11 @@ fn production_runner_error_publication_orders_sanitized_typed_failure_before_ter
             ProductionTaskRunner::with_failure_probe(
                 bootstrap.clone(),
                 agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap),
-                source,
+                source.clone(),
                 "provider-token=super-secret-error-detail",
             )
             .with_lifecycle_bridge(lifecycle_bridge),
+            Box::new(UnavailableAskUserPort),
         )
         .unwrap();
         runtime.authorized.gate.policy = PermissionPolicy::new(
@@ -550,7 +586,7 @@ fn production_runner_error_publication_orders_sanitized_typed_failure_before_ter
             ..SessionContext::fresh()
         }));
 
-        let reported = match expected_error {
+        let reported = match &expected_error {
             TaskRunnerError::Cancelled => HeadlessTaskTerminal::Cancelled.message().to_owned(),
             TaskRunnerError::TimedOut => HeadlessTaskTerminal::TimedOut.message().to_owned(),
             TaskRunnerError::ProviderFailure(cause) => format!(
@@ -564,6 +600,11 @@ fn production_runner_error_publication_orders_sanitized_typed_failure_before_ter
             TaskRunnerError::ChildFailure => {
                 HeadlessTaskTerminal::ChildFailure.message().to_owned()
             }
+            TaskRunnerError::DeclarationRejected { reason, tool } => format!(
+                "{} [declaration: {tool}; {}]",
+                HeadlessTaskTerminal::DeclarationRejected.message(),
+                reason.label()
+            ),
         };
         assert_eq!(
             launch_selected_tui_task(
@@ -583,11 +624,13 @@ fn production_runner_error_publication_orders_sanitized_typed_failure_before_ter
                 agent: "reviewer".into(),
                 event: TuiExecutionEvent::ForegroundStarted { id: 1 },
             },
-            TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::started(
+            TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::started_on(
                 1,
                 "reviewer",
                 "review task",
                 agens_core::TuiExecutionState::ForegroundRunning,
+                Some("gpt-4.1"),
+                None,
             )),
         ];
         if let Some(kind) = expected_kind {

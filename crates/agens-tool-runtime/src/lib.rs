@@ -8,6 +8,7 @@
 //! daemon worker assemble the same runtime.
 
 pub mod child;
+pub mod child_catalog;
 pub mod mcp;
 pub mod rotation;
 pub mod runner;

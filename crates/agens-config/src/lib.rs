@@ -14,6 +14,7 @@ pub use agent_profiles::{
 pub enum ConfigPermissionDecision {
     Allow,
     Deny,
+    Ask,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -869,10 +870,11 @@ pub fn validate_toml_document(document: &toml::Table) -> Result<(), ConfigValida
     validate_named_table(
         document,
         "permissions",
-        &["allow", "deny"],
+        &["allow", "deny", "ask"],
         |table, path| {
             validate_optional(table, "allow", path, is_string_array)?;
-            validate_optional(table, "deny", path, is_string_array)
+            validate_optional(table, "deny", path, is_string_array)?;
+            validate_optional(table, "ask", path, is_string_array)
         },
     )?;
     agent_profiles::validate_agent_profiles(document)?;
@@ -1054,6 +1056,7 @@ fn extract_scoped_permission_rules(
     for (field, decision) in [
         ("allow", ConfigPermissionDecision::Allow),
         ("deny", ConfigPermissionDecision::Deny),
+        ("ask", ConfigPermissionDecision::Ask),
     ] {
         let Some(entries) = permissions.get(field).and_then(toml::Value::as_array) else {
             continue;

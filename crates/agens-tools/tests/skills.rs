@@ -586,7 +586,7 @@ fn skill_resource_tool_discloses_only_selected_confined_content() {
         .unwrap()
         .catalog()
         .clone();
-    let mut tool = SkillResourceTool::new(catalog);
+    let mut tool = SkillResourceTool::new(catalog, &root);
     let context = ToolExecutionContext::with_timeout(Duration::from_secs(1));
 
     assert_eq!(
@@ -777,6 +777,60 @@ fn lazy_resource_reads_reject_post_discovery_hardlinks_and_nonregular_files() {
             .unwrap_err(),
         "skill resource must be a regular non-symbolic-link file"
     );
+}
+
+/// The catalog and the project root arrive at [`SkillResourceTool`] as
+/// independent arguments, so a caller can pair a catalog with a root it was
+/// never discovered under: a re-discovery that failed and left the previous
+/// root's catalog in place, a symlinked worktree, two spellings of one
+/// directory. A project skill that does not lie under the root it is paired
+/// with is that disagreement, in the one place it decides a permission.
+///
+/// Reporting no reach there would be silent and wrong in the dangerous
+/// direction: every rule written against a project skill would stop selecting
+/// the call, while the tool went on opening that skill's files through the
+/// directory descriptors it already holds. The call is refused instead.
+///
+/// A root that merely CONTAINS the true one is the case a `strip_prefix` test
+/// cannot see: the prefix comes off, so the call is answered, and it is
+/// answered with a reach spelled relative to the wrong root. Both directions
+/// are asserted here — a root beside the true one and a root above it.
+#[test]
+fn a_project_skill_outside_the_root_it_is_paired_with_refuses_the_call() {
+    let temporary = TemporaryDirectory::new();
+    let project = temporary.path.join("project");
+    let skills = project.join(".agens/skills");
+    write_skill(
+        &skills,
+        "probe",
+        "---\nname: probe\ndescription: probe skill\n---\ninstructions\n",
+    );
+
+    let catalog = SkillCatalog::discover(temporary.path.join("global"), &skills)
+        .expect("discover skills")
+        .catalog()
+        .clone();
+    let arguments = json!({ "skill": "probe" });
+
+    assert_eq!(
+        SkillResourceTool::new(catalog.clone(), &project)
+            .permission_reach(&arguments)
+            .expect("a catalog paired with its own root reports the file the call opens"),
+        vec![agens_core::PermissionReach::Path(
+            ".agens/skills/probe/SKILL.md".into()
+        )],
+    );
+    for unpaired in [temporary.path.join("elsewhere"), temporary.path.clone()] {
+        let refusal = SkillResourceTool::new(catalog.clone(), &unpaired)
+            .permission_reach(&arguments)
+            .unwrap_err();
+        assert!(
+            matches!(refusal, agens_core::Error::Permission(_)),
+            "a project skill outside the root it is paired with must refuse the call as an \
+             unresolvable permission rather than as an argument error, under {}: {refusal:?}",
+            unpaired.display()
+        );
+    }
 }
 
 fn write_skill(root: &Path, directory: &str, contents: &str) {

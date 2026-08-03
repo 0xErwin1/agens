@@ -475,20 +475,38 @@ mod tests {
                 input: r#"{"agent":"explorer","description":"map the session writer"}"#.into(),
             },
         );
+        // The spelling a model-initiated delegation actually arrives under: the
+        // task tool is advertised to the provider as `task`, and the event
+        // carries the provider's own name for the call. `native::task` is the
+        // spelling agens uses when it launches a delegation on its own behalf.
         record_requested_subagent(
             &requested,
             &TurnEvent::ToolCallRequested {
                 id: "call-2".into(),
+                name: "task".into(),
+                input: r#"{"agent":"reviewer","description":"read the diff"}"#.into(),
+            },
+        );
+        record_requested_subagent(
+            &requested,
+            &TurnEvent::ToolCallRequested {
+                id: "call-3".into(),
                 name: "native::read".into(),
                 input: r#"{"path":"notes.md"}"#.into(),
             },
         );
         assert_eq!(
             requested.lock().unwrap().as_slice(),
-            [RequestedSubagent {
-                agent: "explorer".into(),
-                description: "map the session writer".into(),
-            }]
+            [
+                RequestedSubagent {
+                    agent: "explorer".into(),
+                    description: "map the session writer".into(),
+                },
+                RequestedSubagent {
+                    agent: "reviewer".into(),
+                    description: "read the diff".into(),
+                }
+            ]
         );
 
         let note = interrupted_turn_note(&requested.lock().unwrap());

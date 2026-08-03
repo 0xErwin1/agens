@@ -2,9 +2,13 @@
 
 mod activity;
 mod app;
+mod ask_user;
 mod bridge;
 mod conversation;
+#[cfg(feature = "perf-audit")]
+pub mod perf;
 mod render;
+pub mod shortcuts;
 mod terminal;
 mod widgets;
 
@@ -15,7 +19,11 @@ pub use agens_core::{
     TuiExecutionState, TuiRuntimeEvent, TuiSubagentEvent,
 };
 pub use app::{AppEvent, AppState, Command, Dialog, Effect, Runtime};
-pub use bridge::{TuiPermissionBridge, TuiPermissionReply, TuiPermissionRequest};
+pub use ask_user::{AskUserEditing, AskUserRowSnapshot, AskUserSnapshot};
+pub use bridge::{
+    TuiAskUserBridge, TuiAskUserRequest, TuiPermissionBridge, TuiPermissionReply,
+    TuiPermissionRequest,
+};
 pub use conversation::{
     ActionableError, Conversation, ConversationError, ConversationEvent, SubagentCard, ToolBatch,
     ToolCall, ToolResult, TurnCost,
@@ -24,7 +32,7 @@ pub use terminal::{
     PendingPermissions, PermissionReply, TerminalControl, TerminalModeGuard, TerminalOperation,
     teardown,
 };
-pub use widgets::DisplayMode;
+pub use widgets::{ColorLevel, DisplayMode, UnicodeLevel};
 
 use std::{
     borrow::Cow,
@@ -41,7 +49,9 @@ use std::{
 
 use agens_core::SubagentStatus;
 use agens_core::SubmitOrigin;
+use agens_core::ask_user::{AskUserMode, AskUserQuestion, AskUserReply, AskUserRequest};
 use agens_core::{MessagePart, TurnEvent, TurnState, Usage};
+use ask_user::{AskUserEntry, AskUserOutcome, AskUserRow, AskUserState};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use crossterm::{
     cursor::{Hide as HideCursor, Show as ShowCursor},
@@ -62,7 +72,7 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Borders, Padding, Paragraph, Wrap},
 };
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const TRANSCRIPT_CONTENT_INDENT: u16 = 4;
 /// Chrome padding left of a transcript row, once the row itself spends
@@ -117,12 +127,34 @@ pub enum Event {
         column: u16,
         row: u16,
     },
+    /// The pointer moved with no button held.
+    MouseMove {
+        column: u16,
+        row: u16,
+    },
     Paste(String),
     /// A terminal resize in columns and rows.
     Resize {
         width: u16,
         height: u16,
     },
+}
+
+#[cfg(feature = "perf-audit")]
+impl Event {
+    /// Stable trace-field label for the event's discriminant.
+    const fn trace_kind(&self) -> &'static str {
+        match self {
+            Self::Key(_) => "key",
+            Self::MouseWheel(_) => "mouse_wheel",
+            Self::MouseDown { .. } => "mouse_down",
+            Self::MouseDrag { .. } => "mouse_drag",
+            Self::MouseUp { .. } => "mouse_up",
+            Self::MouseMove { .. } => "mouse_move",
+            Self::Paste(_) => "paste",
+            Self::Resize { .. } => "resize",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -140,6 +172,7 @@ pub enum Key {
     Backspace,
     Delete,
     DeletePreviousWord,
+    DeleteNextWord,
     DeleteToLineStart,
     DeleteToLineEnd,
     /// Submits the current input.
@@ -150,12 +183,24 @@ pub enum Key {
     CtrlC,
     /// Copies the active transcript selection through the terminal clipboard.
     CtrlShiftC,
-    /// Collapses or expands detail (thinking-first, else tool outputs).
+    /// Advances the transcript's tool output detail level.
     CtrlO,
+    /// Walks the tool output detail level back one step.
+    CtrlShiftO,
+    /// Shows or hides the reasoning bodies of the active transcript.
+    CtrlT,
+    /// Unfolds the settled turns the transcript elided, or folds them back.
+    CtrlY,
     /// Scrolls the transcript timeline down (composer-safe).
     CtrlJ,
     /// Scrolls the transcript timeline up (composer-safe).
     CtrlK,
+    /// Half-page down in the focused transcript; forward delete in the composer.
+    CtrlD,
+    /// Half-page up in the focused transcript; delete-to-line-start in the composer.
+    CtrlU,
+    /// Opens the keyboard shortcut overlay from any mode.
+    CtrlQuestion,
     /// Jumps the transcript viewport to the top.
     CtrlG,
     /// Jumps the transcript viewport to the bottom.
@@ -192,11 +237,105 @@ pub enum Key {
     Tab,
 }
 
+impl Key {
+    /// Whether holding this key down should keep applying it.
+    ///
+    /// Typing, deleting and moving are the keys a reader holds on purpose:
+    /// dropping their auto-repeat means a held backspace deletes one character
+    /// and a held `Ctrl+W` one word, which is not what holding a key means
+    /// anywhere else.
+    ///
+    /// Everything else is a command or a mode, and a command must fire once
+    /// per press. A held `Ctrl+Shift+P` that toggled permission bypass forty
+    /// times would land on whichever state the key release happened to leave —
+    /// that is why auto-repeat was dropped wholesale, and why it stays dropped
+    /// here.
+    pub const fn repeats_while_held(self) -> bool {
+        matches!(
+            self,
+            Self::Char(_)
+                | Self::Backspace
+                | Self::Delete
+                | Self::DeletePreviousWord
+                | Self::DeleteNextWord
+                | Self::DeleteToLineStart
+                | Self::DeleteToLineEnd
+                | Self::Left
+                | Self::Right
+                | Self::Up
+                | Self::Down
+                | Self::PreviousWord
+                | Self::NextWord
+                | Self::PageUp
+                | Self::PageDown
+                | Self::ScrollUp
+                | Self::ScrollDown
+                | Self::CtrlJ
+                | Self::CtrlK
+                | Self::CtrlD
+                | Self::CtrlU
+        )
+    }
+
+    /// Whether this key moves the transcript viewport under the vim keymap.
+    ///
+    /// Reading the transcript stays available while a session is being
+    /// restored, so these keys survive the load-time key filter.
+    pub const fn moves_viewport(self) -> bool {
+        matches!(
+            self,
+            Self::Char('j' | 'k' | 'g' | 'G' | '{' | '}') | Self::CtrlD | Self::CtrlU
+        )
+    }
+
+    /// Whether this key's only meaning is to edit or submit the prompt.
+    pub const fn edits_composer(self) -> bool {
+        matches!(
+            self,
+            Self::Char(_)
+                | Self::ShiftEnter
+                | Self::Enter
+                | Self::Backspace
+                | Self::Delete
+                | Self::DeletePreviousWord
+                | Self::DeleteNextWord
+                | Self::DeleteToLineStart
+                | Self::DeleteToLineEnd
+                | Self::Left
+                | Self::Right
+                | Self::PreviousWord
+                | Self::NextWord
+                | Self::LineStart
+                | Self::LineEnd
+        )
+    }
+
+    /// The composer meaning of a key whose transcript meaning differs.
+    ///
+    /// `Ctrl+D` and `Ctrl+U` are readline edits inside the composer and vim
+    /// half-page motions over the transcript. The terminal cannot tell those
+    /// apart — the mode can — so the raw key is carried to the handler and
+    /// resolved here rather than being decided while mapping the event.
+    const fn composer_equivalent(self) -> Self {
+        match self {
+            Self::CtrlD => Self::Delete,
+            Self::CtrlU => Self::DeleteToLineStart,
+            other => other,
+        }
+    }
+}
+
 /// The result of handling a single terminal event.
 #[derive(Clone, Eq, PartialEq)]
 pub enum Action {
     /// Render the current view state.
     Render,
+    /// The event changed nothing a reader could see.
+    ///
+    /// Pointer movement is the reason this exists: it arrives dozens of times
+    /// per second and almost all of it lands inside the block already under
+    /// the cursor, where repainting shows exactly what was already on screen.
+    Unchanged,
     /// Send this prompt to the composition layer.
     Submit(String),
     /// Submit a redacted credential through the dedicated route only.
@@ -230,6 +369,11 @@ pub enum Action {
     CopyDeviceAuthCode,
     /// A local route was cancelled before its result could be applied.
     CancelRoute,
+    /// Resolves the open ask-user interaction with a validated terminal reply.
+    AskUserReply {
+        id: u64,
+        reply: AskUserReply,
+    },
     /// End the terminal event loop.
     Quit,
 }
@@ -417,6 +561,49 @@ struct DeviceAuthRender<'a> {
     confirmation: Option<&'static str>,
 }
 
+/// Borrowed projection of an open ask-user interaction, for one frame.
+///
+/// Every field either points into the state the interaction already owns or is
+/// a scalar. A renderer that copied the request would pay for the whole
+/// question set — labels, explanations and context — on every frame, including
+/// the frames where nothing about it changed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AskUserRender<'a> {
+    request: &'a AskUserRequest,
+    question: usize,
+    row: AskUserRow,
+    selected: &'a BTreeSet<usize>,
+    other: &'a str,
+    note: &'a str,
+    entry: AskUserEntry,
+    context_option: usize,
+    context_scroll: u16,
+    incomplete: Option<usize>,
+    answered: usize,
+}
+
+impl<'a> AskUserRender<'a> {
+    fn of(state: &'a AskUserState) -> Self {
+        Self {
+            request: state.request(),
+            question: state.question_index(),
+            row: state.row(),
+            selected: state.current_selections(),
+            other: state.current_other(),
+            note: state.current_note(),
+            entry: state.entry(),
+            context_option: state.context_option(),
+            context_scroll: state.context_scroll(),
+            incomplete: state.incomplete(),
+            answered: state.answered_count(),
+        }
+    }
+
+    fn current(&self) -> &'a AskUserQuestion {
+        &self.request.questions()[self.question]
+    }
+}
+
 #[derive(Clone)]
 struct DeviceAuthState {
     verification_url: String,
@@ -434,6 +621,7 @@ impl std::fmt::Debug for Action {
                 .field("secret", &"<redacted>")
                 .finish(),
             Self::Render => formatter.write_str("Render"),
+            Self::Unchanged => formatter.write_str("Unchanged"),
             Self::Submit(value) => formatter.debug_tuple("Submit").field(value).finish(),
             Self::SubmitBackground(value) => formatter
                 .debug_tuple("SubmitBackground")
@@ -471,8 +659,27 @@ impl std::fmt::Debug for Action {
             Self::CopyDeviceAuthUrl => formatter.write_str("CopyDeviceAuthUrl"),
             Self::CopyDeviceAuthCode => formatter.write_str("CopyDeviceAuthCode"),
             Self::CancelRoute => formatter.write_str("CancelRoute"),
+            Self::AskUserReply { id, reply } => formatter
+                .debug_struct("AskUserReply")
+                .field("id", id)
+                .field("status", &ask_user_reply_status(reply))
+                .finish(),
             Self::Quit => formatter.write_str("Quit"),
         }
+    }
+}
+
+/// The reply's terminal status only, for `Action`'s debug rendering.
+///
+/// Answers, notes and free text never reach a debug rendering: only the
+/// closed set of statuses the tool layer itself encodes does.
+const fn ask_user_reply_status(reply: &AskUserReply) -> &'static str {
+    match reply {
+        AskUserReply::Answered(_) => "answered",
+        AskUserReply::Discuss { .. } => "discuss",
+        AskUserReply::Cancelled => "cancelled",
+        AskUserReply::Unavailable(_) => "unavailable",
+        AskUserReply::Expired => "expired",
     }
 }
 
@@ -580,6 +787,17 @@ pub enum TranscriptFocus {
     Viewport,
 }
 
+/// Which user message a jump lands on.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UserMessageTarget {
+    /// The nearest one above the viewport.
+    Previous,
+    /// The nearest one below the viewport.
+    Next,
+    /// The most recent one in the transcript.
+    Last,
+}
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct TranscriptPosition {
     pub row: usize,
@@ -602,8 +820,19 @@ pub struct TranscriptRecord {
     following_bottom: bool,
     scroll_offset: u16,
     tool_display_modes: BTreeMap<String, widgets::DisplayMode>,
+    /// Detail level every settled tool call of this transcript is shown at.
+    ///
+    /// The per-call map is what the renderer reads, but the level is what the
+    /// reader actually moves, so it is held on its own: a call that settles
+    /// after Ctrl+O moved the level joins its neighbours instead of appearing
+    /// hidden among expanded ones.
+    tool_detail: widgets::DisplayMode,
     collapse_thinking: bool,
-    /// When true, auto-collapse on turn finish is skipped (user re-expanded via Ctrl+O).
+    /// When true, the settled turns the transcript would elide stay in view.
+    history_expanded: bool,
+    /// The block keyboard navigation is standing on, by call id.
+    focused_call: Option<String>,
+    /// When true, auto-collapse on turn finish is skipped (user re-expanded via Ctrl+T).
     thinking_user_pinned: bool,
     focus: TranscriptFocus,
     selection: Option<TranscriptSelection>,
@@ -625,7 +854,10 @@ impl TranscriptRecord {
             following_bottom: true,
             scroll_offset: 0,
             tool_display_modes: BTreeMap::new(),
+            tool_detail: widgets::DisplayMode::Collapsed,
             collapse_thinking: false,
+            history_expanded: false,
+            focused_call: None,
             thinking_user_pinned: false,
             focus: TranscriptFocus::Composer,
             selection: None,
@@ -703,6 +935,10 @@ pub struct ViewState<'a> {
     pub session: &'a str,
     /// Project label displayed in the operational footer.
     pub project: &'a str,
+    /// Home directory, so the footer can collapse it to `~`.
+    pub home: Option<&'a str>,
+    /// Branch and working-tree size, refreshed outside the frame path.
+    pub repository: Option<&'a RepositoryStatus>,
     /// Current active-turn state for the dedicated status row.
     pub turn_state: Option<TurnState>,
     /// Whether the next submitted turn will carry dangerous-mode context.
@@ -727,8 +963,20 @@ pub struct ViewState<'a> {
     pub highlight_restored_syntax: bool,
     /// Per-call presentation mode; their source output remains retained regardless of mode.
     pub tool_display_modes: &'a BTreeMap<String, widgets::DisplayMode>,
+    /// Detail level the tool output cycle currently rests on.
+    pub tool_detail: widgets::DisplayMode,
     /// Whether complete reasoning is collapsed according to the UI setting.
     pub collapse_thinking: bool,
+    /// Whether the reader asked to see the settled turns the transcript elides.
+    pub history_expanded: bool,
+    /// The block keyboard navigation is standing on, when there is one.
+    pub focused_call: Option<&'a str>,
+    /// Whether this terminal renders OSC 8 hyperlinks.
+    pub hyperlinks: bool,
+    /// How much colour this terminal can be sent.
+    pub color_level: widgets::ColorLevel,
+    /// Which glyph set this terminal can show.
+    pub unicode_level: widgets::UnicodeLevel,
     pub focus: TranscriptFocus,
     /// A bounded informational dialog rendered above the conversation.
     pub dialog: Option<&'a DialogView>,
@@ -736,6 +984,8 @@ pub struct ViewState<'a> {
     secret_entry: Option<SecretEntryRender<'a>>,
     /// Active device-authentication flow kept outside generic dialogs so its actions remain local.
     device_auth: Option<DeviceAuthRender<'a>>,
+    /// Open structured question set, borrowed rather than copied for the frame.
+    ask_user: Option<AskUserRender<'a>>,
     /// Slash palette metadata and current filtered selection.
     pub palette: Option<PaletteView<'a>>,
     /// Open `@` file picker, its typed query, and its current selection.
@@ -750,6 +1000,31 @@ pub struct ViewState<'a> {
     pub turn_started_at: Option<Duration>,
     /// What the turn is doing, as the single source of every activity label.
     pub turn_activity: TurnActivity<'a>,
+}
+
+/// Reads the already-collected repository state. Never blocks.
+pub type RepositoryProbe = Arc<dyn Fn() -> Option<RepositoryStatus> + Send + Sync>;
+
+/// How often the footer picks up a new repository reading.
+const REPOSITORY_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Working-tree state of the session's repository.
+///
+/// Collected outside the frame path — a footer that shells out to git while
+/// painting would make the whole surface as slow as the slowest `git status`.
+/// An absent value therefore means "not known yet", never "clean".
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RepositoryStatus {
+    pub branch: Option<String>,
+    pub changed_files: u64,
+    pub insertions: u64,
+    pub deletions: u64,
+}
+
+impl RepositoryStatus {
+    pub const fn is_dirty(&self) -> bool {
+        self.changed_files > 0
+    }
 }
 
 /// One child row of the subagent tree: a bounded, name-only activity label.
@@ -976,6 +1251,25 @@ impl DialogEntry {
         self
     }
 
+    /// A row that states a fact and dispatches nothing.
+    ///
+    /// It still carries an action so the list will stop on it: dialog
+    /// navigation walks actionable rows only, and a reference row the cursor
+    /// skipped would be a row the reader cannot reach with the keyboard.
+    pub fn reference(label: impl AsRef<str>, detail: impl AsRef<str>) -> Self {
+        Self {
+            label: bounded_dialog_text(label.as_ref(), 128),
+            detail: Some(bounded_dialog_text(detail.as_ref(), 256)),
+            search_text: Some(bounded_dialog_text(
+                &format!("{} {}", label.as_ref(), detail.as_ref()),
+                512,
+            )),
+            selected_detail: None,
+            action: Some(DialogEntryAction::ToggleDetails),
+            id: None,
+        }
+    }
+
     pub fn cancel(label: impl AsRef<str>) -> Self {
         Self {
             label: bounded_dialog_text(label.as_ref(), 128),
@@ -1156,6 +1450,11 @@ impl DialogView {
             selected_key_actions: Vec::new(),
             overlay_kind: widgets::OverlayKind::Picker,
         }
+    }
+
+    /// Rows the dialog actually kept, after its own bound was applied.
+    pub fn entry_count(&self) -> usize {
+        self.entries.len()
     }
 
     pub fn read_only<H>(
@@ -1396,16 +1695,33 @@ impl<B: Backend> Renderer for RatatuiRenderer<B> {
 }
 
 fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
+    render_frame_content(frame, &state);
+    // Last, over the finished frame: the buffer is the one place every colour
+    // has arrived, including the ones this crate never chose.
+    let _perf_quantize = agens_perf::span!(
+        "tui.frame.quantize",
+        color_level = state.color_level.trace_label(),
+    );
+    widgets::quantize_buffer(frame.buffer_mut(), state.color_level);
+}
+
+fn render_frame_content(frame: &mut ratatui::Frame<'_>, state: &ViewState<'_>) {
+    let _perf_content = agens_perf::span!("tui.frame.content");
     let area = frame.area();
-    let notice = notice_spans(&state);
-    let layout = screen_layout(area, state.input, !notice.is_empty());
+    let notice = notice_spans(state);
+    let layout = {
+        let _perf_layout = agens_perf::span!("tui.frame.layout");
+        screen_layout(area, state.input)
+    };
 
     let row_width = layout
         .transcript
         .width
         .saturating_sub(TRANSCRIPT_ROW_INDENT);
-    let transcript =
-        SelectableTranscript::from_lines(&rendered_transcript(&state, row_width), row_width);
+    let transcript = {
+        let _perf_select = agens_perf::span!("tui.transcript.select", row_width = row_width);
+        SelectableTranscript::from_lines(&rendered_transcript(state, row_width), row_width)
+    };
     let visible_rows = layout
         .transcript
         .height
@@ -1421,33 +1737,48 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
         let mut transcript_block = Block::default()
             .borders(Borders::TOP)
             .padding(Padding::left(TRANSCRIPT_ROW_INDENT))
-            .border_style(Style::default().fg(Color::DarkGray));
+            .border_style(Style::default().fg(widgets::RolePalette::chrome()));
         if !state.following_bottom {
             transcript_block = transcript_block
                 .title_bottom(Span::styled(
                     format!(" SCROLL {scroll}/{bottom_scroll}"),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(widgets::RolePalette::chrome()),
                 ))
                 .title_alignment(Alignment::Right);
         }
-        frame.render_widget(
-            Paragraph::new(Text::from(transcript.render_lines(state.selection)))
-                .block(transcript_block)
-                .scroll((scroll, 0)),
-            layout.transcript,
-        );
+        {
+            let _perf_paint =
+                agens_perf::span!("tui.transcript.paint", rows = transcript.rows.len() as u64,);
+            frame.render_widget(
+                Paragraph::new(Text::from(transcript.render_lines(state.selection)))
+                    .block(transcript_block)
+                    .scroll((scroll, 0)),
+                layout.transcript,
+            );
+        }
+        // After painting, not during: the pass reads back the laid-out rows, so
+        // it is the one place every widget's output has already become columns.
+        {
+            let _perf_hyperlinks = agens_perf::span!("tui.transcript.hyperlinks");
+            widgets::apply_hyperlinks(
+                frame.buffer_mut(),
+                layout.transcript,
+                state.project,
+                state.hyperlinks,
+            );
+        }
     }
 
     if layout.composer.height > 0 && state.active_transcript != TranscriptId::Main {
         let mut dock = Block::default()
             .borders(Borders::TOP)
-            .border_style(Style::default().fg(Color::DarkGray));
-        if let Some(metrics) = border_metrics(&state, layout.composer) {
+            .border_style(Style::default().fg(widgets::RolePalette::chrome()));
+        if let Some(metrics) = border_metrics(state, layout.composer) {
             dock = dock.title_top(metrics);
         }
         frame.render_widget(
             Paragraph::new(" Subagent transcript · i to message · x to cancel")
-                .style(Style::default().fg(Color::DarkGray))
+                .style(Style::default().fg(widgets::RolePalette::chrome()))
                 .block(dock),
             layout.composer,
         );
@@ -1456,14 +1787,17 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
     let composer_color = widgets::RolePalette::muted();
     if layout.composer.height > 0 && state.active_transcript == TranscriptId::Main {
         let (cursor_line, cursor_column) = cursor_position(state.input, state.input_cursor);
-        let inner_width = usize::from(layout.composer.width.saturating_sub(2).max(1));
+        // Two borders plus the column of padding that puts typed text in the
+        // same column as the prose above it.
+        let inner_width = usize::from(layout.composer.width.saturating_sub(3).max(1));
         let inner_height = usize::from(layout.composer.height.saturating_sub(2).max(1));
         let vertical_scroll = cursor_line.saturating_sub(inner_height.saturating_sub(1));
         let horizontal_scroll = cursor_column.saturating_sub(inner_width.saturating_sub(1));
         let mut composer = Block::default()
             .borders(Borders::ALL)
+            .padding(Padding::left(1))
             .border_style(Style::default().fg(composer_color));
-        if let Some(metrics) = border_metrics(&state, layout.composer) {
+        if let Some(metrics) = border_metrics(state, layout.composer) {
             composer = composer.title_bottom(metrics);
         }
         frame.render_widget(
@@ -1489,20 +1823,27 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
             let cursor_x = layout.composer.x.saturating_add(saturating_u16(
                 cursor_column
                     .saturating_sub(horizontal_scroll)
-                    .saturating_add(1),
+                    .saturating_add(2),
             ));
             frame.set_cursor_position((cursor_x, cursor_y));
         }
     }
 
     if layout.notice.height > 0 {
-        render_notice(frame, layout.notice, notice);
+        // The band belongs to whatever is most urgent. A warning outranks a
+        // legend, so the hints yield the row rather than share it.
+        let band = if notice.is_empty() {
+            hint_spans(state)
+        } else {
+            notice
+        };
+        render_notice(frame, layout.notice, band);
     }
 
     if layout.tree.height > 0 {
         frame.render_widget(
             Paragraph::new(Text::from(fitted_subagent_tree_lines(
-                &state,
+                state,
                 layout.tree.height,
                 layout.tree.width,
             ))),
@@ -1511,10 +1852,11 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
     }
 
     if layout.footer.height > 0 {
+        let _perf_footer = agens_perf::span!("tui.footer");
         frame.render_widget(
             Paragraph::new(Line::from(widgets::MetricFooter::spans(
                 layout.footer.width,
-                footer_context(&state),
+                footer_context(state),
             ))),
             layout.footer,
         );
@@ -1532,6 +1874,10 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
         render_file_picker(frame, area, layout.composer, picker);
     }
 
+    if let Some(ask_user) = state.ask_user {
+        render_ask_user(frame, area, ask_user);
+    }
+
     if let Some(secret_entry) = state.secret_entry {
         render_secret_entry(frame, area, secret_entry);
     }
@@ -1539,6 +1885,672 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
     if let Some(device_auth) = state.device_auth {
         render_device_auth(frame, area, device_auth);
     }
+}
+
+/// Inner overlay width at which the context earns a column of its own.
+///
+/// Composed rather than guessed: the narrowest option column that still shows a
+/// label with its selection marker is 33 columns, the narrowest column that
+/// wraps prose without turning it into a ladder is 32, and the divider gutter
+/// between them costs [`ASK_USER_COLUMN_GAP`]. It is also exactly the inner
+/// width a classic 80-column terminal resolves to under
+/// [`widgets::OverlaySizing::ask_user`], which is the narrowest terminal where
+/// the second column still earns its space.
+const ASK_USER_TWO_COLUMN_MIN_WIDTH: u16 = 68;
+/// Space, divider rule, space between the two columns.
+const ASK_USER_COLUMN_GAP: u16 = 3;
+/// Wrapped context rows kept for scrolling, on top of the domain's own cap on
+/// the source text.
+const MAX_ASK_USER_CONTEXT_ROWS: usize = 200;
+const MAX_ASK_USER_PROMPT_ROWS: usize = 3;
+const MAX_ASK_USER_EXPLANATION_ROWS: usize = 2;
+/// Shortest stacked context section worth carving out of the option list.
+const MIN_ASK_USER_STACKED_ROWS: u16 = 3;
+const ASK_USER_DEFAULT_TITLE: &str = "the agent needs an answer";
+const ASK_USER_EMPTY_CONTEXT: &str = "no extra context for this option";
+const ASK_USER_CONTEXT_KEYS: &str = "pgup/pgdn";
+
+/// One frame's worth of resolved ask-user geometry and content.
+///
+/// Layout and paint are separated the same way [`widgets::OverlayLayout`]
+/// separates them: everything here is decided before a single cell is written,
+/// so the scroll ceiling the key handler enforces and the rows the renderer
+/// paints are read off the same measurement.
+struct AskUserFrame<'a> {
+    title: &'a str,
+    shortcuts: Vec<widgets::OverlayShortcut<'static>>,
+    layout: widgets::OverlayLayout,
+    header: Rect,
+    rule: Option<Rect>,
+    list: Rect,
+    divider: Option<Rect>,
+    context_label: Option<Rect>,
+    context: Option<Rect>,
+    /// Reserved out of `context`, so it is `Some` exactly when the pane gave up
+    /// a row for it.
+    context_position: Option<Rect>,
+    header_lines: Vec<Line<'static>>,
+    rows: Vec<widgets::OverlayRow<'a>>,
+    selected_row: usize,
+    context_lines: Vec<String>,
+    max_context_scroll: u16,
+}
+
+/// Whether the current question offers any per-option context to show.
+///
+/// When it does not, the pane is not merely empty — the two-column layout would
+/// spend half the overlay on nothing, so the list keeps the whole width.
+fn ask_user_has_context(render: &AskUserRender<'_>) -> bool {
+    render
+        .current()
+        .options()
+        .iter()
+        .any(|option| option.context().is_some())
+}
+
+fn ask_user_context_text<'a>(render: &AskUserRender<'a>) -> &'a str {
+    render
+        .current()
+        .options()
+        .get(render.context_option)
+        .and_then(agens_core::ask_user::AskUserOption::context)
+        .unwrap_or(ASK_USER_EMPTY_CONTEXT)
+}
+
+fn ask_user_shortcuts(render: &AskUserRender<'_>) -> Vec<widgets::OverlayShortcut<'static>> {
+    let question = render.current();
+    let mut shortcuts = vec![
+        widgets::OverlayShortcut {
+            key: "↑↓",
+            label: "move",
+        },
+        widgets::OverlayShortcut {
+            key: "⏎",
+            label: "choose",
+        },
+    ];
+    if render.request.questions().len() > 1 {
+        shortcuts.push(widgets::OverlayShortcut {
+            key: "tab",
+            label: "question",
+        });
+    }
+    if question.allow_other() {
+        shortcuts.push(widgets::OverlayShortcut {
+            key: "o",
+            label: "other",
+        });
+    }
+    if question.allow_note() {
+        shortcuts.push(widgets::OverlayShortcut {
+            key: "n",
+            label: "note",
+        });
+    }
+    if ask_user_has_context(render) {
+        shortcuts.push(widgets::OverlayShortcut {
+            key: ASK_USER_CONTEXT_KEYS,
+            label: "context",
+        });
+    }
+    shortcuts.push(widgets::OverlayShortcut {
+        key: "esc",
+        label: "cancel",
+    });
+    shortcuts
+}
+
+/// ASCII characters a drawing is built out of.
+///
+/// Each one also occurs in ordinary prose, which is why no single occurrence
+/// decides anything — only their density does.
+const ASK_USER_ASCII_ART: [char; 8] = ['|', '+', '-', '/', '\\', '>', '<', '='];
+/// Share of a line's visible characters that must be drawing characters before
+/// the line is read as art. One in three is far above what prose reaches with
+/// a hyphen or two and far below what any box or arrow row falls to.
+const ASK_USER_ART_DENSITY: usize = 3;
+/// Consecutive interior spaces that mark alignment rather than sentence
+/// spacing. Two is what a typist leaves after a full stop; three is a column.
+const ASK_USER_ALIGNMENT_RUN: &str = "   ";
+
+/// Whether a line's own spacing carries meaning, so it must never be re-flowed.
+///
+/// Every row of a diagram is positioned relative to the rows above it, so
+/// wrapping one row silently misaligns all of them — and the wrap also collapses
+/// the interior space runs the drawing is made of. The test is structural rather
+/// than a character range, because the diagram a model is most likely to draw is
+/// `+---+` and `-->`, not `┌───┐`:
+///
+/// 1. a box-drawing, block, geometric or arrow glyph, which prose never carries;
+/// 2. a run of three or more interior spaces, which is alignment, not prose;
+/// 3. ASCII drawing characters at [`ASK_USER_ART_DENSITY`] of the visible
+///    characters, which catches `+-----+-----+` and leaves a sentence with a
+///    hyphen and a pipe in it alone.
+fn ask_user_line_is_preformatted(line: &str) -> bool {
+    if line
+        .chars()
+        .any(|character| matches!(character, '\u{2190}'..='\u{21ff}' | '\u{2500}'..='\u{25ff}'))
+    {
+        return true;
+    }
+    if line.trim().contains(ASK_USER_ALIGNMENT_RUN) {
+        return true;
+    }
+
+    let visible = line.chars().filter(|character| !character.is_whitespace());
+    let (art, total) = visible.fold((0usize, 0usize), |(art, total), character| {
+        (
+            art + usize::from(ASK_USER_ASCII_ART.contains(&character)),
+            total + 1,
+        )
+    });
+    total > 0 && art * ASK_USER_ART_DENSITY >= total
+}
+
+/// Greedy wrap measured in display columns.
+///
+/// Distinct from [`wrapped_prose_lines`], which counts `char`s: a pane is
+/// measured in columns, and a paragraph of double-width glyphs wrapped by
+/// character count produces rows twice as wide as the pane, whose overflow the
+/// terminal silently clips — losing text no keypress can scroll to. Text with no
+/// ASCII space to break at is broken between characters for the same reason: an
+/// unwrappable paragraph must still be readable, not truncated.
+fn ask_user_wrapped_lines(source: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut used = 0usize;
+
+    for word in source.split_whitespace() {
+        let word_width = word.width();
+        if used > 0 && used + 1 + word_width <= width {
+            current.push(' ');
+            current.push_str(word);
+            used += 1 + word_width;
+            continue;
+        }
+
+        if used > 0 {
+            lines.push(std::mem::take(&mut current));
+            used = 0;
+        }
+        if word_width <= width {
+            current.push_str(word);
+            used = word_width;
+            continue;
+        }
+
+        for character in word.chars() {
+            let columns = UnicodeWidthChar::width(character).unwrap_or(0);
+            if used > 0 && used + columns > width {
+                lines.push(std::mem::take(&mut current));
+                used = 0;
+            }
+            current.push(character);
+            used += columns;
+        }
+    }
+
+    lines.push(current);
+    lines
+}
+
+/// Wraps context for a pane of `width` columns.
+///
+/// A source line that already fits is painted verbatim, indentation included,
+/// because that is the only way a drawing survives at all. A line that does not
+/// fit is cut with `…` when its spacing is load-bearing and wrapped otherwise: a
+/// clipped diagram is still readable, a re-flowed one is noise, and a clipped
+/// paragraph is text the reader can never get back.
+fn ask_user_context_lines(text: &str, width: u16) -> Vec<String> {
+    if width == 0 {
+        return Vec::new();
+    }
+
+    let budget = usize::from(width);
+    let mut lines = Vec::new();
+    for source in text.lines() {
+        if source.width() <= budget {
+            lines.push(source.to_owned());
+        } else if ask_user_line_is_preformatted(source) {
+            lines.push(widgets::truncate_columns(source, budget));
+        } else {
+            lines.extend(ask_user_wrapped_lines(source, budget));
+        }
+
+        if lines.len() >= MAX_ASK_USER_CONTEXT_ROWS {
+            lines.truncate(MAX_ASK_USER_CONTEXT_ROWS);
+            break;
+        }
+    }
+    lines
+}
+
+fn ask_user_header_lines(render: &AskUserRender<'_>, width: u16) -> Vec<Line<'static>> {
+    let muted = Style::default().fg(widgets::RolePalette::muted());
+    let total = render.request.questions().len();
+    let mut status = vec![
+        Span::styled(
+            format!("Question {}/{total}", render.question + 1),
+            Style::default().fg(widgets::RolePalette::navigation()),
+        ),
+        Span::styled("  ·  ", muted),
+        Span::styled(
+            format!("{} of {total} answered", render.answered),
+            if render.answered == total {
+                Style::default().fg(widgets::RolePalette::success())
+            } else {
+                muted
+            },
+        ),
+    ];
+    if let Some(index) = render.incomplete {
+        status.push(Span::styled("  ·  ", muted));
+        status.push(Span::styled(
+            format!("answer question {} first", index + 1),
+            Style::default().fg(widgets::RolePalette::warning()),
+        ));
+    }
+
+    let question = render.current();
+    let mut lines = vec![Line::from(status)];
+    lines.extend(
+        wrapped_prose_lines(question.prompt(), width)
+            .into_iter()
+            .take(MAX_ASK_USER_PROMPT_ROWS)
+            .map(|line| {
+                Line::styled(
+                    line,
+                    Style::default()
+                        .fg(widgets::RolePalette::assistant())
+                        .add_modifier(Modifier::BOLD),
+                )
+            }),
+    );
+    if let Some(explanation) = question.explanation() {
+        lines.extend(
+            wrapped_prose_lines(explanation, width)
+                .into_iter()
+                .take(MAX_ASK_USER_EXPLANATION_ROWS)
+                .map(|line| Line::styled(line, muted)),
+        );
+    }
+    lines
+}
+
+/// The option list, its per-option sub-lines, the free-form buffers and the
+/// action rows, plus the index of the row the cursor stands on.
+fn ask_user_rows<'a>(render: &AskUserRender<'a>) -> (Vec<widgets::OverlayRow<'a>>, usize) {
+    let question = render.current();
+    let multiple = question.mode() == AskUserMode::Multiple;
+    let mut rows: Vec<widgets::OverlayRow<'a>> = Vec::new();
+    let mut selected_row = 0;
+
+    for (index, option) in question.options().iter().enumerate() {
+        let chosen = render.selected.contains(&index);
+        let marker = match (multiple, chosen) {
+            (true, true) => "[x]",
+            (true, false) => "[ ]",
+            (false, true) => "(•)",
+            (false, false) => "( )",
+        };
+        let highlighted = render.row == AskUserRow::Option(index);
+        if highlighted {
+            selected_row = rows.len();
+        }
+        rows.push(widgets::OverlayRow {
+            label: Cow::Borrowed(option.label()),
+            badge: Some(marker),
+            selected: highlighted,
+            ..widgets::OverlayRow::default()
+        });
+        if let Some(explanation) = option.explanation() {
+            rows.push(widgets::OverlayRow {
+                label: Cow::Borrowed(explanation),
+                indent: 1,
+                dimmed: true,
+                ..widgets::OverlayRow::default()
+            });
+        }
+    }
+
+    if question.allow_other() {
+        rows.push(ask_user_buffer_row(
+            "other",
+            render.other,
+            render.entry == AskUserEntry::Other,
+            "press o to type your own answer",
+        ));
+    }
+    if question.allow_note() {
+        rows.push(ask_user_buffer_row(
+            "note",
+            render.note,
+            render.entry == AskUserEntry::Note,
+            "press n to add a note",
+        ));
+    }
+
+    rows.push(widgets::OverlayRow::new(""));
+    let blocked = render.answered < render.request.questions().len();
+    let mut action = |row: AskUserRow, label: &'static str, right: Option<&'static str>| {
+        let highlighted = render.row == row;
+        if highlighted {
+            selected_row = rows.len();
+        }
+        rows.push(widgets::OverlayRow {
+            label: Cow::Borrowed(label),
+            right_label: right.map(Cow::Borrowed),
+            selected: highlighted,
+            dimmed: right.is_some() && !highlighted,
+            ..widgets::OverlayRow::default()
+        });
+    };
+    action(
+        AskUserRow::Submit,
+        "Submit answers",
+        blocked.then_some("incomplete"),
+    );
+    if question.allow_discuss() {
+        action(AskUserRow::Discuss, "Discuss this in chat instead", None);
+    }
+    action(AskUserRow::Cancel, "Cancel", None);
+
+    (rows, selected_row)
+}
+
+fn ask_user_buffer_row<'a>(
+    field: &str,
+    buffer: &str,
+    editing: bool,
+    hint: &str,
+) -> widgets::OverlayRow<'a> {
+    let label = if editing {
+        format!("{field}: {buffer}▏")
+    } else if buffer.is_empty() {
+        format!("{field}: {hint}")
+    } else {
+        format!("{field}: {buffer}")
+    };
+    widgets::OverlayRow {
+        label: Cow::Owned(label),
+        dimmed: !editing && buffer.is_empty(),
+        ..widgets::OverlayRow::default()
+    }
+}
+
+/// Keeps the cursor's row on screen with the least scrolling that achieves it.
+const fn ask_user_list_offset(selected: usize, height: usize, total: usize) -> usize {
+    if height == 0 || total <= height {
+        return 0;
+    }
+    if selected < height {
+        0
+    } else {
+        let last = total - height;
+        let wanted = selected + 1 - height;
+        if wanted < last { wanted } else { last }
+    }
+}
+
+/// Resolves the whole overlay before anything is painted.
+#[allow(clippy::too_many_lines)]
+fn ask_user_frame<'a>(area: Rect, render: &AskUserRender<'a>) -> Option<AskUserFrame<'a>> {
+    let sizing = widgets::OverlaySizing::ask_user();
+    let inner = sizing.inner_width(area)?;
+    let has_context = ask_user_has_context(render);
+    let two_column = has_context && inner >= ASK_USER_TWO_COLUMN_MIN_WIDTH;
+    let (list_width, context_width) = if two_column {
+        let right = (inner - ASK_USER_COLUMN_GAP) / 2;
+        (inner - ASK_USER_COLUMN_GAP - right, right)
+    } else {
+        (inner, inner)
+    };
+
+    let header_lines = ask_user_header_lines(render, inner);
+    let (rows, selected_row) = ask_user_rows(render);
+    let context_lines = if has_context {
+        ask_user_context_lines(ask_user_context_text(render), context_width)
+    } else {
+        Vec::new()
+    };
+
+    let body_rows = if two_column {
+        rows.len().max(context_lines.len())
+    } else if has_context {
+        rows.len() + context_lines.len() + 1
+    } else {
+        rows.len()
+    };
+    let shortcuts = ask_user_shortcuts(render);
+    let title = render.request.title().unwrap_or(ASK_USER_DEFAULT_TITLE);
+    let layout = widgets::OverlayLayout::solve(
+        area,
+        &widgets::OverlayConfig {
+            title,
+            tabs: None,
+            shortcuts: &shortcuts,
+            sizing,
+            desired_content_rows: saturating_u16(header_lines.len() + 1 + body_rows),
+        },
+    )?;
+
+    let content = layout.content;
+    let header_rows = saturating_u16(header_lines.len()).min(content.height.saturating_sub(1));
+    let header = Rect::new(content.x, content.y, content.width, header_rows);
+    let mut cursor = content.y + header_rows;
+    let mut remaining = content.height - header_rows;
+    let rule = (remaining >= 3).then(|| {
+        cursor += 1;
+        remaining -= 1;
+        Rect::new(content.x, cursor - 1, content.width, 1)
+    });
+    let body = Rect::new(content.x, cursor, content.width, remaining);
+
+    let (list, divider, context_label, mut context) = if two_column {
+        (
+            Rect::new(body.x, body.y, list_width, body.height),
+            Some(Rect::new(body.x + list_width + 1, body.y, 1, body.height)),
+            None,
+            Some(Rect::new(
+                body.x + list_width + ASK_USER_COLUMN_GAP,
+                body.y,
+                context_width,
+                body.height,
+            )),
+        )
+    } else if has_context && body.height >= 2 * MIN_ASK_USER_STACKED_ROWS {
+        let (list, label, pane) = ask_user_stacked_split(body, rows.len(), context_lines.len());
+        (list, None, Some(label), Some(pane))
+    } else {
+        (body, None, None, None)
+    };
+
+    // The scroll affordance costs a row, so it is taken out of the pane before
+    // the ceiling is measured: the reader must never be told there is more
+    // below on a row that is itself the last row of content. The reserved rect
+    // is carried rather than recomputed at paint time, so the pane the renderer
+    // fills and the row it writes the position on cannot disagree.
+    let mut context_position = None;
+    if let Some(pane) = context.as_mut()
+        && context_lines.len() > usize::from(pane.height)
+        && pane.height >= MIN_ASK_USER_STACKED_ROWS
+    {
+        pane.height -= 1;
+        context_position = Some(Rect::new(pane.x, pane.y + pane.height, pane.width, 1));
+    }
+    let max_context_scroll = context.map_or(0, |pane| {
+        saturating_u16(context_lines.len().saturating_sub(usize::from(pane.height)))
+    });
+
+    Some(AskUserFrame {
+        title,
+        shortcuts,
+        layout,
+        header,
+        rule,
+        list,
+        divider,
+        context_label,
+        context,
+        context_position,
+        header_lines,
+        rows,
+        selected_row,
+        context_lines,
+        max_context_scroll,
+    })
+}
+
+/// Divides a single-column body into the option list, the named divider and the
+/// context section, as `(list, label, context)`.
+///
+/// The list is served first: an option set the reader has to scroll past before
+/// discovering that Submit exists is a worse trade than a context section they
+/// have already been told how to page through.
+fn ask_user_stacked_split(body: Rect, rows: usize, context_lines: usize) -> (Rect, Rect, Rect) {
+    let wanted = saturating_u16(context_lines + 1);
+    let floor = MIN_ASK_USER_STACKED_ROWS + 1;
+    let ceiling = (body.height / 2).max(floor);
+    let block = body
+        .height
+        .saturating_sub(saturating_u16(rows))
+        .clamp(floor, ceiling)
+        .min(wanted.max(floor));
+    let list_rows = body.height - block;
+
+    (
+        Rect::new(body.x, body.y, body.width, list_rows),
+        Rect::new(body.x, body.y + list_rows, body.width, 1),
+        Rect::new(body.x, body.y + list_rows + 1, body.width, block - 1),
+    )
+}
+
+fn render_ask_user(frame: &mut ratatui::Frame<'_>, area: Rect, render: AskUserRender<'_>) {
+    let Some(laid) = ask_user_frame(area, &render) else {
+        return;
+    };
+    let AskUserFrame {
+        title,
+        shortcuts,
+        layout,
+        header,
+        rule,
+        list,
+        divider,
+        context_label,
+        context,
+        context_position,
+        header_lines,
+        rows,
+        selected_row,
+        context_lines,
+        max_context_scroll,
+    } = laid;
+
+    let config = widgets::OverlayConfig {
+        title,
+        tabs: None,
+        shortcuts: &shortcuts,
+        sizing: widgets::OverlaySizing::ask_user(),
+        desired_content_rows: layout.content.height,
+    };
+    widgets::OverlayFrame::render(frame, &layout, &config);
+
+    let chrome = Style::default().fg(widgets::RolePalette::chrome());
+    if header.height > 0 {
+        frame.render_widget(Paragraph::new(Text::from(header_lines)), header);
+    }
+    if let Some(rule) = rule {
+        frame.render_widget(
+            Paragraph::new(Line::styled("─".repeat(usize::from(rule.width)), chrome)),
+            rule,
+        );
+    }
+
+    let offset = ask_user_list_offset(selected_row, usize::from(list.height), rows.len());
+    widgets::OverlayList::render(frame, list, &rows, offset, rows.len());
+
+    if let Some(divider) = divider {
+        frame.render_widget(
+            Paragraph::new(Text::from(vec![
+                Line::styled("│", chrome);
+                usize::from(divider.height)
+            ])),
+            divider,
+        );
+    }
+    if let Some(label) = context_label {
+        frame.render_widget(
+            Paragraph::new(Line::styled(ask_user_context_label(label.width), chrome)),
+            label,
+        );
+    }
+    if let Some(pane) = context {
+        let scroll = render.context_scroll.min(max_context_scroll);
+        render_ask_user_context(frame, pane, &context_lines, scroll);
+        if let Some(position) = context_position {
+            render_ask_user_context_position(
+                frame,
+                position,
+                scroll,
+                pane.height,
+                context_lines.len(),
+            );
+        }
+    }
+}
+
+/// The stacked-mode divider: it names the section and the keys that reach it,
+/// because a pane below the fold nobody knows how to scroll is not reachable.
+fn ask_user_context_label(width: u16) -> String {
+    let named = format!("── context ── {ASK_USER_CONTEXT_KEYS} ");
+    if named.width() >= usize::from(width) {
+        return widgets::truncate_columns(&named, usize::from(width));
+    }
+    format!("{named}{}", "─".repeat(usize::from(width) - named.width()))
+}
+
+fn render_ask_user_context(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    lines: &[String],
+    scroll: u16,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let style = Style::default().fg(widgets::RolePalette::muted());
+    let visible: Vec<Line<'static>> = lines
+        .iter()
+        .skip(usize::from(scroll))
+        .take(usize::from(area.height))
+        .map(|line| Line::styled(line.clone(), style))
+        .collect();
+    frame.render_widget(Paragraph::new(Text::from(visible)), area);
+}
+
+fn render_ask_user_context_position(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    scroll: u16,
+    height: u16,
+    total: usize,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let first = usize::from(scroll) + 1;
+    let last = (usize::from(scroll) + usize::from(height)).min(total);
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            widgets::truncate_columns(
+                &format!("{first}–{last} of {total}  ·  {ASK_USER_CONTEXT_KEYS}"),
+                usize::from(area.width),
+            ),
+            Style::default().fg(widgets::RolePalette::chrome()),
+        )),
+        area,
+    );
 }
 
 const SECRET_ENTRY_SHORTCUTS: [widgets::OverlayShortcut<'static>; 3] = [
@@ -1674,6 +2686,10 @@ fn footer_context<'a>(state: &ViewState<'a>) -> widgets::FooterContext<'a> {
         effort: state.reasoning_effort,
         context_window: state.context_window,
         project: state.project,
+        home: state.home,
+        repository: state.repository,
+        idle: state.turn_activity == crate::activity::TurnActivity::Ready,
+        unicode: state.unicode_level,
         turn_label: state.turn_activity.footer_label(),
         duration: state.turn_duration,
         usage: state.latest_usage,
@@ -2367,13 +3383,22 @@ impl BottomChrome {
         }
     }
 
-    /// Places the reserved rows inside their region: the notice and the tree hug
-    /// the composer and the status bar keeps the last row, so the rows a missing
-    /// notice does not claim become a gap above the status bar instead of dead
-    /// air under the composer. The region keeps its full reserved height either
-    /// way, which is what keeps the composer a function of terminal height only.
-    fn placed(self, region: Rect, notice_shown: bool) -> ChromeBands {
-        let notice = if notice_shown { self.notice } else { 0 };
+    /// Places the reserved rows inside their region: the tree hugs the composer,
+    /// the notice and hint band sits under it, and the status bar keeps the last
+    /// row. The region keeps its full reserved height, which is what keeps the
+    /// composer a function of terminal height only.
+    ///
+    /// The tree goes first because a reader walks into it with Down out of the
+    /// prompt, and a legend wedged between the two would break the only reason
+    /// that gesture reads as movement.
+    ///
+    /// The notice band always claims its row, because it always has something
+    /// to say: a warning when there is one, and the contextual key hints
+    /// otherwise. It used to be conditional, and the condition was evaluated
+    /// once by the renderer and once by hit-testing — which is exactly how a
+    /// click came to land on a different tree row than the one on screen.
+    fn placed(self, region: Rect) -> ChromeBands {
+        let notice = self.notice;
         let band = |y: u16, height: u16| Rect {
             x: region.x,
             y,
@@ -2381,8 +3406,8 @@ impl BottomChrome {
             height,
         };
         ChromeBands {
-            notice: band(region.y, notice),
-            tree: band(region.y.saturating_add(notice), self.tree),
+            tree: band(region.y, self.tree),
+            notice: band(region.y.saturating_add(self.tree), notice),
             footer: band(region.bottom().saturating_sub(self.footer), self.footer),
         }
     }
@@ -2426,7 +3451,7 @@ fn composer_rows(height: u16, input: &str) -> u16 {
     }
 }
 
-fn screen_layout(area: Rect, input: &str, notice_shown: bool) -> ScreenLayout {
+fn screen_layout(area: Rect, input: &str) -> ScreenLayout {
     let area = conversation_surface(area);
     let composer_rows = composer_rows(area.height, input).min(area.height);
     let chrome =
@@ -2443,10 +3468,17 @@ fn screen_layout(area: Rect, input: &str, notice_shown: bool) -> ScreenLayout {
     .split(area);
 
     let gutter = Margin::new(chrome_gutter(area.width), 0);
-    let bands = chrome.placed(chunks[2].inner(gutter), notice_shown);
+    let bands = chrome.placed(chunks[2].inner(gutter));
+    // The transcript keeps its own left indent, so only the right edge is owed
+    // the gutter. Without it the prose ran past the composer it belongs to, and
+    // a line that outruns the box you typed it into reads as a different column.
+    let transcript = Rect {
+        width: chunks[0].width.saturating_sub(chrome_gutter(area.width)),
+        ..chunks[0]
+    };
 
     ScreenLayout {
-        transcript: chunks[0],
+        transcript,
         composer: chunks[1].inner(gutter),
         notice: bands.notice,
         tree: bands.tree,
@@ -2525,6 +3557,66 @@ fn turn_failure_banner(state: &ViewState<'_>) -> Option<Span<'static>> {
     })
 }
 
+/// Keys worth naming for what the reader is doing at this exact moment.
+///
+/// A fixed legend is either too long to read or too short to help, and it goes
+/// stale the moment the keymap moves. This is short because it is contextual:
+/// `Enter` is only worth a slot once there is something to send, and the mode
+/// badge only exists while a mode other than typing is on. Everything not named
+/// here lives in the shortcuts overlay, which is the one list that cannot drift
+/// out of date.
+fn hint_spans(state: &ViewState<'_>) -> Vec<Span<'static>> {
+    let mut hints: Vec<(&str, &str)> = Vec::new();
+
+    if state.focus == TranscriptFocus::Viewport {
+        hints.push(("j/k", "scroll"));
+        if state.selection.is_some() {
+            hints.push(("^⇧C", "copy"));
+        }
+        if state.running {
+            hints.push(("Esc", "cancel"));
+        }
+        hints.push(("i", "insert"));
+    } else {
+        if !state.input.is_empty() && !state.running {
+            hints.push(("Enter", "send"));
+        }
+        hints.push(("Esc", if state.running { "look" } else { "normal" }));
+    }
+    hints.push(("^?", "shortcuts"));
+
+    let mut spans = Vec::new();
+    if state.focus == TranscriptFocus::Viewport {
+        spans.push(Span::styled(
+            " NORMAL ",
+            Style::default()
+                .fg(widgets::RolePalette::navigation())
+                .add_modifier(Modifier::BOLD),
+        ));
+    } else {
+        spans.push(Span::raw(" "));
+    }
+
+    for (index, (key, label)) in hints.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled(
+                "  ",
+                Style::default().fg(widgets::RolePalette::chrome()),
+            ));
+        }
+        spans.push(Span::styled(
+            (*key).to_owned(),
+            Style::default().fg(widgets::RolePalette::muted()),
+        ));
+        spans.push(Span::styled(
+            format!(":{label}"),
+            Style::default().fg(widgets::RolePalette::chrome()),
+        ));
+    }
+
+    spans
+}
+
 fn render_notice(frame: &mut ratatui::Frame<'_>, area: Rect, spans: Vec<Span<'static>>) {
     frame.render_widget(
         Paragraph::new(Line::from(spans)).wrap(Wrap { trim: false }),
@@ -2549,8 +3641,23 @@ fn render_notice(frame: &mut ratatui::Frame<'_>, area: Rect, spans: Vec<Span<'st
 /// The tree is painted without wrapping, so every label is bounded to the
 /// columns left of it by its own rail and glyph.
 fn fitted_subagent_tree_lines(state: &ViewState<'_>, rows: u16, width: u16) -> Vec<Line<'static>> {
+    fitted_subagent_tree(state, rows, width).0
+}
+
+/// The tree's rows, paired with the transcript each one is a way into.
+///
+/// Both come from the same pass on purpose. The rows are not one per branch —
+/// the root is dropped when the tree is tight, activity rows sit under their
+/// branch, and the affordance closes the list — so anything deriving an index
+/// from a row on its own was reading a different tree than the one on screen.
+fn fitted_subagent_tree(
+    state: &ViewState<'_>,
+    rows: u16,
+    width: u16,
+) -> (Vec<Line<'static>>, Vec<Option<TranscriptId>>) {
+    let _perf_tree = agens_perf::span!("tui.tree", rows = rows, width = width);
     if state.executions.is_empty() || rows == 0 {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
     let width = usize::from(width);
 
@@ -2564,27 +3671,68 @@ fn fitted_subagent_tree_lines(state: &ViewState<'_>, rows: u16, width: u16) -> V
     let spare = body.saturating_sub(branches.len());
 
     let mut lines = Vec::new();
+    let mut ids: Vec<Option<TranscriptId>> = Vec::new();
     if spare > 0 {
-        lines.push(Line::from(Span::styled(
-            render::bounded_single_line("Main", width),
-            tree_row_style(state, TranscriptId::Main),
-        )));
+        lines.push(tree_root_line(state, width));
+        ids.push(Some(TranscriptId::Main));
     }
     let backgroundable = branches
         .iter()
         .any(|execution| execution.state == TuiExecutionState::ForegroundRunning);
-    lines.extend(tree_branch_lines(
-        state,
-        &branches,
-        spare.saturating_sub(1),
-        width,
-    ));
+    let (branch_lines, branch_ids) =
+        tree_branch_lines(state, &branches, spare.saturating_sub(1), width);
+    lines.extend(branch_lines);
+    ids.extend(branch_ids);
+    let cancellable = branches.iter().any(|execution| {
+        state.active_transcript == TranscriptId::Subagent(execution.id)
+            && matches!(
+                execution.state,
+                TuiExecutionState::ForegroundRunning | TuiExecutionState::BackgroundRunning
+            )
+    });
     lines.push(tree_affordance_line(
         state.executions.len().saturating_sub(branches.len()),
         backgroundable,
+        cancellable,
         width,
     ));
-    lines
+    ids.push(None);
+    (lines, ids)
+}
+
+/// The tree's root: the parent transcript, and how much delegated work hangs
+/// off it.
+///
+/// The count is what makes the row worth its line. "Main" alone says nothing a
+/// reader cannot see; "Main · 3 running" answers how much is in flight before
+/// any branch is read, and keeps answering it when the branches themselves have
+/// been elided for height. Finished branches are counted separately so a row of
+/// leftovers never reads as live work.
+fn tree_root_line(state: &ViewState<'_>, width: usize) -> Line<'static> {
+    let running = state
+        .executions
+        .iter()
+        .filter(|execution| {
+            matches!(
+                execution.state,
+                TuiExecutionState::ForegroundRunning | TuiExecutionState::BackgroundRunning
+            )
+        })
+        .count();
+    let finished = state.executions.len().saturating_sub(running);
+
+    let mut label = "Main".to_owned();
+    if running > 0 {
+        label.push_str(&format!(" · {running} running"));
+    }
+    if finished > 0 {
+        label.push_str(&format!(" · {finished} done"));
+    }
+
+    Line::from(Span::styled(
+        render::bounded_single_line(&label, width),
+        tree_row_style(state, TranscriptId::Main),
+    ))
 }
 
 fn tree_branch_lines(
@@ -2592,14 +3740,18 @@ fn tree_branch_lines(
     branches: &[&TuiExecution],
     activity_rows: usize,
     width: usize,
-) -> Vec<Line<'static>> {
+) -> (Vec<Line<'static>>, Vec<Option<TranscriptId>>) {
     let mut lines = Vec::new();
+    let mut ids: Vec<Option<TranscriptId>> = Vec::new();
     let mut activity_budget = activity_rows.min(MAX_TREE_ACTIVITIES);
 
     for (index, execution) in branches.iter().enumerate() {
         let last = index + 1 == branches.len();
         let rail = if last { "└─ " } else { "├─ " };
-        let glyph = format!("{} ", execution_state_glyph(execution.state));
+        let glyph = format!(
+            "{} ",
+            execution_state_glyph(execution.state).text(state.unicode_level)
+        );
         lines.push(Line::from(vec![
             Span::styled(
                 rail.to_owned(),
@@ -2619,6 +3771,7 @@ fn tree_branch_lines(
                 tree_row_style(state, TranscriptId::Subagent(execution.id)),
             ),
         ]));
+        ids.push(Some(TranscriptId::Subagent(execution.id)));
 
         let children = state
             .execution_activities
@@ -2638,7 +3791,14 @@ fn tree_branch_lines(
                     "├─ "
                 }
             );
-            let glyph = format!("{} ", if activity.running { "●" } else { "✓" });
+            let glyph = format!(
+                "{} ",
+                if activity.running {
+                    widgets::Glyph::Running.text(state.unicode_level)
+                } else {
+                    widgets::Glyph::Succeeded.text(state.unicode_level)
+                }
+            );
             let label_width = width
                 .saturating_sub(rail.width())
                 .saturating_sub(glyph.width());
@@ -2657,27 +3817,38 @@ fn tree_branch_lines(
                     Style::default().fg(widgets::RolePalette::muted()),
                 ),
             ]));
+            // An activity row belongs to its branch but is not a way into it:
+            // it names a tool call, and there is no transcript to open for one.
+            ids.push(None);
         }
     }
-    lines
+    (lines, ids)
 }
 
 /// Closes the tree with its navigation affordance, folding the branches that
 /// did not fit into the same row so the hidden count stays discoverable.
 ///
-/// Backgrounding only applies to a branch still running in the foreground, so
-/// the hint is dropped when no shown branch can accept it.
+/// Backgrounding only applies to a branch still running in the foreground, and
+/// cancelling only to a branch still running at all, so each hint is dropped
+/// when nothing on screen can accept it. A key advertised over work it cannot
+/// act on is worse than no hint: it invites a press that does nothing.
 fn tree_affordance_line(
     hidden_branches: usize,
     backgroundable: bool,
+    cancellable: bool,
     width: usize,
 ) -> Line<'static> {
     let text = if hidden_branches > 0 {
-        format!("+{hidden_branches} more · Tab to focus")
-    } else if backgroundable {
-        "Tab focus · Enter inspect · Ctrl+B background".to_owned()
+        format!("+{hidden_branches} more · ↓ to focus")
     } else {
-        "Tab focus · Enter inspect".to_owned()
+        let mut hints = vec!["↑↓ walk", "Enter inspect"];
+        if backgroundable {
+            hints.push("Ctrl+B background");
+        }
+        if cancellable {
+            hints.push("x cancel");
+        }
+        hints.join(" · ")
     };
     Line::from(Span::styled(
         render::bounded_single_line(&text, width),
@@ -2703,18 +3874,29 @@ fn tree_row_style(state: &ViewState<'_>, id: TranscriptId) -> Style {
     }
 }
 
+/// One supervisable row: who is running, in what state, for how long, on what.
+///
+/// The model closes the row because it is the datum that makes the elapsed time
+/// mean something — a slow branch on a large model and a slow branch on a small
+/// one are different problems. It is omitted rather than filled in when the
+/// runtime has not reported it, so the row never guesses.
 fn tree_execution_label(execution: &TuiExecution, now: Duration) -> String {
     let elapsed = execution
         .terminal_at
         .unwrap_or(now)
         .saturating_sub(execution.started_at);
-    format!(
-        "{} #{} · {} · {}s",
+    let mut label = format!(
+        "{} #{} · {} · {}",
         display_agent_name(&execution.agent),
         execution.id,
         execution_state_label(execution.state),
-        elapsed.as_secs()
-    )
+        render::elapsed_label(elapsed)
+    );
+    if let Some(model) = execution.model.as_deref().filter(|model| !model.is_empty()) {
+        label.push_str(" · ");
+        label.push_str(model);
+    }
+    label
 }
 
 const fn execution_state_label(state: TuiExecutionState) -> &'static str {
@@ -2787,55 +3969,160 @@ fn transcript_lines(entries: &[TranscriptEntry]) -> Vec<Line<'static>> {
 /// `row_width` counts that column: chrome rows that no conversation block
 /// describes are padded through [`render::unaccented_row`] so their content
 /// keeps the same screen column as block rows.
+/// Settled turns kept in view before the transcript starts eliding.
+///
+/// Enough that the reader can see what led here, few enough that a long session
+/// does not make every scroll a walk through work that is already finished.
+const VISIBLE_SETTLED_TURNS: usize = 6;
+
+/// How many settled turns the transcript folds behind its count row.
+///
+/// Nothing is elided while the reader has asked to see everything, and nothing
+/// is elided when folding would hide fewer turns than the row costs to say so.
+fn elided_turn_count(state: &ViewState<'_>) -> usize {
+    if state.history_expanded {
+        return 0;
+    }
+    let settled = state.completed_conversations.len();
+    if settled <= VISIBLE_SETTLED_TURNS + 1 {
+        return 0;
+    }
+    settled - VISIBLE_SETTLED_TURNS
+}
+
 fn rendered_transcript(state: &ViewState<'_>, row_width: u16) -> Vec<Line<'static>> {
+    assemble_transcript(state, row_width, false).0
+}
+
+/// Which tool call owns each transcript row, for the rows any call owns.
+///
+/// Computed only when something asks — hit-testing a pointer, and nothing else —
+/// because the owners bypass the settled-conversation cache that the lines
+/// themselves enjoy.
+fn transcript_call_owners(state: &ViewState<'_>, row_width: u16) -> Vec<Option<String>> {
+    assemble_transcript(state, row_width, true).1
+}
+
+/// The rows a turn contributes, described only when the caller wants them.
+///
+/// A turn's owners can be shorter than its rows — trailing rows belong to no
+/// call — so the row count always comes from the painted lines. Copying those
+/// lines is what a pointer movement cannot afford, and hit-testing never reads
+/// them, so it gets rows of the right shape and no content.
+fn turn_placeholder_rows(lines: &[Line<'static>], want_owners: bool) -> Vec<Line<'static>> {
+    if want_owners {
+        vec![Line::default(); lines.len()]
+    } else {
+        lines.to_vec()
+    }
+}
+
+fn assemble_transcript(
+    state: &ViewState<'_>,
+    row_width: u16,
+    want_owners: bool,
+) -> (Vec<Line<'static>>, Vec<Option<String>>) {
+    let _perf_assemble = agens_perf::span!(
+        "tui.transcript.assemble",
+        row_width = row_width,
+        settled_turns = state.completed_conversations.len() as u64,
+        want_owners = want_owners,
+    );
     let mut transcript = chrome_rows(transcript_provenance(state));
+    let mut owners = vec![None; transcript.len()];
     let thinking_streaming = state.running;
     let mut turn_lines = Vec::new();
-    let mut append_turn = |lines: Vec<Line<'static>>| {
+    let mut turn_owners: Vec<Option<String>> = Vec::new();
+    let mut turn_rows = 0usize;
+    let mut append_turn = |lines: Vec<Line<'static>>, mut lines_owners: Vec<Option<String>>| {
         if lines.is_empty() {
             return;
         }
-        if !turn_lines.is_empty() {
+        if turn_rows > 0 {
             turn_lines.push(Line::default());
+            turn_owners.push(None);
+            turn_rows += 1;
         }
+        lines_owners.resize(lines.len(), None);
+        turn_rows += lines.len();
         turn_lines.extend(lines);
+        turn_owners.extend(lines_owners);
     };
-    for (index, conversation) in state.completed_conversations.iter().enumerate() {
+    let elided = elided_turn_count(state);
+    if elided > 0 {
         append_turn(
-            render::settled_conversation_lines(
-                render::SettledConversation {
-                    generation: state.transcript_generation,
-                    transcript: state.active_transcript,
-                    index,
-                },
-                conversation,
-                state.tool_display_modes,
+            vec![render::history_elision_row(
+                elided,
                 row_width,
-                render::ConversationRenderState {
-                    collapse_thinking: state.collapse_thinking,
-                    thinking_streaming: false,
-                    assistant_streaming: !state.highlight_restored_syntax,
-                    now: state.now,
-                },
-            )
-            .to_vec(),
+                state.unicode_level,
+            )],
+            Vec::new(),
+        );
+    }
+    for (index, conversation) in state
+        .completed_conversations
+        .iter()
+        .enumerate()
+        .skip(elided)
+    {
+        let settled_state = render::ConversationRenderState {
+            collapse_thinking: state.collapse_thinking,
+            thinking_streaming: false,
+            assistant_streaming: !state.highlight_restored_syntax,
+            now: state.now,
+            focused_call: state.focused_call,
+            unicode: state.unicode_level,
+        };
+        let identity = render::SettledConversation {
+            generation: state.transcript_generation,
+            transcript: state.active_transcript,
+            index,
+        };
+        let blocks = render::settled_conversation_blocks(
+            identity,
+            conversation,
+            state.tool_display_modes,
+            row_width,
+            settled_state,
+        );
+        append_turn(
+            turn_placeholder_rows(&blocks.lines, want_owners),
+            if want_owners {
+                blocks.owners.to_vec()
+            } else {
+                Vec::new()
+            },
         );
     }
     if let Some(conversation) = state.conversation {
-        append_turn(render::conversation_lines(
+        let live_state = render::ConversationRenderState {
+            collapse_thinking: state.collapse_thinking,
+            thinking_streaming,
+            assistant_streaming: state.assistant_streaming,
+            now: state.now,
+            focused_call: state.focused_call,
+            unicode: state.unicode_level,
+        };
+        let painted = render::painted_conversation(
             conversation,
             state.runtime_events,
             state.tool_display_modes,
             row_width,
-            render::ConversationRenderState {
-                collapse_thinking: state.collapse_thinking,
-                thinking_streaming,
-                assistant_streaming: state.assistant_streaming,
-                now: state.now,
+            live_state,
+        );
+        append_turn(
+            turn_placeholder_rows(&painted.lines, want_owners),
+            if want_owners {
+                painted.owners
+            } else {
+                Vec::new()
             },
-        ));
+        );
     }
+    let turn_start = transcript.len();
     transcript.extend(turn_lines);
+    owners.resize(turn_start, None);
+    owners.extend(turn_owners);
     let conversation_is_authoritative =
         !state.completed_conversations.is_empty() || state.conversation.is_some();
     if !conversation_is_authoritative {
@@ -2846,6 +4133,11 @@ fn rendered_transcript(state: &ViewState<'_>, row_width: u16) -> Vec<Line<'stati
         conversation_is_authoritative,
     )));
     if state.running {
+        // The status row reports the turn, it is not part of it: without a
+        // blank row it reads as another line of whatever the agent just said.
+        if transcript.last().is_some_and(|line| line.width() > 0) {
+            transcript.push(render::unaccented_row(Line::default()));
+        }
         let label = state.turn_activity.status_label();
         transcript.push(render::unaccented_row(render::turn_status_line(
             render::TurnStatus {
@@ -2861,7 +4153,8 @@ fn rendered_transcript(state: &ViewState<'_>, row_width: u16) -> Vec<Line<'stati
             usize::from(row_width.max(1)).saturating_sub(widgets::ACCENT_WIDTH),
         )));
     }
-    transcript
+    owners.resize(transcript.len(), None);
+    (transcript, owners)
 }
 
 /// Reserves the accent column on transcript rows that no conversation block owns.
@@ -2875,12 +4168,31 @@ struct SelectableCell {
     column: u16,
     width: u16,
     style: Style,
+    /// Whether this cell is part of the text or part of the layout.
+    ///
+    /// A continuation row opens with the indent that keeps it under its
+    /// paragraph. That indent exists because the terminal is narrow, so it is
+    /// painted and highlighted like everything else but never copied.
+    copyable: bool,
+}
+
+/// What separates a row from the one below it in the copied text.
+///
+/// Only `Hard` is a line the author wrote. The soft variants are wrap seams:
+/// rejoining puts back the space the wrap consumed, or nothing at all when the
+/// wrap cut through the middle of a word.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum RowBreak {
+    #[default]
+    Hard,
+    SoftSpace,
+    SoftTight,
 }
 
 #[derive(Clone, Debug, Default)]
 struct SelectableRow {
     cells: Vec<SelectableCell>,
-    hard_break_after: bool,
+    break_after: RowBreak,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2893,27 +4205,76 @@ impl SelectableTranscript {
         let width = width.max(1);
         let mut rows = Vec::new();
 
+        let mut continues_into_this_line = false;
         for line in lines {
-            let cells = line
+            let mut cells = line
                 .styled_graphemes(Style::default())
                 .map(|grapheme| SelectableCell {
                     text: grapheme.symbol.to_owned(),
                     column: 0,
                     width: saturating_u16(grapheme.symbol.width()),
                     style: grapheme.style,
+                    copyable: true,
                 })
-                .collect();
+                .collect::<Vec<_>>();
+
+            let joined = match cells.last().map(|cell| cell.text.as_str()) {
+                Some(render::WRAP_JOINER_SPACE) => Some(RowBreak::SoftSpace),
+                Some(render::WRAP_JOINER_TIGHT) => Some(RowBreak::SoftTight),
+                _ => None,
+            };
+            if joined.is_some() {
+                cells.pop();
+            }
+            if continues_into_this_line {
+                for cell in cells
+                    .iter_mut()
+                    .take_while(|cell| selectable_cell_is_whitespace(cell))
+                {
+                    cell.copyable = false;
+                }
+            }
+            continues_into_this_line = joined.is_some();
+
             let wrapped = wrap_selectable_line(cells, width);
             let last = wrapped.len().saturating_sub(1);
-            rows.extend(
-                wrapped
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, cells)| selectable_row(cells, index == last)),
-            );
+            rows.extend(wrapped.into_iter().enumerate().map(|(index, cells)| {
+                let break_after = if index == last {
+                    joined.unwrap_or(RowBreak::Hard)
+                } else {
+                    RowBreak::SoftSpace
+                };
+                selectable_row(cells, break_after)
+            }));
         }
 
         Self { rows }
+    }
+
+    /// How many rows these lines wrap into, without materializing any of them.
+    ///
+    /// Scroll bounds need the row count and nothing else. Building the full
+    /// index for it means allocating a styled, copyable, text-carrying cell
+    /// for every character in the transcript — tens of thousands of them, on
+    /// a path that runs for every scroll tick and every mouse press.
+    fn row_count(lines: &[Line<'_>], width: u16) -> usize {
+        let width = width.max(1);
+        let mut rows = 0;
+
+        for line in lines {
+            let mut shapes = line
+                .styled_graphemes(Style::default())
+                .map(CellShape::from_grapheme)
+                .collect::<Vec<_>>();
+
+            if shapes.last().is_some_and(CellShape::is_wrap_joiner) {
+                shapes.pop();
+            }
+
+            rows += wrap_cells(shapes, width, CellShape::width, CellShape::is_whitespace).len();
+        }
+
+        rows
     }
 
     fn position_at(&self, row: usize, column: u16) -> Option<TranscriptPosition> {
@@ -2944,13 +4305,21 @@ impl SelectableTranscript {
                     row: row_index,
                     column: cell.column,
                 };
-                if position < start || position > end {
+                if position < start || position > end || !cell.copyable {
                     continue;
                 }
                 append_bounded_selection(&mut text, &cell.text)?;
             }
-            if row_index < end.row && row.hard_break_after {
-                append_bounded_selection(&mut text, "\n")?;
+            if row_index < end.row {
+                match row.break_after {
+                    RowBreak::Hard => append_bounded_selection(&mut text, "\n")?,
+                    RowBreak::SoftSpace
+                        if !text.ends_with(char::is_whitespace) && !text.is_empty() =>
+                    {
+                        append_bounded_selection(&mut text, " ")?;
+                    }
+                    RowBreak::SoftSpace | RowBreak::SoftTight => {}
+                }
             }
         }
         Ok(text)
@@ -2975,8 +4344,8 @@ impl SelectableTranscript {
                     let style = if selected {
                         cell.style.patch(
                             Style::default()
-                                .fg(Color::Black)
-                                .bg(widgets::RolePalette::brand()),
+                                .fg(widgets::RolePalette::selection_fg())
+                                .bg(widgets::RolePalette::selection_bg()),
                         )
                     } else {
                         cell.style
@@ -2999,25 +4368,80 @@ impl SelectableTranscript {
 }
 
 fn wrap_selectable_line(cells: Vec<SelectableCell>, width: u16) -> Vec<Vec<SelectableCell>> {
+    wrap_cells(
+        cells,
+        width,
+        |cell| cell.width,
+        selectable_cell_is_whitespace,
+    )
+}
+
+/// Everything the wrap algorithm needs to know about a cell, and nothing else.
+///
+/// Deliberately `Copy` and three bytes wide: this is what a transcript costs
+/// when it only has to be counted.
+#[derive(Clone, Copy)]
+struct CellShape {
+    width: u16,
+    whitespace: bool,
+    wrap_joiner: bool,
+}
+
+impl CellShape {
+    fn from_grapheme(grapheme: ratatui::text::StyledGrapheme<'_>) -> Self {
+        let symbol = grapheme.symbol;
+        Self {
+            width: saturating_u16(symbol.width()),
+            whitespace: symbol == "\u{200b}"
+                || symbol != "\u{00a0}" && symbol.chars().all(char::is_whitespace),
+            wrap_joiner: symbol == render::WRAP_JOINER_SPACE || symbol == render::WRAP_JOINER_TIGHT,
+        }
+    }
+
+    const fn width(&self) -> u16 {
+        self.width
+    }
+
+    const fn is_whitespace(&self) -> bool {
+        self.whitespace
+    }
+
+    const fn is_wrap_joiner(&self) -> bool {
+        self.wrap_joiner
+    }
+}
+
+/// Wraps a line's cells into rows.
+///
+/// Generic over the cell so that counting rows and materializing them run the
+/// same algorithm: only the advance width and whether a cell is whitespace
+/// affect where a row breaks, and a second implementation for counting would
+/// be free to drift away from this one without any test noticing.
+fn wrap_cells<T>(
+    cells: Vec<T>,
+    width: u16,
+    cell_width: impl Fn(&T) -> u16,
+    is_whitespace_cell: impl Fn(&T) -> bool,
+) -> Vec<Vec<T>> {
     let mut rows = Vec::new();
     let mut line = Vec::new();
     let mut line_width = 0_u16;
     let mut word = Vec::new();
     let mut word_width = 0_u16;
-    let mut whitespace: VecDeque<SelectableCell> = VecDeque::new();
+    let mut whitespace: VecDeque<T> = VecDeque::new();
     let mut whitespace_width = 0_u16;
     let mut previous_was_text = false;
 
     for cell in cells {
-        if cell.width > width {
+        if cell_width(&cell) > width {
             continue;
         }
-        let is_whitespace = selectable_cell_is_whitespace(&cell);
+        let is_whitespace = is_whitespace_cell(&cell);
         let word_finished = previous_was_text && is_whitespace;
         let segment_overflow = line.is_empty()
             && word_width
                 .saturating_add(whitespace_width)
-                .saturating_add(cell.width)
+                .saturating_add(cell_width(&cell))
                 > width;
         if word_finished || segment_overflow {
             line.extend(whitespace.drain(..));
@@ -3029,7 +4453,7 @@ fn wrap_selectable_line(cells: Vec<SelectableCell>, width: u16) -> Vec<Vec<Selec
         }
 
         let line_full = line_width >= width;
-        let word_overflow = cell.width > 0
+        let word_overflow = cell_width(&cell) > 0
             && line_width
                 .saturating_add(whitespace_width)
                 .saturating_add(word_width)
@@ -3039,11 +4463,11 @@ fn wrap_selectable_line(cells: Vec<SelectableCell>, width: u16) -> Vec<Vec<Selec
             rows.push(std::mem::take(&mut line));
             line_width = 0;
             while let Some(pending) = whitespace.front() {
-                if pending.width > remaining {
+                if cell_width(pending) > remaining {
                     break;
                 }
-                whitespace_width = whitespace_width.saturating_sub(pending.width);
-                remaining = remaining.saturating_sub(pending.width);
+                whitespace_width = whitespace_width.saturating_sub(cell_width(pending));
+                remaining = remaining.saturating_sub(cell_width(pending));
                 whitespace.pop_front();
             }
             if is_whitespace && whitespace.is_empty() {
@@ -3053,10 +4477,10 @@ fn wrap_selectable_line(cells: Vec<SelectableCell>, width: u16) -> Vec<Vec<Selec
         }
 
         if is_whitespace {
-            whitespace_width = whitespace_width.saturating_add(cell.width);
+            whitespace_width = whitespace_width.saturating_add(cell_width(&cell));
             whitespace.push_back(cell);
         } else {
-            word_width = word_width.saturating_add(cell.width);
+            word_width = word_width.saturating_add(cell_width(&cell));
             word.push(cell);
         }
         previous_was_text = !is_whitespace;
@@ -3077,16 +4501,13 @@ fn selectable_cell_is_whitespace(cell: &SelectableCell) -> bool {
     cell.text == "\u{200b}" || cell.text != "\u{00a0}" && cell.text.chars().all(char::is_whitespace)
 }
 
-fn selectable_row(mut cells: Vec<SelectableCell>, hard_break_after: bool) -> SelectableRow {
+fn selectable_row(mut cells: Vec<SelectableCell>, break_after: RowBreak) -> SelectableRow {
     let mut column = 0;
     for cell in &mut cells {
         cell.column = column;
         column = column.saturating_add(cell.width);
     }
-    SelectableRow {
-        cells,
-        hard_break_after,
-    }
+    SelectableRow { cells, break_after }
 }
 
 fn ordered_selection(selection: TranscriptSelection) -> (TranscriptPosition, TranscriptPosition) {
@@ -3142,12 +4563,12 @@ fn transcript_provenance(state: &ViewState<'_>) -> Vec<Line<'static>> {
             Line::styled(
                 format!("Subagent {id} · {}", state.owner_label),
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(widgets::RolePalette::warning())
                     .add_modifier(Modifier::BOLD),
             ),
             Line::styled(
-                "g select · m Main · h/l sibling",
-                Style::default().fg(Color::DarkGray),
+                "gt select · m Main · [/] sibling",
+                Style::default().fg(widgets::RolePalette::chrome()),
             ),
             Line::default(),
         ],
@@ -3197,12 +4618,14 @@ fn execution_priority(state: TuiExecutionState) -> u8 {
     }
 }
 
-const fn execution_state_glyph(state: TuiExecutionState) -> &'static str {
+const fn execution_state_glyph(state: TuiExecutionState) -> widgets::Glyph {
     match state {
-        TuiExecutionState::ForegroundRunning | TuiExecutionState::BackgroundRunning => "●",
-        TuiExecutionState::CompletedRecent => "✓",
-        TuiExecutionState::Failed => "✗",
-        TuiExecutionState::Cancelled => "○",
+        TuiExecutionState::ForegroundRunning | TuiExecutionState::BackgroundRunning => {
+            widgets::Glyph::Running
+        }
+        TuiExecutionState::CompletedRecent => widgets::Glyph::Succeeded,
+        TuiExecutionState::Failed => widgets::Glyph::Failed,
+        TuiExecutionState::Cancelled => widgets::Glyph::Cancelled,
     }
 }
 
@@ -3278,6 +4701,10 @@ pub struct Tui<E> {
     context_window: Option<u64>,
     session: String,
     project: String,
+    home: Option<String>,
+    repository: Option<RepositoryStatus>,
+    repository_probe: Option<RepositoryProbe>,
+    repository_polled_at: Option<Duration>,
     turn_state: Option<TurnState>,
     /// Whether the visible failure of the current turn is the projection's own
     /// placeholder, still waiting to be replaced by the real cause.
@@ -3291,17 +4718,25 @@ pub struct Tui<E> {
     turn_duration: Option<Duration>,
     turn_started_at: Option<Duration>,
     /// Tokens billed by the rounds of the active turn, summed as they report.
-    turn_input_tokens: Option<u64>,
+    turn_context_tokens: Option<u64>,
     turn_output_tokens: Option<u64>,
     latest_usage: Option<Usage>,
     status: Option<String>,
     restored_syntax_ready_at: Option<Duration>,
     highlight_restored_syntax: bool,
+    /// Whether the terminal this session is attached to renders OSC 8 links.
+    ///
+    /// Decided once from the environment rather than per frame, so the render
+    /// path stays a pure function of state and a test can state the answer.
+    hyperlinks: bool,
+    color_level: widgets::ColorLevel,
+    unicode_level: widgets::UnicodeLevel,
     completed_conversations: Vec<Conversation>,
     conversation: Option<Conversation>,
     dialog: Option<DialogView>,
     secret_entry: Option<SecretEntryState>,
     device_auth: Option<DeviceAuthState>,
+    ask_user: Option<AskUserState>,
     palette_entries: Vec<PaletteEntry>,
     palette_open: bool,
     palette_selected: usize,
@@ -3317,6 +4752,8 @@ pub struct Tui<E> {
     now: Duration,
     next_runtime_ordinal: u64,
     mouse_selection_snapshot: Option<MouseSelectionSnapshot>,
+    /// First key of an unfinished viewport chord, such as the `g` of `gg`.
+    pending_viewport_key: Option<char>,
 }
 
 impl<E> Tui<E>
@@ -3327,6 +4764,21 @@ where
     pub fn new(engine: E) -> Self {
         Self {
             engine,
+            hyperlinks: widgets::hyperlinks_enabled(),
+            color_level: widgets::detect_color_level(
+                std::env::var("NO_COLOR").ok().as_deref(),
+                std::env::var("AGENS_COLOR").ok().as_deref(),
+                std::env::var("COLORTERM").ok().as_deref(),
+                std::env::var("TERM").ok().as_deref(),
+            ),
+            unicode_level: widgets::detect_unicode_level(
+                std::env::var("AGENS_GLYPHS").ok().as_deref(),
+                std::env::var("LC_ALL")
+                    .or_else(|_| std::env::var("LC_CTYPE"))
+                    .or_else(|_| std::env::var("LANG"))
+                    .ok()
+                    .as_deref(),
+            ),
             input: String::new(),
             input_cursor: 0,
             recovered_failed_prompt: false,
@@ -3345,6 +4797,10 @@ where
             context_window: None,
             session: "new session".to_owned(),
             project: "agens".to_owned(),
+            home: std::env::var("HOME").ok().filter(|home| !home.is_empty()),
+            repository: None,
+            repository_probe: None,
+            repository_polled_at: None,
             turn_state: None,
             placeholder_failure: false,
             active_tool: None,
@@ -3353,7 +4809,7 @@ where
             runtime_events: Vec::new(),
             turn_duration: None,
             turn_started_at: None,
-            turn_input_tokens: None,
+            turn_context_tokens: None,
             turn_output_tokens: None,
             latest_usage: None,
             status: None,
@@ -3364,6 +4820,7 @@ where
             dialog: None,
             secret_entry: None,
             device_auth: None,
+            ask_user: None,
             palette_entries: Vec::new(),
             palette_open: false,
             palette_selected: 0,
@@ -3379,11 +4836,19 @@ where
             now: Duration::ZERO,
             next_runtime_ordinal: 0,
             mouse_selection_snapshot: None,
+            pending_viewport_key: None,
         }
     }
 
     /// Handles one input or resize event without performing rendering or engine work.
     pub fn handle(&mut self, event: Event) -> Action {
+        let _perf_event = agens_perf::span!("tui.event", kind = event.trace_kind(), batch = 1u64,);
+        // A chord is only ever completed by the key that follows it. Anything
+        // else the reader does abandons it, so `gt` cannot be completed by a
+        // `t` typed a mouse click and a resize later.
+        if !matches!(event, Event::Key(_)) {
+            self.pending_viewport_key = None;
+        }
         match event {
             Event::Resize { width, height } => {
                 self.size = (width, height);
@@ -3391,6 +4856,7 @@ where
                 self.clamp_palette_selection();
                 self.clamp_scroll_offset();
                 self.ensure_dialog_selection_visible();
+                self.clamp_ask_user_context_scroll();
                 Action::Render
             }
             Event::Key(key) => self.handle_key(key),
@@ -3400,6 +4866,7 @@ where
                 .unwrap_or_else(|| self.begin_mouse_selection(column, row)),
             Event::MouseDrag { column, row } => self.update_mouse_selection(column, row, true),
             Event::MouseUp { column, row } => self.update_mouse_selection(column, row, false),
+            Event::MouseMove { column, row } => self.hover_block(column, row),
             Event::Paste(text) if self.secret_entry.is_some() => {
                 self.quit_armed_until = None;
                 self.append_secret_text(&text);
@@ -3455,6 +4922,22 @@ where
         self.refresh_file_picker();
     }
 
+    /// Overrides the terminal hyperlink capability detected at construction.
+    ///
+    /// The environment is the right source for a real session and the wrong one
+    /// for a test, which must be able to state the answer rather than inherit
+    /// whatever `TERM` the runner happened to export.
+    pub fn set_hyperlinks(&mut self, enabled: bool) {
+        self.hyperlinks = enabled;
+    }
+
+    /// Overrides the terminal colour and glyph capabilities detected at
+    /// construction, for the same reason [`Tui::set_hyperlinks`] exists.
+    pub fn set_capabilities(&mut self, color: widgets::ColorLevel, unicode: widgets::UnicodeLevel) {
+        self.color_level = color;
+        self.unicode_level = unicode;
+    }
+
     pub fn set_collapse_thinking(&mut self, collapse: bool) {
         let record = self.active_record_mut();
         record.collapse_thinking = collapse;
@@ -3506,8 +4989,26 @@ where
         executions
     }
 
+    /// Whether anything is still moving and therefore owed a repaint.
+    ///
+    /// The parent turn is not the only live thing on screen: a background
+    /// subagent keeps running after its turn ends, and its card reports an
+    /// elapsed time. Tying the frame heartbeat to the parent alone froze that
+    /// clock until the next keystroke, so the surface looked hung and then
+    /// jumped when the runtime continued on its own.
+    pub fn has_live_work(&self) -> bool {
+        self.running
+            || self.executions.iter().any(|execution| {
+                matches!(
+                    execution.state,
+                    TuiExecutionState::ForegroundRunning | TuiExecutionState::BackgroundRunning
+                )
+            })
+    }
+
     pub fn tick(&mut self, now: Duration) {
         self.now = now;
+        self.poll_repository(now);
         if self.quit_armed_until.is_some_and(|until| now >= until) {
             self.quit_armed_until = None;
         }
@@ -3542,7 +5043,7 @@ where
         self.reasoning_started_at = None;
         if running {
             self.turn_started_at = Some(self.now);
-            self.turn_input_tokens = None;
+            self.turn_context_tokens = None;
             self.turn_output_tokens = None;
             self.palette_open = false;
             self.turn_state = Some(TurnState::Requesting);
@@ -3570,7 +5071,7 @@ where
             duration: self
                 .turn_started_at
                 .map(|started| self.now.saturating_sub(started)),
-            input_tokens: self.turn_input_tokens,
+            context_tokens: self.turn_context_tokens,
             output_tokens: self.turn_output_tokens,
         };
         if let Some(conversation) = self.conversation.as_mut() {
@@ -3579,10 +5080,14 @@ where
         }
     }
 
-    /// Adds one round's report to the active turn's running total.
+    /// Folds one round's report into the active turn, per figure.
+    ///
+    /// See [`TurnCost`]: output accumulates because each round generates its
+    /// own, and the prompt takes the maximum because each round resends the
+    /// last one's.
     fn accumulate_turn_usage(&mut self, usage: &Usage) {
         if let Some(input) = usage.input_tokens {
-            self.turn_input_tokens = Some(self.turn_input_tokens.unwrap_or(0) + input);
+            self.turn_context_tokens = Some(self.turn_context_tokens.unwrap_or(0).max(input));
         }
         if let Some(output) = usage.output_tokens {
             self.turn_output_tokens = Some(self.turn_output_tokens.unwrap_or(0) + output);
@@ -3624,6 +5129,30 @@ where
     /// Sets the project identity displayed in the semantic terminal header.
     pub fn set_project(&mut self, project: impl Into<String>) {
         self.project = project.into();
+    }
+
+    /// Installs the source the footer reads branch and working-tree size from.
+    ///
+    /// The probe is called on the tick, so it must already have the answer:
+    /// collecting it is the caller's job, on the caller's own clock. A probe
+    /// that shells out to git here would put every frame behind it.
+    pub fn set_repository_probe(&mut self, probe: RepositoryProbe) {
+        self.repository = probe();
+        self.repository_probe = Some(probe);
+    }
+
+    fn poll_repository(&mut self, now: Duration) {
+        let Some(probe) = self.repository_probe.as_ref() else {
+            return;
+        };
+        if self
+            .repository_polled_at
+            .is_some_and(|polled| now.saturating_sub(polled) < REPOSITORY_POLL_INTERVAL)
+        {
+            return;
+        }
+        self.repository_polled_at = Some(now);
+        self.repository = probe();
     }
 
     /// Sets the dangerous-mode state displayed for the next submitted turn.
@@ -4003,7 +5532,9 @@ where
         self.transcript.clear();
         self.completed_conversations.clear();
         self.conversation = None;
-        self.active_record_mut().tool_display_modes.clear();
+        let record = self.active_record_mut();
+        record.tool_display_modes.clear();
+        record.tool_detail = widgets::DisplayMode::Collapsed;
         self.set_running(false);
         self.turn_state = None;
         self.placeholder_failure = false;
@@ -4042,6 +5573,7 @@ where
         {
             let record = self.active_record_mut();
             record.tool_display_modes.clear();
+            record.tool_detail = widgets::DisplayMode::Collapsed;
             record.tool_display_modes.extend(
                 completed_tool_call_ids
                     .into_iter()
@@ -4075,6 +5607,18 @@ where
         self.transcripts
             .get_mut(&self.active_transcript)
             .expect("active transcript always exists")
+    }
+
+    /// The record owning `self.conversation`, whichever transcript is on screen.
+    ///
+    /// Parent turn events arrive while the reader may be watching a subagent, so
+    /// the transcript they belong to and the transcript being looked at are
+    /// different questions. Presentation state for a parent call belongs to the
+    /// former.
+    fn main_record_mut(&mut self) -> &mut TranscriptRecord {
+        self.transcripts
+            .get_mut(&TranscriptId::Main)
+            .expect("the main transcript always exists")
     }
 
     fn show_transcript_dialog(&mut self) {
@@ -4155,18 +5699,17 @@ where
             .collect()
     }
 
+    /// Enters the tree at its first row, which is the one nearest the composer.
     fn focus_execution_strip(&mut self) {
-        let ids = self.execution_strip_ids();
-        self.execution_selection = match self.execution_selection {
-            None => Some(TranscriptId::Main),
-            Some(current) => ids
-                .iter()
-                .position(|id| *id == current)
-                .map(|index| ids[(index + 1) % ids.len()])
-                .or(Some(TranscriptId::Main)),
-        };
+        self.execution_selection = self.execution_strip_ids().first().copied();
     }
 
+    /// Walks the tree, treating its ends as the edges of a list rather than a
+    /// ring.
+    ///
+    /// Wrapping would make the tree a loop with no way out, and the way out is
+    /// the point: the composer sits directly above the first row, so walking up
+    /// off that row is how a reader gets back to typing.
     fn move_execution_selection(&mut self, direction: isize) {
         let ids = self.execution_strip_ids();
         let current = self.execution_selection.unwrap_or(TranscriptId::Main);
@@ -4174,11 +5717,12 @@ where
             self.execution_selection = Some(TranscriptId::Main);
             return;
         };
-        let next = index
-            .checked_add_signed(direction)
-            .map(|index| index % ids.len())
-            .unwrap_or(ids.len().saturating_sub(1));
-        self.execution_selection = ids.get(next).copied();
+
+        match index.checked_add_signed(direction) {
+            None => self.execution_selection = None,
+            Some(next) if next < ids.len() => self.execution_selection = ids.get(next).copied(),
+            Some(_) => {}
+        }
     }
 
     fn inspect_execution_selection(&mut self) {
@@ -4191,7 +5735,7 @@ where
     /// same rows the renderer paints.
     fn screen_layout(&self) -> ScreenLayout {
         let area = Rect::new(0, 0, self.size.0.max(1), self.size.1.max(1));
-        screen_layout(area, &self.input, !notice_spans(&self.view()).is_empty())
+        screen_layout(area, &self.input)
     }
 
     /// Selects a transcript from a click on the subagent tree.
@@ -4209,7 +5753,9 @@ where
         }
 
         let index = usize::from(row.saturating_sub(layout.tree.y));
-        let id = *self.execution_strip_ids().get(index)?;
+        let id = (*fitted_subagent_tree(&self.view(), layout.tree.height, layout.tree.width)
+            .1
+            .get(index)?)?;
         self.execution_selection = Some(id);
         self.select_transcript(id);
         Some(Action::Render)
@@ -4248,8 +5794,11 @@ where
                 self.accumulate_turn_usage(usage);
                 self.latest_usage = Some(usage.clone());
             }
-            TuiRuntimeEvent::Diff { lines, .. } => {
-                self.project_conversation(ConversationEvent::Diff(lines.clone()));
+            TuiRuntimeEvent::Diff { call_id, lines } => {
+                self.project_conversation(ConversationEvent::Diff {
+                    call_id: call_id.clone(),
+                    lines: lines.clone(),
+                });
             }
             TuiRuntimeEvent::TaskExecution { agent, event } => {
                 self.apply_task_execution_event(agent, *event);
@@ -4313,12 +5862,19 @@ where
                 execution.terminal_at = Some(self.now);
             }
         }
-        if let agens_core::TuiSubagentUpdate::Started { agent, .. } = &event.update {
+        if let agens_core::TuiSubagentUpdate::Started { agent, model, .. } = &event.update {
             self.transcripts
                 .get_mut(&TranscriptId::Subagent(event.id))
                 .expect("admitted child event has a transcript")
                 .owner_label
                 .clone_from(agent);
+            if let Some(execution) = self
+                .executions
+                .iter_mut()
+                .find(|execution| execution.id == event.id)
+            {
+                execution.model.clone_from(model);
+            }
         }
         self.transcripts
             .get_mut(&TranscriptId::Subagent(event.id))
@@ -4327,11 +5883,12 @@ where
             .get_or_insert_with(|| Conversation::new(String::new()))
             .apply_child_event(event.clone());
         if let agens_core::TuiSubagentUpdate::ToolResult { call_id, .. } = &event.update {
-            self.transcripts
+            let record = self
+                .transcripts
                 .get_mut(&TranscriptId::Subagent(event.id))
-                .expect("admitted child event has a transcript")
-                .tool_display_modes
-                .insert(call_id.clone(), widgets::DisplayMode::Collapsed);
+                .expect("admitted child event has a transcript");
+            let detail = record.tool_detail;
+            record.tool_display_modes.insert(call_id.clone(), detail);
         }
         if matches!(
             &event.update,
@@ -4413,7 +5970,10 @@ where
                 following_bottom: true,
                 scroll_offset: 0,
                 tool_display_modes: BTreeMap::new(),
+                tool_detail: widgets::DisplayMode::Collapsed,
                 collapse_thinking: false,
+                history_expanded: false,
+                focused_call: None,
                 thinking_user_pinned: false,
                 focus: TranscriptFocus::Viewport,
                 selection: None,
@@ -4476,9 +6036,9 @@ where
             .get_or_insert_with(|| Conversation::new(String::new()))
             .apply(event)?;
         if let Some(call_id) = completed_tool_call {
-            self.active_record_mut()
-                .tool_display_modes
-                .insert(call_id, widgets::DisplayMode::Collapsed);
+            let record = self.main_record_mut();
+            let detail = record.tool_detail;
+            record.tool_display_modes.insert(call_id, detail);
         }
         Ok(())
     }
@@ -4559,6 +6119,8 @@ where
             context_window: self.context_window,
             session: &self.session,
             project: &self.project,
+            home: self.home.as_deref(),
+            repository: self.repository.as_ref(),
             turn_state: self.turn_state,
             dangerous_mode: self.dangerous_mode,
             bypass: self.bypass,
@@ -4581,7 +6143,13 @@ where
             },
             highlight_restored_syntax: self.highlight_restored_syntax,
             tool_display_modes: &active.tool_display_modes,
+            tool_detail: active.tool_detail,
             collapse_thinking: active.collapse_thinking,
+            history_expanded: active.history_expanded,
+            focused_call: active.focused_call.as_deref(),
+            hyperlinks: self.hyperlinks,
+            color_level: self.color_level,
+            unicode_level: self.unicode_level,
             focus: active.focus,
             dialog: self.dialog.as_ref(),
             secret_entry: self.secret_entry.as_ref().map(|entry| SecretEntryRender {
@@ -4596,6 +6164,7 @@ where
                 selected: entry.selected,
                 confirmation: entry.confirmation,
             }),
+            ask_user: self.ask_user.as_ref().map(AskUserRender::of),
             palette: self.palette_open.then_some(PaletteView {
                 entries: &self.palette_entries,
                 selected: self.palette_selected,
@@ -4697,8 +6266,14 @@ where
         {
             return;
         }
+        // A cancellation is a decision someone already took, not news: waking
+        // the model for it made a cancelled duplicate answer anyway, which is
+        // exactly what cancelling it was meant to prevent.
         let finished_in_background = execution.state == TuiExecutionState::BackgroundRunning
-            && !matches!(state, TuiExecutionState::BackgroundRunning);
+            && !matches!(
+                state,
+                TuiExecutionState::BackgroundRunning | TuiExecutionState::Cancelled
+            );
         execution.state = state;
         execution.last_activity = self.now;
         if !matches!(state, TuiExecutionState::BackgroundRunning) {
@@ -4727,6 +6302,7 @@ where
             id,
             agent: agent.to_owned(),
             state,
+            model: None,
             started_at: self.now,
             last_activity: self.now,
             terminal_at: None,
@@ -4793,13 +6369,27 @@ where
     }
 
     fn begin_mouse_selection(&mut self, column: u16, row: u16) -> Action {
-        let Some(snapshot) = self.capture_mouse_selection_snapshot() else {
+        // An overlay owns the whole screen while it is up, so a press under it
+        // belongs to the overlay and must not disturb what is behind it.
+        if self.dialog.is_some() || self.palette_open {
+            return Action::Render;
+        }
+
+        let snapshot = self.capture_mouse_selection_snapshot();
+        let position = snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.position(column, row));
+
+        let Some(position) = position else {
+            // A press that lands on no transcript row is the reader putting the
+            // selection down. Leaving it painted, and the transcript focused,
+            // is what used to make dismissing it cost a keypress of its own.
+            self.clear_selection();
+            self.active_record_mut().focus = TranscriptFocus::Composer;
             return Action::Render;
         };
-        let Some(position) = snapshot.position(column, row) else {
-            return Action::Render;
-        };
-        self.mouse_selection_snapshot = Some(snapshot);
+
+        self.mouse_selection_snapshot = snapshot;
         let record = self.active_record_mut();
         record.focus = TranscriptFocus::Viewport;
         record.selection = Some(TranscriptSelection {
@@ -4851,9 +6441,12 @@ where
                 record.selection_too_large = false;
             }
             Some(Ok(_)) | None => {
+                // A press that selected nothing is a plain click, and a plain
+                // click is how the reader dismisses what was selected before.
                 record.selection = None;
                 record.selection_text = None;
                 record.selection_too_large = false;
+                record.focus = TranscriptFocus::Composer;
             }
             Some(Err(())) => {
                 record.selection_text = None;
@@ -5151,6 +6744,77 @@ where
         Action::Render
     }
 
+    /// Opens a bounded structured question set as a dedicated modal
+    /// interaction, sibling to secret entry and device authentication.
+    pub fn open_ask_user(&mut self, id: u64, request: AskUserRequest) {
+        self.ask_user = Some(AskUserState::new(id, request));
+    }
+
+    /// A read-only snapshot of the open ask-user interaction, if one exists.
+    pub fn ask_user_snapshot(&self) -> Option<AskUserSnapshot> {
+        self.ask_user.as_ref().map(AskUserState::snapshot)
+    }
+
+    /// Closes the open ask-user overlay if it is the one identified by
+    /// `id`, without resolving anything itself. Returns whether it closed
+    /// one.
+    ///
+    /// This is for a request the BRIDGE resolved on its own — a deadline
+    /// expiring, an external cancellation, or the surface closing — none of
+    /// which travel through `Action::AskUserReply`. Without this, the
+    /// overlay would keep holding the keyboard for a turn that has already
+    /// ended, and whatever the person then typed or submitted into it would
+    /// be silently dropped rather than answering anyone.
+    pub fn dismiss_ask_user(&mut self, id: u64) -> bool {
+        if self.ask_user.as_ref().is_some_and(|state| state.id() == id) {
+            self.ask_user = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// The context pane's scroll ceiling in the frame the reader is looking at.
+    ///
+    /// Measured from the same geometry the renderer solves, so `End` stores a
+    /// real offset instead of a sentinel the next `PageUp` would have to walk
+    /// back from one step at a time.
+    fn ask_user_max_context_scroll(&self) -> u16 {
+        let Some(state) = self.ask_user.as_ref() else {
+            return 0;
+        };
+        let render = AskUserRender::of(state);
+        let area = Rect::new(0, 0, self.size.0, self.size.1);
+        ask_user_frame(area, &render).map_or(0, |laid| laid.max_context_scroll)
+    }
+
+    fn clamp_ask_user_context_scroll(&mut self) {
+        let max = self.ask_user_max_context_scroll();
+        if let Some(state) = self.ask_user.as_mut() {
+            state.clamp_context_scroll(max);
+        }
+    }
+
+    fn handle_ask_user_key(&mut self, key: Key) -> Action {
+        let max_context_scroll = self.ask_user_max_context_scroll();
+        let Some(state) = self.ask_user.as_mut() else {
+            return Action::Render;
+        };
+        let outcome = state.reduce(key, max_context_scroll);
+        let id = state.id();
+        match outcome {
+            AskUserOutcome::Unchanged => Action::Unchanged,
+            AskUserOutcome::Changed => {
+                self.clamp_ask_user_context_scroll();
+                Action::Render
+            }
+            AskUserOutcome::Resolved(reply) => {
+                self.ask_user = None;
+                Action::AskUserReply { id, reply }
+            }
+        }
+    }
+
     fn handle_key(&mut self, key: Key) -> Action {
         if key != Key::CtrlC {
             self.quit_armed_until = None;
@@ -5166,6 +6830,9 @@ where
         }
         if self.secret_entry.is_some() {
             return self.handle_secret_key(key);
+        }
+        if self.ask_user.is_some() {
+            return self.handle_ask_user_key(key);
         }
         if key == Key::Escape && self.session_loading {
             return Action::CancelRoute;
@@ -5184,6 +6851,7 @@ where
                     | Key::CtrlG
                     | Key::CtrlShiftG
             )
+            && !(self.viewport_focused() && key.moves_viewport())
         {
             return Action::Render;
         }
@@ -5224,6 +6892,21 @@ where
         if !self.palette_open && !self.file_picker_open() && !self.executions.is_empty() {
             match key {
                 Key::Tab => {
+                    if self.execution_selection.is_some() {
+                        self.execution_selection = None;
+                    } else {
+                        self.focus_execution_strip();
+                    }
+                    return Action::Render;
+                }
+                // The tree hangs below the composer, so walking down out of the
+                // prompt walks into it. Only from an empty prompt: with text in
+                // it, Down belongs to the text.
+                Key::Down
+                    if self.execution_selection.is_none()
+                        && self.input.is_empty()
+                        && !self.viewport_focused() =>
+                {
                     self.focus_execution_strip();
                     return Action::Render;
                 }
@@ -5233,6 +6916,13 @@ where
                 }
                 Key::Down if self.execution_selection.is_some() => {
                     self.move_execution_selection(1);
+                    return Action::Render;
+                }
+                // Main is where the reader already is, so accepting it is a way
+                // back to the prompt rather than a transcript switch.
+                Key::Enter if self.execution_selection == Some(TranscriptId::Main) => {
+                    self.select_transcript(TranscriptId::Main);
+                    self.execution_selection = None;
                     return Action::Render;
                 }
                 Key::Enter if self.execution_selection.is_some() => {
@@ -5251,50 +6941,34 @@ where
             return Action::Render;
         }
 
+        // The shortcut list answers "what can I press", so it answers from
+        // wherever the question was asked — including on top of an open dialog.
+        if key == Key::CtrlQuestion {
+            self.palette_open = false;
+            self.show_selection_dialog(shortcuts::shortcuts_dialog());
+            return Action::Render;
+        }
+
+        if key == Key::Escape {
+            return self.handle_escape();
+        }
+
+        // An open palette or picker is typed into, so it owns the alphabet even
+        // when the transcript behind it still holds focus.
+        if self.viewport_focused()
+            && !self.palette_open
+            && !self.file_picker_open()
+            && let Some(action) = self.handle_viewport_key(key)
+        {
+            return action;
+        }
+
         match key {
-            Key::Char('g') if self.active_record_mut().focus == TranscriptFocus::Viewport => {
-                self.show_transcript_dialog();
-                return Action::Render;
-            }
-            Key::Char('m') if self.active_record_mut().focus == TranscriptFocus::Viewport => {
-                self.select_transcript(TranscriptId::Main);
-                return Action::Render;
-            }
-            Key::Char('h') if self.active_record_mut().focus == TranscriptFocus::Viewport => {
-                self.select_sibling(-1);
-                return Action::Render;
-            }
-            Key::Char('l') if self.active_record_mut().focus == TranscriptFocus::Viewport => {
-                self.select_sibling(1);
-                return Action::Render;
-            }
-            Key::Char('i')
-                if self.active_record_mut().focus == TranscriptFocus::Viewport
-                    && !self.active_record_mut().terminal =>
-            {
-                self.active_record_mut().focus = TranscriptFocus::Composer;
-                self.execution_selection = None;
-                return Action::Render;
-            }
-            Key::Char('x')
-                if self.active_record_mut().focus == TranscriptFocus::Viewport
-                    && !self.active_record_mut().terminal =>
-            {
-                if let TranscriptId::Subagent(id) = self.active_transcript {
-                    return Action::CancelExecution(id);
-                }
-            }
-            Key::Home
-                if self.active_transcript != TranscriptId::Main
-                    || self.active_record_mut().focus == TranscriptFocus::Viewport =>
-            {
+            Key::Home if self.active_transcript != TranscriptId::Main => {
                 self.scroll_to_start();
                 return Action::Render;
             }
-            Key::End
-                if self.active_transcript != TranscriptId::Main
-                    || self.active_record_mut().focus == TranscriptFocus::Viewport =>
-            {
+            Key::End if self.active_transcript != TranscriptId::Main => {
                 self.scroll_to_end();
                 return Action::Render;
             }
@@ -5310,6 +6984,7 @@ where
                     | Key::Backspace
                     | Key::Delete
                     | Key::DeletePreviousWord
+                    | Key::DeleteNextWord
                     | Key::DeleteToLineStart
                     | Key::DeleteToLineEnd
                     | Key::Left
@@ -5359,6 +7034,7 @@ where
                 | Key::Backspace
                 | Key::Delete
                 | Key::DeletePreviousWord
+                | Key::DeleteNextWord
                 | Key::DeleteToLineStart
                 | Key::DeleteToLineEnd
                 | Key::Left
@@ -5377,7 +7053,20 @@ where
 
         match key {
             Key::CtrlO => {
-                self.toggle_detail_expansion();
+                self.cycle_tool_detail(true);
+                Action::Render
+            }
+            Key::CtrlShiftO => {
+                self.cycle_tool_detail(false);
+                Action::Render
+            }
+            Key::CtrlT => {
+                self.toggle_thinking_expansion();
+                Action::Render
+            }
+            Key::CtrlY => {
+                let record = self.active_record_mut();
+                record.history_expanded = !record.history_expanded;
                 Action::Render
             }
             Key::CtrlJ => {
@@ -5397,11 +7086,11 @@ where
                 Action::Render
             }
             Key::CtrlN => {
-                self.jump_to_user_message(false);
+                self.jump_to_user_message(UserMessageTarget::Last);
                 Action::Render
             }
             Key::CtrlShiftN => {
-                self.jump_to_user_message(true);
+                self.jump_to_user_message(UserMessageTarget::Previous);
                 Action::Render
             }
             Key::PageUp => {
@@ -5486,23 +7175,7 @@ where
                 self.recovered_failed_prompt = false;
                 Action::Submit(std::mem::take(&mut self.input))
             }
-            Key::Escape if self.recovered_failed_prompt => {
-                self.input.clear();
-                self.input_cursor = 0;
-                self.recovered_failed_prompt = false;
-                self.active_record_mut().focus = TranscriptFocus::Composer;
-                self.status = Some("Recovered prompt discarded.".into());
-                Action::Render
-            }
-            Key::Escape if self.running => self.cancel_running(),
-            Key::Escape if self.dialog.is_some() => {
-                self.dialog = None;
-                Action::Render
-            }
-            Key::Escape => {
-                self.active_record_mut().focus = TranscriptFocus::Viewport;
-                Action::Render
-            }
+            Key::Escape => unreachable!("Escape is handled before focused input"),
             Key::CtrlC => unreachable!("Ctrl+C is handled before focused input"),
             _ => unreachable!("composer keys are handled before global keys"),
         }
@@ -5510,13 +7183,16 @@ where
 
     fn handle_composer_key(&mut self, key: Key) -> Option<Action> {
         let cursor = self.input_cursor;
-        match key {
+        match key.composer_equivalent() {
             Key::Char(character) => self.insert_text(&character.to_string()),
             Key::ShiftEnter => self.insert_text("\n"),
             Key::Backspace if cursor > 0 => self.replace_chars(cursor - 1, cursor, ""),
             Key::Delete => self.replace_chars(cursor, cursor.saturating_add(1), ""),
             Key::DeletePreviousWord => {
                 self.replace_chars(previous_word_boundary(&self.input, cursor), cursor, "");
+            }
+            Key::DeleteNextWord => {
+                self.replace_chars(cursor, next_word_boundary(&self.input, cursor), "");
             }
             Key::DeleteToLineStart => {
                 self.replace_chars(line_start(&self.input, cursor), cursor, "");
@@ -5583,6 +7259,11 @@ where
     }
 
     fn handle_mouse_wheel_batch(&mut self, directions: &[MouseWheelDirection]) -> Action {
+        let _perf_event = agens_perf::span!(
+            "tui.event.wheel_batch",
+            kind = "mouse_wheel",
+            batch = directions.len() as u64,
+        );
         if self
             .dialog
             .as_ref()
@@ -5625,10 +7306,12 @@ where
                 }
             }
         }
-        record.focus = TranscriptFocus::Viewport;
         Action::Render
     }
 
+    // Scrolling moves the viewport and nothing else. Focus is a mode now, and a
+    // mode that Ctrl+K or the wheel could switch by accident would leave the
+    // reader typing into a prompt that had quietly stopped accepting text.
     fn scroll_up(&mut self, rows: u16) {
         let bottom = self.detached_scroll_bottom();
         let record = self.active_record_mut();
@@ -5639,26 +7322,22 @@ where
         };
         record.following_bottom = false;
         record.scroll_offset = current.saturating_sub(rows);
-        record.focus = TranscriptFocus::Viewport;
     }
 
     fn scroll_down(&mut self, rows: u16) {
         let bottom = self.detached_scroll_bottom();
         let record = self.active_record_mut();
         if record.following_bottom {
-            record.focus = TranscriptFocus::Viewport;
             return;
         }
         record.scroll_offset = record.scroll_offset.saturating_add(rows).min(bottom);
         record.following_bottom = record.scroll_offset == bottom;
-        record.focus = TranscriptFocus::Viewport;
     }
 
     fn scroll_to_start(&mut self) {
         let record = self.active_record_mut();
         record.following_bottom = false;
         record.scroll_offset = 0;
-        record.focus = TranscriptFocus::Viewport;
     }
 
     fn scroll_to_end(&mut self) {
@@ -5666,7 +7345,6 @@ where
         let record = self.active_record_mut();
         record.following_bottom = true;
         record.scroll_offset = scroll_offset;
-        record.focus = TranscriptFocus::Viewport;
     }
 
     fn clamp_scroll_offset(&mut self) {
@@ -5703,9 +7381,9 @@ where
             .transcript
             .width
             .saturating_sub(TRANSCRIPT_ROW_INDENT);
-        let transcript =
-            SelectableTranscript::from_lines(&rendered_transcript(&view, row_width), row_width);
-        saturating_u16(transcript.rows.len().saturating_sub(visible_rows))
+        let rows =
+            SelectableTranscript::row_count(&rendered_transcript(&view, row_width), row_width);
+        saturating_u16(rows.saturating_sub(visible_rows))
     }
 
     /// Rows a page advances, bounded by the rows the transcript actually shows:
@@ -5748,6 +7426,197 @@ where
         self.input_cursor = start + replacement.chars().count();
     }
 
+    fn viewport_focused(&self) -> bool {
+        self.transcripts
+            .get(&self.active_transcript)
+            .expect("active transcript always exists")
+            .focus
+            == TranscriptFocus::Viewport
+    }
+
+    /// Focuses the transcript and pins the viewport where the reader left it.
+    ///
+    /// Detaching on entry rather than on the first motion is what makes the
+    /// mode worth entering during a turn: output that keeps arriving would
+    /// otherwise scroll away the very row the reader stopped to read.
+    fn enter_viewport(&mut self) {
+        let bottom = self.detached_scroll_bottom();
+        let record = self.active_record_mut();
+        if record.following_bottom {
+            record.scroll_offset = bottom;
+            record.following_bottom = false;
+        }
+        record.focus = TranscriptFocus::Viewport;
+    }
+
+    /// Drops the painted selection, reporting whether there was one to drop.
+    fn clear_selection(&mut self) -> bool {
+        let record = self.active_record_mut();
+        let painted = record.selection.is_some()
+            || record.selection_text.is_some()
+            || record.selection_too_large;
+
+        record.selection = None;
+        record.selection_text = None;
+        record.selection_too_large = false;
+        record.selecting = false;
+
+        painted
+    }
+
+    /// Escape leaves the composer before it reaches the running turn.
+    ///
+    /// Stopping to read and cancelling are different intents, and a reader who
+    /// only wanted to look must not lose the turn to do it. Escape therefore
+    /// always steps out of the composer first; only a second Escape, pressed
+    /// with the transcript already focused and nothing selected, cancels.
+    fn handle_escape(&mut self) -> Action {
+        self.pending_viewport_key = None;
+
+        if self.recovered_failed_prompt {
+            self.input.clear();
+            self.input_cursor = 0;
+            self.recovered_failed_prompt = false;
+            self.active_record_mut().focus = TranscriptFocus::Composer;
+            self.status = Some("Recovered prompt discarded.".into());
+            return Action::Render;
+        }
+
+        if self.dialog.is_some() {
+            self.dialog = None;
+            return Action::Render;
+        }
+
+        if !self.viewport_focused() {
+            self.enter_viewport();
+            return Action::Render;
+        }
+
+        if self.clear_selection() {
+            return Action::Render;
+        }
+
+        if self.running {
+            return self.cancel_running();
+        }
+
+        Action::Render
+    }
+
+    /// The transcript keymap, applied only while the viewport holds focus.
+    ///
+    /// Returning `None` lets the key continue to the global and composer
+    /// handlers; every arm that returns swallows it, which is what stops a
+    /// motion from also landing as text in the prompt underneath.
+    fn handle_viewport_key(&mut self, key: Key) -> Option<Action> {
+        if self.pending_viewport_key.take() == Some('g') {
+            return Some(self.handle_g_chord(key));
+        }
+
+        match key {
+            Key::Char('g') => {
+                self.pending_viewport_key = Some('g');
+                Some(Action::Render)
+            }
+            Key::Char('G') => {
+                self.scroll_to_end();
+                Some(Action::Render)
+            }
+            Key::Char('j') | Key::Down => {
+                self.scroll_down(1);
+                Some(Action::Render)
+            }
+            Key::Char('k') | Key::Up => {
+                self.scroll_up(1);
+                Some(Action::Render)
+            }
+            Key::CtrlD => {
+                self.scroll_down(self.half_page_rows());
+                Some(Action::Render)
+            }
+            Key::CtrlU => {
+                self.scroll_up(self.half_page_rows());
+                Some(Action::Render)
+            }
+            Key::Home => {
+                self.scroll_to_start();
+                Some(Action::Render)
+            }
+            Key::End => {
+                self.scroll_to_end();
+                Some(Action::Render)
+            }
+            Key::Char('{') => {
+                self.jump_to_user_message(UserMessageTarget::Previous);
+                Some(Action::Render)
+            }
+            Key::Char('}') => {
+                self.jump_to_user_message(UserMessageTarget::Next);
+                Some(Action::Render)
+            }
+            Key::Char('J') => {
+                self.move_block_focus(true);
+                self.scroll_to_focused_block();
+                Some(Action::Render)
+            }
+            Key::Char('K') => {
+                self.move_block_focus(false);
+                self.scroll_to_focused_block();
+                Some(Action::Render)
+            }
+            Key::Char('o') => {
+                self.cycle_focused_block_detail();
+                self.scroll_to_focused_block();
+                Some(Action::Render)
+            }
+            Key::Char('[') => {
+                self.select_sibling(-1);
+                Some(Action::Render)
+            }
+            Key::Char(']') => {
+                self.select_sibling(1);
+                Some(Action::Render)
+            }
+            Key::Char('m') => {
+                self.select_transcript(TranscriptId::Main);
+                Some(Action::Render)
+            }
+            Key::Char('?') => {
+                self.show_selection_dialog(shortcuts::shortcuts_dialog());
+                Some(Action::Render)
+            }
+            Key::Char('i' | 'a') if !self.active_record_mut().terminal => {
+                self.clear_selection();
+                self.active_record_mut().focus = TranscriptFocus::Composer;
+                self.execution_selection = None;
+                Some(Action::Render)
+            }
+            Key::Char('x') if !self.active_record_mut().terminal => match self.active_transcript {
+                TranscriptId::Subagent(id) => Some(Action::CancelExecution(id)),
+                TranscriptId::Main => Some(Action::Render),
+            },
+            // Nothing types while the transcript holds focus. Letting an
+            // unclaimed editing key through would put text into a prompt whose
+            // cursor is not even being drawn.
+            key if key.edits_composer() => Some(Action::Render),
+            _ => None,
+        }
+    }
+
+    fn handle_g_chord(&mut self, key: Key) -> Action {
+        match key {
+            Key::Char('g') => self.scroll_to_start(),
+            Key::Char('t') => self.show_transcript_dialog(),
+            _ => {}
+        }
+        Action::Render
+    }
+
+    /// Rows a `Ctrl+D`/`Ctrl+U` step advances.
+    fn half_page_rows(&self) -> u16 {
+        (self.transcript_page_rows() / 2).max(1)
+    }
+
     fn cancel_running(&mut self) -> Action {
         self.palette_open = false;
         self.engine.cancel();
@@ -5762,6 +7631,13 @@ where
             .get(&self.active_transcript)
             .expect("active transcript always exists");
         if let Some(text) = record.selection_text.clone() {
+            // Copying ends the selection. It is also what keeps the exit
+            // reachable: with the selection gone, the next Ctrl+C arms the
+            // quit it always did.
+            let record = self.active_record_mut();
+            record.selection = None;
+            record.selection_text = None;
+            record.selection_too_large = false;
             return Action::CopySelection(text);
         }
         if record.selection_too_large {
@@ -5771,6 +7647,30 @@ where
     }
 
     fn handle_control_c(&mut self) -> Action {
+        // An open ask-user interaction resolves here, ahead of the copy and
+        // quit-arming logic below and ahead of the bridge's own cancellation
+        // poll, so Ctrl+C cancels it deterministically on a single press.
+        if let Some(state) = self.ask_user.take() {
+            return Action::AskUserReply {
+                id: state.id(),
+                reply: AskUserReply::Cancelled,
+            };
+        }
+
+        // Mouse capture takes the terminal's own selection away, so the only
+        // copy the user has is ours. Many terminals also swallow Ctrl+Shift+C
+        // for themselves, which left a made selection with no way to reach the
+        // clipboard: with something selected, Ctrl+C copies rather than arms
+        // the exit it would otherwise arm.
+        if self
+            .transcripts
+            .get(&self.active_transcript)
+            .and_then(|record| record.selection_text.as_ref())
+            .is_some()
+        {
+            return self.handle_copy_selection();
+        }
+
         if self.quit_is_armed() {
             self.quit_armed_until = None;
             if self.running || self.has_active_execution() {
@@ -6382,29 +8282,34 @@ where
             .and_then(|entry| entry.dialog_id.clone())
     }
 
-    /// Shared Ctrl+O detail path: expand/collapse finished thinking first, else tool outputs.
-    fn toggle_detail_expansion(&mut self) {
-        if self.has_finished_thinking() {
-            let thinking_collapsed = self
-                .transcripts
-                .get(&self.active_transcript)
-                .expect("active transcript always exists")
-                .collapse_thinking;
-            if thinking_collapsed {
-                self.toggle_thinking_expansion();
-                return;
-            }
-
-            let has_completed_tools = self.completed_tool_call_ids().next().is_some();
-            if !has_completed_tools {
-                self.toggle_thinking_expansion();
-                return;
-            }
-        }
-        self.toggle_tool_output_expansion();
+    /// Shows or hides the reasoning bodies of the active transcript.
+    ///
+    /// Pinning survives the auto-collapse a finishing turn performs, so a reader
+    /// who asked to see the thought keeps seeing it.
+    fn toggle_thinking_expansion(&mut self) {
+        let record = self.active_record_mut();
+        let current = widgets::ExpandableBody::new(if record.collapse_thinking {
+            widgets::ExpandMode::Collapsed
+        } else {
+            widgets::ExpandMode::Expanded
+        });
+        let next = current.toggle_detail();
+        record.collapse_thinking = !next.is_visible();
+        record.thinking_user_pinned = next.is_visible();
     }
 
-    fn completed_tool_call_ids(&self) -> impl Iterator<Item = String> + '_ {
+    /// Moves the transcript's tool output detail one step along its cycle.
+    ///
+    /// The level is the whole state this key owns: it advances even when no call
+    /// has settled yet, so what the footer names is always what the next result
+    /// will be shown at. Every settled call is rewritten to the new level, which
+    /// is what makes the cycle legible — three levels, one meaning each, rather
+    /// than a per-call state the reader would have to track block by block.
+    /// Every settled tool call of the active transcript, in transcript order.
+    ///
+    /// This is the set AGN-109 collapses, which makes it the set block
+    /// navigation has to be able to reach.
+    fn settled_call_ids(&self) -> Vec<String> {
         let active = self
             .transcripts
             .get(&self.active_transcript)
@@ -6428,88 +8333,81 @@ where
             .flat_map(|batch| &batch.calls)
             .filter(|call| call.result.is_some())
             .map(|call| call.call_id.clone())
+            .collect()
     }
 
-    fn has_finished_thinking(&self) -> bool {
-        if self.running {
-            return false;
-        }
-        let active = self
-            .transcripts
-            .get(&self.active_transcript)
-            .expect("active transcript always exists");
-        let (completed, conversation) = if self.active_transcript == TranscriptId::Main {
-            (
-                self.completed_conversations.as_slice(),
-                self.conversation.as_ref(),
-            )
-        } else {
-            (
-                active.completed_conversations.as_slice(),
-                active.conversation.as_ref(),
-            )
-        };
-        completed
-            .iter()
-            .chain(conversation)
-            .any(|conversation| !conversation.reasoning.is_empty())
-    }
-
-    fn toggle_thinking_expansion(&mut self) {
-        let record = self.active_record_mut();
-        let current = widgets::ExpandableBody::new(if record.collapse_thinking {
-            widgets::ExpandMode::Collapsed
-        } else {
-            widgets::ExpandMode::Expanded
-        });
-        let next = current.toggle_detail();
-        record.collapse_thinking = !next.is_visible();
-        record.thinking_user_pinned = next.is_visible();
-    }
-
-    fn toggle_tool_output_expansion(&mut self) {
-        let active = self
-            .transcripts
-            .get(&self.active_transcript)
-            .expect("active transcript always exists");
-        let (completed, conversation) = if self.active_transcript == TranscriptId::Main {
-            (&self.completed_conversations, self.conversation.as_ref())
-        } else {
-            (
-                &active.completed_conversations,
-                active.conversation.as_ref(),
-            )
-        };
-        let completed_call_ids = completed
-            .iter()
-            .chain(conversation)
-            .flat_map(|conversation| &conversation.tool_batches)
-            .flat_map(|batch| &batch.calls)
-            .filter(|call| call.result.is_some())
-            .map(|call| call.call_id.clone())
-            .collect::<Vec<_>>();
-        if completed_call_ids.is_empty() {
+    /// Moves the focused block, or starts focus at the newest block.
+    ///
+    /// Focus enters at the end rather than the start because the block a reader
+    /// wants is almost always the one that just happened.
+    fn move_block_focus(&mut self, forward: bool) {
+        let calls = self.settled_call_ids();
+        if calls.is_empty() {
             return;
         }
 
-        // All completed calls always advance together, so they share one
-        // current mode; sampling the first call's mode (or the shared
-        // fallback for a call cleared by a new submission) keeps the whole
-        // group synchronized on every press. The fallback matches
-        // a finished `ToolCallBlock::default_mode()` so the sampled state
-        // agrees with what is actually on screen.
-        let modes = &mut self.active_record_mut().tool_display_modes;
-        let current = completed_call_ids
-            .first()
-            .and_then(|call_id| modes.get(call_id).copied())
-            .unwrap_or(widgets::DisplayMode::Collapsed);
-        let next = current.next();
-        for call_id in completed_call_ids {
-            modes.insert(call_id, next);
-        }
+        let record = self.active_record_mut();
+        let next = match record
+            .focused_call
+            .as_ref()
+            .and_then(|focused| calls.iter().position(|call| call == focused))
+        {
+            None => calls.len() - 1,
+            Some(index) if forward => (index + 1).min(calls.len() - 1),
+            Some(index) => index.saturating_sub(1),
+        };
+        record.focused_call = Some(calls[next].clone());
     }
 
-    fn jump_to_user_message(&mut self, previous: bool) {
+    /// Cycles the detail of the focused block alone.
+    ///
+    /// The transcript-wide cycle answers "how much of everything"; this answers
+    /// "what is in this one", which is the question a reader has while looking
+    /// at a specific row.
+    fn cycle_focused_block_detail(&mut self) {
+        let record = self.active_record_mut();
+        let Some(call_id) = record.focused_call.clone() else {
+            return;
+        };
+        let current = record
+            .tool_display_modes
+            .get(&call_id)
+            .copied()
+            .unwrap_or(record.tool_detail);
+        let next = current.next();
+        record.tool_display_modes.insert(call_id, next);
+        self.report_detail_level("block", next);
+    }
+
+    fn cycle_tool_detail(&mut self, forward: bool) {
+        let completed_call_ids = self.settled_call_ids();
+
+        let record = self.active_record_mut();
+        let next = if forward {
+            record.tool_detail.next()
+        } else {
+            record.tool_detail.previous()
+        };
+        record.tool_detail = next;
+        for call_id in completed_call_ids {
+            record.tool_display_modes.insert(call_id, next);
+        }
+        self.report_detail_level("tools", next);
+    }
+
+    /// Says where the detail cycle now rests, for as long as that is news.
+    ///
+    /// The cycle has three positions and no key that names them, so pressing it
+    /// blind is guesswork. The footer used to carry the answer permanently,
+    /// which spent a slot on an instruction that was only ever interesting in
+    /// the instant after the press — so it is announced instead, and the next
+    /// key clears it.
+    fn report_detail_level(&mut self, subject: &str, mode: widgets::DisplayMode) {
+        self.status = Some(format!("{subject} {}", mode.label()));
+    }
+
+    /// Absolute wrapped rows every user message of the active transcript starts on.
+    fn user_message_offsets(&self) -> Vec<u16> {
         let layout = self.screen_layout();
         let row_width = layout
             .transcript
@@ -6517,7 +8415,8 @@ where
             .saturating_sub(TRANSCRIPT_ROW_INDENT)
             .max(1);
         let lines = rendered_transcript(&self.view(), row_width);
-        let mut user_offsets = Vec::new();
+
+        let mut offsets = Vec::new();
         let mut row = 0usize;
         for line in &lines {
             if line
@@ -6525,10 +8424,16 @@ where
                 .get(1)
                 .is_some_and(|span| span.content.starts_with('❯'))
             {
-                user_offsets.push(saturating_u16(row));
+                offsets.push(saturating_u16(row));
             }
             row += line.width().div_ceil(usize::from(row_width)).max(1);
         }
+
+        offsets
+    }
+
+    fn jump_to_user_message(&mut self, target: UserMessageTarget) {
+        let user_offsets = self.user_message_offsets();
         if user_offsets.is_empty() {
             return;
         }
@@ -6545,15 +8450,19 @@ where
             }
         };
 
-        let target = if previous {
-            user_offsets
+        let target = match target {
+            UserMessageTarget::Previous => user_offsets
                 .iter()
                 .rev()
                 .find(|offset| **offset < current)
                 .copied()
-                .or_else(|| user_offsets.first().copied())
-        } else {
-            user_offsets.last().copied()
+                .or_else(|| user_offsets.first().copied()),
+            UserMessageTarget::Next => user_offsets
+                .iter()
+                .find(|offset| **offset > current)
+                .copied()
+                .or_else(|| user_offsets.last().copied()),
+            UserMessageTarget::Last => user_offsets.last().copied(),
         };
 
         if let Some(offset) = target {
@@ -6561,7 +8470,110 @@ where
             let record = self.active_record_mut();
             record.following_bottom = false;
             record.scroll_offset = offset.min(bottom);
-            record.focus = TranscriptFocus::Viewport;
+        }
+    }
+
+    /// Moves block focus to whatever the pointer is resting on.
+    ///
+    /// Hover is an accelerator over the keyboard path, never a second one: it
+    /// sets the same focus `j`/`k` set and opens nothing by itself, so the
+    /// detail still costs a deliberate press and a session with mouse capture
+    /// off loses no capability at all.
+    fn hover_block(&mut self, column: u16, row: u16) -> Action {
+        let layout = self.screen_layout();
+        if layout.transcript.height == 0
+            || row < layout.transcript.y
+            || row >= layout.transcript.bottom()
+            || column < layout.transcript.x
+            || column >= layout.transcript.right()
+        {
+            return Action::Unchanged;
+        }
+
+        let row_width = layout
+            .transcript
+            .width
+            .saturating_sub(TRANSCRIPT_ROW_INDENT)
+            .max(1);
+        let view = self.view();
+        let scroll = usize::from(if view.following_bottom {
+            self.detached_scroll_bottom()
+        } else {
+            view.scroll_offset
+        });
+        // The transcript block draws a top border, so its first content row sits
+        // one below the rect. A pointer on the border itself owns nothing.
+        let Some(inside) = row
+            .checked_sub(layout.transcript.y)
+            .and_then(|offset| offset.checked_sub(1))
+        else {
+            return Action::Unchanged;
+        };
+        let target = scroll.saturating_add(usize::from(inside));
+
+        let hovered = transcript_call_owners(&view, row_width)
+            .into_iter()
+            .nth(target)
+            .flatten();
+
+        let record = self.active_record_mut();
+        if record.focused_call == hovered {
+            return Action::Unchanged;
+        }
+
+        record.focused_call = hovered;
+        Action::Render
+    }
+
+    /// Brings the focused block into view and stops the viewport chasing the
+    /// bottom.
+    ///
+    /// Detaching is what keeps the detail from displacing the transcript: rows
+    /// opening below a header never move the header, but a viewport still stuck
+    /// to the bottom would slide everything up under the reader instead.
+    fn scroll_to_focused_block(&mut self) {
+        let layout = self.screen_layout();
+        let row_width = layout
+            .transcript
+            .width
+            .saturating_sub(TRANSCRIPT_ROW_INDENT)
+            .max(1);
+        let lines = rendered_transcript(&self.view(), row_width);
+
+        let mut row = 0usize;
+        let mut target = None;
+        for line in &lines {
+            if target.is_none()
+                && line
+                    .spans
+                    .iter()
+                    .any(|span| span.style.fg == Some(widgets::RolePalette::navigation()))
+            {
+                target = Some(saturating_u16(row));
+            }
+            row += line.width().div_ceil(usize::from(row_width)).max(1);
+        }
+
+        let Some(target) = target else {
+            return;
+        };
+        let bottom = self.detached_scroll_bottom();
+        let visible = usize::from(
+            layout
+                .transcript
+                .height
+                .saturating_sub(transcript_chrome_rows(false)),
+        );
+        let record = self.active_record_mut();
+        record.following_bottom = false;
+        if target < record.scroll_offset {
+            record.scroll_offset = target.min(bottom);
+        } else if usize::from(target) >= usize::from(record.scroll_offset) + visible {
+            record.scroll_offset = saturating_u16(
+                usize::from(target)
+                    .saturating_sub(visible.saturating_sub(1))
+                    .min(usize::from(bottom)),
+            );
         }
     }
 
@@ -6658,6 +8670,20 @@ fn auto_turn_subject(finished: usize) -> String {
 /// It is not a user message and must never read like one: the completion notices themselves
 /// arrive as bounded coordination messages, so this only states who scheduled the turn and where
 /// the recorded outcome lives.
+/// Opening marker of a prompt the runtime wrote for itself.
+pub const RUNTIME_SCHEDULED_PROMPT_MARKER: &str = "[coordination source=runtime";
+
+/// Whether `prompt` was scheduled by the runtime rather than typed by the user.
+///
+/// A failed turn's prompt is offered back for retry, which is only ever right
+/// for something the user wrote. Handing back a coordination prompt puts text
+/// nobody typed in the composer and invites retrying a turn the runtime owns.
+pub fn is_runtime_scheduled_prompt(prompt: &str) -> bool {
+    prompt
+        .trim_start()
+        .starts_with(RUNTIME_SCHEDULED_PROMPT_MARKER)
+}
+
 fn auto_turn_prompt(finished: usize) -> String {
     format!(
         "[coordination source=runtime untrusted=false]\n{} finished. The completion notices \
@@ -6669,10 +8695,40 @@ fn auto_turn_prompt(finished: usize) -> String {
 }
 
 fn auto_turn_notice(finished: usize) -> String {
-    format!(
-        "Continuing automatically: {} finished.",
-        auto_turn_subject(finished)
-    )
+    auto_turn_notice_for(&auto_turn_subject(finished))
+}
+
+fn auto_turn_notice_for(subject: &str) -> String {
+    format!("Continuing automatically: {subject} finished.")
+}
+
+/// The notice a runtime-scheduled prompt should be shown as, if it is one.
+///
+/// A scheduled turn opens with no user prompt at all: the live path records a
+/// notice and leaves the prompt empty. The coordination text exists only
+/// because the provider has to be told, and the provider is told in a user-role
+/// message — which is what the session store keeps. Replaying that verbatim on
+/// resume attributed to the reader a prompt whose own words say the user did
+/// not send it.
+///
+/// The subject is read back out of the prompt so the restored notice says the
+/// same thing the live one did. It sits next to the generator on purpose: the
+/// two formats have to move together.
+pub fn runtime_scheduled_notice(prompt: &str) -> Option<String> {
+    if !is_runtime_scheduled_prompt(prompt) {
+        return None;
+    }
+
+    let subject = prompt
+        .split_once('\n')
+        .and_then(|(_, body)| body.split_once(" finished."))
+        .map(|(subject, _)| subject.trim())
+        .filter(|subject| !subject.is_empty());
+
+    Some(subject.map_or_else(
+        || "Continued automatically after background work finished.".to_owned(),
+        auto_turn_notice_for,
+    ))
 }
 
 fn status_matches_execution(status: SubagentStatus, state: TuiExecutionState) -> bool {
@@ -6976,7 +9032,8 @@ where
                 terminal.copy_selection(&text)?;
                 renderer.render(tui.view())?;
             }
-            Action::Render
+            Action::Unchanged
+            | Action::Render
             | Action::Submit(_)
             | Action::SubmitSecret { .. }
             | Action::SubmitBackground(_)
@@ -6991,7 +9048,8 @@ where
             | Action::CopyDeviceAuthUrl
             | Action::CopyDeviceAuthCode
             | Action::Cancel
-            | Action::CancelRoute => renderer.render(tui.view())?,
+            | Action::CancelRoute
+            | Action::AskUserReply { .. } => renderer.render(tui.view())?,
         }
     }
 }
@@ -7054,7 +9112,8 @@ where
                 });
                 renderer.render(tui.view())?;
             }
-            Action::Render
+            Action::Unchanged
+            | Action::Render
             | Action::SubmitSecret { .. }
             | Action::SubmitBackground(_)
             | Action::TransitionToBackground(_)
@@ -7068,7 +9127,8 @@ where
             | Action::CopyDeviceAuthUrl
             | Action::CopyDeviceAuthCode
             | Action::Cancel
-            | Action::CancelRoute => renderer.render(tui.view())?,
+            | Action::CancelRoute
+            | Action::AskUserReply { .. } => renderer.render(tui.view())?,
         }
     }
 }
@@ -7091,28 +9151,34 @@ impl Drop for PermissionBridgeTeardown {
     }
 }
 
+struct AskUserBridgeTeardown(Option<TuiAskUserBridge>);
+impl Drop for AskUserBridgeTeardown {
+    fn drop(&mut self) {
+        let _ = self.0.as_ref().is_some_and(TuiAskUserBridge::close);
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct FrameSchedule {
     last_render: Option<Duration>,
 }
 
 impl FrameSchedule {
-    fn heartbeat_due(self, now: Duration, running: bool) -> bool {
-        running
-            && self
-                .last_render
-                .is_none_or(|last| now.saturating_sub(last) >= ACTIVE_FRAME_HEARTBEAT)
+    fn heartbeat_due(self, now: Duration, live: bool) -> bool {
+        live && self
+            .last_render
+            .is_none_or(|last| now.saturating_sub(last) >= ACTIVE_FRAME_HEARTBEAT)
     }
 
     fn mark_rendered(&mut self, now: Duration) {
         self.last_render = Some(now);
     }
 
-    fn poll_timeout(self, now: Duration, running: bool, backlog: bool) -> Duration {
+    fn poll_timeout(self, now: Duration, live: bool, backlog: bool) -> Duration {
         if backlog {
             return Duration::ZERO;
         }
-        if !running {
+        if !live {
             return TERMINAL_POLL_INTERVAL;
         }
 
@@ -7134,6 +9200,12 @@ where
     E: Engine,
     R: Renderer,
 {
+    let _perf_gate = agens_perf::span!(
+        "tui.frame.gate",
+        rendered = agens_perf::Pending,
+        live_work = agens_perf::Pending,
+    );
+
     let execution_count = tui.executions.len();
     let quit_armed = tui.quit_is_armed();
     let restored_syntax_ready = tui.highlight_restored_syntax;
@@ -7143,17 +9215,28 @@ where
     let expired_quit_warning = quit_armed && !tui.quit_is_armed();
     let restored_syntax_became_ready = !restored_syntax_ready && tui.highlight_restored_syntax;
     let status_changed = status != tui.status;
+    let live_work = tui.has_live_work();
+    agens_perf::field!(live_work = live_work);
     if !dirty
         && !expired_execution
         && !expired_quit_warning
         && !restored_syntax_became_ready
         && !status_changed
-        && !schedule.heartbeat_due(now, tui.running)
+        && !schedule.heartbeat_due(now, live_work)
     {
+        agens_perf::field!(rendered = false);
         return Ok(false);
     }
 
-    renderer.render(tui.view())?;
+    agens_perf::field!(rendered = true);
+    let view = tui.view();
+    let _perf_frame = agens_perf::span!(
+        "tui.frame",
+        width = view.size.0,
+        height = view.size.1,
+        scroll_offset = view.scroll_offset,
+    );
+    renderer.render(view)?;
     schedule.mark_rendered(now);
     Ok(true)
 }
@@ -7209,6 +9292,13 @@ fn drain_provider_channels<E: Engine>(
     progress_receiver: &mpsc::Receiver<TurnEvent>,
     completion_receiver: &mpsc::Receiver<TuiProviderOutcome>,
 ) -> ProviderDrain {
+    let _perf_drain = agens_perf::span!(
+        "tui.drain",
+        progress = agens_perf::Pending,
+        metrics = agens_perf::Pending,
+        backlog = agens_perf::Pending,
+    );
+
     let progress = drain_channel(progress_receiver, |event| tui.apply_progress(event));
     let metrics = if progress.caught_up {
         drain_channel(metrics_receiver, |envelope| {
@@ -7226,13 +9316,17 @@ fn drain_provider_channels<E: Engine>(
         ChannelDrain::default()
     };
 
-    ProviderDrain {
+    let result = ProviderDrain {
         dirty: progress.dirty() || metrics.dirty() || completion.dirty(),
         backlog: progress.backlog()
             || metrics.backlog()
             || completion.backlog()
             || !(metrics.caught_up && progress.caught_up),
-    }
+    };
+    agens_perf::field!(progress = progress.processed as u64);
+    agens_perf::field!(metrics = metrics.processed as u64);
+    agens_perf::field!(backlog = result.backlog);
+    result
 }
 
 pub fn run_with_default_progress_submit(
@@ -7331,6 +9425,59 @@ where
     C: Fn(u64) -> bool + Send + Sync + 'static,
     M: Fn(u64, String) -> bool + Send + Sync + 'static,
 {
+    run_with_default_progress_submit_with_permissions_task_controls_and_ask_user(
+        tui,
+        route,
+        submit,
+        transition,
+        cancel_execution,
+        send_task_message,
+        permissions,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_with_default_progress_submit_with_permissions_task_controls_and_ask_user<
+    E,
+    R,
+    F,
+    B,
+    C,
+    M,
+>(
+    tui: &mut Tui<E>,
+    route: R,
+    submit: F,
+    transition: B,
+    cancel_execution: C,
+    send_task_message: M,
+    permissions: Option<(TuiPermissionBridge, mpsc::Receiver<TuiPermissionRequest>)>,
+    ask_user: Option<(TuiAskUserBridge, mpsc::Receiver<TuiAskUserRequest>)>,
+) -> io::Result<()>
+where
+    E: Engine + Send,
+    R: Fn(
+            TuiRouteRequest,
+            mpsc::Sender<TuiRouteProgress>,
+            TuiRouteCancellation,
+        ) -> TuiSubmissionOutcome
+        + Send
+        + Sync
+        + 'static,
+    F: Fn(
+            String,
+            SubmitOrigin,
+            mpsc::Sender<TurnEvent>,
+            BridgeTx<TuiRuntimeEvent>,
+        ) -> TuiProviderOutcome
+        + Send
+        + Sync
+        + 'static,
+    B: Fn(u64) -> bool + Send + Sync + 'static,
+    C: Fn(u64) -> bool + Send + Sync + 'static,
+    M: Fn(u64, String) -> bool + Send + Sync + 'static,
+{
     let route = Arc::new(route);
     let submit = Arc::new(submit);
     let transition = Arc::new(transition);
@@ -7344,6 +9491,9 @@ where
     let (permission_bridge, permission_requests) = permissions.unzip();
     let _permission_teardown = PermissionBridgeTeardown(permission_bridge.clone());
     let mut active_permission = None;
+    let (ask_user_bridge, ask_user_requests) = ask_user.unzip();
+    let _ask_user_teardown = AskUserBridgeTeardown(ask_user_bridge.clone());
+    let mut active_ask_user: Option<u64> = None;
     let mut runtime_terminal = Terminal::enter()?;
     sync_terminal_size(tui)?;
     let terminal = RatatuiTerminal::new(CrosstermBackend::new(io::stdout()))?;
@@ -7436,6 +9586,19 @@ where
             );
             dirty = true;
         }
+        if dismiss_resolved_ask_user(tui, active_ask_user, ask_user_bridge.as_ref()) {
+            active_ask_user = None;
+            dirty = true;
+        }
+        if let Some(id) = drain_ask_user_request(
+            tui,
+            active_ask_user,
+            ask_user_bridge.as_ref(),
+            ask_user_requests.as_ref(),
+        ) {
+            active_ask_user = Some(id);
+            dirty = true;
+        }
         if active_route.is_none()
             && let Some(prompt) = tui.take_ready_auto_turn()
         {
@@ -7450,7 +9613,7 @@ where
             dirty = true;
         }
         render_progress_frame(tui, &mut renderer, &mut frame_schedule, now, dirty)?;
-        let timeout = frame_schedule.poll_timeout(now, tui.running, backlog);
+        let timeout = frame_schedule.poll_timeout(now, tui.has_live_work(), backlog);
         let event = if let Some(event) = pending_event.take() {
             event
         } else {
@@ -7467,6 +9630,7 @@ where
         } else {
             tui.handle(event)
         };
+        let changed_something = !matches!(action, Action::Unchanged);
         match action {
             Action::Quit => {
                 if let Some((_, cancellation, session_load)) = active_route.take()
@@ -7669,6 +9833,13 @@ where
             Action::CopySelection(text) => {
                 runtime_terminal.copy_selection(&text)?;
             }
+            Action::Unchanged => {}
+            Action::AskUserReply { id, reply } => {
+                resolve_ask_user_reply(ask_user_bridge.as_ref(), id, reply);
+                active_ask_user = None;
+                render_requested = true;
+                continue;
+            }
             Action::Render | Action::Cancel => {
                 if cancel_permission
                     && let (Some(id), Some(permission_bridge)) =
@@ -7678,7 +9849,63 @@ where
                 }
             }
         }
-        render_requested = true;
+        if changed_something {
+            render_requested = true;
+        }
+    }
+}
+
+/// The event loop's ask-user drain arm: opens a newly parked request as the
+/// active overlay, if none is already open and the request the drain
+/// received is still genuinely pending. Factored out of the loop so it can
+/// be exercised directly by a test without a live terminal.
+fn drain_ask_user_request<E: Engine>(
+    tui: &mut Tui<E>,
+    active_ask_user: Option<u64>,
+    ask_user_bridge: Option<&TuiAskUserBridge>,
+    ask_user_requests: Option<&mpsc::Receiver<TuiAskUserRequest>>,
+) -> Option<u64> {
+    if active_ask_user.is_some() {
+        return None;
+    }
+    let request = ask_user_requests?.try_recv().ok()?;
+    if !ask_user_bridge?.is_pending(request.id()) {
+        return None;
+    }
+    let id = request.id();
+    tui.open_ask_user(id, request.request().clone());
+    Some(id)
+}
+
+/// The event loop's ask-user teardown arm: dismisses the open overlay when
+/// the bridge resolved the active request from its own side — deadline
+/// expiry, external cancellation, or a closed surface — none of which
+/// travel through `Action::AskUserReply`. Factored out for the same reason
+/// as the drain arm above.
+fn dismiss_resolved_ask_user<E: Engine>(
+    tui: &mut Tui<E>,
+    active_ask_user: Option<u64>,
+    ask_user_bridge: Option<&TuiAskUserBridge>,
+) -> bool {
+    let Some(id) = active_ask_user else {
+        return false;
+    };
+    if ask_user_bridge.is_none_or(|bridge| bridge.is_pending(id)) {
+        return false;
+    }
+    tui.dismiss_ask_user(id)
+}
+
+/// The event loop's ask-user reply arm: forwards a UI-driven resolution to
+/// the bridge. Factored out for the same reason as the drain and teardown
+/// arms above.
+fn resolve_ask_user_reply(
+    ask_user_bridge: Option<&TuiAskUserBridge>,
+    id: u64,
+    reply: AskUserReply,
+) {
+    if let Some(bridge) = ask_user_bridge {
+        let _ = bridge.reply(id, reply);
     }
 }
 
@@ -7738,7 +9965,11 @@ fn sync_terminal_size<E: Engine>(tui: &mut Tui<E>) -> io::Result<()> {
 fn map_event(event: CrosstermEvent) -> Option<Event> {
     match event {
         CrosstermEvent::Resize(width, height) => Some(Event::Resize { width, height }),
-        CrosstermEvent::Key(key) if key.kind == KeyEventKind::Press => map_key(key),
+        CrosstermEvent::Key(key)
+            if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
+        {
+            map_key(key)
+        }
         CrosstermEvent::Mouse(mouse) if mouse.kind == MouseEventKind::ScrollUp => {
             Some(Event::MouseWheel(MouseWheelDirection::Up))
         }
@@ -7761,6 +9992,12 @@ fn map_event(event: CrosstermEvent) -> Option<Event> {
                 row: mouse.row,
             })
         }
+        CrosstermEvent::Mouse(mouse) if mouse.kind == MouseEventKind::Moved => {
+            Some(Event::MouseMove {
+                column: mouse.column,
+                row: mouse.row,
+            })
+        }
         CrosstermEvent::Mouse(mouse)
             if mouse.kind == MouseEventKind::Up(crossterm::event::MouseButton::Left) =>
         {
@@ -7775,7 +10012,9 @@ fn map_event(event: CrosstermEvent) -> Option<Event> {
 }
 
 fn map_key(event: KeyEvent) -> Option<Event> {
-    if event.kind != KeyEventKind::Press {
+    // A release never acts. A repeat acts only for the keys holding down is
+    // meant to repeat; see [`Key::repeats_while_held`].
+    if !matches!(event.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
         return None;
     }
 
@@ -7789,8 +10028,20 @@ fn map_key(event: KeyEvent) -> Option<Event> {
         (KeyCode::Char('c' | 'C'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
             Key::CtrlC
         }
+        (KeyCode::Char('o'), modifiers)
+            if modifiers == KeyModifiers::CONTROL | KeyModifiers::SHIFT =>
+        {
+            Key::CtrlShiftO
+        }
+        (KeyCode::Char('O'), modifiers) if modifiers == KeyModifiers::CONTROL => Key::CtrlShiftO,
         (KeyCode::Char('o' | 'O'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
             Key::CtrlO
+        }
+        (KeyCode::Char('t' | 'T'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+            Key::CtrlT
+        }
+        (KeyCode::Char('y' | 'Y'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+            Key::CtrlY
         }
         (KeyCode::Char('j' | 'J'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
             Key::CtrlJ
@@ -7846,8 +10097,14 @@ fn map_key(event: KeyEvent) -> Option<Event> {
         (KeyCode::Char('w' | 'W'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
             Key::DeletePreviousWord
         }
+        // `?` is already Shift+`/`, so a terminal reports Ctrl+? with or without
+        // the shift bit depending on how it resolves the layout. Both are the
+        // same press to the reader.
+        (KeyCode::Char('?'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+            Key::CtrlQuestion
+        }
         (KeyCode::Char('u' | 'U'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
-            Key::DeleteToLineStart
+            Key::CtrlU
         }
         (KeyCode::Char('a' | 'A'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
             Key::LineStart
@@ -7859,7 +10116,7 @@ fn map_key(event: KeyEvent) -> Option<Event> {
             Key::Right
         }
         (KeyCode::Char('d' | 'D'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
-            Key::Delete
+            Key::CtrlD
         }
         (KeyCode::Char('b' | 'B'), modifiers) if modifiers.contains(KeyModifiers::ALT) => {
             Key::PreviousWord
@@ -7872,6 +10129,9 @@ fn map_key(event: KeyEvent) -> Option<Event> {
         {
             Key::Char(character)
         }
+        (KeyCode::Backspace, modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+            Key::DeletePreviousWord
+        }
         (KeyCode::Backspace, _) => Key::Backspace,
         (KeyCode::Enter, modifiers) if modifiers.contains(KeyModifiers::SHIFT) => Key::ShiftEnter,
         (KeyCode::Enter, _) => Key::Enter,
@@ -7881,6 +10141,9 @@ fn map_key(event: KeyEvent) -> Option<Event> {
         (KeyCode::Right, modifiers) if modifiers.contains(KeyModifiers::CONTROL) => Key::NextWord,
         (KeyCode::Left, _) => Key::Left,
         (KeyCode::Right, _) => Key::Right,
+        (KeyCode::Delete, modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+            Key::DeleteNextWord
+        }
         (KeyCode::Delete, _) => Key::Delete,
         (KeyCode::Home, _) => Key::Home,
         (KeyCode::End, _) => Key::End,
@@ -7892,6 +10155,10 @@ fn map_key(event: KeyEvent) -> Option<Event> {
         (KeyCode::Esc, _) => Key::Escape,
         _ => return None,
     };
+
+    if event.kind == KeyEventKind::Repeat && !key.repeats_while_held() {
+        return None;
+    }
 
     Some(Event::Key(key))
 }
@@ -8801,7 +11068,7 @@ mod runtime_tests {
                 KeyModifiers::CONTROL,
                 KeyEventKind::Press,
             )),
-            Some(Event::Key(Key::Delete))
+            Some(Event::Key(Key::CtrlD))
         );
     }
 
@@ -9019,6 +11286,29 @@ mod runtime_tests {
             tui.view().scroll_offset > 0,
             "a prompt row is reachable even though the accent column precedes its glyph"
         );
+    }
+
+    #[test]
+    fn counting_rows_agrees_with_building_them() {
+        let lines = vec![
+            Line::raw("short"),
+            Line::raw(""),
+            Line::raw("a much longer paragraph that has to wrap several times at this width"),
+            Line::raw("AAA AAA AAAAA AA AAAAAA"),
+            Line::raw("supercalifragilisticexpialidocious antidisestablishmentarianism"),
+            Line::raw("  indented continuation with trailing space   "),
+            Line::raw("café ñandú 日本語 mixed widths"),
+            Line::raw(format!("joined{}", render::WRAP_JOINER_SPACE)),
+            Line::raw(format!("tight{}", render::WRAP_JOINER_TIGHT)),
+        ];
+
+        for width in [1, 2, 3, 7, 10, 23, 80] {
+            assert_eq!(
+                SelectableTranscript::row_count(&lines, width),
+                SelectableTranscript::from_lines(&lines, width).rows.len(),
+                "row count and row construction disagreed at width {width}"
+            );
+        }
     }
 
     #[test]
@@ -9259,9 +11549,439 @@ mod runtime_tests {
         assert_eq!(tui.input(), "x");
     }
 
+    /// Three settled turns, long enough that scrolling has somewhere to go and
+    /// that every prompt row a `{`/`}` jump looks for is really in the render.
+    fn scrollable_tui() -> Tui<NoopEngine> {
+        let mut tui = Tui::new(NoopEngine);
+        tui.handle(Event::Resize {
+            width: 80,
+            height: 24,
+        });
+        for turn in 0..12 {
+            tui.begin_submission(format!("prompt-{turn}"));
+            tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text(
+                "body\n".repeat(40),
+            )));
+            tui.apply_progress(TurnEvent::StateChanged(TurnState::Completed));
+        }
+        // Settled turns are elided by default, which would leave the prompt rows
+        // a jump navigates by collapsed out of the render.
+        tui.active_record_mut().history_expanded = true;
+        tui.scroll_to_end();
+        tui.active_record_mut().focus = TranscriptFocus::Composer;
+        tui
+    }
+
+    /// Escape used to be the cancel key, so a reader who only wanted to scroll
+    /// up and look at something lost the turn to do it.
+    #[test]
+    fn escape_focuses_the_transcript_before_it_cancels_a_running_turn() {
+        let mut tui = scrollable_tui();
+        tui.running = true;
+
+        assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Render);
+        assert_eq!(tui.view().focus, TranscriptFocus::Viewport);
+        assert!(tui.running, "leaving the composer never cancels the turn");
+
+        assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Cancel);
+    }
+
+    /// A selection is the nearer thing to dismiss, so it goes before the turn.
+    #[test]
+    fn escape_drops_the_selection_before_it_reaches_the_running_turn() {
+        let mut tui = selected_tui();
+        tui.running = true;
+
+        assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Render);
+        assert_eq!(tui.selected_text(), None);
+        assert!(tui.running, "dropping a selection never cancels the turn");
+
+        assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Cancel);
+    }
+
+    /// Entering the mode has to pin the viewport, or output arriving during the
+    /// turn scrolls away the row the reader stopped on.
+    #[test]
+    fn focusing_the_transcript_detaches_it_from_the_bottom() {
+        let mut tui = scrollable_tui();
+        assert!(tui.following_bottom());
+
+        tui.handle(Event::Key(Key::Escape));
+        assert!(!tui.following_bottom());
+
+        tui.handle(Event::Key(Key::Char('G')));
+        assert!(tui.following_bottom(), "G re-attaches to the bottom");
+    }
+
+    #[test]
+    fn viewport_vim_motions_scroll_rows_rather_than_typing_into_the_composer() {
+        let mut tui = scrollable_tui();
+        tui.handle(Event::Key(Key::Escape));
+
+        let bottom = tui.view().scroll_offset;
+        tui.handle(Event::Key(Key::Char('k')));
+        assert_eq!(tui.view().scroll_offset, bottom - 1, "k scrolls one row up");
+
+        tui.handle(Event::Key(Key::Char('j')));
+        assert_eq!(tui.view().scroll_offset, bottom, "j scrolls one row down");
+
+        tui.handle(Event::Key(Key::CtrlU));
+        assert!(tui.view().scroll_offset < bottom, "Ctrl+U is a half page");
+
+        tui.handle(Event::Key(Key::Char('g')));
+        tui.handle(Event::Key(Key::Char('g')));
+        assert_eq!(tui.view().scroll_offset, 0, "gg reaches the top");
+
+        assert_eq!(tui.input(), "", "no motion ever reached the prompt");
+    }
+
+    #[test]
+    fn braces_walk_the_transcript_prompt_by_prompt_in_both_directions() {
+        let mut tui = scrollable_tui();
+        tui.handle(Event::Key(Key::Escape));
+        tui.handle(Event::Key(Key::Char('g')));
+        tui.handle(Event::Key(Key::Char('g')));
+        assert_eq!(tui.view().scroll_offset, 0);
+
+        tui.handle(Event::Key(Key::Char('}')));
+        let first = tui.view().scroll_offset;
+        assert!(first > 0, "}} advances to the next prompt");
+
+        tui.handle(Event::Key(Key::Char('}')));
+        let second = tui.view().scroll_offset;
+        assert!(second > first, "}} keeps advancing rather than resting");
+
+        tui.handle(Event::Key(Key::Char('{')));
+        assert_eq!(tui.view().scroll_offset, first, "{{ walks back one prompt");
+    }
+
+    /// `g` alone is a prefix now, so it must not act until its second key.
+    #[test]
+    fn an_abandoned_g_chord_neither_acts_nor_survives_the_next_event() {
+        let mut tui = scrollable_tui();
+        tui.handle(Event::Key(Key::Escape));
+        let resting = tui.view().scroll_offset;
+
+        tui.handle(Event::Key(Key::Char('g')));
+        assert_eq!(tui.view().scroll_offset, resting, "g alone moves nothing");
+
+        tui.handle(Event::Key(Key::Char('z')));
+        assert_eq!(tui.view().scroll_offset, resting);
+
+        tui.handle(Event::Key(Key::Char('g')));
+        tui.handle(Event::Resize {
+            width: 80,
+            height: 24,
+        });
+        tui.handle(Event::Key(Key::Char('g')));
+        assert_eq!(
+            tui.view().scroll_offset,
+            resting,
+            "a resize between the two g's abandons the chord"
+        );
+    }
+
+    #[test]
+    fn i_returns_to_the_composer_and_typing_resumes() {
+        let mut tui = scrollable_tui();
+        tui.handle(Event::Key(Key::Escape));
+
+        assert_eq!(tui.handle(Event::Key(Key::Char('i'))), Action::Render);
+        assert_eq!(tui.view().focus, TranscriptFocus::Composer);
+
+        tui.handle(Event::Key(Key::Char('j')));
+        assert_eq!(tui.input(), "j", "j is a character again in the composer");
+    }
+
+    /// The legend is contextual, so it can stay short enough to actually read.
+    #[test]
+    fn the_hint_row_names_only_the_keys_the_current_state_can_use() {
+        let text = |tui: &Tui<NoopEngine>| {
+            hint_spans(&tui.view())
+                .iter()
+                .map(|span| span.content.as_ref().to_owned())
+                .collect::<String>()
+        };
+
+        let mut tui = scrollable_tui();
+        let empty = text(&tui);
+        assert!(!empty.contains("Enter"), "nothing to send yet: {empty:?}");
+        assert!(empty.contains("Esc:normal"), "{empty:?}");
+        assert!(empty.contains("^?:shortcuts"), "{empty:?}");
+
+        tui.handle(Event::Key(Key::Char('h')));
+        let typing = text(&tui);
+        assert!(typing.contains("Enter:send"), "{typing:?}");
+
+        tui.running = true;
+        let running = text(&tui);
+        assert!(!running.contains("Enter"), "a turn is already in flight");
+
+        tui.running = false;
+        tui.handle(Event::Key(Key::Escape));
+        let normal = text(&tui);
+        assert!(normal.contains("NORMAL"), "{normal:?}");
+        assert!(normal.contains("j/k:scroll"), "{normal:?}");
+        assert!(normal.contains("i:insert"), "{normal:?}");
+    }
+
+    /// The tree hangs below the composer, so the arrows walk between them as
+    /// one vertical surface. Tab used to be the only door in, and it cycled.
+    #[test]
+    fn the_arrows_walk_between_the_prompt_and_the_subagent_tree() {
+        let mut tui = scrollable_tui();
+        tui.apply_task_execution_event(
+            "bug-hunter",
+            TuiExecutionEvent::ForegroundStarted { id: 1 },
+        );
+        assert!(!tui.executions.is_empty(), "a subagent is running");
+
+        tui.handle(Event::Key(Key::Down));
+        assert_eq!(
+            tui.view().execution_selection,
+            Some(TranscriptId::Main),
+            "an empty prompt walks down into the tree"
+        );
+
+        tui.handle(Event::Key(Key::Down));
+        assert_eq!(
+            tui.view().execution_selection,
+            Some(TranscriptId::Subagent(1))
+        );
+
+        tui.handle(Event::Key(Key::Up));
+        assert_eq!(tui.view().execution_selection, Some(TranscriptId::Main));
+
+        tui.handle(Event::Key(Key::Up));
+        assert_eq!(
+            tui.view().execution_selection,
+            None,
+            "walking up off the first row returns to the prompt"
+        );
+    }
+
+    /// Down belongs to the text as soon as there is any.
+    #[test]
+    fn a_prompt_with_text_keeps_the_down_arrow() {
+        let mut tui = scrollable_tui();
+        tui.apply_task_execution_event(
+            "bug-hunter",
+            TuiExecutionEvent::ForegroundStarted { id: 1 },
+        );
+        tui.handle(Event::Key(Key::Char('x')));
+
+        tui.handle(Event::Key(Key::Down));
+        assert_eq!(tui.view().execution_selection, None);
+    }
+
+    /// Main is where the reader already is, so accepting it is a way back.
+    #[test]
+    fn enter_on_main_returns_to_the_prompt() {
+        let mut tui = scrollable_tui();
+        tui.apply_task_execution_event(
+            "bug-hunter",
+            TuiExecutionEvent::ForegroundStarted { id: 1 },
+        );
+        tui.handle(Event::Key(Key::Down));
+
+        tui.handle(Event::Key(Key::Enter));
+        assert_eq!(tui.view().execution_selection, None);
+        assert_eq!(tui.active_transcript, TranscriptId::Main);
+    }
+
+    /// The list has to be reachable from wherever the question is asked.
+    #[test]
+    fn ctrl_question_opens_the_shortcut_list_from_either_mode() {
+        let mut tui = scrollable_tui();
+        tui.handle(Event::Key(Key::CtrlQuestion));
+        assert_eq!(
+            tui.view().dialog.map(|dialog| dialog.title.clone()),
+            Some("Keyboard shortcuts".to_owned())
+        );
+
+        tui.handle(Event::Key(Key::Escape));
+        tui.handle(Event::Key(Key::Escape));
+        assert_eq!(tui.view().focus, TranscriptFocus::Viewport);
+        tui.handle(Event::Key(Key::Char('?')));
+        assert!(tui.view().dialog.is_some(), "? opens it in Normal mode");
+    }
+
+    /// A warning outranks a legend: the band is one row and cannot show both.
+    #[test]
+    fn a_notice_takes_the_band_from_the_hints() {
+        let mut tui = scrollable_tui();
+        assert!(notice_spans(&tui.view()).is_empty());
+
+        tui.handle(Event::Key(Key::CtrlC));
+        let notice = notice_spans(&tui.view())
+            .iter()
+            .map(|span| span.content.as_ref().to_owned())
+            .collect::<String>();
+        assert!(notice.contains("Ctrl+C again"), "{notice:?}");
+    }
+
+    /// Scrolling is not a mode switch. Ctrl+J/Ctrl+K and the wheel are reachable
+    /// from the prompt, so letting them focus the transcript would leave the
+    /// reader typing into a composer that had silently stopped accepting text.
+    #[test]
+    fn scrolling_detaches_the_viewport_without_taking_focus_from_the_composer() {
+        for scroll in [
+            Event::Key(Key::CtrlK),
+            Event::MouseWheel(MouseWheelDirection::Up),
+            Event::Key(Key::PageUp),
+            Event::Key(Key::CtrlN),
+        ] {
+            let mut tui = scrollable_tui();
+
+            tui.handle(scroll.clone());
+            assert!(!tui.following_bottom(), "the viewport detached");
+            assert_eq!(
+                tui.view().focus,
+                TranscriptFocus::Composer,
+                "scrolling never enters the transcript keymap"
+            );
+
+            tui.handle(Event::Key(Key::Char('j')));
+            assert_eq!(tui.input(), "j", "the composer still takes text");
+        }
+    }
+
+    /// The palette is typed into, so it keeps the alphabet even when a mouse
+    /// press left the transcript focused behind it.
+    #[test]
+    fn an_open_palette_keeps_the_alphabet_from_the_transcript_keymap() {
+        let mut tui = scrollable_tui();
+        tui.handle(Event::Key(Key::Char('/')));
+        assert!(tui.palette_open);
+
+        tui.active_record_mut().focus = TranscriptFocus::Viewport;
+        tui.handle(Event::Key(Key::Char('g')));
+        assert_eq!(tui.input(), "/g", "the palette query kept the key");
+    }
+
+    /// Ctrl+D and Ctrl+U carry two meanings; the composer must keep its own.
+    #[test]
+    fn ctrl_d_and_ctrl_u_still_edit_the_composer_while_it_holds_focus() {
+        let mut tui = Tui::new(NoopEngine);
+        for character in "hello world".chars() {
+            tui.handle(Event::Key(Key::Char(character)));
+        }
+
+        tui.input_cursor = 5;
+        tui.handle(Event::Key(Key::CtrlD));
+        assert_eq!(tui.input(), "helloworld", "Ctrl+D deletes forward");
+
+        tui.handle(Event::Key(Key::CtrlU));
+        assert_eq!(tui.input(), "world", "Ctrl+U deletes to the line start");
+    }
+
+    /// Drags across one known transcript row, leaving a painted selection.
+    fn selected_tui() -> Tui<NoopEngine> {
+        let mut tui = Tui::new(NoopEngine);
+        tui.handle(Event::Resize {
+            width: 80,
+            height: 12,
+        });
+        tui.active_record_mut()
+            .transcript
+            .push(TranscriptEntry::Info("alpha café 🙂 omega".into()));
+
+        tui.handle(Event::MouseDown { column: 24, row: 1 });
+        tui.handle(Event::MouseDrag { column: 30, row: 1 });
+        tui.handle(Event::MouseUp { column: 30, row: 1 });
+        assert_eq!(tui.selected_text(), Some("café 🙂"));
+
+        tui
+    }
+
+    /// The selection used to outlive every click that missed the transcript.
+    #[test]
+    fn a_click_outside_the_transcript_drops_the_selection_and_restores_the_composer() {
+        let mut tui = selected_tui();
+        assert_eq!(tui.view().focus, TranscriptFocus::Viewport);
+
+        let composer_row = tui.size().1 - 2;
+        tui.handle(Event::MouseDown {
+            column: 4,
+            row: composer_row,
+        });
+        assert_eq!(tui.selected_text(), None);
+        assert_eq!(tui.view().focus, TranscriptFocus::Composer);
+    }
+
+    /// A press and release on the same cell selects nothing, which is exactly
+    /// how a reader dismisses what was selected before.
+    #[test]
+    fn a_bare_click_inside_the_transcript_drops_the_selection_and_restores_the_composer() {
+        let mut tui = selected_tui();
+
+        tui.handle(Event::MouseDown { column: 24, row: 1 });
+        tui.handle(Event::MouseUp { column: 24, row: 1 });
+        assert_eq!(tui.selected_text(), None);
+        assert_eq!(tui.view().focus, TranscriptFocus::Composer);
+    }
+
     fn press<E: Engine>(tui: &mut Tui<E>, code: KeyCode, modifiers: KeyModifiers) -> Action {
         let event = map_key(crossterm::event::KeyEvent::new(code, modifiers)).unwrap();
         tui.handle(event)
+    }
+
+    /// Holding a key down is how a reader deletes a line or walks a word at a
+    /// time. Dropping auto-repeat wholesale made every one of those a
+    /// one-shot, which is why a held Ctrl+W removed a single word.
+    #[test]
+    fn held_editing_keys_repeat_while_commands_and_modes_fire_once() {
+        let ctrl = KeyModifiers::CONTROL;
+        let repeated = |code, modifiers| {
+            map_key(crossterm::event::KeyEvent::new_with_kind(
+                code,
+                modifiers,
+                KeyEventKind::Repeat,
+            ))
+        };
+
+        for (code, modifiers) in [
+            (KeyCode::Backspace, KeyModifiers::NONE),
+            (KeyCode::Backspace, ctrl),
+            (KeyCode::Delete, ctrl),
+            (KeyCode::Char('w'), ctrl),
+            (KeyCode::Char('a'), KeyModifiers::NONE),
+            (KeyCode::Left, KeyModifiers::NONE),
+            (KeyCode::Up, KeyModifiers::NONE),
+            (KeyCode::PageDown, KeyModifiers::NONE),
+        ] {
+            assert!(
+                repeated(code, modifiers).is_some(),
+                "{code:?} with {modifiers:?} should repeat while held"
+            );
+        }
+
+        for (code, modifiers) in [
+            (KeyCode::Enter, KeyModifiers::NONE),
+            (KeyCode::Esc, KeyModifiers::NONE),
+            (KeyCode::Tab, KeyModifiers::NONE),
+            (KeyCode::Char('c'), ctrl),
+            (KeyCode::Char('o'), ctrl),
+            (KeyCode::Char('D'), ctrl),
+            (KeyCode::Char('P'), ctrl),
+        ] {
+            assert!(
+                repeated(code, modifiers).is_none(),
+                "{code:?} with {modifiers:?} is a command and must fire once per press"
+            );
+        }
+    }
+
+    #[test]
+    fn control_delete_removes_the_word_ahead_of_the_cursor() {
+        let mut tui = Tui::new(NoopEngine);
+        for character in "borra esta palabra".chars() {
+            press(&mut tui, KeyCode::Char(character), KeyModifiers::NONE);
+        }
+        press(&mut tui, KeyCode::Home, KeyModifiers::NONE);
+        press(&mut tui, KeyCode::Delete, KeyModifiers::CONTROL);
+
+        assert_eq!(tui.input(), " esta palabra");
     }
 
     #[test]
@@ -9278,7 +11998,9 @@ mod runtime_tests {
             (KeyCode::Enter, KeyModifiers::NONE, Key::Enter),
             (KeyCode::Enter, KeyModifiers::SHIFT, Key::ShiftEnter),
             (KeyCode::Char('w'), ctrl, Key::DeletePreviousWord),
-            (KeyCode::Char('u'), ctrl, Key::DeleteToLineStart),
+            (KeyCode::Backspace, ctrl, Key::DeletePreviousWord),
+            (KeyCode::Delete, ctrl, Key::DeleteNextWord),
+            (KeyCode::Char('u'), ctrl, Key::CtrlU),
             (KeyCode::Char('j'), ctrl, Key::CtrlJ),
             (KeyCode::Char('k'), ctrl, Key::CtrlK),
             (KeyCode::Char('g'), ctrl, Key::CtrlG),
@@ -9293,8 +12015,11 @@ mod runtime_tests {
             (KeyCode::Char('f'), alt, Key::NextWord),
             (KeyCode::Left, ctrl, Key::PreviousWord),
             (KeyCode::Right, ctrl, Key::NextWord),
-            (KeyCode::Char('d'), ctrl, Key::Delete),
+            (KeyCode::Char('d'), ctrl, Key::CtrlD),
             (KeyCode::Char('o'), ctrl, Key::CtrlO),
+            (KeyCode::Char('O'), ctrl, Key::CtrlShiftO),
+            (KeyCode::Char('t'), ctrl, Key::CtrlT),
+            (KeyCode::Char('y'), ctrl, Key::CtrlY),
         ] {
             let event = crossterm::event::KeyEvent::new(code, modifiers);
             assert_eq!(map_key(event), Some(Event::Key(expected)));
@@ -9659,13 +12384,17 @@ mod runtime_tests {
 
     #[test]
     fn bottom_chrome_bands_share_one_gutter_that_collapses_on_narrow_terminals() {
-        let layout = screen_layout(Rect::new(0, 0, 120, 24), "", true);
+        let layout = screen_layout(Rect::new(0, 0, 120, 24), "");
         for band in [layout.composer, layout.notice, layout.tree, layout.footer] {
             assert_eq!(band.x, CHROME_GUTTER, "{band:?}");
             assert_eq!(band.width, 120 - 2 * CHROME_GUTTER, "{band:?}");
         }
+        // The transcript indents its own content on the left, so it owes the
+        // gutter only on the right — where prose would otherwise outrun the
+        // composer it belongs to.
         assert_eq!(layout.transcript.x, 0);
-        assert_eq!(layout.transcript.width, 120);
+        assert_eq!(layout.transcript.right(), 120 - CHROME_GUTTER);
+        assert_eq!(layout.composer.right(), layout.transcript.right());
 
         assert_eq!(
             [0_u16, 1, 24, 26, 28, 30, 32, 120].map(chrome_gutter),
@@ -9673,7 +12402,7 @@ mod runtime_tests {
         );
 
         for width in 0..=64_u16 {
-            let layout = screen_layout(Rect::new(0, 0, width, 24), "", false);
+            let layout = screen_layout(Rect::new(0, 0, width, 24), "");
             assert!(layout.composer.right() <= width, "width {width}");
             assert!(
                 layout.composer.width >= width.min(MIN_GUTTERED_COMPOSER_WIDTH),
@@ -9784,5 +12513,135 @@ mod runtime_tests {
         assert!(!format!("{request:?}").contains("SECRET_SUBMISSION_SENTINEL"));
         assert!(!is_session_resume_request(&request));
         assert!(!is_session_browser_request(&request));
+    }
+
+    fn runtime_glue_ask_user_request() -> AskUserRequest {
+        use agens_core::ask_user::AskUserOption;
+
+        let options = vec![
+            AskUserOption::new("a", "Option A", None, None),
+            AskUserOption::new("b", "Option B", None, None),
+        ];
+        let question = AskUserQuestion::new(
+            "plan",
+            "Which plan?",
+            None,
+            AskUserMode::Single,
+            options,
+            false,
+            false,
+            false,
+        );
+        AskUserRequest::new(None, vec![question]).expect("valid request")
+    }
+
+    /// Calls the real drain arm until it opens the request the waiter
+    /// thread just parked, spinning rather than sleeping: the waiter sends
+    /// on its own thread, so the exact instant its message reaches
+    /// `requests` is not observable from here without polling for it.
+    fn open_first_ask_user_request(
+        tui: &mut Tui<NoopEngine>,
+        bridge: &TuiAskUserBridge,
+        requests: &mpsc::Receiver<TuiAskUserRequest>,
+    ) -> u64 {
+        loop {
+            if let Some(id) = drain_ask_user_request(tui, None, Some(bridge), Some(requests)) {
+                return id;
+            }
+            thread::yield_now();
+        }
+    }
+
+    /// Drives a real request through the event loop's actual drain and
+    /// reply arms — not a reimplementation of them, the exact functions the
+    /// running loop calls — proving they open the overlay for a genuinely
+    /// parked request and, once the UI resolves it, deliver that resolution
+    /// back to the parked tool thread through the bridge.
+    #[test]
+    fn the_ask_user_drain_and_reply_arms_carry_a_real_request_through_open_and_resolve() {
+        use agens_core::ask_user::AskUserAnswer;
+
+        let (bridge, requests) = TuiAskUserBridge::channel();
+        let cancellation = agens_core::HeadlessTurnCancellation::new();
+        let waiting_bridge = bridge.clone();
+
+        let waiter = thread::spawn(move || {
+            waiting_bridge.wait_for_reply(runtime_glue_ask_user_request(), &cancellation)
+        });
+
+        let mut tui = Tui::new(NoopEngine);
+        let id = open_first_ask_user_request(&mut tui, &bridge, &requests);
+        assert!(tui.ask_user_snapshot().is_some());
+        assert!(bridge.is_pending(id));
+
+        let stale_drain =
+            drain_ask_user_request(&mut tui, Some(id), Some(&bridge), Some(&requests));
+        assert_eq!(
+            stale_drain, None,
+            "the drain arm must not reopen while a request is already active"
+        );
+
+        let answer = AskUserAnswer {
+            question_id: "plan".into(),
+            selected: vec!["a".into()],
+            other: None,
+            note: None,
+        };
+        resolve_ask_user_reply(
+            Some(&bridge),
+            id,
+            AskUserReply::Answered(vec![answer.clone()]),
+        );
+
+        assert_eq!(
+            waiter.join().expect("waiter thread should not panic"),
+            AskUserReply::Answered(vec![answer])
+        );
+        assert!(!bridge.is_pending(id));
+    }
+
+    /// The spec's "surface closes" scenario as seen by the running loop: a
+    /// deadline firing releases the parked tool thread as expected, but the
+    /// bug this pins is that nothing DROVE the overlay closed on the UI side
+    /// — before this fix, `self.ask_user` stayed populated, kept answering
+    /// keys instead of routing them anywhere real, and no later UI action
+    /// could ever resolve the (already-resolved) request again.
+    #[test]
+    fn bridge_side_expiry_dismisses_the_open_overlay_and_releases_the_keyboard() {
+        let (bridge, requests) = TuiAskUserBridge::channel();
+        let cancellation = agens_core::HeadlessTurnCancellation::with_deadline(
+            std::time::Duration::from_millis(15),
+        );
+        let waiting_bridge = bridge.clone();
+
+        let waiter = thread::spawn(move || {
+            waiting_bridge.wait_for_reply(runtime_glue_ask_user_request(), &cancellation)
+        });
+
+        let mut tui = Tui::new(NoopEngine);
+        let id = open_first_ask_user_request(&mut tui, &bridge, &requests);
+        assert!(tui.ask_user_snapshot().is_some());
+
+        assert_eq!(
+            waiter.join().expect("waiter thread should not panic"),
+            AskUserReply::Expired
+        );
+
+        assert!(
+            !dismiss_resolved_ask_user(&mut tui, None, Some(&bridge)),
+            "there must be no active overlay to dismiss before the loop notices the resolution"
+        );
+        let dismissed = dismiss_resolved_ask_user(&mut tui, Some(id), Some(&bridge));
+
+        assert!(
+            dismissed,
+            "an expired request must release the overlay it opened, not leave it stuck \
+             answering a turn that already ended"
+        );
+        assert!(
+            tui.ask_user_snapshot().is_none(),
+            "the overlay must be gone so `handle_key` stops routing keystrokes into a dead \
+             ask-user interaction and returns to ordinary composer handling"
+        );
     }
 }

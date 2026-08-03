@@ -144,7 +144,10 @@ mod tests {
             (
                 "native::grep",
                 serde_json::json!({"pattern": "permission"}),
-                NativePermissionTarget::Pattern("permission".into()),
+                NativePermissionTarget::Search {
+                    pattern: "permission".into(),
+                    path: None,
+                },
             ),
             (
                 "native::webfetch",
@@ -161,14 +164,51 @@ mod tests {
         }
     }
 
+    /// A search is named by its pattern and reads whatever its path points at.
+    /// Keeping both is what lets a rule written against the file select the
+    /// call that would read it; projecting only the pattern left every path
+    /// rule unable to reach a tool that reports the lines it matched.
     #[test]
-    fn native_permission_target_keeps_grep_path_separate_from_its_pattern() {
+    fn native_permission_target_keeps_grep_path_beside_its_pattern() {
+        let with_path = NativePermissionTarget::parse(
+            "native::grep",
+            &serde_json::json!({"pattern": "TODO", "path": "crates/agens-cli"}),
+        )
+        .expect("a grep call must parse");
+
+        assert_eq!(
+            with_path,
+            NativePermissionTarget::Search {
+                pattern: "TODO".into(),
+                path: Some("crates/agens-cli".into()),
+            }
+        );
+        assert_eq!(
+            with_path.reach(),
+            vec![agens_core::PermissionReach::Path("crates/agens-cli".into())]
+        );
+        assert_eq!(
+            NativePermissionTarget::parse("native::grep", &serde_json::json!({"pattern": "TODO"}))
+                .expect("a grep call must parse")
+                .reach(),
+            Vec::new(),
+            "a search given no path names no file, so nothing here decides which it may read"
+        );
+    }
+
+    /// `glob` reports the paths its pattern names and never their contents, and
+    /// it takes no path argument to read a file through, so its pattern is the
+    /// whole of what it reaches.
+    #[test]
+    fn native_permission_target_gives_glob_no_reach_beyond_its_pattern() {
         assert_eq!(
             NativePermissionTarget::parse(
-                "native::grep",
-                &serde_json::json!({"pattern": "TODO", "path": "crates/agens-cli"}),
-            ),
-            Ok(NativePermissionTarget::Pattern("TODO".into()))
+                "native::glob",
+                &serde_json::json!({"pattern": "src/**/*.rs"}),
+            )
+            .expect("a glob call must parse")
+            .reach(),
+            Vec::new()
         );
     }
 
@@ -554,13 +594,14 @@ mod tests {
         assert!(denied.prompts.is_empty());
         assert!(denied.executions.is_empty());
 
-        for (name, input) in [
-            ("native::list", "{malformed"),
-            ("native::glob", r#"{}"#),
-            ("native::unknown", r#"{"path":"src"}"#),
+        for (name, input, expected_content) in [
+            ("native::list", "{malformed", "invalid tool arguments"),
+            ("native::glob", r#"{}"#, "invalid tool arguments"),
+            ("native::edit", r#"{"path":"src"}"#, "permission denied"),
             (
                 "native::grep",
                 r#"{"pattern":"TODO","_inject_permission_evaluator_failure":true}"#,
+                "invalid tool arguments",
             ),
         ] {
             let invalid = run_production_batch_with_policy(
@@ -579,17 +620,121 @@ mod tests {
             assert!(invalid.result.is_ok());
             assert!(invalid.prompts.is_empty());
             assert!(invalid.executions.is_empty());
-            assert!(invalid.progress.iter().any(|event| {
-                matches!(
-                    event,
+            assert!(
+                invalid.progress.iter().any(|event| {
+                    matches!(
+                        event,
+                        TurnEvent::ToolResult(MessagePart::ToolResult {
+                            is_error: true,
+                            content,
+                            ..
+                        }) if content == expected_content
+                    )
+                }),
+                "{name} should report {expected_content:?}"
+            );
+        }
+    }
+
+    /// Four things can refuse a call before it runs, and the model has to be
+    /// able to tell them apart, because each asks for something different:
+    /// malformed arguments invite a rewritten call, a denial invites a
+    /// different target, an unresolvable reach invites nothing because the
+    /// tool is misconfigured, and a name no tool answers to invites nothing
+    /// either — but for the opposite reason, that there is no tool to call.
+    #[test]
+    fn every_refusal_the_model_can_receive_before_dispatch_reads_differently() {
+        let refusal_of = |name: &str, input: &str| {
+            let policy = PermissionPolicy::new(
+                PermissionMode::Edit,
+                vec![PermissionRule::global(
+                    PermissionDecision::Ask,
+                    PermissionPattern::glob("native::*").expect("native glob should be valid"),
+                    PermissionPattern::Any,
+                )],
+            );
+            let outcome = run_production_batch_with_policy(
+                ProductionBatchInput::new(
+                    "unresolvable-reach",
+                    Vec::new(),
+                    vec![MessagePart::ToolCall {
+                        id: "call".into(),
+                        name: name.into(),
+                        input: input.into(),
+                    }],
+                )
+                .with_policy(policy)
+                .with_bypass(),
+            );
+            assert!(outcome.result.is_ok(), "{name} must not fail the turn");
+            assert!(outcome.executions.is_empty(), "{name} must not execute");
+
+            let content = outcome
+                .progress
+                .iter()
+                .find_map(|event| match event {
                     TurnEvent::ToolResult(MessagePart::ToolResult {
                         is_error: true,
                         content,
                         ..
-                    }) if content == "invalid tool arguments"
-                )
-            }));
-        }
+                    }) => Some(content.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{name} should report a failing tool result"));
+            let facts = outcome.progress.iter().find_map(|event| match event {
+                TurnEvent::ToolResultFacts { facts, .. } => Some(facts.clone()),
+                _ => None,
+            });
+
+            (content, facts)
+        };
+
+        let (unresolvable, _) = refusal_of(
+            "native::grep",
+            r#"{"pattern":"TODO","_inject_unresolvable_reach":true}"#,
+        );
+        let (malformed, _) = refusal_of("native::glob", r#"{}"#);
+        let (denied, denied_facts) = refusal_of("native::edit", r#"{"path":"src/main.rs"}"#);
+        let (missing, _) = refusal_of("native::unknown", r#"{"path":"src"}"#);
+
+        assert_eq!(
+            unresolvable,
+            "tool call refused: this tool is misconfigured in this session and no permission \
+             decision could be made for it; the arguments are not at fault, and repeating the \
+             call will not change this"
+        );
+        assert_eq!(malformed, "invalid tool arguments");
+        assert_eq!(denied, "permission denied");
+        assert_eq!(
+            missing,
+            "tool call refused: this session has no tool by that name; it was not denied and its \
+             arguments are not at fault, so no rewriting of this call can reach a tool; call one \
+             of the tools you were given instead"
+        );
+
+        assert_eq!(
+            denied_facts,
+            Some(ToolResultFacts::Edit {
+                path: FactPath::new("src/main.rs"),
+                outcome: ToolOutcome::Denied,
+                changed: None,
+            }),
+            "a denied edit still names the path it would have touched"
+        );
+
+        let (_, facts) = refusal_of(
+            "native::write",
+            r#"{"path":"notes.md","_inject_unresolvable_reach":true}"#,
+        );
+        assert_eq!(
+            facts,
+            Some(ToolResultFacts::Write {
+                path: FactPath::new("notes.md"),
+                outcome: ToolOutcome::Denied,
+                written: None,
+            }),
+            "a refused call must still report what it would have touched"
+        );
     }
 
     #[test]
@@ -712,8 +857,8 @@ mod tests {
         else {
             panic!("ungranted MCP call should require a prompt");
         };
-        assert_ne!(context.qualified_tool_name, "files::read");
-        let canonical_name = context.qualified_tool_name.clone();
+        assert_ne!(context.tool_identity, "files::read");
+        let canonical_name = context.tool_identity.clone();
 
         let canonical = agens_core::ProjectPermissionGrant::allow(
             "project",
@@ -884,16 +1029,59 @@ mod tests {
         );
     }
 
+    /// A remote tool reaches the model as `{server}_{tool}` and a rule naming it
+    /// as `<server>::<tool>`. Neither is a native name, and neither can be
+    /// parsed into native facts: what a remote call's arguments mean is defined
+    /// by the server serving it, so no path is reported rather than a guessed
+    /// one. Both spellings are asserted so a future prefix-stripping shortcut
+    /// cannot start reading one of them as a native `read`.
     #[test]
     fn a_denied_call_with_an_unrecognized_tool_name_reports_no_facts() {
         let gate = permission_gate_with_no_grants();
-        let call = HeadlessToolCall {
-            id: "denied-unknown".into(),
-            name: "mcp::files::read".into(),
-            input: r#"{"path":"secret.txt"}"#.into(),
+
+        for name in ["files_read", "files::read"] {
+            let call = HeadlessToolCall {
+                id: "denied-unknown".into(),
+                name: name.into(),
+                input: r#"{"path":"secret.txt"}"#.into(),
+            };
+
+            assert_eq!(
+                gate.denial_facts(&call),
+                None,
+                "{name} names no native tool"
+            );
+        }
+    }
+
+    /// The same call has to report the same facts whichever of a tool's two
+    /// registered spellings named it.
+    ///
+    /// The model calls a native tool by its bare name, while agens calling one
+    /// on its own behalf spells it qualified — the TUI's task launch does. Both
+    /// are aliases of one dispatcher identity, so a denial that reported a path
+    /// for one and nothing for the other would make the facts depend on who
+    /// made the call rather than on what it touched.
+    #[test]
+    fn a_denied_native_call_reports_the_same_facts_under_either_of_its_spellings() {
+        let gate = permission_gate_with_no_grants();
+        let facts = |name: &str| {
+            gate.denial_facts(&HeadlessToolCall {
+                id: "denied-write".into(),
+                name: name.into(),
+                input: r#"{"path":"secret.txt","content":"x"}"#.into(),
+            })
         };
 
-        assert_eq!(gate.denial_facts(&call), None);
+        assert_eq!(facts("write"), facts("native::write"));
+        assert_eq!(
+            facts("write"),
+            Some(ToolResultFacts::Write {
+                path: FactPath::new("secret.txt"),
+                outcome: ToolOutcome::Denied,
+                written: None,
+            })
+        );
     }
 
     /// A malformed payload for a known native tool parses to `ToolInput::Other`,

@@ -127,8 +127,9 @@ pub fn run_production_headless_chat_with_progress(
     if has_task {
         let base = match request.system_prompt.take() {
             Some(explicit) => explicit,
-            None => headless_turn_system_prompt(bootstrap, &agent_catalog_root)?
-                .unwrap_or_else(|| "You are Agens, a helpful coding agent.".to_owned()),
+            None => agens_core::prompt::base_system_prompt(
+                headless_turn_system_prompt(bootstrap, &agent_catalog_root)?.as_deref(),
+            ),
         };
         request.system_prompt = Some(explicit_task_delegation_prompt(&base));
     }
@@ -231,8 +232,9 @@ pub fn run_production_headless_chat_with_progress(
             let credentials_path = bootstrap.paths.credentials.clone();
             let instructions = match request.system_prompt.clone() {
                 Some(explicit) => explicit,
-                None => headless_turn_system_prompt(bootstrap, &agent_catalog_root)?
-                    .unwrap_or_else(|| "You are Agens, a helpful coding agent.".to_owned()),
+                None => agens_core::prompt::base_system_prompt(
+                    headless_turn_system_prompt(bootstrap, &agent_catalog_root)?.as_deref(),
+                ),
             };
             let base_url = headless_turn_provider_base_url(bootstrap, &agent_catalog_root)?;
             run_production_headless_chat_with_provider(
@@ -406,8 +408,9 @@ pub fn headless_turn_own_system_prompt(
 ) -> Result<String, CliError> {
     let base = match explicit {
         Some(explicit) => explicit,
-        None => headless_turn_system_prompt(bootstrap, project_root)?
-            .unwrap_or_else(|| "You are Agens, a helpful coding agent.".to_owned()),
+        None => agens_core::prompt::base_system_prompt(
+            headless_turn_system_prompt(bootstrap, project_root)?.as_deref(),
+        ),
     };
 
     let session_root =

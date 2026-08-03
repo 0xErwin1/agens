@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     fmt,
     future::Future,
     path::{Component, Path},
@@ -11,9 +12,16 @@ use std::{
 
 use globset::{GlobBuilder, GlobMatcher};
 
+pub mod ask_user;
+mod permission_precedence;
+mod permission_target;
+pub mod prompt;
 pub mod redaction;
 mod request_config;
 
+pub use permission_precedence::{
+    declarations_deny_every_target, prevailing_decision, prevailing_rule_decision,
+};
 pub use request_config::{ReasoningEffort, RequestConfig, RequestConfigError};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1315,6 +1323,11 @@ pub enum HeadlessTaskTerminal {
     ConcurrencyLimit,
     ProviderFailure,
     ChildFailure,
+    /// The delegated agent's own `permissions:` declarations could not be
+    /// resolved into a tool surface, so no child turn started. Distinct from
+    /// [`Self::ChildFailure`] because the operator can fix it by editing the
+    /// agent definition, which an opaque runtime failure never tells them.
+    DeclarationRejected,
 }
 
 impl HeadlessTaskTerminal {
@@ -1331,6 +1344,7 @@ impl HeadlessTaskTerminal {
             Self::ConcurrencyLimit => "task: concurrent child limit reached",
             Self::ProviderFailure => "task: provider failure",
             Self::ChildFailure => "task: child execution failed",
+            Self::DeclarationRejected => "task: agent permission declaration rejected",
         }
     }
 }
@@ -1430,12 +1444,27 @@ pub enum HeadlessTurnPortError {
     Provider,
     ProviderRejected,
     ProviderContext,
+    ProviderHistoryBudget,
+    ProviderToolRounds,
     ProviderRateLimited,
     ProviderServer,
     ProviderNetwork,
     ProviderProtocol,
     Permission,
     Tool,
+    /// A call naming a registered tool and carrying well-formed arguments
+    /// that the permission layer still could not resolve into a decision,
+    /// because the tool cannot say what the call reaches. Distinct from
+    /// [`Self::Tool`], which is the malformed-arguments channel, and from
+    /// [`Self::Permission`], which is an infrastructure failure that ends
+    /// the turn: this one is refused per call and reported to the model.
+    PermissionUnresolvable,
+    /// A call naming something this session holds no tool for at all. Distinct
+    /// from a denial, which answers for a tool that exists and was refused,
+    /// and from [`Self::Tool`], which answers for a real tool called wrongly:
+    /// here the name itself is what does not resolve, so neither different
+    /// arguments nor a different target can reach anything.
+    UnknownTool,
     TaskTerminal(HeadlessTaskTerminal),
 }
 
@@ -1575,6 +1604,12 @@ pub enum HeadlessTurnError {
     Provider,
     ProviderRejected,
     ProviderContext,
+    /// The session's own history outgrew what one request may replay. This is
+    /// the runtime's budget, not the model's context window: reporting it as
+    /// context sends the reader to shorten a prompt that was never the problem.
+    ProviderHistoryBudget,
+    /// The turn kept calling tools past the round limit without finishing.
+    ProviderToolRounds,
     ProviderRateLimited,
     ProviderServer,
     ProviderNetwork,
@@ -1598,6 +1633,8 @@ impl fmt::Display for HeadlessTurnError {
             Self::Provider => "provider operation failed",
             Self::ProviderRejected => "provider rejected the request",
             Self::ProviderContext => "provider rejected the request because it exceeds context",
+            Self::ProviderHistoryBudget => "session history outgrew the replay budget",
+            Self::ProviderToolRounds => "turn exceeded the tool continuation rounds",
             Self::ProviderRateLimited => "provider rate limited the request",
             Self::ProviderServer => "provider service failed",
             Self::ProviderNetwork => "provider network request failed",
@@ -1660,6 +1697,7 @@ pub async fn run_headless_turn_with_progress(
         None,
         progress,
         attempt,
+        AskUnreachable::PromptIsReachable,
     )
     .await
 }
@@ -1709,8 +1747,70 @@ pub async fn run_headless_turn_with_max_iterations_and_progress(
         Some(max_iterations),
         progress,
         attempt,
+        AskUnreachable::PromptIsReachable,
     )
     .await
+}
+
+/// Runs an isolated child turn, where no human can be reached to answer a
+/// permission prompt: any tool call that resolves to `Ask` is answered by
+/// the child's own [`HeadlessPermissionResolver`], which denies it without
+/// ever surfacing a prompt. The rendered denial states plainly that the
+/// prompt could not be reached, so it is never mistaken for a policy
+/// `deny`.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_isolated_headless_turn_with_max_iterations_and_progress(
+    provider: &mut impl TurnProvider,
+    permission_gate: &mut impl HeadlessPermissionGate,
+    permission_resolver: &mut impl HeadlessPermissionResolver,
+    dispatcher: &mut impl HeadlessToolDispatcher,
+    repository: &mut impl CompletedTurnRepository,
+    cancellation: &HeadlessTurnCancellation,
+    max_iterations: usize,
+    progress: Option<&TurnProgressSink>,
+    attempt: Option<AttemptKey>,
+) -> Result<CompletedTurnSnapshot, HeadlessTurnError> {
+    run_headless_turn_with_iteration_limit(
+        provider,
+        permission_gate,
+        permission_resolver,
+        dispatcher,
+        repository,
+        cancellation,
+        Some(max_iterations),
+        progress,
+        attempt,
+        AskUnreachable::PromptIsUnreachable,
+    )
+    .await
+}
+
+/// Whether a call resolving to [`PermissionDecision::Ask`] can actually
+/// reach a human. An isolated child turn has no such channel: its
+/// [`HeadlessPermissionResolver`] denies every `Ask` unconditionally, so a
+/// resulting `Deny` needs its own wording rather than the generic policy
+/// denial message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AskUnreachable {
+    PromptIsReachable,
+    PromptIsUnreachable,
+}
+
+/// What a tool call's preflight permission step decided, ahead of the
+/// second pass that actually dispatches or fails it. A call that resolved
+/// `Ask` inside an isolated child turn is tracked separately from a plain
+/// `Deny`, so the two can be rendered with different wording. A call the
+/// permission layer could not resolve at all is tracked separately again,
+/// because reporting it as either malformed arguments or a policy denial
+/// tells the model to change something that is not what went wrong. A call
+/// naming no tool this session holds is tracked separately for the same
+/// reason: nothing denied it, because there was nothing there to deny.
+enum PreflightAuthorization {
+    InvalidArguments,
+    UnresolvablePermission,
+    UnknownTool,
+    Decided(PermissionDecision),
+    UnreachablePromptDenial,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1724,6 +1824,7 @@ async fn run_headless_turn_with_iteration_limit(
     max_iterations: Option<usize>,
     progress: Option<&TurnProgressSink>,
     attempt: Option<AttemptKey>,
+    ask_unreachable: AskUnreachable,
 ) -> Result<CompletedTurnSnapshot, HeadlessTurnError> {
     let mut coordinator = match attempt {
         Some(key) => TurnCoordinator::for_attempt(key),
@@ -1789,7 +1890,15 @@ async fn run_headless_turn_with_iteration_limit(
             let decision = match permission_gate.evaluate(&call, cancellation).await {
                 Ok(decision) => decision,
                 Err(HeadlessTurnPortError::Tool) => {
-                    preflight.push((call, None));
+                    preflight.push((call, PreflightAuthorization::InvalidArguments));
+                    continue;
+                }
+                Err(HeadlessTurnPortError::PermissionUnresolvable) => {
+                    preflight.push((call, PreflightAuthorization::UnresolvablePermission));
+                    continue;
+                }
+                Err(HeadlessTurnPortError::UnknownTool) => {
+                    preflight.push((call, PreflightAuthorization::UnknownTool));
                     continue;
                 }
                 Err(error) => {
@@ -1800,6 +1909,7 @@ async fn run_headless_turn_with_iteration_limit(
                     ));
                 }
             };
+            let asked = decision == PermissionDecision::Ask;
             check_cancelled(&mut coordinator, cancellation)?;
             let decision = resolve_permission_decision(
                 decision,
@@ -1811,29 +1921,64 @@ async fn run_headless_turn_with_iteration_limit(
             .await?;
             check_cancelled(&mut coordinator, cancellation)?;
 
-            preflight.push((call, Some(decision)));
+            let authorization = if asked
+                && decision == PermissionDecision::Deny
+                && ask_unreachable == AskUnreachable::PromptIsUnreachable
+            {
+                PreflightAuthorization::UnreachablePromptDenial
+            } else {
+                PreflightAuthorization::Decided(decision)
+            };
+            preflight.push((call, authorization));
         }
 
-        for (call, decision) in preflight {
+        for (call, authorization) in preflight {
             check_cancelled(&mut coordinator, cancellation)?;
             flush_progress(&coordinator, progress, &mut progress_cursor);
 
-            let output = match decision {
-                None => HeadlessToolOutput::failure("invalid tool arguments"),
-                Some(PermissionDecision::Allow) => dispatcher
+            let output = match authorization {
+                PreflightAuthorization::InvalidArguments => {
+                    HeadlessToolOutput::failure("invalid tool arguments")
+                }
+                PreflightAuthorization::UnresolvablePermission => {
+                    let output = HeadlessToolOutput::failure(
+                        "tool call refused: this tool is misconfigured in this session and no \
+                         permission decision could be made for it; the arguments are not at \
+                         fault, and repeating the call will not change this",
+                    );
+                    match permission_gate.denial_facts(&call) {
+                        Some(facts) => output.with_facts(facts),
+                        None => output,
+                    }
+                }
+                PreflightAuthorization::UnknownTool => HeadlessToolOutput::failure(
+                    "tool call refused: this session has no tool by that name; it was not denied \
+                     and its arguments are not at fault, so no rewriting of this call can reach a \
+                     tool; call one of the tools you were given instead",
+                ),
+                PreflightAuthorization::Decided(PermissionDecision::Allow) => dispatcher
                     .dispatch(call.clone(), cancellation)
                     .await
                     .map_err(|error| {
                         finish_port_error(&mut coordinator, error, HeadlessTurnError::Tool)
                     })?,
-                Some(PermissionDecision::Deny) => {
+                PreflightAuthorization::Decided(PermissionDecision::Deny) => {
                     let output = HeadlessToolOutput::failure("permission denied");
                     match permission_gate.denial_facts(&call) {
                         Some(facts) => output.with_facts(facts),
                         None => output,
                     }
                 }
-                Some(PermissionDecision::Ask) => {
+                PreflightAuthorization::UnreachablePromptDenial => {
+                    let output = HeadlessToolOutput::failure(
+                        "permission denied: the approval prompt could not be reached in a subagent",
+                    );
+                    match permission_gate.denial_facts(&call) {
+                        Some(facts) => output.with_facts(facts),
+                        None => output,
+                    }
+                }
+                PreflightAuthorization::Decided(PermissionDecision::Ask) => {
                     return Err(permission_required(&mut coordinator));
                 }
             };
@@ -1965,6 +2110,10 @@ fn map_port_error(error: HeadlessTurnPortError) -> Option<HeadlessTurnError> {
     match error {
         HeadlessTurnPortError::ProviderRejected => Some(HeadlessTurnError::ProviderRejected),
         HeadlessTurnPortError::ProviderContext => Some(HeadlessTurnError::ProviderContext),
+        HeadlessTurnPortError::ProviderHistoryBudget => {
+            Some(HeadlessTurnError::ProviderHistoryBudget)
+        }
+        HeadlessTurnPortError::ProviderToolRounds => Some(HeadlessTurnError::ProviderToolRounds),
         HeadlessTurnPortError::ProviderRateLimited => Some(HeadlessTurnError::ProviderRateLimited),
         HeadlessTurnPortError::ProviderServer => Some(HeadlessTurnError::ProviderServer),
         HeadlessTurnPortError::ProviderNetwork => Some(HeadlessTurnError::ProviderNetwork),
@@ -2022,8 +2171,44 @@ pub const MAX_PERMISSION_GLOB_SEGMENTS: usize = 256;
 pub const MAX_PERMISSION_TARGET_BYTES: usize = 16 * 1024;
 
 impl PermissionPattern {
+    /// Builds a glob pattern for a path-shaped target, where `/` is a
+    /// literal path-segment boundary that a bare `*` never crosses; only
+    /// `**` occupying a whole segment (`prefix/**`, `**/suffix`,
+    /// `dir/**/secret`) matches across it. This is the right matcher for
+    /// filesystem paths and for tool-name patterns, so it is also the
+    /// default used everywhere a target's kind is not otherwise known.
+    ///
+    /// A target that is free-form text rather than a path — most notably
+    /// `bash`'s command line, which routinely contains `/` as an ordinary
+    /// character rather than a hierarchy boundary — needs
+    /// [`Self::glob_for_target_kind`] with [`PermissionTargetKind::FreeFormText`]
+    /// instead; this constructor would otherwise make a pattern like `rm*`
+    /// silently fail to match `rm -rf /tmp/x`.
     pub fn glob(pattern: impl Into<String>) -> Result<Self, PermissionPatternError> {
-        ValidatedPermissionGlob::new(pattern.into()).map(Self::Glob)
+        Self::glob_for_target_kind(pattern, PermissionTargetKind::Path)
+    }
+
+    /// Builds a glob pattern whose `/`-crossing behavior is chosen by the
+    /// target's kind. See [`PermissionTargetKind`] for the semantics of each
+    /// kind and [`permission_target_kind_for_tool`] for classifying a tool by
+    /// name.
+    ///
+    /// A path-shaped pattern is reduced to the same canonical spelling its
+    /// targets are, so a rule written `./src//secret/**` selects the files it
+    /// reads as naming instead of silently selecting nothing.
+    pub fn glob_for_target_kind(
+        pattern: impl Into<String>,
+        kind: PermissionTargetKind,
+    ) -> Result<Self, PermissionPatternError> {
+        let literal_separator = matches!(kind, PermissionTargetKind::Path);
+        let pattern = pattern.into();
+        let pattern = if literal_separator {
+            permission_target::normalized_path_target(&pattern)
+        } else {
+            pattern
+        };
+
+        ValidatedPermissionGlob::new(pattern, literal_separator).map(Self::Glob)
     }
 
     pub fn glob_source(&self) -> Option<&str> {
@@ -2040,16 +2225,97 @@ impl PermissionPattern {
             Self::Glob(pattern) => pattern.matches(value),
         }
     }
+
+    /// Reports whether this pattern selects every value it could be compared
+    /// against, which is what makes an absent target, `*` on a free-form
+    /// target, and `**` three spellings of one thing rather than three
+    /// different breadths.
+    ///
+    /// `*` on a path-shaped target is deliberately NOT one of them: it stops
+    /// at a `/`, so `src/main.rs` escapes it while `**` covers it.
+    pub fn denotes_everything(&self) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Exact(_) => false,
+            Self::Glob(pattern) => pattern.denotes_everything(),
+        }
+    }
+
+    /// Reports whether every value `other` selects is also selected by `self`.
+    ///
+    /// This is a sound under-approximation: it answers `true` only where the
+    /// containment can be established structurally, and `false` — meaning
+    /// "not known to be broader" — for every pattern shape it cannot decide.
+    /// Callers therefore have to treat `false` in both directions as
+    /// "incomparable" rather than as "disjoint". [`Self::Any`] is decided by
+    /// the two breadth checks above and never reaches the shape comparison.
+    pub fn covers(&self, other: &Self) -> bool {
+        if self.denotes_everything() {
+            return true;
+        }
+        if other.denotes_everything() {
+            return false;
+        }
+
+        match (self, other) {
+            (Self::Exact(broader), Self::Exact(narrower)) => broader == narrower,
+            (Self::Exact(_), _) => false,
+            (_, Self::Exact(value)) => self.matches(value),
+            (Self::Glob(broader), Self::Glob(narrower)) => broader.covers(narrower),
+            (Self::Any, _) | (_, Self::Any) => false,
+        }
+    }
+}
+
+/// Classifies what kind of value a permission target holds, which decides
+/// whether a bare `*` in a glob pattern may cross a `/`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PermissionTargetKind {
+    /// A filesystem-shaped target: `read`/`write`/`edit`/`list`/`search`
+    /// paths, `glob`'s own file-glob argument, `grep`'s search pattern, and
+    /// `webfetch` URLs (a URL's scheme/host/path components are themselves
+    /// hierarchical, so treating `/` as a path-segment boundary there gives
+    /// the same predictable, non-surprising behavior as an actual path), and
+    /// the files a `git_read` diff reports.
+    /// `/` is a meaningful segment boundary that a bare `*` never crosses;
+    /// only an explicit `**` segment matches across it.
+    Path,
+    /// A free-form target that is not shaped like a path even though it may
+    /// contain `/` incidentally: `bash`'s shell command line. `/` is an
+    /// ordinary character here, so a bare `*` crosses it, matching a user's
+    /// plain-English expectation that `rm*` denies `rm -rf /tmp/x`.
+    FreeFormText,
+}
+
+/// Classifies a native tool's permission target by name, matching the bare
+/// form (`bash`), the fully-qualified native identity (`native::bash`) and the
+/// dispatcher's own encoding of it. A tool this function does not recognize as
+/// free-form text defaults to [`PermissionTargetKind::Path`], keeping
+/// segment-discipline matching for every target whose shape is not known to be
+/// free-form.
+///
+/// `git_read` is path-shaped even though the target it is *called* with is an
+/// operation keyword. `diff` reports what the files it names hold, so a rule
+/// written against a file decides each of those files ([`PermissionReadFilter`])
+/// and has to select them under the same segment discipline `read(**/.env)`
+/// does. The keywords carry no `/`, so classifying them as paths leaves
+/// `git_read(diff)` selecting exactly the diffs it already selected.
+pub fn permission_target_kind_for_tool(tool: &str) -> PermissionTargetKind {
+    match bare_tool_name(tool).as_ref() {
+        "bash" => PermissionTargetKind::FreeFormText,
+        _ => PermissionTargetKind::Path,
+    }
 }
 
 #[derive(Clone, Debug)]
 pub struct ValidatedPermissionGlob {
     pattern: String,
+    literal_separator: bool,
     matcher: GlobMatcher,
 }
 
 impl ValidatedPermissionGlob {
-    fn new(pattern: String) -> Result<Self, PermissionPatternError> {
+    fn new(pattern: String, literal_separator: bool) -> Result<Self, PermissionPatternError> {
         if pattern.trim().is_empty() {
             return Err(PermissionPatternError::InvalidGlob { pattern });
         }
@@ -2070,19 +2336,70 @@ impl ValidatedPermissionGlob {
         }
 
         let matcher = GlobBuilder::new(&pattern)
-            .literal_separator(true)
+            .literal_separator(literal_separator)
             .build()
             .map_err(|_| PermissionPatternError::InvalidGlob {
                 pattern: pattern.clone(),
             })?
             .compile_matcher();
 
-        Ok(Self { pattern, matcher })
+        Ok(Self {
+            pattern,
+            literal_separator,
+            matcher,
+        })
     }
 
     fn matches(&self, value: &str) -> bool {
         value.len() <= MAX_PERMISSION_TARGET_BYTES && self.matcher.is_match(value)
     }
+
+    fn denotes_everything(&self) -> bool {
+        self.pattern == "**" || self.pattern == "*" && !self.literal_separator
+    }
+
+    /// Establishes containment between two globs from the only shape it can be
+    /// read off structurally: a wildcard-free prefix followed by a trailing
+    /// wildcard that runs to the end of the pattern. Every other shape is left
+    /// undecided, because `a*` and `*b` overlap without either containing the
+    /// other and no ordering of them would be defensible.
+    fn covers(&self, other: &Self) -> bool {
+        if self.pattern == other.pattern && self.literal_separator == other.literal_separator {
+            return true;
+        }
+
+        if !has_glob_wildcard(&other.pattern) {
+            return self.matches(&other.pattern);
+        }
+
+        let (Some((prefix, crosses_separator)), Some((other_prefix, other_crosses_separator))) = (
+            self.trailing_wildcard_prefix(),
+            other.trailing_wildcard_prefix(),
+        ) else {
+            return false;
+        };
+
+        let Some(remainder) = other_prefix.strip_prefix(prefix) else {
+            return false;
+        };
+
+        crosses_separator || !other_crosses_separator && !remainder.contains('/')
+    }
+
+    /// Splits `<literal><trailing wildcard>` into the literal and whether that
+    /// wildcard reaches across `/`, or reports `None` for any other shape.
+    fn trailing_wildcard_prefix(&self) -> Option<(&str, bool)> {
+        let (prefix, crosses_separator) = match self.pattern.strip_suffix("**") {
+            Some(prefix) => (prefix, true),
+            None => (self.pattern.strip_suffix('*')?, !self.literal_separator),
+        };
+
+        (!has_glob_wildcard(prefix)).then_some((prefix, crosses_separator))
+    }
+}
+
+fn has_glob_wildcard(pattern: &str) -> bool {
+    pattern.contains(['*', '?', '[', ']', '{', '}', '\\'])
 }
 
 impl PartialEq for ValidatedPermissionGlob {
@@ -2110,6 +2427,54 @@ impl fmt::Display for PermissionPatternError {
 
 impl std::error::Error for PermissionPatternError {}
 
+/// What a call reaches beyond the target it is named by.
+///
+/// A search is named by its pattern, which says nothing about which files it
+/// reads — that is decided by the path it is given. Reporting that path here is
+/// what lets a rule written against a file select the call that would read it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PermissionReach {
+    /// One path the call reads, matched under every spelling of it.
+    Path(String),
+}
+
+/// One act a call performs, as the values a rule could be written against.
+///
+/// The values are alternatives rather than parts: any one of them names this
+/// act, so a rule selecting any one of them selects it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Subject(Vec<String>);
+
+impl Subject {
+    fn spelled(forms: Vec<String>) -> Self {
+        Self(forms)
+    }
+
+    /// Folds what a call reaches into the act its target already names: a
+    /// search is one read of one file set, described by its pattern and by its
+    /// path at once, so either description names the same act.
+    ///
+    /// A root that names the worktree itself is left out, because it singles
+    /// out no file: which of the files under a root the call may report is
+    /// settled per file while it runs. See [`PermissionReadFilter`].
+    fn reaching(mut forms: Vec<String>, reach: &[PermissionReach]) -> Self {
+        for entry in reach {
+            let PermissionReach::Path(path) = entry;
+            let spellings = permission_target::path_target_forms(path);
+
+            if !spellings.first().is_some_and(|form| form == ".") {
+                forms.extend(spellings);
+            }
+        }
+
+        Self(forms)
+    }
+
+    fn selected_by(&self, pattern: &PermissionPattern) -> bool {
+        self.0.iter().any(|form| pattern.matches(form))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PermissionRequest {
     pub project: String,
@@ -2117,6 +2482,11 @@ pub struct PermissionRequest {
     pub target: String,
     pub access: ToolAccess,
     outside_worktree: bool,
+    /// The acts this call performs, as the values a rule could be written
+    /// against: one entry per invocation a command line would run, and one
+    /// entry for a path or a search, holding every value that names it. Empty
+    /// whenever the target names exactly one act under exactly one spelling.
+    subjects: Vec<Subject>,
 }
 
 impl PermissionRequest {
@@ -2126,13 +2496,13 @@ impl PermissionRequest {
         target: impl Into<String>,
         access: ToolAccess,
     ) -> Self {
-        Self {
-            project: project.into(),
-            tool: tool.into(),
-            target: PermissionTarget::native(target).project(),
+        Self::build(
+            project.into(),
+            tool.into(),
+            PermissionTarget::native(target).project(),
             access,
-            outside_worktree: false,
-        }
+            &[],
+        )
     }
 
     pub fn with_target(
@@ -2141,12 +2511,74 @@ impl PermissionRequest {
         target: PermissionTarget,
         access: ToolAccess,
     ) -> Self {
+        Self::build(project.into(), tool.into(), target.project(), access, &[])
+    }
+
+    /// Builds a request for a call that reaches more than the target names it
+    /// by. See [`PermissionReach`].
+    pub fn reaching(
+        project: impl Into<String>,
+        tool: impl Into<String>,
+        target: impl Into<String>,
+        access: ToolAccess,
+        reach: &[PermissionReach],
+    ) -> Self {
+        Self::build(
+            project.into(),
+            tool.into(),
+            PermissionTarget::native(target).project(),
+            access,
+            reach,
+        )
+    }
+
+    /// Reads the raw target as what it names before any rule sees it: a path
+    /// loses the components that select nothing and keeps the directory
+    /// spelling a rule may have been written against, and a command line is
+    /// decomposed into the invocations it would run. See
+    /// [`crate::permission_target`] for what that does and does not cover.
+    ///
+    /// What a call reaches beyond its target joins the act its target already
+    /// names, rather than standing beside it as a second one: a search is one
+    /// read, described by its pattern and by its path at once.
+    fn build(
+        project: String,
+        tool: String,
+        target: String,
+        access: ToolAccess,
+        reach: &[PermissionReach],
+    ) -> Self {
+        let (target, subjects) = match permission_target_kind_for_tool(&tool) {
+            PermissionTargetKind::Path => {
+                let spellings = permission_target::path_target_forms(&target);
+                let normalized = spellings.first().cloned().unwrap_or(target);
+                let subjects = if !reach.is_empty() {
+                    vec![Subject::reaching(spellings, reach)]
+                } else if spellings.len() > 1 {
+                    vec![Subject::spelled(spellings)]
+                } else {
+                    Vec::new()
+                };
+
+                (normalized, subjects)
+            }
+            PermissionTargetKind::FreeFormText if bare_tool_name(&tool) == "bash" => {
+                let invocations = permission_target::command_invocations(&target);
+                (
+                    target,
+                    invocations.into_iter().map(Subject::spelled).collect(),
+                )
+            }
+            PermissionTargetKind::FreeFormText => (target, Vec::new()),
+        };
+
         Self {
-            project: project.into(),
-            tool: tool.into(),
-            target: target.project(),
+            project,
+            tool,
+            target,
             access,
             outside_worktree: false,
+            subjects,
         }
     }
 
@@ -2154,6 +2586,96 @@ impl PermissionRequest {
         self.outside_worktree = true;
         self
     }
+
+    /// Reports whether `pattern` selects this request's target.
+    ///
+    /// A shell target is several calls at once, so the two directions of that
+    /// question are not the same. A restrictive rule selects the command when
+    /// ANY of its invocations is selected — a deny on `rm` has to hold in
+    /// `cd /tmp && rm -rf x`. A permissive rule selects it only when EVERY
+    /// invocation is selected, because authorizing `git*` is not authorization
+    /// for whatever was chained onto it.
+    ///
+    /// A path is one act rather than several, so both directions reduce to the
+    /// same question there: the rule selects the call when it names the file
+    /// under any of its spellings. A search is one act too — one read of one
+    /// file set — named by its pattern and by the path it was given at once,
+    /// so a rule naming either one selects it in either direction. What that
+    /// leaves is the files under that path, which no value here names; a rule
+    /// naming one of those withholds that file alone, while the search runs.
+    /// See [`PermissionReadFilter`].
+    fn target_selected_by(
+        &self,
+        pattern: &PermissionPattern,
+        decision: PermissionDecision,
+    ) -> bool {
+        let selects = |subject: &Subject| subject.selected_by(pattern);
+
+        match decision {
+            _ if self.subjects.is_empty() => pattern.matches(&self.target),
+            PermissionDecision::Allow => self.subjects.iter().all(selects),
+            PermissionDecision::Ask | PermissionDecision::Deny => {
+                pattern.matches(&self.target) || self.subjects.iter().any(selects)
+            }
+        }
+    }
+}
+
+/// Reduces any spelling of a tool to the name a rule is written against:
+/// `bash`, `native::bash`, and the dispatcher's own identity for it,
+/// `native:4:bash`, all reduce to `bash`.
+///
+/// Anything reading a value that reached it from a dispatcher has to come
+/// through here rather than compare against a qualified name directly. The
+/// identity is what a `PermissionRequest` and a `PermissionPromptContext`
+/// carry, and it equals no spelling anyone writes down, so a guard testing it
+/// against `"native::bash"` silently never fires.
+///
+/// A remote tool answers to no barer name than `<server>::<tool>`, so that is
+/// what its identity — `mcp:5:probe:14:read_text_file` — reduces to. It is the
+/// one of the two names a rule may write it under that says on its own that
+/// the tool is remote, and it can never collide with a native: no native name
+/// contains `::` once qualification is stripped.
+pub fn bare_tool_name(tool: &str) -> Cow<'_, str> {
+    if let Some((server, name)) = mcp_identity_parts(tool) {
+        return Cow::Owned(format!("{server}::{name}"));
+    }
+
+    let qualified = tool
+        .strip_prefix("native:")
+        .and_then(|rest| rest.split_once(':'))
+        .filter(|(length, _)| {
+            !length.is_empty() && length.bytes().all(|byte| byte.is_ascii_digit())
+        })
+        .map_or(tool, |(_, name)| name);
+
+    Cow::Borrowed(qualified.strip_prefix("native::").unwrap_or(qualified))
+}
+
+/// Splits an MCP dispatcher identity back into the server and tool it was built
+/// from.
+///
+/// The identity headers each field with its length precisely because neither a
+/// server name nor a tool name is guaranteed to be free of `:`, so the fields
+/// are cut by those lengths rather than by splitting on the separator. Anything
+/// that does not consume the whole value is not an identity at all.
+fn mcp_identity_parts(tool: &str) -> Option<(&str, &str)> {
+    let (server, rest) = length_headed_field(tool.strip_prefix("mcp:")?)?;
+    let (name, rest) = length_headed_field(rest)?;
+
+    rest.is_empty().then_some((server, name))
+}
+
+fn length_headed_field(value: &str) -> Option<(&str, &str)> {
+    let (length, rest) = value.split_once(':')?;
+    let length = length
+        .bytes()
+        .all(|byte| byte.is_ascii_digit())
+        .then(|| length.parse::<usize>().ok())
+        .flatten()?;
+    let (field, rest) = rest.split_at_checked(length)?;
+
+    Some((field, rest.strip_prefix(':').unwrap_or(rest)))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2250,7 +2772,9 @@ impl PermissionRule {
             PermissionScope::Project => self.project.as_deref() == Some(request.project.as_str()),
         };
 
-        project_matches && self.tool.matches(&request.tool) && self.target.matches(&request.target)
+        project_matches
+            && self.tool.matches(&request.tool)
+            && request.target_selected_by(&self.target, self.decision)
     }
 }
 
@@ -2403,7 +2927,7 @@ impl ProjectPermissionGrant {
     fn matches(&self, request: &PermissionRequest) -> bool {
         self.project == request.project
             && self.tool.matches(&request.tool)
-            && self.target.matches(&request.target)
+            && request.target_selected_by(&self.target, self.decision)
     }
 }
 
@@ -2433,6 +2957,72 @@ pub enum SafetyPredicate {
     GlobalDeny(Box<GlobalDenyPredicate>),
 }
 
+/// The operator's configured `[permissions]` rules, resolved among themselves
+/// and then combined with whatever the agent declared.
+///
+/// Configuration is a ceiling on authority rather than one voice among many: a
+/// declaration can narrow it further, but can never reopen a call the
+/// configuration nets to `Deny` nor skip an approval it nets to `Ask`. The two
+/// sets are resolved separately and combined by taking the more restrictive
+/// answer, which is what keeps both halves of that sentence true — merging them
+/// into one set would let whichever rule happened to be narrower decide alone.
+///
+/// Resolving the configured rules against each other first is also what keeps a
+/// configured `allow` able to carve an exception out of a configured `deny`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConfiguredFloor {
+    rules: Vec<PermissionRule>,
+    role: ConfiguredRole,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConfiguredRole {
+    Governing,
+    Restricting,
+}
+
+impl ConfiguredFloor {
+    /// The primary path, where the operator's configuration is the authority a
+    /// call is measured against: a configured `allow` authorizes on its own.
+    pub fn governing(rules: Vec<PermissionRule>) -> Self {
+        Self {
+            rules,
+            role: ConfiguredRole::Governing,
+        }
+    }
+
+    /// A delegated child, where only the agent definition can authorize a tool.
+    /// The same rules still restrict, so a configured `deny` or `ask` reaches
+    /// the child exactly as it reaches the parent, but a configured `allow`
+    /// grants a child nothing it did not declare.
+    pub fn restricting(rules: Vec<PermissionRule>) -> Self {
+        Self {
+            rules,
+            role: ConfiguredRole::Restricting,
+        }
+    }
+
+    pub fn rules(&self) -> &[PermissionRule] {
+        &self.rules
+    }
+
+    fn denies(&self, request: &PermissionRequest) -> bool {
+        self.decision(request) == Some(PermissionDecision::Deny)
+    }
+
+    fn decision(&self, request: &PermissionRequest) -> Option<PermissionDecision> {
+        prevailing_rule_decision(&self.rules, request)
+    }
+
+    /// The configured answer as far as it constrains this path: everything on
+    /// the primary path, and only the non-authorizing decisions in a child.
+    fn constraint(&self, request: &PermissionRequest) -> Option<PermissionDecision> {
+        self.decision(request).filter(|decision| {
+            self.role == ConfiguredRole::Governing || *decision != PermissionDecision::Allow
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GlobalDenyPredicate {
     pub tool: PermissionPattern,
@@ -2444,6 +3034,7 @@ pub struct PermissionPolicy {
     mode: PermissionMode,
     static_rules: Vec<PermissionRule>,
     safety_predicates: Vec<SafetyPredicate>,
+    configured_floor: Option<ConfiguredFloor>,
 }
 
 impl PermissionPolicy {
@@ -2464,7 +3055,17 @@ impl PermissionPolicy {
             mode,
             static_rules,
             safety_predicates,
+            configured_floor: None,
         }
+    }
+
+    /// Holds the operator's configured rules above the declared ones. See
+    /// [`ConfiguredFloor`] for why they are kept as a separate set rather than
+    /// concatenated onto `static_rules`.
+    #[must_use]
+    pub fn with_configured_floor(mut self, floor: ConfiguredFloor) -> Self {
+        self.configured_floor = Some(floor);
+        self
     }
 
     pub fn evaluate(
@@ -2482,8 +3083,16 @@ impl PermissionPolicy {
             normalize_tool_pattern(&mut rule.tool, &aliases);
         }
         for predicate in &mut policy.safety_predicates {
-            if let SafetyPredicate::GlobalDeny(deny) = predicate {
-                normalize_tool_pattern(&mut deny.tool, &aliases);
+            match predicate {
+                SafetyPredicate::GlobalDeny(deny) => {
+                    normalize_tool_pattern(&mut deny.tool, &aliases);
+                }
+                SafetyPredicate::WorktreeEscape | SafetyPredicate::ChatWrite => {}
+            }
+        }
+        if let Some(floor) = policy.configured_floor.as_mut() {
+            for rule in &mut floor.rules {
+                normalize_tool_pattern(&mut rule.tool, &aliases);
             }
         }
         policy
@@ -2496,34 +3105,108 @@ impl PermissionPolicy {
         session_grants: &[ProjectPermissionGrant],
         session: &PermissionSession,
     ) -> PermissionDecision {
+        self.evaluate_with_unmatched_override(
+            request,
+            project_grants,
+            session_grants,
+            session,
+            false,
+        )
+    }
+
+    /// Resolves a permission request against static rules, then persisted
+    /// grants, then an unmatched-call fallback — in that order of authority —
+    /// and never above what the operator's configured rules leave open.
+    ///
+    /// A static rule's `Deny` is sticky: once a declaration (agent-defined or
+    /// configured) denies a request, no later project or session grant can
+    /// reopen it. Any other matched decision keeps the existing
+    /// grant-outranks-rule behavior. A matched decision is never touched by
+    /// `unmatched_allow` or by `session.temporary_bypass` — those two only
+    /// decide what happens when nothing matched at all, which is the sole
+    /// remaining role of `resolve_ask`.
+    ///
+    /// Which static rule decides is [`prevailing_rule_decision`]'s answer, not
+    /// the last one written: authoring order never decides safety.
+    pub fn evaluate_with_unmatched_override(
+        &self,
+        request: &PermissionRequest,
+        project_grants: &[ProjectPermissionGrant],
+        session_grants: &[ProjectPermissionGrant],
+        session: &PermissionSession,
+        unmatched_allow: bool,
+    ) -> PermissionDecision {
+        self.stated_decision(request, project_grants, session_grants)
+            .unwrap_or_else(|| {
+                let fallback = if unmatched_allow {
+                    PermissionDecision::Allow
+                } else {
+                    PermissionDecision::Ask
+                };
+
+                Self::resolve_ask(fallback, session)
+            })
+    }
+
+    /// What a rule, a grant or the operator's configured floor states about
+    /// `request`, or `None` when nothing names it.
+    ///
+    /// Kept apart from the fallback so a call authorized as one act can ask
+    /// the same question again about each file it turns out to read, without a
+    /// second matcher: the fallback settled the act, and it has nothing to say
+    /// about a file no rule names. See [`PermissionReadFilter`].
+    fn stated_decision(
+        &self,
+        request: &PermissionRequest,
+        project_grants: &[ProjectPermissionGrant],
+        session_grants: &[ProjectPermissionGrant],
+    ) -> Option<PermissionDecision> {
         if !self.hard_safety_allows(request) {
-            return PermissionDecision::Deny;
+            return Some(PermissionDecision::Deny);
         }
 
-        let decision = self
-            .static_rules
+        let static_decision = prevailing_rule_decision(&self.static_rules, request);
+
+        let grant_decision = project_grants
             .iter()
-            .filter(|rule| rule.matches(request))
-            .map(|rule| rule.decision)
-            .chain(
-                project_grants
-                    .iter()
-                    .filter(|grant| grant.matches(request))
-                    .map(|grant| grant.decision),
-            )
+            .filter(|grant| grant.matches(request))
+            .map(|grant| grant.decision)
             .chain(
                 session_grants
                     .iter()
                     .filter(|grant| grant.matches(request))
                     .map(|grant| grant.decision),
             )
-            .last()
-            .unwrap_or(PermissionDecision::Ask);
+            .last();
 
-        Self::resolve_ask(decision, session)
+        let matched = if static_decision == Some(PermissionDecision::Deny) {
+            static_decision
+        } else {
+            grant_decision.or(static_decision)
+        };
+
+        let configured = self
+            .configured_floor
+            .as_ref()
+            .and_then(|floor| floor.constraint(request));
+
+        match (matched, configured) {
+            (Some(decision), Some(floor)) => Some(prevailing_decision(decision, floor)),
+            (Some(decision), None) => Some(decision),
+            (None, Some(floor)) => Some(floor),
+            (None, None) => None,
+        }
     }
 
     pub fn hard_safety_allows(&self, request: &PermissionRequest) -> bool {
+        if self
+            .configured_floor
+            .as_ref()
+            .is_some_and(|floor| floor.denies(request))
+        {
+            return false;
+        }
+
         !self.safety_predicates.iter().any(|predicate| {
             matches!(predicate, SafetyPredicate::WorktreeEscape) && request.outside_worktree
                 || matches!(predicate, SafetyPredicate::ChatWrite)
@@ -2544,6 +3227,61 @@ impl PermissionPolicy {
         } else {
             decision
         }
+    }
+}
+
+/// Which of the files an authorized call may report, for a call that reads a
+/// file set rather than one named file.
+///
+/// A search is authorized as one act, named by its pattern and by the root it
+/// was given. Neither names the files under that root, so authorizing the act
+/// cannot authorize every file it walks into. The same rules that decided the
+/// act therefore decide each file as it is read: this carries that evaluation
+/// to whoever does the reading rather than duplicating it, so the precedence,
+/// the path normalization and the spelling handling are the ones every other
+/// decision already goes through.
+#[derive(Clone, Debug)]
+pub struct PermissionReadFilter {
+    policy: PermissionPolicy,
+    grants: Vec<ProjectPermissionGrant>,
+    project: String,
+    tool: String,
+    access: ToolAccess,
+}
+
+impl PermissionReadFilter {
+    pub fn new(
+        policy: PermissionPolicy,
+        grants: Vec<ProjectPermissionGrant>,
+        project: impl Into<String>,
+        tool: impl Into<String>,
+        access: ToolAccess,
+    ) -> Self {
+        Self {
+            policy,
+            grants,
+            project: project.into(),
+            tool: tool.into(),
+            access,
+        }
+    }
+
+    /// Whether the call may report what the project-relative `path` holds.
+    ///
+    /// Only a rule that names the file withholds it. A file no rule names
+    /// stays readable, because the call reading it was already authorized and
+    /// the unmatched fallback answered for that act, not for this file — the
+    /// alternative would empty every search run under a configuration that
+    /// names nothing. An `ask` withholds alongside a `deny`: the prompt that
+    /// would have settled it was never reached for this file.
+    pub fn permits(&self, path: &str) -> bool {
+        let request =
+            PermissionRequest::new(self.project.clone(), self.tool.clone(), path, self.access);
+
+        !matches!(
+            self.policy.stated_decision(&request, &self.grants, &[]),
+            Some(PermissionDecision::Deny | PermissionDecision::Ask)
+        )
     }
 }
 
@@ -3036,6 +3774,11 @@ pub enum TuiSubagentUpdate {
         agent: String,
         task_summary: String,
         presentation: TuiExecutionState,
+        /// What the subagent is actually running on. A delegation whose model
+        /// or effort differs from the parent's is the common case, and the
+        /// surface that hides it makes the difference impossible to notice.
+        model: Option<String>,
+        effort: Option<String>,
     },
     Reasoning(String),
     Text(String),
@@ -3067,12 +3810,26 @@ impl TuiSubagentEvent {
         task_summary: impl AsRef<str>,
         presentation: TuiExecutionState,
     ) -> Self {
+        Self::started_on(id, agent, task_summary, presentation, None, None)
+    }
+
+    /// A start that also records the model and effort the subagent runs on.
+    pub fn started_on(
+        id: u64,
+        agent: impl AsRef<str>,
+        task_summary: impl AsRef<str>,
+        presentation: TuiExecutionState,
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) -> Self {
         Self {
             id,
             update: TuiSubagentUpdate::Started {
                 agent: sanitize_projection(agent.as_ref()),
                 task_summary: sanitize_projection(task_summary.as_ref()),
                 presentation,
+                model: model.map(sanitize_projection),
+                effort: effort.map(sanitize_projection),
             },
         }
     }
@@ -3250,6 +4007,12 @@ pub struct TuiExecution {
     pub id: u64,
     pub agent: String,
     pub state: TuiExecutionState,
+    /// What this delegation runs on, once the runtime has reported it.
+    ///
+    /// A subagent routinely differs from its parent, and from its siblings, in
+    /// model. Supervising several at once means comparing them, and elapsed
+    /// time alone cannot be compared across different models.
+    pub model: Option<String>,
     pub started_at: Duration,
     pub last_activity: Duration,
     pub terminal_at: Option<Duration>,

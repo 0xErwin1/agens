@@ -1,6 +1,6 @@
 use agens_core::{
-    AgentDefinition, AgentMode, AgentModelSource, Error, HeadlessTaskTerminal, RequestConfig,
-    TaskProviderFailure, TaskSkillRejection,
+    AgentDefinition, AgentMode, AgentModelSource, Error, HeadlessTaskTerminal, PermissionRule,
+    RequestConfig, TaskProviderFailure, TaskSkillRejection,
 };
 use serde_json::Value;
 use std::{
@@ -858,6 +858,7 @@ pub struct TaskTurnRequest {
     skills: Vec<TaskSkill>,
     description: String,
     model_notice: Option<String>,
+    permission_rules: Vec<PermissionRule>,
 }
 
 impl TaskTurnRequest {
@@ -888,6 +889,10 @@ impl TaskTurnRequest {
     pub fn description(&self) -> &str {
         &self.description
     }
+
+    pub fn permission_rules(&self) -> &[PermissionRule] {
+        &self.permission_rules
+    }
 }
 
 pub struct TaskTurnResult {
@@ -895,13 +900,39 @@ pub struct TaskTurnResult {
     pub iterations: usize,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TaskRunnerError {
     Cancelled,
     TimedOut,
     ProviderFailure(TaskProviderFailure),
     IterationLimit,
     ChildFailure,
+    /// A `permissions:` entry the agent definition could not be delegated
+    /// with, named so the parent can correct the definition rather than retry
+    /// a call that will fail identically.
+    DeclarationRejected {
+        reason: TaskDeclarationRejection,
+        tool: String,
+    },
+}
+
+/// Why an agent's permission declaration could not be resolved into a child
+/// tool surface, as the parent is allowed to read it. Fixed strings, so the
+/// sanitizer guarding model-visible output keeps verifying the whole message
+/// against a closed set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TaskDeclarationRejection {
+    ExceedsParentSurface,
+    ConfigurationDenies,
+}
+
+impl TaskDeclarationRejection {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::ExceedsParentSurface => "the parent does not hold it",
+            Self::ConfigurationDenies => "the configuration denies it",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1200,6 +1231,7 @@ impl<R: TaskRunner> TaskTool<R> {
             skills,
             description: invocation.description,
             model_notice,
+            permission_rules: agent.permission_rules.clone(),
         })
     }
 
@@ -1435,7 +1467,39 @@ fn task_error_output(error: TaskRunnerError) -> ToolOutput {
         }
         TaskRunnerError::IterationLimit => task_terminal(HeadlessTaskTerminal::IterationLimit),
         TaskRunnerError::ChildFailure => task_terminal(HeadlessTaskTerminal::ChildFailure),
+        TaskRunnerError::DeclarationRejected { reason, tool } => {
+            declaration_rejected_output(&tool, reason)
+        }
     }
+}
+
+/// Names the rejected declaration and why, so the operator can edit the agent
+/// definition instead of reading an opaque runtime failure.
+///
+/// A terminal message bypasses the failure sanitizer, so the reason comes from
+/// a closed set and the tool name is emitted only when it is shaped like a tool
+/// identity — a declaration is free text and could otherwise carry host detail
+/// into model-visible output.
+fn declaration_rejected_output(tool: &str, reason: TaskDeclarationRejection) -> ToolOutput {
+    let mut output = task_terminal(HeadlessTaskTerminal::DeclarationRejected);
+    output.content.push_str(" [declaration: ");
+    output.content.push_str(if is_safe_tool_pattern(tool) {
+        tool
+    } else {
+        "[redacted]"
+    });
+    output.content.push_str("; ");
+    output.content.push_str(reason.label());
+    output.content.push(']');
+    output
+}
+
+fn is_safe_tool_pattern(tool: &str) -> bool {
+    !tool.is_empty()
+        && tool.len() <= MAX_TASK_MODEL_CHARS
+        && tool.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':' | b'*' | b'?')
+        })
 }
 
 struct TaskPanicHookGuard;
