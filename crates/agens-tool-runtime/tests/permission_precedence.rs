@@ -2043,6 +2043,14 @@ fn probe_git(root: &Path, arguments: &[&str]) {
 /// The repository keeps its metadata outside the worktree, because a probe that
 /// walks every file under the root would otherwise walk git's own storage and
 /// fail on bytes that are not text.
+///
+/// The worktree carries its own `.gitignore` re-including both files. The walk
+/// `grep` and `search` perform honors ignore files from every parent directory
+/// and the machine's `core.excludesFile`, none of which this fixture controls,
+/// so an ambient rule naming `secrets.md` would drop the denied file from the
+/// walk and leave the probe passing whether or not the tool asked the rules. A
+/// deeper ignore file outranks every shallower one, which is what makes this
+/// re-inclusion hold.
 fn worktree_holding_a_denied_secret(project_root: &Path, git_dir: &Path) {
     fs::create_dir_all(project_root).expect("the probe worktree must be creatable");
     let _ = fs::remove_dir(project_root.join(".git"));
@@ -2056,6 +2064,7 @@ fn worktree_holding_a_denied_secret(project_root: &Path, git_dir: &Path) {
         ],
     );
 
+    fs::write(project_root.join(".gitignore"), "!secrets.md\n!notes.md\n").unwrap();
     fs::write(
         project_root.join("secrets.md"),
         "OPENAI_API_KEY=placeholder\n",
@@ -2083,6 +2092,13 @@ fn worktree_holding_a_denied_secret(project_root: &Path, git_dir: &Path) {
 /// Each probe runs the real tool over a worktree holding a denied secret, under
 /// the rule that denies it, and has to come back with what it is allowed to
 /// report and without the secret. A tool that never asks reports both.
+///
+/// Each probe is run twice: once with no rule withholding anything, where the
+/// secret must come back, and once under the rule denying it, where it must
+/// not. The first run is what makes the second falsifiable — a call that never
+/// reaches the denied file at all comes back without the secret for a reason
+/// that has nothing to do with the rules, and would pass the second assertion
+/// with the tool's own check deleted.
 #[test]
 fn every_tool_this_table_says_asks_per_file_withholds_a_denied_file() {
     let temporary = agens_fixtures::session_directory("tool-surface-per-file");
@@ -2099,6 +2115,23 @@ fn every_tool_this_table_says_asks_per_file_withholds_a_denied_file() {
         };
 
         let bare = entry.tool.trim_start_matches("native::");
+        let arguments: serde_json::Value =
+            serde_json::from_str(probe.arguments).expect("a probe names its call in JSON");
+        let reached = catalog
+            .execute(
+                entry.tool,
+                arguments.clone(),
+                &ToolExecutionContext::with_timeout(Duration::from_secs(30)),
+            )
+            .unwrap_or_else(|error| panic!("{bare} must answer its probe: {error}"));
+
+        assert!(
+            reached.content.contains(PER_FILE_PROBE_SECRET),
+            "{bare} must reach the denied file when no rule withholds it, or the probe below \
+             proves nothing: {}",
+            reached.content
+        );
+
         let rule = format!("deny {bare} {}", probe.denies);
         let (policy, identity) = configured_child_policy(&configured_rules(&[&rule]), &[], bare)
             .unwrap_or_else(|| panic!("a delegated child must be able to reach {bare}"));
@@ -2112,8 +2145,6 @@ fn every_tool_this_table_says_asks_per_file_withholds_a_denied_file() {
                 ToolAccess::ReadOnly,
             ),
         );
-        let arguments =
-            serde_json::from_str(probe.arguments).expect("a probe names its call in JSON");
         let output = catalog
             .execute(entry.tool, arguments, &context)
             .unwrap_or_else(|error| panic!("{bare} must answer its probe: {error}"));
