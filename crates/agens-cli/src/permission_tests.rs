@@ -839,8 +839,8 @@ mod tests {
         else {
             panic!("ungranted MCP call should require a prompt");
         };
-        assert_ne!(context.qualified_tool_name, "files::read");
-        let canonical_name = context.qualified_tool_name.clone();
+        assert_ne!(context.tool_identity, "files::read");
+        let canonical_name = context.tool_identity.clone();
 
         let canonical = agens_core::ProjectPermissionGrant::allow(
             "project",

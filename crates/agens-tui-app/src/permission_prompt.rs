@@ -56,7 +56,7 @@ impl PermissionPrompter for TuiPermissionPrompter {
     ) -> Result<PermissionPromptAnswer, HeadlessTurnPortError> {
         {
             match self.0.wait_for_reply(
-                context.qualified_tool_name.clone(),
+                agens_core::bare_tool_name(&context.tool_identity).to_owned(),
                 render_permission_prompt(context),
                 cancellation,
             ) {
@@ -82,12 +82,18 @@ pub fn parse_permission_prompt_answer(value: &str) -> Option<PermissionPromptAns
     }
 }
 
+/// Renders the question a person answers.
+///
+/// The tool is named the way a rule names it rather than by the dispatcher's
+/// own identity for it, because the person answering has to recognize the tool
+/// and may want to write a rule about it afterwards. The identity keeps
+/// deciding the grant; it is only unfit to be read.
 pub fn render_permission_prompt(context: &PermissionPromptContext) -> String {
     format!(
         "Permission required for {} ({:?})\nTarget: {}\n[a]llow once, allow [always], [d]eny once, deny [always], or [c]ancel: ",
-        context.qualified_tool_name,
+        agens_core::bare_tool_name(&context.tool_identity),
         context.access,
-        sanitize_permission_target(&context.qualified_tool_name, &context.target_identifier),
+        sanitize_permission_target(&context.tool_identity, &context.target_identifier),
     )
 }
 
@@ -238,7 +244,7 @@ mod tests {
             );
             let decision = run_ready(resolver.resolve(&call, &cancellation));
             let (request, replied) = reply.join().expect("TUI permission reply should finish");
-            assert!(request.details().0.starts_with("native:"));
+            assert_eq!(request.details().0, "read");
             assert!(request.details().1.contains("notes.md"));
             assert!(replied);
 
@@ -315,21 +321,21 @@ mod tests {
 
         let prompt = render_permission_prompt(&agens_tools::PermissionPromptContext {
             project_id: "project".into(),
-            qualified_tool_name: "native::webfetch".into(),
+            tool_identity: "native::webfetch".into(),
             target_identifier:
                 "https://user:SENTINEL_URL_SECRET@example.test/path?token=SENTINEL_TOKEN".into(),
             access: agens_core::ToolAccess::ReadOnly,
             reason: "permission policy requires confirmation".into(),
         });
 
-        assert!(prompt.contains("native::webfetch"));
+        assert!(prompt.contains("Permission required for webfetch"));
         assert!(prompt.contains("https://example.test/path"));
         assert!(!prompt.contains("SENTINEL_URL_SECRET"));
         assert!(!prompt.contains("SENTINEL_TOKEN"));
 
         let prompt = render_permission_prompt(&agens_tools::PermissionPromptContext {
             project_id: "project".into(),
-            qualified_tool_name: "native::webfetch".into(),
+            tool_identity: "native::webfetch".into(),
             target_identifier:
                 "https://user:SENTINEL_URL_SECRET@example.test?token=SENTINEL_TOKEN#fragment".into(),
             access: agens_core::ToolAccess::ReadOnly,
@@ -343,7 +349,7 @@ mod tests {
 
         let prompt = render_permission_prompt(&agens_tools::PermissionPromptContext {
             project_id: "project".into(),
-            qualified_tool_name: "native::webfetch".into(),
+            tool_identity: "native::webfetch".into(),
             target_identifier: r#"{"url":"https://example.test","token":"SENTINEL_JSON"}"#.into(),
             access: agens_core::ToolAccess::ReadOnly,
             reason: "permission policy requires confirmation".into(),
@@ -351,5 +357,82 @@ mod tests {
 
         assert!(prompt.contains("Target: [redacted]"));
         assert!(!prompt.contains("SENTINEL_JSON"));
+    }
+
+    /// A `bash` prompt withholds the command line, and the context it is asked
+    /// about comes from the dispatcher rather than from a literal written here.
+    ///
+    /// A prompt context carries the dispatcher's own identity for the tool
+    /// (`native:4:bash`), not the qualified name a rule is written in. A guard
+    /// comparing it against `"native::bash"` reads as redacting and redacts
+    /// nothing, and a test constructing the context by hand cannot see that —
+    /// it writes down whichever spelling makes the guard fire. So the context
+    /// here is built the way production builds it: register the tool, evaluate
+    /// a call against a policy that asks, and prompt with what comes back.
+    #[test]
+    fn a_prompt_for_a_bash_call_withholds_the_command_the_dispatcher_named_it_by() {
+        struct BashLikeTool;
+
+        impl DispatchTool for BashLikeTool {
+            fn permission_target(
+                &self,
+                arguments: &serde_json::Value,
+            ) -> Result<String, agens_core::Error> {
+                Ok(arguments["command"].as_str().unwrap_or_default().to_owned())
+            }
+
+            fn execute(
+                &mut self,
+                _: &ToolExecutionContext,
+                _: serde_json::Value,
+            ) -> Result<ToolOutput, agens_core::Error> {
+                Ok(ToolOutput::success("unused"))
+            }
+        }
+
+        let mut dispatcher = ToolDispatcher::new();
+        dispatcher
+            .register_native("native::bash", agens_core::ToolAccess::Write, BashLikeTool)
+            .expect("the probe dispatcher must accept the tool");
+
+        let policy = PermissionPolicy::new(
+            PermissionMode::Edit,
+            vec![PermissionRule::global(
+                PermissionDecision::Ask,
+                PermissionPattern::Exact("native::bash".into()),
+                PermissionPattern::Any,
+            )],
+        );
+        let outcome = dispatcher
+            .evaluate(
+                &policy,
+                &[],
+                &PermissionSession::new(),
+                agens_tools::ToolDispatchRequest::new(
+                    "project",
+                    "bash",
+                    serde_json::json!({"command": "curl -H 'Bearer SENTINEL_COMMAND'"}),
+                ),
+            )
+            .expect("the call must be decidable");
+        let agens_tools::ToolEvaluationOutcome::PromptRequired(context) = outcome else {
+            panic!("a rule that asks must produce a prompt: {outcome:?}");
+        };
+
+        let prompt = render_permission_prompt(&context);
+
+        assert!(
+            prompt.contains("[command redacted]"),
+            "a bash prompt must withhold the command line it was asked about: {prompt}"
+        );
+        assert!(
+            !prompt.contains("SENTINEL_COMMAND"),
+            "the command line must not reach the prompt at all: {prompt}"
+        );
+        assert!(
+            prompt.contains("bash") && !prompt.contains("native:4:"),
+            "the prompt has to name the tool the way a rule names it, not by the dispatcher's \
+             own encoding: {prompt}"
+        );
     }
 }

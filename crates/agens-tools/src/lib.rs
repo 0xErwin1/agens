@@ -3359,7 +3359,13 @@ impl ToolDispatchRequest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PermissionPromptContext {
     pub project_id: String,
-    pub qualified_tool_name: String,
+    /// The dispatcher's own identity for the tool (`native:4:bash`), which is
+    /// what policy compares against and what a grant is stored under.
+    ///
+    /// It is deliberately not a qualified name: it equals no spelling a rule or
+    /// a person writes, so anything deciding on it — a redaction, a display —
+    /// has to reduce it through [`agens_core::bare_tool_name`] first.
+    pub tool_identity: String,
     pub target_identifier: String,
     pub access: ToolAccess,
     pub reason: String,
@@ -3369,7 +3375,7 @@ impl PermissionPromptContext {
     fn from_request(request: &PermissionRequest) -> Self {
         Self {
             project_id: request.project.clone(),
-            qualified_tool_name: request.tool.clone(),
+            tool_identity: request.tool.clone(),
             target_identifier: request.target.clone(),
             access: request.access,
             reason: "permission policy requires confirmation".into(),

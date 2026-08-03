@@ -543,7 +543,7 @@ impl<P: PermissionPrompter> HeadlessPermissionResolver for ProductionPermissionR
                 PermissionPromptAnswer::AllowOnce => {
                     let grant = agens_core::ProjectPermissionGrant::allow(
                         context.project_id,
-                        PermissionPattern::Exact(context.qualified_tool_name),
+                        PermissionPattern::Exact(context.tool_identity),
                         PermissionPattern::Exact(context.target_identifier),
                     );
                     self.authorize_prompted_allow(call, Some(grant))?
@@ -558,7 +558,7 @@ impl<P: PermissionPrompter> HeadlessPermissionResolver for ProductionPermissionR
                     let grant = agens_core::ProjectPermissionGrant::new(
                         context.project_id,
                         decision,
-                        PermissionPattern::Exact(context.qualified_tool_name),
+                        PermissionPattern::Exact(context.tool_identity),
                         PermissionPattern::Exact(context.target_identifier),
                     );
                     self.grant_store
@@ -760,8 +760,14 @@ fn parse_tool_input(call: &HeadlessToolCall) -> Result<serde_json::Value, Headle
     serde_json::from_str(&call.input).map_err(|_| HeadlessTurnPortError::Tool)
 }
 
+/// Reduces a target to what may be shown for it.
+///
+/// `tool` is whatever spelling the caller holds, including a dispatcher
+/// identity, so it is reduced through [`agens_core::bare_tool_name`] before
+/// anything is decided on it. A `bash` target is the command line itself and is
+/// withheld whole: there is no part of it this can be sure carries no secret.
 pub fn sanitize_permission_target(tool: &str, target: &str) -> String {
-    if tool == "native::bash" {
+    if agens_core::bare_tool_name(tool) == "bash" {
         return "[command redacted]".into();
     }
 

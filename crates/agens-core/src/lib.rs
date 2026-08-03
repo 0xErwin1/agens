@@ -2586,9 +2586,16 @@ impl PermissionRequest {
     }
 }
 
-/// Reduces any spelling of a tool — bare, qualified, or a dispatcher identity
-/// (`native:13:native::bash`) — to the name a rule is written against.
-fn bare_tool_name(tool: &str) -> &str {
+/// Reduces any spelling of a tool to the name a rule is written against:
+/// `bash`, `native::bash`, and the dispatcher's own identity for it,
+/// `native:4:bash`.
+///
+/// Anything reading a value that reached it from a dispatcher has to come
+/// through here rather than compare against a qualified name directly. The
+/// identity is what a `PermissionRequest` and a `PermissionPromptContext`
+/// carry, and it equals no spelling anyone writes down, so a guard testing it
+/// against `"native::bash"` silently never fires.
+pub fn bare_tool_name(tool: &str) -> &str {
     let qualified = tool
         .strip_prefix("native:")
         .and_then(|rest| rest.split_once(':'))
