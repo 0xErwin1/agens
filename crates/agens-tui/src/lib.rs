@@ -72,6 +72,7 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Borders, Padding, Paragraph, Wrap},
 };
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const TRANSCRIPT_CONTENT_INDENT: u16 = 4;
@@ -1787,13 +1788,16 @@ fn render_frame_content(frame: &mut ratatui::Frame<'_>, state: &ViewState<'_>) {
 
     let composer_color = widgets::RolePalette::muted();
     if layout.composer.height > 0 && state.active_transcript == TranscriptId::Main {
-        let (cursor_line, cursor_column) = cursor_position(state.input, state.input_cursor);
         // Two borders plus the column of padding that puts typed text in the
         // same column as the prose above it.
-        let inner_width = usize::from(layout.composer.width.saturating_sub(3).max(1));
-        let inner_height = usize::from(layout.composer.height.saturating_sub(2).max(1));
+        let visible_inner_width = layout.composer.width.saturating_sub(3);
+        let visible_inner_height = layout.composer.height.saturating_sub(2);
+        let inner_width = usize::from(visible_inner_width.max(1));
+        let inner_height = usize::from(visible_inner_height.max(1));
+        let composer_layout = composer_layout(state.input, state.input_cursor, inner_width);
+        let cursor_line = composer_layout.cursor_line;
+        let cursor_column = composer_layout.cursor_column;
         let vertical_scroll = cursor_line.saturating_sub(inner_height.saturating_sub(1));
-        let horizontal_scroll = cursor_column.saturating_sub(inner_width.saturating_sub(1));
         let mut composer = Block::default()
             .borders(Borders::ALL)
             .padding(Padding::left(1))
@@ -1802,14 +1806,13 @@ fn render_frame_content(frame: &mut ratatui::Frame<'_>, state: &ViewState<'_>) {
             composer = composer.title_bottom(metrics);
         }
         frame.render_widget(
-            Paragraph::new(state.input).block(composer).scroll((
-                saturating_u16(vertical_scroll),
-                saturating_u16(horizontal_scroll),
-            )),
+            Paragraph::new(composer_layout.text)
+                .block(composer)
+                .scroll((saturating_u16(vertical_scroll), 0)),
             layout.composer,
         );
-        if inner_width > 0
-            && inner_height > 0
+        if visible_inner_width > 0
+            && visible_inner_height > 0
             && state.focus == TranscriptFocus::Composer
             && !state.running
             && !state.session_loading
@@ -1821,11 +1824,10 @@ fn render_frame_content(frame: &mut ratatui::Frame<'_>, state: &ViewState<'_>) {
                 .y
                 .saturating_add(1)
                 .saturating_add(saturating_u16(cursor_line.saturating_sub(vertical_scroll)));
-            let cursor_x = layout.composer.x.saturating_add(saturating_u16(
-                cursor_column
-                    .saturating_sub(horizontal_scroll)
-                    .saturating_add(2),
-            ));
+            let cursor_x = layout
+                .composer
+                .x
+                .saturating_add(saturating_u16(cursor_column.saturating_add(2)));
             frame.set_cursor_position((cursor_x, cursor_y));
         }
     }
@@ -3572,22 +3574,27 @@ fn bottom_chrome(width: u16, height: u16) -> BottomChrome {
     }
 }
 
-fn composer_rows(height: u16, input: &str) -> u16 {
+fn composer_rows(height: u16, input: &str, width: usize) -> u16 {
     match height {
         0 => 0,
         1 => 1,
         2..=6 => 2,
         7..=11 => 3,
-        _ => {
-            let input_lines = input.chars().filter(|character| *character == '\n').count() + 1;
-            saturating_u16(input_lines.saturating_add(2)).clamp(3, 8)
-        }
+        _ => saturating_u16(
+            composer_layout(input, input.chars().count(), width)
+                .rows
+                .saturating_add(2),
+        )
+        .clamp(3, 8),
     }
 }
 
 fn screen_layout(area: Rect, input: &str) -> ScreenLayout {
     let area = conversation_surface(area);
-    let composer_rows = composer_rows(area.height, input).min(area.height);
+    let gutter = chrome_gutter(area.width);
+    let composer_width = area.width.saturating_sub(gutter.saturating_mul(2));
+    let inner_width = usize::from(composer_width.saturating_sub(3).max(1));
+    let composer_rows = composer_rows(area.height, input, inner_width).min(area.height);
     let chrome =
         bottom_chrome(area.width, area.height).fitted(area.height.saturating_sub(composer_rows));
     let transcript_rows = area
@@ -4763,18 +4770,80 @@ const fn execution_state_glyph(state: TuiExecutionState) -> widgets::Glyph {
     }
 }
 
-fn cursor_position(input: &str, cursor: usize) -> (usize, usize) {
+struct ComposerLayout {
+    text: String,
+    cursor_line: usize,
+    cursor_column: usize,
+    rows: usize,
+}
+
+fn composer_layout(input: &str, cursor: usize, width: usize) -> ComposerLayout {
+    let width = width.max(1);
+    let cursor = cursor.min(input.chars().count());
+    let mut text = String::with_capacity(input.len());
+    let mut character_index = 0_usize;
     let mut line = 0;
-    let mut current_line = String::new();
-    for character in input.chars().take(cursor) {
-        if character == '\n' {
+    let mut column = 0;
+    let mut cursor_position = None;
+
+    for grapheme in input.graphemes(true) {
+        let grapheme_end = character_index.saturating_add(grapheme.chars().count());
+        if grapheme.ends_with('\n') {
+            if cursor >= character_index && cursor < grapheme_end {
+                cursor_position = Some(wrapped_cursor_position(line, column, width));
+            }
+
+            text.push_str(grapheme);
+            character_index = grapheme_end;
             line += 1;
-            current_line.clear();
-        } else {
-            current_line.push(character);
+            column = 0;
+            continue;
         }
+
+        let grapheme_width = grapheme.width();
+        if column > 0 && column.saturating_add(grapheme_width) > width {
+            text.push('\n');
+            line += 1;
+            column = 0;
+        }
+        if cursor >= character_index && cursor < grapheme_end {
+            let prefix_characters = cursor.saturating_sub(character_index);
+            let prefix_end = grapheme
+                .char_indices()
+                .nth(prefix_characters)
+                .map_or(grapheme.len(), |(index, _)| index);
+            let prefix_width = grapheme[..prefix_end].width().min(width);
+            cursor_position = Some(wrapped_cursor_position(
+                line,
+                column.saturating_add(prefix_width),
+                width,
+            ));
+        }
+
+        let rendered_grapheme = if grapheme_width > width {
+            "\u{fffd}"
+        } else {
+            grapheme
+        };
+        text.push_str(rendered_grapheme);
+        character_index = grapheme_end;
+        column = column.saturating_add(grapheme_width.min(width));
     }
-    (line, Line::from(current_line).width())
+
+    let (cursor_line, cursor_column) =
+        cursor_position.unwrap_or_else(|| wrapped_cursor_position(line, column, width));
+    let rows = line.saturating_add(1).max(cursor_line.saturating_add(1));
+
+    ComposerLayout {
+        text,
+        cursor_line,
+        cursor_column,
+        rows,
+    }
+}
+
+fn wrapped_cursor_position(line: usize, column: usize, width: usize) -> (usize, usize) {
+    (line.saturating_add(column / width), column % width)
 }
 
 fn saturating_u16(value: usize) -> u16 {
@@ -12544,6 +12613,96 @@ mod runtime_tests {
                 layout.composer
             );
         }
+    }
+
+    #[test]
+    fn composer_soft_wraps_long_unicode_input_without_horizontal_scroll() {
+        let input = "abcdefghijklmnop🙂qrstuvwxyz";
+        let wrapped = composer_layout(input, input.chars().count(), 21);
+        assert_eq!(wrapped.text, "abcdefghijklmnop🙂qrs\ntuvwxyz");
+        assert_eq!((wrapped.cursor_line, wrapped.cursor_column), (1, 7));
+
+        let before_wrapped_emoji = composer_layout("abcdefghijklmnopqrst🙂", 20, 21);
+        assert_eq!(
+            (
+                before_wrapped_emoji.cursor_line,
+                before_wrapped_emoji.cursor_column,
+            ),
+            (1, 0)
+        );
+
+        let family = "👩‍👩‍👧‍👦";
+        let family_input = format!("abcdefghijklmnopqrst{family}");
+        let wrapped_family = composer_layout(&family_input, family_input.chars().count(), 21);
+        assert_eq!(
+            wrapped_family.text,
+            format!("abcdefghijklmnopqrst\n{family}")
+        );
+        assert_eq!(
+            (wrapped_family.cursor_line, wrapped_family.cursor_column),
+            (1, 2)
+        );
+
+        let combining_mark = composer_layout("e\u{301}", 1, 10);
+        assert_eq!(
+            (combining_mark.cursor_line, combining_mark.cursor_column),
+            (0, 1)
+        );
+
+        let windows_lines = composer_layout("a\r\nb", 4, 10);
+        assert_eq!(windows_lines.text, "a\r\nb");
+        assert_eq!(
+            (windows_lines.cursor_line, windows_lines.cursor_column),
+            (1, 1)
+        );
+        assert_eq!(windows_lines.rows, 2);
+
+        let layout = screen_layout(Rect::new(0, 0, 30, 12), input);
+        assert_eq!(layout.composer.height, 4);
+
+        let mut tui = Tui::new(NoopEngine);
+        assert_eq!(tui.handle(Event::Paste(input.into())), Action::Render);
+        let terminal = RatatuiTerminal::new(ratatui::backend::TestBackend::new(30, 12)).unwrap();
+        let mut renderer = RatatuiRenderer::new(terminal);
+        renderer.render(tui.view()).unwrap();
+        let rendered = renderer
+            .terminal()
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("abcdefghijklmnop"), "{rendered:?}");
+        assert!(rendered.contains("tuvwxyz"), "{rendered:?}");
+    }
+
+    #[test]
+    fn composer_replaces_a_grapheme_that_cannot_fit_the_viewport() {
+        let narrow_emoji = composer_layout("🙂", 1, 1);
+        assert_eq!(narrow_emoji.text, "\u{fffd}");
+        assert_eq!(
+            (narrow_emoji.cursor_line, narrow_emoji.cursor_column),
+            (1, 0)
+        );
+        assert_eq!(narrow_emoji.rows, 2);
+
+        let mut tui = Tui::new(NoopEngine);
+        assert_eq!(tui.handle(Event::Paste("🙂".into())), Action::Render);
+        let terminal = RatatuiTerminal::new(ratatui::backend::TestBackend::new(4, 12)).unwrap();
+        let mut renderer = RatatuiRenderer::new(terminal);
+        renderer.render(tui.view()).unwrap();
+        let rendered = renderer
+            .terminal()
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains('\u{fffd}'), "{rendered:?}");
     }
 
     fn secret_entry_view() -> SecretEntryView {
