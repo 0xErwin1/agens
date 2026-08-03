@@ -2174,8 +2174,10 @@ fn every_native_registered_beside_the_catalog_is_named_by_the_list_that_resolves
 /// It decides nothing else here, and two things it is easy to assume it decides
 /// it does not: the fallback for a call no rule matched is settled by the
 /// unmatched override, the session's bypass and the mode, none of which read
-/// access; and the automatic grant a delegated subagent runs under is a
-/// hard-coded list of six names in `child_catalog`, which excludes
+/// access; and the automatic grant a delegated subagent runs under is a list of
+/// names in `child_catalog` rather than a class — `AUTO_ALLOW_NATIVE_TOOLS`'
+/// six, plus whichever of the two `CHILD_COORDINATION_TOOLS` this delegation's
+/// own rules leave reachable, so eight at most and six at least. It excludes
 /// `native::webfetch` precisely because that tool is `ReadOnly` and the class
 /// is the wrong predicate for it.
 const ACCESS_OF_THE_NATIVES_REGISTERED_BESIDE_THE_CATALOG: [(&str, ToolAccess); 4] = [
@@ -2245,10 +2247,15 @@ fn every_native_beside_the_catalog_has_its_access_written_down_and_held_by_the_c
 /// The probe dispatcher holds each native under the access class production
 /// registers it by, not merely under the same name.
 ///
-/// Access decides what an unmatched call falls back to, so a harness holding a
-/// write tool as read-class answers a whole region of cases differently from
-/// the session it stands in for. This asks the probe dispatcher itself, and
-/// compares its answers against two statements neither it nor
+/// Access is what the `ChatWrite` predicate refuses on, above every rule, so a
+/// harness holding a write tool as read-class runs in chat mode a call the
+/// session it stands in for would refuse outright — and answers every
+/// hard-safety case differently. It does not decide the fallback for an
+/// unmatched call; the statement above
+/// [`ACCESS_OF_THE_NATIVES_REGISTERED_BESIDE_THE_CATALOG`] says what does.
+///
+/// This asks the probe dispatcher itself, and compares its answers against two
+/// statements neither it nor
 /// [`production_parent_natives`] is derived from: the catalog's own declared
 /// access for the ten it holds, and
 /// [`ACCESS_OF_THE_NATIVES_REGISTERED_BESIDE_THE_CATALOG`] for the four it does
@@ -2370,12 +2377,24 @@ fn every_native_tool_that_returns_file_contents_is_reached_by_a_path_rule() {
     let mut still_native = with_a_remote_tool.registered_native_names();
     still_native.sort_unstable();
 
+    // This does not guard the registration. `register_mcp` cannot produce a
+    // `native:`-prefixed identity by any path, so no change there reaches this
+    // assertion, and it is not standing in for the MCP surface being left
+    // undecided — that is executed by
+    // `no_path_rule_reaches_an_mcp_tool_and_naming_the_tool_refuses_every_call`.
+    //
+    // What it guards is `registered_native_names`, which is how every list
+    // above reads a dispatcher's surface: it must report the natives of a
+    // dispatcher that holds both kinds and nothing else. It tells them apart
+    // twice over — by the `native:` prefix and by the length header matching
+    // the name — and either check alone already excludes a remote identity, so
+    // this fails only when a reader loses both. That is a real edit and a
+    // narrow guard, not a broad one.
     assert_eq!(
         still_native, classified,
-        "this table classifies the native surface, and a remote tool joins the same dispatcher \
-         without joining it; what that leaves undecided is executed by \
-         `no_path_rule_reaches_an_mcp_tool_and_naming_the_tool_refuses_every_call` rather than \
-         left to this table's silence"
+        "a dispatcher holding both kinds has to report the native surface this table classifies \
+         and nothing else, or every list derived from `registered_native_names` is reading a \
+         surface it was not asked about"
     );
 }
 
@@ -2537,6 +2556,12 @@ fn both_spellings_of_a_tool_of_a_declared_absent_server_resolve_and_bind_when_it
 }
 
 /// Nothing beyond that is softened, and both spellings refuse in step.
+///
+/// "Refuses" is refusing to build the policy, which is not one moment on both
+/// surfaces: `agens chat` builds it for the turn it was asked to run, so the
+/// command fails, while the TUI builds it inside its own submit path, so the
+/// session starts and every prompt fails instead. Neither runs a call under a
+/// rule it could not resolve, which is what this pins.
 ///
 /// A tool name misspelt against a server this session DOES hold has a live
 /// surface to be checked against. A name for a server the configuration never
