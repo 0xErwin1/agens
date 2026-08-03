@@ -103,8 +103,8 @@ effort = "high"
 #      decides whether the diff runs at all and says nothing about which files
 #      it may report.
 #
-# Three tools that can return the contents of a file do neither, each for its
-# own reason:
+# Four kinds of call that can return the contents of a file do neither, each for
+# its own reason:
 #
 #   * `bash` — a rule written for it is matched against the command line rather
 #     than against any path, and the command chooses what it prints. Granting it
@@ -113,18 +113,29 @@ effort = "high"
 #     one by its target. Skills come from two roots. A skill installed under
 #     `<project-root>/.agens/skills/` reports the file the call would open, so
 #     `deny skill(**/.agens/**)` refuses it. A skill installed beside this file
-#     is outside the worktree and has no path a rule here can name, and there
-#     the exception stands — bounded by what the tool can open: a skill's files
-#     are read relative to that skill's own directory, under a single plain
-#     filename with no traversal, refusing symbolic links and files carrying
-#     more than one link. It returns that skill's own installed assets and
-#     nothing else.
+#     normally has no path a rule here can name, and there the exception stands
+#     — bounded by what the tool can open: a skill's files are read relative to
+#     that skill's own directory, under a single plain filename with no
+#     traversal, refusing symbolic links and files carrying more than one link.
+#     It returns that skill's own installed assets and nothing else. The
+#     exception is a property of the two paths, not of the origin: where this
+#     file's own directory sits under the session's root, a global skill has a
+#     project-relative path too and a deny here binds it.
 #   * `task` — named by the subagent it resolves to, so `deny task(reviewer)`
 #     refuses every delegation to that agent and no rule written against a path
 #     selects one. What it returns is whatever the subagent reports, which no
 #     rule here reaches — but the subagent read those files under these same
 #     rules, so a file denied below was already withheld before the report was
 #     written.
+#   * MCP tools — a remote tool is named `<server>::<tool>`, and what its
+#     arguments mean is defined by the server serving it, so agens cannot tell
+#     which file, if any, a call would read. There is no path to decide, and a
+#     rule written against one binds the tool and then selects none of its
+#     calls: `deny filesystem::read_text_file(**/.env)` resolves and matches
+#     nothing ever after. The rule that binds names the tool and no target —
+#     `deny filesystem::read_text_file`. So if a configured server can read
+#     files, it can read the ones denied below, and nothing in this block stops
+#     it; see the `[mcp.*]` examples further down.
 #
 # Apply the same test to any tool added later — if it can return the contents of
 # a file and does neither of the two, no deny here binds it, and it belongs on
@@ -180,6 +191,12 @@ ask = [
 
 # MCP server definitions are global-only. Uncomment and adapt one or more of
 # these examples in the global configuration.
+#
+# A server you configure here is trusted to the extent of what it can do. No
+# `deny` in the `[permissions]` block above reaches its tools by path — the
+# filesystem server below can read every file denied there, because agens cannot
+# tell which file one of its calls names. The rules that reach it name its tools
+# instead, one to a rule: `deny filesystem::read_text_file`.
 #
 # [mcp.filesystem]
 # transport = "stdio"

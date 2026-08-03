@@ -1740,6 +1740,18 @@ struct SurfaceEntry {
 
 /// The whole registered native surface, classified.
 ///
+/// **Scope.** This table covers every native tool a production dispatcher
+/// registers, in any configuration, and nothing else. It does not cover the
+/// remote tools an MCP server supplies, which share the primary dispatcher with
+/// these and are the one other thing on it that can return the contents of a
+/// file. That omission is a decision, not an oversight: a remote tool's
+/// arguments are defined by the server serving it, so nothing here can say
+/// which file a given call would read, and there is no path to decide. The
+/// whole class is therefore reached by no rule written against a path, which
+/// [`no_path_rule_reaches_an_mcp_tool_and_naming_the_tool_refuses_every_call`]
+/// executes and [`every_native_tool_that_returns_file_contents_is_reached_by_a_path_rule`]
+/// keeps outside this table on purpose rather than by omission.
+///
 /// This table exists because the enumeration is what keeps being got wrong: a
 /// tool that returns the contents of a file and is decided neither way is a
 /// path deny that does not bind, and repeated passes over this surface each
@@ -1891,9 +1903,11 @@ const TOOL_SURFACE: &[SurfaceEntry] = &[
         unbound: Some(
             "a skill call is named by a skill name rather than by a path. A skill discovered \
              under the project root reports the file it would open, so a rule naming that file \
-             selects the call — but a skill discovered beside the global configuration lives \
-             outside the worktree and has no project-relative path for a rule to name, and for \
-             those the exception stands. It is bounded rather than closed by what the tool can \
+             selects the call — but a skill discovered beside the global configuration ordinarily \
+             has no project-relative path for a rule to name, and for those the exception stands. \
+             It rests on where the two roots sit rather than on the origin: a global skills root \
+             that happens to lie under the project root does have such a spelling, and a rule \
+             naming it binds. It is bounded rather than closed by what the tool can \
              open: a skill's files are read relative to that skill's own directory descriptor, \
              under a single normal filename with no traversal, rejecting symbolic links and \
              files carrying more than one link, so the only files it can return are the ones \
@@ -2206,6 +2220,108 @@ fn every_native_tool_that_returns_file_contents_is_reached_by_a_path_rule() {
             "{bare} is matched under the wrong target shape"
         );
     }
+
+    let mut with_a_remote_tool = native_dispatcher();
+    with_a_remote_tool
+        .register_mcp(&probe_remote_metadata(), probe_remote_tool())
+        .expect("the probe dispatcher must accept the remote tool");
+    let mut still_native = with_a_remote_tool.registered_native_names();
+    still_native.sort_unstable();
+
+    assert_eq!(
+        still_native, classified,
+        "this table classifies the native surface, and a remote tool joins the same dispatcher \
+         without joining it; what that leaves undecided is executed by \
+         `no_path_rule_reaches_an_mcp_tool_and_naming_the_tool_refuses_every_call` rather than \
+         left to this table's silence"
+    );
+}
+
+/// The metadata one remote tool arrives with, named the way a rule naming it
+/// has to be written: `<server>::<tool>`.
+fn probe_remote_metadata() -> agens_tools::RemoteToolMetadata {
+    agens_tools::RemoteToolMetadata {
+        qualified_name: PROBE_REMOTE_TOOL.into(),
+        server_name: "probe".into(),
+        tool_name: "read_text_file".into(),
+        description: None,
+        input_schema: serde_json::json!({"type": "object"}),
+        access: agens_tools::RemoteToolAccess::ReadOnly,
+    }
+}
+
+/// The production adapter a remote tool reaches the dispatcher through. Its
+/// registry is empty because no probe here executes the call — what is under
+/// test is the target and the reach the adapter projects, which it decides
+/// without consulting the server.
+fn probe_remote_tool() -> agens_dispatch::RegisteredMcpTool {
+    agens_dispatch::RegisteredMcpTool {
+        name: PROBE_REMOTE_TOOL.into(),
+        registry: Arc::new(Mutex::new(agens_tools::McpRegistry::new())),
+    }
+}
+
+const PROBE_REMOTE_TOOL: &str = "probe::read_text_file";
+
+/// What a rule can and cannot decide about a remote tool, and why
+/// [`TOOL_SURFACE`] stops where it does.
+///
+/// A remote tool's arguments are defined by the server that serves it. Nothing
+/// in agens can say which file — if any — `{"path": "src/.env"}` names to that
+/// server, so the adapter projects the tool's own name as the target and
+/// reports no reach at all. A rule written against a path therefore resolves
+/// cleanly at startup, binds to this tool, and then selects no call it ever
+/// makes.
+///
+/// What does bind is a rule naming the tool: with no target it refuses every
+/// call, and with the tool's own name as the target it refuses them the same
+/// way, because that name is what each call is matched against. This is the
+/// whole class — every MCP tool is decided this way, whatever it returns.
+#[test]
+fn no_path_rule_reaches_an_mcp_tool_and_naming_the_tool_refuses_every_call() {
+    let arguments = serde_json::json!({"path": "src/.env"});
+
+    for (entry, denied) in [
+        (format!("deny {PROBE_REMOTE_TOOL} **/.env"), false),
+        (format!("deny {PROBE_REMOTE_TOOL} src/.env"), false),
+        (format!("deny {PROBE_REMOTE_TOOL}"), true),
+        (
+            format!("deny {PROBE_REMOTE_TOOL} {PROBE_REMOTE_TOOL}"),
+            true,
+        ),
+    ] {
+        let mut dispatcher = ToolDispatcher::new();
+        dispatcher
+            .register_mcp(&probe_remote_metadata(), probe_remote_tool())
+            .expect("the probe dispatcher must accept the remote tool");
+        let dispatcher = Arc::new(Mutex::new(dispatcher));
+
+        let policy = permission_policy(
+            &configured_entries(&[&entry]),
+            "project",
+            PermissionMode::Edit,
+            &dispatcher,
+            None,
+        )
+        .expect("a rule naming a registered remote tool must resolve");
+        let outcome = dispatcher
+            .lock()
+            .expect("dispatcher must be available")
+            .evaluate(
+                &policy,
+                &[],
+                &PermissionSession::new(),
+                ToolDispatchRequest::new("project", PROBE_REMOTE_TOOL, arguments.clone()),
+            )
+            .expect("the call must be decidable");
+
+        assert_eq!(
+            matches!(outcome, ToolEvaluationOutcome::Denied),
+            denied,
+            "`{entry}` must {} a call carrying {arguments}",
+            if denied { "refuse" } else { "not select" }
+        );
+    }
 }
 
 /// The secret a probe must never report. It is written into the working tree
@@ -2254,9 +2370,14 @@ fn probe_git(root: &Path, arguments: &[&str]) {
 /// `grep` and `search` perform honors ignore files from every parent directory
 /// and the machine's `core.excludesFile`, none of which this fixture controls,
 /// so an ambient rule naming `secrets.md` would drop the denied file from the
-/// walk and leave the probe passing whether or not the tool asked the rules. A
-/// deeper ignore file outranks every shallower one, which is what makes this
-/// re-inclusion hold.
+/// walk and leave the probe passing whether or not the tool asked the rules.
+///
+/// The re-inclusion narrows that, and does not close it: a deeper file outranks
+/// a shallower one only within its own ignore category, so an ancestor `.ignore`
+/// still outranks this `.gitignore`. What actually makes the probes falsifiable
+/// is that each of them first runs with no rule withholding anything and has to
+/// come back holding the secret; a walk that never reached the file fails there
+/// rather than passing the assertion that follows.
 fn worktree_holding_a_denied_secret(project_root: &Path, git_dir: &Path) {
     fs::create_dir_all(project_root).expect("the probe worktree must be creatable");
     let _ = fs::remove_dir(project_root.join(".git"));
@@ -2503,9 +2624,12 @@ fn every_tool_this_table_says_a_rule_reaches_past_its_target_is_denied_by_naming
 /// `skill` row says it does: it binds the project skill and leaves the global
 /// one to the bound on what the tool can open.
 ///
-/// This is the exception's residual, executed rather than asserted. A skill
-/// installed beside the global configuration lives outside the worktree, so the
-/// file it opens has no project-relative spelling for a rule to name.
+/// This is the exception's residual, executed rather than asserted. The global
+/// root of this fixture sits outside the project root, as a global skills
+/// directory ordinarily does, so the file that skill opens has no
+/// project-relative spelling for a rule to name. Where the two roots are nested
+/// the other way the spelling exists and the rule binds, which is why the
+/// exception is stated over the paths rather than over the origin.
 #[test]
 fn one_path_rule_reaches_a_project_skills_files_and_not_a_global_skills() {
     let temporary = agens_fixtures::session_directory("skill-reach-residual");
