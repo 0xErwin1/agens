@@ -89,6 +89,8 @@ pub struct ChildToolSurface {
     /// The coordination tools the declarations leave reachable, in
     /// [`CHILD_NON_CATALOG_TOOLS`] order.
     pub coordination_tools: Vec<&'static str>,
+    /// The parent's MCP tool identities the declarations leave reachable.
+    pub remote_tools: Vec<String>,
     pub rules: Vec<PermissionRule>,
     pub configured_floor: ConfiguredFloor,
 }
@@ -111,15 +113,24 @@ pub struct ChildToolSurface {
 /// path holds the same floor over the same rules, which is what keeps the two
 /// from answering a configured rule differently; the one deliberate difference
 /// is that a configured `allow` authorizes there and not here.
+/// `remote_tools` are the MCP identities the parent has already connected.
+/// They belong to the surface for the same reason the natives do — they are
+/// tools the child will hold — and being here is what lets a definition scope
+/// them. Grafting them on after this function returns would leave `allow
+/// engram::mem_search` rejected as exceeding a surface that simply had not
+/// been told about it yet, so an agent could hold every remote tool or none,
+/// but never the ones it named.
 pub fn resolve_child_surface(
     parent_rules: &[PermissionRule],
     declarations: &[PermissionRule],
+    remote_tools: &[String],
 ) -> Result<ChildToolSurface, ChildSurfaceRejection> {
     let metadata = NativeToolCatalog::metadata();
     let surface = metadata
         .iter()
         .map(|entry| entry.qualified_name.as_str())
         .chain(CHILD_NON_CATALOG_TOOLS)
+        .chain(remote_tools.iter().map(String::as_str))
         .collect::<Vec<_>>();
 
     let parent_rules = parent_rules
@@ -188,10 +199,17 @@ pub fn resolve_child_surface(
             .any(|rule| rule.decision == PermissionDecision::Allow && rule.tool.matches(tool))
     };
 
+    let remote_tools = remote_tools
+        .iter()
+        .filter(|tool| reachable(tool))
+        .cloned()
+        .collect::<Vec<_>>();
+
     let mut rules = tools
         .iter()
         .map(|entry| entry.qualified_name.as_str())
         .chain(coordination_tools.iter().copied())
+        .chain(remote_tools.iter().map(String::as_str))
         .filter(|tool| !enumerated(tool))
         .map(|tool| {
             PermissionRule::global(
@@ -206,6 +224,7 @@ pub fn resolve_child_surface(
     Ok(ChildToolSurface {
         tools,
         coordination_tools,
+        remote_tools,
         rules,
         configured_floor: ConfiguredFloor::restricting(parent_rules),
     })
@@ -321,7 +340,7 @@ mod tests {
 
     #[test]
     fn empty_declarations_yield_every_native_tool() {
-        let surface = resolve_child_surface(&[], &[]).unwrap();
+        let surface = resolve_child_surface(&[], &[], &[]).unwrap();
 
         assert_eq!(
             tool_names(&surface),
@@ -335,7 +354,7 @@ mod tests {
     #[test]
     fn a_declared_deny_omits_its_tool_from_the_catalog() {
         let surface =
-            resolve_child_surface(&[], &[rule(PermissionDecision::Deny, "bash")]).unwrap();
+            resolve_child_surface(&[], &[rule(PermissionDecision::Deny, "bash")], &[]).unwrap();
 
         assert!(!tool_names(&surface).contains(&"native::bash".to_owned()));
         assert_eq!(
@@ -354,6 +373,7 @@ mod tests {
         let surface = resolve_child_surface(
             &[],
             &[rule(PermissionDecision::Allow, "bash"), targeted_deny],
+            &[],
         )
         .unwrap();
 
@@ -372,9 +392,12 @@ mod tests {
 
     #[test]
     fn an_allow_naming_an_unknown_tool_errors_naming_it() {
-        let rejection =
-            resolve_child_surface(&[], &[rule(PermissionDecision::Allow, "not_a_real_tool")])
-                .unwrap_err();
+        let rejection = resolve_child_surface(
+            &[],
+            &[rule(PermissionDecision::Allow, "not_a_real_tool")],
+            &[],
+        )
+        .unwrap_err();
 
         assert_eq!(
             rejection,
@@ -394,7 +417,7 @@ mod tests {
     fn a_deny_or_ask_naming_an_unheld_tool_is_retained_rather_than_rejected() {
         for decision in [PermissionDecision::Deny, PermissionDecision::Ask] {
             for tool in ["webfetc", "mcp::github::create_issue", "zz*"] {
-                let surface = resolve_child_surface(&[], &[rule(decision, tool)])
+                let surface = resolve_child_surface(&[], &[rule(decision, tool)], &[])
                     .unwrap_or_else(|error| panic!("{decision:?} {tool} must resolve: {error:?}"));
 
                 assert_eq!(
@@ -423,7 +446,7 @@ mod tests {
             PermissionPattern::glob("read").unwrap(),
             PermissionPattern::glob(".env*").unwrap(),
         );
-        let surface = resolve_child_surface(&[], &[declared]).unwrap();
+        let surface = resolve_child_surface(&[], &[declared], &[]).unwrap();
         let policy = PermissionPolicy::new(PermissionMode::Edit, surface.rules);
         let decision = |target| {
             policy.evaluate(
@@ -457,8 +480,8 @@ mod tests {
     /// no matter what the definition declares.
     #[test]
     fn a_configured_deny_omits_its_tool_from_the_child_catalog() {
-        let surface =
-            resolve_child_surface(&[parent_deny("bash", None)], &[]).expect("surface must resolve");
+        let surface = resolve_child_surface(&[parent_deny("bash", None)], &[], &[])
+            .expect("surface must resolve");
 
         assert!(!tool_names(&surface).contains(&"native::bash".to_owned()));
     }
@@ -468,6 +491,7 @@ mod tests {
         let rejection = resolve_child_surface(
             &[parent_deny("bash", None)],
             &[rule(PermissionDecision::Allow, "bash")],
+            &[],
         )
         .unwrap_err();
 
@@ -489,6 +513,7 @@ mod tests {
         let surface = resolve_child_surface(
             &[parent_deny("bash", Some("rm*"))],
             &[rule(PermissionDecision::Allow, "bash")],
+            &[],
         )
         .expect("a targeted configured deny must not reject the delegation");
 
@@ -517,8 +542,9 @@ mod tests {
             )
             .unwrap(),
         );
-        let surface = resolve_child_surface(&[ask], &[rule(PermissionDecision::Allow, "bash")])
-            .expect("a configured ask must not reject the delegation");
+        let surface =
+            resolve_child_surface(&[ask], &[rule(PermissionDecision::Allow, "bash")], &[])
+                .expect("a configured ask must not reject the delegation");
 
         assert!(tool_names(&surface).contains(&"native::bash".to_owned()));
         assert_eq!(
@@ -559,6 +585,7 @@ mod tests {
         let surface = resolve_child_surface(
             &[parent_deny("bash", None), carve_out],
             &[rule(PermissionDecision::Allow, "bash")],
+            &[],
         )
         .expect("a configured carve-out must not reject the delegation");
 
@@ -582,7 +609,7 @@ mod tests {
     /// execution can ever display.
     #[test]
     fn an_undeclared_child_is_authorized_for_every_tool_it_holds() {
-        let surface = resolve_child_surface(&[], &[]).unwrap();
+        let surface = resolve_child_surface(&[], &[], &[]).unwrap();
 
         for tool in ["native::bash", "native::write", "native::edit"] {
             assert!(
@@ -603,12 +630,13 @@ mod tests {
     #[test]
     fn an_undeclared_child_may_reach_the_network_and_a_declaration_is_what_stops_it() {
         assert!(authorizes(
-            &resolve_child_surface(&[], &[]).unwrap(),
+            &resolve_child_surface(&[], &[], &[]).unwrap(),
             "native::webfetch"
         ));
 
-        let declared = resolve_child_surface(&[], &[rule(PermissionDecision::Deny, "webfetch")])
-            .expect("surface must resolve");
+        let declared =
+            resolve_child_surface(&[], &[rule(PermissionDecision::Deny, "webfetch")], &[])
+                .expect("surface must resolve");
 
         assert!(
             !authorizes(&declared, "native::webfetch"),
@@ -633,6 +661,7 @@ mod tests {
                 PermissionPattern::Exact("bash".into()),
                 PermissionPattern::glob("git*").expect("valid target glob"),
             )],
+            &[],
         )
         .expect("surface must resolve");
 
@@ -650,14 +679,95 @@ mod tests {
         );
     }
 
+    fn engram_tools() -> Vec<String> {
+        vec![
+            "engram::mem_search".to_owned(),
+            "engram::mem_save".to_owned(),
+        ]
+    }
+
+    /// An MCP tool is a tool the child holds, so it follows the same default as
+    /// a native one.
+    #[test]
+    fn remote_tools_the_parent_connected_are_authorized_for_the_child_too() {
+        let surface = resolve_child_surface(&[], &[], &engram_tools()).unwrap();
+
+        assert!(authorizes(&surface, "engram::mem_save"));
+        assert!(
+            surface
+                .remote_tools
+                .contains(&"engram::mem_save".to_owned())
+        );
+    }
+
+    /// And the config can say otherwise. `remote_tools` is what the child's
+    /// runtime offers, so a denied server tool has to leave that list, not
+    /// merely lose its authorization — a tool the model is shown and then
+    /// refused for is a worse answer than one it was never shown.
+    #[test]
+    fn a_denied_remote_tool_is_not_offered_to_the_child_at_all() {
+        let surface = resolve_child_surface(
+            &[],
+            &[rule(PermissionDecision::Deny, "engram::mem_save")],
+            &engram_tools(),
+        )
+        .expect("a deny naming a connected remote tool must resolve");
+
+        assert!(
+            !surface
+                .remote_tools
+                .contains(&"engram::mem_save".to_owned())
+        );
+        assert!(!authorizes(&surface, "engram::mem_save"));
+        assert!(
+            surface
+                .remote_tools
+                .contains(&"engram::mem_search".to_owned()),
+            "denying one remote tool must leave the rest of the server alone"
+        );
+    }
+
+    /// A definition may scope its remote access — which is only possible
+    /// because the identities reach the surface before declarations are
+    /// checked. Resolved after the fact, this `allow` was rejected outright as
+    /// naming a tool the surface did not have.
+    #[test]
+    fn a_definition_can_name_the_remote_tools_it_may_call() {
+        let declared = PermissionRule::global(
+            PermissionDecision::Allow,
+            PermissionPattern::Exact("engram::mem_search".into()),
+            PermissionPattern::Any,
+        );
+        let surface = resolve_child_surface(&[], std::slice::from_ref(&declared), &engram_tools())
+            .expect("a declaration naming a connected remote tool must resolve");
+
+        let granted = surface
+            .rules
+            .iter()
+            .filter(|rule| {
+                rule.decision == PermissionDecision::Allow
+                    && rule.tool.matches("engram::mem_search")
+            })
+            .count();
+
+        assert_eq!(
+            granted, 1,
+            "the declared allow must stand alone, not be joined by a derived one"
+        );
+        assert!(
+            authorizes(&surface, "engram::mem_save"),
+            "a remote tool the definition never named still follows the default"
+        );
+    }
+
     /// The configured floor outranks the blanket authorization, which is the
     /// property that keeps `[permissions]` meaningful now that a child
     /// authorizes itself: a tool the configuration denies outright is gone from
     /// the catalog, not merely allowed-then-overruled.
     #[test]
     fn the_configured_floor_still_outranks_what_the_child_authorizes_itself() {
-        let surface =
-            resolve_child_surface(&[parent_deny("bash", None)], &[]).expect("surface must resolve");
+        let surface = resolve_child_surface(&[parent_deny("bash", None)], &[], &[])
+            .expect("surface must resolve");
 
         assert!(!authorizes(&surface, "native::bash"));
         assert!(!tool_names(&surface).contains(&"native::bash".to_owned()));

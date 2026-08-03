@@ -16,7 +16,7 @@ use std::{
 };
 
 use crate::{
-    AgentCatalog, AgentModelValidator, DispatchTool, IS_SUBAGENT_WORKER, SkillCatalog,
+    AgentCatalog, AgentModelValidator, DispatchTool, IS_SUBAGENT_WORKER, McpRegistry, SkillCatalog,
     ToolExecutionContext, ToolOutput, install_subagent_panic_hook,
 };
 
@@ -1014,6 +1014,17 @@ pub trait TaskRunner: Send + Sync + 'static {
     fn execution_registry(&self) -> Option<TaskExecutionRegistry> {
         None
     }
+
+    /// Hands the runner the MCP registry the parent already connected.
+    ///
+    /// A delegated child runs on a thread of this same process, so it
+    /// dispatches through these connections rather than opening its own: the
+    /// registry's discovery is idempotent, so a child that shares it registers
+    /// the servers' tools without a second connection to any of them. Loading
+    /// a registry from the same configuration would not do — it would be a
+    /// separate instance, having attempted nothing, and would connect again
+    /// per subagent.
+    fn share_mcp_registry(&mut self, _registry: std::sync::Arc<std::sync::Mutex<McpRegistry>>) {}
 
     fn run(
         &self,

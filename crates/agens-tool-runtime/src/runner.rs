@@ -331,6 +331,10 @@ pub struct ProductionTaskRunner {
     bypass: bool,
     lifecycle_bridge: Option<TuiTaskLifecycleBridge>,
     task_registry: Option<TaskExecutionRegistry>,
+    /// The parent's own MCP registry, shared rather than rebuilt. `None` only
+    /// where no parent runtime handed one over, which is every test that
+    /// exercises the runner without an MCP surface.
+    mcp_registry: Option<Arc<Mutex<agens_tools::McpRegistry>>>,
     #[cfg(any(test, feature = "probe"))]
     probe: Option<ProductionTaskProbe>,
     #[cfg(any(test, feature = "probe"))]
@@ -348,6 +352,7 @@ impl ProductionTaskRunner {
             bypass: false,
             lifecycle_bridge: None,
             task_registry: None,
+            mcp_registry: None,
             #[cfg(any(test, feature = "probe"))]
             probe: None,
             #[cfg(any(test, feature = "probe"))]
@@ -393,6 +398,7 @@ impl ProductionTaskRunner {
             bypass: false,
             lifecycle_bridge: None,
             task_registry: None,
+            mcp_registry: None,
             probe: Some(probe),
             progress_probe: None,
             failure_probe: None,
@@ -413,6 +419,7 @@ impl ProductionTaskRunner {
             bypass: false,
             lifecycle_bridge: None,
             task_registry: None,
+            mcp_registry: None,
             probe: Some(probe),
             progress_probe: Some(progress),
             failure_probe: None,
@@ -433,6 +440,7 @@ impl ProductionTaskRunner {
             bypass: false,
             lifecycle_bridge: None,
             task_registry: None,
+            mcp_registry: None,
             probe: None,
             progress_probe: None,
             failure_probe: Some(TestTaskFailure {
@@ -446,6 +454,10 @@ impl ProductionTaskRunner {
 impl TaskRunner for ProductionTaskRunner {
     fn execution_registry(&self) -> Option<TaskExecutionRegistry> {
         self.task_registry.clone()
+    }
+
+    fn share_mcp_registry(&mut self, registry: Arc<Mutex<agens_tools::McpRegistry>>) {
+        self.mcp_registry = Some(registry);
     }
 
     /// `self.bypass` deliberately does NOT reach [`ProductionTaskExecutionContext`] below, unlike
@@ -555,6 +567,7 @@ impl TaskRunner for ProductionTaskRunner {
                         diagnostic_reference: &diagnostic_reference,
                         task_registry: context.execution_registry(),
                         execution_id: context.execution().expect("registered task execution").id(),
+                        mcp_registry: self.mcp_registry.clone(),
                     },
                 )
             });
@@ -570,6 +583,7 @@ impl TaskRunner for ProductionTaskRunner {
                 diagnostic_reference: &diagnostic_reference,
                 task_registry: context.execution_registry(),
                 execution_id: context.execution().expect("registered task execution").id(),
+                mcp_registry: self.mcp_registry.clone(),
             },
         );
         if let Err(error) = &result {

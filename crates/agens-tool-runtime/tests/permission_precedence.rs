@@ -1348,7 +1348,7 @@ fn configured_child_policy(
     declarations: &[PermissionRule],
     tool: &str,
 ) -> Option<(PermissionPolicy, String)> {
-    let surface = resolve_child_surface(configured, declarations).ok()?;
+    let surface = resolve_child_surface(configured, declarations, &[]).ok()?;
     let qualified = format!("native::{tool}");
     let reachable = surface
         .tools
@@ -1597,7 +1597,8 @@ fn child_decision(
     target: &str,
     path: Option<&str>,
 ) -> PermissionDecision {
-    let surface = resolve_child_surface(&[], declarations).expect("the child surface must resolve");
+    let surface =
+        resolve_child_surface(&[], declarations, &[]).expect("the child surface must resolve");
     let qualified = format!("native::{tool}");
 
     if !surface
@@ -2059,7 +2060,7 @@ fn registered_child_native_access() -> Vec<(String, ToolAccess)> {
     let project_root = temporary.join("project");
     fs::create_dir_all(&project_root).unwrap();
 
-    let surface = resolve_child_surface(&[], &[]).expect("the child surface must resolve");
+    let surface = resolve_child_surface(&[], &[], &[]).expect("the child surface must resolve");
     let registry = agens_tools::TaskExecutionRegistry::new();
     let execution = registry
         .admit(agens_tools::TaskLaunchMode::Foreground)
@@ -2070,6 +2071,7 @@ fn registered_child_native_access() -> Vec<(String, ToolAccess)> {
         &surface,
         registry,
         execution,
+        None,
         None,
     )
     .expect("the child runtime must build");

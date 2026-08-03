@@ -172,6 +172,9 @@ pub struct ProductionTaskExecutionContext<'a> {
     pub diagnostic_reference: &'a str,
     pub task_registry: &'a TaskExecutionRegistry,
     pub execution_id: agens_tools::TaskExecutionId,
+    /// The parent's connected MCP registry, shared so this child dispatches
+    /// through the same servers instead of standing up its own.
+    pub mcp_registry: Option<Arc<Mutex<agens_tools::McpRegistry>>>,
 }
 
 pub fn run_production_task(
@@ -187,6 +190,7 @@ pub fn run_production_task(
         diagnostic_reference,
         task_registry,
         execution_id,
+        mcp_registry,
     } = context;
     let messages = vec![
         Message {
@@ -202,15 +206,24 @@ pub fn run_production_task(
         record_subagent_surface_rejection(bootstrap, diagnostic_reference, &error.message);
         ChildRunError::Runtime
     })?;
-    let surface =
-        resolve_child_surface(&parent_rules, request.permission_rules()).map_err(|rejection| {
-            record_subagent_surface_rejection(
-                bootstrap,
-                diagnostic_reference,
-                &rejection.message(),
-            );
-            ChildRunError::DeclarationRejected(rejection)
-        })?;
+    // Read from the registry the parent already connected, so the declarations
+    // below are resolved against the remote tools this child will actually
+    // hold rather than against the natives alone.
+    let remote_tools = match mcp_registry.as_ref() {
+        Some(registry) => registry
+            .lock()
+            .map_err(|_| ChildRunError::Runtime)?
+            .tools()
+            .into_iter()
+            .map(|tool| tool.qualified_name.clone())
+            .collect::<Vec<_>>(),
+        None => Vec::new(),
+    };
+    let surface = resolve_child_surface(&parent_rules, request.permission_rules(), &remote_tools)
+        .map_err(|rejection| {
+        record_subagent_surface_rejection(bootstrap, diagnostic_reference, &rejection.message());
+        ChildRunError::DeclarationRejected(rejection)
+    })?;
     let skills = agens_bootstrap::discover_skill_catalog(bootstrap, project_root)
         .map_err(|_| ChildRunError::Runtime)?;
     let (provider_tools, tool_runtime) = production_child_tool_runtime(
@@ -220,6 +233,7 @@ pub fn run_production_task(
         task_registry.clone(),
         execution_id,
         Some(skills.catalog()),
+        mcp_registry,
     )
     .map_err(|_| ChildRunError::Runtime)?;
     let diagnostic_store = diagnostic_store(bootstrap);
@@ -610,7 +624,7 @@ mod tests {
                 dangerous_mode: false,
                 cancellation: &HeadlessTurnCancellation::new(),
                 progress: None,
-                surface: &crate::child_catalog::resolve_child_surface(&[], &[]).unwrap(),
+                surface: &crate::child_catalog::resolve_child_surface(&[], &[], &[]).unwrap(),
                 mailbox: TaskMailboxContext {
                     registry,
                     target: TaskMessageTarget::Main,
@@ -752,7 +766,7 @@ mod tests {
                     dangerous_mode: false,
                     cancellation: &HeadlessTurnCancellation::new(),
                     progress: None,
-                    surface: &crate::child_catalog::resolve_child_surface(&[], &[]).unwrap(),
+                    surface: &crate::child_catalog::resolve_child_surface(&[], &[], &[]).unwrap(),
                     mailbox: TaskMailboxContext {
                         registry,
                         target: TaskMessageTarget::Main,
@@ -856,7 +870,7 @@ mod tests {
         input: &str,
     ) -> String {
         let surface =
-            crate::child_catalog::resolve_child_surface(parent_rules, declarations).unwrap();
+            crate::child_catalog::resolve_child_surface(parent_rules, declarations, &[]).unwrap();
         let registry = TaskExecutionRegistry::with_limits(agens_tools::TaskExecutionLimits {
             max_iterations: 3,
             max_concurrency: 1,
@@ -871,6 +885,7 @@ mod tests {
             &surface,
             registry.clone(),
             execution_id,
+            None,
             None,
         )
         .unwrap();
@@ -2352,7 +2367,7 @@ mod tests {
             .agent("explore")
             .expect("explore is a built-in agent");
 
-        let surface = resolve_child_surface(&[], &explore.permission_rules).unwrap();
+        let surface = resolve_child_surface(&[], &explore.permission_rules, &[]).unwrap();
         let tool_names = surface
             .tools
             .iter()
