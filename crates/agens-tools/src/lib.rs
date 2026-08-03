@@ -529,6 +529,11 @@ impl Skill {
 pub struct SkillCatalog {
     skills: Vec<Skill>,
     positions: BTreeMap<String, usize>,
+    /// The root the project half of this catalog was discovered under, kept so
+    /// a holder can tell a project skill from a global one by where it came
+    /// from rather than by guessing from its path. Absent only from a catalog
+    /// that discovered nothing.
+    project_root: Option<PathBuf>,
 }
 
 impl SkillCatalog {
@@ -538,7 +543,10 @@ impl SkillCatalog {
     ) -> Result<SkillDiscovery, SkillDiscoveryError> {
         let global = load_skill_root(global_root.as_ref())?;
         let project = load_skill_root(project_root.as_ref())?;
-        let mut catalog = Self::default();
+        let mut catalog = Self {
+            project_root: Some(project_root.as_ref().to_path_buf()),
+            ..Self::default()
+        };
         let mut diagnostics = global.diagnostics;
         let mut shadowed = Vec::new();
 
@@ -583,6 +591,19 @@ impl SkillCatalog {
         self.skills.iter()
     }
 
+    /// Whether this skill was discovered under the project root rather than
+    /// beside the global configuration.
+    ///
+    /// The distinction decides whether a skill's files have a project-relative
+    /// spelling a permission rule can name, which is why it is answered from
+    /// where the skill was discovered rather than from where its directory
+    /// happens to sit.
+    pub fn is_project_skill(&self, skill: &Skill) -> bool {
+        self.project_root
+            .as_ref()
+            .is_some_and(|root| skill.directory().starts_with(root))
+    }
+
     fn insert(&mut self, skill: Skill) {
         if let Some(position) = self.positions.get(skill.name()).copied() {
             self.skills[position] = skill;
@@ -609,19 +630,39 @@ impl SkillResourceTool {
     }
 
     /// The project-relative file one call would return, when the skill it names
-    /// was discovered under the project root.
+    /// has such a spelling.
     ///
-    /// A skill discovered beside the global configuration lives outside the
-    /// worktree and has no such spelling, so nothing is reported for it and no
-    /// rule written against a path selects the call.
-    fn reached_file(&self, arguments: &Value) -> Option<PathBuf> {
-        let skill = arguments
+    /// A skill discovered under the project root always has one. A skill
+    /// discovered beside the global configuration normally does not, and
+    /// reports nothing, so no rule written against a path selects the call; it
+    /// reports one on the single occasion it has one, which is a global skills
+    /// root that happens to sit under the project root.
+    ///
+    /// The catalog and the root reach this tool as independent arguments and
+    /// can therefore disagree. A project skill that does not lie under the root
+    /// it is paired with is that disagreement, and it is refused rather than
+    /// answered: reporting no reach would leave every rule written against a
+    /// project skill selecting nothing, while the call still opened that
+    /// skill's files.
+    fn reached_file(&self, arguments: &Value) -> Result<Option<PathBuf>, Error> {
+        let Some(skill) = arguments
             .get("skill")
             .and_then(Value::as_str)
-            .and_then(|name| self.catalog.skill(name))?;
-        let directory = skill.directory().strip_prefix(&self.project_root).ok()?;
+            .and_then(|name| self.catalog.skill(name))
+        else {
+            return Ok(None);
+        };
+        let directory = match skill.directory().strip_prefix(&self.project_root) {
+            Ok(directory) => directory,
+            Err(_) if self.catalog.is_project_skill(skill) => {
+                return Err(Error::Tool(
+                    "skill catalog was discovered under a different project root".into(),
+                ));
+            }
+            Err(_) => return Ok(None),
+        };
 
-        match (
+        let reached = match (
             arguments.get("resource_class").and_then(Value::as_str),
             arguments.get("resource").and_then(Value::as_str),
         ) {
@@ -631,7 +672,9 @@ impl SkillResourceTool {
                     .map(|class| directory.join(class.directory()).join(resource))
             }
             _ => None,
-        }
+        };
+
+        Ok(reached)
     }
 
     pub fn input_schema() -> Value {
@@ -660,7 +703,7 @@ impl DispatchTool for SkillResourceTool {
 
     fn permission_reach(&self, arguments: &Value) -> Result<Vec<PermissionReach>, Error> {
         Ok(self
-            .reached_file(arguments)
+            .reached_file(arguments)?
             .map(|path| PermissionReach::Path(path.to_string_lossy().into_owned()))
             .into_iter()
             .collect())
