@@ -525,6 +525,14 @@ impl Skill {
     }
 }
 
+/// Where a project's own skills live, relative to that project's root.
+///
+/// A catalog records the directory it discovered them in, while a holder of that
+/// catalog is handed a project root. The two are only paired with each other
+/// when they agree through this, which is what makes the pairing checkable at
+/// all rather than merely conventional.
+pub const PROJECT_SKILLS_DIRECTORY: &str = ".agens/skills";
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SkillCatalog {
     skills: Vec<Skill>,
@@ -604,6 +612,18 @@ impl SkillCatalog {
             .is_some_and(|root| skill.directory().starts_with(root))
     }
 
+    /// Whether this catalog's project half was discovered under `project_root`.
+    ///
+    /// Answered by equality against the one directory a project's skills are
+    /// discovered in, rather than by containment: a root that merely contains
+    /// the discovered one still strips off every project skill's path, and
+    /// would yield a spelling relative to a root no rule is written against.
+    pub fn is_paired_with_project_root(&self, project_root: &Path) -> bool {
+        self.project_root
+            .as_ref()
+            .is_some_and(|root| root == &project_root.join(PROJECT_SKILLS_DIRECTORY))
+    }
+
     fn insert(&mut self, skill: Skill) {
         if let Some(position) = self.positions.get(skill.name()).copied() {
             self.skills[position] = skill;
@@ -639,11 +659,14 @@ impl SkillResourceTool {
     /// root that happens to sit under the project root.
     ///
     /// The catalog and the root reach this tool as independent arguments and
-    /// can therefore disagree. A project skill that does not lie under the root
-    /// it is paired with is that disagreement, and it is refused rather than
-    /// answered: reporting no reach would leave every rule written against a
-    /// project skill selecting nothing, while the call still opened that
-    /// skill's files.
+    /// can therefore disagree. A project skill answered under a root the
+    /// catalog was not discovered under is that disagreement, and it is refused
+    /// rather than answered. Refusing on the pairing rather than on whether the
+    /// root strips off is what covers a root ABOVE the true one: there the
+    /// prefix comes off cleanly and the call would be answered with a reach
+    /// spelled relative to a root no rule is written against — `deny
+    /// skill(**/.agens/**)` would survive on its leading wildcard while `deny
+    /// skill(.agens/skills/**)` silently stopped selecting anything.
     ///
     /// The refusal is an [`Error::Permission`] rather than an
     /// [`Error::Tool`]: the arguments are well formed and the caller cannot
@@ -657,14 +680,16 @@ impl SkillResourceTool {
         else {
             return Ok(None);
         };
-        let directory = match skill.directory().strip_prefix(&self.project_root) {
-            Ok(directory) => directory,
-            Err(_) if self.catalog.is_project_skill(skill) => {
-                return Err(Error::Permission(
-                    "skill catalog was discovered under a different project root".into(),
-                ));
-            }
-            Err(_) => return Ok(None),
+        if self.catalog.is_project_skill(skill)
+            && !self.catalog.is_paired_with_project_root(&self.project_root)
+        {
+            return Err(Error::Permission(
+                "skill catalog was discovered under a different project root".into(),
+            ));
+        }
+
+        let Ok(directory) = skill.directory().strip_prefix(&self.project_root) else {
+            return Ok(None);
         };
 
         let reached = match (

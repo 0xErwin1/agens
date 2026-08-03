@@ -569,7 +569,7 @@ pub fn discover_skill_catalog(
 ) -> Result<agens_tools::SkillDiscovery, CliError> {
     agens_tools::SkillCatalog::discover(
         bootstrap.paths.global_config.with_file_name("skills"),
-        project_root.join(".agens/skills"),
+        project_root.join(agens_tools::PROJECT_SKILLS_DIRECTORY),
     )
     .map_err(|_| CliError::configuration("skill catalog is unavailable"))
 }

@@ -790,6 +790,11 @@ fn lazy_resource_reads_reject_post_discovery_hardlinks_and_nonregular_files() {
 /// direction: every rule written against a project skill would stop selecting
 /// the call, while the tool went on opening that skill's files through the
 /// directory descriptors it already holds. The call is refused instead.
+///
+/// A root that merely CONTAINS the true one is the case a `strip_prefix` test
+/// cannot see: the prefix comes off, so the call is answered, and it is
+/// answered with a reach spelled relative to the wrong root. Both directions
+/// are asserted here — a root beside the true one and a root above it.
 #[test]
 fn a_project_skill_outside_the_root_it_is_paired_with_refuses_the_call() {
     let temporary = TemporaryDirectory::new();
@@ -815,14 +820,17 @@ fn a_project_skill_outside_the_root_it_is_paired_with_refuses_the_call() {
             ".agens/skills/probe/SKILL.md".into()
         )],
     );
-    let refusal = SkillResourceTool::new(catalog, temporary.path.join("elsewhere"))
-        .permission_reach(&arguments)
-        .expect_err("a project skill outside the root it is paired with must refuse the call");
-    assert!(
-        matches!(refusal, agens_core::Error::Permission(_)),
-        "the refusal must reach the model as an unresolvable permission rather than as an \
-         argument error, got: {refusal:?}"
-    );
+    for unpaired in [temporary.path.join("elsewhere"), temporary.path.clone()] {
+        let refusal = SkillResourceTool::new(catalog.clone(), &unpaired)
+            .permission_reach(&arguments)
+            .unwrap_err();
+        assert!(
+            matches!(refusal, agens_core::Error::Permission(_)),
+            "a project skill outside the root it is paired with must refuse the call as an \
+             unresolvable permission rather than as an argument error, under {}: {refusal:?}",
+            unpaired.display()
+        );
+    }
 }
 
 fn write_skill(root: &Path, directory: &str, contents: &str) {
