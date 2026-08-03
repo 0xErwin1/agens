@@ -661,8 +661,7 @@ impl DispatchTool for SkillResourceTool {
     fn permission_reach(&self, arguments: &Value) -> Result<Vec<PermissionReach>, Error> {
         Ok(self
             .reached_file(arguments)
-            .and_then(|path| path.to_str().map(str::to_owned))
-            .map(PermissionReach::Path)
+            .map(|path| PermissionReach::Path(path.to_string_lossy().into_owned()))
             .into_iter()
             .collect())
     }
