@@ -528,6 +528,26 @@ const CONFIGURED_CASES: &[ConfiguredCase] = &[
         path: None,
         expected: PermissionDecision::Allow,
     },
+    // Two selections that overlap without either containing the other. Neither
+    // rule alone settles `config/.env`, so they tie and the more restrictive
+    // decision takes it. This is the shape the shipped configuration's comment
+    // documents, and a reader cannot derive it from the containment rule.
+    ConfiguredCase {
+        configured: &["deny read **/.env", "allow read config/**"],
+        declarations: &[],
+        tool: "read",
+        target: "config/.env",
+        path: None,
+        expected: PermissionDecision::Deny,
+    },
+    ConfiguredCase {
+        configured: &["deny read **/.env", "allow read config/**"],
+        declarations: &[],
+        tool: "read",
+        target: "config/settings.toml",
+        path: None,
+        expected: PermissionDecision::Allow,
+    },
     ConfiguredCase {
         configured: &["deny bash"],
         declarations: &[],
@@ -1251,6 +1271,40 @@ fn configured_entries(entries: &[&str]) -> Vec<ConfigPermissionRule> {
             }
         })
         .collect()
+}
+
+/// A bare tool name written in `[permissions]` has to resolve to the tool it
+/// names, for every native and not for some of them.
+///
+/// Only the caller resolving against a live dispatcher recovers from a name
+/// left bare, and only because the dispatcher answers to both spellings. Every
+/// other caller — a delegated child among them — is handed the name as written,
+/// so a name that stays bare is one the qualification step did not do.
+#[test]
+fn every_native_tool_named_in_configuration_resolves_to_the_tool_it_names() {
+    let mut unresolved = Vec::new();
+
+    for entry in NativeToolCatalog::metadata() {
+        let bare = entry
+            .qualified_name
+            .strip_prefix("native::")
+            .expect("a native tool name is qualified");
+        let rules = configured_permission_rules(
+            &configured_entries(&[&format!("deny {bare}")]),
+            "project",
+            |configured| Ok(agens_core::PermissionPattern::Exact(configured.to_owned())),
+        )
+        .expect("configured rules must resolve");
+
+        if !rules[0].tool.matches(&entry.qualified_name) {
+            unresolved.push(bare.to_owned());
+        }
+    }
+
+    assert!(
+        unresolved.is_empty(),
+        "these configured names never reach the tool they name: {unresolved:?}"
+    );
 }
 
 /// Resolves configured entries the way a delegated child does: the qualified
@@ -2077,6 +2131,66 @@ fn every_tool_this_table_says_asks_per_file_withholds_a_denied_file() {
             output.content
         );
     }
+
+    fs::remove_dir_all(temporary).unwrap();
+}
+
+/// The rules are asked about every file the call walks, before the caller's own
+/// `glob` decides which of them come back. So a `grep` filtered to `notes.md`
+/// still says a file was withheld when the denied file is `secrets.md` — the
+/// notice answers for what the call reached, not for what it reported.
+///
+/// That order is deliberate and this pins it. Asking the rules after the
+/// filter would make the notice exact, and would also turn the filter into a
+/// way of narrowing the withheld set one filename at a time; the documented
+/// limit — that re-scoping narrows it to a directory — holds only because it
+/// does not.
+#[test]
+fn the_rules_decide_every_file_a_grep_walks_before_its_own_filter_decides_what_returns() {
+    let temporary = agens_fixtures::session_directory("grep-filter-order");
+    let project_root = temporary.join("project");
+    worktree_holding_a_denied_secret(&project_root, &temporary.join("git"));
+
+    let catalog = NativeToolCatalog::new(
+        NativeTools::open(&project_root).expect("the probe worktree must open as a project root"),
+    );
+    let (policy, identity) =
+        configured_child_policy(&configured_rules(&["deny grep **/secrets.md"]), &[], "grep")
+            .expect("a delegated child must be able to reach grep");
+    let context = ToolExecutionContext::with_timeout(Duration::from_secs(30)).with_read_filter(
+        PermissionReadFilter::new(
+            policy,
+            Vec::new(),
+            "project",
+            identity,
+            ToolAccess::ReadOnly,
+        ),
+    );
+
+    let output = catalog
+        .execute(
+            "native::grep",
+            serde_json::json!({"pattern":"OPENAI_API_KEY","glob":"notes.md"}),
+            &context,
+        )
+        .expect("grep must answer");
+
+    assert!(
+        !output.content.contains(PER_FILE_PROBE_SECRET),
+        "the denied file must stay withheld under any filter: {}",
+        output.content
+    );
+    assert!(
+        output.content.contains("notes.md:1:OPENAI_API_KEY is set"),
+        "the filter must still return what it selects: {}",
+        output.content
+    );
+    assert!(
+        output.content.contains("some files were not read"),
+        "the notice answers for every file the call walked, so a filter excluding the \
+         denied file must not silence it: {}",
+        output.content
+    );
 
     fs::remove_dir_all(temporary).unwrap();
 }

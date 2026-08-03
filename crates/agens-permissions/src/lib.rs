@@ -633,19 +633,23 @@ pub fn configured_permission_rules(
         .collect()
 }
 
-/// Qualifies a bare configured tool name. Each name maps to the tool it
-/// actually names: `edit` and `write` are separately registered tools, so a
-/// rule naming one must never be retargeted at the other.
+/// Qualifies a bare configured tool name against the native catalog, so a rule
+/// naming a tool reaches that tool and no other: `edit` and `write` are
+/// separately registered, and a rule naming one must never be retargeted at the
+/// other.
+///
+/// The catalog is asked rather than a list kept here, because a list kept here
+/// qualifies whatever was remembered when it was written. Anything the catalog
+/// does not hold — an MCP tool, an already-qualified name, a typo — is left as
+/// written, for the caller to resolve or to diagnose.
 fn configured_tool_name(name: &str) -> Result<String, CliError> {
-    match name {
-        "read" => Ok("native::read".to_owned()),
-        "write" => Ok("native::write".to_owned()),
-        "edit" => Ok("native::edit".to_owned()),
-        "list" => Ok("native::list".to_owned()),
-        "search" => Ok("native::search".to_owned()),
-        "bash" => Ok("native::bash".to_owned()),
-        name => Ok(name.to_owned()),
-    }
+    let qualified = format!("native::{name}");
+
+    let known = agens_tools::NativeToolCatalog::metadata()
+        .iter()
+        .any(|entry| entry.qualified_name == qualified);
+
+    Ok(if known { qualified } else { name.to_owned() })
 }
 
 fn parse_tool_input(call: &HeadlessToolCall) -> Result<serde_json::Value, HeadlessTurnPortError> {
