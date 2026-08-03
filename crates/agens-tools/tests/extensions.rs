@@ -11,9 +11,9 @@ use std::{
 };
 
 use agens_core::{
-    AgentDefinition, AgentMode, Error, HeadlessTaskTerminal, PermissionDecision, PermissionMode,
-    PermissionPattern, PermissionPolicy, PermissionRule, PermissionSession, PermissionTargetKind,
-    ReasoningEffort, RequestConfig, ToolAccess,
+    AgentDefinition, AgentMode, AgentModelSource, Error, HeadlessTaskTerminal, PermissionDecision,
+    PermissionMode, PermissionPattern, PermissionPolicy, PermissionRule, PermissionSession,
+    PermissionTargetKind, ReasoningEffort, RequestConfig, ToolAccess,
 };
 use agens_tools::{
     AgentCatalog, AgentModelValidationError, AgentModelValidator, CommandCatalog,
@@ -215,6 +215,7 @@ fn discovers_agents_with_deterministic_precedence_modes_and_diagnostics() {
         description: "built-in".into(),
         mode: AgentMode::Primary,
         model: None,
+        model_source: None,
         reasoning_effort: None,
         system_prompt: "built-in".into(),
         permission_rules: vec![],
@@ -433,6 +434,7 @@ fn isolates_unsafe_mismatched_and_oversized_agent_documents() {
         description: "built-in".into(),
         mode: AgentMode::Primary,
         model: None,
+        model_source: None,
         reasoning_effort: None,
         system_prompt: "built-in".into(),
         permission_rules: vec![],
@@ -638,7 +640,7 @@ fn task_dispatch_resolves_only_subagents_and_validated_requested_configuration()
     );
     assert_eq!(
         TaskTool::<RecordingTaskRunner>::input_schema(),
-        serde_json::json!({"type":"object","additionalProperties":false,"required":["description"],"properties":{"agent":{"type":"string","minLength":1,"maxLength":64},"background":{"type":"boolean"},"description":{"type":"string","minLength":1,"maxLength":16384},"model":{"type":"string","minLength":1,"maxLength":64},"skills":{"type":"array","maxItems":128,"uniqueItems":true,"items":{"type":"string","minLength":1,"maxLength":64}}}})
+        serde_json::json!({"type":"object","additionalProperties":false,"required":["description"],"properties":{"agent":{"type":"string","minLength":1,"maxLength":64},"background":{"type":"boolean"},"description":{"type":"string","minLength":1,"maxLength":16384},"model":{"type":"string","minLength":1,"maxLength":64,"description":"Omit this. The agent's configured profile then decides the model, falling back to this thread's model. Send it only when the user explicitly asked for a specific model for this call: an explicit value overrides the configured profile."},"skills":{"type":"array","maxItems":128,"uniqueItems":true,"items":{"type":"string","minLength":1,"maxLength":64}}}})
     );
     assert_eq!(
         task.catalog_input_schema()["properties"]["agent"]["enum"],
@@ -713,6 +715,101 @@ fn task_inherits_parent_model_and_effort_but_validates_explicit_overrides() {
         task.catalog_input_schema()["properties"]["model"]["enum"],
         serde_json::json!(["override-model", "parent-model", "worker-model"])
     );
+    assert!(
+        task.catalog_input_schema()["properties"]["model"]["description"]
+            .as_str()
+            .is_some_and(|description| description.starts_with("Omit this."))
+    );
+}
+
+#[test]
+fn explicit_model_overriding_a_configured_profile_announces_the_override() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let mut task = task_tool_with_configured_worker_model(Arc::clone(&calls));
+
+    let output = task
+        .execute(
+            &task_context(),
+            serde_json::json!({"agent":"worker","description":"override","model":"override-model"}),
+        )
+        .unwrap();
+
+    assert_eq!(
+        output,
+        ToolOutput::success(
+            "warning: agent worker is configured to run worker-model; the explicit model argument override-model overrides that configuration\ncaptured"
+        )
+    );
+    assert_eq!(
+        *calls.lock().unwrap(),
+        vec![("override-model".to_owned(), None)]
+    );
+}
+
+#[test]
+fn an_explicit_model_matching_configuration_or_inheritance_announces_nothing() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let mut task = task_tool_with_configured_worker_model(Arc::clone(&calls));
+
+    assert_eq!(
+        task.execute(
+            &task_context(),
+            serde_json::json!({"agent":"worker","description":"agree","model":"worker-model"}),
+        )
+        .unwrap(),
+        ToolOutput::success("captured")
+    );
+    assert_eq!(
+        task.execute(
+            &task_context(),
+            serde_json::json!({"agent":"inherited","description":"inherit","model":"override-model"}),
+        )
+        .unwrap(),
+        ToolOutput::success("captured")
+    );
+}
+
+fn task_tool_with_configured_worker_model(
+    calls: CapturedTaskModels,
+) -> TaskTool<CapturingTaskRunner> {
+    let temporary = TemporaryDirectory::new();
+    let agents = temporary.path.join("agents");
+    let missing = temporary.path.join("missing");
+    fs::create_dir_all(&agents).unwrap();
+    write_agent(&agents, "worker", "worker agent", "subagent");
+    write_agent(&agents, "inherited", "inherited agent", "subagent");
+    let agents = AgentCatalog::discover(&[], &agents, &missing)
+        .unwrap()
+        .catalog()
+        .map_agents(|agent| {
+            let mut agent = agent.clone();
+            let configured = agent.name == "worker";
+            agent.model = Some(if configured {
+                "worker-model".to_owned()
+            } else {
+                "parent-model".to_owned()
+            });
+            agent.model_source = Some(if configured {
+                AgentModelSource::ConfiguredProfile
+            } else {
+                AgentModelSource::SessionInherited
+            });
+            agent
+        });
+
+    TaskTool::from_catalogs_with_parent_config(
+        agents,
+        SkillCatalog::default(),
+        "parent-model",
+        RequestConfig::default(),
+        vec![
+            "override-model".to_owned(),
+            "parent-model".to_owned(),
+            "worker-model".to_owned(),
+        ],
+        TaskModels,
+        CapturingTaskRunner(calls),
+    )
 }
 
 #[test]
@@ -2340,6 +2437,7 @@ fn agent_with_rules(permission_rules: Vec<PermissionRule>) -> AgentDefinition {
         description: "agent".into(),
         mode: AgentMode::Primary,
         model: None,
+        model_source: None,
         reasoning_effort: None,
         system_prompt: "body".into(),
         permission_rules,

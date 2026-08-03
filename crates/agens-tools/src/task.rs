@@ -1,6 +1,6 @@
 use agens_core::{
-    AgentDefinition, AgentMode, Error, HeadlessTaskTerminal, PermissionRule, RequestConfig,
-    TaskProviderFailure, TaskSkillRejection,
+    AgentDefinition, AgentMode, AgentModelSource, Error, HeadlessTaskTerminal, PermissionRule,
+    RequestConfig, TaskProviderFailure, TaskSkillRejection,
 };
 use serde_json::Value;
 use std::{
@@ -857,7 +857,7 @@ pub struct TaskTurnRequest {
     request_config: RequestConfig,
     skills: Vec<TaskSkill>,
     description: String,
-    fallback_warning: Option<String>,
+    model_notice: Option<String>,
     permission_rules: Vec<PermissionRule>,
 }
 
@@ -1117,7 +1117,7 @@ impl<R: TaskRunner> TaskTool<R> {
     }
 
     pub fn input_schema() -> Value {
-        serde_json::json!({"type":"object","additionalProperties":false,"required":["description"],"properties":{"agent":{"type":"string","minLength":1,"maxLength":64},"background":{"type":"boolean"},"description":{"type":"string","minLength":1,"maxLength":16384},"model":{"type":"string","minLength":1,"maxLength":64},"skills":{"type":"array","maxItems":128,"uniqueItems":true,"items":{"type":"string","minLength":1,"maxLength":64}}}})
+        serde_json::json!({"type":"object","additionalProperties":false,"required":["description"],"properties":{"agent":{"type":"string","minLength":1,"maxLength":64},"background":{"type":"boolean"},"description":{"type":"string","minLength":1,"maxLength":16384},"model":{"type":"string","minLength":1,"maxLength":64,"description":"Omit this. The agent's configured profile then decides the model, falling back to this thread's model. Send it only when the user explicitly asked for a specific model for this call: an explicit value overrides the configured profile."},"skills":{"type":"array","maxItems":128,"uniqueItems":true,"items":{"type":"string","minLength":1,"maxLength":64}}}})
     }
 
     pub fn catalog_input_schema(&self) -> Value {
@@ -1174,7 +1174,7 @@ impl<R: TaskRunner> TaskTool<R> {
     fn resolve(&self, invocation: TaskInvocation) -> Result<TaskTurnRequest, ToolOutput> {
         let agent = self.resolve_agent(invocation.agent.as_deref())?;
 
-        let (model, mut request_config, fallback_warning) = match invocation.model {
+        let (model, mut request_config, model_notice) = match invocation.model {
             Some(model) => {
                 if self.model_validator.validate_model(&model).is_err() {
                     return Err(self.model_unavailable_output(&agent.name, &model));
@@ -1184,7 +1184,8 @@ impl<R: TaskRunner> TaskTool<R> {
                 } else {
                     RequestConfig::default()
                 };
-                (model, request_config, None)
+                let notice = configuration_override_warning(agent, &model);
+                (model, request_config, notice)
             }
             None => match agent.model.clone() {
                 Some(model) if self.model_validator.validate_model(&model).is_ok() => {
@@ -1229,7 +1230,7 @@ impl<R: TaskRunner> TaskTool<R> {
             request_config,
             skills,
             description: invocation.description,
-            fallback_warning,
+            model_notice,
             permission_rules: agent.permission_rules.clone(),
         })
     }
@@ -1369,7 +1370,7 @@ impl<R: TaskRunner> TaskTool<R> {
         let registry = self.registry.clone();
         let worker_context = context.clone();
         let worker = thread::spawn(move || {
-            let fallback_warning = request.fallback_warning.clone();
+            let model_notice = request.model_notice.clone();
             let mut output = {
                 let _panic_hook = TaskPanicHookGuard::new();
                 let result = catch_unwind(AssertUnwindSafe(|| {
@@ -1386,10 +1387,10 @@ impl<R: TaskRunner> TaskTool<R> {
             worker_context.run_before_publication_hook();
             if let Some(cancelled) = worker_context.terminal_output() {
                 output = cancelled;
-            } else if let Some(warning) = fallback_warning
+            } else if let Some(notice) = model_notice
                 && !output.is_error
             {
-                output.content = format!("{warning}\n{}", output.content);
+                output.content = format!("{notice}\n{}", output.content);
             }
             registry.finish(execution_id, task_terminal_state(&output), output.clone());
             let _ = sender.send(output);
@@ -1534,6 +1535,27 @@ fn skill_unavailable_output(skill: &str, reason: TaskSkillRejection) -> ToolOutp
     output.content.push_str(reason.label());
     output.content.push(']');
     output
+}
+
+/// Announces that an explicit `model` argument displaced the model an operator configured
+/// for this agent.
+///
+/// The parent model authors that argument on its own, so an override is a guess outranking a
+/// deliberate configuration. Prefixing the task output is the only resolution channel a person
+/// reads without going looking: it lands in the transcript beside the delegation it changed.
+///
+/// Every part comes from a closed set -- a catalog name and two validated model identifiers --
+/// so the sanitizer guarding model-visible output still sees no host detail.
+fn configuration_override_warning(agent: &AgentDefinition, model: &str) -> Option<String> {
+    let configured = agent
+        .model
+        .as_deref()
+        .filter(|_| agent.model_source == Some(AgentModelSource::ConfiguredProfile))
+        .filter(|configured| *configured != model)?;
+    Some(format!(
+        "warning: agent {} is configured to run {configured}; the explicit model argument {model} overrides that configuration",
+        agent.name
+    ))
 }
 
 fn fallback_warning(

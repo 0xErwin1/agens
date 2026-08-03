@@ -2789,12 +2789,26 @@ pub enum AgentMode {
     All,
 }
 
+/// Where an agent's `model` was decided, for callers that must treat an operator's
+/// configured choice differently from an inherited or self-declared one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentModelSource {
+    /// An `[agents.<name>]` entry in project or global configuration.
+    ConfiguredProfile,
+    /// The agent's own definition, whether markdown frontmatter or configuration.
+    AgentDefinition,
+    /// Inherited from the model the session is running.
+    SessionInherited,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentDefinition {
     pub name: String,
     pub description: String,
     pub mode: AgentMode,
     pub model: Option<String>,
+    /// `None` until profile resolution has run; the model is then unattributed.
+    pub model_source: Option<AgentModelSource>,
     pub reasoning_effort: Option<ReasoningEffort>,
     pub system_prompt: String,
     pub permission_rules: Vec<PermissionRule>,

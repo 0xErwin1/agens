@@ -7,7 +7,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use agens_core::ask_user::AskUserPort;
-use agens_core::{PermissionMode, PermissionSession};
+use agens_core::{AgentModelSource, PermissionMode, PermissionSession};
 use agens_providers::OpenAiFunctionTool;
 use agens_store::PermissionGrantStore;
 use agens_tools::{
@@ -17,7 +17,7 @@ use agens_tools::{
 
 use crate::runner::{ProductionTaskRunner, TuiTaskLifecycleBridge};
 use crate::runtime::production_tool_runtime_with_parent_task_runner_and_ask_user;
-use agens_agents::{TaskModelValidator, task_agent_catalog, task_model_catalog};
+use agens_agents::{ProfileOrigin, TaskModelValidator, task_agent_catalog, task_model_catalog};
 use agens_bootstrap::Bootstrap;
 use agens_diagnostics::{next_diagnostic_reference, record_subagent_model_unavailable};
 use agens_dispatch::{AuthorizedNativeTaskRuntime, ProductionToolDispatcher};
@@ -290,9 +290,20 @@ fn resolved_task_agents(
         );
         let mut agent = agent.clone();
         agent.model = Some(profile.model.value);
+        agent.model_source = Some(model_source(profile.model.origin));
         agent.reasoning_effort = profile.effort.value;
         agent
     }))
+}
+
+const fn model_source(origin: ProfileOrigin) -> AgentModelSource {
+    match origin {
+        ProfileOrigin::ProjectProfile | ProfileOrigin::GlobalProfile => {
+            AgentModelSource::ConfiguredProfile
+        }
+        ProfileOrigin::Frontmatter => AgentModelSource::AgentDefinition,
+        ProfileOrigin::SessionInherited => AgentModelSource::SessionInherited,
+    }
 }
 
 fn register_task_coordination_tools(
@@ -337,10 +348,31 @@ fn register_task_coordination_tools(
 
 #[cfg(test)]
 mod tests {
-    use agens_core::{ReasoningEffort, RequestConfig};
+    use agens_agents::ProfileOrigin;
+    use agens_core::{AgentModelSource, ReasoningEffort, RequestConfig};
     use agens_fixtures::bootstrap_from_configuration;
 
-    use super::{TaskParentSelection, resolved_task_agents};
+    use super::{TaskParentSelection, model_source, resolved_task_agents};
+
+    #[test]
+    fn every_profile_origin_maps_to_the_model_source_the_task_tool_reads() {
+        assert_eq!(
+            model_source(ProfileOrigin::ProjectProfile),
+            AgentModelSource::ConfiguredProfile
+        );
+        assert_eq!(
+            model_source(ProfileOrigin::GlobalProfile),
+            AgentModelSource::ConfiguredProfile
+        );
+        assert_eq!(
+            model_source(ProfileOrigin::Frontmatter),
+            AgentModelSource::AgentDefinition
+        );
+        assert_eq!(
+            model_source(ProfileOrigin::SessionInherited),
+            AgentModelSource::SessionInherited
+        );
+    }
 
     #[test]
     fn task_agents_resolve_profiles_for_the_shared_tui_and_headless_builder() {
@@ -368,9 +400,17 @@ mod tests {
         let explore = agents.agent("explore").unwrap();
         assert_eq!(explore.model.as_deref(), Some("project-model"));
         assert_eq!(explore.reasoning_effort, Some(ReasoningEffort::Max));
+        assert_eq!(
+            explore.model_source,
+            Some(AgentModelSource::ConfiguredProfile)
+        );
 
         let general = agents.agent("general").unwrap();
         assert_eq!(general.model.as_deref(), Some("session-model"));
         assert_eq!(general.reasoning_effort, Some(ReasoningEffort::Low));
+        assert_eq!(
+            general.model_source,
+            Some(AgentModelSource::SessionInherited)
+        );
     }
 }

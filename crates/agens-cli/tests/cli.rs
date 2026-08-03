@@ -1878,7 +1878,8 @@ fn explicit_task_model_selects_a_second_available_openai_model() {
         ScriptedOpenAiResponse {
             required_body_fragments: vec![
                 "\"model\":\"gpt-5.6-sol\"".into(),
-                "\"model\":{\"enum\"".into(),
+                "\"model\":{\"description\":\"Omit this.".into(),
+                "\"enum\":[\"gpt-4.1\"".into(),
                 "gpt-4.1".into(),
                 "parent chooses child model".into(),
             ],
