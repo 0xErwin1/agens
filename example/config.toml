@@ -81,8 +81,7 @@ effort = "high"
 # and a deny written for `grep` says nothing about `search`.
 #
 # A path deny reaches a tool when that tool asks these rules about the file.
-# There are two ways it can, and every tool that returns the contents of a file
-# uses one of them:
+# There are two ways it can:
 #
 #   1. The call names the file. The path it is given is the target the rule is
 #      matched against, so a deny refuses the call outright. `read`, `write`,
@@ -96,16 +95,20 @@ effort = "high"
 #      decides whether the diff runs at all and says nothing about which files
 #      it may report.
 #
-# Apply that test to any tool added later: if it can return the contents of a
-# file and does neither, no deny here binds it.
+# Every tool that returns the contents of a file does one of the two, with one
+# exception: `bash` does neither, because a rule written for it is matched
+# against the command line rather than against any path. Apply the same test to
+# any tool added later — if it can return the contents of a file and does
+# neither, no deny here binds it, exactly as none binds `bash`.
 #
 # A call bounded the second way still runs. It returns everything it may return,
-# omits the rest, and ends with a line saying some files were not read — a line
-# that names nothing and counts nothing, because either would answer questions
-# about the files being withheld.
+# omits the rest, and ends with a line saying some files were not read. That
+# line carries no path, no count and no root, so a single call discloses only
+# that something under what it reached was withheld; a caller free to re-scope
+# the call — a narrower search root, a narrower revision range — narrows that
+# down to a directory or to one commit.
 #
-# Two limits follow from that test rather than from an exception list. `bash` is
-# matched on its command line and never on a path, so granting it grants a way
+# Two limits follow. The `bash` exception is total: granting it grants a way
 # around every rule below. And `glob` reports file paths, never their contents:
 # its pattern denotes a set while a rule is matched as text, so
 # `deny glob(**/.env)` does not stop `glob(**)` from listing that name — a name

@@ -19,7 +19,9 @@
 //! and has to land on one answer for the same reason.
 
 use std::fs;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use agens_config::{ConfigPermissionDecision, ConfigPermissionRule, ConfigPermissionScope};
 use agens_core::{
@@ -30,8 +32,8 @@ use agens_core::{
 use agens_permissions::{NativePermissionTarget, configured_permission_rules, permission_policy};
 use agens_tool_runtime::child_catalog::resolve_child_surface;
 use agens_tools::{
-    AgentCatalog, DispatchTool, EffectiveCapabilitySet, NativeToolCatalog, ToolDispatcher,
-    ToolExecutionContext, ToolOutput,
+    AgentCatalog, DispatchTool, EffectiveCapabilitySet, NativeToolCatalog, NativeTools,
+    ToolDispatcher, ToolExecutionContext, ToolOutput,
 };
 
 struct Case {
@@ -1535,6 +1537,19 @@ fn is_search_tool(tool: &str) -> bool {
     tool == "grep"
 }
 
+/// The call that proves a tool asks the rules about each file it reports.
+///
+/// A row cannot claim the per-file question in prose: the claim is this call,
+/// executed against a worktree holding a denied secret under a rule that denies
+/// it. A tool wired to nothing runs the call and prints the secret.
+struct PerFileProbe {
+    /// The arguments of one call that reaches the denied file.
+    arguments: &'static str,
+    /// A line the same call must still return, so a tool cannot pass the probe
+    /// by returning nothing at all.
+    still_reports: &'static str,
+}
+
 /// One native tool, classified by the two facts that decide whether a path deny
 /// binds it.
 struct SurfaceEntry {
@@ -1544,9 +1559,9 @@ struct SurfaceEntry {
     /// Whether the path the call is given is the target a rule is matched
     /// against, so a deny refuses the call outright.
     decided_on_its_target: bool,
-    /// Whether the call reports files it never named, so the same rules are
-    /// asked once per file while it runs.
-    decided_per_file: bool,
+    /// The call that reports files it never named, present when the tool asks
+    /// the same rules once per file while it runs.
+    decided_per_file: Option<PerFileProbe>,
 }
 
 /// The whole native surface, classified.
@@ -1558,46 +1573,54 @@ struct SurfaceEntry {
 /// below, which is the point — the classification is the decision, and it has
 /// to be made deliberately rather than inherited.
 ///
-/// The rows say what the classification is; that the per-file ones actually ask
-/// is pinned elsewhere: [`REPORTED_FILE_CASES`] for `grep` and `git_read`, and
-/// the shipped-configuration turns in `child.rs` for all three.
+/// A row's per-file claim is executed rather than restated: it carries the call
+/// that proves it, run by
+/// [`every_tool_this_table_says_asks_per_file_withholds_a_denied_file`]. What
+/// each rule decides is pinned separately, by [`REPORTED_FILE_CASES`] and by the
+/// shipped-configuration turns in `child.rs`.
 const TOOL_SURFACE: &[SurfaceEntry] = &[
     SurfaceEntry {
         tool: "native::read",
         returns_file_contents: true,
         decided_on_its_target: true,
-        decided_per_file: false,
+        decided_per_file: None,
     },
     SurfaceEntry {
         tool: "native::write",
         returns_file_contents: false,
         decided_on_its_target: true,
-        decided_per_file: false,
+        decided_per_file: None,
     },
     // `edit` reports the region it rewrote, which is the file's own text.
     SurfaceEntry {
         tool: "native::edit",
         returns_file_contents: true,
         decided_on_its_target: true,
-        decided_per_file: false,
+        decided_per_file: None,
     },
     SurfaceEntry {
         tool: "native::list",
         returns_file_contents: false,
         decided_on_its_target: true,
-        decided_per_file: false,
+        decided_per_file: None,
     },
     SurfaceEntry {
         tool: "native::search",
         returns_file_contents: true,
         decided_on_its_target: true,
-        decided_per_file: true,
+        decided_per_file: Some(PerFileProbe {
+            arguments: r#"{"path":".","query":"OPENAI_API_KEY"}"#,
+            still_reports: "OPENAI_API_KEY is set",
+        }),
     },
     SurfaceEntry {
         tool: "native::grep",
         returns_file_contents: true,
         decided_on_its_target: true,
-        decided_per_file: true,
+        decided_per_file: Some(PerFileProbe {
+            arguments: r#"{"pattern":"OPENAI_API_KEY"}"#,
+            still_reports: "OPENAI_API_KEY is set",
+        }),
     },
     // `glob` reports the paths its pattern names and never their contents. Its
     // pattern is matched as text rather than as the set it denotes, which is a
@@ -1606,7 +1629,7 @@ const TOOL_SURFACE: &[SurfaceEntry] = &[
         tool: "native::glob",
         returns_file_contents: false,
         decided_on_its_target: false,
-        decided_per_file: false,
+        decided_per_file: None,
     },
     // `git_read` is named by an operation keyword, so no rule written against
     // it selects a file; the files its `diff` reports are decided one by one.
@@ -1614,14 +1637,17 @@ const TOOL_SURFACE: &[SurfaceEntry] = &[
         tool: "native::git_read",
         returns_file_contents: true,
         decided_on_its_target: false,
-        decided_per_file: true,
+        decided_per_file: Some(PerFileProbe {
+            arguments: r#"{"operation":"diff"}"#,
+            still_reports: "notes: second",
+        }),
     },
     // `webfetch` returns HTTP and HTTPS responses and cannot address a file.
     SurfaceEntry {
         tool: "native::webfetch",
         returns_file_contents: false,
         decided_on_its_target: false,
-        decided_per_file: false,
+        decided_per_file: None,
     },
     // `bash` prints whatever the command it runs prints, and its target is that
     // command line rather than a path. It is the one tool no path deny binds.
@@ -1629,7 +1655,7 @@ const TOOL_SURFACE: &[SurfaceEntry] = &[
         tool: "native::bash",
         returns_file_contents: true,
         decided_on_its_target: false,
-        decided_per_file: false,
+        decided_per_file: None,
     },
 ];
 
@@ -1658,7 +1684,9 @@ fn every_native_tool_that_returns_file_contents_is_reached_by_a_path_rule() {
     let unreached = TOOL_SURFACE
         .iter()
         .filter(|entry| {
-            entry.returns_file_contents && !entry.decided_on_its_target && !entry.decided_per_file
+            entry.returns_file_contents
+                && !entry.decided_on_its_target
+                && entry.decided_per_file.is_none()
         })
         .map(|entry| entry.tool)
         .collect::<Vec<_>>();
@@ -1684,6 +1712,129 @@ fn every_native_tool_that_returns_file_contents_is_reached_by_a_path_rule() {
             "{bare} is matched under the wrong target shape"
         );
     }
+}
+
+/// The secret a probe must never report. It is written into the working tree
+/// and never committed, so `.git` holds no copy of it that a probe could reach
+/// without asking the rules about `.env`.
+const PER_FILE_PROBE_SECRET: &str = "sk-live-surface-probe-do-not-leak";
+
+/// Runs one git command in the probe worktree, under an identity and a
+/// configuration of its own, so neither the machine's committer identity nor
+/// its global ignore rules decide what the fixture ends up containing.
+fn probe_git(root: &Path, arguments: &[&str]) {
+    let output = std::process::Command::new("git")
+        .args(arguments)
+        .current_dir(root)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_AUTHOR_NAME", "agens")
+        .env("GIT_AUTHOR_EMAIL", "agens@example.invalid")
+        .env("GIT_COMMITTER_NAME", "agens")
+        .env("GIT_COMMITTER_EMAIL", "agens@example.invalid")
+        .output()
+        .expect("git must be available to probe git_read");
+
+    assert!(
+        output.status.success(),
+        "git {arguments:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// A worktree every probe can be run over: `.env` holds the secret and
+/// `notes.md` holds a line naming the same key, both reachable by a walk, by a
+/// pattern and by a diff against the commit that holds neither.
+///
+/// The repository keeps its metadata outside the worktree, because a probe that
+/// walks every file under the root would otherwise walk git's own storage and
+/// fail on bytes that are not text.
+fn worktree_holding_a_denied_secret(project_root: &Path, git_dir: &Path) {
+    fs::create_dir_all(project_root).expect("the probe worktree must be creatable");
+    let _ = fs::remove_dir(project_root.join(".git"));
+    probe_git(
+        project_root,
+        &[
+            "init",
+            "--initial-branch=main",
+            "--quiet",
+            &format!("--separate-git-dir={}", git_dir.display()),
+        ],
+    );
+
+    fs::write(project_root.join(".env"), "OPENAI_API_KEY=placeholder\n").unwrap();
+    fs::write(project_root.join("notes.md"), "notes: first\n").unwrap();
+    probe_git(project_root, &["add", "-A"]);
+    probe_git(project_root, &["commit", "--quiet", "-m", "first"]);
+
+    fs::write(
+        project_root.join(".env"),
+        format!("OPENAI_API_KEY={PER_FILE_PROBE_SECRET}\n"),
+    )
+    .unwrap();
+    fs::write(
+        project_root.join("notes.md"),
+        "OPENAI_API_KEY is set\nnotes: second\n",
+    )
+    .unwrap();
+}
+
+/// Every per-file claim in [`TOOL_SURFACE`] is executed here, so a row asserting
+/// it without the wiring behind it fails rather than reading as proven.
+///
+/// Each probe runs the real tool over a worktree holding a denied secret, under
+/// the rule that denies it, and has to come back with what it is allowed to
+/// report and without the secret. A tool that never asks reports both.
+#[test]
+fn every_tool_this_table_says_asks_per_file_withholds_a_denied_file() {
+    let temporary = agens_fixtures::session_directory("tool-surface-per-file");
+    let project_root = temporary.join("project");
+    worktree_holding_a_denied_secret(&project_root, &temporary.join("git"));
+
+    let catalog = NativeToolCatalog::new(
+        NativeTools::open(&project_root).expect("the probe worktree must open as a project root"),
+    );
+
+    for entry in TOOL_SURFACE {
+        let Some(probe) = entry.decided_per_file.as_ref() else {
+            continue;
+        };
+
+        let bare = entry.tool.trim_start_matches("native::");
+        let rule = format!("deny {bare} **/.env");
+        let (policy, identity) = configured_child_policy(&configured_rules(&[&rule]), &[], bare)
+            .unwrap_or_else(|| panic!("a delegated child must be able to reach {bare}"));
+
+        let context = ToolExecutionContext::with_timeout(Duration::from_secs(30)).with_read_filter(
+            PermissionReadFilter::new(
+                policy,
+                Vec::new(),
+                "project",
+                identity,
+                ToolAccess::ReadOnly,
+            ),
+        );
+        let arguments =
+            serde_json::from_str(probe.arguments).expect("a probe names its call in JSON");
+        let output = catalog
+            .execute(entry.tool, arguments, &context)
+            .unwrap_or_else(|error| panic!("{bare} must answer its probe: {error}"));
+
+        assert!(
+            !output.content.contains(PER_FILE_PROBE_SECRET),
+            "{bare} reported a denied file under {}: {}",
+            probe.arguments,
+            output.content
+        );
+        assert!(
+            output.content.contains(probe.still_reports),
+            "{bare} must still report what no rule denies under {}, got: {}",
+            probe.arguments,
+            output.content
+        );
+    }
+
+    fs::remove_dir_all(temporary).unwrap();
 }
 
 /// A dispatcher holding exactly the natives a delegated child inherits, so

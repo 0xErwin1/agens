@@ -131,12 +131,12 @@ The `task` tool delegates work to a subagent, which runs its own turn loop with 
 
 **What the automatic grant costs.** The read-class grant is bounded by the `[permissions]` rules that name each tool, and by nothing else. A rule names one tool, so `deny grep(**/.env)` keeps a subagent out of that file while `deny read(**/.env)` alone does not, and neither covers `search`.
 
-**Which tools a path deny reaches.** A path deny reaches a tool when that tool asks the rules about the file. There are exactly two ways it can, and every tool that returns the contents of a file uses one of them:
+**Which tools a path deny reaches.** A path deny reaches a tool when that tool asks the rules about the file. There are exactly two ways it can:
 
 1. **The call names the file.** The path the call is given is the target the rule is matched against, so a deny refuses the call outright.
 2. **The call reports files it never named.** The tool asks the same rules once per file, while it runs, and omits what they deny.
 
-That is the test to apply to any tool added later: if it can return the contents of a file and does neither, a path deny does not bind it.
+Every tool that returns the contents of a file does one of the two, with one exception: `bash` does neither, because a rule written for it is matched against the command line rather than against any path. That is also the test to apply to any tool added later — if it can return the contents of a file and does neither, a path deny does not bind it, exactly as none binds `bash`.
 
 | Tool | Returns file contents | How a path deny reaches it |
 |------|-----------------------|----------------------------|
@@ -151,9 +151,9 @@ That is the test to apply to any tool added later: if it can return the contents
 | `webfetch` | no — `http`/`https` responses | not as a path; its target is the URL |
 | `bash` | whatever it chooses to print | **it does not** — the target is the command line |
 
-Two limits follow from the table rather than from an exception list. Granting `bash` grants a way around every path rule. And `glob`'s pattern denotes a set while a rule is matched as text, so `deny glob(**/.env)` does not stop `glob(**)` from listing that name — it discloses a name, which `list(**)` already discloses, not what the file holds.
+Two limits follow. The `bash` exception is total: granting `bash` grants a way around every path rule. And `glob`'s pattern denotes a set while a rule is matched as text, so `deny glob(**/.env)` does not stop `glob(**)` from listing that name — it discloses a name, which `list(**)` already discloses, not what the file holds.
 
-**Bounding a call that reads files it never named.** Such a call still runs. It returns everything it is allowed to return, omits the denied files, and ends with one line saying some files were not read — a line that names nothing and counts nothing, so it cannot be used to locate what was withheld. A call that names the denied file directly is refused outright instead, because the rule denies the whole of what that call asked for. This is why `deny git_read(**/.env)` is written against a path while `deny git_read(diff)` is written against an operation: the first decides the files a diff reports, the second decides whether the diff runs at all.
+**Bounding a call that reads files it never named.** Such a call still runs. It returns everything it is allowed to return, omits the denied files, and ends with one line saying some files were not read. That line carries no path, no count and no root, so a single call discloses only that something under what it reached was withheld. It does not make the withheld file unfindable: a caller free to re-scope the call narrows it down — by searching from a narrower root, down to a directory, or by diffing a narrower revision range, down to a single commit. A call that names the denied file directly is refused outright instead, because the rule denies the whole of what that call asked for. This is why `deny git_read(**/.env)` is written against a path while `deny git_read(diff)` is written against an operation: the first decides the files a diff reports, the second decides whether the diff runs at all.
 
 **Narrowing and granting.** Agent definitions are markdown files with YAML frontmatter, discovered in `<project-root>/.agens/agents/` and in `agents/` beside the global configuration. A `permissions:` list adjusts the inherited surface:
 
