@@ -479,7 +479,7 @@ impl HttpWorkerOperation for McpSseOperation {
                         return Err(HttpWorkerError::ResponseTooLarge);
                     }
                 }
-                if buffer.len() > MAX_HTTP_BODY_BYTES {
+                if pending_line_data_bytes(&buffer) > MAX_HTTP_BODY_BYTES {
                     return Err(HttpWorkerError::ResponseTooLarge);
                 }
             }
@@ -493,6 +493,19 @@ impl HttpWorkerOperation for McpSseOperation {
 
     fn close(&mut self) {
         self.client = None;
+    }
+}
+
+/// Bytes of a pending, unterminated SSE line that would count toward the frame
+/// limit once the line completes. `buffer` holds at most one such line, because
+/// every terminated line is drained before this is consulted. A line that cannot
+/// contribute data is charged in full so an unterminated field of any other name
+/// stays bounded.
+fn pending_line_data_bytes(buffer: &[u8]) -> usize {
+    let line = buffer.strip_suffix(b"\r").unwrap_or(buffer);
+    match line.strip_prefix(b"data:") {
+        Some(rest) => rest.strip_prefix(b" ").unwrap_or(rest).len(),
+        None => line.len(),
     }
 }
 

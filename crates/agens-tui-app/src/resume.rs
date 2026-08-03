@@ -143,15 +143,17 @@ pub fn prepare_loaded_tui_session_resume(
         bypass_permission_prompts,
     } = loaded;
     agens_callcount::note_session_resume_projection();
-    let restored_history =
-        Conversation::from_messages_with_parser(&session.messages, |name, input| {
+    let restored_history = Conversation::from_messages_with_parser(
+        &history_without_subagent_turns(&session.messages),
+        |name, input| {
             let bare = name
                 .strip_prefix("native::")
                 .or_else(|| name.strip_prefix("mcp::"))
                 .unwrap_or(name);
             agens_core::ToolInput::parse(bare, input)
-        })
-        .map_err(|_| CliError::storage("saved session is unavailable"))?;
+        },
+    )
+    .map_err(|_| CliError::storage("saved session is unavailable"))?;
     let saved_provider = session.metadata.provider_id.as_deref();
     let provider = saved_provider.and_then(ProviderKind::parse);
     let selection_provider =
@@ -206,7 +208,11 @@ pub fn prepare_loaded_tui_session_resume(
             .map(agens_core::SessionAttemptSummary::status)
             .ok_or_else(|| CliError::storage("saved session is unavailable"))?;
         context.resume_notice = resume_retry_notice(status).map(str::to_owned);
-        context.resume_draft = Some(ResumeDraft::new(boundary.prompt().to_owned()));
+        // A runtime-scheduled turn is not the user's to retry, so its prompt is
+        // never handed back to the composer.
+        if !agens_tui::is_runtime_scheduled_prompt(boundary.prompt()) {
+            context.resume_draft = Some(ResumeDraft::new(boundary.prompt().to_owned()));
+        }
     }
     reconcile_persisted_active_agent(bootstrap, &mut context)?;
     Ok(ResumedTuiSession {
@@ -271,6 +277,50 @@ pub fn commit_tui_session_resume(
 
 const MAX_RESTORED_SUBAGENT_TOOL_USES: usize = 256;
 
+/// The session's own messages, with the turns that belong to a subagent removed.
+///
+/// A completed subagent is persisted as an ordinary user/assistant/tool turn,
+/// and [`resumed_subagent_cards`] already restores it as a card. Left in the
+/// history as well, its task text opens a turn of its own and reads as though
+/// the user had typed the instructions the runtime wrote for the subagent.
+fn history_without_subagent_turns(messages: &[Message]) -> Vec<Message> {
+    let mut kept = Vec::with_capacity(messages.len());
+    let mut index = 0;
+
+    while index < messages.len() {
+        if messages
+            .get(index..index + 3)
+            .is_some_and(is_persisted_subagent_turn)
+        {
+            index += 3;
+            continue;
+        }
+        kept.push(messages[index].clone());
+        index += 1;
+    }
+
+    kept
+}
+
+/// Whether `window` is the three-message shape a completed subagent is stored as.
+fn is_persisted_subagent_turn(window: &[Message]) -> bool {
+    let [user, assistant, tool] = window else {
+        return false;
+    };
+    if !matches!(user.parts.as_slice(), [MessagePart::Text(_)]) {
+        return false;
+    }
+    let [MessagePart::ToolCall { id, .. }, MessagePart::Reasoning(_)] = assistant.parts.as_slice()
+    else {
+        return false;
+    };
+    let [MessagePart::ToolResult { tool_call_id, .. }] = tool.parts.as_slice() else {
+        return false;
+    };
+
+    id.starts_with("subagent:") && tool_call_id == id
+}
+
 pub fn resumed_subagent_cards(messages: &[Message]) -> Vec<TuiRuntimeEvent> {
     let mut restored = Vec::new();
     let mut seen = BTreeSet::new();
@@ -306,7 +356,9 @@ pub fn resumed_subagent_cards(messages: &[Message]) -> Vec<TuiRuntimeEvent> {
         else {
             continue;
         };
-        let Some((agent, description)) = (name == "native::task")
+        // Sessions recorded before the wire name was corrected still carry the
+        // dispatcher's `native::task`, and they must keep restoring their cards.
+        let Some((agent, description)) = matches!(name.as_str(), "task" | "native::task")
             .then(|| serde_json::from_str::<serde_json::Value>(input).ok())
             .flatten()
             .and_then(|value| {
@@ -379,6 +431,7 @@ mod tests {
     };
     use agens_agents::ensure_active_agent_runtime;
     use agens_callcount::{Counts, counts as call_counts, reset as reset_call_counts};
+    use agens_core::ask_user::UnavailableAskUserPort;
     use agens_headless::{HeadlessChatRequest, apply_session_to_request};
     use agens_session::attempt::attempt_failure_status;
     use agens_session::turns::{completed_session_turn_from_events, next_session_metadata};
@@ -450,6 +503,7 @@ mod tests {
             agens_core::RequestConfig::default(),
             "confinement-check".to_owned(),
             false,
+            Box::new(UnavailableAskUserPort),
         )
         .unwrap();
         ensure_active_agent_runtime(&resume_bootstrap, &session, &runtime.dispatcher).unwrap();
@@ -985,6 +1039,7 @@ mod tests {
             agens_core::RequestConfig::default(),
             "abc12345".to_owned(),
             false,
+            Box::new(UnavailableAskUserPort),
         )
         .unwrap();
         ensure_active_agent_runtime(&bootstrap, &session, &runtime.dispatcher).unwrap();
@@ -1496,5 +1551,63 @@ mod tests {
             is_error: true,
         }];
         assert!(resumed_subagent_cards(&transient).is_empty());
+    }
+
+    /// A subagent's instructions are written by the runtime, not typed by the
+    /// user, and the card is where they belong. Left in the restored history
+    /// they open a turn that reads as the user's own prompt.
+    #[test]
+    fn a_restored_history_leaves_a_subagent_turn_to_its_card() {
+        let messages = vec![
+            Message {
+                role: agens_core::Role::User,
+                parts: vec![MessagePart::Text("lanza un subagente".into())],
+            },
+            Message {
+                role: agens_core::Role::Assistant,
+                parts: vec![MessagePart::Text("listo".into())],
+            },
+            Message {
+                role: agens_core::Role::User,
+                parts: vec![MessagePart::Text("explore the repository".into())],
+            },
+            Message {
+                role: agens_core::Role::Assistant,
+                parts: vec![
+                    MessagePart::ToolCall {
+                        id: "subagent:1".into(),
+                        name: "task".into(),
+                        input: r#"{"agent":"explore","description":"explore the repository"}"#
+                            .into(),
+                    },
+                    MessagePart::Reasoning("3 tool uses".into()),
+                ],
+            },
+            Message {
+                role: agens_core::Role::Tool,
+                parts: vec![MessagePart::ToolResult {
+                    tool_call_id: "subagent:1".into(),
+                    content: "a map".into(),
+                    is_error: false,
+                }],
+            },
+        ];
+
+        let kept = history_without_subagent_turns(&messages);
+
+        assert_eq!(kept.len(), 2, "{kept:?}");
+        assert!(
+            !kept.iter().any(|message| message
+                .parts
+                .iter()
+                .any(|part| matches!(part, MessagePart::Text(text)
+                    if text == "explore the repository"))),
+            "{kept:?}"
+        );
+        assert_eq!(
+            resumed_subagent_cards(&messages).len(),
+            1,
+            "the turn is still restored, as a card"
+        );
     }
 }

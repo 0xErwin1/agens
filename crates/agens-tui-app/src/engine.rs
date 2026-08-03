@@ -11,9 +11,10 @@ use agens_tools::{
 };
 use agens_tui::{
     BridgeCancel, Engine as TuiEngine, Tui, TuiProviderOutcome, TuiSubmissionOutcome,
-    run_with_default_progress_submit_with_permissions_and_task_controls,
+    run_with_default_progress_submit_with_permissions_task_controls_and_ask_user,
 };
 
+use crate::ask_user_prompt::{TuiAskUserPort, production_tui_ask_user_bridge};
 use crate::extensions::{start_tui_commands, start_tui_skills};
 use crate::files::{expand_tui_file_reference, tui_picker_file_candidates};
 use crate::metrics::{TuiMetricsPublisher, finish_tui_metrics};
@@ -22,6 +23,7 @@ use crate::models::seed_remembered_tui_selection;
 use crate::permission_prompt::TtyPermissionPrompter;
 use crate::permission_prompt::TuiPermissionPrompter;
 use crate::permission_prompt::production_tui_permission_bridge;
+use crate::repository::start_repository_probe;
 use crate::resume::{ResumedTuiSession, resume_tui_session, resumed_subagent_cards};
 use crate::router::{TuiRuntimeRouter, tui_provider_outcome};
 use crate::turn::{complete_tui_turn, tui_session_presentation};
@@ -66,6 +68,27 @@ impl TuiEngine for ProductionTuiEngine {
 
 fn interactive_turn_cancellation() -> HeadlessTurnCancellation {
     HeadlessTurnCancellation::new()
+}
+
+/// Installs the trace recorder when `AGENS_PERF_TRACE` names a directory.
+///
+/// This is the only path that measures a real terminal. The scenario harness
+/// drives a `TestBackend`, so everything crossterm does to paint an actual tty
+/// — and everything the terminal emulator does with it — is invisible there.
+#[cfg(feature = "perf-audit")]
+fn session_perf_recorder() -> Option<agens_perf::Recorder> {
+    let directory = std::env::var("AGENS_PERF_TRACE").ok()?;
+    let run_id = std::env::var("AGENS_PERF_RUN").unwrap_or_else(|_| "session".to_owned());
+
+    match agens_perf::Recorder::install(
+        agens_perf::RecorderConfig::new(directory, run_id).with_scenario("live_session"),
+    ) {
+        Ok(recorder) => Some(recorder),
+        Err(error) => {
+            eprintln!("perf tracing is off: {error}");
+            None
+        }
+    }
 }
 
 pub fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<String, CliError> {
@@ -168,12 +191,17 @@ pub fn run_production_tui_with_profile_store(
     let mcp_noticed: Arc<Mutex<std::collections::BTreeSet<String>>> =
         Arc::new(Mutex::new(std::collections::BTreeSet::new()));
     let (permission_bridge, permission_requests) = production_tui_permission_bridge();
+    let (ask_user_bridge, ask_user_requests) = production_tui_ask_user_bridge();
     let transition_controls = task_controls.clone();
     let cancel_controls = task_controls.clone();
     let message_controls = task_controls.clone();
     let submit_task_controls = task_controls.clone();
     let prompt_bridge = permission_bridge.clone();
-    let tui_result = run_with_default_progress_submit_with_permissions_and_task_controls(
+    let submit_ask_user_bridge = ask_user_bridge.clone();
+    #[cfg(feature = "perf-audit")]
+    let perf_recorder = session_perf_recorder();
+
+    let tui_result = run_with_default_progress_submit_with_permissions_task_controls_and_ask_user(
         &mut tui,
         move |request, progress, cancellation| {
             route_router.route_request_with_cancellation(request, progress, cancellation)
@@ -252,6 +280,7 @@ pub fn run_production_tui_with_profile_store(
                 task_parent_request_config.clone(),
                 task_diagnostic_reference.clone(),
                 session_bypass,
+                Box::new(TuiAskUserPort(submit_ask_user_bridge.clone())),
             ) {
                 Ok(runtime) => runtime,
                 Err(error) => return tui_provider_outcome(Err(error)),
@@ -302,6 +331,7 @@ pub fn run_production_tui_with_profile_store(
                         .with_bypass(request.dangerously_allow_all),
                         task_parent_request_config.clone(),
                         Some(task_diagnostic_reference.clone()),
+                        Box::new(TuiAskUserPort(submit_ask_user_bridge.clone())),
                     )?;
                     run_production_headless_chat_with_progress(
                         request,
@@ -340,11 +370,20 @@ pub fn run_production_tui_with_profile_store(
                 .is_ok()
         },
         Some((permission_bridge, permission_requests)),
+        Some((ask_user_bridge, ask_user_requests)),
     );
     task_controls.0.cancel_all();
     let _ = task_controls
         .0
         .wait_for_idle(std::time::Duration::from_secs(2));
+    #[cfg(feature = "perf-audit")]
+    if let Some(recorder) = perf_recorder {
+        match recorder.finish() {
+            Ok(paths) => eprintln!("perf trace: {}", paths.jsonl.display()),
+            Err(error) => eprintln!("perf trace was not written: {error}"),
+        }
+    }
+
     tui_result.map_err(|_| CliError::new(ExitStatus::Failure, "ui", "terminal UI failed"))?;
 
     Ok(String::new())
@@ -598,6 +637,7 @@ pub fn configure_tui_project_identity(tui: &mut Tui<ProductionTuiEngine>, bootst
         agens_bootstrap::session_root::SessionRoot::discover_for_new_session(bootstrap)
     {
         tui.set_project(root.path().display().to_string());
+        tui.set_repository_probe(start_repository_probe(root.path()));
     }
 }
 

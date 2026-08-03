@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+use agens_core::ask_user::UnavailableAskUserPort;
 use agens_core::{
     HeadlessTurnCancellation, PermissionDecision, PermissionMode, PermissionPattern,
     PermissionPolicy, PermissionRule, PermissionSession, ToolAccess,
@@ -78,6 +79,7 @@ fn a_task_runtimes_permission_policy_is_scoped_to_its_own_root_not_the_bootstrap
             ProductionTaskRunner::new(bootstrap_from_root_b.clone(), root.to_path_buf()),
             agens_core::RequestConfig::default(),
             None,
+            Box::new(UnavailableAskUserPort),
         )
         .unwrap();
         let write_identity = runtime
@@ -151,6 +153,7 @@ fn u15_a1b1_production_task_runtime_assembles_current_turn_registration() {
         ),
         agens_core::RequestConfig::with_reasoning_effort("high").unwrap(),
         None,
+        Box::new(UnavailableAskUserPort),
     )
     .unwrap();
 
@@ -233,6 +236,7 @@ fn tui_and_headless_task_tool_construction_delegate_profiles_identically() {
         ),
         parent_config.clone(),
         Some("abcd1234".into()),
+        Box::new(UnavailableAskUserPort),
     )
     .unwrap();
     let headless_probe = Arc::new(Mutex::new(Vec::new()));

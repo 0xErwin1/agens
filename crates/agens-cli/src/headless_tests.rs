@@ -35,6 +35,7 @@ fn a_live_task_runtime_pins_the_headless_turn_to_its_own_session_root_not_the_pr
     use agens_store::SessionStore;
     use agens_tools::SkillCatalog;
 
+    use agens_core::ask_user::UnavailableAskUserPort;
     use agens_tool_runtime::runner::{TuiTaskControls, TuiTaskLifecycleBridge};
     use agens_tool_runtime::task::production_tui_task_runtime;
     use agens_tui_app::permission_prompt::{
@@ -83,6 +84,7 @@ fn a_live_task_runtime_pins_the_headless_turn_to_its_own_session_root_not_the_pr
         agens_core::RequestConfig::default(),
         "headless-root-check".to_owned(),
         false,
+        Box::new(UnavailableAskUserPort),
     )
     .unwrap();
 
@@ -186,6 +188,96 @@ fn a_headless_turns_permission_policy_is_scoped_to_its_own_root_not_the_bootstra
 
     std::fs::remove_dir_all(&temporary).ok();
     std::fs::remove_dir_all(bootstrap_from_root_b.data_directory()).ok();
+}
+
+/// Exercises `production_tool_runtime_for_parent` — the exact builder
+/// `agens-headless/src/turn.rs` calls for a headless turn — end to end through
+/// `native::ask_user`, proving the headless composition keeps the default
+/// `UnavailableAskUserPort` wiring: no interactive surface, no blocking wait, no
+/// translation into a permission `DenyOnce`.
+#[test]
+fn a_headless_ask_user_call_returns_unavailable_within_a_bounded_deadline_and_never_blocks() {
+    use std::time::{Duration, Instant};
+
+    use agens_tool_runtime::runtime::production_tool_runtime_for_parent;
+    use agens_tools::{ToolDispatchRequest, ToolEvaluationOutcome, ToolExecutionContext};
+
+    let temporary = std::env::temp_dir().join(format!(
+        "agens-headless-ask-user-unavailable-{}",
+        std::process::id()
+    ));
+    let project_root = temporary.join("project");
+    std::fs::create_dir_all(project_root.join(".git")).unwrap();
+
+    let bootstrap = bootstrap(&CliDependencies::for_test(
+        project_root.clone(),
+        Some(temporary.join("home")),
+        BTreeMap::from([(
+            "AGENS_CONFIG_HOME".to_owned(),
+            temporary.join("config").display().to_string(),
+        )]),
+        BTreeMap::from([(
+            temporary.join("config/config.toml"),
+            "[provider]\ntype = \"openai-api\"\nmodel = \"gpt-4.1\"\n".to_owned(),
+        )]),
+    ))
+    .unwrap();
+
+    let (_, dispatcher) = production_tool_runtime_for_parent(
+        &bootstrap,
+        &project_root,
+        None,
+        "gpt-4.1".to_owned(),
+        agens_core::RequestConfig::default(),
+        None,
+    )
+    .unwrap();
+
+    let policy = agens_core::PermissionPolicy::new(PermissionMode::Edit, vec![]);
+    let mut dispatcher = dispatcher.lock().unwrap();
+    let ToolEvaluationOutcome::Authorized(handle) = dispatcher
+        .evaluate(
+            &policy,
+            &[],
+            &agens_core::PermissionSession::with_temporary_bypass(),
+            ToolDispatchRequest::new(
+                "project",
+                "native::ask_user",
+                serde_json::json!({
+                    "questions": [{
+                        "id": "q",
+                        "prompt": "p",
+                        "mode": "single",
+                        "options": [{"id": "a", "label": "A"}]
+                    }]
+                }),
+            ),
+        )
+        .unwrap()
+    else {
+        panic!("native::ask_user should authorize under a bypassed session");
+    };
+
+    let deadline_budget = Duration::from_secs(30);
+    let started = Instant::now();
+    let output = dispatcher
+        .execute(handle, &ToolExecutionContext::with_timeout(deadline_budget))
+        .unwrap();
+    let elapsed = started.elapsed();
+
+    assert!(!output.is_error, "{output:?}");
+    assert_eq!(
+        output.content,
+        "{\"status\":\"unavailable\",\"reason\":\"no interactive surface\"}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "a headless ask_user call must return immediately, not wait toward its deadline budget; \
+         took {elapsed:?}"
+    );
+
+    std::fs::remove_dir_all(&temporary).ok();
+    std::fs::remove_dir_all(bootstrap.data_directory()).ok();
 }
 
 /// Covers BOTH `system_prompt` fallback sites in
@@ -899,7 +991,9 @@ fn production_resumed_headless_turn_replays_typed_history_and_appends_to_the_sam
         serde_json::json!([
             {"role": "user", "content": [{"type": "input_text", "text": "first input"}]},
             {"type": "reasoning", "summary": [{"type": "summary_text", "text": "first reasoning"}]},
-            {"type": "function_call", "call_id": "call-history", "name": "native::read", "arguments": "{\"path\":\"notes.md\"}"},
+            // Recorded history keeps the dispatcher's name; the wire never sees
+            // it, because the provider rejects the whole request over it.
+            {"type": "function_call", "call_id": "call-history", "name": "read", "arguments": "{\"path\":\"notes.md\"}"},
             {"role": "assistant", "content": [{"type": "output_text", "text": "calling the tool"}]},
             {"type": "function_call_output", "call_id": "call-history", "output": "file contents"},
             {"role": "system", "content": [{"type": "input_text", "text": "Agent capabilities expanded: primary -> reviewer."}]},

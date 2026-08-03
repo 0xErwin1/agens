@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+use agens_core::ask_user::AskUserPort;
 use agens_core::{PermissionMode, PermissionSession};
 use agens_providers::OpenAiFunctionTool;
 use agens_store::PermissionGrantStore;
@@ -15,7 +16,7 @@ use agens_tools::{
 };
 
 use crate::runner::{ProductionTaskRunner, TuiTaskLifecycleBridge};
-use crate::runtime::production_tool_runtime_with_parent_task_runner;
+use crate::runtime::production_tool_runtime_with_parent_task_runner_and_ask_user;
 use agens_agents::{TaskModelValidator, task_agent_catalog, task_model_catalog};
 use agens_bootstrap::Bootstrap;
 use agens_diagnostics::{next_diagnostic_reference, record_subagent_model_unavailable};
@@ -61,6 +62,7 @@ pub fn production_tui_task_runtime(
     parent_request_config: agens_core::RequestConfig,
     model_resolution_reference: String,
     bypass: bool,
+    ask_user: Box<dyn AskUserPort>,
 ) -> Result<ProductionTuiTaskRuntime, CliError> {
     production_tui_task_runtime_with_runner_and_parent_config(
         bootstrap,
@@ -72,6 +74,7 @@ pub fn production_tui_task_runtime(
             .with_bypass(bypass),
         parent_request_config,
         Some(model_resolution_reference),
+        ask_user,
     )
 }
 
@@ -81,6 +84,7 @@ pub fn production_tui_task_runtime_with_runner(
     skills: &SkillCatalog,
     prompter: Box<dyn PermissionPrompter>,
     task_runner: ProductionTaskRunner,
+    ask_user: Box<dyn AskUserPort>,
 ) -> Result<ProductionTuiTaskRuntime, CliError> {
     production_tui_task_runtime_with_runner_and_parent_config(
         bootstrap,
@@ -90,9 +94,11 @@ pub fn production_tui_task_runtime_with_runner(
         task_runner,
         agens_core::RequestConfig::default(),
         None,
+        ask_user,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn production_tui_task_runtime_with_runner_and_parent_config(
     bootstrap: &Bootstrap,
     project_root: &Path,
@@ -101,6 +107,7 @@ pub fn production_tui_task_runtime_with_runner_and_parent_config(
     task_runner: ProductionTaskRunner,
     parent_request_config: agens_core::RequestConfig,
     model_resolution_reference: Option<String>,
+    ask_user: Box<dyn AskUserPort>,
 ) -> Result<ProductionTuiTaskRuntime, CliError> {
     let bypass = task_runner.bypass();
     let task_registry = task_runner.execution_registry().unwrap_or_default();
@@ -112,15 +119,17 @@ pub fn production_tui_task_runtime_with_runner_and_parent_config(
             })?
             .to_owned(),
     };
-    let (provider_tools, dispatcher) = production_tool_runtime_with_parent_task_runner(
-        bootstrap,
-        project_root,
-        Some(skills),
-        parent_model,
-        parent_request_config,
-        model_resolution_reference,
-        task_runner,
-    )?;
+    let (provider_tools, dispatcher) =
+        production_tool_runtime_with_parent_task_runner_and_ask_user(
+            bootstrap,
+            project_root,
+            Some(skills),
+            parent_model,
+            parent_request_config,
+            model_resolution_reference,
+            task_runner,
+            ask_user,
+        )?;
     let project = project_root.display().to_string();
     let session_root =
         agens_bootstrap::session_root::SessionRoot::confined_to(project_root.to_path_buf());

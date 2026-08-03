@@ -7,6 +7,7 @@
 //!
 //! It is a surface, so it may depend on logic and logic may never depend on it.
 
+pub mod ask_user_prompt;
 pub mod dialogs;
 pub mod engine;
 pub mod extensions;
@@ -15,6 +16,7 @@ pub mod metrics;
 pub mod models;
 pub mod permission_prompt;
 pub mod profiles;
+pub mod repository;
 pub mod resume;
 pub mod router;
 pub mod session;

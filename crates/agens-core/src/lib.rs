@@ -11,6 +11,7 @@ use std::{
 
 use globset::{GlobBuilder, GlobMatcher};
 
+pub mod ask_user;
 pub mod prompt;
 pub mod redaction;
 mod request_config;
@@ -1431,6 +1432,8 @@ pub enum HeadlessTurnPortError {
     Provider,
     ProviderRejected,
     ProviderContext,
+    ProviderHistoryBudget,
+    ProviderToolRounds,
     ProviderRateLimited,
     ProviderServer,
     ProviderNetwork,
@@ -1576,6 +1579,12 @@ pub enum HeadlessTurnError {
     Provider,
     ProviderRejected,
     ProviderContext,
+    /// The session's own history outgrew what one request may replay. This is
+    /// the runtime's budget, not the model's context window: reporting it as
+    /// context sends the reader to shorten a prompt that was never the problem.
+    ProviderHistoryBudget,
+    /// The turn kept calling tools past the round limit without finishing.
+    ProviderToolRounds,
     ProviderRateLimited,
     ProviderServer,
     ProviderNetwork,
@@ -1599,6 +1608,8 @@ impl fmt::Display for HeadlessTurnError {
             Self::Provider => "provider operation failed",
             Self::ProviderRejected => "provider rejected the request",
             Self::ProviderContext => "provider rejected the request because it exceeds context",
+            Self::ProviderHistoryBudget => "session history outgrew the replay budget",
+            Self::ProviderToolRounds => "turn exceeded the tool continuation rounds",
             Self::ProviderRateLimited => "provider rate limited the request",
             Self::ProviderServer => "provider service failed",
             Self::ProviderNetwork => "provider network request failed",
@@ -1966,6 +1977,10 @@ fn map_port_error(error: HeadlessTurnPortError) -> Option<HeadlessTurnError> {
     match error {
         HeadlessTurnPortError::ProviderRejected => Some(HeadlessTurnError::ProviderRejected),
         HeadlessTurnPortError::ProviderContext => Some(HeadlessTurnError::ProviderContext),
+        HeadlessTurnPortError::ProviderHistoryBudget => {
+            Some(HeadlessTurnError::ProviderHistoryBudget)
+        }
+        HeadlessTurnPortError::ProviderToolRounds => Some(HeadlessTurnError::ProviderToolRounds),
         HeadlessTurnPortError::ProviderRateLimited => Some(HeadlessTurnError::ProviderRateLimited),
         HeadlessTurnPortError::ProviderServer => Some(HeadlessTurnError::ProviderServer),
         HeadlessTurnPortError::ProviderNetwork => Some(HeadlessTurnError::ProviderNetwork),
@@ -3023,6 +3038,11 @@ pub enum TuiSubagentUpdate {
         agent: String,
         task_summary: String,
         presentation: TuiExecutionState,
+        /// What the subagent is actually running on. A delegation whose model
+        /// or effort differs from the parent's is the common case, and the
+        /// surface that hides it makes the difference impossible to notice.
+        model: Option<String>,
+        effort: Option<String>,
     },
     Reasoning(String),
     Text(String),
@@ -3054,12 +3074,26 @@ impl TuiSubagentEvent {
         task_summary: impl AsRef<str>,
         presentation: TuiExecutionState,
     ) -> Self {
+        Self::started_on(id, agent, task_summary, presentation, None, None)
+    }
+
+    /// A start that also records the model and effort the subagent runs on.
+    pub fn started_on(
+        id: u64,
+        agent: impl AsRef<str>,
+        task_summary: impl AsRef<str>,
+        presentation: TuiExecutionState,
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) -> Self {
         Self {
             id,
             update: TuiSubagentUpdate::Started {
                 agent: sanitize_projection(agent.as_ref()),
                 task_summary: sanitize_projection(task_summary.as_ref()),
                 presentation,
+                model: model.map(sanitize_projection),
+                effort: effort.map(sanitize_projection),
             },
         }
     }
@@ -3237,6 +3271,12 @@ pub struct TuiExecution {
     pub id: u64,
     pub agent: String,
     pub state: TuiExecutionState,
+    /// What this delegation runs on, once the runtime has reported it.
+    ///
+    /// A subagent routinely differs from its parent, and from its siblings, in
+    /// model. Supervising several at once means comparing them, and elapsed
+    /// time alone cannot be compared across different models.
+    pub model: Option<String>,
     pub started_at: Duration,
     pub last_activity: Duration,
     pub terminal_at: Option<Duration>,

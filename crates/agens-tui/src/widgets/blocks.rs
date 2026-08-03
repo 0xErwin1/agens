@@ -3,6 +3,7 @@
 use std::time::Duration;
 
 use agens_core::ToolInput;
+use agens_core::redaction::{is_credential_key, redact_credential_values};
 use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
@@ -10,7 +11,7 @@ use ratatui::{
 use serde_json::Value;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use super::{DisplayMode, ExpandMode, RolePalette, StatusGlyph};
+use super::{DisplayMode, ExpandMode, Glyph, RolePalette, StatusGlyph, UnicodeLevel};
 
 /// Columns reserved by the shared transcript gutter: one bullet cell plus one
 /// separator cell.
@@ -40,8 +41,6 @@ pub(crate) enum RowAccent {
 }
 
 impl RowAccent {
-    const BAR: &'static str = "┃";
-    const THIN_BAR: &'static str = "❙";
     /// Brightness percentages the wave cycles through, in travel order.
     const WAVE_LEVELS: [u16; 4] = [100, 84, 68, 84];
     const COLLAPSED_LEVEL: u16 = 50;
@@ -53,13 +52,13 @@ impl RowAccent {
     const WAVE_PERIODS: u128 = 3;
 
     /// Bar painted for the `row`-th line of its block under the tick clock.
-    pub(crate) fn span(self, row: usize, now: Duration) -> Span<'static> {
+    pub(crate) fn span(self, row: usize, now: Duration, unicode: UnicodeLevel) -> Span<'static> {
         let (glyph, color) = match self {
-            Self::Wave(color) => (Self::BAR, scaled(color, Self::wave_level(row, now))),
-            Self::Still(color) => (Self::BAR, color),
-            Self::Collapsed(color) => (Self::THIN_BAR, scaled(color, Self::COLLAPSED_LEVEL)),
+            Self::Wave(color) => (Glyph::AccentBar, scaled(color, Self::wave_level(row, now))),
+            Self::Still(color) => (Glyph::AccentBar, color),
+            Self::Collapsed(color) => (Glyph::ThinAccentBar, scaled(color, Self::COLLAPSED_LEVEL)),
         };
-        Span::styled(glyph, Style::default().fg(color))
+        Span::styled(glyph.text(unicode), Style::default().fg(color))
     }
 
     fn wave_level(row: usize, now: Duration) -> u16 {
@@ -112,18 +111,15 @@ pub(crate) enum RowBullet {
     /// A header standing in for several rows (verb run, elided remainder).
     Group(RowState),
     /// Fixed identity glyph (user prompt, subagent card).
-    Identity(&'static str, Color),
+    Identity(Glyph, Color),
 }
 
 impl RowBullet {
-    const ACTIVITY: &'static str = "◆";
-    const GROUP: &'static str = "◈";
-
-    pub(crate) fn span(self) -> Span<'static> {
+    pub(crate) fn span(self, unicode: UnicodeLevel) -> Span<'static> {
         let (glyph, color) = match self {
-            Self::Activity(state) => (Self::ACTIVITY, state.color()),
-            Self::Group(state) => (Self::GROUP, state.color()),
-            Self::Identity(glyph, color) => (glyph, color),
+            Self::Activity(state) => (Glyph::ActivityBullet.text(unicode), state.color()),
+            Self::Group(state) => (Glyph::GroupBullet.text(unicode), state.color()),
+            Self::Identity(glyph, color) => (glyph.text(unicode), color),
         };
         Span::styled(
             format!("{glyph} "),
@@ -229,8 +225,12 @@ impl ThinkingBlock {
     pub(crate) const fn accent(mode: ExpandMode) -> Option<RowAccent> {
         match mode {
             ExpandMode::Streaming => Some(RowAccent::Wave(RowState::Running.color())),
-            ExpandMode::Expanded => Some(RowAccent::Still(RolePalette::muted())),
-            ExpandMode::Collapsed => None,
+            // Collapsed keeps the rail. Every other block sits on the gutter, and
+            // a single row that does not reads as belonging to something else
+            // rather than as the quiet member of the same list.
+            ExpandMode::Expanded | ExpandMode::Collapsed => {
+                Some(RowAccent::Still(RolePalette::muted()))
+            }
         }
     }
 
@@ -246,11 +246,37 @@ impl ThinkingBlock {
     /// `elapsed` is rendered only when the caller measured it: no reasoning
     /// timing exists in the projection today, so the bare form is what ships
     /// rather than a fabricated duration.
-    pub(crate) fn collapsed_title(elapsed: Option<Duration>) -> Line<'static> {
-        Self::row(elapsed.map_or_else(
+    ///
+    /// The row carries no key hint: it is the quietest thing in the transcript
+    /// and stays that way. Ctrl+T is documented where keys are documented.
+    pub(crate) fn collapsed_title(
+        summary: Option<&str>,
+        elapsed: Option<Duration>,
+    ) -> Line<'static> {
+        let label = elapsed.map_or_else(
             || "Thought".to_owned(),
             |elapsed| format!("Thought for {}", thought_duration(elapsed)),
-        ))
+        );
+
+        let Some(summary) = summary.map(str::trim).filter(|summary| !summary.is_empty()) else {
+            return Self::row(label);
+        };
+
+        // The label is what the row is; the summary is what it was about. They
+        // carry different weight so the eye can skip the first and read the
+        // second down a column of collapsed thoughts.
+        Line::from(vec![
+            Span::styled(
+                format!("{label} · "),
+                Style::default()
+                    .fg(RolePalette::muted())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                summary.to_owned(),
+                Style::default().fg(RolePalette::muted()),
+            ),
+        ])
     }
 
     fn row(label: String) -> Line<'static> {
@@ -338,7 +364,7 @@ pub(crate) fn tool_header(parsed: &ToolInput, content_width: usize) -> Line<'sta
         Style::default().fg(RolePalette::muted())
     } else {
         Style::default()
-            .fg(RolePalette::assistant())
+            .fg(RolePalette::machine())
             .add_modifier(Modifier::BOLD)
     };
 
@@ -358,7 +384,7 @@ pub(crate) fn tool_header(parsed: &ToolInput, content_width: usize) -> Line<'sta
     }
     spans.push(Span::styled(
         operand,
-        Style::default().fg(RolePalette::assistant()),
+        Style::default().fg(RolePalette::machine()),
     ));
     if let Some(suffix) = parts.suffix {
         spans.push(Span::raw(" "));
@@ -480,22 +506,69 @@ fn header_parts(parsed: &ToolInput) -> HeaderParts {
     }
 }
 
-/// Summarize an unknown tool's arguments without dumping arbitrary values.
+/// Summarize an unknown tool's arguments by what was actually asked for.
 ///
-/// Stable resource identifiers (`readable_id` or `slug`) are safe and useful on
-/// the scan path; a move also includes its destination column. Other JSON objects
-/// retain only their top-level key shape. Complete raw arguments stay reachable
+/// The key shape alone (`{board, limit, status}`) is the same for every call to
+/// the same tool, so a batch of them reads as one row repeated: it says which
+/// tool ran and nothing about what it was told to do. The values are what tell
+/// two calls apart, so scalars are shown — each redacted, collapsed and
+/// bounded — while nested objects and arrays stay shape-only, since those are
+/// the payloads worth dumping nowhere. Complete raw arguments remain reachable
 /// through [`DisplayMode::Expanded`].
 fn summarize_args(tool_name: &str, raw: &str) -> String {
     let trimmed = raw.trim();
-    if trimmed.starts_with('{') {
-        tool_name
-            .strip_prefix("mcp::atlas_")
-            .and_then(|_| safe_resource_summary(trimmed))
-            .unwrap_or_else(|| format_key_shape(&object_keys(trimmed)))
-    } else {
-        collapse_whitespace(trimmed)
+    if !trimmed.starts_with('{') {
+        return redact_credential_values(&collapse_whitespace(trimmed));
     }
+
+    tool_name
+        .strip_prefix("mcp::atlas_")
+        .and_then(|_| safe_resource_summary(trimmed))
+        .or_else(|| summarize_arguments_by_value(trimmed))
+        .unwrap_or_else(|| format_key_shape(&object_keys(trimmed)))
+}
+
+/// Bounded `key=value` pairs for a JSON object's own members.
+///
+/// Returns `None` for anything that is not a parsable object, so the caller can
+/// fall back to the shape scanner that tolerates malformed input.
+fn summarize_arguments_by_value(raw: &str) -> Option<String> {
+    let Value::Object(arguments) = serde_json::from_str(raw).ok()? else {
+        return None;
+    };
+    if arguments.is_empty() {
+        return None;
+    }
+
+    let mut parts = Vec::new();
+    let mut width = 0usize;
+    for (key, value) in arguments.iter().take(MAX_SUMMARIZED_KEYS) {
+        let key = truncate_operand(key, MAX_SUMMARIZED_KEY_WIDTH);
+        let rendered = match value {
+            Value::Object(_) => "{…}".to_owned(),
+            Value::Array(items) => format!("[{}]", items.len()),
+            Value::Null => "null".to_owned(),
+            // A value under a credential-shaped key is withheld on the key
+            // alone. Judging it by its own shape asks the wrong question: a
+            // short or low-entropy secret is still a secret, and the argument
+            // called `token` announced what it holds.
+            _ if is_credential_key(&key) => "[redacted]".to_owned(),
+            Value::String(text) => {
+                let text = redact_credential_values(&collapse_whitespace(text));
+                truncate_operand(&text, MAX_SUMMARIZED_VALUE_WIDTH)
+            }
+            other => other.to_string(),
+        };
+        let part = format!("{key}={rendered}");
+        width += part.width() + 2;
+        if width > MAX_SUMMARIZED_ARGUMENTS_WIDTH && !parts.is_empty() {
+            parts.push("…".to_owned());
+            break;
+        }
+        parts.push(part);
+    }
+
+    (!parts.is_empty()).then(|| format!("{{{}}}", parts.join(", ")))
 }
 
 const MAX_RESOURCE_SUMMARY_WIDTH: usize = 48;
@@ -527,6 +600,9 @@ fn collapse_whitespace(raw: &str) -> String {
 
 const MAX_SUMMARIZED_KEYS: usize = 6;
 const MAX_SUMMARIZED_KEY_WIDTH: usize = 24;
+const MAX_SUMMARIZED_VALUE_WIDTH: usize = 28;
+/// Budget the whole argument summary shares before it elides the rest.
+const MAX_SUMMARIZED_ARGUMENTS_WIDTH: usize = 72;
 
 /// Top-level member names of a JSON-shaped object payload, in source order.
 ///
@@ -774,10 +850,24 @@ fn short_tool_name(name: &str) -> String {
 mod tests {
     use super::*;
 
+    /// A hidden thought names itself and what it was about. A column of rows
+    /// reading only "Thought" is the shape of information without any: nothing
+    /// there tells one from the next.
     #[test]
     fn collapsed_thinking_is_one_row_naming_the_thought_and_its_duration() {
         assert_eq!(line_text(&ThinkingBlock::title()), "Thinking");
-        assert_eq!(line_text(&ThinkingBlock::collapsed_title(None)), "Thought");
+        assert_eq!(
+            line_text(&ThinkingBlock::collapsed_title(None, None)),
+            "Thought"
+        );
+        assert_eq!(
+            line_text(&ThinkingBlock::collapsed_title(
+                Some("Investigating the timeout"),
+                None
+            )),
+            "Thought · Investigating the timeout",
+            "a collapsed thought says what it was about"
+        );
         for (elapsed, expected) in [
             (Duration::from_millis(1_800), "Thought for 1.8s"),
             (Duration::from_millis(59_940), "Thought for 59.9s"),
@@ -785,7 +875,7 @@ mod tests {
             (Duration::from_secs(125), "Thought for 2m5s"),
         ] {
             assert_eq!(
-                line_text(&ThinkingBlock::collapsed_title(Some(elapsed))),
+                line_text(&ThinkingBlock::collapsed_title(None, Some(elapsed))),
                 expected
             );
         }
@@ -914,7 +1004,7 @@ mod tests {
                 name: "mcp::foo__bar".into(),
                 raw: "{\"a\":1}".into(),
             }),
-            "foo__bar {a}"
+            "foo__bar {a=1}"
         );
         // Multi-line raw args collapse to a single summarized line (no JSON dump).
         let collapsed = header_of(&ToolInput::Other {
@@ -1037,16 +1127,46 @@ mod tests {
         );
     }
 
+    /// A batch of calls to the same tool differs only in its values, so the
+    /// summary carries them; nested payloads stay shape-only, which is what
+    /// keeps a blob out of a one-line row.
     #[test]
-    fn mcp_headers_summarize_argument_shape_instead_of_raw_json() {
+    fn mcp_headers_summarize_what_was_asked_for_not_only_its_shape() {
         let header = header_of(&ToolInput::Other {
             name: "mcp::foo__bar".into(),
             raw: "{\"path\":\"/etc/hosts\",\"limit\":10,\"nested\":{\"deep\":true}}".into(),
         });
-        assert_eq!(header, "foo__bar {path, limit, nested}");
+        assert_eq!(header, "foo__bar {limit=10, nested={…}, path=/etc/hosts}");
         assert!(!header.contains('"'), "no raw JSON punctuation: {header:?}");
-        assert!(!header.contains("/etc/hosts"), "no argument values");
         assert!(!header.contains("deep"), "no nested keys");
+
+        let credential = header_of(&ToolInput::Other {
+            name: "mcp::foo__bar".into(),
+            raw: "{\"token\":\"sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"}".into(),
+        });
+        assert!(
+            !credential.contains("sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+            "an argument that looks like a credential never reaches the row: {credential:?}"
+        );
+
+        // Shape is not the only signal, and it is the weaker one: a short or
+        // low-entropy secret looks like nothing, while the key that holds it
+        // already said what it is.
+        let named = header_of(&ToolInput::Other {
+            name: "mcp::foo__bar".into(),
+            raw: r#"{"token":"hunter2","password":"x","tokenizer":"bpe"}"#.into(),
+        });
+        assert_eq!(
+            named, "foo__bar {password=[redacted], token=[redacted], tokenizer=bpe}",
+            "a credential-shaped key withholds its value whatever the value looks like, \
+             and a word that merely contains one does not"
+        );
+
+        let long = header_of(&ToolInput::Other {
+            name: "mcp::foo__bar".into(),
+            raw: format!("{{\"query\":\"{}\"}}", "x".repeat(200)),
+        });
+        assert!(long.width() < 80, "the summary stays bounded: {long:?}");
 
         assert_eq!(
             header_of(&ToolInput::Other {
@@ -1071,12 +1191,17 @@ mod tests {
             }),
             "atlas_move_task AGN-92 → Done"
         );
+        // Outside the Atlas shape the summary is generic rather than absent:
+        // the values are what tell one call from the next, and they are the
+        // same values the model was already given.
         let non_atlas = header_of(&ToolInput::Other {
             name: "mcp::other_lookup".into(),
-            raw: r#"{"readable_id":"PRIVATE-ID","slug":"PRIVATE-SLUG"}"#.into(),
+            raw: r#"{"readable_id":"LOOKUP-ID","slug":"lookup-slug"}"#.into(),
         });
-        assert_eq!(non_atlas, "other_lookup {readable_id, slug}");
-        assert!(!non_atlas.contains("PRIVATE"));
+        assert_eq!(
+            non_atlas,
+            "other_lookup {readable_id=LOOKUP-ID, slug=lookup-slug}"
+        );
         // Non-object payloads keep the collapsed single-line summary.
         assert_eq!(
             header_of(&ToolInput::Other {
@@ -1313,17 +1438,17 @@ mod tests {
         );
         assert_eq!(
             ThinkingBlock::accent(ExpandMode::Collapsed),
-            None,
-            "a hidden thought is finished chrome and carries no bar"
+            Some(RowAccent::Still(RolePalette::muted())),
+            "a hidden thought keeps the gutter every other block sits on"
         );
     }
 
     #[test]
     fn the_accent_bar_moves_in_colour_only_and_dims_when_collapsed() {
         let wave = RowAccent::Wave(RolePalette::running());
-        let first = wave.span(0, Duration::ZERO);
-        let later = wave.span(0, Duration::from_millis(240));
-        let travelled = wave.span(1, Duration::ZERO);
+        let first = wave.span(0, Duration::ZERO, UnicodeLevel::Extended);
+        let later = wave.span(0, Duration::from_millis(240), UnicodeLevel::Extended);
+        let travelled = wave.span(1, Duration::ZERO, UnicodeLevel::Extended);
 
         assert_eq!(first.content, later.content, "the glyph never changes");
         assert_eq!(
@@ -1340,17 +1465,26 @@ mod tests {
             "the wave travels down the block by one row per frame"
         );
         assert_eq!(
-            wave.span(0, Duration::from_millis(239)).style.fg,
+            wave.span(0, Duration::from_millis(239), UnicodeLevel::Extended)
+                .style
+                .fg,
             first.style.fg,
             "a frame holds for three spinner periods"
         );
 
-        let still = RowAccent::Still(RolePalette::success()).span(0, Duration::from_millis(240));
+        let still = RowAccent::Still(RolePalette::success()).span(
+            0,
+            Duration::from_millis(240),
+            UnicodeLevel::Extended,
+        );
         assert_eq!(still.content, first.content);
         assert_eq!(still.style.fg, Some(RolePalette::success()));
 
-        let collapsed =
-            RowAccent::Collapsed(RolePalette::success()).span(0, Duration::from_millis(240));
+        let collapsed = RowAccent::Collapsed(RolePalette::success()).span(
+            0,
+            Duration::from_millis(240),
+            UnicodeLevel::Extended,
+        );
         assert_ne!(
             collapsed.content, first.content,
             "a collapsed run gets the thin variant"

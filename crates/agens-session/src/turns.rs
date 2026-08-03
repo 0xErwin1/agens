@@ -159,7 +159,10 @@ pub fn completed_subagent_session_turn(
             parts: vec![
                 MessagePart::ToolCall {
                     id: call_id.clone(),
-                    name: "native::task".into(),
+                    // The wire name the model itself used. Recording the
+                    // dispatcher's `native::` name instead put a string the
+                    // provider rejects into replayable history.
+                    name: "task".into(),
                     input,
                 },
                 MessagePart::Reasoning(format!("{} tool uses", turn.tool_uses)),
@@ -409,6 +412,28 @@ mod tests {
                 is_error: false,
             }]
         );
+    }
+
+    /// The provider rejects the WHOLE request when a replayed history item
+    /// carries a name outside `^[a-zA-Z0-9_-]+$`, so recording the dispatcher's
+    /// internal name here poisoned every later turn of the session.
+    #[test]
+    fn a_completed_subagent_records_the_wire_name_the_model_used() {
+        let turn = CompletedSubagentTurn {
+            id: 1,
+            agent: "reviewer".into(),
+            task: "review the patch".into(),
+            final_result: "done".into(),
+            tool_uses: 2,
+        };
+
+        let turn = completed_subagent_session_turn(&turn, "subagent:1")
+            .expect("a completed subagent turn should be persistable");
+
+        let Some(MessagePart::ToolCall { name, .. }) = turn.messages()[1].parts.first() else {
+            panic!("the assistant message opens with the task call");
+        };
+        assert_eq!(name, "task");
     }
 
     #[test]

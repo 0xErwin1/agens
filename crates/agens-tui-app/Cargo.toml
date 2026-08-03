@@ -12,6 +12,9 @@ workspace = true
 # Fixtures the binary's tests reach for. `cfg(test)` never reaches a dependency,
 # so a consumer opts in here; production builds never enable it.
 test-support = ["dep:agens-fixtures", "dep:ratatui"]
+# Traces a real session: the audit harness drives a TestBackend, which never
+# writes to a terminal, so the cost of actually painting one is invisible to it.
+perf-audit = ["agens-tui/perf-audit", "dep:agens-perf"]
 
 [dependencies]
 agens-agents = { path = "../agens-agents" }
@@ -33,6 +36,7 @@ agens-store = { path = "../agens-store" }
 agens-tool-runtime = { path = "../agens-tool-runtime", features = ["probe"] }
 agens-tools = { path = "../agens-tools" }
 agens-fixtures = { path = "../agens-fixtures", optional = true }
+agens-perf = { path = "../agens-perf", optional = true }
 agens-tui = { path = "../agens-tui" }
 ratatui = { version = "0.30.2", optional = true }
 serde_json = "1"
