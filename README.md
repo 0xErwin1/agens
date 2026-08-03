@@ -172,6 +172,7 @@ What makes that possible is your configuration naming the server. A rule for a s
 | `skill` (primary only) | yes — a skill's own files | not by its target, which is the skill name; by the file it opens, which a global skill has only when the global skills directory sits under the session's root |
 | `task` (primary only) | what the subagent reports | **not here** — its target is the subagent's name; the subagent read under these same rules |
 | `task_control`, `task_message` | no — execution state only | not as a path; they never address a file |
+| `ask_user` (primary only) | no — only the answer given at the terminal | not as a path; its target is the tool's own name and no call to it addresses a file |
 | `<server>::<tool>` from MCP (primary only) | whatever that server returns | **it does not** — the target is the tool's own name, and its arguments belong to the server |
 
 The remaining limit is over names rather than contents: `glob`'s pattern denotes a set while a rule is matched as text, so `deny glob(**/.env)` does not stop `glob(**)` from listing that name — it discloses a name, which `list(**)` already discloses, not what the file holds.
@@ -270,7 +271,7 @@ nix develop --no-pure-eval -c just verify
 ## Known limitations
 
 - `agens models` is reserved in the command surface but currently reports that the capability is unavailable.
-- The production tool catalog wires native tools, configured MCP tools, and the `skill` and `task` tools. A delegated subagent reaches native tools only; MCP tools are not passed through to it.
+- The production tool catalog wires native tools, configured MCP tools, and the `skill`, `task` and `ask_user` tools. A delegated subagent reaches native tools only; MCP tools are not passed through to it.
 - TUI model and reasoning-effort palettes are not implemented; use configuration or `agens chat --model` for model selection.
 - Packaging, release automation, and editor protocol integrations are not provided.
 

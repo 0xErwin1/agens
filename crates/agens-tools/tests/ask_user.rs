@@ -440,15 +440,60 @@ fn a_lying_port_reply_with_out_of_order_questions_never_produces_an_answered_env
     assert_eq!(calls.load(Ordering::Acquire), 1);
 }
 
+/// The second case is the one that carries the weight. An object holding no
+/// key the schema declares cannot distinguish a constant from a projection of
+/// a field, since every field it could be projected out of is absent; a
+/// well-formed call whose strings are path-shaped can, and it is also the call
+/// a rule would have to be written against.
 #[test]
 fn permission_target_is_a_constant_independent_of_arguments() {
     let (port, _) = ScriptedPort::new(AskUserReply::Cancelled);
     let tool = AskUserTool::new(Box::new(port));
 
-    assert_eq!(
-        tool.permission_target(&json!({"anything": "goes"}))
-            .expect("permission target"),
-        "ask_user"
+    for arguments in [
+        json!({"anything": "goes"}),
+        json!({
+            "title": "src/.env",
+            "questions": [{
+                "id": "**/secrets.md",
+                "prompt": "/etc/passwd",
+                "mode": "single",
+                "options": [{"id": "a", "label": "notes.md", "context": "src/main.rs"}]
+            }]
+        }),
+    ] {
+        assert_eq!(
+            tool.permission_target(&arguments)
+                .expect("permission target"),
+            "ask_user",
+            "these arguments changed the target a rule is matched against: {arguments}"
+        );
+    }
+}
+
+/// The tool is classified as reached by no path rule, and that classification
+/// rests on two projections rather than on prose: the target is the constant
+/// above, and the reach is empty. A call whose arguments are full of
+/// path-shaped strings is the case that would break the second one, since those
+/// strings are the only thing a reach could be projected out of.
+#[test]
+fn no_arguments_make_ask_user_project_a_reach_a_path_rule_could_name() {
+    let (port, _) = ScriptedPort::new(AskUserReply::Cancelled);
+    let tool = AskUserTool::new(Box::new(port));
+    let arguments = json!({
+        "title": "src/.env",
+        "questions": [{
+            "id": "**/secrets.md",
+            "prompt": "/etc/passwd",
+            "mode": "single",
+            "options": [{"id": "a", "label": "notes.md", "context": "src/main.rs"}]
+        }]
+    });
+
+    assert!(
+        tool.permission_reach(&arguments)
+            .expect("permission reach")
+            .is_empty()
     );
 }
 

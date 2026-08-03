@@ -1283,7 +1283,7 @@ fn configured_entries(entries: &[&str]) -> Vec<ConfigPermissionRule> {
 /// so a name that stays bare is one the qualification step did not do.
 ///
 /// The names are read off the registered surface rather than off the catalog,
-/// because the catalog is not the surface: four natives are registered beside
+/// because the catalog is not the surface: five natives are registered beside
 /// it, and a rule naming one of those has the same reason to bind.
 #[test]
 fn every_native_tool_named_in_configuration_resolves_to_the_tool_it_names() {
@@ -1889,6 +1889,22 @@ const TOOL_SURFACE: &[SurfaceEntry] = &[
         matched_as: Some(PermissionTargetKind::FreeFormText),
     },
     // Registered directly on the primary path, beside the catalog rather than
+    // out of it. It puts a question on an interactive surface and returns what
+    // the person answers, so it opens no file and addresses none: its target is
+    // the constant `ask_user`, and it projects no reach. Neither probe applies
+    // — a `PerFileProbe` needs a file the call would report and a `ReachProbe` a
+    // file a rule could name it by, and there is no call to this tool that has
+    // either. A delegated child never holds it, having no surface to ask on.
+    SurfaceEntry {
+        tool: "native::ask_user",
+        returns_file_contents: false,
+        decided_on_its_target: false,
+        decided_per_file: None,
+        partly_reached: None,
+        unbound: None,
+        matched_as: None,
+    },
+    // Registered directly on the primary path, beside the catalog rather than
     // out of it.
     SurfaceEntry {
         tool: "native::skill",
@@ -2082,11 +2098,11 @@ fn sorted_native_access(dispatchers: &[Arc<Mutex<ToolDispatcher>>]) -> Vec<(Stri
 /// Every native a production dispatcher registers in any configuration,
 /// gathered from the dispatchers themselves.
 ///
-/// The catalog is not the surface. `skill`, `task` and the two coordination
-/// tools are registered directly beside the catalog's ten on the primary path,
-/// and a delegated child registers the coordination pair the same way, so a
-/// table compared against `NativeToolCatalog::metadata()` leaves four tools
-/// unclassified while reading as complete.
+/// The catalog is not the surface. `ask_user`, `skill`, `task` and the two
+/// coordination tools are registered directly beside the catalog's ten on the
+/// primary path, and a delegated child registers the coordination pair the same
+/// way, so a table compared against `NativeToolCatalog::metadata()` leaves five
+/// tools unclassified while reading as complete.
 ///
 /// Neither is one session's dispatcher the surface: what a parent registers
 /// depends on whether any subagent-mode agent exists, so this unions both
@@ -2160,7 +2176,7 @@ fn every_native_registered_beside_the_catalog_is_named_by_the_list_that_resolves
 /// The access class each native registered beside the catalog is registered
 /// under, and what that class decides.
 ///
-/// These four have no catalog entry to be compared against: each declares its
+/// These five have no catalog entry to be compared against: each declares its
 /// access at its own registration site, and until it is written down somewhere
 /// that declaration answers to nothing.
 ///
@@ -2180,7 +2196,13 @@ fn every_native_registered_beside_the_catalog_is_named_by_the_list_that_resolves
 /// own rules leave reachable, so eight at most and six at least. It excludes
 /// `native::webfetch` precisely because that tool is `ReadOnly` and the class
 /// is the wrong predicate for it.
-const ACCESS_OF_THE_NATIVES_REGISTERED_BESIDE_THE_CATALOG: [(&str, ToolAccess); 4] = [
+const ACCESS_OF_THE_NATIVES_REGISTERED_BESIDE_THE_CATALOG: [(&str, ToolAccess); 5] = [
+    // Puts a question on an interactive surface and returns the answer given
+    // there, touching neither the worktree nor the network. The class is
+    // load-bearing rather than incidental: a chat-mode turn is exactly the turn
+    // that has to be able to ask, and `Write` would have the hard-safety
+    // predicate refuse it there above every rule.
+    ("native::ask_user", ToolAccess::ReadOnly),
     // Returns a skill's own installed files and changes nothing.
     ("native::skill", ToolAccess::ReadOnly),
     // Runs a whole turn on a surface of its own, whose calls write; a class
@@ -2196,7 +2218,7 @@ const ACCESS_OF_THE_NATIVES_REGISTERED_BESIDE_THE_CATALOG: [(&str, ToolAccess); 
 /// native outside the catalog, and for the child's own registration of the two
 /// it shares with the parent.
 ///
-/// Without the first assertion the table is one-directional: a fifth native
+/// Without the first assertion the table is one-directional: a sixth native
 /// registered beside the catalog is forced into
 /// [`NATIVE_TOOLS_REGISTERED_OUTSIDE_THE_CATALOG`] by the test above, and its
 /// access class would then go unwritten and unasserted — the same gap in the
@@ -2258,7 +2280,7 @@ fn every_native_beside_the_catalog_has_its_access_written_down_and_held_by_the_c
 /// statements neither it nor
 /// [`production_parent_natives`] is derived from: the catalog's own declared
 /// access for the ten it holds, and
-/// [`ACCESS_OF_THE_NATIVES_REGISTERED_BESIDE_THE_CATALOG`] for the four it does
+/// [`ACCESS_OF_THE_NATIVES_REGISTERED_BESIDE_THE_CATALOG`] for the five it does
 /// not.
 #[test]
 fn the_probe_dispatcher_holds_every_native_under_the_access_production_registers_it_by() {
@@ -3524,8 +3546,8 @@ fn production_parent_natives() -> &'static [(String, ToolAccess)] {
 ///
 /// The two paths have to compare over the surface that exists. A harness built
 /// from `NativeToolCatalog::metadata()` holds ten, while the primary path holds
-/// fourteen — and `permission_policy` refuses a configured name its dispatcher
-/// cannot resolve, so the four it left out were names no parent-path case could
+/// fifteen — and `permission_policy` refuses a configured name its dispatcher
+/// cannot resolve, so the five it left out were names no parent-path case could
 /// even be written against.
 fn native_dispatcher() -> ToolDispatcher {
     let mut dispatcher = ToolDispatcher::new();

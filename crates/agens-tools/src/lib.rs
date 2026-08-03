@@ -5294,15 +5294,17 @@ fn visible_html_text(html: &str) -> String {
 ///
 /// Each is constructed from something the catalog holds no handle on — the
 /// skill catalog, the agent catalog, the registry a live delegation is
-/// coordinated through — so the runtime that owns those constructs and
-/// registers the tool itself. Which of them a given dispatcher ends up holding
-/// depends on what that runtime is for and on how the session is configured.
+/// coordinated through, the port an interactive surface answers a question on —
+/// so the runtime that owns those constructs and registers the tool itself.
+/// Which of them a given dispatcher ends up holding depends on what that
+/// runtime is for and on how the session is configured.
 ///
 /// They are enumerated here all the same, because anything resolving a name
 /// against "the native tools" resolves it against a surface these belong to. A
 /// name left out survives as a pattern that never matches a dispatcher
 /// identity: the rule reads as enforced and decides nothing.
-pub const NATIVE_TOOLS_REGISTERED_OUTSIDE_THE_CATALOG: [&str; 4] = [
+pub const NATIVE_TOOLS_REGISTERED_OUTSIDE_THE_CATALOG: [&str; 5] = [
+    "native::ask_user",
     "native::skill",
     "native::task",
     "native::task_control",
