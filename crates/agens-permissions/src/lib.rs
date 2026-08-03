@@ -128,16 +128,19 @@ impl NativePermissionTarget {
 
     /// What the call reaches beyond the target it is named by.
     ///
-    /// A search reads the files under the path it is given, and every file in
-    /// the worktree when it is given none — the pattern it is named by says
-    /// nothing about which those are. Every other native tool is named by the
-    /// one thing it touches.
+    /// A search reads the files under the path it is given, which the pattern
+    /// it is named by says nothing about, so that path is reported here and a
+    /// rule naming it selects the call. A search given no path names no file
+    /// at all, and which of the files it walks into it may report is settled
+    /// per file while it runs. Every other native tool is named by the one
+    /// thing it touches.
     pub fn reach(&self) -> Vec<PermissionReach> {
         match self {
-            Self::Search { path, .. } => vec![
-                path.clone()
-                    .map_or(PermissionReach::EveryPath, PermissionReach::Path),
-            ],
+            Self::Search { path, .. } => path
+                .clone()
+                .map(PermissionReach::Path)
+                .into_iter()
+                .collect(),
             Self::Command(_)
             | Self::Path(_)
             | Self::Pattern(_)

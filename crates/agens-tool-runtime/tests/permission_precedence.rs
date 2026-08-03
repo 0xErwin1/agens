@@ -24,8 +24,8 @@ use std::sync::{Arc, Mutex};
 use agens_config::{ConfigPermissionDecision, ConfigPermissionRule, ConfigPermissionScope};
 use agens_core::{
     AgentDefinition, PermissionDecision, PermissionMode, PermissionPolicy, PermissionReach,
-    PermissionRequest, PermissionRule, PermissionSession, PermissionTargetKind, ToolAccess,
-    permission_target_kind_for_tool,
+    PermissionReadFilter, PermissionRequest, PermissionRule, PermissionSession,
+    PermissionTargetKind, ToolAccess, permission_target_kind_for_tool,
 };
 use agens_permissions::{NativePermissionTarget, configured_permission_rules, permission_policy};
 use agens_tool_runtime::child_catalog::resolve_child_surface;
@@ -460,22 +460,23 @@ const CASES: &[Case] = &[
         path: Some(".env"),
         expected: PermissionDecision::Deny,
     },
-    // A search of the whole worktree reads the denied file too, however that
-    // root is spelled — and a search that names no root at all is that same
-    // call with the argument left out.
+    // A search of the whole worktree names no file, however that root is
+    // spelled — and a search that names no root at all is that same call with
+    // the argument left out. Neither can be decided on the root, so both run
+    // and are decided file by file; see [`ROOTED_SEARCH_CASES`].
     Case {
         declarations: &["deny grep **/.env", "allow grep **"],
         tool: "grep",
         target: "OPENAI_API_KEY",
         path: Some("."),
-        expected: PermissionDecision::Deny,
+        expected: PermissionDecision::Allow,
     },
     Case {
         declarations: &["deny grep **/.env", "allow grep **"],
         tool: "grep",
         target: "OPENAI_API_KEY",
         path: None,
-        expected: PermissionDecision::Deny,
+        expected: PermissionDecision::Allow,
     },
     // The pattern axis keeps deciding what it always decided.
     Case {
@@ -692,9 +693,246 @@ const CONFIGURED_CASES: &[ConfiguredCase] = &[
         tool: "grep",
         target: "OPENAI_API_KEY",
         path: None,
-        expected: PermissionDecision::Deny,
+        expected: PermissionDecision::Allow,
     },
 ];
+
+/// One rooted search plus one file it walks into.
+///
+/// The tables above decide calls, and a search rooted above a file is a single
+/// authorized call that reads many of them — so what a rule naming one of those
+/// files does cannot be written as a row there. It is written here instead, and
+/// it has to come out the same on both paths for the same reason every other
+/// row does.
+struct RootedSearchCase {
+    configured: &'static [&'static str],
+    declarations: &'static [&'static str],
+    /// The root the search was given, `None` for a search that named none.
+    root: Option<&'static str>,
+    /// A file under that root, as the search reaches it.
+    file: &'static str,
+    /// Whether what that file holds may reach the caller.
+    reported: bool,
+}
+
+const ROOTED_SEARCH_CASES: &[RootedSearchCase] = &[
+    // The shape the shipped configuration is written in, entered from above the
+    // file it denies — the whole point of deciding per file.
+    RootedSearchCase {
+        configured: &["deny grep **/.env"],
+        declarations: &[],
+        root: None,
+        file: ".env",
+        reported: false,
+    },
+    RootedSearchCase {
+        configured: &["deny grep **/.env"],
+        declarations: &[],
+        root: None,
+        file: "notes.md",
+        reported: true,
+    },
+    RootedSearchCase {
+        configured: &["deny grep **/.env"],
+        declarations: &[],
+        root: Some("."),
+        file: "src/.env",
+        reported: false,
+    },
+    RootedSearchCase {
+        configured: &["deny grep **/.env"],
+        declarations: &[],
+        root: Some("src"),
+        file: "src/.env",
+        reported: false,
+    },
+    RootedSearchCase {
+        configured: &["deny grep **/.env"],
+        declarations: &[],
+        root: Some("src"),
+        file: "src/main.rs",
+        reported: true,
+    },
+    // A declaration reaches the files a search reads exactly as a configured
+    // rule does, and on a path that has nothing to do with `.env`.
+    RootedSearchCase {
+        configured: &[],
+        declarations: &["deny grep src/secret/**", "allow grep **"],
+        root: Some("src"),
+        file: "src/secret/key",
+        reported: false,
+    },
+    RootedSearchCase {
+        configured: &[],
+        declarations: &["deny grep src/secret/**", "allow grep **"],
+        root: Some("src"),
+        file: "src/main.rs",
+        reported: true,
+    },
+    // An `ask` withholds beside a `deny`: the prompt that would settle it is
+    // not reachable once the call it belongs to is already running.
+    RootedSearchCase {
+        configured: &[],
+        declarations: &["ask grep src/secret/**", "allow grep **"],
+        root: Some("src"),
+        file: "src/secret/key",
+        reported: false,
+    },
+    // The narrower rule decides a file exactly as it decides a call. The root
+    // here is the worktree, because a search rooted at `src` names a path the
+    // broad deny selects and is refused outright — which is the correct answer
+    // for a root a rule names, and a different question from this one.
+    RootedSearchCase {
+        configured: &[],
+        declarations: &[
+            "deny grep src/**",
+            "allow grep src/generated/**",
+            "allow grep **",
+        ],
+        root: Some("."),
+        file: "src/generated/schema.rs",
+        reported: true,
+    },
+    RootedSearchCase {
+        configured: &[],
+        declarations: &[
+            "deny grep src/**",
+            "allow grep src/generated/**",
+            "allow grep **",
+        ],
+        root: Some("."),
+        file: "src/main.rs",
+        reported: false,
+    },
+];
+
+/// The pattern every rooted-search row is searched for. The rows are written
+/// against paths, so the pattern is held fixed and named by no rule.
+const ROOTED_SEARCH_PATTERN: &str = "OPENAI_API_KEY";
+
+/// What one path answers about a rooted search: whether the search runs at all,
+/// and whether one of the files under its root may be reported.
+fn rooted_search_answer(
+    policy: PermissionPolicy,
+    identity: &str,
+    root: Option<&str>,
+    file: &str,
+) -> (PermissionDecision, bool) {
+    let call = policy.evaluate(
+        &request(identity, "grep", ROOTED_SEARCH_PATTERN, root),
+        &[],
+        &PermissionSession::new(),
+    );
+    let permits = PermissionReadFilter::new(
+        policy,
+        Vec::new(),
+        "project",
+        identity,
+        ToolAccess::ReadOnly,
+    )
+    .permits(file);
+
+    (call, permits)
+}
+
+/// Compares one rooted-search row across both paths, under one spelling of its
+/// root and of the file it walks into.
+fn rooted_search_disagreements(
+    case: &RootedSearchCase,
+    root: Option<&str>,
+    file: &str,
+    spelling: &str,
+) -> Vec<String> {
+    let declarations = parsed_declarations(case.declarations);
+    let configured = configured_rules(case.configured);
+
+    let (child_policy, child_identity) =
+        configured_child_policy(&configured, &declarations, "grep")
+            .expect("a delegated child must be able to reach grep");
+    let (parent_policy, parent_identity) =
+        configured_parent_policy(case.configured, &declarations, "grep");
+
+    let answers = [
+        (
+            "child",
+            rooted_search_answer(child_policy, &child_identity, root, file),
+        ),
+        (
+            "parent",
+            rooted_search_answer(parent_policy, &parent_identity, root, file),
+        ),
+    ];
+
+    answers
+        .into_iter()
+        .filter_map(|(path, (call, permits))| {
+            let fault = if call == PermissionDecision::Deny {
+                "refused the whole search instead of the file"
+            } else if permits && !case.reported {
+                "reported a file a rule names"
+            } else if !permits && case.reported {
+                "withheld a file no rule names"
+            } else {
+                return None;
+            };
+
+            Some(format!(
+                "config {:?} + {:?} rooted at {root:?} over {file:?} spelled {spelling}: \
+                 the {path} path {fault}",
+                case.configured, case.declarations
+            ))
+        })
+        .collect()
+}
+
+/// A search rooted above a file it may not report has to run and withhold that
+/// file, on both paths. Refusing the call instead is the answer this table
+/// exists to rule out: it would make every recursive search useless under any
+/// configuration that denies one file.
+#[test]
+fn a_rooted_search_reports_the_same_files_on_both_paths() {
+    let disagreements = ROOTED_SEARCH_CASES
+        .iter()
+        .flat_map(|case| rooted_search_disagreements(case, case.root, case.file, "as written"))
+        .collect::<Vec<_>>();
+
+    assert!(
+        disagreements.is_empty(),
+        "{} of {} rooted searches disagreed:\n{}",
+        disagreements.len(),
+        ROOTED_SEARCH_CASES.len(),
+        disagreements.join("\n")
+    );
+}
+
+/// The spelling axis reaches the per-file question too. A rule names a file,
+/// and neither the spelling of that file nor the spelling of the root the
+/// search was given may change what the search is allowed to report.
+#[test]
+fn every_spelling_of_a_rooted_search_reports_the_same_files() {
+    let mut disagreements = Vec::new();
+
+    for case in ROOTED_SEARCH_CASES {
+        for spelling in PATH_SPELLINGS {
+            let root = case.root.map(|root| (spelling.rewrite)(root));
+            let file = (spelling.rewrite)(case.file);
+
+            disagreements.extend(rooted_search_disagreements(
+                case,
+                root.as_deref(),
+                &file,
+                spelling.name,
+            ));
+        }
+    }
+
+    assert!(
+        disagreements.is_empty(),
+        "{} spellings of a rooted search disagreed:\n{}",
+        disagreements.len(),
+        disagreements.join("\n")
+    );
+}
 
 /// A rewrite of a path target into an equivalent spelling of the same file.
 struct Spelling {
@@ -928,26 +1166,39 @@ fn configured_child_decision(
     target: &str,
     path: Option<&str>,
 ) -> PermissionDecision {
-    let Ok(surface) = resolve_child_surface(configured, declarations) else {
+    let Some((policy, identity)) = configured_child_policy(configured, declarations, tool) else {
         return PermissionDecision::Deny;
     };
+
+    policy.evaluate(
+        &request(&identity, tool, target, path),
+        &[],
+        &PermissionSession::new(),
+    )
+}
+
+/// The policy a delegated child runs a call to `tool` under, and the name it
+/// holds that tool by. `None` when the child could never reach the tool at
+/// all, which is a denial rather than a decision.
+fn configured_child_policy(
+    configured: &[PermissionRule],
+    declarations: &[PermissionRule],
+    tool: &str,
+) -> Option<(PermissionPolicy, String)> {
+    let surface = resolve_child_surface(configured, declarations).ok()?;
     let qualified = format!("native::{tool}");
 
-    if !surface
+    surface
         .tools
         .iter()
         .any(|entry| entry.qualified_name == qualified)
-    {
-        return PermissionDecision::Deny;
-    }
-
-    PermissionPolicy::new(PermissionMode::Edit, surface.rules)
-        .with_configured_floor(surface.configured_floor)
-        .evaluate(
-            &request(&qualified, tool, target, path),
-            &[],
-            &PermissionSession::new(),
-        )
+        .then(|| {
+            (
+                PermissionPolicy::new(PermissionMode::Edit, surface.rules)
+                    .with_configured_floor(surface.configured_floor),
+                qualified,
+            )
+        })
 }
 
 fn configured_parent_decision(
@@ -957,6 +1208,22 @@ fn configured_parent_decision(
     target: &str,
     path: Option<&str>,
 ) -> PermissionDecision {
+    let (policy, identity) = configured_parent_policy(configured, declarations, tool);
+
+    policy.evaluate(
+        &request(&identity, tool, target, path),
+        &[],
+        &PermissionSession::new(),
+    )
+}
+
+/// The same, for the primary path: the policy a dispatcher-backed capability
+/// set produces, and the dispatcher identity it holds the tool by.
+fn configured_parent_policy(
+    configured: &[&str],
+    declarations: &[PermissionRule],
+    tool: &str,
+) -> (PermissionPolicy, String) {
     let dispatcher = Arc::new(Mutex::new(native_dispatcher()));
     let mut agent = agent_definition(&[]);
     agent.permission_rules = declarations.to_vec();
@@ -973,19 +1240,16 @@ fn configured_parent_decision(
         .as_str()
         .to_owned();
 
-    permission_policy(
+    let policy = permission_policy(
         &configured_entries(configured),
         "project",
         PermissionMode::Edit,
         &dispatcher,
         Some(&capabilities),
     )
-    .expect("the configured policy must resolve")
-    .evaluate(
-        &request(&identity, tool, target, path),
-        &[],
-        &PermissionSession::new(),
-    )
+    .expect("the configured policy must resolve");
+
+    (policy, identity)
 }
 
 #[test]

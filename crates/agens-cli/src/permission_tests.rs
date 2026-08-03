@@ -191,8 +191,8 @@ mod tests {
             NativePermissionTarget::parse("native::grep", &serde_json::json!({"pattern": "TODO"}))
                 .expect("a grep call must parse")
                 .reach(),
-            vec![agens_core::PermissionReach::EveryPath],
-            "a search given no path reads the whole worktree, which no one path names"
+            Vec::new(),
+            "a search given no path names no file, so nothing here decides which it may read"
         );
     }
 

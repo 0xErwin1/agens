@@ -1812,6 +1812,12 @@ mod tests {
     /// and a real secret in a real `.env`. `grep` returns the lines it matched,
     /// so a deny that does not reach it hands the file's contents to the model
     /// however loudly the configuration denies reading that path.
+    ///
+    /// A call that names the denied file is refused outright, which is the
+    /// honest answer to a call whose whole subject a rule denies. A search
+    /// rooted above it is a different question, answered per file while it
+    /// runs; see
+    /// [`a_search_rooted_above_a_denied_file_omits_it_and_still_reports_the_rest`].
     #[test]
     fn the_shipped_configuration_keeps_a_denied_file_out_of_a_grep_result() {
         let temporary = agens_fixtures::session_directory("shipped-config-grep");
@@ -1831,9 +1837,6 @@ mod tests {
             r#"{"pattern":"OPENAI_API_KEY","path":"./.env"}"#,
             r#"{"pattern":"OPENAI_API_KEY","path":".//.env"}"#,
             r#"{"pattern":"OPENAI_API_KEY","path":"./.env/."}"#,
-            r#"{"pattern":"OPENAI_API_KEY"}"#,
-            r#"{"pattern":"OPENAI_API_KEY","path":"."}"#,
-            r#"{"pattern":"OPENAI_API_KEY","path":"./"}"#,
         ] {
             let output = single_call_turn(
                 &project_root,
@@ -1870,6 +1873,167 @@ mod tests {
             allowed.contains("OPENAI_API_KEY is set"),
             "the allowed search must still report the lines it matched, got: {allowed}"
         );
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    /// Lays out a worktree holding three secrets a rule denies and two
+    /// ordinary files that match the same pattern, so a probe can tell a
+    /// search that omitted the denied files from one that returned nothing.
+    fn worktree_with_denied_secrets(project_root: &Path) {
+        std::fs::create_dir_all(project_root.join("src/secret")).unwrap();
+        std::fs::write(
+            project_root.join(".env"),
+            "OPENAI_API_KEY=sk-live-root-do-not-leak\n",
+        )
+        .unwrap();
+        std::fs::write(
+            project_root.join("src/.env"),
+            "OPENAI_API_KEY=sk-live-nested-do-not-leak\n",
+        )
+        .unwrap();
+        std::fs::write(
+            project_root.join("src/secret/key"),
+            "OPENAI_API_KEY=sk-live-keyfile-do-not-leak\n",
+        )
+        .unwrap();
+        std::fs::write(project_root.join("notes.md"), "OPENAI_API_KEY is set\n").unwrap();
+        std::fs::write(
+            project_root.join("src/main.rs"),
+            "// OPENAI_API_KEY comes from the environment\n",
+        )
+        .unwrap();
+    }
+
+    /// The one line a search adds when it withheld something. A caller is told
+    /// that its result is not the whole corpus and nothing more: naming the
+    /// files would hand over what the rule withholds, and counting them would
+    /// let a caller that can re-root the search locate them by narrowing it.
+    const WITHHELD_FILES_NOTICE: &str =
+        "[some files were not read: a permission rule denies reading them]";
+
+    fn withheld_notice(output: &str) -> Option<&str> {
+        output
+            .lines()
+            .find(|line| line.starts_with("[some files were not read"))
+    }
+
+    const DENIED_SECRETS: &[&str] = &[
+        "sk-live-root-do-not-leak",
+        "sk-live-nested-do-not-leak",
+        "sk-live-keyfile-do-not-leak",
+    ];
+
+    /// The rules an operator who copied the shipped example gets, plus the two
+    /// that name a secret outside the `**/.env` shape — enough to show the
+    /// filter is driven by the rules rather than by anything `.env`-specific.
+    fn shipped_rules_denying_the_key_file(project_root: &Path) -> Vec<PermissionRule> {
+        let mut rules = shipped_configured_rules(project_root);
+        for tool in ["grep", "search"] {
+            rules.push(PermissionRule::global(
+                PermissionDecision::Deny,
+                PermissionPattern::glob(tool).unwrap(),
+                PermissionPattern::glob_for_target_kind(
+                    "src/secret/**",
+                    agens_core::PermissionTargetKind::Path,
+                )
+                .unwrap(),
+            ));
+        }
+        rules
+    }
+
+    /// A search rooted above a denied file must not report what that file
+    /// holds, and must still report everything else it matched. Refusing the
+    /// whole call instead would make every recursive search under the shipped
+    /// configuration useless, which is why the decision cannot be taken on the
+    /// root alone.
+    #[test]
+    fn a_search_rooted_above_a_denied_file_omits_it_and_still_reports_the_rest() {
+        let temporary = agens_fixtures::session_directory("rooted-search-filter");
+        let project_root = temporary.join("project");
+        worktree_with_denied_secrets(&project_root);
+
+        let configured = shipped_rules_denying_the_key_file(&project_root);
+
+        for (arguments, expected) in [
+            (r#"{"pattern":"OPENAI_API_KEY"}"#, "OPENAI_API_KEY is set"),
+            (
+                r#"{"pattern":"OPENAI_API_KEY","path":"."}"#,
+                "OPENAI_API_KEY is set",
+            ),
+            (
+                r#"{"pattern":"OPENAI_API_KEY","path":"./"}"#,
+                "OPENAI_API_KEY is set",
+            ),
+            (
+                r#"{"pattern":"OPENAI_API_KEY","path":"src"}"#,
+                "OPENAI_API_KEY comes from the environment",
+            ),
+            (
+                r#"{"pattern":"OPENAI_API_KEY","path":"./src/."}"#,
+                "OPENAI_API_KEY comes from the environment",
+            ),
+        ] {
+            let output = single_call_turn(
+                &project_root,
+                &[],
+                &configured,
+                false,
+                "native::grep",
+                arguments,
+            );
+
+            for secret in DENIED_SECRETS {
+                assert!(
+                    !output.contains(secret),
+                    "grep {arguments} reported a denied file's contents: {output}"
+                );
+            }
+            assert!(
+                output.contains(expected),
+                "grep {arguments} must still report what it is allowed to, got: {output}"
+            );
+            assert_eq!(
+                withheld_notice(&output),
+                Some(WITHHELD_FILES_NOTICE),
+                "grep {arguments} must say its result is not the whole corpus, \
+                 and say it without naming or counting what it withheld: {output}"
+            );
+        }
+
+        for (path, expected) in [
+            (".", "OPENAI_API_KEY is set"),
+            ("./", "OPENAI_API_KEY is set"),
+            ("src", "OPENAI_API_KEY comes from the environment"),
+        ] {
+            let arguments = format!(r#"{{"path":"{path}","query":"OPENAI_API_KEY"}}"#);
+            let output = single_call_turn(
+                &project_root,
+                &[],
+                &configured,
+                false,
+                "native::search",
+                &arguments,
+            );
+
+            for secret in DENIED_SECRETS {
+                assert!(
+                    !output.contains(secret),
+                    "search {arguments} reported a denied file's contents: {output}"
+                );
+            }
+            assert_eq!(
+                withheld_notice(&output),
+                Some(WITHHELD_FILES_NOTICE),
+                "search {arguments} must say its result is not the whole corpus, \
+                 and say it without naming or counting what it withheld: {output}"
+            );
+            assert!(
+                output.contains(expected),
+                "search {arguments} must still report what it is allowed to, got: {output}"
+            );
+        }
 
         std::fs::remove_dir_all(temporary).unwrap();
     }

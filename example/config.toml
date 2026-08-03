@@ -76,24 +76,29 @@ effort = "high"
 # sandbox, and a command written to hide which binary it runs still can.
 #
 # Name every tool you mean. `read`, `write` and `edit` are separately
-# registered tools, so denying a path to one says nothing about the other two.
-# `grep` is matched on its pattern AND on the path it is given, and a deny on
-# either refuses the call — that is what makes the `grep` line below hold, and
-# it is load-bearing, because `grep` reports the lines it matched. `glob` is
-# matched on its pattern alone and `bash` on its command line, so a path deny
-# never reaches those two; granting `bash` grants a way around every path rule
-# below.
+# registered tools, so denying a path to one says nothing about the other two,
+# and a deny written for `grep` says nothing about `search`.
 #
-# What the `grep` deny costs, stated once: a search given no path — or rooted
-# at the worktree itself — reads whatever it walks, so any `grep` deny refuses
-# it. Name a path to scope the search. A search rooted at a directory is
-# matched on that directory and not on the files under it, so a deny naming
-# one file below it does not stop a search rooted above it.
+# `search` and `grep` report the lines they matched, so a path deny binds them
+# twice over. It binds the call: `search` is matched on the path it is given,
+# `grep` on its pattern and on the path it is given, and a deny naming either
+# refuses the call outright. It also binds every file the search actually
+# reads: a file a rule denies contributes no line, however far above it the
+# search was rooted, and a search given no path is bounded by nothing else. A
+# search that walked past something it may not read still returns everything
+# else and ends with a line saying some files were not read — a line that names
+# nothing and counts nothing, because either would answer questions about the
+# files being withheld.
+#
+# `glob` is matched on its pattern alone and `bash` on its command line, so no
+# path deny reaches those two. `glob` reports file paths and never their
+# contents, and its pattern denotes a set while a rule is matched as text, so
+# `deny glob(**/.env)` does not stop `glob(**)` from listing that name.
+# Granting `bash` grants a way around every path rule below.
 #
 # A delegated subagent may use `read`, `list`, `search`, `grep`, `glob` and
 # `git_read` without declaring anything, and every deny below binds it exactly
-# as it binds the primary agent. What `glob` reports is file paths and never
-# their contents, and no path deny bounds it on either path.
+# as it binds the primary agent.
 [permissions]
 allow = [
   "read(**)",

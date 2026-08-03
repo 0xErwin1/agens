@@ -2368,8 +2368,6 @@ impl std::error::Error for PermissionPatternError {}
 pub enum PermissionReach {
     /// One path the call reads, matched under every spelling of it.
     Path(String),
-    /// Every path in the worktree, for a search given no root to start from.
-    EveryPath,
 }
 
 /// One act a call performs, as the values a rule could be written against.
@@ -2377,58 +2375,35 @@ pub enum PermissionReach {
 /// The values are alternatives rather than parts: any one of them names this
 /// act, so a rule selecting any one of them selects it.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct Subject {
-    /// The interchangeable spellings this act can be named by.
-    forms: Vec<String>,
-    /// Whether it also extends to everything the worktree holds, which happens
-    /// when the call named no root to start from. Nothing spells that, so a
-    /// restrictive rule always selects such an act — the call would reach
-    /// whatever that rule names — while a permissive one selects it only by
-    /// naming one of the forms above or by authorizing everything.
-    unbounded: bool,
-}
+struct Subject(Vec<String>);
 
 impl Subject {
     fn spelled(forms: Vec<String>) -> Self {
-        Self {
-            forms,
-            unbounded: false,
-        }
+        Self(forms)
     }
 
     /// Folds what a call reaches into the act its target already names: a
     /// search is one read of one file set, described by its pattern and by its
     /// path at once, so either description names the same act.
+    ///
+    /// A root that names the worktree itself is left out, because it singles
+    /// out no file: which of the files under a root the call may report is
+    /// settled per file while it runs. See [`PermissionReadFilter`].
     fn reaching(mut forms: Vec<String>, reach: &[PermissionReach]) -> Self {
-        let mut unbounded = false;
-
         for entry in reach {
-            match entry {
-                PermissionReach::EveryPath => unbounded = true,
-                PermissionReach::Path(path) => {
-                    let spellings = permission_target::path_target_forms(path);
-                    if spellings.first().is_some_and(|form| form == ".") {
-                        unbounded = true;
-                    } else {
-                        forms.extend(spellings);
-                    }
-                }
+            let PermissionReach::Path(path) = entry;
+            let spellings = permission_target::path_target_forms(path);
+
+            if !spellings.first().is_some_and(|form| form == ".") {
+                forms.extend(spellings);
             }
         }
 
-        Self { forms, unbounded }
+        Self(forms)
     }
 
-    fn selected_by(&self, pattern: &PermissionPattern, decision: PermissionDecision) -> bool {
-        if self.forms.iter().any(|form| pattern.matches(form)) {
-            return true;
-        }
-
-        self.unbounded
-            && match decision {
-                PermissionDecision::Allow => pattern.denotes_everything(),
-                PermissionDecision::Ask | PermissionDecision::Deny => true,
-            }
+    fn selected_by(&self, pattern: &PermissionPattern) -> bool {
+        self.0.iter().any(|form| pattern.matches(form))
     }
 }
 
@@ -2558,15 +2533,15 @@ impl PermissionRequest {
     /// under any of its spellings. A search is one act too — one read of one
     /// file set — named by its pattern and by the path it was given at once,
     /// so a rule naming either one selects it in either direction. What that
-    /// leaves is the search whose extent no value names, where a restrictive
-    /// rule always selects and a permissive one has to authorize everything;
-    /// see [`Subject`].
+    /// leaves is the files under that path, which no value here names; a rule
+    /// naming one of those withholds that file alone, while the search runs.
+    /// See [`PermissionReadFilter`].
     fn target_selected_by(
         &self,
         pattern: &PermissionPattern,
         decision: PermissionDecision,
     ) -> bool {
-        let selects = |subject: &Subject| subject.selected_by(pattern, decision);
+        let selects = |subject: &Subject| subject.selected_by(pattern);
 
         match decision {
             _ if self.subjects.is_empty() => pattern.matches(&self.target),
@@ -3036,8 +3011,33 @@ impl PermissionPolicy {
         session: &PermissionSession,
         unmatched_allow: bool,
     ) -> PermissionDecision {
+        self.stated_decision(request, project_grants, session_grants)
+            .unwrap_or_else(|| {
+                let fallback = if unmatched_allow {
+                    PermissionDecision::Allow
+                } else {
+                    PermissionDecision::Ask
+                };
+
+                Self::resolve_ask(fallback, session)
+            })
+    }
+
+    /// What a rule, a grant or the operator's configured floor states about
+    /// `request`, or `None` when nothing names it.
+    ///
+    /// Kept apart from the fallback so a call authorized as one act can ask
+    /// the same question again about each file it turns out to read, without a
+    /// second matcher: the fallback settled the act, and it has nothing to say
+    /// about a file no rule names. See [`PermissionReadFilter`].
+    fn stated_decision(
+        &self,
+        request: &PermissionRequest,
+        project_grants: &[ProjectPermissionGrant],
+        session_grants: &[ProjectPermissionGrant],
+    ) -> Option<PermissionDecision> {
         if !self.hard_safety_allows(request) {
-            return PermissionDecision::Deny;
+            return Some(PermissionDecision::Deny);
         }
 
         let static_decision = prevailing_rule_decision(&self.static_rules, request);
@@ -3066,17 +3066,10 @@ impl PermissionPolicy {
             .and_then(|floor| floor.constraint(request));
 
         match (matched, configured) {
-            (Some(decision), Some(floor)) => prevailing_decision(decision, floor),
-            (Some(decision), None) => decision,
-            (None, Some(floor)) => floor,
-            (None, None) => {
-                let fallback = if unmatched_allow {
-                    PermissionDecision::Allow
-                } else {
-                    PermissionDecision::Ask
-                };
-                Self::resolve_ask(fallback, session)
-            }
+            (Some(decision), Some(floor)) => Some(prevailing_decision(decision, floor)),
+            (Some(decision), None) => Some(decision),
+            (None, Some(floor)) => Some(floor),
+            (None, None) => None,
         }
     }
 
@@ -3109,6 +3102,61 @@ impl PermissionPolicy {
         } else {
             decision
         }
+    }
+}
+
+/// Which of the files an authorized call may report, for a call that reads a
+/// file set rather than one named file.
+///
+/// A search is authorized as one act, named by its pattern and by the root it
+/// was given. Neither names the files under that root, so authorizing the act
+/// cannot authorize every file it walks into. The same rules that decided the
+/// act therefore decide each file as it is read: this carries that evaluation
+/// to whoever does the reading rather than duplicating it, so the precedence,
+/// the path normalization and the spelling handling are the ones every other
+/// decision already goes through.
+#[derive(Clone, Debug)]
+pub struct PermissionReadFilter {
+    policy: PermissionPolicy,
+    grants: Vec<ProjectPermissionGrant>,
+    project: String,
+    tool: String,
+    access: ToolAccess,
+}
+
+impl PermissionReadFilter {
+    pub fn new(
+        policy: PermissionPolicy,
+        grants: Vec<ProjectPermissionGrant>,
+        project: impl Into<String>,
+        tool: impl Into<String>,
+        access: ToolAccess,
+    ) -> Self {
+        Self {
+            policy,
+            grants,
+            project: project.into(),
+            tool: tool.into(),
+            access,
+        }
+    }
+
+    /// Whether the call may report what the project-relative `path` holds.
+    ///
+    /// Only a rule that names the file withholds it. A file no rule names
+    /// stays readable, because the call reading it was already authorized and
+    /// the unmatched fallback answered for that act, not for this file — the
+    /// alternative would empty every search run under a configuration that
+    /// names nothing. An `ask` withholds alongside a `deny`: the prompt that
+    /// would have settled it was never reached for this file.
+    pub fn permits(&self, path: &str) -> bool {
+        let request =
+            PermissionRequest::new(self.project.clone(), self.tool.clone(), path, self.access);
+
+        !matches!(
+            self.policy.stated_decision(&request, &self.grants, &[]),
+            Some(PermissionDecision::Deny | PermissionDecision::Ask)
+        )
     }
 }
 

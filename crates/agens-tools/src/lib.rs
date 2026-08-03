@@ -18,8 +18,9 @@ use std::{
 
 use agens_core::{
     EditMagnitude, Error, FactPath, HeadlessTaskTerminal, HeadlessTurnCancellationAdapter,
-    PermissionDecision, PermissionPolicy, PermissionReach, PermissionRequest, PermissionSession,
-    ProjectPermissionGrant, ToolAccess, ToolOutcome, ToolResultFacts, WriteMagnitude,
+    PermissionDecision, PermissionPolicy, PermissionReach, PermissionReadFilter, PermissionRequest,
+    PermissionSession, ProjectPermissionGrant, ToolAccess, ToolOutcome, ToolResultFacts,
+    WriteMagnitude,
 };
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use ignore::WalkBuilder;
@@ -72,6 +73,14 @@ const DEFAULT_WEBFETCH_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_WEBFETCH_BYTES: usize = 100 * 1024;
 const MAX_WEBFETCH_REDIRECTS: usize = 5;
 const WEBFETCH_TRUNCATED_MARKER: &str = "\n[webfetch output truncated]";
+/// Told to the caller when a search walked into files a rule refuses to let it
+/// report, so the result is not silently passed off as the whole corpus.
+///
+/// It carries no path and no count deliberately. Either would answer questions
+/// about the files being withheld, and a caller that can re-root the same
+/// search could turn a count into a way of locating them.
+const WITHHELD_FILES_NOTICE: &str =
+    "[some files were not read: a permission rule denies reading them]\n";
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const DEFAULT_MAX_LIST_ENTRIES: usize = 1_000;
 const DEFAULT_MAX_SEARCH_ENTRIES: usize = 10_000;
@@ -1878,6 +1887,7 @@ pub struct ToolExecutionContext {
     cancellation: Option<Arc<AtomicBool>>,
     headless_cancellation: Option<HeadlessTurnCancellationAdapter>,
     deadline: Instant,
+    read_filter: Option<PermissionReadFilter>,
 }
 
 impl ToolExecutionContext {
@@ -1894,7 +1904,30 @@ impl ToolExecutionContext {
             cancellation: Some(cancellation),
             headless_cancellation: None,
             deadline,
+            read_filter: None,
         }
+    }
+
+    /// Carries the per-file decision for one authorized call to the tool that
+    /// performs it. Set by [`ToolDispatcher::execute`], which is where a call
+    /// stops being a decision and starts reading files.
+    #[must_use]
+    pub fn with_read_filter(mut self, filter: PermissionReadFilter) -> Self {
+        self.read_filter = Some(filter);
+        self
+    }
+
+    /// Whether the call may report what the project-relative `path` holds.
+    ///
+    /// A context built without a filter permits everything: it belongs to a
+    /// caller that never went through a permission decision at all, such as a
+    /// direct test of a tool, and inventing a refusal there would withhold
+    /// files no rule was ever consulted about. Every dispatched call carries
+    /// one.
+    pub fn permits_read(&self, path: &str) -> bool {
+        self.read_filter
+            .as_ref()
+            .is_none_or(|filter| filter.permits(path))
     }
 
     /// Adapts core's opaque turn cancellation view without exposing its internals.
@@ -1906,6 +1939,7 @@ impl ToolExecutionContext {
             cancellation: None,
             headless_cancellation: Some(cancellation),
             deadline,
+            read_filter: None,
         }
     }
 
@@ -3204,6 +3238,9 @@ pub struct AuthorizedToolCall {
     access: ToolAccess,
     arguments: Value,
     arguments_digest: u64,
+    /// The rules that authorized this call, kept so a tool that reads a whole
+    /// file set can ask them about each file. See [`PermissionReadFilter`].
+    read_filter: PermissionReadFilter,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -3435,6 +3472,14 @@ impl ToolDispatcher {
                 PermissionPromptContext::from_request(&permission),
             )),
             PermissionDecision::Allow => {
+                let read_filter = PermissionReadFilter::new(
+                    policy,
+                    grants.to_vec(),
+                    permission.project.clone(),
+                    identity.0.clone(),
+                    permission.access,
+                );
+
                 Ok(ToolEvaluationOutcome::Authorized(AuthorizedToolCall {
                     dispatcher_id: self.dispatcher_id,
                     registration_version: registered.version,
@@ -3443,6 +3488,7 @@ impl ToolDispatcher {
                     access: permission.access,
                     arguments_digest: digest_arguments(&request.arguments),
                     arguments: request.arguments,
+                    read_filter,
                 }))
             }
         }
@@ -3472,7 +3518,9 @@ impl ToolDispatcher {
             return Err(Error::Tool("stale authorized tool call".into()));
         }
 
-        match registered.tool.execute(context, handle.arguments) {
+        let context = context.clone().with_read_filter(handle.read_filter);
+
+        match registered.tool.execute(&context, handle.arguments) {
             Ok(output) => {
                 if let Err(status) = context.check() {
                     return Ok(sanitized_execution_status(status));
@@ -4053,6 +4101,14 @@ impl NativeTools {
     }
 
     pub fn search(&self, input: SearchInput) -> Result<ToolOutput, Error> {
+        self.search_with_context(input, None)
+    }
+
+    pub fn search_with_context(
+        &self,
+        input: SearchInput,
+        context: Option<&ToolExecutionContext>,
+    ) -> Result<ToolOutput, Error> {
         if input.query.is_empty() {
             return Ok(ToolOutput::failure("search: query is required"));
         }
@@ -4066,15 +4122,27 @@ impl NativeTools {
             return Ok(ToolOutput::failure("search: path is not a directory"));
         }
 
-        let mut results = Vec::new();
-        let mut budget = SearchBudget::new(&self.limits, "search");
-        if let Err(output) =
-            self.search_directory(&path, &input.query, 0, &mut budget, &mut results)
-        {
+        let mut walk = SearchWalk {
+            query: &input.query,
+            context,
+            budget: SearchBudget::new(&self.limits, "search"),
+            results: Vec::new(),
+            withheld: false,
+        };
+        if let Err(output) = self.search_directory(&path, 0, &mut walk) {
             return Ok(output);
         }
 
+        let SearchWalk {
+            mut results,
+            withheld,
+            ..
+        } = walk;
         let match_count = results.len();
+        if withheld {
+            results.push(WITHHELD_FILES_NOTICE.to_owned());
+        }
+
         Ok(
             ToolOutput::success(results.join("")).with_facts(ToolResultFacts::Search {
                 outcome: ToolOutcome::Succeeded,
@@ -4085,6 +4153,14 @@ impl NativeTools {
     }
 
     pub fn grep(&self, input: GrepInput) -> Result<ToolOutput, Error> {
+        self.grep_with_context(input, None)
+    }
+
+    pub fn grep_with_context(
+        &self,
+        input: GrepInput,
+        context: Option<&ToolExecutionContext>,
+    ) -> Result<ToolOutput, Error> {
         if input.pattern.is_empty() {
             return Ok(ToolOutput::failure("grep: pattern is required"));
         }
@@ -4124,6 +4200,7 @@ impl NativeTools {
         }
 
         let mut results = Vec::new();
+        let mut withheld = false;
         for path in files {
             if let Err(output) = budget.check_deadline() {
                 return Ok(output);
@@ -4131,6 +4208,10 @@ impl NativeTools {
             let relative = path
                 .strip_prefix(&self.project_root)
                 .map_err(|_| Error::Tool("path: outside project root".into()))?;
+            if !permits_read(context, relative) {
+                withheld = true;
+                continue;
+            }
             if file_glob
                 .as_ref()
                 .is_some_and(|glob| !glob.is_match(relative))
@@ -4173,6 +4254,9 @@ impl NativeTools {
                 if regex.is_match(text) {
                     if results.len() == self.limits.max_search_results {
                         let match_count = results.len();
+                        if withheld {
+                            results.push(WITHHELD_FILES_NOTICE.to_owned());
+                        }
                         results.push(format!(
                             "[grep output truncated after {} results]\n",
                             self.limits.max_search_results
@@ -4191,6 +4275,10 @@ impl NativeTools {
         }
 
         let match_count = results.len();
+        if withheld {
+            results.push(WITHHELD_FILES_NOTICE.to_owned());
+        }
+
         Ok(
             ToolOutput::success(results.join("")).with_facts(ToolResultFacts::Search {
                 outcome: ToolOutcome::Succeeded,
@@ -4575,23 +4663,21 @@ impl NativeTools {
     fn search_directory(
         &self,
         directory: &Path,
-        query: &str,
         depth: usize,
-        budget: &mut SearchBudget,
-        results: &mut Vec<String>,
+        walk: &mut SearchWalk<'_>,
     ) -> Result<(), ToolOutput> {
         let directory_entries = fs::read_dir(directory)
             .map_err(|error| ToolOutput::failure(format!("search: {error}")))?;
         let mut entries = Vec::new();
 
         for entry in directory_entries {
-            budget.consume_entry()?;
+            walk.budget.consume_entry()?;
             entries.push(entry.map_err(|error| ToolOutput::failure(format!("search: {error}")))?);
         }
         entries.sort_by_key(|entry| entry.file_name());
 
         for entry in entries {
-            budget.check_deadline()?;
+            walk.budget.check_deadline()?;
 
             let path = entry.path();
             let metadata = fs::symlink_metadata(&path)
@@ -4609,7 +4695,7 @@ impl NativeTools {
                         self.limits.max_search_depth
                     )));
                 }
-                self.search_directory(&path, query, next_depth, budget, results)?;
+                self.search_directory(&path, next_depth, walk)?;
                 continue;
             }
 
@@ -4617,22 +4703,29 @@ impl NativeTools {
                 continue;
             }
 
-            let content = fs::read_to_string(&path)
-                .map_err(|error| ToolOutput::failure(format!("search: {error}")))?;
             let relative = path
                 .strip_prefix(&self.project_root)
                 .map_err(|_| ToolOutput::failure("path: outside project root"))?;
 
+            if !permits_read(walk.context, relative) {
+                walk.withheld = true;
+                continue;
+            }
+
+            let content = fs::read_to_string(&path)
+                .map_err(|error| ToolOutput::failure(format!("search: {error}")))?;
+
             for (line, text) in content.lines().enumerate() {
-                budget.check_deadline()?;
-                if text.contains(query) {
-                    if results.len() == self.limits.max_search_results {
+                walk.budget.check_deadline()?;
+                if text.contains(walk.query) {
+                    if walk.results.len() == self.limits.max_search_results {
                         return Err(ToolOutput::failure(format!(
                             "search: result limit of {} exceeded",
                             self.limits.max_search_results
                         )));
                     }
-                    results.push(format!("{}:{}:{text}\n", relative.display(), line + 1));
+                    walk.results
+                        .push(format!("{}:{}:{text}\n", relative.display(), line + 1));
                 }
             }
         }
@@ -5049,9 +5142,10 @@ impl NativeToolCatalog {
             "native::list" => self
                 .tools
                 .list_directory(ListDirectoryInput::new(string("path")?))?,
-            "native::search" => self
-                .tools
-                .search(SearchInput::new(string("path")?, string("query")?))?,
+            "native::search" => self.tools.search_with_context(
+                SearchInput::new(string("path")?, string("query")?),
+                Some(context),
+            )?,
             "native::grep" => {
                 let mut input = GrepInput::new(string("pattern")?);
                 if let Some(path) = arguments.get("path").and_then(Value::as_str) {
@@ -5065,7 +5159,7 @@ impl NativeToolCatalog {
                 {
                     input = input.with_case_insensitive(case_insensitive);
                 }
-                self.tools.grep(input)?
+                self.tools.grep_with_context(input, Some(context))?
             }
             "native::glob" => self.tools.glob(GlobInput::new(string("pattern")?))?,
             "native::git_read" => {
@@ -5173,6 +5267,17 @@ fn validate_limits(limits: &NativeToolLimits) -> Result<(), Error> {
     Ok(())
 }
 
+/// Asks the rules that authorized a search whether it may report what one of
+/// the files it walked into holds.
+///
+/// A search is authorized on its pattern and on the root it was given, neither
+/// of which names the files under that root, so this is asked once per file
+/// actually read. A caller holding no context — a direct use of the tool
+/// outside any permission decision — reads everything.
+fn permits_read(context: Option<&ToolExecutionContext>, relative: &Path) -> bool {
+    context.is_none_or(|context| context.permits_read(&relative.to_string_lossy()))
+}
+
 fn build_glob_set(pattern: &str, tool: &str) -> Result<GlobSet, ToolOutput> {
     validate_relative_glob_pattern(pattern, tool)?;
 
@@ -5209,6 +5314,16 @@ fn validate_relative_glob_pattern(pattern: &str, tool: &str) -> Result<(), ToolO
     }
 
     Ok(())
+}
+
+/// What one `search` call carries through its traversal: what it looks for,
+/// what it is allowed to read, and what it has found so far.
+struct SearchWalk<'a> {
+    query: &'a str,
+    context: Option<&'a ToolExecutionContext>,
+    budget: SearchBudget,
+    results: Vec<String>,
+    withheld: bool,
 }
 
 struct SearchBudget {

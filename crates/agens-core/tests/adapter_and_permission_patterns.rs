@@ -3,9 +3,9 @@ use std::time::Duration;
 use agens_core::{
     HeadlessTurnCancellation, MAX_PERMISSION_GLOB_SEGMENTS, MAX_PERMISSION_TARGET_BYTES,
     PermissionDecision, PermissionMode, PermissionPattern, PermissionPatternError,
-    PermissionPolicy, PermissionReach, PermissionRequest, PermissionRule, PermissionScope,
-    PermissionSession, PermissionTarget, PermissionTargetKind, ProjectPermissionGrant, ToolAccess,
-    permission_target_kind_for_tool,
+    PermissionPolicy, PermissionReach, PermissionReadFilter, PermissionRequest, PermissionRule,
+    PermissionScope, PermissionSession, PermissionTarget, PermissionTargetKind,
+    ProjectPermissionGrant, ToolAccess, permission_target_kind_for_tool,
 };
 
 #[test]
@@ -178,9 +178,10 @@ fn search_decision(
     pattern: &str,
     path: Option<&str>,
 ) -> PermissionDecision {
-    let reach = vec![path.map_or(PermissionReach::EveryPath, |path| {
-        PermissionReach::Path(path.to_owned())
-    })];
+    let reach = path
+        .map(|path| PermissionReach::Path(path.to_owned()))
+        .into_iter()
+        .collect::<Vec<_>>();
 
     PermissionPolicy::new(PermissionMode::Edit, rules.to_vec()).evaluate(
         &PermissionRequest::reaching("project", "grep", pattern, ToolAccess::ReadOnly, &reach),
@@ -216,20 +217,84 @@ fn a_search_is_refused_by_a_deny_on_its_path_or_on_its_pattern() {
     );
 }
 
+/// Builds the per-file decision a search carries into execution, from the same
+/// rules that decided the call itself.
+fn read_filter(rules: &[PermissionRule]) -> PermissionReadFilter {
+    PermissionReadFilter::new(
+        PermissionPolicy::new(PermissionMode::Edit, rules.to_vec()),
+        Vec::new(),
+        "project",
+        "grep",
+        ToolAccess::ReadOnly,
+    )
+}
+
 /// A search given no path — or rooted at the worktree, however that root is
-/// spelled — reads whatever it walks, so it fails closed against any deny on
-/// the tool rather than escaping every one of them.
+/// spelled — names no file, so the root cannot decide it. The call runs and
+/// each file it walks into is decided as it is read; refusing the whole call
+/// instead would leave no usable recursive search under any configuration that
+/// denies a single file.
 #[test]
-fn a_search_over_the_whole_worktree_fails_closed_against_a_deny() {
+fn a_search_over_the_whole_worktree_runs_and_withholds_only_what_a_rule_denies() {
     let rules = search_rules(PermissionDecision::Deny, "**/.env");
 
     for root in [None, Some("."), Some("./"), Some(".//."), Some("././")] {
         assert_eq!(
             search_decision(&rules, "OPENAI_API_KEY", root),
-            PermissionDecision::Deny,
-            "a search rooted at {root:?} reads the denied file too"
+            PermissionDecision::Allow,
+            "a search rooted at {root:?} must still return what it may"
         );
     }
+
+    let filter = read_filter(&rules);
+    assert!(
+        !filter.permits(".env"),
+        "the denied file must not reach the caller through a search rooted above it"
+    );
+    assert!(
+        filter.permits("notes.md"),
+        "a file no rule names must still be reported"
+    );
+}
+
+/// The filter is the policy, asked again: the same spellings, the same
+/// precedence, the same narrower-rule-wins answer. A second matcher would be
+/// free to disagree with the decision that authorized the call.
+#[test]
+fn the_per_file_decision_uses_the_same_rules_as_the_call_itself() {
+    let denied = read_filter(&search_rules(PermissionDecision::Deny, "src/secret/**"));
+    for spelling in [
+        "src/secret/key",
+        "./src/secret/key",
+        "src//secret//key",
+        "src/./secret/key",
+        ".//src//secret//key",
+    ] {
+        assert!(
+            !denied.permits(spelling),
+            "{spelling:?} names a denied file and must be withheld"
+        );
+    }
+    assert!(denied.permits("src/main.rs"));
+
+    let asked = read_filter(&search_rules(PermissionDecision::Ask, "src/secret/**"));
+    assert!(
+        !asked.permits("src/secret/key"),
+        "the prompt an ask calls for cannot be reached per file, so it withholds"
+    );
+
+    let mut carved = search_rules(PermissionDecision::Deny, "src/**");
+    carved.push(PermissionRule::global(
+        PermissionDecision::Allow,
+        PermissionPattern::Exact("grep".into()),
+        PermissionPattern::glob("src/generated/**").expect("the rule target must compile"),
+    ));
+    let carved = read_filter(&carved);
+    assert!(!carved.permits("src/main.rs"));
+    assert!(
+        carved.permits("src/generated/schema.rs"),
+        "the narrower allow decides the files it names, exactly as it does for a call"
+    );
 }
 
 /// A search is one read described two ways, so a rule naming either
@@ -267,11 +332,11 @@ fn a_search_is_authorized_by_a_rule_naming_either_its_pattern_or_its_path() {
     );
 }
 
-/// The other side of failing closed: an unbounded search is still authorized
-/// by a grant that authorizes everything, which is what keeps a subagent's
-/// derived read grant usable.
+/// A search naming no path is named by its pattern alone, so an `allow` has to
+/// name that pattern — or everything — to authorize it. A rule naming one
+/// subtree says nothing about a search that was given no subtree.
 #[test]
-fn an_unbounded_search_is_authorized_only_by_a_rule_that_authorizes_everything() {
+fn a_search_naming_no_path_is_authorized_on_its_pattern_alone() {
     let blanket = vec![PermissionRule::global(
         PermissionDecision::Allow,
         PermissionPattern::Exact("grep".into()),
