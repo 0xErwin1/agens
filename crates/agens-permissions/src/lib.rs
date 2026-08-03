@@ -600,7 +600,8 @@ pub fn permission_policy(
     dispatcher: &SharedToolDispatcher,
     effective_capabilities: Option<&EffectiveCapabilitySet>,
 ) -> Result<PermissionPolicy, CliError> {
-    let configured = configured_permission_rules(rules, project, |configured| {
+    let enforceable = enforceable_configured_rules(rules, dispatcher)?;
+    let configured = configured_permission_rules(&enforceable, project, |configured| {
         let dispatcher = dispatcher
             .lock()
             .map_err(|_| CliError::configuration("tool catalog is invalid"))?;
@@ -612,9 +613,7 @@ pub fn permission_policy(
             return Ok(PermissionPattern::Exact(configured.to_owned()));
         }
 
-        Err(CliError::configuration(
-            "permission configuration is invalid",
-        ))
+        Err(unresolvable_configured_rule(&dispatcher, configured))
     })?;
     let declared = effective_capabilities
         .map(EffectiveCapabilitySet::permission_rules)
@@ -626,6 +625,66 @@ pub fn permission_policy(
         vec![SafetyPredicate::WorktreeEscape, SafetyPredicate::ChatWrite],
     )
     .with_configured_floor(ConfiguredFloor::governing(configured)))
+}
+
+/// Drops a configured `allow` whose tool name nothing this session can account
+/// for, and keeps every other entry for the resolver to bind or to refuse.
+///
+/// A grant for a tool no call can name grants nothing, so refusing to run over
+/// one turns a stale line into a session that cannot start — and `[permissions]`
+/// may be written in a project document that is committed to a repository,
+/// while `[mcp]` may not, so that line can reach a collaborator whose own
+/// configuration never declared the server it names. This is the same trade an
+/// agent definition's unmatched `allow` already makes for the same reason
+/// (`agens_tools`' `resolved_selectors`).
+///
+/// `deny` and `ask` keep refusing. Dropping one of those would leave an
+/// operator believing a restriction is in force when the name they wrote
+/// reaches nothing, which is fail-open in exactly the direction a dropped
+/// `allow` is fail-closed.
+fn enforceable_configured_rules(
+    rules: &[ConfigPermissionRule],
+    dispatcher: &SharedToolDispatcher,
+) -> Result<Vec<ConfigPermissionRule>, CliError> {
+    let dispatcher = dispatcher
+        .lock()
+        .map_err(|_| CliError::configuration("tool catalog is invalid"))?;
+
+    Ok(rules
+        .iter()
+        .filter(|rule| {
+            let configured = configured_tool_name(&rule.tool_pattern);
+
+            rule.decision != ConfigPermissionDecision::Allow
+                || dispatcher.canonical_identity(&configured).is_some()
+                || names_a_tool_this_session_does_not_hold(&dispatcher, &configured)
+        })
+        .cloned()
+        .collect())
+}
+
+/// Says which rule was refused and what could not be resolved about it.
+///
+/// The operator who removed an MCP server and the operator who mistyped a tool
+/// name are looking at different mistakes, and neither of them necessarily
+/// wrote the rule: a project document carries `[permissions]` into every
+/// checkout of a repository.
+fn unresolvable_configured_rule(dispatcher: &ToolDispatcher, configured: &str) -> CliError {
+    let reason = match qualified_mcp_server(configured) {
+        Some(server) if dispatcher.declares_mcp_server(server) => {
+            format!("MCP server \"{server}\" is running and serves no tool by that name")
+        }
+        Some(server) => {
+            format!("no [mcp.{server}] block declares an MCP server named \"{server}\"")
+        }
+        None => "it names no native tool, and no MCP server this configuration declares \
+                 advertises a tool under that name"
+            .to_owned(),
+    };
+
+    CliError::configuration(format!(
+        "permission rule \"{configured}\" cannot be resolved: {reason}"
+    ))
 }
 
 /// Converts configured `[permissions]` entries into policy rules, resolving
@@ -650,14 +709,19 @@ pub fn configured_permission_rules(
                 ConfigPermissionDecision::Deny => PermissionDecision::Deny,
                 ConfigPermissionDecision::Ask => PermissionDecision::Ask,
             };
-            let configured = configured_tool_name(&rule.tool_pattern)?;
+            let configured = configured_tool_name(&rule.tool_pattern);
             let tool = resolve_tool(&configured)?;
             let target = match &rule.target_pattern {
                 Some(pattern) => PermissionPattern::glob_for_target_kind(
                     pattern.clone(),
                     permission_target_kind_for_tool(&configured),
                 )
-                .map_err(|_| CliError::configuration("permission configuration is invalid"))?,
+                .map_err(|_| {
+                    CliError::configuration(format!(
+                        "permission rule \"{configured}\" cannot be resolved: its target is not a \
+                         valid pattern"
+                    ))
+                })?,
                 None => PermissionPattern::Any,
             };
             Ok(match rule.scope {
@@ -681,14 +745,14 @@ pub fn configured_permission_rules(
 /// registered beside it, and a rule naming one of those has to reach it too.
 /// Anything the surface does not hold — an MCP tool, an already-qualified name,
 /// a typo — is left as written, for the caller to resolve or to diagnose.
-fn configured_tool_name(name: &str) -> Result<String, CliError> {
+fn configured_tool_name(name: &str) -> String {
     let qualified = format!("native::{name}");
 
-    Ok(if names_the_native_surface(&qualified) {
+    if names_the_native_surface(&qualified) {
         qualified
     } else {
         name.to_owned()
-    })
+    }
 }
 
 /// Whether a qualified name is one of the natives agens ships, across every
@@ -712,7 +776,9 @@ fn names_the_native_surface(qualified: &str) -> bool {
 /// dispatcher's own alias lookup resolves the retained name at evaluation time,
 /// so it binds for real the moment that surface appears. This is the same trade
 /// an agent definition's unmatched `deny` already makes for the same reason
-/// (`agens_tools`' `resolved_selectors`).
+/// (`agens_tools`' `resolved_selectors`), and the two paths agree on the other
+/// side of it too: an unmatched `allow` is dropped rather than kept, here by
+/// [`enforceable_configured_rules`].
 ///
 /// Two surfaces can legitimately be absent, and nothing else is softened.
 ///
@@ -741,6 +807,27 @@ fn names_a_tool_this_session_does_not_hold(dispatcher: &ToolDispatcher, configur
     absent_native || names_a_tool_of_an_absent_mcp_server(dispatcher, configured)
 }
 
+/// A `<server>::<tool>` name says which server it means, so that one server
+/// answers for it. A `<server>_<tool>` name says nothing: it carries no
+/// separator, and more than one declared server can explain it — a server `a`
+/// serving `b_c` and a server `a_b` serving `c` are both advertised as `a_b_c`.
+/// The declared set is therefore asked whether ANY of them explains the name
+/// and is absent. Deciding on whichever one is examined first refuses a
+/// correctly spelt rule whenever that one happens to be the server that is
+/// running.
+fn names_a_tool_of_an_absent_mcp_server(dispatcher: &ToolDispatcher, configured: &str) -> bool {
+    if let Some(server) = qualified_mcp_server(configured) {
+        return dispatcher.declares_mcp_server(server) && !dispatcher.holds_mcp_server(server);
+    }
+
+    dispatcher
+        .declared_mcp_servers()
+        .filter(|server| advertises_a_tool_as(server, configured))
+        .any(|server| !dispatcher.holds_mcp_server(server))
+}
+
+/// The server a `<server>::<tool>` name names.
+///
 /// `native` is excluded from the server side, exactly rather than case-folded:
 /// `native::` is the literal prefix [`ToolDispatcher::register_native`]
 /// qualifies its own tools under, so `native::webfetc` is a misspelt native
@@ -748,25 +835,19 @@ fn names_a_tool_this_session_does_not_hold(dispatcher: &ToolDispatcher, configur
 /// in a session that declares such a server. `Native` is a legal MCP server
 /// name and is treated as one: `Native::writ` is refused for the ordinary
 /// reason that no server by that name was declared, not for being native.
-fn names_a_tool_of_an_absent_mcp_server(dispatcher: &ToolDispatcher, configured: &str) -> bool {
-    let qualified = configured
+fn qualified_mcp_server(configured: &str) -> Option<&str> {
+    configured
         .split_once("::")
         .filter(|(server, tool)| !server.is_empty() && *server != "native" && !tool.is_empty())
-        .map(|(server, _)| server);
-    let advertised = || {
-        dispatcher.declared_mcp_servers().find(|server| {
-            configured
-                .strip_prefix(*server)
-                .and_then(|tool| tool.strip_prefix('_'))
-                .is_some_and(|tool| !tool.is_empty())
-        })
-    };
+        .map(|(server, _)| server)
+}
 
-    let Some(server) = qualified.or_else(advertised) else {
-        return false;
-    };
-
-    dispatcher.declares_mcp_server(server) && !dispatcher.holds_mcp_server(server)
+/// Whether `server` would advertise a tool of its own under `configured`.
+fn advertises_a_tool_as(server: &str, configured: &str) -> bool {
+    configured
+        .strip_prefix(server)
+        .and_then(|tool| tool.strip_prefix('_'))
+        .is_some_and(|tool| !tool.is_empty())
 }
 
 fn parse_tool_input(call: &HeadlessToolCall) -> Result<serde_json::Value, HeadlessTurnPortError> {

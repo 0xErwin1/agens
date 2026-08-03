@@ -146,12 +146,18 @@ effort = "high"
 #     the rule is kept as written and binds again the moment the server is
 #     reachable. What allows that is an `[mcp.*]` block below naming the server:
 #     a rule for a server this file never declares is indistinguishable from a
-#     typo and is rejected, as is a tool name misspelt against a server that IS
-#     running, and as is a misspelt native name.
-#     A rejected name is refused when the permission policy is built. For
-#     `agens chat` that is the turn it was asked to run, so the command fails.
-#     The TUI builds it per submission, so agens starts and then fails every
-#     prompt you send until the rule is fixed.
+#     typo, as is a tool name misspelt against a server that IS running, and as
+#     is a misspelt native name. Written as `deny` or `ask`, such a rule is
+#     rejected. Written as `allow`, it is dropped instead: it could only widen,
+#     and a grant for a tool nothing can call grants nothing. That matters
+#     because `[permissions]` may live in a project file committed to a
+#     repository while `[mcp.*]` may not, so a stale `allow` can reach a
+#     checkout whose global configuration never declared the server it names.
+#     A rejected name is refused when the permission policy is built, naming
+#     the rule and what could not be resolved about it. For `agens chat` that
+#     is the turn it was asked to run, so the command fails. The TUI builds it
+#     per submission, so agens starts and then fails every prompt you send
+#     until the rule is fixed.
 #     The allow side of the same fact: a prompt for a remote tool can show only
 #     that tool's name, so answering "Allow always" stores a grant matching
 #     every future call to it. For `bash` such a grant is remembered per

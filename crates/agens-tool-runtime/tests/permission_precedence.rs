@@ -2557,6 +2557,10 @@ fn both_spellings_of_a_tool_of_a_declared_absent_server_resolve_and_bind_when_it
 
 /// Nothing beyond that is softened, and both spellings refuse in step.
 ///
+/// Every entry here is a `deny`. The `allow` side of the same names is decided
+/// differently, and is pinned by
+/// [`an_allow_naming_an_unresolvable_tool_is_dropped_where_a_deny_refuses_to_run`].
+///
 /// "Refuses" is refusing to build the policy, which is not one moment on both
 /// surfaces: `agens chat` builds it for the turn it was asked to run, so the
 /// command fails, while the TUI builds it inside its own submit path, so the
@@ -2621,13 +2625,196 @@ fn a_name_no_declared_server_and_no_native_surface_explains_refuses_to_run() {
     }
 }
 
+/// A session declaring both `a` and `a_b`, having reached the tools of
+/// whichever of them is named. Each serves one tool of its own, neither of
+/// which is advertised as `a_b_c` — so that name is explained by both servers
+/// and held by neither.
+fn dispatcher_declaring_two_servers(held: &[&str]) -> Arc<Mutex<ToolDispatcher>> {
+    let mut dispatcher = native_dispatcher();
+    dispatcher.declare_mcp_servers(["a".to_owned(), "a_b".to_owned()]);
+
+    for server in held {
+        dispatcher
+            .register_mcp(
+                &agens_tools::RemoteToolMetadata {
+                    qualified_name: format!("{server}::served"),
+                    server_name: (*server).into(),
+                    tool_name: "served".into(),
+                    description: None,
+                    input_schema: serde_json::json!({"type": "object"}),
+                    access: agens_tools::RemoteToolAccess::ReadOnly,
+                },
+                probe_remote_tool(),
+            )
+            .expect("the probe dispatcher must accept the remote tool");
+    }
+
+    Arc::new(Mutex::new(dispatcher))
+}
+
+/// One `<server>_<tool>` name can be explained by more than one declared
+/// server, and the question asked of them is whether ANY of them explains it —
+/// not what the first one in some order happens to say.
+///
+/// Deciding on whichever server is examined first refuses a correctly spelt
+/// rule whenever that server is the one that is running: `a` is here, therefore
+/// `a_b_c` is a typo — while `a_b`, which is not here, explains the name
+/// exactly.
+///
+/// A name that any absent declared server explains is retained for the reason
+/// every absent surface is retained: it binds when that server returns. A name
+/// every server that could explain it is holding has a live surface to be
+/// checked against, and fails there.
+#[test]
+fn a_name_two_declared_servers_could_explain_is_resolved_by_any_of_them() {
+    for (held, resolves) in [
+        (&["a"][..], true),
+        (&["a_b"][..], true),
+        (&[][..], true),
+        (&["a", "a_b"][..], false),
+    ] {
+        let resolved = permission_policy(
+            &configured_entries(&["deny a_b_c"]),
+            "project",
+            PermissionMode::Edit,
+            &dispatcher_declaring_two_servers(held),
+            None,
+        );
+
+        assert_eq!(
+            resolved.is_ok(),
+            resolves,
+            "with {held:?} running, `deny a_b_c` must {}: {resolved:?}",
+            if resolves {
+                "resolve against the declared server that is not here"
+            } else {
+                "be checked against the live surfaces that hold every name explaining it"
+            }
+        );
+    }
+}
+
+/// A refusal names the rule it refused and why it could not be resolved.
+///
+/// The operator who removed a server and the operator who mistyped a tool are
+/// looking at different mistakes, and `[permissions]` may be written in a
+/// project document that is committed to a repository while `[mcp]` may not
+/// (`agens-bootstrap` rejects a project `[mcp]` block). A collaborator whose
+/// global configuration never declared that server therefore inherits a rule
+/// they did not write, and a refusal that says only that the configuration is
+/// invalid leaves them nothing to act on.
+#[test]
+fn a_refusal_names_the_rule_it_refused_and_why_it_could_not_be_resolved() {
+    let mut holding_the_probe_server = native_dispatcher();
+    holding_the_probe_server.declare_mcp_servers(["probe".to_owned()]);
+    holding_the_probe_server
+        .register_mcp(&probe_remote_metadata(), probe_remote_tool())
+        .expect("the probe dispatcher must accept the remote tool");
+
+    for (entry, dispatcher, expected) in [
+        (
+            "deny ghost::read_text_file",
+            native_dispatcher(),
+            vec!["ghost::read_text_file", "ghost", "declares"],
+        ),
+        (
+            "deny ghost_read_text_file",
+            native_dispatcher(),
+            vec!["ghost_read_text_file", "native tool"],
+        ),
+        (
+            "deny webfetc",
+            native_dispatcher(),
+            vec!["webfetc", "native tool"],
+        ),
+        (
+            "deny probe::read_txt_file",
+            holding_the_probe_server,
+            vec!["probe::read_txt_file", "probe", "serves"],
+        ),
+        (
+            "deny read ",
+            native_dispatcher(),
+            vec!["native::read", "target"],
+        ),
+    ] {
+        let message = permission_policy(
+            &configured_entries(&[entry]),
+            "project",
+            PermissionMode::Edit,
+            &Arc::new(Mutex::new(dispatcher)),
+            None,
+        )
+        .expect_err("the rule under test must be refused")
+        .to_string();
+
+        for fragment in expected {
+            assert!(
+                message.contains(fragment),
+                "the refusal of `{entry}` has to say {fragment:?}, and says: {message}"
+            );
+        }
+    }
+}
+
+/// A configured `allow` naming a tool nothing here can resolve is dropped, and
+/// only `allow`.
+///
+/// It is the same trade an agent definition already makes for the same reason
+/// (`agens_tools`' `resolved_selectors`): a grant for a tool no call can name
+/// grants nothing, so refusing to run over one turns a harmless stale line into
+/// a session that cannot start. `[permissions]` may be written in a project
+/// document that is committed to a repository, so that line can arrive from a
+/// collaborator's checkout rather than from the operator's own file.
+///
+/// `deny` and `ask` keep refusing. Dropping one of those silently would leave
+/// an operator believing a restriction is in force when the name they wrote
+/// reaches nothing — which is fail-open in exactly the direction a dropped
+/// `allow` is fail-closed.
+#[test]
+fn an_allow_naming_an_unresolvable_tool_is_dropped_where_a_deny_refuses_to_run() {
+    for tool in ["engram_mem_save", "engram::mem_save", "webfetc"] {
+        let allowed = permission_policy(
+            &configured_entries(&[&format!("allow {tool}")]),
+            "project",
+            PermissionMode::Edit,
+            &Arc::new(Mutex::new(native_dispatcher())),
+            None,
+        );
+
+        assert!(
+            allowed.is_ok(),
+            "`allow {tool}` grants nothing this session can call and must not stop it starting: \
+             {allowed:?}"
+        );
+
+        for decision in ["deny", "ask"] {
+            let refused = permission_policy(
+                &configured_entries(&[&format!("{decision} {tool}")]),
+                "project",
+                PermissionMode::Edit,
+                &Arc::new(Mutex::new(native_dispatcher())),
+                None,
+            );
+
+            assert!(
+                refused.is_err(),
+                "`{decision} {tool}` reads as a restriction and reaches nothing, so it must \
+                 refuse to run: {refused:?}"
+            );
+        }
+    }
+}
+
 /// A session's own configuration decides which server names explain a rule, so
 /// the dispatcher a production parent hands to `permission_policy` has to carry
 /// them — including for a server that was never contacted at all.
 ///
-/// A `disabled` server is the case the shipped `example/config.toml` creates:
-/// nothing is discovered from it, so every name it would have explained resolves
-/// through this declaration or through nothing.
+/// A `disabled` server is the case the shipped `example/config.toml` documents
+/// — its `[mcp.*]` blocks are commented out, under a heading asking the reader
+/// to uncomment and adapt one of them, so the server built here is this test's
+/// own. Nothing is discovered from it, so every name it would have explained
+/// resolves through this declaration or through nothing.
 #[test]
 fn a_production_parent_declares_a_disabled_server_so_a_rule_naming_its_tools_resolves() {
     let temporary = agens_fixtures::session_directory("declared-disabled-server");
@@ -2739,10 +2926,38 @@ fn a_rule_naming_a_native_this_session_never_registers_still_runs_the_session() 
             None,
         );
 
+        let policy = resolved.unwrap_or_else(|error| {
+            panic!(
+                "`deny {tool}` names a real native and must not refuse to run a session that \
+                 registers no delegation: {error:?}"
+            )
+        });
+
+        let mut delegating = ToolDispatcher::new();
+        delegating
+            .register_native(
+                format!("native::{tool}"),
+                agens_core::ToolAccess::Write,
+                InertTool,
+            )
+            .expect("the delegation tool must register");
+        let outcome = delegating
+            .evaluate(
+                &policy,
+                &[],
+                &PermissionSession::new(),
+                ToolDispatchRequest::new(
+                    "project",
+                    tool,
+                    serde_json::json!({"target": "reviewer"}),
+                ),
+            )
+            .expect("the call must be decidable");
+
         assert!(
-            resolved.is_ok(),
-            "`deny {tool}` names a real native and must not refuse to run a session that \
-             registers no delegation: {resolved:?}"
+            matches!(outcome, ToolEvaluationOutcome::Denied),
+            "`deny {tool}` has to refuse the call once a session registers the tool it names, or \
+             it reads as denying and denies nothing: {outcome:?}"
         );
     }
 
