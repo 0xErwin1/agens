@@ -214,6 +214,15 @@ impl SkillResourceClass {
             Self::Asset => "assets",
         }
     }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "reference" => Some(Self::Reference),
+            "script" => Some(Self::Script),
+            "asset" => Some(Self::Asset),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -508,6 +517,12 @@ impl Skill {
     pub fn source(&self) -> &Path {
         &self.source
     }
+
+    /// The directory holding this skill's manifest and its resource classes.
+    /// Every file the skill can return is a child of it.
+    pub fn directory(&self) -> &Path {
+        &self.directory
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -582,11 +597,41 @@ impl SkillCatalog {
 #[derive(Clone, Debug)]
 pub struct SkillResourceTool {
     catalog: SkillCatalog,
+    project_root: PathBuf,
 }
 
 impl SkillResourceTool {
-    pub fn new(catalog: SkillCatalog) -> Self {
-        Self { catalog }
+    pub fn new(catalog: SkillCatalog, project_root: impl Into<PathBuf>) -> Self {
+        Self {
+            catalog,
+            project_root: project_root.into(),
+        }
+    }
+
+    /// The project-relative file one call would return, when the skill it names
+    /// was discovered under the project root.
+    ///
+    /// A skill discovered beside the global configuration lives outside the
+    /// worktree and has no such spelling, so nothing is reported for it and no
+    /// rule written against a path selects the call.
+    fn reached_file(&self, arguments: &Value) -> Option<PathBuf> {
+        let skill = arguments
+            .get("skill")
+            .and_then(Value::as_str)
+            .and_then(|name| self.catalog.skill(name))?;
+        let directory = skill.directory().strip_prefix(&self.project_root).ok()?;
+
+        match (
+            arguments.get("resource_class").and_then(Value::as_str),
+            arguments.get("resource").and_then(Value::as_str),
+        ) {
+            (None, None) => Some(directory.join(SKILL_MANIFEST_NAME)),
+            (Some(class), Some(resource)) if is_normal_filename(resource) => {
+                SkillResourceClass::parse(class)
+                    .map(|class| directory.join(class.directory()).join(resource))
+            }
+            _ => None,
+        }
     }
 
     pub fn input_schema() -> Value {
@@ -613,6 +658,15 @@ impl DispatchTool for SkillResourceTool {
             .ok_or_else(|| Error::Tool("skill arguments are invalid".into()))
     }
 
+    fn permission_reach(&self, arguments: &Value) -> Result<Vec<PermissionReach>, Error> {
+        Ok(self
+            .reached_file(arguments)
+            .and_then(|path| path.to_str().map(str::to_owned))
+            .map(PermissionReach::Path)
+            .into_iter()
+            .collect())
+    }
+
     fn execute(&mut self, _: &ToolExecutionContext, arguments: Value) -> Result<ToolOutput, Error> {
         let Some(arguments) = arguments.as_object().filter(|arguments| {
             arguments
@@ -637,11 +691,8 @@ impl DispatchTool for SkillResourceTool {
         ) {
             (None, None) => skill.load_instructions(),
             (Some(class), Some(resource)) => {
-                let class = match class {
-                    "reference" => SkillResourceClass::Reference,
-                    "script" => SkillResourceClass::Script,
-                    "asset" => SkillResourceClass::Asset,
-                    _ => return Ok(ToolOutput::failure("skill resource class is invalid")),
+                let Some(class) = SkillResourceClass::parse(class) else {
+                    return Ok(ToolOutput::failure("skill resource class is invalid"));
                 };
                 skill.load_resource(class, resource)
             }

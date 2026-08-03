@@ -110,10 +110,15 @@ effort = "high"
 #     than against any path, and the command chooses what it prints. Granting it
 #     grants a way around every rule below.
 #   * `skill` — a skill call is named by a skill name, so no rule here selects
-#     one. Bounded by what the tool can open: a skill's files are read relative
-#     to that skill's own directory, under a single plain filename with no
-#     traversal, refusing symbolic links and files carrying more than one link.
-#     It returns that skill's own installed assets and nothing else.
+#     one by its target. Skills come from two roots. A skill installed under
+#     `<project-root>/.agens/skills/` reports the file the call would open, so
+#     `deny skill(**/.agens/**)` refuses it. A skill installed beside this file
+#     is outside the worktree and has no path a rule here can name, and there
+#     the exception stands — bounded by what the tool can open: a skill's files
+#     are read relative to that skill's own directory, under a single plain
+#     filename with no traversal, refusing symbolic links and files carrying
+#     more than one link. It returns that skill's own installed assets and
+#     nothing else.
 #   * `task` — named by the subagent it resolves to, so `deny task(reviewer)`
 #     refuses every delegation to that agent and no rule written against a path
 #     selects one. What it returns is whatever the subagent reports, which no

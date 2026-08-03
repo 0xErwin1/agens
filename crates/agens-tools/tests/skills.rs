@@ -586,7 +586,7 @@ fn skill_resource_tool_discloses_only_selected_confined_content() {
         .unwrap()
         .catalog()
         .clone();
-    let mut tool = SkillResourceTool::new(catalog);
+    let mut tool = SkillResourceTool::new(catalog, &root);
     let context = ToolExecutionContext::with_timeout(Duration::from_secs(1));
 
     assert_eq!(

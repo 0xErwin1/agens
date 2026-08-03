@@ -32,8 +32,9 @@ use agens_core::{
 use agens_permissions::{NativePermissionTarget, configured_permission_rules, permission_policy};
 use agens_tool_runtime::child_catalog::resolve_child_surface;
 use agens_tools::{
-    AgentCatalog, DispatchTool, EffectiveCapabilitySet, NativeToolCatalog, NativeTools, TaskTool,
-    ToolDispatchRequest, ToolDispatcher, ToolEvaluationOutcome, ToolExecutionContext, ToolOutput,
+    AgentCatalog, DispatchTool, EffectiveCapabilitySet, NativeToolCatalog, NativeTools,
+    SkillResourceTool, TaskTool, ToolDispatchRequest, ToolDispatcher, ToolEvaluationOutcome,
+    ToolExecutionContext, ToolOutput,
 };
 
 struct Case {
@@ -1667,6 +1668,26 @@ struct PerFileProbe {
     still_reports: &'static str,
 }
 
+/// The call that proves a rule naming a file selects the call that would open
+/// it, for a tool whose own target is not that file.
+///
+/// A tool can report what a call reaches beyond the target it is named by, and
+/// what it reports folds into the same act a rule is matched against — which is
+/// how a rule naming a file reaches a call named by something else. Where that
+/// covers only part of what the tool can return, the row keeps its `unbound`
+/// reason for the rest and carries this to keep the covered part from being
+/// prose.
+struct ReachProbe {
+    /// The arguments of one call whose reach a rule can name.
+    arguments: &'static str,
+    /// A rule target naming the file that call would open, which must deny it.
+    denied_by: &'static str,
+    /// A rule target naming some other file, which must leave the call
+    /// unselected — otherwise a tool reporting every path in the worktree would
+    /// pass by denying everything.
+    unmatched_by: &'static str,
+}
+
 /// One native tool, classified by the facts that decide whether a path deny
 /// binds it.
 struct SurfaceEntry {
@@ -1679,9 +1700,15 @@ struct SurfaceEntry {
     /// The call that reports files it never named, present when the tool asks
     /// the same rules once per file while it runs.
     decided_per_file: Option<PerFileProbe>,
+    /// The call that proves a rule naming a file reaches this tool for the part
+    /// of what it can return that a path can name. Present only where that
+    /// coverage is partial: a row it covers entirely is `decided_on_its_target`
+    /// instead, and a row it covers not at all carries `unbound` alone.
+    partly_reached: Option<ReachProbe>,
     /// Why no path rule reaches what this tool can return. Required of exactly
-    /// the rows neither mechanism covers, and forbidden of the rest, so an
-    /// exception is written down rather than inferred from an absence.
+    /// the rows neither mechanism fully covers, and forbidden of the rest, so an
+    /// exception is written down rather than inferred from an absence. A row
+    /// carrying a [`ReachProbe`] states here what that probe leaves over.
     unbound: Option<&'static str>,
     /// The shape a rule's target is matched under, which decides whether a bare
     /// `*` crosses a `/`. `None` where the target is neither a path nor a
@@ -1716,6 +1743,7 @@ const TOOL_SURFACE: &[SurfaceEntry] = &[
         returns_file_contents: true,
         decided_on_its_target: true,
         decided_per_file: None,
+        partly_reached: None,
         unbound: None,
         matched_as: Some(PermissionTargetKind::Path),
     },
@@ -1724,6 +1752,7 @@ const TOOL_SURFACE: &[SurfaceEntry] = &[
         returns_file_contents: false,
         decided_on_its_target: true,
         decided_per_file: None,
+        partly_reached: None,
         unbound: None,
         matched_as: Some(PermissionTargetKind::Path),
     },
@@ -1733,6 +1762,7 @@ const TOOL_SURFACE: &[SurfaceEntry] = &[
         returns_file_contents: true,
         decided_on_its_target: true,
         decided_per_file: None,
+        partly_reached: None,
         unbound: None,
         matched_as: Some(PermissionTargetKind::Path),
     },
@@ -1741,6 +1771,7 @@ const TOOL_SURFACE: &[SurfaceEntry] = &[
         returns_file_contents: false,
         decided_on_its_target: true,
         decided_per_file: None,
+        partly_reached: None,
         unbound: None,
         matched_as: Some(PermissionTargetKind::Path),
     },
@@ -1753,6 +1784,7 @@ const TOOL_SURFACE: &[SurfaceEntry] = &[
             denies: "**/secrets.md",
             still_reports: "OPENAI_API_KEY is set",
         }),
+        partly_reached: None,
         unbound: None,
         matched_as: Some(PermissionTargetKind::Path),
     },
@@ -1765,6 +1797,7 @@ const TOOL_SURFACE: &[SurfaceEntry] = &[
             denies: "**/secrets.md",
             still_reports: "OPENAI_API_KEY is set",
         }),
+        partly_reached: None,
         unbound: None,
         matched_as: Some(PermissionTargetKind::Path),
     },
@@ -1776,6 +1809,7 @@ const TOOL_SURFACE: &[SurfaceEntry] = &[
         returns_file_contents: false,
         decided_on_its_target: false,
         decided_per_file: None,
+        partly_reached: None,
         unbound: None,
         matched_as: Some(PermissionTargetKind::Path),
     },
@@ -1790,6 +1824,7 @@ const TOOL_SURFACE: &[SurfaceEntry] = &[
             denies: "**/secrets.md",
             still_reports: "notes: second",
         }),
+        partly_reached: None,
         unbound: None,
         matched_as: Some(PermissionTargetKind::Path),
     },
@@ -1799,6 +1834,7 @@ const TOOL_SURFACE: &[SurfaceEntry] = &[
         returns_file_contents: false,
         decided_on_its_target: false,
         decided_per_file: None,
+        partly_reached: None,
         unbound: None,
         matched_as: Some(PermissionTargetKind::Path),
     },
@@ -1807,6 +1843,7 @@ const TOOL_SURFACE: &[SurfaceEntry] = &[
         returns_file_contents: true,
         decided_on_its_target: false,
         decided_per_file: None,
+        partly_reached: None,
         unbound: Some(
             "a rule written for bash is matched against the command line rather than against \
              any path, and the command chooses what it prints. The exception is total, and it \
@@ -1821,17 +1858,23 @@ const TOOL_SURFACE: &[SurfaceEntry] = &[
         returns_file_contents: true,
         decided_on_its_target: false,
         decided_per_file: None,
+        partly_reached: Some(ReachProbe {
+            arguments: r#"{"skill":"probe","resource_class":"reference","resource":"notes.md"}"#,
+            denied_by: "**/.agens/**",
+            unmatched_by: "**/elsewhere/**",
+        }),
         unbound: Some(
-            "a skill call is named by a skill name, and no rule written against a path selects \
-             one. The exception is bounded rather than closed, and deliberately not papered \
-             over with a reach that could not be matched: a skill's files are opened relative \
-             to that skill's own directory descriptor, under a single normal filename with no \
-             traversal, rejecting symbolic links and files carrying more than one link, so the \
-             only files it can return are the ones installed as that skill's own assets. A \
-             global skill has no project-relative path for a rule to name at all. It is absent \
-             from every delegated child.",
+            "a skill call is named by a skill name rather than by a path. A skill discovered \
+             under the project root reports the file it would open, so a rule naming that file \
+             selects the call — but a skill discovered beside the global configuration lives \
+             outside the worktree and has no project-relative path for a rule to name, and for \
+             those the exception stands. It is bounded rather than closed by what the tool can \
+             open: a skill's files are read relative to that skill's own directory descriptor, \
+             under a single normal filename with no traversal, rejecting symbolic links and \
+             files carrying more than one link, so the only files it can return are the ones \
+             installed as that skill's own assets. It is absent from every delegated child.",
         ),
-        matched_as: None,
+        matched_as: Some(PermissionTargetKind::Path),
     },
     // Registered directly on the primary path. A delegated child never holds
     // it, which is what keeps delegation from nesting.
@@ -1840,6 +1883,7 @@ const TOOL_SURFACE: &[SurfaceEntry] = &[
         returns_file_contents: true,
         decided_on_its_target: false,
         decided_per_file: None,
+        partly_reached: None,
         unbound: Some(
             "a task call is named by the agent it resolves to, so `deny task(reviewer)` refuses \
              every delegation to that agent while no rule written against a path selects one, \
@@ -1857,6 +1901,7 @@ const TOOL_SURFACE: &[SurfaceEntry] = &[
         returns_file_contents: false,
         decided_on_its_target: false,
         decided_per_file: None,
+        partly_reached: None,
         unbound: None,
         matched_as: None,
     },
@@ -1865,6 +1910,7 @@ const TOOL_SURFACE: &[SurfaceEntry] = &[
         returns_file_contents: false,
         decided_on_its_target: false,
         decided_per_file: None,
+        partly_reached: None,
         unbound: None,
         matched_as: None,
     },
@@ -2147,6 +2193,175 @@ fn every_tool_this_table_says_asks_per_file_withholds_a_denied_file() {
             probe.arguments,
             output.content
         );
+    }
+
+    fs::remove_dir_all(temporary).unwrap();
+}
+
+/// A skill fixture holding one project skill and one global skill, each with a
+/// reference file of its own, and the tool that reads them.
+///
+/// The two origins are what this fixture exists for: `discover_skill_catalog`
+/// passes both roots, and only the project one produces files a rule written
+/// against a path can name.
+fn skill_tool_over_both_roots(temporary: &Path) -> (std::path::PathBuf, SkillResourceTool) {
+    let project_root = temporary.join("project");
+    let global_root = temporary.join("global/skills");
+
+    for (root, name, description) in [
+        (
+            project_root.join(".agens/skills"),
+            "probe",
+            "project skill probe",
+        ),
+        (global_root.clone(), "elsewhere", "global skill probe"),
+    ] {
+        let directory = root.join(name);
+        fs::create_dir_all(directory.join("references")).unwrap();
+        fs::write(
+            directory.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: {description}\n---\ninstructions\n"),
+        )
+        .unwrap();
+        fs::write(
+            directory.join("references/notes.md"),
+            "reference contents\n",
+        )
+        .unwrap();
+    }
+
+    let catalog =
+        agens_tools::SkillCatalog::discover(&global_root, project_root.join(".agens/skills"))
+            .expect("the probe skill catalog must discover")
+            .catalog()
+            .clone();
+
+    (
+        project_root.clone(),
+        SkillResourceTool::new(catalog, project_root),
+    )
+}
+
+/// Runs one call through a dispatcher holding `tool` under `identity`, decided
+/// by a single configured rule, and reports whether the rule refused it.
+fn configured_rule_denies_a_call(
+    identity: &'static str,
+    tool: impl DispatchTool + 'static,
+    entry: &str,
+    arguments: serde_json::Value,
+) -> bool {
+    let mut dispatcher = ToolDispatcher::new();
+    dispatcher
+        .register_native(identity, ToolAccess::ReadOnly, tool)
+        .expect("the probe dispatcher must accept the tool");
+    let dispatcher = Arc::new(Mutex::new(dispatcher));
+
+    let policy = permission_policy(
+        &configured_entries(&[entry]),
+        "project",
+        PermissionMode::Edit,
+        &dispatcher,
+        None,
+    )
+    .expect("the configured policy must resolve");
+    let outcome = dispatcher
+        .lock()
+        .expect("dispatcher must be available")
+        .evaluate(
+            &policy,
+            &[],
+            &PermissionSession::new(),
+            ToolDispatchRequest::new("project", identity, arguments),
+        )
+        .expect("the call must be decidable");
+
+    matches!(outcome, ToolEvaluationOutcome::Denied)
+}
+
+/// Every [`ReachProbe`] in [`TOOL_SURFACE`] is executed here, so a row claiming
+/// a rule reaches past its target has the call that proves it.
+///
+/// A tool reporting nothing beyond its target fails the first case; a tool
+/// reporting the whole worktree fails the second.
+#[test]
+fn every_tool_this_table_says_a_rule_reaches_past_its_target_is_denied_by_naming_the_file() {
+    let probed = TOOL_SURFACE
+        .iter()
+        .filter(|entry| entry.partly_reached.is_some())
+        .map(|entry| entry.tool)
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        probed,
+        vec!["native::skill"],
+        "this probe builds a skill call; a row added here needs a fixture of its own"
+    );
+    let probe = TOOL_SURFACE
+        .iter()
+        .find_map(|entry| entry.partly_reached.as_ref())
+        .expect("the row asserted above carries the probe");
+
+    let temporary = agens_fixtures::session_directory("skill-reach-probe");
+    let arguments: serde_json::Value =
+        serde_json::from_str(probe.arguments).expect("a probe names its call in JSON");
+
+    for (target, denied) in [(probe.denied_by, true), (probe.unmatched_by, false)] {
+        let (_, tool) = skill_tool_over_both_roots(&temporary);
+
+        assert_eq!(
+            configured_rule_denies_a_call(
+                "native::skill",
+                tool,
+                &format!("deny skill {target}"),
+                arguments.clone(),
+            ),
+            denied,
+            "`deny skill({target})` must {} the call {}",
+            if denied { "refuse" } else { "not select" },
+            probe.arguments
+        );
+    }
+
+    fs::remove_dir_all(temporary).unwrap();
+}
+
+/// Skills come from two roots, and one rule has to answer for both the way the
+/// `skill` row says it does: it binds the project skill and leaves the global
+/// one to the bound on what the tool can open.
+///
+/// This is the exception's residual, executed rather than asserted. A skill
+/// installed beside the global configuration lives outside the worktree, so the
+/// file it opens has no project-relative spelling for a rule to name.
+#[test]
+fn one_path_rule_reaches_a_project_skills_files_and_not_a_global_skills() {
+    let temporary = agens_fixtures::session_directory("skill-reach-residual");
+
+    for (skill, denied) in [("probe", true), ("elsewhere", false)] {
+        for (call, arguments) in [
+            ("instructions", serde_json::json!({"skill": skill})),
+            (
+                "reference",
+                serde_json::json!({
+                    "skill": skill,
+                    "resource_class": "reference",
+                    "resource": "notes.md",
+                }),
+            ),
+        ] {
+            let (_, tool) = skill_tool_over_both_roots(&temporary);
+
+            assert_eq!(
+                configured_rule_denies_a_call(
+                    "native::skill",
+                    tool,
+                    "deny skill **/*.md",
+                    arguments
+                ),
+                denied,
+                "`deny skill(**/*.md)` must {} the {skill} skill's own {call}",
+                if denied { "refuse" } else { "not select" }
+            );
+        }
     }
 
     fs::remove_dir_all(temporary).unwrap();

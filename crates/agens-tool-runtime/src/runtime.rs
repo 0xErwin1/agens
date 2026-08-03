@@ -178,7 +178,7 @@ pub fn production_tool_runtime_with_parent_task_runner<R: TaskRunner>(
         .register_native(
             "native::skill",
             agens_core::ToolAccess::ReadOnly,
-            SkillResourceTool::new(skills.clone()),
+            SkillResourceTool::new(skills.clone(), project_root),
         )
         .map_err(|_| CliError::configuration("tool catalog is invalid"))?;
 
