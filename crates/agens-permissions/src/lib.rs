@@ -334,25 +334,28 @@ impl HeadlessPermissionGate for ProductionPermissionGate {
     /// before any tool runs, so this is the only vantage point left from
     /// which the harness can still surface what a denied call touched.
     ///
-    /// `call.name` carries its dispatcher prefix (`native::`/`mcp::`); the
-    /// prefix is stripped before parsing so the bare name matches
-    /// `ToolInput::parse`'s vocabulary, mirroring the same strip performed
-    /// when reconstructing a saved session's tool history.
+    /// A call the model made carries the bare name it was advertised under,
+    /// which is already the vocabulary `ToolInput::parse` expects. A call agens
+    /// makes on its own behalf carries the qualified one instead — the TUI's
+    /// own task launch spells it `native::task` — and both are aliases of the
+    /// same tool everywhere else in the dispatcher. The prefix is stripped so
+    /// this function cannot answer differently for the same call depending on
+    /// which spelling reached it.
+    ///
+    /// There is no `mcp::` spelling to strip alongside it: a remote tool is
+    /// advertised as `{server}_{tool}` and named in a rule as `<server>::<tool>`
+    /// (`mcp_model_tool_name`, `remote_tool_metadata`). Neither is a native
+    /// name, so a remote call falls through to no facts, which is the honest
+    /// answer — a remote tool's arguments belong to its server.
     fn denial_facts(&self, call: &HeadlessToolCall) -> Option<ToolResultFacts> {
-        let bare = call
-            .name
-            .strip_prefix("native::")
-            .or_else(|| call.name.strip_prefix("mcp::"))
-            .unwrap_or(call.name.as_str());
-
-        match bare {
-            "write" => Some(ToolResultFacts::Write {
-                path: denied_input_path(ToolInput::parse(bare, &call.input)),
+        match call.name.strip_prefix("native::").unwrap_or(&call.name) {
+            name @ "write" => Some(ToolResultFacts::Write {
+                path: denied_input_path(ToolInput::parse(name, &call.input)),
                 outcome: ToolOutcome::Denied,
                 written: None,
             }),
-            "edit" => Some(ToolResultFacts::Edit {
-                path: denied_input_path(ToolInput::parse(bare, &call.input)),
+            name @ "edit" => Some(ToolResultFacts::Edit {
+                path: denied_input_path(ToolInput::parse(name, &call.input)),
                 outcome: ToolOutcome::Denied,
                 changed: None,
             }),

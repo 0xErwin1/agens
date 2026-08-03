@@ -3280,8 +3280,37 @@ impl ToolOutput {
     }
 }
 
+/// A tool as the dispatcher holds it: what a call projects onto for a
+/// permission decision, and how it runs once that decision allows it.
+///
+/// # Which error a projection fails with
+///
+/// The two projection methods carry a reserved distinction, because the variant
+/// they return decides what the model is told and therefore what it does next:
+///
+/// - [`Error::Tool`] means **the arguments are malformed**. The model reads
+///   this as `invalid tool arguments`, which invites it to rewrite them and
+///   call again. Use it whenever rewriting the arguments could produce a call
+///   that works.
+/// - [`Error::Permission`] means **the arguments are well formed and no
+///   permission decision can be made for this call at all** — the tool is
+///   misconfigured in this session, not misused. The model is told so in its
+///   own words, and told that repeating the call will not change it. Nothing
+///   the model can write repairs this, so it must never arrive wearing the
+///   wording that asks it to try.
+///
+/// Every other error variant is classified with [`Error::Tool`]. A projection
+/// that cannot decide must fail one of these two ways rather than answer: an
+/// empty target or an empty reach is a positive claim that the call touches
+/// nothing, and every rule written against it stops selecting the call while
+/// the call goes on doing what it does.
 pub trait DispatchTool: Send {
     /// Projects the exact execution arguments into the permission target.
+    ///
+    /// See the trait's own documentation for which error variant to fail with:
+    /// the choice is part of this method's contract, and the default body's
+    /// [`Error::Tool`] is the malformed-arguments case rather than the general
+    /// one.
     fn permission_target(&self, arguments: &Value) -> Result<String, Error> {
         arguments
             .get("target")
@@ -3293,6 +3322,8 @@ pub trait DispatchTool: Send {
     /// Projects what the exact execution arguments let the call reach beyond
     /// [`Self::permission_target`]. A tool named by the one thing it touches
     /// reaches nothing else, which is why this defaults to empty.
+    ///
+    /// Fails under the same contract as [`Self::permission_target`].
     fn permission_reach(&self, _arguments: &Value) -> Result<Vec<PermissionReach>, Error> {
         Ok(Vec::new())
     }

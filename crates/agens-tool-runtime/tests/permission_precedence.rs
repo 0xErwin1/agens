@@ -1998,6 +1998,23 @@ fn registered_parent_natives(label: &str, agents: &[(&str, &str)]) -> Vec<String
 /// The natives the two production child dispatchers register, for a delegation
 /// no declaration narrows.
 fn registered_child_natives() -> Vec<String> {
+    let mut registered = registered_child_native_access()
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect::<Vec<_>>();
+    registered.dedup();
+
+    registered
+}
+
+/// The same natives, each paired with the access class the child dispatcher
+/// registering it chose. A child's coordination pair is constructed and
+/// registered by the child runtime rather than read out of the catalog, so this
+/// is the only place their class can be read back from.
+///
+/// Both dispatchers contribute, and a name they registered under two different
+/// classes appears twice here rather than being collapsed into one answer.
+fn registered_child_native_access() -> Vec<(String, ToolAccess)> {
     let temporary = agens_fixtures::session_directory("registered-child-natives");
     let project_root = temporary.join("project");
     fs::create_dir_all(&project_root).unwrap();
@@ -2022,23 +2039,41 @@ fn registered_child_natives() -> Vec<String> {
     )
     .expect("the dangerous child runtime must build");
 
-    let registered = sorted_native_names(&[child, dangerous]);
+    let registered = sorted_native_access(&[child, dangerous]);
     fs::remove_dir_all(temporary).unwrap();
 
     registered
 }
 
 fn sorted_native_names(dispatchers: &[Arc<Mutex<ToolDispatcher>>]) -> Vec<String> {
+    let mut registered = sorted_native_access(dispatchers)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect::<Vec<_>>();
+    registered.dedup();
+
+    registered
+}
+
+fn sorted_native_access(dispatchers: &[Arc<Mutex<ToolDispatcher>>]) -> Vec<(String, ToolAccess)> {
     let mut registered = dispatchers
         .iter()
         .flat_map(|dispatcher| {
+            let dispatcher = dispatcher.lock().expect("dispatcher must be available");
+
             dispatcher
-                .lock()
-                .expect("dispatcher must be available")
                 .registered_native_names()
+                .into_iter()
+                .map(|name| {
+                    let access = dispatcher
+                        .native_access(&name)
+                        .expect("a name the dispatcher reported must resolve");
+                    (name, access)
+                })
+                .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
-    registered.sort_unstable();
+    registered.sort_by(|left, right| left.0.cmp(&right.0));
     registered.dedup();
 
     registered
@@ -2127,21 +2162,85 @@ fn every_native_registered_beside_the_catalog_is_named_by_the_list_that_resolves
 ///
 /// These four have no catalog entry to be compared against: each declares its
 /// access at its own registration site, and until it is written down somewhere
-/// that declaration answers to nothing. Access decides what a call no rule
-/// matched falls back to, and read-class is what a delegated subagent may use
-/// without declaring anything — so registering `native::task` as `ReadOnly`
-/// would quietly fold every delegation into that automatic grant.
+/// that declaration answers to nothing.
+///
+/// Access decides one thing in the policy, and it decides it above every rule:
+/// the `ChatWrite` hard-safety predicate refuses a `Write`-access call outright
+/// whenever the session is in chat mode. A write tool registered as `ReadOnly`
+/// is therefore a tool chat mode will run. The dispatcher also re-checks it
+/// when redeeming an authorization, so a registration that changed class
+/// invalidates the handles taken under the old one.
+///
+/// It decides nothing else here, and two things it is easy to assume it decides
+/// it does not: the fallback for a call no rule matched is settled by the
+/// unmatched override, the session's bypass and the mode, none of which read
+/// access; and the automatic grant a delegated subagent runs under is a
+/// hard-coded list of six names in `child_catalog`, which excludes
+/// `native::webfetch` precisely because that tool is `ReadOnly` and the class
+/// is the wrong predicate for it.
 const ACCESS_OF_THE_NATIVES_REGISTERED_BESIDE_THE_CATALOG: [(&str, ToolAccess); 4] = [
     // Returns a skill's own installed files and changes nothing.
     ("native::skill", ToolAccess::ReadOnly),
-    // Launches a subagent holding a tool surface of its own, which is not
-    // something a call falls into for want of a rule naming it.
+    // Runs a whole turn on a surface of its own, whose calls write; a class
+    // saying otherwise would put every delegation inside chat mode.
     ("native::task", ToolAccess::Write),
     // Both act on a live execution — backgrounding it, cancelling it, queueing
     // a message onto it — rather than reading anything.
     ("native::task_control", ToolAccess::Write),
     ("native::task_message", ToolAccess::Write),
 ];
+
+/// [`ACCESS_OF_THE_NATIVES_REGISTERED_BESIDE_THE_CATALOG`] answers for every
+/// native outside the catalog, and for the child's own registration of the two
+/// it shares with the parent.
+///
+/// Without the first assertion the table is one-directional: a fifth native
+/// registered beside the catalog is forced into
+/// [`NATIVE_TOOLS_REGISTERED_OUTSIDE_THE_CATALOG`] by the test above, and its
+/// access class would then go unwritten and unasserted — the same gap in the
+/// same shape, one list along.
+///
+/// The second exists because the coordination pair is registered on two paths
+/// that share no constant: the parent's registration is what the probe
+/// dispatcher mirrors, while the runtime for a live delegation chooses the
+/// class at its own call site and was compared against nothing. A class the
+/// child dispatchers do not agree on shows up here as two answers for one name,
+/// and a pair no child registers as none.
+#[test]
+fn every_native_beside_the_catalog_has_its_access_written_down_and_held_by_the_child_too() {
+    let written = ACCESS_OF_THE_NATIVES_REGISTERED_BESIDE_THE_CATALOG
+        .iter()
+        .map(|(name, _)| *name)
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        written,
+        agens_tools::NATIVE_TOOLS_REGISTERED_OUTSIDE_THE_CATALOG,
+        "a native registered beside the catalog has to have its access class written down, not \
+         only its name"
+    );
+
+    let child = registered_child_native_access();
+    for tool in agens_tool_runtime::child_catalog::CHILD_COORDINATION_TOOLS {
+        let expected = ACCESS_OF_THE_NATIVES_REGISTERED_BESIDE_THE_CATALOG
+            .iter()
+            .find(|(name, _)| *name == tool)
+            .map(|(_, access)| *access)
+            .expect("a child coordination tool is registered beside the catalog");
+        let held = child
+            .iter()
+            .filter(|(name, _)| name == tool)
+            .map(|(_, access)| *access)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            held,
+            vec![expected],
+            "{tool} has to reach a delegated child under the one class written down for it, and \
+             under no other"
+        );
+    }
+}
 
 /// The probe dispatcher holds each native under the access class production
 /// registers it by, not merely under the same name.

@@ -1011,16 +1011,59 @@ mod tests {
         );
     }
 
+    /// A remote tool reaches the model as `{server}_{tool}` and a rule naming it
+    /// as `<server>::<tool>`. Neither is a native name, and neither can be
+    /// parsed into native facts: what a remote call's arguments mean is defined
+    /// by the server serving it, so no path is reported rather than a guessed
+    /// one. Both spellings are asserted so a future prefix-stripping shortcut
+    /// cannot start reading one of them as a native `read`.
     #[test]
     fn a_denied_call_with_an_unrecognized_tool_name_reports_no_facts() {
         let gate = permission_gate_with_no_grants();
-        let call = HeadlessToolCall {
-            id: "denied-unknown".into(),
-            name: "mcp::files::read".into(),
-            input: r#"{"path":"secret.txt"}"#.into(),
+
+        for name in ["files_read", "files::read"] {
+            let call = HeadlessToolCall {
+                id: "denied-unknown".into(),
+                name: name.into(),
+                input: r#"{"path":"secret.txt"}"#.into(),
+            };
+
+            assert_eq!(
+                gate.denial_facts(&call),
+                None,
+                "{name} names no native tool"
+            );
+        }
+    }
+
+    /// The same call has to report the same facts whichever of a tool's two
+    /// registered spellings named it.
+    ///
+    /// The model calls a native tool by its bare name, while agens calling one
+    /// on its own behalf spells it qualified — the TUI's task launch does. Both
+    /// are aliases of one dispatcher identity, so a denial that reported a path
+    /// for one and nothing for the other would make the facts depend on who
+    /// made the call rather than on what it touched.
+    #[test]
+    fn a_denied_native_call_reports_the_same_facts_under_either_of_its_spellings() {
+        let gate = permission_gate_with_no_grants();
+        let facts = |name: &str| {
+            gate.denial_facts(&HeadlessToolCall {
+                id: "denied-write".into(),
+                name: name.into(),
+                input: r#"{"path":"secret.txt","content":"x"}"#.into(),
+            })
         };
 
-        assert_eq!(gate.denial_facts(&call), None);
+        assert_eq!(facts("write"), facts("native::write"));
+        assert_eq!(
+            facts("write"),
+            Some(ToolResultFacts::Write {
+                path: FactPath::new("secret.txt"),
+                outcome: ToolOutcome::Denied,
+                written: None,
+            })
+        );
     }
 
     /// A malformed payload for a known native tool parses to `ToolInput::Other`,
