@@ -32,8 +32,8 @@ use agens_core::{
 use agens_permissions::{NativePermissionTarget, configured_permission_rules, permission_policy};
 use agens_tool_runtime::child_catalog::resolve_child_surface;
 use agens_tools::{
-    AgentCatalog, DispatchTool, EffectiveCapabilitySet, NativeToolCatalog, NativeTools,
-    ToolDispatcher, ToolExecutionContext, ToolOutput,
+    AgentCatalog, DispatchTool, EffectiveCapabilitySet, NativeToolCatalog, NativeTools, TaskTool,
+    ToolDispatchRequest, ToolDispatcher, ToolEvaluationOutcome, ToolExecutionContext, ToolOutput,
 };
 
 struct Case {
@@ -1841,11 +1841,12 @@ const TOOL_SURFACE: &[SurfaceEntry] = &[
         decided_on_its_target: false,
         decided_per_file: None,
         unbound: Some(
-            "a task call is named by a description, so no rule written against a path selects \
-             it, and what it returns is whatever the child reports. No rule reaches that text \
-             here — but the child read those files under these same configured rules, resolved \
-             into its own surface by `resolve_child_surface`, so a file this configuration \
-             denies was already withheld before the report was written.",
+            "a task call is named by the agent it resolves to, so `deny task(reviewer)` refuses \
+             every delegation to that agent while no rule written against a path selects one, \
+             and what it returns is whatever the child reports. No rule reaches that text here \
+             — but the child read those files under these same configured rules, resolved into \
+             its own surface by `resolve_child_surface`, so a file this configuration denies \
+             was already withheld before the report was written.",
         ),
         matched_as: None,
     },
@@ -1878,21 +1879,6 @@ const TOOL_SURFACE: &[SurfaceEntry] = &[
 /// compared against `NativeToolCatalog::metadata()` leaves four tools
 /// unclassified while reading as complete.
 fn registered_native_surface() -> Vec<String> {
-    struct InertTaskRunner;
-
-    impl agens_tools::TaskRunner for InertTaskRunner {
-        fn run(
-            &self,
-            request: agens_tools::TaskTurnRequest,
-            _: &agens_tools::TaskRunContext,
-        ) -> Result<agens_tools::TaskTurnResult, agens_tools::TaskRunnerError> {
-            Ok(agens_tools::TaskTurnResult {
-                output: request.description().to_owned(),
-                iterations: 1,
-            })
-        }
-    }
-
     let temporary = agens_fixtures::session_directory("registered-native-surface");
     let bootstrap = agens_fixtures::session_bootstrap(&temporary, &[]);
     let project_root = agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap);
@@ -2224,6 +2210,105 @@ fn the_rules_decide_every_file_a_grep_walks_before_its_own_filter_decides_what_r
     );
 
     fs::remove_dir_all(temporary).unwrap();
+}
+
+/// The rule an operator is told to write has to be the rule that binds.
+///
+/// A `task` call is named by the agent it resolves to: `TaskTool` parses the
+/// invocation, resolves the agent — the requested one, or the default when the
+/// call names none — and answers with that agent's own name. A rule written
+/// against the description the call carries therefore selects nothing, which is
+/// the spelling both documents used to recommend.
+#[test]
+fn a_task_rule_names_the_agent_a_call_resolves_to_and_not_its_description() {
+    let temporary = agens_fixtures::session_directory("task-permission-target");
+    let agents = temporary.join("agents");
+    fs::create_dir_all(&agents).unwrap();
+    fs::write(
+        agents.join("worker.md"),
+        "---\nname: worker\ndescription: worker agent\nmode: subagent\n---\nworker instructions\n",
+    )
+    .unwrap();
+
+    let discovery = AgentCatalog::discover(&[], &agents, &temporary.join("missing")).unwrap();
+    let task = TaskTool::from_catalogs_with_model_validator(
+        discovery.catalog().clone(),
+        agens_tools::SkillCatalog::default(),
+        "parent-model",
+        EveryModel,
+        InertTaskRunner,
+    );
+    let arguments = serde_json::json!({"description": "inspect the repository"});
+
+    assert_eq!(
+        task.permission_target(&arguments)
+            .expect("a task call must project to a permission target"),
+        "worker",
+        "the target is the agent the call resolves to"
+    );
+
+    let mut dispatcher = ToolDispatcher::new();
+    dispatcher
+        .register_native("native::task", ToolAccess::Write, task)
+        .expect("the probe dispatcher must accept the task tool");
+    let dispatcher = Arc::new(Mutex::new(dispatcher));
+
+    for (entry, denied) in [
+        ("deny task worker", true),
+        ("deny task inspect the repository", false),
+        ("deny task inspect*", false),
+    ] {
+        let policy = permission_policy(
+            &configured_entries(&[entry]),
+            "project",
+            PermissionMode::Edit,
+            &dispatcher,
+            None,
+        )
+        .expect("the configured policy must resolve");
+        let outcome = dispatcher
+            .lock()
+            .expect("dispatcher must be available")
+            .evaluate(
+                &policy,
+                &[],
+                &PermissionSession::new(),
+                ToolDispatchRequest::new("project", "native::task", arguments.clone()),
+            )
+            .expect("a task call must be decidable");
+
+        assert_eq!(
+            matches!(outcome, ToolEvaluationOutcome::Denied),
+            denied,
+            "`{entry}` must {} this call",
+            if denied { "deny" } else { "not select" }
+        );
+    }
+
+    fs::remove_dir_all(temporary).unwrap();
+}
+
+struct EveryModel;
+
+impl agens_tools::AgentModelValidator for EveryModel {
+    fn validate_model(&self, _: &str) -> Result<(), agens_tools::AgentModelValidationError> {
+        Ok(())
+    }
+}
+
+struct InertTaskRunner;
+
+impl agens_tools::TaskRunner for InertTaskRunner {
+    fn run(
+        &self,
+        request: agens_tools::TaskTurnRequest,
+        _: &agens_tools::TaskRunContext,
+    ) -> Result<agens_tools::TaskTurnResult, agens_tools::TaskRunnerError> {
+        Ok(agens_tools::TaskTurnResult {
+            output: request.description().to_owned(),
+            iterations: 1,
+        })
+    }
 }
 
 /// A dispatcher holding exactly the natives a delegated child inherits, so

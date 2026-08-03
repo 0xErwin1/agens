@@ -140,7 +140,7 @@ Three tools that can return the contents of a file do neither, and each is an ex
 
 - **`bash`** — a rule written for it is matched against the command line rather than against any path, and the command chooses what it prints. The exception is total.
 - **`skill`** — a skill call is named by a skill name, so no path rule selects one. The exception is bounded by what the tool can open: a skill's files are read relative to that skill's own directory, under a single plain filename with no traversal, refusing symbolic links and files carrying more than one link. It can return that skill's own installed assets and nothing else, and a subagent never holds it at all.
-- **`task`** — a task call is named by a description, and what it returns is whatever the subagent reports. No rule here reaches that text, but the subagent read those files under these same rules, so a file this configuration denies was already withheld before the report was written.
+- **`task`** — a task call is named by the subagent it resolves to, so `deny task(reviewer)` refuses every delegation to that agent and no path rule selects one. What the call returns is whatever the subagent reports, which no rule here reaches — but the subagent read those files under these same rules, so a file this configuration denies was already withheld before the report was written.
 
 That is the test to apply to any tool added later: if it can return the contents of a file and does neither of the two, a path deny does not bind it, and it belongs on this list with the reason written down.
 
@@ -157,7 +157,7 @@ That is the test to apply to any tool added later: if it can return the contents
 | `webfetch` | no — `http`/`https` responses | not as a path; its target is the URL |
 | `bash` | whatever it chooses to print | **it does not** — the target is the command line |
 | `skill` (primary only) | yes — a skill's own files | **it does not** — the target is the skill name; bounded as above |
-| `task` (primary only) | what the subagent reports | **not here** — the subagent read under these same rules |
+| `task` (primary only) | what the subagent reports | **not here** — its target is the subagent's name; the subagent read under these same rules |
 | `task_control`, `task_message` | no — execution state only | not as a path; they never address a file |
 
 The remaining limit is over names rather than contents: `glob`'s pattern denotes a set while a rule is matched as text, so `deny glob(**/.env)` does not stop `glob(**)` from listing that name — it discloses a name, which `list(**)` already discloses, not what the file holds.

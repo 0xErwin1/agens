@@ -114,10 +114,12 @@ effort = "high"
 #     to that skill's own directory, under a single plain filename with no
 #     traversal, refusing symbolic links and files carrying more than one link.
 #     It returns that skill's own installed assets and nothing else.
-#   * `task` — named by a description, and what it returns is whatever the
-#     subagent reports. No rule here reaches that text, but the subagent read
-#     those files under these same rules, so a file denied below was already
-#     withheld before the report was written.
+#   * `task` — named by the subagent it resolves to, so `deny task(reviewer)`
+#     refuses every delegation to that agent and no rule written against a path
+#     selects one. What it returns is whatever the subagent reports, which no
+#     rule here reaches — but the subagent read those files under these same
+#     rules, so a file denied below was already withheld before the report was
+#     written.
 #
 # Apply the same test to any tool added later — if it can return the contents of
 # a file and does neither of the two, no deny here binds it, and it belongs on
