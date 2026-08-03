@@ -107,6 +107,7 @@ pub fn discover_agent_catalog(
         description: "Default interactive agent".into(),
         mode: agens_core::AgentMode::Primary,
         model: None,
+        model_source: None,
         reasoning_effort: None,
         system_prompt,
         permission_rules: Vec::new(),
@@ -117,6 +118,7 @@ pub fn discover_agent_catalog(
         description: "Explore the codebase without modifying files".into(),
         mode: agens_core::AgentMode::Subagent,
         model: None,
+        model_source: None,
         reasoning_effort: None,
         system_prompt: "You are the read-only exploration subagent. Inspect the codebase without modifying files and return concise, grounded findings."
             .into(),
@@ -128,6 +130,7 @@ pub fn discover_agent_catalog(
         description: "Handle a general delegated coding task".into(),
         mode: agens_core::AgentMode::Subagent,
         model: None,
+        model_source: None,
         reasoning_effort: None,
         system_prompt: "You are the general-purpose subagent. Complete the delegated task with the available native tools and return a concise result."
             .into(),

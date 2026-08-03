@@ -448,6 +448,7 @@ pub fn rotation_agent(name: &str, model: Option<&str>, allow_read: bool) -> Agen
         description: format!("{name} agent"),
         mode: AgentMode::Primary,
         model: model.map(str::to_owned),
+        model_source: None,
         reasoning_effort: None,
         system_prompt: format!("You are {name}."),
         permission_rules: allow_read
