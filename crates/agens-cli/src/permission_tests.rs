@@ -636,6 +636,89 @@ mod tests {
         }
     }
 
+    /// A call the permission layer cannot resolve at all is neither a
+    /// malformed call nor a denied one, and the model has to be able to tell
+    /// all three apart: the first invites rewritten arguments, the second
+    /// invites a different target, and this one invites neither because
+    /// nothing the model can say changes it.
+    #[test]
+    fn an_unresolvable_permission_reach_reads_as_neither_a_malformed_call_nor_a_denial() {
+        let refusal_of = |name: &str, input: &str| {
+            let policy = PermissionPolicy::new(
+                PermissionMode::Edit,
+                vec![PermissionRule::global(
+                    PermissionDecision::Ask,
+                    PermissionPattern::glob("native::*").expect("native glob should be valid"),
+                    PermissionPattern::Any,
+                )],
+            );
+            let outcome = run_production_batch_with_policy(
+                ProductionBatchInput::new(
+                    "unresolvable-reach",
+                    Vec::new(),
+                    vec![MessagePart::ToolCall {
+                        id: "call".into(),
+                        name: name.into(),
+                        input: input.into(),
+                    }],
+                )
+                .with_policy(policy)
+                .with_bypass(),
+            );
+            assert!(outcome.result.is_ok(), "{name} must not fail the turn");
+            assert!(outcome.executions.is_empty(), "{name} must not execute");
+
+            let content = outcome
+                .progress
+                .iter()
+                .find_map(|event| match event {
+                    TurnEvent::ToolResult(MessagePart::ToolResult {
+                        is_error: true,
+                        content,
+                        ..
+                    }) => Some(content.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{name} should report a failing tool result"));
+            let facts = outcome.progress.iter().find_map(|event| match event {
+                TurnEvent::ToolResultFacts { facts, .. } => Some(facts.clone()),
+                _ => None,
+            });
+
+            (content, facts)
+        };
+
+        let (unresolvable, _) = refusal_of(
+            "native::grep",
+            r#"{"pattern":"TODO","_inject_unresolvable_reach":true}"#,
+        );
+        let (malformed, _) = refusal_of("native::glob", r#"{}"#);
+        let (denied, _) = refusal_of("native::unknown", r#"{"path":"src"}"#);
+
+        assert_eq!(
+            unresolvable,
+            "tool call refused: this tool is misconfigured in this session and no permission \
+             decision could be made for it; the arguments are not at fault, and repeating the \
+             call will not change this"
+        );
+        assert_eq!(malformed, "invalid tool arguments");
+        assert_eq!(denied, "permission denied");
+
+        let (_, facts) = refusal_of(
+            "native::write",
+            r#"{"path":"notes.md","_inject_unresolvable_reach":true}"#,
+        );
+        assert_eq!(
+            facts,
+            Some(ToolResultFacts::Write {
+                path: FactPath::new("notes.md"),
+                outcome: ToolOutcome::Denied,
+                written: None,
+            }),
+            "a refused call must still report what it would have touched"
+        );
+    }
+
     #[test]
     fn production_batch_prompts_each_distinct_ask_individually() {
         let outcome = run_production_batch(

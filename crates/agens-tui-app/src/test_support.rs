@@ -46,9 +46,9 @@ pub use agens_fixtures::{
 };
 
 /// A native tool that records every path it acts on into a shared log and can
-/// be told, per call, to inject a permission-evaluator failure or a
-/// tool-execution failure. Backs the production-turn permission-batch
-/// harness below.
+/// be told, per call, to inject a permission-evaluator failure, an
+/// unresolvable permission reach, or a tool-execution failure. Backs the
+/// production-turn permission-batch harness below.
 pub struct BatchTool {
     pub name: String,
     pub calls: Arc<Mutex<Vec<String>>>,
@@ -73,6 +73,26 @@ impl DispatchTool for BatchTool {
         NativePermissionTarget::parse(&self.name, arguments)
             .map(NativePermissionTarget::into_value)
             .map_err(|error| agens_core::Error::Tool(error.to_string()))
+    }
+
+    /// Stands in for a tool that knows its arguments are well formed and
+    /// still cannot say what the call reaches, the shape a skill whose
+    /// catalog was discovered under another project root arrives in.
+    fn permission_reach(
+        &self,
+        arguments: &serde_json::Value,
+    ) -> Result<Vec<agens_core::PermissionReach>, agens_core::Error> {
+        if arguments
+            .get("_inject_unresolvable_reach")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        {
+            return Err(agens_core::Error::Permission(
+                "injected unresolvable permission reach".into(),
+            ));
+        }
+
+        Ok(Vec::new())
     }
 
     fn execute(

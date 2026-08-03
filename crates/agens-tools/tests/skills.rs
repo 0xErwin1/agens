@@ -815,11 +815,13 @@ fn a_project_skill_outside_the_root_it_is_paired_with_refuses_the_call() {
             ".agens/skills/probe/SKILL.md".into()
         )],
     );
+    let refusal = SkillResourceTool::new(catalog, temporary.path.join("elsewhere"))
+        .permission_reach(&arguments)
+        .expect_err("a project skill outside the root it is paired with must refuse the call");
     assert!(
-        SkillResourceTool::new(catalog, temporary.path.join("elsewhere"))
-            .permission_reach(&arguments)
-            .is_err(),
-        "a project skill outside the root it is paired with must refuse the call"
+        matches!(refusal, agens_core::Error::Permission(_)),
+        "the refusal must reach the model as an unresolvable permission rather than as an \
+         argument error, got: {refusal:?}"
     );
 }
 

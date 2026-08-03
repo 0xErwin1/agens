@@ -1447,6 +1447,13 @@ pub enum HeadlessTurnPortError {
     ProviderProtocol,
     Permission,
     Tool,
+    /// A call naming a registered tool and carrying well-formed arguments
+    /// that the permission layer still could not resolve into a decision,
+    /// because the tool cannot say what the call reaches. Distinct from
+    /// [`Self::Tool`], which is the malformed-arguments channel, and from
+    /// [`Self::Permission`], which is an infrastructure failure that ends
+    /// the turn: this one is refused per call and reported to the model.
+    PermissionUnresolvable,
     TaskTerminal(HeadlessTaskTerminal),
 }
 
@@ -1773,9 +1780,13 @@ enum AskUnreachable {
 /// What a tool call's preflight permission step decided, ahead of the
 /// second pass that actually dispatches or fails it. A call that resolved
 /// `Ask` inside an isolated child turn is tracked separately from a plain
-/// `Deny`, so the two can be rendered with different wording.
+/// `Deny`, so the two can be rendered with different wording. A call the
+/// permission layer could not resolve at all is tracked separately again,
+/// because reporting it as either malformed arguments or a policy denial
+/// tells the model to change something that is not what went wrong.
 enum PreflightAuthorization {
     InvalidArguments,
+    UnresolvablePermission,
     Decided(PermissionDecision),
     UnreachablePromptDenial,
 }
@@ -1860,6 +1871,10 @@ async fn run_headless_turn_with_iteration_limit(
                     preflight.push((call, PreflightAuthorization::InvalidArguments));
                     continue;
                 }
+                Err(HeadlessTurnPortError::PermissionUnresolvable) => {
+                    preflight.push((call, PreflightAuthorization::UnresolvablePermission));
+                    continue;
+                }
                 Err(error) => {
                     return Err(finish_port_error(
                         &mut coordinator,
@@ -1898,6 +1913,17 @@ async fn run_headless_turn_with_iteration_limit(
             let output = match authorization {
                 PreflightAuthorization::InvalidArguments => {
                     HeadlessToolOutput::failure("invalid tool arguments")
+                }
+                PreflightAuthorization::UnresolvablePermission => {
+                    let output = HeadlessToolOutput::failure(
+                        "tool call refused: this tool is misconfigured in this session and no \
+                         permission decision could be made for it; the arguments are not at \
+                         fault, and repeating the call will not change this",
+                    );
+                    match permission_gate.denial_facts(&call) {
+                        Some(facts) => output.with_facts(facts),
+                        None => output,
+                    }
                 }
                 PreflightAuthorization::Decided(PermissionDecision::Allow) => dispatcher
                     .dispatch(call.clone(), cancellation)

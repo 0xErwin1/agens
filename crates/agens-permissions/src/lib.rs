@@ -297,7 +297,7 @@ impl HeadlessPermissionGate for ProductionPermissionGate {
                                 self.dangerous_override
                                     && is_dangerous_child_native_tool(&call.name),
                             )
-                            .map_err(|_| HeadlessTurnPortError::Tool)
+                            .map_err(evaluation_failure)
                     })
             })
             .and_then(|outcome| match outcome {
@@ -362,6 +362,21 @@ impl HeadlessPermissionGate for ProductionPermissionGate {
             }),
             _ => None,
         }
+    }
+}
+
+/// Classifies why the dispatcher could not evaluate a call.
+///
+/// A tool reports a malformed payload as [`agens_core::Error::Tool`], which
+/// keeps travelling the argument-error channel the model already reads as
+/// "you called it wrong". A tool that cannot state what a well-formed call
+/// reaches reports [`agens_core::Error::Permission`] instead: nothing the
+/// model writes fixes that, so it must not arrive wearing the wording that
+/// asks it to try.
+fn evaluation_failure(error: agens_core::Error) -> HeadlessTurnPortError {
+    match error {
+        agens_core::Error::Permission(_) => HeadlessTurnPortError::PermissionUnresolvable,
+        _ => HeadlessTurnPortError::Tool,
     }
 }
 

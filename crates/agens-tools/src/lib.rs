@@ -644,6 +644,11 @@ impl SkillResourceTool {
     /// answered: reporting no reach would leave every rule written against a
     /// project skill selecting nothing, while the call still opened that
     /// skill's files.
+    ///
+    /// The refusal is an [`Error::Permission`] rather than an
+    /// [`Error::Tool`]: the arguments are well formed and the caller cannot
+    /// repair the disagreement by rewriting them, so it must not arrive as
+    /// the argument error that asks it to.
     fn reached_file(&self, arguments: &Value) -> Result<Option<PathBuf>, Error> {
         let Some(skill) = arguments
             .get("skill")
@@ -655,7 +660,7 @@ impl SkillResourceTool {
         let directory = match skill.directory().strip_prefix(&self.project_root) {
             Ok(directory) => directory,
             Err(_) if self.catalog.is_project_skill(skill) => {
-                return Err(Error::Tool(
+                return Err(Error::Permission(
                     "skill catalog was discovered under a different project root".into(),
                 ));
             }
