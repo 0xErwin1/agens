@@ -56,7 +56,7 @@ impl PermissionPrompter for TuiPermissionPrompter {
     ) -> Result<PermissionPromptAnswer, HeadlessTurnPortError> {
         {
             match self.0.wait_for_reply(
-                agens_core::bare_tool_name(&context.tool_identity).to_owned(),
+                agens_core::bare_tool_name(&context.tool_identity).into_owned(),
                 render_permission_prompt(context),
                 cancellation,
             ) {
@@ -86,8 +86,10 @@ pub fn parse_permission_prompt_answer(value: &str) -> Option<PermissionPromptAns
 ///
 /// The tool is named the way a rule names it rather than by the dispatcher's
 /// own identity for it, because the person answering has to recognize the tool
-/// and may want to write a rule about it afterwards. The identity keeps
-/// deciding the grant; it is only unfit to be read.
+/// and may want to write a rule about it afterwards. That holds for a remote
+/// tool as much as for a native one: both identities are length-headed and
+/// neither is a spelling anyone writes down. The identity keeps deciding the
+/// grant; it is only unfit to be read.
 pub fn render_permission_prompt(context: &PermissionPromptContext) -> String {
     format!(
         "Permission required for {} ({:?})\nTarget: {}\n[a]llow once, allow [always], [d]eny once, deny [always], or [c]ancel: ",
@@ -433,6 +435,86 @@ mod tests {
             prompt.contains("bash") && !prompt.contains("native:4:"),
             "the prompt has to name the tool the way a rule names it, not by the dispatcher's \
              own encoding: {prompt}"
+        );
+    }
+
+    /// A remote tool is named in the prompt the way a rule names it too.
+    ///
+    /// The dispatcher's identity for a remote tool is length-headed
+    /// (`mcp:5:probe:14:read_text_file`) and carries no spelling anyone writes
+    /// down. The person answering has to recognize the tool and may want to
+    /// write a rule about it afterwards, so what the prompt shows is
+    /// `<server>::<tool>` — the one of the two names a remote tool answers to
+    /// that says on its own that it is remote.
+    #[test]
+    fn a_prompt_for_a_remote_call_names_the_tool_the_way_a_rule_names_it() {
+        struct RemoteLikeTool;
+
+        impl DispatchTool for RemoteLikeTool {
+            fn permission_target(
+                &self,
+                _: &serde_json::Value,
+            ) -> Result<String, agens_core::Error> {
+                Ok("probe::read_text_file".to_owned())
+            }
+
+            fn execute(
+                &mut self,
+                _: &ToolExecutionContext,
+                _: serde_json::Value,
+            ) -> Result<ToolOutput, agens_core::Error> {
+                Ok(ToolOutput::success("unused"))
+            }
+        }
+
+        let mut dispatcher = ToolDispatcher::new();
+        dispatcher
+            .register_mcp(
+                &agens_tools::RemoteToolMetadata {
+                    qualified_name: "probe::read_text_file".into(),
+                    server_name: "probe".into(),
+                    tool_name: "read_text_file".into(),
+                    description: None,
+                    input_schema: serde_json::json!({"type": "object"}),
+                    access: agens_tools::RemoteToolAccess::ReadOnly,
+                },
+                RemoteLikeTool,
+            )
+            .expect("the probe dispatcher must accept the remote tool");
+
+        let policy = PermissionPolicy::new(
+            PermissionMode::Edit,
+            vec![PermissionRule::global(
+                PermissionDecision::Ask,
+                PermissionPattern::Exact("probe::read_text_file".into()),
+                PermissionPattern::Any,
+            )],
+        );
+        let outcome = dispatcher
+            .evaluate(
+                &policy,
+                &[],
+                &PermissionSession::new(),
+                agens_tools::ToolDispatchRequest::new(
+                    "project",
+                    "probe_read_text_file",
+                    serde_json::json!({"path": "notes.md"}),
+                ),
+            )
+            .expect("the call must be decidable");
+        let agens_tools::ToolEvaluationOutcome::PromptRequired(context) = outcome else {
+            panic!("a rule that asks must produce a prompt: {outcome:?}");
+        };
+
+        let prompt = render_permission_prompt(&context);
+
+        assert!(
+            prompt.contains("Permission required for probe::read_text_file"),
+            "the prompt has to name the remote tool the way a rule names it: {prompt}"
+        );
+        assert!(
+            !prompt.contains("mcp:5:"),
+            "the dispatcher's own encoding must not reach the person answering: {prompt}"
         );
     }
 }

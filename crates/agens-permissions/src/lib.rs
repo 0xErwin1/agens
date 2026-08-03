@@ -19,10 +19,20 @@ pub const DANGEROUS_CHILD_NATIVE_TOOLS: [&str; 10] = [
     "native::webfetch",
 ];
 
+/// Whether `name` is one of the natives a dangerous-mode override may widen.
+///
+/// The name is reduced through [`agens_core::bare_tool_name`] rather than
+/// compared against a list of spellings, so this cannot answer differently for
+/// the same tool depending on which of its names reached it — the bare one the
+/// model is advertised, the qualified one a rule is written in, or the
+/// dispatcher's own encoding of either.
 pub fn is_dangerous_child_native_tool(name: &str) -> bool {
-    DANGEROUS_CHILD_NATIVE_TOOLS.iter().any(|registered| {
-        name == *registered || name == registered.strip_prefix("native::").unwrap_or_default()
-    })
+    let bare = agens_core::bare_tool_name(name);
+
+    DANGEROUS_CHILD_NATIVE_TOOLS
+        .iter()
+        .filter_map(|registered| registered.strip_prefix("native::"))
+        .any(|registered| bare == registered)
 }
 
 use std::collections::BTreeMap;
@@ -338,17 +348,18 @@ impl HeadlessPermissionGate for ProductionPermissionGate {
     /// which is already the vocabulary `ToolInput::parse` expects. A call agens
     /// makes on its own behalf carries the qualified one instead — the TUI's
     /// own task launch spells it `native::task` — and both are aliases of the
-    /// same tool everywhere else in the dispatcher. The prefix is stripped so
-    /// this function cannot answer differently for the same call depending on
-    /// which spelling reached it.
+    /// same tool everywhere else in the dispatcher. The name is reduced through
+    /// [`agens_core::bare_tool_name`] so this cannot answer differently for the
+    /// same call depending on which spelling reached it, the dispatcher's own
+    /// encoding included.
     ///
-    /// There is no `mcp::` spelling to strip alongside it: a remote tool is
-    /// advertised as `{server}_{tool}` and named in a rule as `<server>::<tool>`
-    /// (`mcp_model_tool_name`, `remote_tool_metadata`). Neither is a native
-    /// name, so a remote call falls through to no facts, which is the honest
-    /// answer — a remote tool's arguments belong to its server.
+    /// A remote call reduces to `<server>::<tool>`, which is no native name, so
+    /// it falls through to no facts. That is the honest answer — a remote
+    /// tool's arguments belong to the server that serves it.
     fn denial_facts(&self, call: &HeadlessToolCall) -> Option<ToolResultFacts> {
-        match call.name.strip_prefix("native::").unwrap_or(&call.name) {
+        let called = agens_core::bare_tool_name(&call.name);
+
+        match called.as_ref() {
             name @ "write" => Some(ToolResultFacts::Write {
                 path: denied_input_path(ToolInput::parse(name, &call.input)),
                 outcome: ToolOutcome::Denied,
@@ -724,8 +735,10 @@ fn names_the_native_surface(qualified: &str) -> bool {
 /// configuration declares. A tool misspelt against a server this session DOES
 /// hold has a live surface to be checked against and fails there.
 fn names_a_tool_this_session_does_not_hold(dispatcher: &ToolDispatcher, configured: &str) -> bool {
-    names_the_native_surface(configured)
-        || names_a_tool_of_an_absent_mcp_server(dispatcher, configured)
+    let absent_native =
+        names_the_native_surface(configured) && dispatcher.canonical_identity(configured).is_none();
+
+    absent_native || names_a_tool_of_an_absent_mcp_server(dispatcher, configured)
 }
 
 /// `native` is excluded from the server side, exactly rather than case-folded:
@@ -1027,6 +1040,84 @@ mod tests {
         assert!(
             !matches!(decision("native::write"), ToolEvaluationOutcome::Denied),
             "a configured deny naming edit must not deny a different tool"
+        );
+    }
+
+    /// Every reader of a tool name in this crate answers the same for every
+    /// spelling of the same tool.
+    ///
+    /// Two of them decide something a person then relies on: whether a
+    /// dangerous-mode override may widen this call, and what a denied call is
+    /// reported to have touched. A dispatcher identity is a name either could
+    /// be handed — it is what a `PermissionRequest` and a prompt context carry
+    /// — and comparing it against a written spelling answers `false` for a tool
+    /// that is plainly on the list.
+    #[test]
+    fn a_tool_name_decides_the_same_way_in_every_spelling_it_answers_to() {
+        for spelling in ["bash", "native::bash", "native:4:bash"] {
+            assert!(
+                super::is_dangerous_child_native_tool(spelling),
+                "`{spelling}` names bash and must be recognized as one of the tools a \
+                 dangerous-mode override widens"
+            );
+        }
+        assert!(
+            !super::is_dangerous_child_native_tool("mcp:5:probe:14:read_text_file"),
+            "a remote tool is on no native list, whichever name it arrives under"
+        );
+
+        let dispatcher: SharedToolDispatcher = Arc::new(Mutex::new(ToolDispatcher::new()));
+        let gate = ProductionPermissionGate::new(
+            PermissionPolicy::new(PermissionMode::Edit, Vec::new()),
+            Arc::new(Mutex::new(Vec::new())),
+            PermissionSession::new(),
+            "project".into(),
+            dispatcher,
+            Arc::new(Mutex::new(BTreeMap::new())),
+            Arc::new(Mutex::new(BTreeMap::new())),
+        );
+
+        for spelling in ["write", "native::write", "native:5:write"] {
+            let facts = gate.denial_facts(&HeadlessToolCall {
+                id: "current".into(),
+                name: spelling.into(),
+                input: r#"{"path":"notes.md"}"#.into(),
+            });
+
+            assert!(
+                matches!(
+                    facts,
+                    Some(agens_core::ToolResultFacts::Write { ref path, .. })
+                        if path.relative() == Some("notes.md")
+                ),
+                "a denied write has to report the path it targeted whichever name it arrived \
+                 under, and `{spelling}` reported {facts:?}"
+            );
+        }
+    }
+
+    /// The two surfaces a rule may legitimately name and this session not hold
+    /// are asked the same question, so neither branch answers for a tool that
+    /// is right here.
+    ///
+    /// The caller reaches this only after the dispatcher failed to resolve the
+    /// name, so a held tool never gets here today. A branch that would answer
+    /// `true` for one is still wrong: it makes the function's answer depend on
+    /// a check outside it, and the next caller inherits that.
+    #[test]
+    fn a_tool_this_session_holds_is_not_reported_as_one_it_lacks() {
+        let mut dispatcher = ToolDispatcher::new();
+        dispatcher
+            .register_native("native::write", ToolAccess::Write, StubBashTool)
+            .expect("native write should register");
+
+        assert!(
+            !super::names_a_tool_this_session_does_not_hold(&dispatcher, "native::write"),
+            "a native this dispatcher registered is held, not absent"
+        );
+        assert!(
+            super::names_a_tool_this_session_does_not_hold(&dispatcher, "native::task"),
+            "a native on the shared surface that this dispatcher never registered is absent"
         );
     }
 

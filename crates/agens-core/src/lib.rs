@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     fmt,
     future::Future,
     path::{Component, Path},
@@ -2266,7 +2267,7 @@ pub enum PermissionTargetKind {
 /// does. The keywords carry no `/`, so classifying them as paths leaves
 /// `git_read(diff)` selecting exactly the diffs it already selected.
 pub fn permission_target_kind_for_tool(tool: &str) -> PermissionTargetKind {
-    match bare_tool_name(tool) {
+    match bare_tool_name(tool).as_ref() {
         "bash" => PermissionTargetKind::FreeFormText,
         _ => PermissionTargetKind::Path,
     }
@@ -2588,14 +2589,24 @@ impl PermissionRequest {
 
 /// Reduces any spelling of a tool to the name a rule is written against:
 /// `bash`, `native::bash`, and the dispatcher's own identity for it,
-/// `native:4:bash`.
+/// `native:4:bash`, all reduce to `bash`.
 ///
 /// Anything reading a value that reached it from a dispatcher has to come
 /// through here rather than compare against a qualified name directly. The
 /// identity is what a `PermissionRequest` and a `PermissionPromptContext`
 /// carry, and it equals no spelling anyone writes down, so a guard testing it
 /// against `"native::bash"` silently never fires.
-pub fn bare_tool_name(tool: &str) -> &str {
+///
+/// A remote tool answers to no barer name than `<server>::<tool>`, so that is
+/// what its identity — `mcp:5:probe:14:read_text_file` — reduces to. It is the
+/// one of the two names a rule may write it under that says on its own that
+/// the tool is remote, and it can never collide with a native: no native name
+/// contains `::` once qualification is stripped.
+pub fn bare_tool_name(tool: &str) -> Cow<'_, str> {
+    if let Some((server, name)) = mcp_identity_parts(tool) {
+        return Cow::Owned(format!("{server}::{name}"));
+    }
+
     let qualified = tool
         .strip_prefix("native:")
         .and_then(|rest| rest.split_once(':'))
@@ -2604,7 +2615,33 @@ pub fn bare_tool_name(tool: &str) -> &str {
         })
         .map_or(tool, |(_, name)| name);
 
-    qualified.strip_prefix("native::").unwrap_or(qualified)
+    Cow::Borrowed(qualified.strip_prefix("native::").unwrap_or(qualified))
+}
+
+/// Splits an MCP dispatcher identity back into the server and tool it was built
+/// from.
+///
+/// The identity headers each field with its length precisely because neither a
+/// server name nor a tool name is guaranteed to be free of `:`, so the fields
+/// are cut by those lengths rather than by splitting on the separator. Anything
+/// that does not consume the whole value is not an identity at all.
+fn mcp_identity_parts(tool: &str) -> Option<(&str, &str)> {
+    let (server, rest) = length_headed_field(tool.strip_prefix("mcp:")?)?;
+    let (name, rest) = length_headed_field(rest)?;
+
+    rest.is_empty().then_some((server, name))
+}
+
+fn length_headed_field(value: &str) -> Option<(&str, &str)> {
+    let (length, rest) = value.split_once(':')?;
+    let length = length
+        .bytes()
+        .all(|byte| byte.is_ascii_digit())
+        .then(|| length.parse::<usize>().ok())
+        .flatten()?;
+    let (field, rest) = rest.split_at_checked(length)?;
+
+    Some((field, rest.strip_prefix(':').unwrap_or(rest)))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
