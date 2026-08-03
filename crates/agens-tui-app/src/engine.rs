@@ -328,7 +328,14 @@ pub fn run_production_tui_with_profile_store(
                         )
                         .with_lifecycle_bridge(lifecycle_bridge.clone())
                         .with_dangerous_mode(request.dangerous_mode)
-                        .with_bypass(request.dangerously_allow_all),
+                        .with_bypass(request.dangerously_allow_all)
+                        .with_permission_prompter({
+                            let bridge = prompt_bridge.clone();
+                            Arc::new(move || {
+                                Box::new(TuiPermissionPrompter(bridge.clone()))
+                                    as Box<dyn agens_permissions::PermissionPrompter>
+                            })
+                        }),
                         task_parent_request_config.clone(),
                         Some(task_diagnostic_reference.clone()),
                         Box::new(TuiAskUserPort(submit_ask_user_bridge.clone())),

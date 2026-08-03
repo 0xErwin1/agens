@@ -40,6 +40,10 @@ type ProductionTaskProbe = Arc<
     >,
 >;
 
+/// Builds one delegated execution's prompter onto the parent's surface.
+pub type PrompterFactory =
+    Arc<dyn Fn() -> Box<dyn agens_permissions::PermissionPrompter> + Send + Sync>;
+
 #[cfg(any(test, feature = "probe"))]
 struct TestTaskFailure {
     error: ChildRunError,
@@ -335,6 +339,14 @@ pub struct ProductionTaskRunner {
     /// where no parent runtime handed one over, which is every test that
     /// exercises the runner without an MCP surface.
     mcp_registry: Option<Arc<Mutex<agens_tools::McpRegistry>>>,
+    /// Makes a prompter onto the surface the parent is already using, one per
+    /// delegated execution.
+    ///
+    /// A factory rather than a shared prompter because prompting is a surface:
+    /// each execution owns its own, exactly as the parent turn does, and they
+    /// reach the same person through the same bridge without contending for a
+    /// lock while one of them is parked on an answer.
+    permission_prompter: Option<PrompterFactory>,
     #[cfg(any(test, feature = "probe"))]
     probe: Option<ProductionTaskProbe>,
     #[cfg(any(test, feature = "probe"))]
@@ -353,6 +365,7 @@ impl ProductionTaskRunner {
             lifecycle_bridge: None,
             task_registry: None,
             mcp_registry: None,
+            permission_prompter: None,
             #[cfg(any(test, feature = "probe"))]
             probe: None,
             #[cfg(any(test, feature = "probe"))]
@@ -370,6 +383,18 @@ impl ProductionTaskRunner {
 
     pub fn with_dangerous_mode(mut self, dangerous_mode: bool) -> Self {
         self.dangerous_mode = dangerous_mode;
+        self
+    }
+
+    /// Gives delegated executions a way to reach the person at the surface.
+    ///
+    /// Without one a child's `Ask` is answered `Deny` by nobody, which is the
+    /// only thing a headless delegation can honestly do; with one it is
+    /// answered by the same person, on the same prompt, that the parent's own
+    /// calls go to.
+    #[must_use]
+    pub fn with_permission_prompter(mut self, prompter: PrompterFactory) -> Self {
+        self.permission_prompter = Some(prompter);
         self
     }
 
@@ -399,6 +424,7 @@ impl ProductionTaskRunner {
             lifecycle_bridge: None,
             task_registry: None,
             mcp_registry: None,
+            permission_prompter: None,
             probe: Some(probe),
             progress_probe: None,
             failure_probe: None,
@@ -420,6 +446,7 @@ impl ProductionTaskRunner {
             lifecycle_bridge: None,
             task_registry: None,
             mcp_registry: None,
+            permission_prompter: None,
             probe: Some(probe),
             progress_probe: Some(progress),
             failure_probe: None,
@@ -441,6 +468,7 @@ impl ProductionTaskRunner {
             lifecycle_bridge: None,
             task_registry: None,
             mcp_registry: None,
+            permission_prompter: None,
             probe: None,
             progress_probe: None,
             failure_probe: Some(TestTaskFailure {
@@ -568,6 +596,7 @@ impl TaskRunner for ProductionTaskRunner {
                         task_registry: context.execution_registry(),
                         execution_id: context.execution().expect("registered task execution").id(),
                         mcp_registry: self.mcp_registry.clone(),
+                        permission_prompter: self.permission_prompter.clone(),
                     },
                 )
             });
@@ -584,6 +613,7 @@ impl TaskRunner for ProductionTaskRunner {
                 task_registry: context.execution_registry(),
                 execution_id: context.execution().expect("registered task execution").id(),
                 mcp_registry: self.mcp_registry.clone(),
+                permission_prompter: self.permission_prompter.clone(),
             },
         );
         if let Err(error) = &result {
