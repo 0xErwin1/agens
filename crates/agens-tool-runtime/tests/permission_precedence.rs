@@ -2466,59 +2466,119 @@ fn no_path_rule_reaches_an_mcp_tool_and_naming_the_tool_refuses_every_call() {
     }
 }
 
-/// `deny <server>::<tool>` is the only rule that binds a remote tool, and it is
-/// resolved against whatever the dispatcher holds when the session starts. A
-/// server that failed to start contributes no tools, so the name stops
-/// resolving — and refusing to start over it would blame the operator's
-/// configuration for a server being unreachable, on the very rule the
-/// documentation tells them to write.
-///
-/// A name of that shape is therefore retained as written when this session
-/// holds no tool from that server at all, and it binds for real the moment the
-/// server comes back: the dispatcher's own alias lookup carries it to the
-/// identity policy compares against. Nothing else is softened. A tool name
-/// misspelt against a server this session DOES hold is a typo with a live
-/// surface to check it against, and still refuses to start, as does every
-/// native spelling.
-#[test]
-fn a_rule_for_a_server_this_session_lacks_resolves_while_a_typo_against_one_it_holds_does_not() {
-    let absent = Arc::new(Mutex::new(ToolDispatcher::new()));
-    let policy = permission_policy(
-        &configured_entries(&[&format!("deny {PROBE_REMOTE_TOOL}")]),
-        "project",
-        PermissionMode::Edit,
-        &absent,
-        None,
-    )
-    .expect("a rule naming a tool of a server this session lacks must resolve");
+/// The model-facing spelling of the same remote tool, which is also a spelling
+/// a rule may be written in: `register_mcp` installs it as an alias, and the
+/// repository's own configuration fixture uses it.
+const PROBE_REMOTE_TOOL_AS_ADVERTISED: &str = "probe_read_text_file";
 
-    let mut returned = ToolDispatcher::new();
-    returned
+/// A dispatcher for a session that declared the probe server and reached
+/// nothing from it — a server that failed to start, or one shipped `disabled`.
+fn dispatcher_declaring_an_absent_probe_server() -> Arc<Mutex<ToolDispatcher>> {
+    let mut dispatcher = native_dispatcher();
+    dispatcher.declare_mcp_servers(["probe".to_owned()]);
+
+    Arc::new(Mutex::new(dispatcher))
+}
+
+/// A rule naming a remote tool is resolved against whatever the dispatcher
+/// holds when the session starts. A server that failed to start contributes no
+/// tools, so the name stops resolving — and refusing to run over it would blame
+/// the operator's configuration for a server being unreachable, on the very
+/// rule the documentation tells them to write.
+///
+/// Such a name is therefore retained as written, and it binds for real the
+/// moment the server comes back: the dispatcher's own alias lookup carries it
+/// to the identity policy compares against.
+///
+/// One remote tool answers to two names — `<server>::<tool>` and the
+/// `<server>_<tool>` it is advertised to the model under — and a rule may be
+/// written in either. Only the first says on its own that it is remote; the
+/// second is shaped exactly like a bare native name, so nothing distinguishes
+/// `probe_read_text_file` from a misspelt `webfetc` except the configuration
+/// that declares the server. Both spellings are therefore softened on the same
+/// condition: the session declares that server and holds nothing from it.
+#[test]
+fn both_spellings_of_a_tool_of_a_declared_absent_server_resolve_and_bind_when_it_returns() {
+    for entry in [PROBE_REMOTE_TOOL, PROBE_REMOTE_TOOL_AS_ADVERTISED] {
+        let policy = permission_policy(
+            &configured_entries(&[&format!("deny {entry}")]),
+            "project",
+            PermissionMode::Edit,
+            &dispatcher_declaring_an_absent_probe_server(),
+            None,
+        )
+        .unwrap_or_else(|error| {
+            panic!("`deny {entry}` names a tool of a declared server and must resolve: {error:?}")
+        });
+
+        let mut returned = ToolDispatcher::new();
+        returned
+            .register_mcp(&probe_remote_metadata(), probe_remote_tool())
+            .expect("the probe dispatcher must accept the remote tool");
+        let outcome = returned
+            .evaluate(
+                &policy,
+                &[],
+                &PermissionSession::new(),
+                ToolDispatchRequest::new(
+                    "project",
+                    PROBE_REMOTE_TOOL,
+                    serde_json::json!({"path": "src/.env"}),
+                ),
+            )
+            .expect("the call must be decidable");
+
+        assert!(
+            matches!(outcome, ToolEvaluationOutcome::Denied),
+            "`deny {entry}` has to refuse the call once the server it names comes back, or it \
+             reads as denying and denies nothing: {outcome:?}"
+        );
+    }
+}
+
+/// Nothing beyond that is softened, and both spellings refuse in step.
+///
+/// A tool name misspelt against a server this session DOES hold has a live
+/// surface to be checked against. A name for a server the configuration never
+/// declared is indistinguishable from a typo, whichever spelling it is written
+/// in. And `native` is not a server: `native::` is the exact prefix the
+/// dispatcher qualifies its own tools under, so a misspelt native keeps failing
+/// in either of ITS spellings.
+///
+/// `native::` takes precedence over any server that claims it, which is what
+/// the last case asks: a session declaring a server literally called `native`
+/// must not turn a misspelt native into a retained remote rule. The comparison
+/// is exact rather than case-folded, because `native::` is the literal prefix
+/// natives are qualified under. `Native` is a legal MCP server name and is
+/// treated as one — `Native::writ` is refused for the ordinary reason that no
+/// server by that name was declared, rather than for being native.
+#[test]
+fn a_name_no_declared_server_and_no_native_surface_explains_refuses_to_run() {
+    let mut holding_the_probe_server = native_dispatcher();
+    holding_the_probe_server.declare_mcp_servers(["probe".to_owned()]);
+    holding_the_probe_server
         .register_mcp(&probe_remote_metadata(), probe_remote_tool())
         .expect("the probe dispatcher must accept the remote tool");
-    let outcome = returned
-        .evaluate(
-            &policy,
-            &[],
-            &PermissionSession::new(),
-            ToolDispatchRequest::new(
-                "project",
-                PROBE_REMOTE_TOOL,
-                serde_json::json!({"path": "src/.env"}),
-            ),
-        )
-        .expect("the call must be decidable");
-
-    assert!(
-        matches!(outcome, ToolEvaluationOutcome::Denied),
-        "the retained rule has to refuse the call once the server it names comes back, or it \
-         reads as denying and denies nothing: {outcome:?}"
-    );
 
     for (entry, dispatcher) in [
-        ("deny probe::read_txt_file", returned),
+        ("deny probe::read_txt_file", holding_the_probe_server),
+        ("deny probe_read_txt_file", {
+            let mut held = native_dispatcher();
+            held.declare_mcp_servers(["probe".to_owned()]);
+            held.register_mcp(&probe_remote_metadata(), probe_remote_tool())
+                .expect("the probe dispatcher must accept the remote tool");
+            held
+        }),
+        ("deny ghost::read_text_file", native_dispatcher()),
+        ("deny ghost_read_text_file", native_dispatcher()),
         ("deny webfetc", native_dispatcher()),
         ("deny native::webfetc", native_dispatcher()),
+        ("deny Native::writ", native_dispatcher()),
+        ("deny native::webfetc", {
+            let mut named_native = native_dispatcher();
+            named_native.declare_mcp_servers(["native".to_owned()]);
+            named_native
+        }),
     ] {
         let rejected = permission_policy(
             &configured_entries(&[entry]),
@@ -2530,10 +2590,151 @@ fn a_rule_for_a_server_this_session_lacks_resolves_while_a_typo_against_one_it_h
 
         assert!(
             rejected.is_err(),
-            "`{entry}` names nothing on a surface that can answer for it and must refuse to \
-             start rather than read as enforced"
+            "`{entry}` names nothing this session's configuration or native surface can answer \
+             for, and must refuse to run rather than read as enforced"
         );
     }
+}
+
+/// A session's own configuration decides which server names explain a rule, so
+/// the dispatcher a production parent hands to `permission_policy` has to carry
+/// them — including for a server that was never contacted at all.
+///
+/// A `disabled` server is the case the shipped `example/config.toml` creates:
+/// nothing is discovered from it, so every name it would have explained resolves
+/// through this declaration or through nothing.
+#[test]
+fn a_production_parent_declares_a_disabled_server_so_a_rule_naming_its_tools_resolves() {
+    let temporary = agens_fixtures::session_directory("declared-disabled-server");
+    let mut bootstrap = agens_fixtures::session_bootstrap(&temporary, &[]);
+    bootstrap.mcp_servers.push(disabled_probe_server());
+    let project_root = agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap);
+
+    let (_, dispatcher) = agens_tool_runtime::runtime::production_tool_runtime_with_task_runner(
+        &bootstrap,
+        &project_root,
+        Some(&agens_tools::SkillCatalog::default()),
+        InertTaskRunner,
+    )
+    .expect("the parent runtime must build");
+
+    for entry in [PROBE_REMOTE_TOOL, PROBE_REMOTE_TOOL_AS_ADVERTISED] {
+        let resolved = permission_policy(
+            &configured_entries(&[&format!("deny {entry}")]),
+            "project",
+            PermissionMode::Edit,
+            &dispatcher,
+            None,
+        );
+
+        assert!(
+            resolved.is_ok(),
+            "`deny {entry}` names a tool of a server this configuration declares, and a session \
+             that disabled that server must still run: {resolved:?}"
+        );
+    }
+
+    let rejected = permission_policy(
+        &configured_entries(&["deny ghost_read_text_file"]),
+        "project",
+        PermissionMode::Edit,
+        &dispatcher,
+        None,
+    );
+
+    assert!(
+        rejected.is_err(),
+        "a name no declared server explains must still refuse to run: {rejected:?}"
+    );
+
+    fs::remove_dir_all(temporary).unwrap();
+}
+
+/// One `disabled` MCP server, declared and never contacted.
+fn disabled_probe_server() -> agens_config::McpServerConfig {
+    agens_config::McpServerConfig {
+        name: "probe".into(),
+        disabled: true,
+        transport: agens_config::McpTransport::Stdio,
+        command: Some(std::path::PathBuf::from("/nonexistent/probe")),
+        args: Vec::new(),
+        environment: std::collections::BTreeMap::new(),
+        cwd: None,
+        url: None,
+        headers: std::collections::BTreeMap::new(),
+        max_retries: 0,
+        timeout_ms: 1_000,
+    }
+}
+
+/// A configured rule naming a native this session does not register has to
+/// resolve, because a session that registers fewer natives is a configuration
+/// agens supports rather than an operator error.
+///
+/// `register_production_task_tool` returns before registering anything when no
+/// subagent-mode agent exists, so `task` and the two coordination tools are
+/// absent from a parent built under [`AGENTS_WITHOUT_A_SUBAGENT`]. A rule
+/// naming one of them is spelt correctly, names a real tool, and passes
+/// configuration validation — and resolving it through the live dispatcher
+/// alone made agens refuse to run.
+///
+/// This goes through `permission_policy` itself rather than through a resolver
+/// substituted for it, because the dispatcher lookup is the whole mechanism
+/// under test.
+#[test]
+fn a_rule_naming_a_native_this_session_never_registers_still_runs_the_session() {
+    let temporary = agens_fixtures::session_directory("rule-naming-an-unregistered-native");
+    let bootstrap = agens_fixtures::session_bootstrap(&temporary, &AGENTS_WITHOUT_A_SUBAGENT);
+    let project_root = agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap);
+
+    let (_, dispatcher) = agens_tool_runtime::runtime::production_tool_runtime_with_task_runner(
+        &bootstrap,
+        &project_root,
+        Some(&agens_tools::SkillCatalog::default()),
+        InertTaskRunner,
+    )
+    .expect("the parent runtime must build");
+
+    for tool in ["task", "task_control", "task_message"] {
+        assert!(
+            dispatcher
+                .lock()
+                .expect("dispatcher must be available")
+                .canonical_identity(&format!("native::{tool}"))
+                .is_none(),
+            "{tool} must be absent from this parent, or the case under test is not the one \
+             described"
+        );
+
+        let resolved = permission_policy(
+            &configured_entries(&[&format!("deny {tool}")]),
+            "project",
+            PermissionMode::Edit,
+            &dispatcher,
+            None,
+        );
+
+        assert!(
+            resolved.is_ok(),
+            "`deny {tool}` names a real native and must not refuse to run a session that \
+             registers no delegation: {resolved:?}"
+        );
+    }
+
+    let rejected = permission_policy(
+        &configured_entries(&["deny tsk"]),
+        "project",
+        PermissionMode::Edit,
+        &dispatcher,
+        None,
+    );
+
+    assert!(
+        rejected.is_err(),
+        "a name that is no native at all must still refuse to run: {rejected:?}"
+    );
+
+    fs::remove_dir_all(temporary).unwrap();
 }
 
 /// The secret a probe must never report. It is written into the working tree

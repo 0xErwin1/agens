@@ -134,6 +134,12 @@ pub fn production_tool_runtime_with_parent_task_runner<R: TaskRunner>(
         project_root,
     )));
     let mut dispatcher = ToolDispatcher::new();
+    dispatcher.declare_mcp_servers(
+        bootstrap
+            .mcp_servers
+            .iter()
+            .map(|server| server.name.clone()),
+    );
     let mut provider_tools = BTreeMap::new();
     let discovered_skills;
     let skills = match skills {

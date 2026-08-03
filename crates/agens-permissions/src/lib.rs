@@ -597,7 +597,7 @@ pub fn permission_policy(
         if let Some(identity) = dispatcher.canonical_identity(configured) {
             return Ok(PermissionPattern::Exact(identity.as_str().to_owned()));
         }
-        if names_a_tool_of_an_absent_mcp_server(&dispatcher, configured) {
+        if names_a_tool_this_session_does_not_hold(&dispatcher, configured) {
             return Ok(PermissionPattern::Exact(configured.to_owned()));
         }
 
@@ -673,48 +673,87 @@ pub fn configured_permission_rules(
 fn configured_tool_name(name: &str) -> Result<String, CliError> {
     let qualified = format!("native::{name}");
 
-    let known = agens_tools::NativeToolCatalog::metadata()
-        .iter()
-        .any(|entry| entry.qualified_name == qualified)
-        || agens_tools::NATIVE_TOOLS_REGISTERED_OUTSIDE_THE_CATALOG.contains(&qualified.as_str());
-
-    Ok(if known { qualified } else { name.to_owned() })
+    Ok(if names_the_native_surface(&qualified) {
+        qualified
+    } else {
+        name.to_owned()
+    })
 }
 
-/// Whether a configured name spells a remote tool on a server this session does
-/// not hold, which is the one name a live dispatcher cannot answer for.
+/// Whether a qualified name is one of the natives agens ships, across every
+/// dispatcher any session builds.
 ///
-/// `deny <server>::<tool>` is the only rule that binds a remote tool, and it is
-/// resolved against the dispatcher discovery has already filled. A server that
-/// failed to start, or one configured `disabled`, contributes no tools, so the
-/// name resolves to nothing — and rejecting the configuration over that would
-/// report an unreachable server as an operator error, on the very rule the
-/// documentation asks for. Such a rule is kept as written instead. The
-/// dispatcher's own alias lookup resolves it at evaluation time, so it binds
-/// for real as soon as the server is reachable again.
+/// The catalog alone is not that surface: `skill`, `task` and the two
+/// coordination tools are registered beside it.
+fn names_the_native_surface(qualified: &str) -> bool {
+    agens_tools::NativeToolCatalog::metadata()
+        .iter()
+        .any(|entry| entry.qualified_name == qualified)
+        || agens_tools::NATIVE_TOOLS_REGISTERED_OUTSIDE_THE_CATALOG.contains(&qualified)
+}
+
+/// Whether a configured name spells a tool this session's own configuration
+/// accounts for and this session's dispatcher does not hold — the one case a
+/// live dispatcher cannot answer for on its own.
 ///
-/// Nothing else is softened, and the asymmetry is deliberate. A native name is
-/// resolved against a surface that is always fully present, so a misspelt one
-/// is a typo with no other reading and keeps failing loudly — including in its
-/// `native::`-qualified spelling, which this deliberately does not treat as a
-/// server called `native`. A remote tool misspelt against a server this session
-/// DOES hold has a live surface to be checked against too, and fails the same
-/// way.
+/// Such a rule is kept as written rather than rejected. Rejecting it would
+/// report a surface that is legitimately not here as an operator error, and the
+/// dispatcher's own alias lookup resolves the retained name at evaluation time,
+/// so it binds for real the moment that surface appears. This is the same trade
+/// an agent definition's unmatched `deny` already makes for the same reason
+/// (`agens_tools`' `resolved_selectors`).
 ///
-/// This still leaves a rule for an absent server reading as enforced while
-/// deciding nothing for as long as the server stays away, which is the same
-/// trade an agent definition's unmatched `deny` already makes for the same
-/// reason (`agens_tools`' `resolved_selectors`): the alternative is refusing to
-/// run over a surface that is legitimately not here.
+/// Two surfaces can legitimately be absent, and nothing else is softened.
+///
+/// **A native this session does not register.** `task` and the two tools that
+/// coordinate a live delegation reach the dispatcher only when some agent runs
+/// in subagent mode, so a session configured without one holds none of them; a
+/// rule naming one is spelt correctly and names a real tool. A name on no
+/// native surface at all is a typo with no other reading and keeps failing,
+/// including in its `native::`-qualified spelling.
+///
+/// **A tool of a declared MCP server this session reached nothing from.** A
+/// server that failed to start, or one configured `disabled`, contributes no
+/// tools, and a rule naming its tools is what the documentation asks operators
+/// to write. Both names one remote tool answers to are softened together:
+/// `<server>::<tool>` and the `<server>_<tool>` it is advertised to the model
+/// under, which `register_mcp` installs as an alias and the repository's own
+/// configuration fixture writes as a rule. Only the first says on its own that
+/// it is remote — the second is shaped exactly like a bare native name — so
+/// both are keyed on the same thing instead: a server this session's
+/// configuration declares. A tool misspelt against a server this session DOES
+/// hold has a live surface to be checked against and fails there.
+fn names_a_tool_this_session_does_not_hold(dispatcher: &ToolDispatcher, configured: &str) -> bool {
+    names_the_native_surface(configured)
+        || names_a_tool_of_an_absent_mcp_server(dispatcher, configured)
+}
+
+/// `native` is excluded from the server side, exactly rather than case-folded:
+/// `native::` is the literal prefix [`ToolDispatcher::register_native`]
+/// qualifies its own tools under, so `native::webfetc` is a misspelt native
+/// rather than a remote tool of a server called `native` — and stays one even
+/// in a session that declares such a server. `Native` is a legal MCP server
+/// name and is treated as one: `Native::writ` is refused for the ordinary
+/// reason that no server by that name was declared, not for being native.
 fn names_a_tool_of_an_absent_mcp_server(dispatcher: &ToolDispatcher, configured: &str) -> bool {
-    let Some((server, tool)) = configured.split_once("::") else {
+    let qualified = configured
+        .split_once("::")
+        .filter(|(server, tool)| !server.is_empty() && *server != "native" && !tool.is_empty())
+        .map(|(server, _)| server);
+    let advertised = || {
+        dispatcher.declared_mcp_servers().find(|server| {
+            configured
+                .strip_prefix(*server)
+                .and_then(|tool| tool.strip_prefix('_'))
+                .is_some_and(|tool| !tool.is_empty())
+        })
+    };
+
+    let Some(server) = qualified.or_else(advertised) else {
         return false;
     };
 
-    !server.is_empty()
-        && server != "native"
-        && !tool.is_empty()
-        && !dispatcher.holds_mcp_server(server)
+    dispatcher.declares_mcp_server(server) && !dispatcher.holds_mcp_server(server)
 }
 
 fn parse_tool_input(call: &HeadlessToolCall) -> Result<serde_json::Value, HeadlessTurnPortError> {

@@ -3437,6 +3437,7 @@ struct RegisteredDispatchTool {
 pub struct ToolDispatcher {
     tools: BTreeMap<ToolIdentity, RegisteredDispatchTool>,
     aliases: BTreeMap<String, ToolIdentity>,
+    declared_mcp_servers: BTreeSet<String>,
     dispatcher_id: u64,
     next_version: u64,
 }
@@ -3457,6 +3458,7 @@ impl ToolDispatcher {
             next_version: 1,
             tools: BTreeMap::new(),
             aliases: BTreeMap::new(),
+            declared_mcp_servers: BTreeSet::new(),
         }
     }
 
@@ -3550,12 +3552,42 @@ impl ToolDispatcher {
         self.aliases.get(alias)
     }
 
+    /// Records the MCP servers this session's configuration names, whether or
+    /// not any of them was ever reached.
+    ///
+    /// A configured rule may name a remote tool by either of the two names it
+    /// answers to, and only one of them says so on its own. `<server>::<tool>`
+    /// is self-identifying; `<server>_<tool>` — the name the model is actually
+    /// advertised, and the one `register_mcp` installs alongside it — is shaped
+    /// exactly like a bare native name. Nothing in `engram_mem_save`
+    /// distinguishes it from a misspelt `webfetc`, so a caller resolving it has
+    /// to ask what this session set out to run rather than what it reached.
+    pub fn declare_mcp_servers(&mut self, servers: impl IntoIterator<Item = String>) {
+        self.declared_mcp_servers
+            .extend(servers.into_iter().filter(|server| !server.is_empty()));
+    }
+
+    /// Whether this session's configuration names `server` at all.
+    pub fn declares_mcp_server(&self, server: &str) -> bool {
+        self.declared_mcp_servers.contains(server)
+    }
+
+    /// Every server name this session's configuration declares.
+    ///
+    /// A caller resolving a `<server>_<tool>` name has no separator to split on
+    /// and cannot recover the server from the name alone — a server called `a`
+    /// serving `b_c` and a server called `a_b` serving `c` are advertised under
+    /// the same name — so it matches the name against the declared set instead.
+    pub fn declared_mcp_servers(&self) -> impl Iterator<Item = &str> {
+        self.declared_mcp_servers.iter().map(String::as_str)
+    }
+
     /// Whether this dispatcher holds any tool served by `server`.
     ///
-    /// A caller resolving a configured `<server>::<tool>` rule needs to tell a
-    /// misspelt tool name — which a live server's own surface can refuse — from
-    /// a name for a server that is not here at all, which nothing here can
-    /// answer for. Discovery is what puts a server's tools in this map, so a
+    /// A caller resolving a configured rule that names a remote tool needs to
+    /// tell a misspelt tool name — which a live server's own surface can refuse
+    /// — from a name for a server that is not here at all, which nothing here
+    /// can answer for. Discovery is what puts a server's tools in this map, so a
     /// server absent from it is a server this session never reached.
     pub fn holds_mcp_server(&self, server: &str) -> bool {
         let prefix = format!("mcp:{}:{server}:", server.len());

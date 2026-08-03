@@ -136,12 +136,22 @@ effort = "high"
 #     `deny filesystem::read_text_file`. So if a configured server can read
 #     files, it can read the ones denied below, and nothing in this block stops
 #     it; see the `[mcp.*]` examples further down.
-#     That rule is resolved at startup against the servers this session
-#     reached. A server that failed to start, or one marked `disabled`,
-#     contributes no tools, so the rule is kept as written and binds again the
-#     moment the server is reachable — agens does not refuse to start over a
-#     server being down. A tool name misspelt against a server that IS running
-#     is rejected instead, the same way a misspelt native name is.
+#     That tool answers to a second name too: `<server>_<tool>`, the one the
+#     model is advertised, which a rule may also be written in. Prefer the `::`
+#     spelling — it is the only one that says on its own that the name is
+#     remote, since `filesystem_read_text_file` is shaped exactly like a bare
+#     native name.
+#     Either spelling is resolved against what this session reached. A server
+#     that failed to start, or one marked `disabled`, contributes no tools, so
+#     the rule is kept as written and binds again the moment the server is
+#     reachable. What allows that is an `[mcp.*]` block below naming the server:
+#     a rule for a server this file never declares is indistinguishable from a
+#     typo and is rejected, as is a tool name misspelt against a server that IS
+#     running, and as is a misspelt native name.
+#     A rejected name is refused when the permission policy is built. For
+#     `agens chat` that is the turn it was asked to run, so the command fails.
+#     The TUI builds it per submission, so agens starts and then fails every
+#     prompt you send until the rule is fixed.
 #     The allow side of the same fact: a prompt for a remote tool can show only
 #     that tool's name, so answering "Allow always" stores a grant matching
 #     every future call to it. For `bash` such a grant is remembered per
