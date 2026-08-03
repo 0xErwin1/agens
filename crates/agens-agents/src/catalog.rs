@@ -95,11 +95,10 @@ pub fn discover_agent_catalog(
 ) -> Result<AgentCatalog, CliError> {
     let session_root =
         agens_bootstrap::session_root::SessionRoot::confined_to(project_root.to_path_buf());
-    let system_prompt =
+    let system_prompt = agens_core::prompt::base_system_prompt(
         agens_bootstrap::session_config::SessionConfig::resolve(&session_root, bootstrap)?
-            .system_prompt()
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(|| "You are Agens, a helpful coding agent.".into());
+            .system_prompt(),
+    );
     let instructions =
         agens_bootstrap::session_config::SessionInstructions::resolve(&session_root, bootstrap);
     let primary = AgentDefinition {

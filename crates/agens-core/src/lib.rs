@@ -12,6 +12,7 @@ use std::{
 use globset::{GlobBuilder, GlobMatcher};
 
 pub mod ask_user;
+pub mod prompt;
 pub mod redaction;
 mod request_config;
 

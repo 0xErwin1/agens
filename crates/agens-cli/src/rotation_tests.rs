@@ -184,9 +184,10 @@ fn the_built_in_primary_agents_system_prompt_is_scoped_to_its_own_root_not_the_b
     let primary = catalog.agent("primary").unwrap();
 
     assert_eq!(
-        primary.system_prompt, "You are root A's own assistant.",
-        "a session's OWN project configuration must still set the built-in primary agent's \
-         system prompt"
+        primary.system_prompt,
+        "You are Agens, a helpful coding agent.\n\nYou are root A's own assistant.",
+        "a session's OWN project configuration must compose after the built-in base for the \
+         primary agent's system prompt"
     );
 
     std::fs::remove_dir_all(&temporary).ok();
@@ -297,13 +298,14 @@ fn a_configured_system_prompt_is_preserved_with_agents_md_instructions_appended_
     let canonical_instructions_path =
         std::fs::canonicalize(project_root.join("AGENTS.md")).unwrap();
     let expected = format!(
-        "CONFIGURED-CUSTOM-PROMPT\n\n## Instructions from {}\nPROJECT-INSTRUCTIONS-TEXT",
+        "You are Agens, a helpful coding agent.\n\nCONFIGURED-CUSTOM-PROMPT\n\n## Instructions \
+         from {}\nPROJECT-INSTRUCTIONS-TEXT",
         canonical_instructions_path.display()
     );
     assert_eq!(
         primary.system_prompt, expected,
-        "a TOML-configured system_prompt must remain the agent's own prompt, with AGENTS.md \
-         instructions appended after it, never replacing it"
+        "a TOML-configured system_prompt must compose after the built-in base, with AGENTS.md \
+         instructions appended after both, never replacing either"
     );
 
     std::fs::remove_dir_all(&temporary).ok();

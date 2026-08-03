@@ -87,7 +87,18 @@ The CLI and TUI submit work through one cancellation-aware engine. Providers emi
 
 ## Agent instructions (AGENTS.md)
 
-Every agent's system prompt is composed, never replaced. The agent's own prompt — TOML-configured or markdown-defined — comes first; two optional instruction files are appended after it, in a fixed order.
+Every agent's system prompt is assembled in a fixed layer order, each layer separated by a blank line:
+
+1. **Built-in base** — `agens_core::prompt::BASE_SYSTEM_PROMPT`, the one place the base identity text lives (`agens-core/src/prompt.rs`).
+2. **Agent prompt** — the agent's own prompt, TOML-configured (`[agent].system_prompt`) or markdown-defined.
+3. **AGENTS.md instructions** — two optional instruction files, appended global-then-project (see table below).
+4. **Delegation block** — the subagent routing-discipline text, appended only when the catalog reports a subagent.
+
+**Breaking change**: a configured `[agent].system_prompt` now composes after the built-in base (`agens_core::prompt::base_system_prompt`) instead of replacing it. An unconfigured agent is unaffected — it still resolves to the base alone. A configured agent's effective prompt gained a new leading paragraph it did not have before.
+
+The headless `--system` flag is the one exception: it fully **replaces** the base for that invocation — the resolver in `agens_core::prompt` is not consulted at all when `--system` is supplied. Layers 3 and 4 still apply on top of the replaced text. This means "the user supplied a prompt" carries two different semantics depending on the source — `[agent].system_prompt` composes, `--system` replaces — which is a discoverability wart worth knowing before reaching for either.
+
+The built-in `explore` and `general` subagents never receive the base layer: their one-line role prompts already state an identity, and they are unreachable by `[agent].system_prompt`, so composing there would widen the breaking surface with no benefit.
 
 | Source | Location |
 |---|---|

@@ -55,3 +55,13 @@ for doc in CLAUDE.md AGENTS.md CODE_STYLE.md CONTRIBUTING.md README.md; do
         exit 1
     fi
 done
+
+base_prompt_hits=$(grep -rl 'You are Agens, a helpful coding agent\.' crates --include='*.rs' \
+    | grep -v '_tests\.rs$' \
+    | grep -v '/tests/' \
+    | grep -v 'crates/agens-core/src/prompt.rs$' || true)
+if [ -n "$base_prompt_hits" ]; then
+    echo "the built-in base system prompt literal must live only in crates/agens-core/src/prompt.rs:" >&2
+    echo "$base_prompt_hits" >&2
+    exit 1
+fi

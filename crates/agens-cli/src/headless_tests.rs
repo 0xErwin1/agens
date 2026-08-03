@@ -547,13 +547,140 @@ fn a_headless_turns_own_system_prompt_is_unchanged_when_no_agents_md_exists() {
     std::fs::remove_dir_all(bootstrap.data_directory()).ok();
 }
 
+/// Pins the direct-`SessionConfig` path's own composition: with `explicit` absent,
+/// `headless_turn_own_system_prompt` must fall back through `headless_turn_system_prompt`
+/// into `agens_core::prompt::base_system_prompt`, composing the built-in base with a
+/// configured `[agent].system_prompt` rather than replacing it. The catalog path's half of
+/// this same composition is already pinned in `rotation_tests.rs`.
+#[test]
+fn a_headless_turns_own_system_prompt_composes_a_configured_prompt_after_the_base_on_the_direct_path()
+ {
+    let temporary = std::env::temp_dir().join(format!(
+        "agens-headless-own-system-prompt-configured-{}",
+        std::process::id()
+    ));
+    let config_home = temporary.join("config");
+    let project_root = temporary.join("project");
+    std::fs::create_dir_all(&project_root).expect("project root should be created");
+
+    let mut files = BTreeMap::new();
+    files.insert(
+        project_root.join(".agens/config.toml"),
+        "[agent]\nsystem_prompt = \"You are the project's own assistant.\"\n".to_owned(),
+    );
+
+    let bootstrap = bootstrap(&CliDependencies::for_test(
+        project_root.clone(),
+        Some(temporary.join("home")),
+        BTreeMap::from([(
+            "AGENS_CONFIG_HOME".to_owned(),
+            config_home.display().to_string(),
+        )]),
+        files,
+    ))
+    .unwrap();
+
+    let prompt = headless_turn_own_system_prompt(&bootstrap, &project_root, None).unwrap();
+
+    assert_eq!(
+        prompt, "You are Agens, a helpful coding agent.\n\nYou are the project's own assistant.",
+        "the direct SessionConfig path must compose the configured prompt after the built-in \
+         base, not replace it"
+    );
+
+    std::fs::remove_dir_all(&temporary).ok();
+    std::fs::remove_dir_all(bootstrap.data_directory()).ok();
+}
+
+/// Pins the full fixed layer order from the spec's "All layers present" scenario in a single
+/// assertion: built-in base, then the configured agent prompt, then the AGENTS.md
+/// `## Instructions from` block, then the delegation discipline block. This is exactly the
+/// sequence `run_production_headless_chat_with_progress` performs for a genuinely new turn
+/// whose catalog reports a subagent: `headless_turn_own_system_prompt` produces the first
+/// three layers, and `explicit_task_delegation_prompt` appends the fourth.
+#[test]
+fn all_four_prompt_layers_are_assembled_in_the_fixed_order() {
+    let temporary = std::env::temp_dir().join(format!(
+        "agens-headless-all-layers-order-{}",
+        std::process::id()
+    ));
+    let config_home = temporary.join("config");
+    let project_root = temporary.join("project");
+    std::fs::create_dir_all(&project_root).expect("project root should be created");
+    std::fs::write(project_root.join("AGENTS.md"), "PROJECT-INSTRUCTIONS")
+        .expect("project AGENTS.md should be written");
+
+    let mut files = BTreeMap::new();
+    files.insert(
+        project_root.join(".agens/config.toml"),
+        "[agent]\nsystem_prompt = \"You are the project's own assistant.\"\n".to_owned(),
+    );
+
+    let bootstrap = bootstrap(&CliDependencies::for_test(
+        project_root.clone(),
+        Some(temporary.join("home")),
+        BTreeMap::from([(
+            "AGENS_CONFIG_HOME".to_owned(),
+            config_home.display().to_string(),
+        )]),
+        files,
+    ))
+    .unwrap();
+
+    let composed = headless_turn_own_system_prompt(&bootstrap, &project_root, None).unwrap();
+    let prompt = explicit_task_delegation_prompt(&composed);
+
+    let canonical = std::fs::canonicalize(project_root.join("AGENTS.md")).unwrap();
+    assert_eq!(
+        prompt,
+        format!(
+            "You are Agens, a helpful coding agent.\n\nYou are the project's own assistant.\n\n\
+             ## Instructions from {}\nPROJECT-INSTRUCTIONS\n\nWhen the user explicitly asks for \
+             subagent delegation, use the `task` tool instead of completing the delegated work \
+             inline. Use `task_control` to inspect, background, or cancel a live execution and \
+             `task_message` to send bounded coordination without waiting for completion. \
+             Subagent delegation is a routing decision, not a search for an agent that happens \
+             to work. Route a task to the agent whose declared role covers it. When no declared \
+             role covers the work, or the assigned agent reports it cannot proceed, report that \
+             and the evidence to the user; do not substitute another agent to get past a block. \
+             Judge tool availability only from the agent actually assigned — a surface reported \
+             by one agent says nothing about another. Never invent context (identifiers, \
+             workflow state, artifacts) to make a request routable to an agent that would \
+             otherwise reject it. Do not cancel a running execution on circumstantial evidence: \
+             a file, diff, or log line appearing while it runs is correlation, not proof — use \
+             `task_control` to inspect and `task_message` to ask what it touched, and cancel \
+             only on a confirmed scope violation or irreversible-action risk. Keep one change \
+             with one agent start to finish; if an execution was interrupted, resume the same \
+             role with full context instead of compensating with a different agent.",
+            canonical.display()
+        ),
+        "the base must precede the configured prompt, which must precede the AGENTS.md \
+         instructions, which must precede the delegation discipline block"
+    );
+
+    std::fs::remove_dir_all(&temporary).ok();
+    std::fs::remove_dir_all(bootstrap.data_directory()).ok();
+}
+
 #[test]
 fn primary_task_instruction_requires_explicit_delegation_and_is_idempotent() {
     let prompt = explicit_task_delegation_prompt("Base instructions.");
 
-    assert_eq!(
-        prompt,
-        "Base instructions.\n\nWhen the user explicitly asks for subagent delegation, use the `task` tool instead of completing the delegated work inline. Use `task_control` to inspect, background, or cancel a live execution and `task_message` to send bounded coordination without waiting for completion."
+    assert!(
+        prompt.starts_with(
+            "Base instructions.\n\nWhen the user explicitly asks for subagent delegation, use \
+             the `task` tool instead of completing the delegated work inline. Use \
+             `task_control` to inspect, background, or cancel a live execution and \
+             `task_message` to send bounded coordination without waiting for completion."
+        ),
+        "the routing instruction must still open the appended block: {prompt}"
+    );
+    assert!(
+        prompt.contains(
+            "Subagent delegation is a routing decision, not a search for an agent that happens \
+             to work."
+        ),
+        "the delegation discipline text must be appended in the same block: {prompt}"
     );
     assert_eq!(explicit_task_delegation_prompt(&prompt), prompt);
 }
