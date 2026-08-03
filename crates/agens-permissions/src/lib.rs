@@ -587,12 +587,20 @@ pub fn permission_policy(
     effective_capabilities: Option<&EffectiveCapabilitySet>,
 ) -> Result<PermissionPolicy, CliError> {
     let configured = configured_permission_rules(rules, project, |configured| {
-        dispatcher
+        let dispatcher = dispatcher
             .lock()
-            .map_err(|_| CliError::configuration("tool catalog is invalid"))?
-            .canonical_identity(configured)
-            .map(|identity| PermissionPattern::Exact(identity.as_str().to_owned()))
-            .ok_or_else(|| CliError::configuration("permission configuration is invalid"))
+            .map_err(|_| CliError::configuration("tool catalog is invalid"))?;
+
+        if let Some(identity) = dispatcher.canonical_identity(configured) {
+            return Ok(PermissionPattern::Exact(identity.as_str().to_owned()));
+        }
+        if names_a_tool_of_an_absent_mcp_server(&dispatcher, configured) {
+            return Ok(PermissionPattern::Exact(configured.to_owned()));
+        }
+
+        Err(CliError::configuration(
+            "permission configuration is invalid",
+        ))
     })?;
     let declared = effective_capabilities
         .map(EffectiveCapabilitySet::permission_rules)
@@ -668,6 +676,42 @@ fn configured_tool_name(name: &str) -> Result<String, CliError> {
         || agens_tools::NATIVE_TOOLS_REGISTERED_OUTSIDE_THE_CATALOG.contains(&qualified.as_str());
 
     Ok(if known { qualified } else { name.to_owned() })
+}
+
+/// Whether a configured name spells a remote tool on a server this session does
+/// not hold, which is the one name a live dispatcher cannot answer for.
+///
+/// `deny <server>::<tool>` is the only rule that binds a remote tool, and it is
+/// resolved against the dispatcher discovery has already filled. A server that
+/// failed to start, or one configured `disabled`, contributes no tools, so the
+/// name resolves to nothing — and rejecting the configuration over that would
+/// report an unreachable server as an operator error, on the very rule the
+/// documentation asks for. Such a rule is kept as written instead. The
+/// dispatcher's own alias lookup resolves it at evaluation time, so it binds
+/// for real as soon as the server is reachable again.
+///
+/// Nothing else is softened, and the asymmetry is deliberate. A native name is
+/// resolved against a surface that is always fully present, so a misspelt one
+/// is a typo with no other reading and keeps failing loudly — including in its
+/// `native::`-qualified spelling, which this deliberately does not treat as a
+/// server called `native`. A remote tool misspelt against a server this session
+/// DOES hold has a live surface to be checked against too, and fails the same
+/// way.
+///
+/// This still leaves a rule for an absent server reading as enforced while
+/// deciding nothing for as long as the server stays away, which is the same
+/// trade an agent definition's unmatched `deny` already makes for the same
+/// reason (`agens_tools`' `resolved_selectors`): the alternative is refusing to
+/// run over a surface that is legitimately not here.
+fn names_a_tool_of_an_absent_mcp_server(dispatcher: &ToolDispatcher, configured: &str) -> bool {
+    let Some((server, tool)) = configured.split_once("::") else {
+        return false;
+    };
+
+    !server.is_empty()
+        && server != "native"
+        && !tool.is_empty()
+        && !dispatcher.holds_mcp_server(server)
 }
 
 fn parse_tool_input(call: &HeadlessToolCall) -> Result<serde_json::Value, HeadlessTurnPortError> {

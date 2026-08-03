@@ -136,6 +136,17 @@ effort = "high"
 #     `deny filesystem::read_text_file`. So if a configured server can read
 #     files, it can read the ones denied below, and nothing in this block stops
 #     it; see the `[mcp.*]` examples further down.
+#     That rule is resolved at startup against the servers this session
+#     reached. A server that failed to start, or one marked `disabled`,
+#     contributes no tools, so the rule is kept as written and binds again the
+#     moment the server is reachable — agens does not refuse to start over a
+#     server being down. A tool name misspelt against a server that IS running
+#     is rejected instead, the same way a misspelt native name is.
+#     The allow side of the same fact: a prompt for a remote tool can show only
+#     that tool's name, so answering "Allow always" stores a grant matching
+#     every future call to it. For `bash` such a grant is remembered per
+#     command, for `task` per subagent, for `skill` per skill — a remote tool
+#     is the one class with nothing to scope it by.
 #
 # Apply the same test to any tool added later — if it can return the contents of
 # a file and does neither of the two, no deny here binds it, and it belongs on
@@ -196,7 +207,10 @@ ask = [
 # `deny` in the `[permissions]` block above reaches its tools by path — the
 # filesystem server below can read every file denied there, because agens cannot
 # tell which file one of its calls names. The rules that reach it name its tools
-# instead, one to a rule: `deny filesystem::read_text_file`.
+# instead, one to a rule: `deny filesystem::read_text_file`. Such a rule may
+# name a server that is not running — the `disabled` one at the end among them.
+# It is kept as written and binds when that server returns; startup does not
+# fail over it.
 #
 # [mcp.filesystem]
 # transport = "stdio"

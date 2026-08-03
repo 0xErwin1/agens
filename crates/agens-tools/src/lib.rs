@@ -3519,6 +3519,21 @@ impl ToolDispatcher {
         self.aliases.get(alias)
     }
 
+    /// Whether this dispatcher holds any tool served by `server`.
+    ///
+    /// A caller resolving a configured `<server>::<tool>` rule needs to tell a
+    /// misspelt tool name — which a live server's own surface can refuse — from
+    /// a name for a server that is not here at all, which nothing here can
+    /// answer for. Discovery is what puts a server's tools in this map, so a
+    /// server absent from it is a server this session never reached.
+    pub fn holds_mcp_server(&self, server: &str) -> bool {
+        let prefix = format!("mcp:{}:{server}:", server.len());
+
+        self.tools
+            .keys()
+            .any(|identity| identity.0.starts_with(&prefix))
+    }
+
     /// The qualified names of every native tool registered here.
     ///
     /// A dispatcher is the only authority on what it holds. Deriving the native

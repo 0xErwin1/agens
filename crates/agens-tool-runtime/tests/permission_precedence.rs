@@ -2367,6 +2367,76 @@ fn no_path_rule_reaches_an_mcp_tool_and_naming_the_tool_refuses_every_call() {
     }
 }
 
+/// `deny <server>::<tool>` is the only rule that binds a remote tool, and it is
+/// resolved against whatever the dispatcher holds when the session starts. A
+/// server that failed to start contributes no tools, so the name stops
+/// resolving — and refusing to start over it would blame the operator's
+/// configuration for a server being unreachable, on the very rule the
+/// documentation tells them to write.
+///
+/// A name of that shape is therefore retained as written when this session
+/// holds no tool from that server at all, and it binds for real the moment the
+/// server comes back: the dispatcher's own alias lookup carries it to the
+/// identity policy compares against. Nothing else is softened. A tool name
+/// misspelt against a server this session DOES hold is a typo with a live
+/// surface to check it against, and still refuses to start, as does every
+/// native spelling.
+#[test]
+fn a_rule_for_a_server_this_session_lacks_resolves_while_a_typo_against_one_it_holds_does_not() {
+    let absent = Arc::new(Mutex::new(ToolDispatcher::new()));
+    let policy = permission_policy(
+        &configured_entries(&[&format!("deny {PROBE_REMOTE_TOOL}")]),
+        "project",
+        PermissionMode::Edit,
+        &absent,
+        None,
+    )
+    .expect("a rule naming a tool of a server this session lacks must resolve");
+
+    let mut returned = ToolDispatcher::new();
+    returned
+        .register_mcp(&probe_remote_metadata(), probe_remote_tool())
+        .expect("the probe dispatcher must accept the remote tool");
+    let outcome = returned
+        .evaluate(
+            &policy,
+            &[],
+            &PermissionSession::new(),
+            ToolDispatchRequest::new(
+                "project",
+                PROBE_REMOTE_TOOL,
+                serde_json::json!({"path": "src/.env"}),
+            ),
+        )
+        .expect("the call must be decidable");
+
+    assert!(
+        matches!(outcome, ToolEvaluationOutcome::Denied),
+        "the retained rule has to refuse the call once the server it names comes back, or it \
+         reads as denying and denies nothing: {outcome:?}"
+    );
+
+    for (entry, dispatcher) in [
+        ("deny probe::read_txt_file", returned),
+        ("deny webfetc", native_dispatcher()),
+        ("deny native::webfetc", native_dispatcher()),
+    ] {
+        let rejected = permission_policy(
+            &configured_entries(&[entry]),
+            "project",
+            PermissionMode::Edit,
+            &Arc::new(Mutex::new(dispatcher)),
+            None,
+        );
+
+        assert!(
+            rejected.is_err(),
+            "`{entry}` names nothing on a surface that can answer for it and must refuse to \
+             start rather than read as enforced"
+        );
+    }
+}
+
 /// The secret a probe must never report. It is written into the working tree
 /// and never committed, so `.git` holds no copy of it that a probe could reach
 /// without asking the rules about `.env`.

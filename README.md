@@ -145,6 +145,10 @@ Four kinds of call that can return the contents of a file do neither, and each i
 
 That is the test to apply to any tool added later: if it can return the contents of a file and does neither of the two, a path deny does not bind it, and it belongs on this list with the reason written down.
 
+**Writing a rule for a server that is not running.** A rule naming a remote tool is resolved at startup against the servers this session actually reached, and a server that failed to start or is configured `disabled` contributes no tools. Such a rule is kept exactly as written and binds the moment that server is reachable again — agens does not refuse to start because a server is down. The cost is that it decides nothing while the server is away, which is no weaker than the server not being there. A tool name misspelt against a server that IS running is a different case: that surface can answer for it, so the name is rejected and startup fails, the same way a misspelt native name does.
+
+**Approving a remote call approves all of them.** A permission prompt for a remote tool shows the tool's name and nothing else, because the tool's own name is the only target agens can project — the arguments belong to the server. Answering **Allow always** therefore stores a grant matching *every future call to that tool*, for as long as the grant lives. That is the mirror image of the deny side, and it is unique to this class: an `Allow always` for `bash` is remembered per command text, for `task` per subagent, for `skill` per skill name. If you want a remote tool authorized for some calls and not others, there is nothing to scope it by — grant it once per call, or `deny` it.
+
 | Tool | Returns file contents | How a path deny reaches it |
 |------|-----------------------|----------------------------|
 | `read` | yes | the target is the file |
