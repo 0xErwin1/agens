@@ -5013,20 +5013,28 @@ impl TaskStalledOpenAiMockServer {
                 .expect("test should receive the child request observation");
             // The reviewer agent declares no `permissions:`, so it inherits the
             // parent's full native surface (write/bash/webfetch included) unlike
-            // `explore`, which narrows explicitly. Only task nesting and MCP stay
-            // excluded from a child's catalog.
-            for forbidden in ["parent task cancellation", "\"name\":\"task\"", "mcp"] {
+            // `explore`, which narrows explicitly. It also carries `task`: a
+            // child may delegate one level further, and the chain stops at the
+            // grandchild — which this request cannot observe, so the depth limit
+            // itself is pinned in `delegation_reaches_a_grandchild_and_stops_there`.
+            for forbidden in ["parent task cancellation", "mcp"] {
                 assert!(
                     !child_body.contains(forbidden),
                     "child request leaked {forbidden:?}: {child_body}"
                 );
             }
-            for expected in ["write", "bash", "webfetch"] {
+            for expected in ["write", "bash", "webfetch", "\"name\":\"task\""] {
                 assert!(
                     child_body.contains(expected),
                     "child request should inherit the parent's full native surface, missing {expected:?}: {child_body}"
                 );
             }
+            assert_eq!(
+                child_body.matches("\"name\":\"task_control\"").count(),
+                1,
+                "the child's own execution-scoped task_control must not be joined by \
+                 the main-scoped one: {child_body}"
+            );
             child
                 .set_read_timeout(Some(stall_timeout))
                 .expect("child close timeout should be configured");

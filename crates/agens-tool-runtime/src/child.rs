@@ -181,6 +181,9 @@ pub struct ProductionTaskExecutionContext<'a> {
     /// Builds this execution's prompter onto the parent's surface. `None` is a
     /// delegation with nobody to ask.
     pub permission_prompter: Option<crate::runner::PrompterFactory>,
+    /// Where this execution sits in the delegation chain. The parent turn is
+    /// 0, so its own children are 1.
+    pub depth: usize,
 }
 
 pub fn run_production_task(
@@ -198,6 +201,7 @@ pub fn run_production_task(
         execution_id,
         mcp_registry,
         permission_prompter,
+        depth,
     } = context;
     let messages = vec![
         Message {
@@ -240,7 +244,17 @@ pub fn run_production_task(
         task_registry.clone(),
         execution_id,
         Some(skills.catalog()),
-        mcp_registry,
+        mcp_registry.clone(),
+        Some(crate::runtime::ChildDelegation {
+            bootstrap,
+            depth,
+            parent: crate::task::TaskParentSelection {
+                model: request.model().to_owned(),
+                request_config: request.request_config().clone(),
+                diagnostic_reference: Some(diagnostic_reference.to_owned()),
+            },
+            permission_prompter: permission_prompter.clone(),
+        }),
     )
     .map_err(|_| ChildRunError::Runtime)?;
     let diagnostic_store = diagnostic_store(bootstrap);
@@ -657,6 +671,7 @@ mod tests {
                 &crate::child_catalog::resolve_child_surface(&[], &[], &[]).unwrap(),
                 TaskExecutionRegistry::new(),
                 agens_tools::TaskExecutionId::from_value(1),
+                None,
                 None,
                 None,
             )
@@ -1082,6 +1097,7 @@ mod tests {
             &surface,
             registry.clone(),
             execution_id,
+            None,
             None,
             None,
         )

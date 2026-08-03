@@ -205,6 +205,31 @@ pub fn register_production_task_tool<R: TaskRunner>(
     parent: TaskParentSelection,
     task_runner: R,
 ) -> Result<(), CliError> {
+    register_task_tool(
+        bootstrap,
+        project_root,
+        skills,
+        dispatcher,
+        provider_tools,
+        parent,
+        task_runner,
+        Some(TaskMessageSource::Main),
+    )
+}
+
+/// `coordination` names the scope the `task_control`/`task_message` pair
+/// should target, or `None` where the caller already holds its own pair.
+#[allow(clippy::too_many_arguments)]
+fn register_task_tool<R: TaskRunner>(
+    bootstrap: &Bootstrap,
+    project_root: &Path,
+    skills: &SkillCatalog,
+    dispatcher: &mut ToolDispatcher,
+    provider_tools: &mut BTreeMap<String, OpenAiFunctionTool>,
+    parent: TaskParentSelection,
+    task_runner: R,
+    coordination: Option<TaskMessageSource>,
+) -> Result<(), CliError> {
     let available_models = task_model_catalog(bootstrap)?;
     let validator = TaskModelValidator::new(&available_models);
     let agents = resolved_task_agents(bootstrap, project_root, &parent)?;
@@ -261,11 +286,38 @@ pub fn register_production_task_tool<R: TaskRunner>(
         .register_native("native::task", agens_core::ToolAccess::Write, task)
         .map_err(|_| CliError::configuration("tool catalog is invalid"))?;
 
-    register_task_coordination_tools(
+    let Some(source) = coordination else {
+        return Ok(());
+    };
+    register_task_coordination_tools(dispatcher, provider_tools, task_registry, source)
+}
+
+/// Registers `task` for a delegated runtime that already holds its own
+/// coordination tools.
+///
+/// A child's `task_control` is bound to its own execution; the pair
+/// [`register_production_task_tool`] adds is bound to `Main`. Registering both
+/// replaces the first with the second, so the child would be able to control
+/// the main thread and no longer able to control itself — the opposite of what
+/// either tool is for.
+pub fn register_delegating_task_tool<R: TaskRunner>(
+    bootstrap: &Bootstrap,
+    project_root: &Path,
+    skills: &SkillCatalog,
+    dispatcher: &mut ToolDispatcher,
+    provider_tools: &mut BTreeMap<String, OpenAiFunctionTool>,
+    parent: TaskParentSelection,
+    task_runner: R,
+) -> Result<(), CliError> {
+    register_task_tool(
+        bootstrap,
+        project_root,
+        skills,
         dispatcher,
         provider_tools,
-        task_registry,
-        TaskMessageSource::Main,
+        parent,
+        task_runner,
+        None,
     )
 }
 

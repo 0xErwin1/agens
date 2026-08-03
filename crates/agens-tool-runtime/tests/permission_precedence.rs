@@ -2073,6 +2073,7 @@ fn registered_child_native_access() -> Vec<(String, ToolAccess)> {
         execution,
         None,
         None,
+        None,
     )
     .expect("the child runtime must build");
 
