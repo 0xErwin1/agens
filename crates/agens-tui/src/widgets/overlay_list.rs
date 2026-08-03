@@ -40,6 +40,18 @@ const SEARCH_LABEL: &str = "/ ";
 const SEARCH_CURSOR: &str = "▏";
 const SEARCH_HINT: &str = "type to filter · esc to exit";
 
+/// Columns a row spends before and after its label in the worst case: the
+/// selection marker, plus the scrollbar gutter the list claims once it
+/// scrolls.
+///
+/// A caller whose label merely has to be readable can ignore this and let
+/// truncation happen. A caller that must keep one specific character of its
+/// label on screen — a caret the reader is typing at — budgets against it
+/// instead, and accepts spending the gutter's two columns even on the frames
+/// where the list does not scroll, because the alternative is a caret that
+/// disappears exactly when the list grows.
+pub(crate) const ROW_LABEL_RESERVE: u16 = MARKER_COLUMNS as u16 + SCROLLBAR_COLUMNS;
+
 /// One list row: left label, optional right-aligned metadata, optional badge.
 #[derive(Default)]
 pub(crate) struct OverlayRow<'a> {

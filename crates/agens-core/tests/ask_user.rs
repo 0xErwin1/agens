@@ -701,7 +701,6 @@ fn terminal_replies_other_than_answered_and_discuss_are_always_valid() {
     let request = valid_request();
 
     assert!(request.validate_reply(&AskUserReply::Cancelled).is_ok());
-    assert!(request.validate_reply(&AskUserReply::Expired).is_ok());
     assert!(
         request
             .validate_reply(&AskUserReply::Unavailable(

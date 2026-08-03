@@ -546,7 +546,7 @@ mod tests {
             label: "navigate",
         },
         OverlayShortcut {
-            key: "⏎",
+            key: "Enter",
             label: "run",
         },
         OverlayShortcut {

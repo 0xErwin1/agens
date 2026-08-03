@@ -28,7 +28,13 @@ const ASK_USER_CONTEXT_PAGE_STEP: u16 = 10;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AskUserRow {
     Option(usize),
-    Submit,
+    /// The row that carries the interaction forward: the next question while
+    /// any remain, and the submission itself on the last one. It is a single
+    /// row rather than two because its position never moves — the reader's
+    /// hand learns one place to press Enter — while what pressing it means is
+    /// exactly the difference between "there is more to answer" and "there is
+    /// not".
+    Proceed,
     Discuss,
     Cancel,
 }
@@ -63,6 +69,7 @@ pub struct AskUserSnapshot {
     pub other: String,
     pub note: String,
     pub editing: AskUserEditing,
+    pub entry_cursor: usize,
     pub incomplete: Option<usize>,
     pub discuss_available: bool,
     pub context_scroll: u16,
@@ -71,7 +78,7 @@ pub struct AskUserSnapshot {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AskUserRowSnapshot {
     Option(usize),
-    Submit,
+    Proceed,
     Discuss,
     Cancel,
 }
@@ -87,7 +94,7 @@ impl From<AskUserRow> for AskUserRowSnapshot {
     fn from(row: AskUserRow) -> Self {
         match row {
             AskUserRow::Option(index) => Self::Option(index),
-            AskUserRow::Submit => Self::Submit,
+            AskUserRow::Proceed => Self::Proceed,
             AskUserRow::Discuss => Self::Discuss,
             AskUserRow::Cancel => Self::Cancel,
         }
@@ -116,6 +123,10 @@ pub(crate) struct AskUserState {
     other: Vec<String>,
     notes: Vec<String>,
     entry: AskUserEntry,
+    /// Where the caret sits in the buffer [`Self::entry`] names, as a `char`
+    /// index. Only meaningful while a buffer is open; opening one places it at
+    /// the end of whatever is already typed.
+    entry_cursor: usize,
     /// The option whose context the pane is showing.
     ///
     /// Tracked separately from [`Self::row`] so walking down to the action rows
@@ -138,6 +149,7 @@ impl AskUserState {
             question: 0,
             row: AskUserRow::Option(0),
             entry: AskUserEntry::Browsing,
+            entry_cursor: 0,
             context_option: 0,
             context_scroll: 0,
             incomplete: None,
@@ -174,6 +186,10 @@ impl AskUserState {
 
     pub(crate) const fn entry(&self) -> AskUserEntry {
         self.entry
+    }
+
+    pub(crate) const fn entry_cursor(&self) -> usize {
+        self.entry_cursor
     }
 
     pub(crate) const fn context_option(&self) -> usize {
@@ -216,6 +232,7 @@ impl AskUserState {
             other: self.other[self.question].clone(),
             note: self.notes[self.question].clone(),
             editing: self.entry.into(),
+            entry_cursor: self.entry_cursor,
             incomplete: self.incomplete,
             discuss_available: self.current_allows_discuss(),
             context_scroll: self.context_scroll,
@@ -235,17 +252,34 @@ impl AskUserState {
         self.reduce_browse_mode(key, max_context_scroll)
     }
 
+    /// Reduces one key while a free-form buffer is open.
+    ///
+    /// The editing keys are the composer's, resolved through the same
+    /// [`Key::composer_equivalent`] mapping, because a text field that silently
+    /// drops the motions a reader's hands already know is a text field they
+    /// cannot see what they are typing in. `Home`/`End` therefore move the
+    /// caret here rather than paging the context beside it — the pane keeps
+    /// `PageUp`/`PageDown`, which no text field claims.
     fn reduce_entry_mode(&mut self, key: Key, max_context_scroll: u16) -> AskUserOutcome {
-        match key {
+        let cursor = self.entry_cursor;
+        match key.composer_equivalent() {
             Key::Char(character) => self.type_char(character),
-            Key::Backspace | Key::Delete => self.backspace(),
-            Key::DeleteToLineStart => self.clear_buffer(),
+            Key::Backspace => self.delete_range(cursor.saturating_sub(1), cursor),
+            Key::Delete => self.delete_range(cursor, cursor.saturating_add(1)),
+            Key::DeletePreviousWord => self.delete_range(self.previous_word(), cursor),
+            Key::DeleteNextWord => self.delete_range(cursor, self.next_word()),
+            Key::DeleteToLineStart => self.delete_range(0, cursor),
+            Key::DeleteToLineEnd => self.delete_range(cursor, self.buffer_len()),
+            Key::Left => self.move_entry_cursor(cursor.saturating_sub(1)),
+            Key::Right => self.move_entry_cursor(cursor.saturating_add(1)),
+            Key::PreviousWord => self.move_entry_cursor(self.previous_word()),
+            Key::NextWord => self.move_entry_cursor(self.next_word()),
+            Key::Home | Key::LineStart => self.move_entry_cursor(0),
+            Key::End | Key::LineEnd => self.move_entry_cursor(self.buffer_len()),
             Key::Enter => self.commit_entry(),
             Key::Escape => self.escape(),
             Key::PageUp => self.scroll_context(-1, max_context_scroll),
             Key::PageDown => self.scroll_context(1, max_context_scroll),
-            Key::Home => self.scroll_context_to(0),
-            Key::End => self.scroll_context_to(max_context_scroll),
             _ => AskUserOutcome::Unchanged,
         }
     }
@@ -272,10 +306,15 @@ impl AskUserState {
 
     fn escape(&mut self) -> AskUserOutcome {
         if self.entry != AskUserEntry::Browsing {
-            self.entry = AskUserEntry::Browsing;
+            self.close_entry();
             return AskUserOutcome::Changed;
         }
         AskUserOutcome::Resolved(AskUserReply::Cancelled)
+    }
+
+    fn close_entry(&mut self) {
+        self.entry = AskUserEntry::Browsing;
+        self.entry_cursor = 0;
     }
 
     fn current_question_options_len(&self) -> usize {
@@ -302,7 +341,7 @@ impl AskUserState {
         let options = self.current_question_options_len();
         match row {
             AskUserRow::Option(index) => index,
-            AskUserRow::Submit => options,
+            AskUserRow::Proceed => options,
             AskUserRow::Discuss => options + 1,
             AskUserRow::Cancel => options + usize::from(self.current_allows_discuss()) + 1,
         }
@@ -314,7 +353,7 @@ impl AskUserState {
             return AskUserRow::Option(index);
         }
         if index == options {
-            return AskUserRow::Submit;
+            return AskUserRow::Proceed;
         }
         if self.current_allows_discuss() && index == options + 1 {
             return AskUserRow::Discuss;
@@ -347,11 +386,33 @@ impl AskUserState {
         if target == self.question {
             return AskUserOutcome::Unchanged;
         }
+        self.focus_question(target)
+    }
+
+    /// Puts the cursor on the first option of `target`, whether or not that is
+    /// the question already on screen.
+    ///
+    /// Distinct from [`Self::move_to_question`], which is navigation and so
+    /// treats "already there" as nothing to do. This is used where the point
+    /// is to put the reader in front of something specific, and landing on the
+    /// right question with the cursor still parked on a button would not be
+    /// that.
+    fn focus_question(&mut self, target: usize) -> AskUserOutcome {
+        let settled = self.question == target
+            && self.row == AskUserRow::Option(0)
+            && self.context_option == 0
+            && self.context_scroll == 0;
+
         self.question = target;
         self.row = AskUserRow::Option(0);
         self.context_option = 0;
         self.context_scroll = 0;
-        AskUserOutcome::Changed
+
+        if settled {
+            AskUserOutcome::Unchanged
+        } else {
+            AskUserOutcome::Changed
+        }
     }
 
     fn move_to_next_question_wrapping(&mut self) -> AskUserOutcome {
@@ -371,7 +432,7 @@ impl AskUserState {
     fn activate_row(&mut self) -> AskUserOutcome {
         match self.row {
             AskUserRow::Option(index) => self.toggle_or_select(index),
-            AskUserRow::Submit => self.submit(),
+            AskUserRow::Proceed => self.proceed(),
             AskUserRow::Discuss => self.discuss(),
             AskUserRow::Cancel => AskUserOutcome::Resolved(AskUserReply::Cancelled),
         }
@@ -380,7 +441,7 @@ impl AskUserState {
     fn activate_option_row(&mut self) -> AskUserOutcome {
         match self.row {
             AskUserRow::Option(index) => self.toggle_or_select(index),
-            AskUserRow::Submit | AskUserRow::Discuss | AskUserRow::Cancel => {
+            AskUserRow::Proceed | AskUserRow::Discuss | AskUserRow::Cancel => {
                 AskUserOutcome::Unchanged
             }
         }
@@ -411,15 +472,21 @@ impl AskUserState {
         if !self.current_allows_other() {
             return AskUserOutcome::Unchanged;
         }
-        self.entry = AskUserEntry::Other;
-        AskUserOutcome::Changed
+        self.open_entry(AskUserEntry::Other)
     }
 
     fn open_note(&mut self) -> AskUserOutcome {
         if !self.current_allows_note() {
             return AskUserOutcome::Unchanged;
         }
-        self.entry = AskUserEntry::Note;
+        self.open_entry(AskUserEntry::Note)
+    }
+
+    /// Opens a buffer with the caret after the text already in it, which is
+    /// where someone returning to a half-written note expects to continue.
+    fn open_entry(&mut self, entry: AskUserEntry) -> AskUserOutcome {
+        self.entry = entry;
+        self.entry_cursor = self.buffer_len();
         AskUserOutcome::Changed
     }
 
@@ -440,46 +507,77 @@ impl AskUserState {
         }
     }
 
+    fn buffer(&self) -> &str {
+        let question = self.question;
+        match self.entry {
+            AskUserEntry::Other => &self.other[question],
+            AskUserEntry::Note => &self.notes[question],
+            AskUserEntry::Browsing => "",
+        }
+    }
+
+    fn buffer_len(&self) -> usize {
+        self.buffer().chars().count()
+    }
+
+    fn previous_word(&self) -> usize {
+        crate::previous_word_boundary(self.buffer(), self.entry_cursor)
+    }
+
+    fn next_word(&self) -> usize {
+        crate::next_word_boundary(self.buffer(), self.entry_cursor)
+    }
+
+    fn move_entry_cursor(&mut self, target: usize) -> AskUserOutcome {
+        let target = target.min(self.buffer_len());
+        if target == self.entry_cursor {
+            return AskUserOutcome::Unchanged;
+        }
+        self.entry_cursor = target;
+        AskUserOutcome::Changed
+    }
+
     fn type_char(&mut self, character: char) -> AskUserOutcome {
         if character.is_control() {
             return AskUserOutcome::Unchanged;
         }
-        let max_chars = self.max_buffer_chars();
+        if self.buffer_len() >= self.max_buffer_chars() {
+            return AskUserOutcome::Unchanged;
+        }
+
+        let cursor = self.entry_cursor;
         let Some(buffer) = self.buffer_mut() else {
             return AskUserOutcome::Unchanged;
         };
-        if buffer.chars().count() >= max_chars {
-            return AskUserOutcome::Unchanged;
-        }
-        buffer.push(character);
+        let at = crate::byte_index(buffer, cursor);
+        buffer.insert(at, character);
+
+        self.entry_cursor = cursor + 1;
         AskUserOutcome::Changed
     }
 
-    fn backspace(&mut self) -> AskUserOutcome {
-        match self.buffer_mut() {
-            Some(buffer) => {
-                if buffer.pop().is_some() {
-                    AskUserOutcome::Changed
-                } else {
-                    AskUserOutcome::Unchanged
-                }
-            }
-            None => AskUserOutcome::Unchanged,
+    /// Removes the `char` range `start..end` from the open buffer and leaves
+    /// the caret where the removed text began.
+    fn delete_range(&mut self, start: usize, end: usize) -> AskUserOutcome {
+        let length = self.buffer_len();
+        let start = start.min(length);
+        let end = end.min(length);
+        if start >= end {
+            return AskUserOutcome::Unchanged;
         }
-    }
 
-    fn clear_buffer(&mut self) -> AskUserOutcome {
-        match self.buffer_mut() {
-            Some(buffer) if !buffer.is_empty() => {
-                buffer.clear();
-                AskUserOutcome::Changed
-            }
-            _ => AskUserOutcome::Unchanged,
-        }
+        let Some(buffer) = self.buffer_mut() else {
+            return AskUserOutcome::Unchanged;
+        };
+        let range = crate::byte_index(buffer, start)..crate::byte_index(buffer, end);
+        buffer.replace_range(range, "");
+
+        self.entry_cursor = start;
+        AskUserOutcome::Changed
     }
 
     fn commit_entry(&mut self) -> AskUserOutcome {
-        self.entry = AskUserEntry::Browsing;
+        self.close_entry();
         self.clear_incomplete_if_resolved();
         AskUserOutcome::Changed
     }
@@ -523,14 +621,41 @@ impl AskUserState {
         (0..self.request.questions().len()).find(|index| !self.question_is_answered(*index))
     }
 
+    pub(crate) fn is_last_question(&self) -> bool {
+        self.question + 1 == self.request.questions().len()
+    }
+
+    /// Carries the interaction forward from the proceed row.
+    ///
+    /// On any question but the last this only advances; it deliberately does
+    /// not refuse an unanswered question, because the reader may well be
+    /// walking the set to read it before deciding, and the completeness check
+    /// still runs — once — where the interaction actually ends.
+    fn proceed(&mut self) -> AskUserOutcome {
+        if self.is_last_question() {
+            return self.submit();
+        }
+        self.move_to_next_question()
+    }
+
+    /// Ends the interaction, or moves to whatever is stopping it from ending.
+    ///
+    /// Naming the unanswered question is not enough once submission lives on
+    /// the last question: the reader would be told "answer question 2 first"
+    /// while standing on question 5, and left to find it. The cursor goes
+    /// there, and the flag stays to say why the view moved.
     fn submit(&mut self) -> AskUserOutcome {
         if let Some(index) = self.first_incomplete() {
-            if self.incomplete == Some(index) {
+            let repeated = self.incomplete == Some(index);
+            self.incomplete = Some(index);
+
+            let moved = self.focus_question(index);
+            if repeated && matches!(moved, AskUserOutcome::Unchanged) {
                 return AskUserOutcome::Unchanged;
             }
-            self.incomplete = Some(index);
             return AskUserOutcome::Changed;
         }
+
         self.incomplete = None;
         AskUserOutcome::Resolved(AskUserReply::Answered(self.build_answers()))
     }

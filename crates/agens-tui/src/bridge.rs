@@ -194,16 +194,21 @@ impl TuiAskUserBridge {
         (Self { requests, state }, receiver)
     }
 
-    /// Parks the calling thread until the request is answered, cancelled,
-    /// expired, or the surface disconnects.
+    /// Parks the calling thread until the request is answered, cancelled, or
+    /// the surface disconnects.
+    ///
+    /// The deadline `cancellation` may carry is deliberately never read. A
+    /// question is blocking without qualification: the only things that may
+    /// end one are the person answering it, the person cancelling, and the
+    /// surface going away. This holds even when the caller hands over a
+    /// cancellation whose deadline has already passed, so no future caller can
+    /// reintroduce a timeout by supplying one.
     ///
     /// Exactly-once resolution falls out of `reply` removing the pending
     /// sender under one mutex: whichever caller — this loop reacting to
-    /// cancellation or deadline, or an external `reply` carrying the user's
-    /// answer — reaches `pending.remove` first is the only one whose value
-    /// is ever sent. Cancellation is checked before the deadline, both here
-    /// and on every poll, so a cancelled turn is never reported as a
-    /// timeout.
+    /// cancellation, or an external `reply` carrying the user's answer —
+    /// reaches `pending.remove` first is the only one whose value is ever
+    /// sent.
     pub fn wait_for_reply(
         &self,
         request: AskUserRequest,
@@ -214,9 +219,6 @@ impl TuiAskUserBridge {
         }
         if cancellation.is_cancelled() {
             return AskUserReply::Cancelled;
-        }
-        if cancellation.is_expired() {
-            return AskUserReply::Expired;
         }
 
         let id = self.state.next_id.fetch_add(1, Ordering::Relaxed);
@@ -238,9 +240,6 @@ impl TuiAskUserBridge {
             if cancellation.is_cancelled() {
                 return self.resolve_or_defer_to_committed(id, AskUserReply::Cancelled, &receiver);
             }
-            if cancellation.is_expired() {
-                return self.resolve_or_defer_to_committed(id, AskUserReply::Expired, &receiver);
-            }
 
             match receiver.recv_timeout(RETRY_QUANTUM) {
                 Ok(reply) => return reply,
@@ -256,8 +255,8 @@ impl TuiAskUserBridge {
     /// committed a moment earlier — in which case that value, sitting
     /// unread in `receiver`, is returned instead.
     ///
-    /// Without this, a self-triggered resolution (cancellation or deadline
-    /// observed by this very loop) would call `reply` purely to release the
+    /// Without this, a self-triggered resolution (cancellation or a closed
+    /// surface observed by this very loop) would call `reply` purely to release the
     /// pending entry, ignore whether it actually won, and return its own
     /// `outcome` regardless. If an external `reply` had committed a moment
     /// earlier — the real answer already sitting in `receiver` — that value
@@ -394,6 +393,23 @@ mod tests {
         AskUserRequest::new(None, vec![question]).expect("valid request")
     }
 
+    /// Waits for the waiter thread to register `id` as pending, and gives up
+    /// rather than spinning forever.
+    ///
+    /// The bound is what makes this usable as a regression guard: a bridge that
+    /// resolved the request behind the test's back would never register it, and
+    /// an unbounded spin would hang the suite instead of reporting which
+    /// property broke.
+    fn await_pending(bridge: &TuiAskUserBridge, id: u64) {
+        for _ in 0..1_000 {
+            if bridge.is_pending(id) {
+                return;
+            }
+            thread::sleep(super::RETRY_QUANTUM);
+        }
+        panic!("the request never parked: it was resolved without anyone answering it");
+    }
+
     fn answered_reply() -> AskUserReply {
         AskUserReply::Answered(vec![AskUserAnswer {
             question_id: "plan".into(),
@@ -418,20 +434,15 @@ mod tests {
         );
     }
 
-    /// The spec's scenario is a prompt that genuinely parks — has an open
-    /// question a person could still be mid-edit on — whose deadline then
-    /// fires while it is parked, not one that is already expired before it
-    /// ever reaches the bridge. `with_deadline(0)` (the old shape of this
-    /// test) never parks at all: the upfront check in `wait_for_reply`
-    /// short-circuits before the request is even sent, so there is no
-    /// pending entry and nothing genuinely unsent for the assertion to be
-    /// about.
+    /// The deadline here is already in the past before the request is even
+    /// sent, which is the harshest form of the guarantee: not "the clock had
+    /// not run out yet" but "the clock ran out and it changed nothing". Every
+    /// poll of the wait loop sees an expired cancellation and must still park.
     #[test]
-    fn a_parked_request_that_expires_resolves_expired_exactly_once_with_no_partial_content() {
+    fn an_expired_deadline_never_resolves_a_parked_question() {
         let (bridge, receiver) = TuiAskUserBridge::channel();
-        let cancellation = agens_core::HeadlessTurnCancellation::with_deadline(
-            std::time::Duration::from_millis(15),
-        );
+        let cancellation =
+            agens_core::HeadlessTurnCancellation::with_deadline(std::time::Duration::ZERO);
         let waiting_bridge = bridge.clone();
 
         let waiter = thread::spawn(move || {
@@ -440,31 +451,30 @@ mod tests {
 
         let request = receiver
             .recv()
-            .expect("the request should genuinely park before its deadline fires");
+            .expect("an already-expired deadline must not stop the request from parking");
+        await_pending(&bridge, request.id());
+
+        thread::sleep(super::RETRY_QUANTUM * 20);
         assert!(
             bridge.is_pending(request.id()),
-            "this must be a real parked request with unsent input, not an upfront rejection"
+            "the question must still be waiting on a person long after its deadline passed"
         );
 
-        let reply = waiter.join().expect("waiter thread should not panic");
-
-        assert_eq!(reply, AskUserReply::Expired);
         assert!(
-            !bridge.is_pending(request.id()),
-            "expiry must resolve the request so no answer, free text, or note can be attached later"
+            bridge.reply(request.id(), answered_reply()),
+            "the person's answer must still be accepted once the deadline is irrelevant"
         );
-        assert!(
-            !bridge.reply(request.id(), answered_reply()),
-            "a reply arriving after expiry must never turn an expired request into an answered one"
+        assert_eq!(
+            waiter.join().expect("waiter thread should not panic"),
+            answered_reply()
         );
     }
 
     #[test]
-    fn cancellation_wins_over_a_simultaneously_expired_deadline() {
+    fn cancellation_still_ends_a_question_carrying_an_expired_deadline() {
         let (bridge, _receiver) = TuiAskUserBridge::channel();
-        let cancellation = agens_core::HeadlessTurnCancellation::with_deadline(
-            std::time::Duration::from_millis(0),
-        );
+        let cancellation =
+            agens_core::HeadlessTurnCancellation::with_deadline(std::time::Duration::ZERO);
         cancellation.cancel();
 
         let reply = bridge.wait_for_reply(single_question_request(), &cancellation);
