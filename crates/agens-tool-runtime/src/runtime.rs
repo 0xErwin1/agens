@@ -310,12 +310,18 @@ pub fn production_dangerous_child_tool_runtime(
     Ok((provider_tools, Arc::new(Mutex::new(dispatcher))))
 }
 
+/// `skills` is the catalog the child's `skill` tool reads from. A child that
+/// is handed none holds the tool over an empty catalog rather than not holding
+/// it: "this agent has no skills installed" and "this agent cannot load the
+/// skills its own instructions name" are different failures, and only the
+/// first one is a configuration.
 pub fn production_child_tool_runtime(
     project_root: &Path,
     tool_limits: ToolLimitSettings,
     surface: &crate::child_catalog::ChildToolSurface,
     task_registry: TaskExecutionRegistry,
     execution_id: agens_tools::TaskExecutionId,
+    skills: Option<&SkillCatalog>,
 ) -> Result<(Vec<OpenAiFunctionTool>, SharedToolDispatcher), CliError> {
     let catalog = Arc::new(Mutex::new(NativeToolCatalog::new(open_native_tools(
         project_root,
@@ -347,6 +353,24 @@ pub fn production_child_tool_runtime(
     }
 
     let holds = |tool: &str| surface.coordination_tools.contains(&tool);
+
+    if holds("native::skill") {
+        provider_tools.push(
+            OpenAiFunctionTool::new(
+                "skill",
+                "Load selected skill instructions or a declared reference, script, or asset as text",
+                SkillResourceTool::input_schema(),
+            )
+            .map_err(|_| CliError::configuration("skill tool is unavailable"))?,
+        );
+        dispatcher
+            .register_native(
+                "native::skill",
+                agens_core::ToolAccess::ReadOnly,
+                SkillResourceTool::new(skills.cloned().unwrap_or_default(), project_root),
+            )
+            .map_err(|_| CliError::configuration("tool catalog is invalid"))?;
+    }
 
     if holds("native::task_control") {
         provider_tools.push(
@@ -540,6 +564,87 @@ mod tests {
         std::fs::remove_dir_all(temporary).unwrap();
     }
 
+    /// Holding `skill` is only half of it: the tool has to read the same
+    /// installation the parent reads, or an agent told to open its own skill
+    /// still cannot. This drives the catalog in through the runtime rather
+    /// than asserting the tool name is present, because the name was never the
+    /// part that was missing.
+    #[test]
+    fn a_child_can_load_a_skill_from_the_catalog_it_was_given() {
+        let temporary = tui_session_directory("child-skill-load");
+        let project_root = temporary.join("project");
+        let skills_root = temporary.join("skills");
+        std::fs::create_dir_all(project_root.join(agens_tools::PROJECT_SKILLS_DIRECTORY)).unwrap();
+        std::fs::create_dir_all(skills_root.join("sdd-apply")).unwrap();
+        std::fs::write(
+            skills_root.join("sdd-apply").join("SKILL.md"),
+            "---\nname: sdd-apply\ndescription: apply phase\n---\n\nRED then GREEN.\n",
+        )
+        .unwrap();
+
+        let skills = agens_tools::SkillCatalog::discover(
+            skills_root,
+            project_root.join(agens_tools::PROJECT_SKILLS_DIRECTORY),
+        )
+        .expect("the skill catalog must discover")
+        .catalog()
+        .clone();
+
+        let surface = crate::child_catalog::resolve_child_surface(&[], &[]).unwrap();
+        let task_registry = TaskExecutionRegistry::new();
+        let execution_id = task_registry.admit(TaskLaunchMode::Foreground).unwrap();
+        let (tools, dispatcher) = production_child_tool_runtime(
+            &project_root,
+            ToolLimitSettings::default(),
+            &surface,
+            task_registry,
+            execution_id,
+            Some(&skills),
+        )
+        .unwrap();
+
+        assert!(
+            tools.iter().any(|tool| tool.name() == "skill"),
+            "the child must be offered the skill tool"
+        );
+
+        // Authorized through the child's own policy and an ordinary session,
+        // so this also pins that the surface authorizes `skill` rather than
+        // leaving it registered and undecided.
+        let policy = PermissionPolicy::new(PermissionMode::Edit, surface.rules.clone());
+        let cancellation = HeadlessTurnCancellation::new();
+        let context = ToolExecutionContext::from_headless_adapter(cancellation.adapter_view());
+        let mut dispatcher = dispatcher.lock().expect("dispatcher must be available");
+        let ToolEvaluationOutcome::Authorized(handle) = dispatcher
+            .evaluate(
+                &policy,
+                &[],
+                &PermissionSession::new(),
+                ToolDispatchRequest::new(
+                    "project",
+                    "native::skill",
+                    serde_json::json!({"skill": "sdd-apply"}),
+                ),
+            )
+            .expect("the child's skill call must evaluate")
+        else {
+            panic!("a delegated child must be authorized to load its own skill");
+        };
+
+        let output = dispatcher
+            .execute(handle, &context)
+            .expect("the child's skill tool must execute");
+
+        assert!(
+            output.content.contains("RED then GREEN"),
+            "the child must read the same skill body the parent would: {}",
+            output.content
+        );
+
+        drop(dispatcher);
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
     #[test]
     fn child_catalog_inherits_the_parents_surface_by_default() {
         let temporary = tui_session_directory("child-catalog-default");
@@ -555,6 +660,7 @@ mod tests {
             &surface,
             task_registry,
             execution_id,
+            None,
         )
         .unwrap();
 
@@ -571,6 +677,7 @@ mod tests {
                 "bash",
                 "git_read",
                 "webfetch",
+                "skill",
                 "task_control",
                 "task_message",
             ]
@@ -627,6 +734,7 @@ mod tests {
             &surface,
             task_registry,
             execution_id,
+            None,
         )
         .unwrap();
 
@@ -639,6 +747,7 @@ mod tests {
                 "grep",
                 "glob",
                 "git_read",
+                "skill",
                 "task_control",
                 "task_message",
             ]
@@ -686,6 +795,7 @@ mod tests {
             &surface,
             task_registry,
             execution_id,
+            None,
         )
         .unwrap();
 
@@ -1066,6 +1176,7 @@ mod tests {
             &surface,
             task_registry,
             execution_id,
+            None,
         )
         .unwrap();
         assert!(child_tools.iter().all(|tool| tool.name() != "ask_user"));

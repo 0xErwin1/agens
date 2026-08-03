@@ -1493,15 +1493,34 @@ fn configured_parent_policy(
     (policy, identity)
 }
 
+/// Both paths must read a declaration the same way. The one place they are
+/// allowed to part is where no declaration reads at all: the parent turns an
+/// undecided call into a question, and a delegated execution has no surface to
+/// put a question on, so the child decides it instead of stalling on a prompt
+/// nobody can answer.
+///
+/// That exemption is deliberately narrow — it applies only where the parent
+/// itself reached `Ask`, and only to turn it into `Allow`. Any other
+/// divergence, in either direction, is the two paths disagreeing about what a
+/// rule means, which is the thing this table exists to catch.
 #[test]
 fn the_child_path_and_the_parent_path_decide_every_declaration_shape_identically() {
     let mut disagreements = Vec::new();
+    let mut undecided = 0usize;
 
     for case in CASES {
         let declarations = parsed_declarations(case.declarations);
 
         let child = child_decision(&declarations, case.tool, case.target, case.path);
         let parent = parent_decision(&declarations, case.tool, case.target, case.path);
+
+        if parent == case.expected
+            && parent == PermissionDecision::Ask
+            && child == PermissionDecision::Allow
+        {
+            undecided += 1;
+            continue;
+        }
 
         if child != case.expected || parent != case.expected {
             disagreements.push(format!(
@@ -1517,6 +1536,11 @@ fn the_child_path_and_the_parent_path_decide_every_declaration_shape_identically
         disagreements.len(),
         CASES.len(),
         disagreements.join("\n")
+    );
+    assert!(
+        undecided > 0,
+        "the table must still cover calls no declaration decides, or the one sanctioned \
+         difference between the two paths is going untested"
     );
 }
 
@@ -2046,6 +2070,7 @@ fn registered_child_native_access() -> Vec<(String, ToolAccess)> {
         &surface,
         registry,
         execution,
+        None,
     )
     .expect("the child runtime must build");
 
@@ -2160,7 +2185,7 @@ fn every_native_registered_beside_the_catalog_is_named_by_the_list_that_resolves
     );
     assert_eq!(
         beside(child.clone()),
-        agens_tool_runtime::child_catalog::CHILD_COORDINATION_TOOLS,
+        agens_tool_runtime::child_catalog::CHILD_NON_CATALOG_TOOLS,
         "a native a child registers outside the catalog has to be named where declarations are \
          expanded"
     );
@@ -2192,7 +2217,7 @@ fn every_native_registered_beside_the_catalog_is_named_by_the_list_that_resolves
 /// unmatched override, the session's bypass and the mode, none of which read
 /// access; and the automatic grant a delegated subagent runs under is a list of
 /// names in `child_catalog` rather than a class — `AUTO_ALLOW_NATIVE_TOOLS`'
-/// six, plus whichever of the two `CHILD_COORDINATION_TOOLS` this delegation's
+/// six, plus whichever of the two `CHILD_NON_CATALOG_TOOLS` this delegation's
 /// own rules leave reachable, so eight at most and six at least. It excludes
 /// `native::webfetch` precisely because that tool is `ReadOnly` and the class
 /// is the wrong predicate for it.
@@ -2245,7 +2270,7 @@ fn every_native_beside_the_catalog_has_its_access_written_down_and_held_by_the_c
     );
 
     let child = registered_child_native_access();
-    for tool in agens_tool_runtime::child_catalog::CHILD_COORDINATION_TOOLS {
+    for tool in agens_tool_runtime::child_catalog::CHILD_NON_CATALOG_TOOLS {
         let expected = ACCESS_OF_THE_NATIVES_REGISTERED_BESIDE_THE_CATALOG
             .iter()
             .find(|(name, _)| *name == tool)
