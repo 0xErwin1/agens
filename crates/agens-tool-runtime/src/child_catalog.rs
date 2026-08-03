@@ -65,9 +65,24 @@ const AUTO_ALLOW_NATIVE_TOOLS: [&str; 6] = [
     "native::git_read",
 ];
 
+/// Native tools a delegated child holds beside the catalog's. Their
+/// implementations are bound to the execution they coordinate rather than to
+/// the worktree, so the child's runtime constructs and registers them itself
+/// instead of reading them out of [`NativeToolCatalog::metadata`].
+///
+/// They are enumerated here all the same, because a declaration is resolved
+/// against whatever this module calls the child's surface. A tool the surface
+/// omits is a tool no declaration can name — the rule survives as a pattern
+/// that never matches the dispatcher identity, and reads as enforced while
+/// deciding nothing.
+pub const CHILD_COORDINATION_TOOLS: [&str; 2] = ["native::task_control", "native::task_message"];
+
 #[derive(Debug)]
 pub struct ChildToolSurface {
     pub tools: Vec<NativeToolMetadata>,
+    /// The coordination tools the declarations leave reachable, in
+    /// [`CHILD_COORDINATION_TOOLS`] order.
+    pub coordination_tools: Vec<&'static str>,
     pub rules: Vec<PermissionRule>,
     pub configured_floor: ConfiguredFloor,
 }
@@ -95,33 +110,38 @@ pub fn resolve_child_surface(
     declarations: &[PermissionRule],
 ) -> Result<ChildToolSurface, ChildSurfaceRejection> {
     let metadata = NativeToolCatalog::metadata();
+    let surface = metadata
+        .iter()
+        .map(|entry| entry.qualified_name.as_str())
+        .chain(CHILD_COORDINATION_TOOLS)
+        .collect::<Vec<_>>();
 
     let parent_rules = parent_rules
         .iter()
         .cloned()
-        .flat_map(|rule| normalize_declared_tool(rule, &metadata))
+        .flat_map(|rule| normalize_declared_tool(rule, &surface))
         .collect::<Vec<_>>();
 
     for declaration in declarations {
         if declaration.decision != PermissionDecision::Allow {
             continue;
         }
-        if !metadata
+        if !surface
             .iter()
-            .any(|entry| declaration_names_tool(declaration, entry))
+            .any(|tool| declaration_names_tool(declaration, tool))
         {
             return Err(ChildSurfaceRejection {
                 reason: TaskDeclarationRejection::ExceedsParentSurface,
                 tool: declaration_tool_label(&declaration.tool),
             });
         }
-        if let Some(entry) = metadata.iter().find(|entry| {
-            declaration_names_tool(declaration, entry)
-                && declarations_deny_every_target(&parent_rules, &entry.qualified_name)
+        if let Some(tool) = surface.iter().find(|tool| {
+            declaration_names_tool(declaration, tool)
+                && declarations_deny_every_target(&parent_rules, tool)
         }) {
             return Err(ChildSurfaceRejection {
                 reason: TaskDeclarationRejection::ConfigurationDenies,
-                tool: entry.qualified_name.clone(),
+                tool: (*tool).to_owned(),
             });
         }
     }
@@ -129,19 +149,25 @@ pub fn resolve_child_surface(
     let normalized_declarations = declarations
         .iter()
         .cloned()
-        .flat_map(|declaration| normalize_declared_tool(declaration, &metadata))
+        .flat_map(|declaration| normalize_declared_tool(declaration, &surface))
         .collect::<Vec<_>>();
+    let reachable = |tool: &str| {
+        !declarations_deny_every_target(&normalized_declarations, tool)
+            && !declarations_deny_every_target(&parent_rules, tool)
+    };
 
     let tools = metadata
         .into_iter()
-        .filter(|entry| {
-            !declarations_deny_every_target(&normalized_declarations, &entry.qualified_name)
-                && !declarations_deny_every_target(&parent_rules, &entry.qualified_name)
-        })
+        .filter(|entry| reachable(&entry.qualified_name))
+        .collect::<Vec<_>>();
+    let coordination_tools = CHILD_COORDINATION_TOOLS
+        .into_iter()
+        .filter(|tool| reachable(tool))
         .collect::<Vec<_>>();
 
     let mut rules = AUTO_ALLOW_NATIVE_TOOLS
         .into_iter()
+        .chain(coordination_tools.iter().copied())
         .map(|tool| {
             PermissionRule::global(
                 PermissionDecision::Allow,
@@ -154,17 +180,17 @@ pub fn resolve_child_surface(
 
     Ok(ChildToolSurface {
         tools,
+        coordination_tools,
         rules,
         configured_floor: ConfiguredFloor::restricting(parent_rules),
     })
 }
 
-fn declaration_names_tool(declaration: &PermissionRule, entry: &NativeToolMetadata) -> bool {
-    let bare = entry
-        .qualified_name
+fn declaration_names_tool(declaration: &PermissionRule, qualified_name: &str) -> bool {
+    let bare = qualified_name
         .strip_prefix("native::")
-        .unwrap_or(entry.qualified_name.as_str());
-    declaration.tool.matches(&entry.qualified_name) || declaration.tool.matches(bare)
+        .unwrap_or(qualified_name);
+    declaration.tool.matches(qualified_name) || declaration.tool.matches(bare)
 }
 
 /// A dispatched child call carries its tool identity fully qualified and
@@ -192,6 +218,10 @@ fn declaration_names_tool(declaration: &PermissionRule, entry: &NativeToolMetada
 /// implies, rather than inheriting whatever kind the raw wildcard token
 /// happened to classify as.
 ///
+/// `surface` is every native the child's dispatcher registers, not only the
+/// catalog's: a tool absent from it is one no declaration can reach, because
+/// the unexpanded pattern is never compared against a dispatcher identity.
+///
 /// A declaration matching no native tool is kept verbatim rather than dropped.
 /// `permission_rules` are shared with the primary path, where the same rule may
 /// name an MCP tool this surface never holds, so vanishing here would silently
@@ -199,16 +229,13 @@ fn declaration_names_tool(declaration: &PermissionRule, entry: &NativeToolMetada
 /// `deny` or `ask` reaches this branch — an unmatched `allow` is rejected by
 /// the subset invariant before normalization — so a retained rule can narrow
 /// and never widen.
-fn normalize_declared_tool(
-    declaration: PermissionRule,
-    metadata: &[NativeToolMetadata],
-) -> Vec<PermissionRule> {
-    let expanded = metadata
+fn normalize_declared_tool(declaration: PermissionRule, surface: &[&str]) -> Vec<PermissionRule> {
+    let expanded = surface
         .iter()
-        .filter(|entry| declaration_names_tool(&declaration, entry))
-        .map(|entry| PermissionRule {
-            tool: PermissionPattern::Exact(entry.qualified_name.clone()),
-            target: retarget_for_tool(&declaration.target, &entry.qualified_name),
+        .filter(|tool| declaration_names_tool(&declaration, tool))
+        .map(|tool| PermissionRule {
+            tool: PermissionPattern::Exact((*tool).to_owned()),
+            target: retarget_for_tool(&declaration.target, tool),
             ..declaration.clone()
         })
         .collect::<Vec<_>>();

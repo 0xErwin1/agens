@@ -1292,18 +1292,77 @@ fn configured_child_policy(
 ) -> Option<(PermissionPolicy, String)> {
     let surface = resolve_child_surface(configured, declarations).ok()?;
     let qualified = format!("native::{tool}");
-
-    surface
+    let reachable = surface
         .tools
         .iter()
         .any(|entry| entry.qualified_name == qualified)
-        .then(|| {
-            (
-                PermissionPolicy::new(PermissionMode::Edit, surface.rules)
-                    .with_configured_floor(surface.configured_floor),
-                qualified,
-            )
-        })
+        || surface
+            .coordination_tools
+            .iter()
+            .any(|name| *name == qualified);
+
+    reachable.then(|| {
+        // A dispatched child call is decided against the dispatcher's own
+        // identity string, and the dispatcher rewrites an `Exact` rule naming
+        // either spelling of a registered tool to it first. Without that step
+        // here a rule would read as inert that production honors.
+        let policy = PermissionPolicy::new(PermissionMode::Edit, surface.rules)
+            .with_configured_floor(surface.configured_floor)
+            .normalized_tool_aliases(|name| {
+                (name == tool || name == qualified).then(|| qualified.clone())
+            });
+
+        (policy, qualified)
+    })
+}
+
+/// One rule, written in an agent definition and in the operator's
+/// `[permissions]` block, has to decide the same call the same way.
+///
+/// The two spellings reach a child's policy by different routes — a declared
+/// tool name is expanded against the child's surface, a configured one is
+/// resolved against it — so a tool missing from whatever that surface
+/// enumerates makes one spelling inert while the other binds. The coordination
+/// tools are where that last happened: the child's runtime registers them
+/// beside the catalog rather than from it.
+#[test]
+fn a_declared_rule_and_a_configured_rule_decide_a_coordination_tool_identically() {
+    let mut disagreements = Vec::new();
+
+    for tool in ["task_control", "task_message"] {
+        for (spelling, expected) in [
+            ("deny", PermissionDecision::Deny),
+            ("ask", PermissionDecision::Ask),
+        ] {
+            let entry = format!("{spelling} {tool}");
+            let declared = configured_child_decision(
+                &[],
+                &parsed_declarations(&[entry.as_str()]),
+                tool,
+                "status",
+                None,
+            );
+            let configured = configured_child_decision(
+                &configured_rules(&[entry.as_str()]),
+                &[],
+                tool,
+                "status",
+                None,
+            );
+
+            if declared != expected || configured != expected {
+                disagreements.push(format!(
+                    "{entry}: expected {expected:?}, declared {declared:?}, configured {configured:?}"
+                ));
+            }
+        }
+    }
+
+    assert!(
+        disagreements.is_empty(),
+        "a rule that binds written one way must bind written the other:\n{}",
+        disagreements.join("\n")
+    );
 }
 
 fn configured_parent_decision(

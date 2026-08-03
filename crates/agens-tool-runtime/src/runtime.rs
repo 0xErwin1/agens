@@ -295,39 +295,46 @@ pub fn production_child_tool_runtime(
             .map_err(|_| CliError::configuration("tool catalog is invalid"))?;
     }
 
-    provider_tools.push(
-        OpenAiFunctionTool::new(
-            "task_control",
-            "Inspect, background, or cancel this subagent execution",
-            TaskControlTool::input_schema(),
-        )
-        .map_err(|_| CliError::configuration("task control tool is unavailable"))?,
-    );
-    provider_tools.push(
-        OpenAiFunctionTool::new(
-            "task_message",
-            "Queue a bounded coordination message for the main agent",
-            TaskMessageTool::input_schema(),
-        )
-        .map_err(|_| CliError::configuration("task message tool is unavailable"))?,
-    );
-    dispatcher
-        .register_native(
-            "native::task_control",
-            agens_core::ToolAccess::Write,
-            TaskControlTool::new(
-                task_registry.clone(),
-                TaskMessageSource::Execution(execution_id),
-            ),
-        )
-        .map_err(|_| CliError::configuration("tool catalog is invalid"))?;
-    dispatcher
-        .register_native(
-            "native::task_message",
-            agens_core::ToolAccess::Write,
-            TaskMessageTool::new(task_registry, TaskMessageSource::Execution(execution_id)),
-        )
-        .map_err(|_| CliError::configuration("tool catalog is invalid"))?;
+    let holds = |tool: &str| surface.coordination_tools.contains(&tool);
+
+    if holds("native::task_control") {
+        provider_tools.push(
+            OpenAiFunctionTool::new(
+                "task_control",
+                "Inspect, background, or cancel this subagent execution",
+                TaskControlTool::input_schema(),
+            )
+            .map_err(|_| CliError::configuration("task control tool is unavailable"))?,
+        );
+        dispatcher
+            .register_native(
+                "native::task_control",
+                agens_core::ToolAccess::Write,
+                TaskControlTool::new(
+                    task_registry.clone(),
+                    TaskMessageSource::Execution(execution_id),
+                ),
+            )
+            .map_err(|_| CliError::configuration("tool catalog is invalid"))?;
+    }
+
+    if holds("native::task_message") {
+        provider_tools.push(
+            OpenAiFunctionTool::new(
+                "task_message",
+                "Queue a bounded coordination message for the main agent",
+                TaskMessageTool::input_schema(),
+            )
+            .map_err(|_| CliError::configuration("task message tool is unavailable"))?,
+        );
+        dispatcher
+            .register_native(
+                "native::task_message",
+                agens_core::ToolAccess::Write,
+                TaskMessageTool::new(task_registry, TaskMessageSource::Execution(execution_id)),
+            )
+            .map_err(|_| CliError::configuration("tool catalog is invalid"))?;
+    }
 
     Ok((provider_tools, Arc::new(Mutex::new(dispatcher))))
 }
@@ -597,6 +604,50 @@ mod tests {
                 "{name} must be absent from a narrowed child catalog"
             );
         }
+        drop(dispatcher);
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    /// A coordination tool is registered by this function rather than read out
+    /// of the catalog, which is exactly why a declaration naming one used to
+    /// decide nothing. `deny` has to remove it as it removes any other tool.
+    #[test]
+    fn child_catalog_omits_a_declared_deny_on_a_coordination_tool() {
+        let temporary = tui_session_directory("child-catalog-coordination");
+        let project_root = temporary.join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+
+        let surface = crate::child_catalog::resolve_child_surface(
+            &[],
+            &[PermissionRule::global(
+                PermissionDecision::Deny,
+                PermissionPattern::glob("task_control").unwrap(),
+                PermissionPattern::Any,
+            )],
+        )
+        .unwrap();
+        let task_registry = TaskExecutionRegistry::new();
+        let execution_id = task_registry.admit(TaskLaunchMode::Foreground).unwrap();
+        let (tools, dispatcher) = production_child_tool_runtime(
+            &project_root,
+            ToolLimitSettings::default(),
+            &surface,
+            task_registry,
+            execution_id,
+        )
+        .unwrap();
+
+        assert!(tools.iter().all(|tool| tool.name() != "task_control"));
+        assert!(tools.iter().any(|tool| tool.name() == "task_message"));
+        let dispatcher = dispatcher.lock().unwrap();
+        assert_eq!(dispatcher.canonical_identity("native::task_control"), None);
+        assert!(
+            dispatcher
+                .canonical_identity("native::task_message")
+                .is_some(),
+            "denying one coordination tool must leave the other reachable"
+        );
         drop(dispatcher);
 
         std::fs::remove_dir_all(temporary).unwrap();

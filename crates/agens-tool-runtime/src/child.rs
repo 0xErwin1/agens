@@ -462,21 +462,9 @@ where
     } = context;
     let max_iterations = configured_task_max_iterations(&mailbox.registry);
     let mut provider = TaskMailboxProvider::new(provider, Some(mailbox.registry), mailbox.target);
-    let mut rules = surface.rules.clone();
-    rules.extend(
-        ["native::task_control", "native::task_message"]
-            .into_iter()
-            .map(|tool| {
-                PermissionRule::global(
-                    PermissionDecision::Allow,
-                    PermissionPattern::Exact(tool.into()),
-                    PermissionPattern::Any,
-                )
-            }),
-    );
     let policy = PermissionPolicy::with_safety_predicates(
         PermissionMode::Edit,
-        rules,
+        surface.rules.clone(),
         vec![SafetyPredicate::WorktreeEscape, SafetyPredicate::ChatWrite],
     )
     .with_configured_floor(surface.configured_floor.clone());
