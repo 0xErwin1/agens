@@ -1281,13 +1281,16 @@ fn configured_entries(entries: &[&str]) -> Vec<ConfigPermissionRule> {
 /// left bare, and only because the dispatcher answers to both spellings. Every
 /// other caller — a delegated child among them — is handed the name as written,
 /// so a name that stays bare is one the qualification step did not do.
+///
+/// The names are read off the registered surface rather than off the catalog,
+/// because the catalog is not the surface: four natives are registered beside
+/// it, and a rule naming one of those has the same reason to bind.
 #[test]
 fn every_native_tool_named_in_configuration_resolves_to_the_tool_it_names() {
     let mut unresolved = Vec::new();
 
-    for entry in NativeToolCatalog::metadata() {
-        let bare = entry
-            .qualified_name
+    for qualified in registered_native_surface() {
+        let bare = qualified
             .strip_prefix("native::")
             .expect("a native tool name is qualified");
         let rules = configured_permission_rules(
@@ -1297,7 +1300,7 @@ fn every_native_tool_named_in_configuration_resolves_to_the_tool_it_names() {
         )
         .expect("configured rules must resolve");
 
-        if !rules[0].tool.matches(&entry.qualified_name) {
+        if !rules[0].tool.matches(&qualified) {
             unresolved.push(bare.to_owned());
         }
     }
@@ -1380,6 +1383,12 @@ fn configured_child_policy(
 /// enumerates makes one spelling inert while the other binds. The coordination
 /// tools are where that last happened: the child's runtime registers them
 /// beside the catalog rather than from it.
+///
+/// All four routes are compared, not just the child's two. A child answers
+/// `Deny` for a tool its resolved surface omits, so the child alone would
+/// report a `deny` as binding whether or not the rule ever reached its policy —
+/// the primary path holds every coordination tool unconditionally and has no
+/// such shortcut, which is what makes the `deny` half falsifiable.
 #[test]
 fn a_declared_rule_and_a_configured_rule_decide_a_coordination_tool_identically() {
     let mut disagreements = Vec::new();
@@ -1390,32 +1399,45 @@ fn a_declared_rule_and_a_configured_rule_decide_a_coordination_tool_identically(
             ("ask", PermissionDecision::Ask),
         ] {
             let entry = format!("{spelling} {tool}");
-            let declared = configured_child_decision(
-                &[],
-                &parsed_declarations(&[entry.as_str()]),
-                tool,
-                "status",
-                None,
-            );
-            let configured = configured_child_decision(
-                &configured_rules(&[entry.as_str()]),
-                &[],
-                tool,
-                "status",
-                None,
-            );
+            let declarations = parsed_declarations(&[entry.as_str()]);
+            let decisions = [
+                (
+                    "declared, child",
+                    configured_child_decision(&[], &declarations, tool, "status", None),
+                ),
+                (
+                    "configured, child",
+                    configured_child_decision(
+                        &configured_rules(&[entry.as_str()]),
+                        &[],
+                        tool,
+                        "status",
+                        None,
+                    ),
+                ),
+                (
+                    "declared, primary",
+                    parent_decision(&declarations, tool, "status", None),
+                ),
+                (
+                    "configured, primary",
+                    configured_parent_decision(&[entry.as_str()], &[], tool, "status", None),
+                ),
+            ];
 
-            if declared != expected || configured != expected {
-                disagreements.push(format!(
-                    "{entry}: expected {expected:?}, declared {declared:?}, configured {configured:?}"
-                ));
+            for (route, decision) in decisions {
+                if decision != expected {
+                    disagreements.push(format!(
+                        "{entry} ({route}): expected {expected:?}, got {decision:?}"
+                    ));
+                }
             }
         }
     }
 
     assert!(
         disagreements.is_empty(),
-        "a rule that binds written one way must bind written the other:\n{}",
+        "a rule that binds written one way must bind written the other, on both paths:\n{}",
         disagreements.join("\n")
     );
 }
@@ -1728,9 +1750,12 @@ struct SurfaceEntry {
 /// **What is proven and what is claimed.** `decided_per_file` is executed: the
 /// row carries the call that proves it, run by
 /// [`every_tool_this_table_says_asks_per_file_withholds_a_denied_file`], and a
-/// row cannot assert the per-file question without supplying it. `matched_as`
-/// is checked against `permission_target_kind_for_tool`. The tool list is read
-/// off the production dispatchers rather than restated.
+/// row cannot assert the per-file question without supplying it.
+/// `partly_reached` is executed the same way, by
+/// [`every_tool_this_table_says_a_rule_reaches_past_its_target_is_denied_by_naming_the_file`].
+/// `matched_as` is checked against `permission_target_kind_for_tool`. The tool
+/// list is read off the production dispatchers rather than restated, across
+/// both of the configurations that change it.
 /// `returns_file_contents`, `decided_on_its_target` and `unbound` are CLAIMS,
 /// asserted against each other but against no execution: a row could assert
 /// `decided_on_its_target` for a tool whose target parses to something other
@@ -1894,8 +1919,10 @@ const TOOL_SURFACE: &[SurfaceEntry] = &[
         ),
         matched_as: None,
     },
-    // Registered directly by a delegated child's runtime. Both report on the
-    // execution rather than on the worktree.
+    // Registered directly on both paths: by a delegated child's runtime for the
+    // execution it is, and on the primary path beside `task` for the executions
+    // it launches, which is why they are on this surface at all. Both report on
+    // an execution rather than on the worktree.
     SurfaceEntry {
         tool: "native::task_control",
         returns_file_contents: false,
@@ -1916,17 +1943,28 @@ const TOOL_SURFACE: &[SurfaceEntry] = &[
     },
 ];
 
-/// Every native the production dispatchers register, gathered from the
-/// dispatchers themselves.
+/// Agent definitions that leave a session with no subagent-mode agent, by
+/// overriding both built-ins with modes that are not `subagent`.
 ///
-/// The catalog is not the surface. `skill` and `task` are registered directly
-/// beside the catalog's ten on the primary path, and a delegated child
-/// registers `task_control` and `task_message` the same way, so a table
-/// compared against `NativeToolCatalog::metadata()` leaves four tools
-/// unclassified while reading as complete.
-fn registered_native_surface() -> Vec<String> {
-    let temporary = agens_fixtures::session_directory("registered-native-surface");
-    let bootstrap = agens_fixtures::session_bootstrap(&temporary, &[]);
+/// `register_production_task_tool` returns before registering anything when no
+/// such agent exists, so this is the configuration where a parent holds neither
+/// `task` nor the two tools that coordinate a live delegation.
+const AGENTS_WITHOUT_A_SUBAGENT: [(&str, &str); 2] = [
+    (
+        "explore",
+        "---\nname: explore\ndescription: primary override\nmode: primary\npermissions: []\n---\nPrimary work.\n",
+    ),
+    (
+        "general",
+        "---\nname: general\ndescription: all override\nmode: all\npermissions: []\n---\nAll work.\n",
+    ),
+];
+
+/// The natives one production parent dispatcher registers, for a session
+/// holding `agents`.
+fn registered_parent_natives(label: &str, agents: &[(&str, &str)]) -> Vec<String> {
+    let temporary = agens_fixtures::session_directory(label);
+    let bootstrap = agens_fixtures::session_bootstrap(&temporary, agents);
     let project_root = agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap);
 
     let (_, parent) = agens_tool_runtime::runtime::production_tool_runtime_with_task_runner(
@@ -1936,6 +1974,19 @@ fn registered_native_surface() -> Vec<String> {
         InertTaskRunner,
     )
     .expect("the parent runtime must build");
+
+    let registered = sorted_native_names(&[parent]);
+    fs::remove_dir_all(temporary).unwrap();
+
+    registered
+}
+
+/// The natives the two production child dispatchers register, for a delegation
+/// no declaration narrows.
+fn registered_child_natives() -> Vec<String> {
+    let temporary = agens_fixtures::session_directory("registered-child-natives");
+    let project_root = temporary.join("project");
+    fs::create_dir_all(&project_root).unwrap();
 
     let surface = resolve_child_surface(&[], &[]).expect("the child surface must resolve");
     let registry = agens_tools::TaskExecutionRegistry::new();
@@ -1957,7 +2008,14 @@ fn registered_native_surface() -> Vec<String> {
     )
     .expect("the dangerous child runtime must build");
 
-    let mut registered = [parent, child, dangerous]
+    let registered = sorted_native_names(&[child, dangerous]);
+    fs::remove_dir_all(temporary).unwrap();
+
+    registered
+}
+
+fn sorted_native_names(dispatchers: &[Arc<Mutex<ToolDispatcher>>]) -> Vec<String> {
+    let mut registered = dispatchers
         .iter()
         .flat_map(|dispatcher| {
             dispatcher
@@ -1969,9 +2027,125 @@ fn registered_native_surface() -> Vec<String> {
     registered.sort_unstable();
     registered.dedup();
 
-    fs::remove_dir_all(temporary).unwrap();
+    registered
+}
+
+/// Every native a production dispatcher registers in any configuration,
+/// gathered from the dispatchers themselves.
+///
+/// The catalog is not the surface. `skill`, `task` and the two coordination
+/// tools are registered directly beside the catalog's ten on the primary path,
+/// and a delegated child registers the coordination pair the same way, so a
+/// table compared against `NativeToolCatalog::metadata()` leaves four tools
+/// unclassified while reading as complete.
+///
+/// Neither is one session's dispatcher the surface: what a parent registers
+/// depends on whether any subagent-mode agent exists, so this unions both
+/// configurations. Which of them contributes what is pinned by
+/// [`a_parent_holding_no_subagent_registers_the_surface_without_the_delegation_tools`].
+fn registered_native_surface() -> Vec<String> {
+    let mut registered = registered_parent_natives("registered-native-surface", &[])
+        .into_iter()
+        .chain(registered_parent_natives(
+            "registered-native-surface-no-subagent",
+            &AGENTS_WITHOUT_A_SUBAGENT,
+        ))
+        .chain(registered_child_natives())
+        .collect::<Vec<_>>();
+    registered.sort_unstable();
+    registered.dedup();
 
     registered
+}
+
+/// The two lists naming the natives registered beside the catalog have to hold
+/// what the dispatchers actually register beside it.
+///
+/// Both lists resolve names: a declaration is expanded over the child's, and a
+/// configured entry is qualified against the shared one. A tool registered
+/// without being added to them is a rule that reads as enforced and matches no
+/// dispatcher identity. Only this direction catches that — a name in a list and
+/// in no dispatcher already fails the classification above, while a name in a
+/// dispatcher and in no list failed nothing.
+#[test]
+fn every_native_registered_beside_the_catalog_is_named_by_the_list_that_resolves_it() {
+    let catalog = NativeToolCatalog::metadata()
+        .into_iter()
+        .map(|entry| entry.qualified_name)
+        .collect::<Vec<_>>();
+    let beside = |registered: Vec<String>| {
+        registered
+            .into_iter()
+            .filter(|tool| !catalog.contains(tool))
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(
+        beside(registered_native_surface()),
+        agens_tools::NATIVE_TOOLS_REGISTERED_OUTSIDE_THE_CATALOG,
+        "a native registered outside the catalog has to be named where configured rules are \
+         qualified"
+    );
+    assert_eq!(
+        beside(registered_child_natives()),
+        agens_tool_runtime::child_catalog::CHILD_COORDINATION_TOOLS,
+        "a native a child registers outside the catalog has to be named where declarations are \
+         expanded"
+    );
+}
+
+/// The probe dispatcher holds each native under the access class production
+/// holds it by, not merely under the same name.
+///
+/// Access decides what an unmatched call falls back to, so a harness holding a
+/// write tool as read-class answers a whole region of cases differently from
+/// the session it stands in for. Only the catalog's own tools can be checked
+/// this way — the four registered beside it declare their access at the
+/// registration site and have nothing to compare against.
+#[test]
+fn the_probe_dispatcher_holds_every_catalog_tool_under_its_production_access() {
+    let held = production_parent_natives();
+
+    for entry in NativeToolCatalog::metadata() {
+        assert_eq!(
+            held.iter()
+                .find(|(name, _)| *name == entry.qualified_name)
+                .map(|(_, access)| *access),
+            Some(entry.access),
+            "{} must be held under the access the catalog declares",
+            entry.qualified_name
+        );
+    }
+}
+
+/// The classified surface is a union across configurations, and this says which
+/// configuration contributes what.
+///
+/// A session with no subagent-mode agent registers strictly less: `task` never
+/// reaches the dispatcher, and neither do the two tools that coordinate a live
+/// delegation, because the same early return registers all three.
+#[test]
+fn a_parent_holding_no_subagent_registers_the_surface_without_the_delegation_tools() {
+    let delegating = registered_parent_natives("parent-with-a-subagent", &[]);
+    let alone = registered_parent_natives("parent-without-a-subagent", &AGENTS_WITHOUT_A_SUBAGENT);
+
+    assert!(
+        alone.iter().all(|tool| delegating.contains(tool)),
+        "a session with no subagent must register no tool the delegating one lacks: \
+         {alone:?} against {delegating:?}"
+    );
+    assert_eq!(
+        delegating
+            .iter()
+            .filter(|tool| !alone.contains(tool))
+            .collect::<Vec<_>>(),
+        vec![
+            "native::task",
+            "native::task_control",
+            "native::task_message"
+        ],
+        "these are exactly the tools a delegation brings with it"
+    );
 }
 
 /// The surface the table classifies has to be the surface that exists, and
@@ -2526,13 +2700,61 @@ impl agens_tools::TaskRunner for InertTaskRunner {
     }
 }
 
-/// A dispatcher holding exactly the natives a delegated child inherits, so
-/// the two paths compare over the same tool surface.
+/// The native surface a production primary agent holds, as the names and access
+/// classes read off the production dispatcher itself.
+///
+/// Built once for the whole binary: a probe dispatcher is wanted per case, and
+/// building a session's runtime for each of them would rebuild a bootstrap per
+/// row.
+fn production_parent_natives() -> &'static [(String, ToolAccess)] {
+    static SURFACE: std::sync::OnceLock<Vec<(String, ToolAccess)>> = std::sync::OnceLock::new();
+
+    SURFACE.get_or_init(|| {
+        let temporary = agens_fixtures::session_directory("production-parent-natives");
+        let bootstrap = agens_fixtures::session_bootstrap(&temporary, &[]);
+        let project_root = agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap);
+
+        let (_, parent) = agens_tool_runtime::runtime::production_tool_runtime_with_task_runner(
+            &bootstrap,
+            &project_root,
+            Some(&agens_tools::SkillCatalog::default()),
+            InertTaskRunner,
+        )
+        .expect("the parent runtime must build");
+
+        let parent = parent.lock().expect("dispatcher must be available");
+        let mut surface = parent
+            .registered_native_names()
+            .into_iter()
+            .map(|name| {
+                let access = parent
+                    .native_access(&name)
+                    .expect("a name the dispatcher reported must resolve");
+                (name, access)
+            })
+            .collect::<Vec<_>>();
+        surface.sort_by(|left, right| left.0.cmp(&right.0));
+
+        drop(parent);
+        fs::remove_dir_all(temporary).unwrap();
+
+        surface
+    })
+}
+
+/// A dispatcher holding exactly the natives a production primary agent holds,
+/// under the access classes it holds them by.
+///
+/// The two paths have to compare over the surface that exists. A harness built
+/// from `NativeToolCatalog::metadata()` holds ten, while the primary path holds
+/// fourteen — and `permission_policy` refuses a configured name its dispatcher
+/// cannot resolve, so the four it left out were names no parent-path case could
+/// even be written against.
 fn native_dispatcher() -> ToolDispatcher {
     let mut dispatcher = ToolDispatcher::new();
-    for entry in NativeToolCatalog::metadata() {
+    for (name, access) in production_parent_natives() {
         dispatcher
-            .register_native(entry.qualified_name, entry.access, InertTool)
+            .register_native(name.clone(), *access, InertTool)
             .unwrap();
     }
     dispatcher

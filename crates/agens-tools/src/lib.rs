@@ -3471,6 +3471,18 @@ impl ToolDispatcher {
             .collect()
     }
 
+    /// The access class one registered native was registered under.
+    ///
+    /// Paired with [`Self::registered_native_names`], this describes a
+    /// dispatcher's native surface without reference to any catalog — which is
+    /// what a harness modelling the production surface needs in order to model
+    /// it rather than remember it.
+    pub fn native_access(&self, qualified_name: &str) -> Option<ToolAccess> {
+        let identity = self.canonical_identity(qualified_name)?;
+
+        self.tools.get(identity).map(|registered| registered.access)
+    }
+
     pub(crate) fn capability_snapshot(&self) -> capabilities::CapabilitySnapshot {
         capabilities::CapabilitySnapshot {
             identities: self
@@ -5111,6 +5123,26 @@ fn visible_html_text(html: &str) -> String {
     }
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
+
+/// The native tools registered beside [`NativeToolCatalog::metadata`] rather
+/// than out of it.
+///
+/// Each is constructed from something the catalog holds no handle on — the
+/// skill catalog, the agent catalog, the registry a live delegation is
+/// coordinated through — so the runtime that owns those constructs and
+/// registers the tool itself. Which of them a given dispatcher ends up holding
+/// depends on what that runtime is for and on how the session is configured.
+///
+/// They are enumerated here all the same, because anything resolving a name
+/// against "the native tools" resolves it against a surface these belong to. A
+/// name left out survives as a pattern that never matches a dispatcher
+/// identity: the rule reads as enforced and decides nothing.
+pub const NATIVE_TOOLS_REGISTERED_OUTSIDE_THE_CATALOG: [&str; 4] = [
+    "native::skill",
+    "native::task",
+    "native::task_control",
+    "native::task_message",
+];
 
 /// Canonical production catalog for the built-in project-confined tools.
 #[derive(Debug)]

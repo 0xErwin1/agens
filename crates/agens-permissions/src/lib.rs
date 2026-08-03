@@ -638,16 +638,19 @@ pub fn configured_permission_rules(
 /// separately registered, and a rule naming one must never be retargeted at the
 /// other.
 ///
-/// The catalog is asked rather than a list kept here, because a list kept here
-/// qualifies whatever was remembered when it was written. Anything the catalog
-/// does not hold — an MCP tool, an already-qualified name, a typo — is left as
-/// written, for the caller to resolve or to diagnose.
+/// The surface is asked rather than a list kept here, because a list kept here
+/// qualifies whatever was remembered when it was written. The catalog alone is
+/// not that surface: `skill`, `task` and the two coordination tools are
+/// registered beside it, and a rule naming one of those has to reach it too.
+/// Anything the surface does not hold — an MCP tool, an already-qualified name,
+/// a typo — is left as written, for the caller to resolve or to diagnose.
 fn configured_tool_name(name: &str) -> Result<String, CliError> {
     let qualified = format!("native::{name}");
 
     let known = agens_tools::NativeToolCatalog::metadata()
         .iter()
-        .any(|entry| entry.qualified_name == qualified);
+        .any(|entry| entry.qualified_name == qualified)
+        || agens_tools::NATIVE_TOOLS_REGISTERED_OUTSIDE_THE_CATALOG.contains(&qualified.as_str());
 
     Ok(if known { qualified } else { name.to_owned() })
 }
