@@ -1030,6 +1030,9 @@ fn dangerous_override_never_precedes_hard_safety_or_reuses_authorization() {
     assert!(chat.prompts.is_empty());
     assert!(chat.executions.is_empty());
 
+    let missing_tool = "tool call refused: this session has no tool by that name; it was not \
+                        denied and its arguments are not at fault, so no rewriting of this call \
+                        can reach a tool; call one of the tools you were given instead";
     for (name, input, expected_content) in [
         ("native::write", "{malformed", "invalid tool arguments"),
         (
@@ -1037,8 +1040,9 @@ fn dangerous_override_never_precedes_hard_safety_or_reuses_authorization() {
             r#"{"agent":"worker","description":"recursive"}"#,
             "permission denied",
         ),
-        ("mcp::server::tool", r#"{}"#, "permission denied"),
-        ("native::unregistered", r#"{}"#, "permission denied"),
+        ("edit", r#"{"path":"notes.md"}"#, "permission denied"),
+        ("mcp::server::tool", r#"{}"#, missing_tool),
+        ("native::unregistered", r#"{}"#, missing_tool),
     ] {
         let rejected = run_production_batch_with_policy(
             ProductionBatchInput::new(

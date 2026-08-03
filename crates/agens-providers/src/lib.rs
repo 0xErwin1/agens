@@ -1541,6 +1541,7 @@ fn diagnostic_class_for_port_error(error: HeadlessTurnPortError) -> ProviderDiag
         | HeadlessTurnPortError::Permission
         | HeadlessTurnPortError::PermissionUnresolvable
         | HeadlessTurnPortError::Tool
+        | HeadlessTurnPortError::UnknownTool
         | HeadlessTurnPortError::TaskTerminal(_) => ProviderDiagnosticClass::Protocol,
     }
 }

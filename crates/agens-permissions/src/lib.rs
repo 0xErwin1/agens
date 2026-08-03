@@ -291,7 +291,11 @@ impl HeadlessPermissionGate for ProductionPermissionGate {
                     .map_err(|_| HeadlessTurnPortError::Permission)
                     .and_then(|dispatcher| {
                         if dispatcher.canonical_identity(&call.name).is_none() {
-                            return Ok(ToolEvaluationOutcome::Denied);
+                            return if names_a_tool_agens_ships(&call.name) {
+                                Ok(ToolEvaluationOutcome::Denied)
+                            } else {
+                                Err(HeadlessTurnPortError::UnknownTool)
+                            };
                         }
 
                         dispatcher
@@ -765,6 +769,20 @@ fn names_the_native_surface(qualified: &str) -> bool {
         .iter()
         .any(|entry| entry.qualified_name == qualified)
         || agens_tools::NATIVE_TOOLS_REGISTERED_OUTSIDE_THE_CATALOG.contains(&qualified)
+}
+
+/// Whether a called name spells a tool agens ships, in either the bare
+/// spelling a tool is advertised to the model under or the qualified one agens
+/// uses on its own behalf.
+///
+/// Asked only about a call the live dispatcher does not hold, to separate the
+/// two ways that happens. A tool agens ships that this session's surface leaves
+/// out was refused — the model asked for something real and does not have it.
+/// A name that spells no tool agens ships was refused by nothing, because there
+/// was no tool there to refuse it, and telling the model it was denied would
+/// send it looking for a permission it could never be granted.
+fn names_a_tool_agens_ships(called: &str) -> bool {
+    names_the_native_surface(called) || names_the_native_surface(&format!("native::{called}"))
 }
 
 /// Whether a configured name spells a tool this session's own configuration

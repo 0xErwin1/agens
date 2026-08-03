@@ -597,7 +597,7 @@ mod tests {
         for (name, input, expected_content) in [
             ("native::list", "{malformed", "invalid tool arguments"),
             ("native::glob", r#"{}"#, "invalid tool arguments"),
-            ("native::unknown", r#"{"path":"src"}"#, "permission denied"),
+            ("native::edit", r#"{"path":"src"}"#, "permission denied"),
             (
                 "native::grep",
                 r#"{"pattern":"TODO","_inject_permission_evaluator_failure":true}"#,
@@ -636,13 +636,14 @@ mod tests {
         }
     }
 
-    /// A call the permission layer cannot resolve at all is neither a
-    /// malformed call nor a denied one, and the model has to be able to tell
-    /// all three apart: the first invites rewritten arguments, the second
-    /// invites a different target, and this one invites neither because
-    /// nothing the model can say changes it.
+    /// Four things can refuse a call before it runs, and the model has to be
+    /// able to tell them apart, because each asks for something different:
+    /// malformed arguments invite a rewritten call, a denial invites a
+    /// different target, an unresolvable reach invites nothing because the
+    /// tool is misconfigured, and a name no tool answers to invites nothing
+    /// either — but for the opposite reason, that there is no tool to call.
     #[test]
-    fn an_unresolvable_permission_reach_reads_as_neither_a_malformed_call_nor_a_denial() {
+    fn every_refusal_the_model_can_receive_before_dispatch_reads_differently() {
         let refusal_of = |name: &str, input: &str| {
             let policy = PermissionPolicy::new(
                 PermissionMode::Edit,
@@ -693,7 +694,8 @@ mod tests {
             r#"{"pattern":"TODO","_inject_unresolvable_reach":true}"#,
         );
         let (malformed, _) = refusal_of("native::glob", r#"{}"#);
-        let (denied, _) = refusal_of("native::unknown", r#"{"path":"src"}"#);
+        let (denied, denied_facts) = refusal_of("native::edit", r#"{"path":"src/main.rs"}"#);
+        let (missing, _) = refusal_of("native::unknown", r#"{"path":"src"}"#);
 
         assert_eq!(
             unresolvable,
@@ -703,6 +705,22 @@ mod tests {
         );
         assert_eq!(malformed, "invalid tool arguments");
         assert_eq!(denied, "permission denied");
+        assert_eq!(
+            missing,
+            "tool call refused: this session has no tool by that name; it was not denied and its \
+             arguments are not at fault, so no rewriting of this call can reach a tool; call one \
+             of the tools you were given instead"
+        );
+
+        assert_eq!(
+            denied_facts,
+            Some(ToolResultFacts::Edit {
+                path: FactPath::new("src/main.rs"),
+                outcome: ToolOutcome::Denied,
+                changed: None,
+            }),
+            "a denied edit still names the path it would have touched"
+        );
 
         let (_, facts) = refusal_of(
             "native::write",

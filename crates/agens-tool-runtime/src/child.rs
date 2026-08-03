@@ -654,11 +654,12 @@ mod tests {
     }
 
     #[test]
-    fn a_call_to_a_tool_absent_from_the_child_catalog_is_denied_honestly_with_facts() {
+    fn a_child_call_the_catalog_cannot_serve_says_whether_it_was_denied_or_never_existed() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         struct UnregisteredToolProbeProvider {
             calls: AtomicUsize,
+            name: &'static str,
         }
 
         impl TurnProvider for UnregisteredToolProbeProvider {
@@ -673,7 +674,7 @@ mod tests {
                 let parts = if call == 0 {
                     vec![MessagePart::ToolCall {
                         id: "call-1".into(),
-                        name: "native::write".into(),
+                        name: self.name.into(),
                         input: r#"{"path":"b.txt","content":"x"}"#.into(),
                     }]
                 } else {
@@ -726,51 +727,76 @@ mod tests {
             }
         }
 
-        let registry = TaskExecutionRegistry::with_limits(agens_tools::TaskExecutionLimits {
-            max_iterations: 3,
-            max_concurrency: 1,
-            max_output_chars: 1_024,
-        });
-        let mut dispatcher = agens_tools::ToolDispatcher::new();
-        dispatcher
-            .register_native("native::read", agens_core::ToolAccess::ReadOnly, ReadTool)
-            .unwrap();
+        let refusal_of = |name: &'static str| {
+            let registry = TaskExecutionRegistry::with_limits(agens_tools::TaskExecutionLimits {
+                max_iterations: 3,
+                max_concurrency: 1,
+                max_output_chars: 1_024,
+            });
+            let mut dispatcher = agens_tools::ToolDispatcher::new();
+            dispatcher
+                .register_native("native::read", agens_core::ToolAccess::ReadOnly, ReadTool)
+                .unwrap();
 
-        let result = run_isolated_task_turn(
-            UnregisteredToolProbeProvider {
-                calls: AtomicUsize::new(0),
-            },
-            Arc::new(Mutex::new(dispatcher)),
-            IsolatedTaskTurnContext {
-                project_root: Path::new("."),
-                dangerous_mode: false,
-                cancellation: &HeadlessTurnCancellation::new(),
-                progress: None,
-                surface: &crate::child_catalog::resolve_child_surface(&[], &[]).unwrap(),
-                mailbox: TaskMailboxContext {
-                    registry,
-                    target: TaskMessageTarget::Main,
+            let result = run_isolated_task_turn(
+                UnregisteredToolProbeProvider {
+                    calls: AtomicUsize::new(0),
+                    name,
                 },
-            },
+                Arc::new(Mutex::new(dispatcher)),
+                IsolatedTaskTurnContext {
+                    project_root: Path::new("."),
+                    dangerous_mode: false,
+                    cancellation: &HeadlessTurnCancellation::new(),
+                    progress: None,
+                    surface: &crate::child_catalog::resolve_child_surface(&[], &[]).unwrap(),
+                    mailbox: TaskMailboxContext {
+                        registry,
+                        target: TaskMessageTarget::Main,
+                    },
+                },
+            );
+
+            match result {
+                Ok(output) => output,
+                Err(_) => panic!("a refused tool call must not fail the turn"),
+            }
+        };
+
+        let denied = refusal_of("native::write");
+        assert!(
+            denied.contains("permission denied"),
+            "expected a denial naming permission denied, got: {denied}"
+        );
+        assert!(
+            denied.contains("facts=true"),
+            "expected denial_facts to accompany the denial, got: {denied}"
         );
 
-        let output = match result {
-            Ok(output) => output,
-            Err(_) => panic!("a denied tool call must not fail the turn"),
-        };
+        let bare = refusal_of("write");
         assert!(
-            output.contains("permission denied"),
-            "expected a denial naming permission denied, got: {output}"
+            bare.contains("permission denied"),
+            "a tool is advertised to the model under its bare name, and a call in that spelling \
+             is the same denial as in the qualified one, got: {bare}"
+        );
+
+        let missing = refusal_of("native::sorcery");
+        assert!(
+            missing.contains("this session has no tool by that name"),
+            "a name no tool answers to must not read as a denial, got: {missing}"
         );
         assert!(
-            !output.contains("invalid tool arguments"),
-            "a call to a tool absent from the catalog must never surface as an argument error, \
-             got: {output}"
+            !missing.contains("permission denied"),
+            "nothing denied a call there was no tool to deny, got: {missing}"
         );
-        assert!(
-            output.contains("facts=true"),
-            "expected denial_facts to accompany the denial, got: {output}"
-        );
+
+        for output in [&denied, &bare, &missing] {
+            assert!(
+                !output.contains("invalid tool arguments"),
+                "a call the catalog cannot serve must never surface as an argument error, got: \
+                 {output}"
+            );
+        }
     }
 
     struct SingleToolCallProvider {

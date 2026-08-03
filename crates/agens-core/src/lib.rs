@@ -1459,6 +1459,12 @@ pub enum HeadlessTurnPortError {
     /// [`Self::Permission`], which is an infrastructure failure that ends
     /// the turn: this one is refused per call and reported to the model.
     PermissionUnresolvable,
+    /// A call naming something this session holds no tool for at all. Distinct
+    /// from a denial, which answers for a tool that exists and was refused,
+    /// and from [`Self::Tool`], which answers for a real tool called wrongly:
+    /// here the name itself is what does not resolve, so neither different
+    /// arguments nor a different target can reach anything.
+    UnknownTool,
     TaskTerminal(HeadlessTaskTerminal),
 }
 
@@ -1796,10 +1802,13 @@ enum AskUnreachable {
 /// `Deny`, so the two can be rendered with different wording. A call the
 /// permission layer could not resolve at all is tracked separately again,
 /// because reporting it as either malformed arguments or a policy denial
-/// tells the model to change something that is not what went wrong.
+/// tells the model to change something that is not what went wrong. A call
+/// naming no tool this session holds is tracked separately for the same
+/// reason: nothing denied it, because there was nothing there to deny.
 enum PreflightAuthorization {
     InvalidArguments,
     UnresolvablePermission,
+    UnknownTool,
     Decided(PermissionDecision),
     UnreachablePromptDenial,
 }
@@ -1888,6 +1897,10 @@ async fn run_headless_turn_with_iteration_limit(
                     preflight.push((call, PreflightAuthorization::UnresolvablePermission));
                     continue;
                 }
+                Err(HeadlessTurnPortError::UnknownTool) => {
+                    preflight.push((call, PreflightAuthorization::UnknownTool));
+                    continue;
+                }
                 Err(error) => {
                     return Err(finish_port_error(
                         &mut coordinator,
@@ -1938,6 +1951,11 @@ async fn run_headless_turn_with_iteration_limit(
                         None => output,
                     }
                 }
+                PreflightAuthorization::UnknownTool => HeadlessToolOutput::failure(
+                    "tool call refused: this session has no tool by that name; it was not denied \
+                     and its arguments are not at fault, so no rewriting of this call can reach a \
+                     tool; call one of the tools you were given instead",
+                ),
                 PreflightAuthorization::Decided(PermissionDecision::Allow) => dispatcher
                     .dispatch(call.clone(), cancellation)
                     .await
