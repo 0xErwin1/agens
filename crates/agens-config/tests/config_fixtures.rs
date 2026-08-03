@@ -199,6 +199,31 @@ fn extracts_ordered_global_and_project_permission_rules() {
 }
 
 #[test]
+fn extracts_a_configured_ask_field_after_allow_and_deny() {
+    let document = parse_toml_document(
+        r#"
+            [permissions]
+            allow = ["read"]
+            deny = ["bash(git push*)"]
+            ask = ["bash(rm*)", "bash(git commit*)"]
+        "#,
+    )
+    .expect("fixture with an ask field should parse");
+
+    let rules = extract_permission_rules(&document, &toml::Table::new())
+        .expect("a configured ask field should extract");
+
+    assert_eq!(rules.len(), 4);
+    assert_eq!(rules[0].decision, ConfigPermissionDecision::Allow);
+    assert_eq!(rules[1].decision, ConfigPermissionDecision::Deny);
+    assert_eq!(rules[2].decision, ConfigPermissionDecision::Ask);
+    assert_eq!(rules[2].tool_pattern, "bash");
+    assert_eq!(rules[2].target_pattern.as_deref(), Some("rm*"));
+    assert_eq!(rules[3].decision, ConfigPermissionDecision::Ask);
+    assert_eq!(rules[3].target_pattern.as_deref(), Some("git commit*"));
+}
+
+#[test]
 fn permission_rule_extraction_rejects_invalid_or_unsafe_entries_without_echoing_values() {
     let cases = [
         ("empty", "", "permissions.allow[0]"),

@@ -39,11 +39,20 @@ pub fn interrupted_turn_note(requested: &[RequestedSubagent]) -> String {
     note
 }
 
+/// Notes a delegation the turn asked for, so an interrupted turn can say which
+/// ones it left unfinished.
+///
+/// The name is reduced rather than compared against one spelling. This event
+/// carries whatever named the call, and the two producers disagree: the task
+/// tool is advertised to the provider as `task`, so a model-initiated
+/// delegation arrives bare, while agens launching one on its own behalf spells
+/// it `native::task`. Matching only the second silently recorded none of the
+/// delegations a model asked for.
 pub fn record_requested_subagent(requested: &Mutex<Vec<RequestedSubagent>>, event: &TurnEvent) {
     let TurnEvent::ToolCallRequested { name, input, .. } = event else {
         return;
     };
-    if name != "native::task" {
+    if agens_core::bare_tool_name(name) != "task" {
         return;
     }
     let Some(subagent) = serde_json::from_str::<serde_json::Value>(input)

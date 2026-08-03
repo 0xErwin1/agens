@@ -12,17 +12,18 @@ use std::{
 
 use agens_core::{
     AgentDefinition, AgentMode, Error, HeadlessTaskTerminal, PermissionDecision, PermissionMode,
-    PermissionPattern, PermissionPolicy, PermissionRule, PermissionSession, ReasoningEffort,
-    RequestConfig, ToolAccess,
+    PermissionPattern, PermissionPolicy, PermissionRule, PermissionSession, PermissionTargetKind,
+    ReasoningEffort, RequestConfig, ToolAccess,
 };
 use agens_tools::{
     AgentCatalog, AgentModelValidationError, AgentModelValidator, CommandCatalog,
-    CommandDefinition, DispatchTool, EffectiveCapabilitySet, SkillCatalog, TaskControlAction,
-    TaskControlTool, TaskExecutionEvent, TaskExecutionId, TaskExecutionLifecycle,
-    TaskExecutionRegistry, TaskInvocation, TaskLaunchMode, TaskMessageSource, TaskMessageTarget,
-    TaskMessageTool, TaskModelResolutionError, TaskRunContext, TaskRunner, TaskRunnerError,
-    TaskSkill, TaskTerminalState, TaskTool, TaskTurnRequest, TaskTurnResult, ToolDispatchRequest,
-    ToolDispatcher, ToolEvaluationOutcome, ToolExecutionContext, ToolOutput,
+    CommandDefinition, DispatchTool, EffectiveCapabilityDescriptor, EffectiveCapabilitySet,
+    SkillCatalog, TaskControlAction, TaskControlTool, TaskExecutionEvent, TaskExecutionId,
+    TaskExecutionLifecycle, TaskExecutionRegistry, TaskInvocation, TaskLaunchMode,
+    TaskMessageSource, TaskMessageTarget, TaskMessageTool, TaskModelResolutionError,
+    TaskRunContext, TaskRunner, TaskRunnerError, TaskSkill, TaskTerminalState, TaskTool,
+    TaskTurnRequest, TaskTurnResult, ToolDispatchRequest, ToolDispatcher, ToolEvaluationOutcome,
+    ToolExecutionContext, ToolOutput,
     markdown::{self, FrontmatterValue, MarkdownRoot},
 };
 use serde_json::Value;
@@ -1057,6 +1058,12 @@ fn task_reports_exact_terminal_taxonomy_without_runner_details() {
             "task: child execution failed",
             HeadlessTaskTerminal::ChildFailure,
         ),
+        (
+            TerminalTaskRunner::DeclarationRejected,
+            "task: agent permission declaration rejected \
+             [declaration: native::bash; the configuration denies it]",
+            HeadlessTaskTerminal::DeclarationRejected,
+        ),
     ] {
         let mut task = task_tool(runner);
         let output = task.execute(&task_context(), task_arguments()).unwrap();
@@ -1065,6 +1072,24 @@ fn task_reports_exact_terminal_taxonomy_without_runner_details() {
         assert_eq!(output.terminal(), Some(terminal));
         assert!(!output.content.contains("secret panic payload"));
     }
+}
+
+/// A rejected declaration is the one failure the operator can act on directly,
+/// so the offending name reaches the model-visible result instead of only the
+/// diagnostics log. A name that is not shaped like a tool identity is withheld,
+/// because a terminal message bypasses the failure sanitizer entirely.
+#[test]
+fn a_rejected_declaration_names_the_offending_tool_and_withholds_an_unsafe_one() {
+    let mut task = task_tool(TerminalTaskRunner::DeclarationRejectedWithUnsafeName);
+    let output = task.execute(&task_context(), task_arguments()).unwrap();
+
+    assert!(output.is_error);
+    assert_eq!(
+        output.content,
+        "task: agent permission declaration rejected \
+         [declaration: [redacted]; the parent does not hold it]"
+    );
+    assert!(!output.content.contains("secret"));
 }
 
 #[test]
@@ -1653,8 +1678,12 @@ fn task_control_and_message_tools_share_registry_and_enforce_caller_routes() {
     );
 }
 
+/// Two rules that resolve to the same selector and target collapse into one
+/// descriptor carrying the prevailing decision, not the later one: `files_read`
+/// and `native::files_read` name the same tool, so the deny holds against the
+/// allow that follows it.
 #[test]
-fn effective_capabilities_normalize_aliases_globs_projects_and_last_matches() {
+fn effective_capabilities_normalize_aliases_globs_projects_and_prevailing_decisions() {
     let mut dispatcher = ToolDispatcher::new();
     dispatcher
         .register_native("native::files_read", ToolAccess::ReadOnly, InertTool)
@@ -1690,10 +1719,77 @@ fn effective_capabilities_normalize_aliases_globs_projects_and_last_matches() {
     let set = EffectiveCapabilitySet::from_agent(&agent, "project", &dispatcher);
 
     assert_eq!(set.descriptors().len(), 2);
-    assert_eq!(set.descriptors()[0].decision(), PermissionDecision::Allow);
+    assert_eq!(set.descriptors()[0].decision(), PermissionDecision::Deny);
     assert_eq!(set.descriptors()[1].decision(), PermissionDecision::Ask);
     assert!(set.descriptors()[1].matches_identity("native:10:files_read"));
     assert!(set.descriptors()[1].matches_identity("native:11:files_write"));
+}
+
+#[test]
+fn effective_capabilities_round_trip_a_declared_bash_target_as_free_form_text() {
+    let mut dispatcher = ToolDispatcher::new();
+    dispatcher
+        .register_native("native::bash", ToolAccess::Write, InertTool)
+        .unwrap();
+    let agent = agent_with_rules(vec![PermissionRule::global(
+        PermissionDecision::Deny,
+        PermissionPattern::Exact("native::bash".into()),
+        PermissionPattern::glob_for_target_kind("rm*", PermissionTargetKind::FreeFormText).unwrap(),
+    )]);
+
+    let set = EffectiveCapabilitySet::from_agent(&agent, "project", &dispatcher);
+    let rules = set.permission_rules();
+    assert_eq!(
+        rules.len(),
+        1,
+        "the declared bash rule should survive the round trip"
+    );
+    let rebuilt = &rules[0];
+
+    assert!(
+        rebuilt.target.matches("rm -rf /tmp/x"),
+        "a bash target reconstructed from its selector's tool identity must stay free-form, \
+         not fall back to path-shaped segment discipline"
+    );
+}
+
+#[test]
+fn a_wildcard_tool_pattern_spanning_differing_target_kinds_keeps_each_kind_of_its_own() {
+    let mut dispatcher = ToolDispatcher::new();
+    dispatcher
+        .register_native("native::bash", ToolAccess::Write, InertTool)
+        .unwrap();
+    dispatcher
+        .register_native("native::write", ToolAccess::Write, InertTool)
+        .unwrap();
+
+    let agent = agent_with_rules(vec![PermissionRule::global(
+        PermissionDecision::Deny,
+        PermissionPattern::glob("*").unwrap(),
+        PermissionPattern::glob("rm*").unwrap(),
+    )]);
+
+    let set = EffectiveCapabilitySet::from_agent(&agent, "project", &dispatcher);
+    let rules = set.permission_rules();
+
+    let bash_rule = rules
+        .iter()
+        .find(|rule| rule.tool.matches("native:4:bash"))
+        .expect("bash must still have a reconstructed rule");
+    let write_rule = rules
+        .iter()
+        .find(|rule| rule.tool.matches("native:5:write"))
+        .expect("write must still have a reconstructed rule");
+
+    assert!(
+        bash_rule.target.matches("rm -rf /tmp/x"),
+        "bash's own target must stay free-form even though it shares a wildcard with a \
+         path-shaped tool"
+    );
+    assert!(
+        !write_rule.target.matches("rm -rf /tmp/x"),
+        "write's own target must stay path-shaped even though it shares a wildcard with bash"
+    );
 }
 
 #[test]
@@ -1750,15 +1846,99 @@ fn parsed_literal_aliases_resolve_while_globs_remain_distinct_descriptors() {
             .iter()
             .filter(|descriptor| descriptor.decision() == PermissionDecision::Allow)
             .count(),
-        1
+        0,
+        "the allow collapses into the deny that names the same tool"
     );
+    assert_eq!(set.descriptors()[0].decision(), PermissionDecision::Deny);
     assert!(set.descriptors()[0].matches_identity("native:10:files_read"));
     assert!(set.descriptors()[1].matches_identity("native:10:files_read"));
     assert!(set.descriptors()[1].matches_identity("native:11:files_write"));
 }
 
 #[test]
-fn capability_descriptors_are_ordered_independently_of_rule_insertion() {
+fn a_partial_wildcard_tool_pattern_still_produces_a_descriptor_on_the_parent_path() {
+    let mut dispatcher = ToolDispatcher::new();
+    dispatcher
+        .register_native("native::bash", ToolAccess::Write, InertTool)
+        .unwrap();
+    dispatcher
+        .register_native("native::files_write", ToolAccess::Write, InertTool)
+        .unwrap();
+
+    let agent = agent_with_rules(vec![PermissionRule::global(
+        PermissionDecision::Deny,
+        PermissionPattern::glob("bas*").unwrap(),
+        PermissionPattern::Any,
+    )]);
+
+    let set = EffectiveCapabilitySet::from_agent(&agent, "project", &dispatcher);
+
+    assert_eq!(
+        set.descriptors().len(),
+        1,
+        "a partial-wildcard tool pattern that matches a known native tool must not vanish"
+    );
+    assert!(set.descriptors()[0].matches_identity("native:4:bash"));
+    assert_eq!(set.descriptors()[0].decision(), PermissionDecision::Deny);
+}
+
+/// A `deny` or `ask` naming a tool the dispatcher does not hold must survive
+/// resolution, symmetrically with the delegated-child surface. The same
+/// `permission_rules` are shared by both paths, so a rule naming an MCP tool
+/// absent from one of them has to keep meaning the same thing on the other.
+#[test]
+fn a_deny_naming_a_tool_the_dispatcher_lacks_is_retained_rather_than_dropped() {
+    let mut dispatcher = ToolDispatcher::new();
+    dispatcher
+        .register_native("native::files_read", ToolAccess::ReadOnly, InertTool)
+        .unwrap();
+
+    for decision in [PermissionDecision::Deny, PermissionDecision::Ask] {
+        let set = EffectiveCapabilitySet::from_agent(
+            &agent_with_rules(vec![PermissionRule::global(
+                decision,
+                PermissionPattern::glob("mcp::github::create_*").unwrap(),
+                PermissionPattern::Any,
+            )]),
+            "project",
+            &dispatcher,
+        );
+
+        assert_eq!(set.descriptors().len(), 1, "{decision:?} must be retained");
+        let rules = set.permission_rules();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].decision, decision);
+        assert!(rules[0].tool.matches("mcp::github::create_issue"));
+        assert!(!rules[0].tool.matches("native:10:files_read"));
+    }
+}
+
+/// An `allow` for a tool the dispatcher does not hold grants nothing, so it is
+/// dropped rather than retained — the one asymmetry with a `deny`, and the
+/// direction that can never widen anything.
+#[test]
+fn an_allow_naming_a_tool_the_dispatcher_lacks_is_dropped() {
+    let dispatcher = ToolDispatcher::new();
+    let set = EffectiveCapabilitySet::from_agent(
+        &agent_with_rules(vec![PermissionRule::global(
+            PermissionDecision::Allow,
+            PermissionPattern::glob("mcp::github::create_*").unwrap(),
+            PermissionPattern::Any,
+        )]),
+        "project",
+        &dispatcher,
+    );
+
+    assert!(set.descriptors().is_empty());
+}
+
+/// Descriptor order is authoring order, deliberately: these descriptors are
+/// read back by the surfaces that display an agent's declarations, and a set
+/// reordered by selector would show the operator something they did not write.
+/// It decides nothing — precedence is read off what each rule selects — so this
+/// pins presentation, not policy.
+#[test]
+fn capability_descriptors_follow_declaration_order() {
     let mut dispatcher = ToolDispatcher::new();
     dispatcher
         .register_native("native::files_read", ToolAccess::ReadOnly, InertTool)
@@ -1794,8 +1974,34 @@ fn capability_descriptors_are_ordered_independently_of_rule_insertion() {
         &dispatcher,
     );
 
-    assert_eq!(forward.descriptors(), reverse.descriptors());
     assert_eq!(forward.descriptors().len(), 3);
+    assert_eq!(reverse.descriptors().len(), 3);
+    assert_eq!(
+        forward
+            .descriptors()
+            .iter()
+            .map(EffectiveCapabilityDescriptor::decision)
+            .collect::<Vec<_>>(),
+        vec![
+            PermissionDecision::Allow,
+            PermissionDecision::Deny,
+            PermissionDecision::Ask,
+        ]
+    );
+    assert_eq!(
+        reverse
+            .descriptors()
+            .iter()
+            .map(EffectiveCapabilityDescriptor::decision)
+            .collect::<Vec<_>>(),
+        vec![
+            PermissionDecision::Ask,
+            PermissionDecision::Deny,
+            PermissionDecision::Allow,
+        ]
+    );
+    assert!(!forward.is_expansion_from(&reverse));
+    assert!(!reverse.is_expansion_from(&forward));
 }
 
 #[test]
@@ -1960,6 +2166,8 @@ enum TerminalTaskRunner {
     Provider,
     Child,
     Panic,
+    DeclarationRejected,
+    DeclarationRejectedWithUnsafeName,
 }
 
 impl TaskRunner for TerminalTaskRunner {
@@ -1982,6 +2190,14 @@ impl TaskRunner for TerminalTaskRunner {
             )),
             Self::Child => Err(TaskRunnerError::ChildFailure),
             Self::Panic => panic!("secret panic payload"),
+            Self::DeclarationRejected => Err(TaskRunnerError::DeclarationRejected {
+                reason: agens_tools::TaskDeclarationRejection::ConfigurationDenies,
+                tool: "native::bash".into(),
+            }),
+            Self::DeclarationRejectedWithUnsafeName => Err(TaskRunnerError::DeclarationRejected {
+                reason: agens_tools::TaskDeclarationRejection::ExceedsParentSurface,
+                tool: "/home/secret user/tools".into(),
+            }),
         }
     }
 }
@@ -2066,7 +2282,7 @@ impl TaskRunner for LifecycleTaskRunner {
             assert!(lifecycle.transition_to_background());
         }
         self.observed.lock().unwrap().push(lifecycle);
-        if let Some(error) = self.terminal {
+        if let Some(error) = self.terminal.clone() {
             return Err(error);
         }
         Ok(TaskTurnResult {

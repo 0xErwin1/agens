@@ -542,7 +542,7 @@ impl TaskRunner for ProductionTaskRunner {
         let result = self
             .failure_probe
             .as_ref()
-            .map(|failure| Err(failure.error))
+            .map(|failure| Err(failure.error.clone()))
             .unwrap_or_else(|| {
                 run_production_task(
                     request,

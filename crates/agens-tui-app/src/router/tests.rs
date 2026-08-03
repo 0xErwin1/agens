@@ -3138,16 +3138,26 @@ fn persisted_selection_updates_and_resume_are_atomic_and_credential_fresh() {
 
 /// A tool call whose permission target cannot be read is a call that must not
 /// run — but the turn survives it. Since AGN's tool-failure recovery the runtime
-/// hands the model `invalid tool arguments` instead of aborting, so the agent
-/// can correct itself; what stays absolute is that nothing dispatches and no
+/// hands the model an actionable refusal instead of aborting, so the agent can
+/// correct itself. Which refusal depends on what was wrong: a call whose
+/// arguments do not parse is told so, while a call naming no tool this session
+/// holds is told that instead, because rewriting its arguments would not help.
+/// What stays absolute across all of them is that nothing dispatches and no
 /// argument of the rejected call is echoed anywhere.
 #[test]
 fn an_unreadable_permission_target_dispatches_nothing_and_echoes_nothing() {
     let secret_input = r#"{"command":"SENTINEL_COMMAND","token":"SENTINEL_TOKEN"}"#;
-    for (name, input) in [
-        ("native::read", "{malformed"),
-        ("native::read", secret_input),
-        ("native::unknown", r#"{"path":"SENTINEL_PATH"}"#),
+    let missing_tool = "tool call refused: this session has no tool by that name; it was not \
+                        denied and its arguments are not at fault, so no rewriting of this call \
+                        can reach a tool; call one of the tools you were given instead";
+    for (name, input, expected) in [
+        ("native::read", "{malformed", "invalid tool arguments"),
+        ("native::read", secret_input, "invalid tool arguments"),
+        (
+            "native::unknown",
+            r#"{"path":"SENTINEL_PATH"}"#,
+            missing_tool,
+        ),
     ] {
         let outcome = run_production_batch(
             "permission-evaluation-invalid",
@@ -3179,7 +3189,7 @@ fn an_unreadable_permission_target_dispatches_nothing_and_echoes_nothing() {
                     tool_call_id,
                     content,
                     is_error: true,
-                }) if tool_call_id == "invalid" && content == "invalid tool arguments"
+                }) if tool_call_id == "invalid" && content == expected
             )),
             "the model is told, in words that carry none of the call: {:?}",
             snapshot.events()
