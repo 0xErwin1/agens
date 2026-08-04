@@ -1607,7 +1607,7 @@ fn production_task_consolidates_durable_sessions_catalog_skills_and_isolation() 
             // The reviewer agent declares no `permissions:`, so it inherits the
             // parent's full native surface (write/bash/webfetch included) unlike
             // `explore`, which narrows explicitly. Only task nesting and MCP stay
-            // excluded from a child's catalog.
+            // excluded from a child's catalog except for bounded task delegation.
             required_body_fragments: vec![
                 "child request".into(),
                 "You are the isolated reviewer.".into(),
@@ -1618,7 +1618,6 @@ fn production_task_consolidates_durable_sessions_catalog_skills_and_isolation() 
                 "bash".into(),
                 "webfetch".into(),
                 "!parent request".into(),
-                "!\"name\":\"task\"".into(),
                 "!mcp".into(),
             ],
             response: native_tool_call_response(
@@ -1752,7 +1751,6 @@ fn built_in_explore_inherits_the_effective_openai_parent_model_without_agent_fil
                 "inspect child".into(),
                 "read-only exploration subagent".into(),
                 "!parent explore request".into(),
-                "!\"name\":\"task\"".into(),
             ],
             response: text_response("child explored"),
         },
@@ -1830,7 +1828,6 @@ fn agents_md_instructions_reach_both_the_parent_and_a_subagents_request_body_end
                 "general-purpose subagent".into(),
                 "PROJECT-AGENTS-MD-SENTINEL".into(),
                 "!parent general request".into(),
-                "!\"name\":\"task\"".into(),
             ],
             response: text_response("child implemented"),
         },
@@ -1894,7 +1891,6 @@ fn explicit_task_model_selects_a_second_available_openai_model() {
             required_body_fragments: vec![
                 "\"model\":\"gpt-4.1\"".into(),
                 "inspect with second model".into(),
-                "!\"name\":\"task\"".into(),
             ],
             response: text_response("second model child"),
         },
@@ -1963,7 +1959,6 @@ fn built_in_general_inherits_the_effective_chatgpt_parent_model_without_agent_fi
                 "implement child".into(),
                 "general-purpose subagent".into(),
                 "!parent general request".into(),
-                "!\"name\":\"task\"".into(),
             ],
             response: text_response("child implemented"),
         },
