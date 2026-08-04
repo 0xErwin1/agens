@@ -640,6 +640,111 @@ fn skill_resource_tool_discloses_only_selected_confined_content() {
 
 #[cfg(unix)]
 #[test]
+fn lazy_reads_follow_an_atomic_skill_directory_replacement() {
+    let temporary = TemporaryDirectory::new();
+    let root = temporary.path.join("root");
+    let replacement_root = temporary.path.join("replacement");
+    let former_skill = temporary.path.join("former-research");
+
+    write_skill(
+        &root,
+        "research",
+        "---\nname: research\ndescription: original skill\n---\noriginal instructions\n",
+    );
+    write_skill(
+        &replacement_root,
+        "research",
+        "---\nname: research\ndescription: updated skill\n---\nupdated instructions\n",
+    );
+    fs::create_dir_all(replacement_root.join("research/references"))
+        .expect("replacement references directory");
+    fs::write(
+        replacement_root.join("research/references/guide.md"),
+        "updated reference",
+    )
+    .expect("replacement reference");
+
+    let catalog = SkillCatalog::discover(&root, temporary.path.join("missing"))
+        .expect("discover skills")
+        .catalog()
+        .clone();
+    let mut tool = SkillResourceTool::new(catalog, &root);
+    let context = ToolExecutionContext::with_timeout(Duration::from_secs(1));
+
+    fs::rename(root.join("research"), &former_skill).expect("move former skill");
+    fs::rename(replacement_root.join("research"), root.join("research"))
+        .expect("install replacement skill");
+    fs::remove_dir_all(&former_skill).expect("remove former skill");
+
+    let instructions = tool
+        .execute(&context, json!({"skill":"research"}))
+        .expect("execute skill instructions");
+    assert!(!instructions.is_error, "{instructions:?}");
+    assert_eq!(instructions.content, "updated instructions");
+
+    let reference = tool
+        .execute(
+            &context,
+            json!({
+                "skill":"research",
+                "resource_class":"reference",
+                "resource":"guide.md"
+            }),
+        )
+        .expect("execute skill reference");
+    assert!(!reference.is_error, "{reference:?}");
+    assert_eq!(reference.content, "updated reference");
+}
+
+#[cfg(unix)]
+#[test]
+fn lazy_reads_reject_a_replacement_with_a_different_skill_identity() {
+    let temporary = TemporaryDirectory::new();
+    let root = temporary.path.join("root");
+    let replacement_root = temporary.path.join("replacement");
+    let former_skill = temporary.path.join("former-research");
+
+    write_skill(
+        &root,
+        "research",
+        "---\nname: research\ndescription: research skill\n---\noriginal instructions\n",
+    );
+    write_skill(
+        &replacement_root,
+        "research",
+        "---\nname: impostor\ndescription: different skill\n---\nimpostor instructions\n",
+    );
+    fs::create_dir_all(replacement_root.join("research/references"))
+        .expect("replacement references directory");
+    fs::write(
+        replacement_root.join("research/references/guide.md"),
+        "impostor reference",
+    )
+    .expect("replacement reference");
+
+    let discovery =
+        SkillCatalog::discover(&root, temporary.path.join("missing")).expect("discover skills");
+    let skill = discovery.catalog().skill("research").expect("skill");
+
+    fs::rename(root.join("research"), &former_skill).expect("move former skill");
+    fs::rename(replacement_root.join("research"), root.join("research"))
+        .expect("install replacement skill");
+    fs::remove_dir_all(&former_skill).expect("remove former skill");
+
+    assert_eq!(
+        skill.load_instructions().unwrap_err(),
+        "skill manifest name changed after discovery"
+    );
+    assert_eq!(
+        skill
+            .load_resource(SkillResourceClass::Reference, "guide.md")
+            .unwrap_err(),
+        "skill manifest name changed after discovery"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn lazy_reads_remain_in_the_discovered_root_after_root_replacement() {
     use std::os::unix::fs::symlink;
 
