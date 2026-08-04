@@ -16,6 +16,9 @@ pub enum Runtime {
     Running,
 }
 
+static IDLE_RUNTIME: Runtime = Runtime::Idle;
+static RUNNING_RUNTIME: Runtime = Runtime::Running;
+
 /// Identifies the foreground route that owns a runtime turn.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ActiveRoute {
@@ -206,6 +209,10 @@ pub enum AppEvent {
     TurnFailedFor {
         generation: u64,
     },
+    /// The active scheduler-owned turn handed work to the background.
+    TurnReleasedFor {
+        generation: u64,
+    },
     /// A background completion needs one deferred, coalesced internal turn.
     DeferAutoTurn,
     /// A terminal key routed through dialog, global, and composer handlers.
@@ -248,8 +255,6 @@ pub enum Effect {
 /// Application state whose prompt queue has a fixed capacity for its lifetime.
 #[derive(Clone, Debug)]
 pub struct AppState {
-    /// Compatibility projection for consumers that only distinguish busy and idle.
-    runtime: Runtime,
     lifecycle: TurnLifecycle,
     queued_prompts: VecDeque<QueueEntry>,
     queue_capacity: usize,
@@ -265,8 +270,7 @@ pub struct AppState {
 
 impl PartialEq for AppState {
     fn eq(&self, other: &Self) -> bool {
-        self.runtime == other.runtime
-            && self.lifecycle == other.lifecycle
+        self.lifecycle == other.lifecycle
             && self.queued_prompts == other.queued_prompts
             && self.queue_capacity == other.queue_capacity
             && self.next_generation == other.next_generation
@@ -287,7 +291,6 @@ impl AppState {
         assert!(queue_capacity > 0, "prompt queue capacity must be non-zero");
 
         Self {
-            runtime: Runtime::Idle,
             lifecycle: TurnLifecycle::Idle,
             queued_prompts: VecDeque::with_capacity(queue_capacity),
             queue_capacity,
@@ -310,9 +313,9 @@ impl AppState {
             AppEvent::TurnCompletedFor { generation, output } => {
                 self.complete_turn(generation, output)
             }
-            AppEvent::TurnCancelledFor { generation } | AppEvent::TurnFailedFor { generation } => {
-                self.terminate_turn(generation)
-            }
+            AppEvent::TurnCancelledFor { generation }
+            | AppEvent::TurnFailedFor { generation }
+            | AppEvent::TurnReleasedFor { generation } => self.terminate_turn(generation),
             AppEvent::DeferAutoTurn => {
                 if self.pending_auto_turns > 0 {
                     self.observability
@@ -336,8 +339,11 @@ impl AppState {
     }
 
     /// Returns the active/idle runtime state.
-    pub const fn runtime(&self) -> &Runtime {
-        &self.runtime
+    pub const fn runtime(&self) -> &'static Runtime {
+        match self.lifecycle {
+            TurnLifecycle::Idle => &IDLE_RUNTIME,
+            TurnLifecycle::Running(_) | TurnLifecycle::Cancelling(_) => &RUNNING_RUNTIME,
+        }
     }
 
     /// Returns the authoritative foreground lifecycle.
@@ -522,7 +528,6 @@ impl AppState {
         let generation = self.next_generation;
         self.next_generation += 1;
         self.lifecycle = TurnLifecycle::Running(ActiveRoute::new(generation, prompt.clone()));
-        self.runtime = Runtime::Running;
         self.disarm_exit();
 
         Effect::StartPrompt(prompt)
@@ -530,7 +535,6 @@ impl AppState {
 
     fn transition_to_idle(&mut self) {
         self.lifecycle = TurnLifecycle::Idle;
-        self.runtime = Runtime::Idle;
     }
 
     fn command(&mut self, command: Command, now: Instant) -> Vec<Effect> {
@@ -579,7 +583,7 @@ impl AppState {
     }
 
     fn is_unsafe_while_running(&self, command: Command) -> bool {
-        self.runtime == Runtime::Running
+        !matches!(self.lifecycle, TurnLifecycle::Idle)
             && matches!(
                 command,
                 Command::Model | Command::Effort | Command::Session | Command::Agent | Command::New
@@ -683,7 +687,7 @@ mod tests {
             Command::New,
         ] {
             let mut app = AppState::new(1);
-            app.runtime = Runtime::Running;
+            let _ = app.reduce(AppEvent::SubmitPrompt("active".into()));
             let before = app.clone();
 
             assert_eq!(

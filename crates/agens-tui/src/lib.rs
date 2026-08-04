@@ -5003,7 +5003,7 @@ pub struct Tui<E> {
     input_cursor: usize,
     recovered_failed_prompt: bool,
     size: (u16, u16),
-    running: bool,
+    local_route_active: bool,
     session_loading: bool,
     assistant_streaming: bool,
     quit_armed_until: Option<Duration>,
@@ -5107,7 +5107,7 @@ where
             input_cursor: 0,
             recovered_failed_prompt: false,
             size: (80, 24),
-            running: false,
+            local_route_active: false,
             session_loading: false,
             assistant_streaming: false,
             quit_armed_until: None,
@@ -5330,7 +5330,7 @@ where
     /// clock until the next keystroke, so the surface looked hung and then
     /// jumped when the runtime continued on its own.
     pub fn has_live_work(&self) -> bool {
-        self.running
+        self.foreground_running()
             || self.executions.iter().any(|execution| {
                 matches!(
                     execution.state,
@@ -5370,10 +5370,8 @@ where
         }
     }
 
-    /// Updates active-turn state after the composition layer starts or finishes a turn.
-    pub fn set_running(&mut self, running: bool) {
-        let finishing = self.running && !running;
-        self.running = running;
+    fn set_foreground_presentation(&mut self, running: bool) {
+        let finishing = self.foreground_running() && !running;
         self.pending_retry = None;
         self.reasoning_started_at = None;
         if running {
@@ -5397,6 +5395,23 @@ where
             self.settle_active_conversation();
             self.auto_collapse_thinking_on_finish();
         }
+    }
+
+    /// Compatibility helper for callers that need to seed a foreground turn in tests.
+    pub fn set_running(&mut self, running: bool) {
+        if running && !self.foreground_running() {
+            let _ = self.scheduler.reduce(AppEvent::SubmitPrompt(String::new()));
+        }
+        if !running && let Some(generation) = self.active_generation() {
+            let _ = self
+                .scheduler
+                .reduce(AppEvent::TurnReleasedFor { generation });
+        }
+        self.set_foreground_presentation(running);
+    }
+
+    fn foreground_running(&self) -> bool {
+        !matches!(self.scheduler.lifecycle(), TurnLifecycle::Idle)
     }
 
     fn settle_active_conversation(&mut self) {
@@ -5522,7 +5537,7 @@ where
             record.collapse_thinking = false;
             record.thinking_user_pinned = false;
         }
-        self.set_running(true);
+        self.set_foreground_presentation(true);
         self.assistant_streaming = true;
     }
 
@@ -5556,7 +5571,10 @@ where
     }
 
     fn auto_turn_is_safe(&self) -> bool {
-        !self.running && !self.session_loading && self.dialog.is_none() && !self.palette_open
+        !self.foreground_running()
+            && !self.session_loading
+            && self.dialog.is_none()
+            && !self.palette_open
     }
 
     /// Opens the runtime-scheduled turn without a user prompt: the transcript records why the
@@ -5581,7 +5599,7 @@ where
             record.collapse_thinking = false;
             record.thinking_user_pinned = false;
         }
-        self.set_running(true);
+        self.set_foreground_presentation(true);
         self.assistant_streaming = true;
     }
 
@@ -5593,7 +5611,7 @@ where
         self.latest_usage = None;
         self.dialog = None;
         self.device_auth = None;
-        self.running = true;
+        self.local_route_active = true;
         self.turn_started_at = Some(self.now);
         self.assistant_streaming = false;
         self.turn_state = None;
@@ -5601,7 +5619,7 @@ where
     }
 
     pub fn begin_session_load(&mut self) -> bool {
-        if self.running || self.session_loading {
+        if self.foreground_running() || self.session_loading || self.local_route_active {
             return false;
         }
 
@@ -5719,12 +5737,10 @@ where
                 None
             }
             TuiSubmissionOutcome::LocalInfo(message) => {
-                self.set_running(false);
                 self.add_info(message);
                 None
             }
             TuiSubmissionOutcome::LocalActionableError { message, action } => {
-                self.set_running(false);
                 self.show_dialog("Action required", format!("{message}\nAction: {action}"));
                 None
             }
@@ -5741,7 +5757,6 @@ where
                 message,
                 presentation,
             } => {
-                self.set_running(false);
                 self.apply_presentation(presentation);
                 self.add_info(message);
                 None
@@ -5779,7 +5794,6 @@ where
                 None
             }
             TuiSubmissionOutcome::Dialog(dialog) => {
-                self.set_running(false);
                 self.show_selection_dialog(dialog);
                 None
             }
@@ -5788,7 +5802,6 @@ where
                 None
             }
             TuiSubmissionOutcome::TranscriptDialog => {
-                self.set_running(false);
                 self.show_transcript_dialog();
                 None
             }
@@ -5809,7 +5822,7 @@ where
                 None
             }
             TuiSubmissionOutcome::Quit => {
-                self.set_running(false);
+                self.local_route_active = false;
                 None
             }
         }
@@ -5879,6 +5892,12 @@ where
         self.finish_provider_turn_scheduled_for_generation(generation, outcome)
     }
 
+    fn finish_detached_provider_turn(&mut self, outcome: TuiProviderOutcome) {
+        if let TuiProviderOutcome::Failed { message, .. } = outcome {
+            self.status = Some(message);
+        }
+    }
+
     fn finish_provider_turn_scheduled_for_generation(
         &mut self,
         generation: u64,
@@ -5898,7 +5917,7 @@ where
             }),
             TuiProviderOutcome::Failed { .. } => Some(AppEvent::TurnFailedFor { generation }),
             TuiProviderOutcome::Cancelled { .. } => Some(AppEvent::TurnCancelledFor { generation }),
-            TuiProviderOutcome::Backgrounded => None,
+            TuiProviderOutcome::Backgrounded => Some(AppEvent::TurnReleasedFor { generation }),
         };
 
         match outcome {
@@ -5927,11 +5946,10 @@ where
                 } else {
                     self.transcript.push(TranscriptEntry::Assistant(body));
                 }
-                self.set_running(false);
+                self.set_foreground_presentation(false);
             }
             TuiProviderOutcome::Failed { message, action } => {
-                let finishing = self.running;
-                self.running = false;
+                let finishing = self.foreground_running();
                 self.assistant_streaming = false;
                 self.turn_state = Some(TurnState::Failed);
                 self.active_tool = None;
@@ -5942,8 +5960,7 @@ where
                 self.add_error(message, action);
             }
             TuiProviderOutcome::Cancelled { message, action } => {
-                let finishing = self.running;
-                self.running = false;
+                let finishing = self.foreground_running();
                 self.assistant_streaming = false;
                 self.turn_state = Some(TurnState::Cancelled);
                 self.active_tool = None;
@@ -5953,7 +5970,7 @@ where
                 }
                 self.add_error(message, action);
             }
-            TuiProviderOutcome::Backgrounded => self.set_running(false),
+            TuiProviderOutcome::Backgrounded => self.set_foreground_presentation(false),
         }
 
         terminal_event.and_then(|event| next_scheduled_prompt(self.scheduler.reduce(event)))
@@ -5968,7 +5985,7 @@ where
         let record = self.active_record_mut();
         record.tool_display_modes.clear();
         record.tool_detail = widgets::DisplayMode::Collapsed;
-        self.set_running(false);
+        self.set_foreground_presentation(false);
         self.turn_state = None;
         self.placeholder_failure = false;
         self.active_tool = None;
@@ -5999,7 +6016,7 @@ where
         self.runtime_events.clear();
         self.turn_duration = None;
         self.latest_usage = None;
-        self.set_running(false);
+        self.set_foreground_presentation(false);
         self.turn_state = None;
         self.active_tool = None;
         self.clear_current_session_transcripts();
@@ -6220,8 +6237,7 @@ where
         match &event {
             TuiRuntimeEvent::TurnStarted => self.turn_state = Some(TurnState::Requesting),
             TuiRuntimeEvent::TurnEnded { status, duration } => {
-                let finishing = self.running;
-                self.running = false;
+                let finishing = self.foreground_running();
                 self.turn_state = Some(*status);
                 self.turn_duration = *duration;
                 self.active_tool = None;
@@ -6549,7 +6565,7 @@ where
             input: &self.input,
             recovered_failed_prompt: self.recovered_failed_prompt,
             size: self.size,
-            running: self.running,
+            running: self.foreground_running(),
             surface_focus: self.surface_focus,
             composer_cursor_visible: self.surface_focus == SurfaceFocus::Composer,
             queue: self.scheduler.queued_entries(),
@@ -7023,19 +7039,13 @@ where
                     "{name} {outcome}: {content}"
                 )));
             }
-            TurnEvent::StateChanged(TurnState::Completed) => self.set_running(false),
+            TurnEvent::StateChanged(TurnState::Completed) => {
+                self.set_foreground_presentation(false);
+                self.turn_state = Some(TurnState::Completed);
+            }
             TurnEvent::StateChanged(state @ (TurnState::Cancelled | TurnState::Failed)) => {
-                let finishing = self.running;
-                self.running = false;
-                self.assistant_streaming = false;
+                self.set_foreground_presentation(false);
                 self.turn_state = Some(state);
-                self.active_tool = None;
-                self.pending_retry = None;
-                self.reasoning_started_at = None;
-                if finishing {
-                    self.settle_active_conversation();
-                    self.auto_collapse_thinking_on_finish();
-                }
                 if state == TurnState::Failed {
                     self.note_turn_failure();
                 }
@@ -7069,7 +7079,7 @@ where
     fn current_activity(&self) -> TurnActivity<'_> {
         activity::TurnActivity::derive(activity::ActivityInputs {
             turn_state: self.turn_state,
-            running: self.running,
+            running: self.foreground_running(),
             session_loading: self.session_loading,
             active_tool: self.active_tool.as_deref(),
             retry: self.pending_retry,
@@ -7629,10 +7639,10 @@ where
                     message: std::mem::take(&mut self.input),
                 }
             }
-            Key::Enter if self.running && self.busy_policy_routing => {
+            Key::Enter if self.foreground_running() && self.busy_policy_routing => {
                 Action::SubmitBusy(self.input.clone())
             }
-            Key::Enter if self.running => self.enqueue_composer(),
+            Key::Enter if self.foreground_running() => self.enqueue_composer(),
             Key::Enter => {
                 if self.palette_open {
                     if let Some(route_id) = self.selected_palette_dialog() {
@@ -8050,11 +8060,11 @@ where
             self.dialog = None;
         }
         self.replace_chars(self.input_cursor, self.input_cursor, text);
-        if !self.running && self.input == "/" {
+        if !self.foreground_running() && self.input == "/" {
             self.palette_open = true;
             self.palette_selected = 0;
         }
-        if !self.running && text == "@" {
+        if !self.foreground_running() && text == "@" {
             self.open_file_picker();
         }
         self.clamp_palette_selection();
@@ -8269,7 +8279,7 @@ where
         }
         if self.quit_is_armed() {
             self.quit_armed_until = None;
-            if self.running || self.has_active_execution() {
+            if self.foreground_running() || self.has_active_execution() {
                 self.engine.cancel();
                 self.turn_state = Some(TurnState::Cancelled);
             }
@@ -9992,7 +10002,10 @@ fn drain_provider_channels<E: Engine>(
                 Some(generation) => {
                     tui.finish_provider_turn_scheduled_for_generation(generation, outcome)
                 }
-                None => tui.finish_provider_turn_scheduled(outcome),
+                None => {
+                    tui.finish_detached_provider_turn(outcome);
+                    None
+                }
             };
         })
     } else {
@@ -12303,11 +12316,14 @@ mod runtime_tests {
             height: 24,
         });
         for turn in 0..12 {
+            let body = "body\n".repeat(40);
             tui.begin_submission(format!("prompt-{turn}"));
-            tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text(
-                "body\n".repeat(40),
-            )));
+            tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text(body.clone())));
             tui.apply_progress(TurnEvent::StateChanged(TurnState::Completed));
+            assert_eq!(
+                tui.finish_provider_turn(TuiProviderOutcome::Completed(body)),
+                None
+            );
         }
         // Settled turns are elided by default, which would leave the prompt rows
         // a jump navigates by collapsed out of the render.
@@ -12320,22 +12336,22 @@ mod runtime_tests {
     #[test]
     fn escape_is_inert_on_the_main_surface_while_a_turn_is_running() {
         let mut tui = scrollable_tui();
-        tui.running = true;
+        tui.set_running(true);
 
         assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Render);
         assert_eq!(tui.view().focus, TranscriptFocus::Composer);
-        assert!(tui.running);
+        assert!(tui.view().running);
     }
 
     #[test]
     fn escape_preserves_main_surface_selection_while_a_turn_is_running() {
         let mut tui = selected_tui();
-        tui.running = true;
+        tui.set_running(true);
         let selected = tui.selected_text().map(str::to_owned);
 
         assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Render);
         assert_eq!(tui.selected_text(), selected.as_deref());
-        assert!(tui.running);
+        assert!(tui.view().running);
     }
 
     #[test]
@@ -12454,11 +12470,11 @@ mod runtime_tests {
         let typing = text(&tui);
         assert!(typing.contains("Enter:send"), "{typing:?}");
 
-        tui.running = true;
+        tui.set_running(true);
         let running = text(&tui);
         assert!(running.contains("Enter:queue"), "{running:?}");
 
-        tui.running = false;
+        tui.set_running(false);
         tui.handle(Event::Key(Key::Escape));
         let composer = text(&tui);
         assert_eq!(tui.view().focus, TranscriptFocus::Composer);
@@ -12550,6 +12566,7 @@ mod runtime_tests {
     #[test]
     fn a_notice_takes_the_band_from_the_hints() {
         let mut tui = scrollable_tui();
+        tui.begin_submission("active");
         assert!(notice_spans(&tui.view()).is_empty());
 
         tui.handle(Event::Key(Key::CtrlC));
@@ -13599,5 +13616,39 @@ mod runtime_tests {
         ] {
             assert_provider_channels_discard_stale_terminal(stale_outcome);
         }
+    }
+
+    #[test]
+    fn detached_background_outcome_cannot_mutate_a_concurrent_foreground_turn() {
+        let mut tui = Tui::with_queue_capacity(NoopEngine, 2);
+        let (_metrics_sender, metrics_receiver) = BridgeTx::bounded(1);
+        let (_progress_sender, progress_receiver) = mpsc::channel();
+        let (completion_sender, completion_receiver) = mpsc::channel();
+
+        tui.begin_submission("foreground");
+        let generation = tui.scheduler.lifecycle().active().unwrap().generation();
+        tui.input = "queued".into();
+        tui.enqueue_composer();
+        let transcript = tui.transcript().to_vec();
+
+        completion_sender
+            .send((None, TuiProviderOutcome::Backgrounded))
+            .unwrap();
+        let drain = drain_provider_channels(
+            &mut tui,
+            &metrics_receiver,
+            &progress_receiver,
+            &completion_receiver,
+        );
+
+        assert!(drain.next_prompt.is_none());
+        assert_eq!(
+            tui.scheduler.lifecycle().active().unwrap().generation(),
+            generation
+        );
+        assert_eq!(tui.transcript(), transcript);
+        assert!(tui.view().running);
+        assert_eq!(tui.scheduler.queued_prompts(), vec!["queued"]);
+        assert!(tui.take_ready_auto_turn().is_none());
     }
 }

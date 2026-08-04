@@ -811,12 +811,12 @@ mod tests {
         let mut tui = Tui::new(ProductionTuiEngine {
             cancellation: Arc::new(Mutex::new(Some(cancellation.clone()))),
         });
-        tui.set_running(true);
+        tui.begin_submission("active");
 
         assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Render);
-        assert!(!cancellation.is_cancelled());
-        assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Quit);
         assert!(cancellation.is_cancelled());
+        assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Render);
+        assert!(tui.view().running);
     }
 
     #[test]

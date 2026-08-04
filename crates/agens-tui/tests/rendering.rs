@@ -5955,8 +5955,8 @@ fn a_background_subagent_keeps_the_surface_repainting_after_its_turn_ends() {
     tui.apply_progress(TurnEvent::StateChanged(agens_core::TurnState::Completed));
 
     assert!(
-        !tui.view().running,
-        "the parent turn is what finished, not the delegation"
+        tui.view().running,
+        "terminal progress does not release scheduler ownership before provider completion"
     );
     assert!(
         tui.has_live_work(),
@@ -5967,6 +5967,7 @@ fn a_background_subagent_keeps_the_surface_repainting_after_its_turn_ends() {
         agent: "explore".into(),
         event: TuiExecutionEvent::Completed { id: 1 },
     });
+    tui.finish_provider_turn(agens_tui::TuiProviderOutcome::Completed("done".into()));
 
     assert!(
         !tui.has_live_work(),

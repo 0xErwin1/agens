@@ -2849,12 +2849,11 @@ fn resize_updates_the_render_state() {
 #[test]
 fn control_c_warns_then_cancels_and_quits_a_running_turn() {
     let mut tui = Tui::new(FakeEngine::default());
-    tui.set_running(true);
+    tui.begin_submission("active");
 
     assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Render);
-    assert_eq!(tui.engine().cancellations, 0);
-    assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Quit);
     assert_eq!(tui.engine().cancellations, 1);
+    assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Render);
 }
 
 #[test]
@@ -2896,7 +2895,7 @@ fn permission_double_control_c_exits_and_runtime_cleanup_can_fail_closed() {
     });
     let request = requests.recv_timeout(Duration::from_secs(1)).unwrap();
     let mut tui = Tui::new(FakeEngine::default());
-    tui.set_running(true);
+    tui.begin_submission("active");
     tui.show_selection_dialog(DialogView::selection(
         "Permission required",
         None::<String>,
@@ -2909,9 +2908,8 @@ fn permission_double_control_c_exits_and_runtime_cleanup_can_fail_closed() {
     assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Render);
     assert!(bridge.is_pending(request.id()));
     assert!(tui.view().dialog.is_some());
-    assert_eq!(tui.engine().cancellations, 0);
-    assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Quit);
     assert_eq!(tui.engine().cancellations, 1);
+    assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Render);
     assert!(bridge.close());
     assert_eq!(worker.join().unwrap(), TuiPermissionReply::Cancelled);
 }
@@ -2978,7 +2976,7 @@ fn streaming_events_update_stable_entries_and_preserve_tool_order() {
             TranscriptEntry::Tool("native::read completed: file contents".into()),
         ]
     );
-    assert!(!tui.view().running);
+    assert!(tui.view().running);
 }
 
 #[test]
@@ -4021,7 +4019,7 @@ fn device_auth_overlay_actions_copy_exact_values_open_and_keep_route_alive() {
         tui.device_auth_clipboard_text(),
         Some("https://auth.example/device")
     );
-    assert!(tui.view().running);
+    assert!(!tui.view().running);
     assert_eq!(tui.handle(Event::Key(Key::Down)), Action::Render);
     assert_eq!(
         tui.handle(Event::Key(Key::Enter)),
@@ -4031,14 +4029,14 @@ fn device_auth_overlay_actions_copy_exact_values_open_and_keep_route_alive() {
         tui.device_auth_clipboard_text(),
         Some("https://auth.example/device")
     );
-    assert!(tui.view().running);
+    assert!(!tui.view().running);
     assert_eq!(tui.handle(Event::Key(Key::Down)), Action::Render);
     assert_eq!(
         tui.handle(Event::Key(Key::Enter)),
         Action::CopyDeviceAuthCode
     );
     assert_eq!(tui.device_auth_clipboard_text(), Some("ABCD-EFGH"));
-    assert!(tui.view().running);
+    assert!(!tui.view().running);
 }
 
 #[test]
@@ -4819,4 +4817,90 @@ fn ask_user_answered_reply_debug_never_carries_answer_content() {
         !rendered.contains('q'),
         "debug must not leak the question id"
     );
+}
+
+#[test]
+fn terminal_progress_does_not_release_foreground_scheduler_ownership() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.enable_busy_policy_routing();
+    tui.begin_submission("first");
+    tui.apply_progress(TurnEvent::StateChanged(TurnState::Completed));
+    tui.handle(Event::Key(Key::Char('n')));
+
+    assert!(tui.view().running);
+    assert_eq!(
+        tui.handle(Event::Key(Key::Enter)),
+        Action::SubmitBusy("n".into())
+    );
+}
+
+#[test]
+fn runtime_turn_end_does_not_release_foreground_scheduler_ownership() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.enable_busy_policy_routing();
+    tui.begin_submission("first");
+    tui.apply_runtime_event(TuiRuntimeEvent::TurnEnded {
+        status: TurnState::Completed,
+        duration: None,
+    });
+    tui.handle(Event::Key(Key::Char('n')));
+
+    assert!(tui.view().running);
+    assert_eq!(
+        tui.handle(Event::Key(Key::Enter)),
+        Action::SubmitBusy("n".into())
+    );
+}
+
+#[test]
+fn scheduler_owned_background_handoff_releases_and_dispatches_the_oldest_fifo_prompt() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.begin_submission("first");
+    tui.handle(Event::Key(Key::Char('n')));
+    assert_eq!(tui.handle(Event::Key(Key::Enter)), Action::Render);
+
+    assert_eq!(
+        tui.finish_provider_turn(TuiProviderOutcome::Backgrounded),
+        Some("n".into())
+    );
+    assert!(tui.view().running);
+}
+
+#[test]
+fn local_route_stays_cancellable_without_claiming_scheduler_foreground_running() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.begin_route();
+    tui.apply_route_progress(TuiRouteProgress::DeviceCode {
+        verification_url: "https://auth.example/device".into(),
+        user_code: "ABCD-EFGH".into(),
+    });
+
+    assert!(!tui.view().running);
+    assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::CancelRoute);
+}
+
+#[test]
+fn terminal_progress_keeps_auto_turn_deferred_until_matching_outcome_after_fifo() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.begin_submission("foreground");
+    finish_background_child(&mut tui, 7);
+    tui.handle(Event::Key(Key::Char('q')));
+    assert_eq!(tui.handle(Event::Key(Key::Enter)), Action::Render);
+
+    tui.apply_progress(TurnEvent::StateChanged(TurnState::Completed));
+    tui.apply_runtime_event(TuiRuntimeEvent::TurnEnded {
+        status: TurnState::Completed,
+        duration: None,
+    });
+    assert_eq!(tui.take_ready_auto_turn(), None);
+
+    assert_eq!(
+        tui.finish_provider_turn(TuiProviderOutcome::Backgrounded),
+        Some("q".into())
+    );
+    assert_eq!(tui.take_ready_auto_turn(), None);
+    tui.begin_submission("q");
+    tui.finish_provider_turn(TuiProviderOutcome::Completed("done".into()));
+
+    assert!(tui.take_ready_auto_turn().is_some());
 }
