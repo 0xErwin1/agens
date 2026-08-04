@@ -18,7 +18,7 @@ use agens_tui::{TuiPresentation, TuiRouteProgress, TuiRouteRequest};
 
 use super::*;
 use crate::engine::{ProductionTuiEngine, run_tui_prompt_with};
-use crate::extensions::{start_tui_commands, start_tui_skills};
+use crate::extensions::{start_tui_commands, start_tui_skills, tui_builtin_commands};
 use crate::resume::resume_tui_session;
 use crate::session::session_dialog_entry;
 use crate::test_support::{
@@ -3084,39 +3084,33 @@ fn busy_policy_exhaustively_classifies_builtin_commands_and_catalog_extensions()
         bootstrap,
         Arc::new(Mutex::new(SessionContext::fresh())),
         Arc::new(Mutex::new(None)),
-        commands,
+        Arc::clone(&commands),
         skills,
     );
 
+    let built_ins = commands
+        .iter()
+        .filter(|command| command.is_builtin())
+        .collect::<Vec<_>>();
+    assert_eq!(built_ins.len(), tui_builtin_commands().len());
+
+    for command in built_ins {
+        let input = format!("/{} arguments", command.name());
+        assert_eq!(
+            router.classify_busy_input(&input),
+            BusyPolicy::from_catalog_policy(command.busy_policy()),
+            "{input}"
+        );
+    }
+
     let cases = [
-        ("/agent", BusyPolicy::Reject),
         ("/agent primary", BusyPolicy::Reject),
-        ("/bypass", BusyPolicy::Reject),
-        ("/connect", BusyPolicy::Reject),
         ("/connect --device-auth", BusyPolicy::Reject),
-        ("/dangerous", BusyPolicy::Reject),
-        ("/disconnect", BusyPolicy::Reject),
-        ("/diagnostics", BusyPolicy::Local),
-        ("/effort", BusyPolicy::Reject),
         ("/effort high", BusyPolicy::Reject),
-        ("/help", BusyPolicy::Local),
-        ("/keys", BusyPolicy::Invalid),
-        ("/login", BusyPolicy::Reject),
-        ("/mcp", BusyPolicy::Local),
-        ("/model", BusyPolicy::Reject),
         ("/model gpt-5.6", BusyPolicy::Reject),
-        ("/new", BusyPolicy::Reject),
-        ("/provider", BusyPolicy::Reject),
         ("/provider openai-api", BusyPolicy::Reject),
-        ("/quit", BusyPolicy::Quit),
-        ("/resume", BusyPolicy::Reject),
         ("/resume 42", BusyPolicy::Reject),
-        ("/select", BusyPolicy::Local),
-        ("/sessions", BusyPolicy::Reject),
-        ("/subagent", BusyPolicy::Reject),
         ("/subagent primary", BusyPolicy::Reject),
-        ("/subagent-profiles", BusyPolicy::Reject),
-        ("/subagents", BusyPolicy::Local),
         ("/summarize release", BusyPolicy::Queue),
         ("/review release", BusyPolicy::Queue),
         ("plain provider prompt", BusyPolicy::Queue),

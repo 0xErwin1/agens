@@ -2,87 +2,239 @@ use agens_bootstrap::discover_skill_catalog;
 use std::path::Path;
 use std::sync::Arc;
 
-use agens_tools::{CommandCatalog, CommandDefinition, SkillCatalog};
+use agens_tools::{CommandBusyPolicy, CommandCatalog, CommandDefinition, SkillCatalog};
 use agens_tui::{Engine as TuiEngine, PaletteEntry, PaletteEntryKind, Tui};
 
 use agens_bootstrap::Bootstrap;
 use agens_error::CliError;
 
-pub const RESERVED_TUI_COMMANDS: &[&str] = &[
-    "agent",
-    "bypass",
-    "connect",
-    "dangerous",
-    "disconnect",
-    "diagnostics",
-    "effort",
-    "help",
-    "keys",
-    "login",
-    "mcp",
-    "model",
-    "new",
-    "provider",
-    "quit",
-    "resume",
-    "select",
-    "sessions",
-    "subagent",
-    "subagent-profiles",
-    "subagents",
-];
+pub(crate) struct TuiBuiltinCommand {
+    name: &'static str,
+    description: &'static str,
+    argument_hint: &'static str,
+    dialog_id: Option<&'static str>,
+    busy_policy: CommandBusyPolicy,
+    requires_subagents: bool,
+    palette_order: u8,
+}
 
-const TUI_PALETTE_BUILT_INS: &[(&str, &str, &str, Option<&str>)] = &[
-    ("connect", "Connect to ChatGPT", "[--device-auth]", None),
-    ("disconnect", "Disconnect ChatGPT credentials", "", None),
-    ("login", "Sign in to a provider", "", Some("login")),
-    (
-        "diagnostics",
-        "Show sanitized runtime diagnostics",
-        "",
-        Some("diagnostics"),
-    ),
-    ("new", "Start a new session", "", None),
-    ("sessions", "List saved sessions", "", None),
-    ("resume", "Resume a saved session", "<id>", None),
-    ("agent", "List or select the primary agent", "[name]", None),
-    (
-        "provider",
-        "Select runtime provider",
+impl TuiBuiltinCommand {
+    const fn new(
+        name: &'static str,
+        description: &'static str,
+        argument_hint: &'static str,
+        dialog_id: Option<&'static str>,
+        busy_policy: CommandBusyPolicy,
+        requires_subagents: bool,
+        palette_order: u8,
+    ) -> Self {
+        Self {
+            name,
+            description,
+            argument_hint,
+            dialog_id,
+            busy_policy,
+            requires_subagents,
+            palette_order,
+        }
+    }
+}
+
+const TUI_BUILT_INS: &[TuiBuiltinCommand] = &[
+    TuiBuiltinCommand::new(
+        "agent",
+        "List or select the primary agent",
         "[name]",
-        Some("provider"),
+        Some("agent"),
+        CommandBusyPolicy::IdleOnly,
+        false,
+        7,
     ),
-    ("model", "List or select the model", "[name]", Some("model")),
-    (
-        "effort",
-        "Show or set reasoning effort",
-        "[level]",
-        Some("effort"),
-    ),
-    (
+    TuiBuiltinCommand::new(
         "bypass",
         "Toggle skipping permission prompts",
         "",
         Some("bypass"),
+        CommandBusyPolicy::IdleOnly,
+        false,
+        11,
     ),
-    (
+    TuiBuiltinCommand::new(
+        "connect",
+        "Connect to ChatGPT",
+        "[--device-auth]",
+        Some("connect"),
+        CommandBusyPolicy::IdleOnly,
+        false,
+        0,
+    ),
+    TuiBuiltinCommand::new(
         "dangerous",
         "Toggle dangerous mode for subagent tools",
         "",
         Some("dangerous"),
+        CommandBusyPolicy::IdleOnly,
+        false,
+        12,
     ),
-    ("help", "Show commands and skills", "", Some("help")),
-    ("keys", "Show keyboard shortcuts", "", Some("keys")),
-    ("mcp", "Show configured MCP servers", "", Some("mcp")),
-    ("select", "Select a project file", "", Some("select")),
-    (
+    TuiBuiltinCommand::new(
+        "diagnostics",
+        "Show sanitized runtime diagnostics",
+        "",
+        Some("diagnostics"),
+        CommandBusyPolicy::Local,
+        false,
+        3,
+    ),
+    TuiBuiltinCommand::new(
+        "disconnect",
+        "Disconnect ChatGPT credentials",
+        "",
+        Some("disconnect"),
+        CommandBusyPolicy::IdleOnly,
+        false,
+        1,
+    ),
+    TuiBuiltinCommand::new(
+        "effort",
+        "Show or set reasoning effort",
+        "[level]",
+        Some("effort"),
+        CommandBusyPolicy::IdleOnly,
+        false,
+        10,
+    ),
+    TuiBuiltinCommand::new(
+        "help",
+        "Show commands and skills",
+        "",
+        Some("help"),
+        CommandBusyPolicy::Local,
+        false,
+        13,
+    ),
+    TuiBuiltinCommand::new(
+        "keys",
+        "Show keyboard shortcuts",
+        "",
+        Some("keys"),
+        CommandBusyPolicy::Invalid,
+        false,
+        14,
+    ),
+    TuiBuiltinCommand::new(
+        "login",
+        "Sign in to a provider",
+        "",
+        Some("login"),
+        CommandBusyPolicy::IdleOnly,
+        false,
+        2,
+    ),
+    TuiBuiltinCommand::new(
+        "mcp",
+        "Show configured MCP servers",
+        "",
+        Some("mcp"),
+        CommandBusyPolicy::Local,
+        false,
+        15,
+    ),
+    TuiBuiltinCommand::new(
+        "model",
+        "List or select the model",
+        "[name]",
+        Some("model"),
+        CommandBusyPolicy::IdleOnly,
+        false,
+        9,
+    ),
+    TuiBuiltinCommand::new(
+        "new",
+        "Start a new session",
+        "",
+        None,
+        CommandBusyPolicy::IdleOnly,
+        false,
+        4,
+    ),
+    TuiBuiltinCommand::new(
+        "provider",
+        "Select runtime provider",
+        "[name]",
+        Some("provider"),
+        CommandBusyPolicy::IdleOnly,
+        false,
+        8,
+    ),
+    TuiBuiltinCommand::new(
+        "quit",
+        "Exit Agens",
+        "",
+        None,
+        CommandBusyPolicy::Quit,
+        false,
+        18,
+    ),
+    TuiBuiltinCommand::new(
+        "resume",
+        "Resume a saved session",
+        "<id>",
+        Some("sessions"),
+        CommandBusyPolicy::IdleOnly,
+        false,
+        6,
+    ),
+    TuiBuiltinCommand::new(
+        "select",
+        "Select a project file",
+        "",
+        Some("select"),
+        CommandBusyPolicy::Local,
+        false,
+        16,
+    ),
+    TuiBuiltinCommand::new(
+        "sessions",
+        "List saved sessions",
+        "",
+        Some("sessions"),
+        CommandBusyPolicy::IdleOnly,
+        false,
+        5,
+    ),
+    TuiBuiltinCommand::new(
+        "subagent",
+        "Choose an eligible configured subagent",
+        "[name]",
+        Some("subagent"),
+        CommandBusyPolicy::IdleOnly,
+        true,
+        19,
+    ),
+    TuiBuiltinCommand::new(
         "subagent-profiles",
         "Edit subagent model profiles",
         "",
         Some("subagent-profiles"),
+        CommandBusyPolicy::IdleOnly,
+        false,
+        17,
     ),
-    ("quit", "Exit Agens", "", None),
+    TuiBuiltinCommand::new(
+        "subagents",
+        "Inspect current-session subagent transcripts",
+        "",
+        None,
+        CommandBusyPolicy::Local,
+        true,
+        20,
+    ),
 ];
+
+pub(crate) fn tui_builtin_commands() -> &'static [TuiBuiltinCommand] {
+    TUI_BUILT_INS
+}
 
 /// Discovers the command catalog for the given root without surfacing diagnostics to a `Tui`.
 ///
@@ -99,11 +251,16 @@ pub fn discover_tui_command_catalog(
         .ok_or_else(|| CliError::configuration("global command root is unavailable"))?
         .join("commands");
     let project_command_root = project_root.join(".agens/commands");
-    let built_ins = RESERVED_TUI_COMMANDS
+    let built_ins = tui_builtin_commands()
         .iter()
-        .map(|name| {
-            CommandDefinition::new(*name, "Reserved TUI command", *name)
-                .expect("reserved TUI command names are valid")
+        .map(|command| {
+            CommandDefinition::builtin(
+                command.name,
+                command.description,
+                command.name,
+                command.busy_policy,
+            )
+            .expect("reserved TUI command names are valid")
         })
         .collect::<Vec<_>>();
     CommandCatalog::discover(&built_ins, global_root, project_command_root)
@@ -161,38 +318,29 @@ pub fn resolved_tui_palette(
     skills: &SkillCatalog,
     has_subagents: bool,
 ) -> Vec<PaletteEntry> {
-    let mut entries = TUI_PALETTE_BUILT_INS
+    let mut built_ins = tui_builtin_commands()
         .iter()
-        .map(|(name, description, hint, dialog_id)| {
-            let entry = PaletteEntry::new(*name, *description, *hint, PaletteEntryKind::BuiltIn);
-            let dialog_id = dialog_id.or(match *name {
-                "connect" | "disconnect" | "agent" => Some(*name),
-                "sessions" | "resume" => Some("sessions"),
-                _ => None,
-            });
-            dialog_id.map_or(entry.clone(), |route| entry.with_dialog(route))
+        .filter(|command| has_subagents || !command.requires_subagents)
+        .collect::<Vec<_>>();
+    built_ins.sort_by_key(|command| command.palette_order);
+
+    let mut entries = built_ins
+        .into_iter()
+        .map(|command| {
+            let entry = PaletteEntry::new(
+                command.name,
+                command.description,
+                command.argument_hint,
+                PaletteEntryKind::BuiltIn,
+            );
+            command
+                .dialog_id
+                .map_or(entry.clone(), |route| entry.with_dialog(route))
         })
         .collect::<Vec<_>>();
-    if has_subagents {
-        entries.push(
-            PaletteEntry::new(
-                "subagent",
-                "Choose an eligible configured subagent",
-                "[name]",
-                PaletteEntryKind::BuiltIn,
-            )
-            .with_dialog("subagent"),
-        );
-        entries.push(PaletteEntry::new(
-            "subagents",
-            "Inspect current-session subagent transcripts",
-            "",
-            PaletteEntryKind::BuiltIn,
-        ));
-    }
     let mut custom_commands = commands
         .iter()
-        .filter(|command| !RESERVED_TUI_COMMANDS.contains(&command.name()))
+        .filter(|command| !command.is_builtin())
         .collect::<Vec<_>>();
     custom_commands.sort_by_key(|command| command.name());
     entries.extend(custom_commands.into_iter().map(|command| {
@@ -205,10 +353,7 @@ pub fn resolved_tui_palette(
     }));
     let mut resolved_skills = skills
         .skills()
-        .filter(|skill| {
-            !RESERVED_TUI_COMMANDS.contains(&skill.name())
-                && commands.command(skill.name()).is_none()
-        })
+        .filter(|skill| commands.command(skill.name()).is_none())
         .collect::<Vec<_>>();
     resolved_skills.sort_by_key(|skill| skill.name());
     entries.extend(resolved_skills.into_iter().map(|skill| {

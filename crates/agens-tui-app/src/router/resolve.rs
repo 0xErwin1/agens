@@ -6,7 +6,6 @@ use agens_core::HeadlessTurnError;
 use agens_tui::{TuiPresentation, TuiRouteCancellation, TuiSubmissionOutcome};
 
 use crate::engine::{seed_fresh_tui_context, write_through_bypass_permission_prompts};
-use crate::extensions::RESERVED_TUI_COMMANDS;
 use crate::models::{select_tui_effort, select_tui_model};
 use crate::resume::{commit_tui_session_resume, resume_tui_session};
 use crate::turn::tui_session_presentation;
@@ -19,30 +18,6 @@ use agens_tool_runtime::rotation::rotate_agent;
 
 use super::{BusyPolicy, TuiRuntimeRouter};
 
-const BUILTIN_BUSY_POLICIES: &[(&str, BusyPolicy)] = &[
-    ("agent", BusyPolicy::Reject),
-    ("bypass", BusyPolicy::Reject),
-    ("connect", BusyPolicy::Reject),
-    ("dangerous", BusyPolicy::Reject),
-    ("disconnect", BusyPolicy::Reject),
-    ("diagnostics", BusyPolicy::Local),
-    ("effort", BusyPolicy::Reject),
-    ("help", BusyPolicy::Local),
-    ("keys", BusyPolicy::Invalid),
-    ("login", BusyPolicy::Reject),
-    ("mcp", BusyPolicy::Local),
-    ("model", BusyPolicy::Reject),
-    ("new", BusyPolicy::Reject),
-    ("provider", BusyPolicy::Reject),
-    ("quit", BusyPolicy::Quit),
-    ("resume", BusyPolicy::Reject),
-    ("select", BusyPolicy::Local),
-    ("sessions", BusyPolicy::Reject),
-    ("subagent", BusyPolicy::Reject),
-    ("subagent-profiles", BusyPolicy::Reject),
-    ("subagents", BusyPolicy::Local),
-];
-
 impl TuiRuntimeRouter {
     /// Classifies an input against the current built-in, command, and skill catalogs.
     ///
@@ -53,25 +28,21 @@ impl TuiRuntimeRouter {
             return BusyPolicy::Queue;
         };
 
-        if let Some((_, policy)) = BUILTIN_BUSY_POLICIES
-            .iter()
-            .find(|(candidate, _)| *candidate == name)
-        {
-            return *policy;
-        }
-
-        if RESERVED_TUI_COMMANDS.contains(&name) {
+        let Ok(commands) = self.commands() else {
             return BusyPolicy::Invalid;
+        };
+        if let Some(command) = commands.command(name) {
+            return BusyPolicy::from_catalog_policy(command.busy_policy());
         }
 
-        match (self.commands(), self.skills()) {
-            (Ok(commands), Ok(skills))
-                if commands.command(name).is_some() || skills.skill(name).is_some() =>
-            {
-                BusyPolicy::Queue
-            }
-            _ => BusyPolicy::Invalid,
+        if self
+            .skills()
+            .is_ok_and(|skills| skills.skill(name).is_some())
+        {
+            return BusyPolicy::Queue;
         }
+
+        BusyPolicy::Invalid
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -189,7 +160,11 @@ impl TuiRuntimeRouter {
                 message: select_tui_effort(&bootstrap, command, &self.session)?,
                 presentation: self.presentation()?,
             },
-            _ if RESERVED_TUI_COMMANDS.contains(&name) => {
+            _ if self
+                .commands()?
+                .command(name)
+                .is_some_and(|command| command.is_builtin()) =>
+            {
                 return Err(CliError::usage(format!("unknown TUI command: {command}")));
             }
             _ => match self.commands()?.command(name) {

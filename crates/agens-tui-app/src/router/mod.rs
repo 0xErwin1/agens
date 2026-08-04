@@ -17,7 +17,9 @@ use std::sync::{Arc, Mutex};
 
 use crate::profiles::{AgentProfileStore, ProfileEditor};
 use agens_core::HeadlessTurnCancellation;
-use agens_tools::{CommandCatalog, McpStatusHandle, SkillCatalog, ToolDispatcher};
+use agens_tools::{
+    CommandBusyPolicy, CommandCatalog, McpStatusHandle, SkillCatalog, ToolDispatcher,
+};
 use agens_tui::{PaletteEntry, TuiProviderOutcome, TuiSubmissionOutcome};
 
 use crate::extensions::resolved_tui_palette;
@@ -45,6 +47,18 @@ pub enum BusyPolicy {
     Reject,
     Quit,
     Invalid,
+}
+
+impl BusyPolicy {
+    fn from_catalog_policy(policy: CommandBusyPolicy) -> Self {
+        match policy {
+            CommandBusyPolicy::Local => Self::Local,
+            CommandBusyPolicy::ProviderTurn => Self::Queue,
+            CommandBusyPolicy::IdleOnly => Self::Reject,
+            CommandBusyPolicy::Quit => Self::Quit,
+            CommandBusyPolicy::Invalid => Self::Invalid,
+        }
+    }
 }
 
 #[derive(Clone)]
