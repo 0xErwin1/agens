@@ -76,7 +76,10 @@ fn a_live_task_runtime_pins_the_headless_turn_to_its_own_session_root_not_the_pr
         &resume_bootstrap,
         &resolved_root,
         &SkillCatalog::default(),
-        Box::new(TuiPermissionPrompter(production_tui_permission_bridge().0)),
+        Box::new(TuiPermissionPrompter(
+            production_tui_permission_bridge().0,
+            None,
+        )),
         TuiTaskLifecycleBridge::new(
             agens_tui::BridgeTx::bounded(8).0,
             TuiTaskControls::default(),

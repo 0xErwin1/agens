@@ -26,15 +26,32 @@ pub enum TuiPermissionReply {
     DeadlineExpired,
 }
 
+/// Who a parked prompt belongs to.
+///
+/// `None` on a request means the main thread. A delegated execution names
+/// itself, because with several subagents running a question you cannot
+/// attribute is a question you cannot answer responsibly — you would be
+/// approving `bash` without knowing which agent is about to run it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PromptOrigin {
+    pub execution: u64,
+    pub agent: String,
+}
+
 pub struct TuiPermissionRequest {
     id: u64,
     tool: String,
     target: String,
+    origin: Option<PromptOrigin>,
 }
 
 impl TuiPermissionRequest {
     pub const fn id(&self) -> u64 {
         self.id
+    }
+
+    pub const fn origin(&self) -> Option<&PromptOrigin> {
+        self.origin.as_ref()
     }
 
     pub fn details(&self) -> (&str, &str) {
@@ -77,6 +94,7 @@ impl TuiPermissionBridge {
         &self,
         tool: impl Into<String>,
         target: impl Into<String>,
+        origin: Option<PromptOrigin>,
         cancellation: &HeadlessTurnCancellation,
     ) -> TuiPermissionReply {
         if cancellation.is_cancelled() || self.state.closed.load(Ordering::Acquire) {
@@ -93,6 +111,7 @@ impl TuiPermissionBridge {
             id,
             tool: tool.into(),
             target: target.into(),
+            origin,
         };
         if self.requests.send(request).is_err() {
             let _ = self.reply(id, TuiPermissionReply::Cancelled);
@@ -143,11 +162,16 @@ impl TuiPermissionBridge {
 pub struct TuiAskUserRequest {
     id: u64,
     request: AskUserRequest,
+    origin: Option<PromptOrigin>,
 }
 
 impl TuiAskUserRequest {
     pub const fn id(&self) -> u64 {
         self.id
+    }
+
+    pub const fn origin(&self) -> Option<&PromptOrigin> {
+        self.origin.as_ref()
     }
 
     pub const fn request(&self) -> &AskUserRequest {
@@ -212,6 +236,7 @@ impl TuiAskUserBridge {
     pub fn wait_for_reply(
         &self,
         request: AskUserRequest,
+        origin: Option<PromptOrigin>,
         cancellation: &HeadlessTurnCancellation,
     ) -> AskUserReply {
         if self.state.closed.load(Ordering::Acquire) {
@@ -224,7 +249,11 @@ impl TuiAskUserBridge {
         let id = self.state.next_id.fetch_add(1, Ordering::Relaxed);
         let (sender, receiver) = mpsc::channel();
         self.state.pending().insert(id, sender);
-        let tui_request = TuiAskUserRequest { id, request };
+        let tui_request = TuiAskUserRequest {
+            id,
+            request,
+            origin,
+        };
         if self.requests.send(tui_request).is_err() {
             let _ = self.reply(
                 id,
@@ -426,7 +455,7 @@ mod tests {
 
         assert!(!bridge.close());
 
-        let reply = bridge.wait_for_reply(single_question_request(), &cancellation);
+        let reply = bridge.wait_for_reply(single_question_request(), None, &cancellation);
 
         assert_eq!(
             reply,
@@ -446,7 +475,7 @@ mod tests {
         let waiting_bridge = bridge.clone();
 
         let waiter = thread::spawn(move || {
-            waiting_bridge.wait_for_reply(single_question_request(), &cancellation)
+            waiting_bridge.wait_for_reply(single_question_request(), None, &cancellation)
         });
 
         let request = receiver
@@ -477,7 +506,7 @@ mod tests {
             agens_core::HeadlessTurnCancellation::with_deadline(std::time::Duration::ZERO);
         cancellation.cancel();
 
-        let reply = bridge.wait_for_reply(single_question_request(), &cancellation);
+        let reply = bridge.wait_for_reply(single_question_request(), None, &cancellation);
 
         assert_eq!(reply, AskUserReply::Cancelled);
     }
@@ -489,7 +518,7 @@ mod tests {
         let waiting_bridge = bridge.clone();
 
         let waiter = thread::spawn(move || {
-            waiting_bridge.wait_for_reply(single_question_request(), &cancellation)
+            waiting_bridge.wait_for_reply(single_question_request(), None, &cancellation)
         });
 
         let request = receiver
@@ -513,7 +542,7 @@ mod tests {
         let waiting_bridge = bridge.clone();
 
         let waiter = thread::spawn(move || {
-            waiting_bridge.wait_for_reply(single_question_request(), &cancellation)
+            waiting_bridge.wait_for_reply(single_question_request(), None, &cancellation)
         });
 
         let request = receiver
@@ -536,7 +565,7 @@ mod tests {
         let waiting_bridge = bridge.clone();
 
         let waiter = thread::spawn(move || {
-            waiting_bridge.wait_for_reply(single_question_request(), &cancellation)
+            waiting_bridge.wait_for_reply(single_question_request(), None, &cancellation)
         });
 
         let request = receiver
@@ -592,7 +621,7 @@ mod tests {
         let waiting_bridge = bridge.clone();
 
         let waiter = thread::spawn(move || {
-            waiting_bridge.wait_for_reply(single_question_request(), &waiting_cancellation)
+            waiting_bridge.wait_for_reply(single_question_request(), None, &waiting_cancellation)
         });
 
         let request = receiver

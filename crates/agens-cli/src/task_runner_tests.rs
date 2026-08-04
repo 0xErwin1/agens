@@ -82,7 +82,10 @@ fn p1c1_terminal_observer_excludes_non_completed_matrix() {
             &bootstrap,
             &agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap),
             &SkillCatalog::default(),
-            Box::new(TuiPermissionPrompter(production_tui_permission_bridge().0)),
+            Box::new(TuiPermissionPrompter(
+                production_tui_permission_bridge().0,
+                None,
+            )),
             ProductionTaskRunner::with_probe(
                 bootstrap.clone(),
                 agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap),
@@ -169,7 +172,7 @@ fn u15_a1b2_selected_launch_uses_the_registered_production_task_runner() {
         &bootstrap,
         &agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap),
         &SkillCatalog::default(),
-        Box::new(TuiPermissionPrompter(bridge)),
+        Box::new(TuiPermissionPrompter(bridge, None)),
         ProductionTaskRunner::with_probe(
             bootstrap.clone(),
             agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap),
@@ -273,7 +276,10 @@ fn p1c1_p1b_authorized_runner_persists_one_completed_subagent_turn() {
         &bootstrap,
         &agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap),
         &SkillCatalog::default(),
-        Box::new(TuiPermissionPrompter(production_tui_permission_bridge().0)),
+        Box::new(TuiPermissionPrompter(
+            production_tui_permission_bridge().0,
+            None,
+        )),
         ProductionTaskRunner::with_progress_probe(
             bootstrap.clone(),
             agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap),
@@ -562,7 +568,10 @@ fn production_runner_error_publication_orders_sanitized_typed_failure_before_ter
             &bootstrap,
             &agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap),
             &SkillCatalog::default(),
-            Box::new(TuiPermissionPrompter(production_tui_permission_bridge().0)),
+            Box::new(TuiPermissionPrompter(
+                production_tui_permission_bridge().0,
+                None,
+            )),
             ProductionTaskRunner::with_failure_probe(
                 bootstrap.clone(),
                 agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap),

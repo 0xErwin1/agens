@@ -495,7 +495,10 @@ mod tests {
             &resume_bootstrap,
             &resolved_root,
             &SkillCatalog::default(),
-            Box::new(TuiPermissionPrompter(production_tui_permission_bridge().0)),
+            Box::new(TuiPermissionPrompter(
+                production_tui_permission_bridge().0,
+                None,
+            )),
             TuiTaskLifecycleBridge::new(
                 agens_tui::BridgeTx::bounded(8).0,
                 TuiTaskControls::default(),
@@ -1034,7 +1037,7 @@ mod tests {
             &bootstrap,
             &project_root,
             &skills,
-            Box::new(TuiPermissionPrompter(permission_bridge)),
+            Box::new(TuiPermissionPrompter(permission_bridge, None)),
             TuiTaskLifecycleBridge::new(events, TuiTaskControls::default()),
             agens_core::RequestConfig::default(),
             "abc12345".to_owned(),

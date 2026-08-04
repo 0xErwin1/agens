@@ -296,7 +296,10 @@ fn u15_c1c_backgrounded_success_skips_the_parent_provider_and_history_path() {
         &bootstrap,
         &agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap),
         &SkillCatalog::default(),
-        Box::new(TuiPermissionPrompter(production_tui_permission_bridge().0)),
+        Box::new(TuiPermissionPrompter(
+            production_tui_permission_bridge().0,
+            None,
+        )),
         ProductionTaskRunner::with_probe(
             bootstrap.clone(),
             agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap),
@@ -422,7 +425,7 @@ fn u15_a1b2_permission_cardinality_is_exact_for_allow_ask_and_deny() {
         &bootstrap,
         &agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap),
         &SkillCatalog::default(),
-        Box::new(TuiPermissionPrompter(bridge.clone())),
+        Box::new(TuiPermissionPrompter(bridge.clone(), None)),
         ProductionTaskRunner::with_probe(
             bootstrap.clone(),
             agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap),
@@ -505,7 +508,7 @@ fn u15_bypass_upgrades_ask_to_allow_on_the_authorized_launch_path_and_no_bypass_
         &bootstrap,
         &agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap),
         &SkillCatalog::default(),
-        Box::new(TuiPermissionPrompter(bridge.clone())),
+        Box::new(TuiPermissionPrompter(bridge.clone(), None)),
         ProductionTaskRunner::with_probe(
             bootstrap.clone(),
             agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap),
@@ -547,7 +550,7 @@ fn u15_bypass_upgrades_ask_to_allow_on_the_authorized_launch_path_and_no_bypass_
         &bootstrap,
         &agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap),
         &SkillCatalog::default(),
-        Box::new(TuiPermissionPrompter(bridge.clone())),
+        Box::new(TuiPermissionPrompter(bridge.clone(), None)),
         ProductionTaskRunner::with_probe(
             bootstrap.clone(),
             agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap),
@@ -603,7 +606,10 @@ fn u15_the_production_wrapper_threads_its_bypass_flag_into_the_authorized_gate()
         &bootstrap,
         &agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap),
         &SkillCatalog::default(),
-        Box::new(TuiPermissionPrompter(production_tui_permission_bridge().0)),
+        Box::new(TuiPermissionPrompter(
+            production_tui_permission_bridge().0,
+            None,
+        )),
         TuiTaskLifecycleBridge::new(
             agens_tui::BridgeTx::bounded(8).0,
             TuiTaskControls::default(),
@@ -652,7 +658,7 @@ fn u15_a1b2_rejections_leave_the_concrete_runner_and_grants_unchanged() {
         &bootstrap,
         &agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap),
         &SkillCatalog::default(),
-        Box::new(TuiPermissionPrompter(bridge.clone())),
+        Box::new(TuiPermissionPrompter(bridge.clone(), None)),
         ProductionTaskRunner::with_probe(
             bootstrap.clone(),
             agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap),

@@ -21,7 +21,7 @@ pub use agens_core::{
 pub use app::{AppEvent, AppState, Command, Dialog, Effect, Runtime};
 pub use ask_user::{AskUserEditing, AskUserRowSnapshot, AskUserSnapshot};
 pub use bridge::{
-    TuiAskUserBridge, TuiAskUserRequest, TuiPermissionBridge, TuiPermissionReply,
+    PromptOrigin, TuiAskUserBridge, TuiAskUserRequest, TuiPermissionBridge, TuiPermissionReply,
     TuiPermissionRequest,
 };
 pub use conversation::{
@@ -12859,7 +12859,7 @@ mod runtime_tests {
         let waiting_bridge = bridge.clone();
 
         let waiter = thread::spawn(move || {
-            waiting_bridge.wait_for_reply(runtime_glue_ask_user_request(), &cancellation)
+            waiting_bridge.wait_for_reply(runtime_glue_ask_user_request(), None, &cancellation)
         });
 
         let mut tui = Tui::new(NoopEngine);
@@ -12911,7 +12911,11 @@ mod runtime_tests {
         let waiting_cancellation = cancellation.clone();
 
         let waiter = thread::spawn(move || {
-            waiting_bridge.wait_for_reply(runtime_glue_ask_user_request(), &waiting_cancellation)
+            waiting_bridge.wait_for_reply(
+                runtime_glue_ask_user_request(),
+                None,
+                &waiting_cancellation,
+            )
         });
 
         let mut tui = Tui::new(NoopEngine);

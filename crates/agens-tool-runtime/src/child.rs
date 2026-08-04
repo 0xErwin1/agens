@@ -181,6 +181,8 @@ pub struct ProductionTaskExecutionContext<'a> {
     /// Builds this execution's prompter onto the parent's surface. `None` is a
     /// delegation with nobody to ask.
     pub permission_prompter: Option<crate::runner::PrompterFactory>,
+    /// Builds this execution's `ask_user` port onto the parent's surface.
+    pub ask_user_port: Option<crate::runner::AskUserPortFactory>,
     /// Where this execution sits in the delegation chain. The parent turn is
     /// 0, so its own children are 1.
     pub depth: usize,
@@ -201,6 +203,7 @@ pub fn run_production_task(
         execution_id,
         mcp_registry,
         permission_prompter,
+        ask_user_port,
         depth,
     } = context;
     let messages = vec![
@@ -235,6 +238,10 @@ pub fn run_production_task(
         record_subagent_surface_rejection(bootstrap, diagnostic_reference, &rejection.message());
         ChildRunError::DeclarationRejected(rejection)
     })?;
+    let origin = crate::runner::PromptOrigin {
+        execution: execution_id.value(),
+        agent: request.agent_name().to_owned(),
+    };
     let skills = agens_bootstrap::discover_skill_catalog(bootstrap, project_root)
         .map_err(|_| ChildRunError::Runtime)?;
     let (provider_tools, tool_runtime) = production_child_tool_runtime(
@@ -254,6 +261,8 @@ pub fn run_production_task(
                 diagnostic_reference: Some(diagnostic_reference.to_owned()),
             },
             permission_prompter: permission_prompter.clone(),
+            ask_user_port: ask_user_port.clone(),
+            origin: origin.clone(),
         }),
     )
     .map_err(|_| ChildRunError::Runtime)?;
@@ -304,6 +313,7 @@ pub fn run_production_task(
                     },
                     permission_prompter: permission_prompter.clone(),
                     grant_store_root: bootstrap.data_directory().to_path_buf(),
+                    origin: Some(origin.clone()),
                 },
             )
         }
@@ -341,6 +351,7 @@ pub fn run_production_task(
                     },
                     permission_prompter: permission_prompter.clone(),
                     grant_store_root: bootstrap.data_directory().to_path_buf(),
+                    origin: Some(origin.clone()),
                 },
             )
         }
@@ -379,6 +390,7 @@ pub fn run_production_task(
                     },
                     permission_prompter: permission_prompter.clone(),
                     grant_store_root: bootstrap.data_directory().to_path_buf(),
+                    origin: Some(origin.clone()),
                 },
             )
         }
@@ -482,6 +494,7 @@ struct IsolatedTaskTurnContext<'a> {
     mailbox: TaskMailboxContext,
     permission_prompter: Option<crate::runner::PrompterFactory>,
     grant_store_root: PathBuf,
+    origin: Option<crate::runner::PromptOrigin>,
 }
 
 /// Runs a subagent's isolated turn with no session attempt of its own, so the
@@ -507,6 +520,7 @@ where
         mailbox,
         permission_prompter,
         grant_store_root,
+        origin,
     } = context;
     let max_iterations = configured_task_max_iterations(&mailbox.registry);
     let mut provider = TaskMailboxProvider::new(provider, Some(mailbox.registry), mailbox.target);
@@ -536,7 +550,12 @@ where
     let mut resolver = match permission_prompter.and_then(|build| {
         PermissionGrantStore::open(&grant_store_root)
             .ok()
-            .map(|store| (build(), store))
+            .map(|store| {
+                (
+                    build(origin.clone().unwrap_or_else(main_thread_origin)),
+                    store,
+                )
+            })
     }) {
         Some((prompter, store)) => {
             ChildPermissionResolver::Prompting(Box::new(ProductionPermissionResolver::new(
@@ -579,6 +598,15 @@ where
             _ => None,
         })
         .collect())
+}
+
+/// The origin a prompt carries when the caller named none. Only tests reach
+/// this: a real delegation always names its execution.
+fn main_thread_origin() -> crate::runner::PromptOrigin {
+    crate::runner::PromptOrigin {
+        execution: 0,
+        agent: "subagent".into(),
+    }
 }
 
 /// How a delegated execution answers a call the policy left undecided.
@@ -839,6 +867,7 @@ mod tests {
                 },
                 permission_prompter: None,
                 grant_store_root: std::env::temp_dir(),
+                origin: None,
             },
         );
 
@@ -983,6 +1012,7 @@ mod tests {
                     },
                     permission_prompter: None,
                     grant_store_root: std::env::temp_dir(),
+                    origin: None,
                 },
             );
 
@@ -1122,6 +1152,7 @@ mod tests {
                 },
                 permission_prompter: None,
                 grant_store_root: std::env::temp_dir(),
+                origin: None,
             },
         ) {
             Ok(output) => output,
