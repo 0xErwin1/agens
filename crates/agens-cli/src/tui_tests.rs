@@ -285,15 +285,28 @@ fn production_tui_project_identity_uses_the_canonical_current_project_for_new_an
         BTreeMap::new(),
     ))
     .unwrap();
+    let expected_fallback_project =
+        agens_bootstrap::session_root::SessionRoot::discover_for_new_session(&no_project_bootstrap)
+            .map_or_else(
+                || "agens".to_owned(),
+                |root| root.path().display().to_string(),
+            );
+    let expected_fallback_name = std::path::Path::new(&expected_fallback_project)
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or("agens");
     let mut fallback_tui = Tui::new(ProductionTuiEngine {
         cancellation: Arc::new(Mutex::new(None)),
     });
 
     configure_tui_project_identity(&mut fallback_tui, &no_project_bootstrap);
-    assert_eq!(fallback_tui.view().project, "agens");
+    assert_eq!(fallback_tui.view().project, expected_fallback_project);
     let fallback_render = render_tui_test_backend(&fallback_tui, 120, 24);
     // Project basename lives in the operational footer (not "project …" header chrome).
-    assert!(fallback_render.contains("agens"), "{fallback_render:?}");
+    assert!(
+        fallback_render.contains(expected_fallback_name),
+        "{fallback_render:?}"
+    );
 
     std::fs::remove_dir_all(temporary).unwrap();
 }

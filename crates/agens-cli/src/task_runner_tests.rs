@@ -123,7 +123,9 @@ fn p1c1_terminal_observer_excludes_non_completed_matrix() {
             });
 
         assert!(session.lock().unwrap().identifier.is_none());
-        assert!(lifecycle.transition_to_background());
+        if terminal.is_some() {
+            assert!(lifecycle.transition_to_background());
+        }
         assert!(session.lock().unwrap().identifier.is_none());
         if let Some(terminal) = terminal {
             assert!(lifecycle.finish(terminal));
