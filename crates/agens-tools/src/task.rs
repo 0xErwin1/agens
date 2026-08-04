@@ -122,6 +122,7 @@ pub enum TaskRegistryError {
 pub struct TaskExecutionSnapshot {
     pub id: TaskExecutionId,
     pub mode: TaskLaunchMode,
+    pub cancellation_requested: bool,
     pub terminal: Option<TaskTerminalState>,
     pub result: Option<ToolOutput>,
 }
@@ -425,9 +426,30 @@ impl TaskExecutionRegistry {
         Some(TaskExecutionSnapshot {
             id,
             mode: execution.lifecycle.mode(),
+            cancellation_requested: execution.cancellation.load(Ordering::Acquire),
             terminal: execution.lifecycle.terminal(),
             result: execution.result.clone(),
         })
+    }
+
+    /// Returns active executions in admission order for read-only projections.
+    pub fn active_snapshots(&self) -> Vec<TaskExecutionSnapshot> {
+        let Ok(registry) = self.inner.lock() else {
+            return Vec::new();
+        };
+
+        registry
+            .executions
+            .iter()
+            .filter(|(_, execution)| execution.lifecycle.terminal().is_none())
+            .map(|(id, execution)| TaskExecutionSnapshot {
+                id: *id,
+                mode: execution.lifecycle.mode(),
+                cancellation_requested: execution.cancellation.load(Ordering::Acquire),
+                terminal: None,
+                result: None,
+            })
+            .collect()
     }
 
     pub fn result(&self, id: TaskExecutionId) -> Option<ToolOutput> {
@@ -618,14 +640,21 @@ impl TaskExecutionRegistry {
         }
     }
 
-    pub fn cancel_all(&self) {
-        if let Ok(registry) = self.inner.lock() {
-            for execution in registry.executions.values() {
-                if execution.lifecycle.terminal().is_none() {
-                    execution.cancellation.store(true, Ordering::Release);
-                }
-            }
-        }
+    /// Requests cancellation for every active execution and returns the IDs confirmed active.
+    pub fn cancel_all(&self) -> Vec<TaskExecutionId> {
+        let Ok(registry) = self.inner.lock() else {
+            return Vec::new();
+        };
+
+        registry
+            .executions
+            .iter()
+            .filter(|(_, execution)| execution.lifecycle.terminal().is_none())
+            .map(|(id, execution)| {
+                execution.cancellation.store(true, Ordering::Release);
+                *id
+            })
+            .collect()
     }
 
     fn set_worker(&self, id: TaskExecutionId, worker: thread::JoinHandle<()>) {

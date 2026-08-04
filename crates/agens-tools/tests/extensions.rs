@@ -19,11 +19,11 @@ use agens_tools::{
     AgentCatalog, AgentModelValidationError, AgentModelValidator, CommandCatalog,
     CommandDefinition, DispatchTool, EffectiveCapabilityDescriptor, EffectiveCapabilitySet,
     SkillCatalog, TaskControlAction, TaskControlTool, TaskExecutionEvent, TaskExecutionId,
-    TaskExecutionLifecycle, TaskExecutionRegistry, TaskInvocation, TaskLaunchMode,
-    TaskMessageSource, TaskMessageTarget, TaskMessageTool, TaskModelResolutionError,
-    TaskRunContext, TaskRunner, TaskRunnerError, TaskSkill, TaskTerminalState, TaskTool,
-    TaskTurnRequest, TaskTurnResult, ToolDispatchRequest, ToolDispatcher, ToolEvaluationOutcome,
-    ToolExecutionContext, ToolOutput,
+    TaskExecutionLifecycle, TaskExecutionRegistry, TaskExecutionSnapshot, TaskInvocation,
+    TaskLaunchMode, TaskMessageSource, TaskMessageTarget, TaskMessageTool,
+    TaskModelResolutionError, TaskRunContext, TaskRunner, TaskRunnerError, TaskSkill,
+    TaskTerminalState, TaskTool, TaskTurnRequest, TaskTurnResult, ToolDispatchRequest,
+    ToolDispatcher, ToolEvaluationOutcome, ToolExecutionContext, ToolOutput,
     markdown::{self, FrontmatterValue, MarkdownRoot},
 };
 use serde_json::Value;
@@ -1509,6 +1509,64 @@ fn task_registry_owns_session_ids_global_capacity_and_terminal_results() {
         .admit(TaskLaunchMode::Background)
         .expect("terminal execution releases capacity");
     assert_eq!(replacement.value(), 5);
+}
+
+#[test]
+fn task_registry_snapshots_keep_active_work_ordered_and_report_pending_cancellation() {
+    let registry = TaskExecutionRegistry::new();
+    let foreground = registry.admit(TaskLaunchMode::Foreground).unwrap();
+    let background = registry.admit(TaskLaunchMode::Background).unwrap();
+    let terminal = registry.admit(TaskLaunchMode::Background).unwrap();
+
+    assert!(registry.cancel(background));
+    assert!(registry.finish(
+        terminal,
+        TaskTerminalState::Cancelled,
+        ToolOutput::failure("task: cancelled"),
+    ));
+
+    assert_eq!(
+        registry.active_snapshots(),
+        vec![
+            TaskExecutionSnapshot {
+                id: foreground,
+                mode: TaskLaunchMode::Foreground,
+                cancellation_requested: false,
+                terminal: None,
+                result: None,
+            },
+            TaskExecutionSnapshot {
+                id: background,
+                mode: TaskLaunchMode::Background,
+                cancellation_requested: true,
+                terminal: None,
+                result: None,
+            },
+        ]
+    );
+
+    assert!(!registry.cancel(terminal));
+    assert!(!registry.cancel(TaskExecutionId::from_value(99)));
+    assert_eq!(registry.active_snapshots().len(), 2);
+}
+
+#[test]
+fn task_registry_cancel_all_reports_only_live_execution_ids() {
+    let registry = TaskExecutionRegistry::new();
+    let foreground = registry.admit(TaskLaunchMode::Foreground).unwrap();
+    let background = registry.admit(TaskLaunchMode::Background).unwrap();
+    let terminal = registry.admit(TaskLaunchMode::Background).unwrap();
+
+    assert!(registry.finish(
+        terminal,
+        TaskTerminalState::Cancelled,
+        ToolOutput::failure("task: cancelled"),
+    ));
+
+    assert_eq!(registry.cancel_all(), vec![foreground, background]);
+    assert!(registry.is_cancelled(foreground));
+    assert!(registry.is_cancelled(background));
+    assert!(!registry.is_cancelled(terminal));
 }
 
 #[test]

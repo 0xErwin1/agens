@@ -194,6 +194,7 @@ pub fn run_production_tui_with_profile_store(
     let (ask_user_bridge, ask_user_requests) = production_tui_ask_user_bridge();
     let transition_controls = task_controls.clone();
     let cancel_controls = task_controls.clone();
+    let cancel_all_controls = task_controls.clone();
     let message_controls = task_controls.clone();
     let submit_task_controls = task_controls.clone();
     let prompt_bridge = permission_bridge.clone();
@@ -384,6 +385,14 @@ pub fn run_production_tui_with_profile_store(
             cancel_controls
                 .0
                 .cancel(agens_tools::TaskExecutionId::from_value(id))
+        },
+        move || {
+            cancel_all_controls
+                .0
+                .cancel_all()
+                .into_iter()
+                .map(agens_tools::TaskExecutionId::value)
+                .collect()
         },
         move |id, message| {
             message_controls

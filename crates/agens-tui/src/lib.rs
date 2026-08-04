@@ -353,6 +353,7 @@ pub enum Action {
     SubmitBackground(String),
     TransitionToBackground(u64),
     CancelExecution(u64),
+    CancelAllExecutions,
     SendTaskMessage {
         id: u64,
         message: String,
@@ -655,6 +656,7 @@ impl std::fmt::Debug for Action {
             Self::CancelExecution(id) => {
                 formatter.debug_tuple("CancelExecution").field(id).finish()
             }
+            Self::CancelAllExecutions => formatter.write_str("CancelAllExecutions"),
             Self::SendTaskMessage { id, message } => formatter
                 .debug_struct("SendTaskMessage")
                 .field("id", id)
@@ -3879,7 +3881,9 @@ fn fitted_subagent_tree(
         state.active_transcript == TranscriptId::Subagent(execution.id)
             && matches!(
                 execution.state,
-                TuiExecutionState::ForegroundRunning | TuiExecutionState::BackgroundRunning
+                TuiExecutionState::ForegroundRunning
+                    | TuiExecutionState::BackgroundRunning
+                    | TuiExecutionState::CancellationRequested
             )
     });
     lines.push(tree_affordance_line(
@@ -4095,6 +4099,7 @@ const fn execution_state_label(state: TuiExecutionState) -> &'static str {
     match state {
         TuiExecutionState::ForegroundRunning => "running",
         TuiExecutionState::BackgroundRunning => "background",
+        TuiExecutionState::CancellationRequested => "cancellation requested",
         TuiExecutionState::CompletedRecent => "done",
         TuiExecutionState::Failed => "failed",
         TuiExecutionState::Cancelled => "cancelled",
@@ -4103,9 +4108,9 @@ const fn execution_state_label(state: TuiExecutionState) -> &'static str {
 
 fn execution_state_color(state: TuiExecutionState) -> Color {
     match state {
-        TuiExecutionState::ForegroundRunning | TuiExecutionState::BackgroundRunning => {
-            widgets::RolePalette::running()
-        }
+        TuiExecutionState::ForegroundRunning
+        | TuiExecutionState::BackgroundRunning
+        | TuiExecutionState::CancellationRequested => widgets::RolePalette::running(),
         TuiExecutionState::CompletedRecent => widgets::RolePalette::success(),
         TuiExecutionState::Failed => widgets::RolePalette::error(),
         TuiExecutionState::Cancelled => widgets::RolePalette::warning(),
@@ -4807,6 +4812,7 @@ fn execution_priority(state: TuiExecutionState) -> u8 {
         TuiExecutionState::CompletedRecent
         | TuiExecutionState::Failed
         | TuiExecutionState::Cancelled => 1,
+        TuiExecutionState::CancellationRequested => 3,
     }
 }
 
@@ -4817,6 +4823,7 @@ const fn execution_state_glyph(state: TuiExecutionState) -> widgets::Glyph {
         }
         TuiExecutionState::CompletedRecent => widgets::Glyph::Succeeded,
         TuiExecutionState::Failed => widgets::Glyph::Failed,
+        TuiExecutionState::CancellationRequested => widgets::Glyph::Running,
         TuiExecutionState::Cancelled => widgets::Glyph::Cancelled,
     }
 }
@@ -5006,7 +5013,6 @@ pub struct Tui<E> {
     bypass: bool,
     executions: Vec<TuiExecution>,
     execution_selection: Option<TranscriptId>,
-    pending_auto_turns: usize,
     now: Duration,
     next_runtime_ordinal: u64,
     mouse_selection_snapshot: Option<MouseSelectionSnapshot>,
@@ -5099,7 +5105,6 @@ where
             bypass: false,
             executions: Vec::new(),
             execution_selection: None,
-            pending_auto_turns: 0,
             now: Duration::ZERO,
             next_runtime_ordinal: 0,
             mouse_selection_snapshot: None,
@@ -5278,7 +5283,9 @@ where
             || self.executions.iter().any(|execution| {
                 matches!(
                     execution.state,
-                    TuiExecutionState::ForegroundRunning | TuiExecutionState::BackgroundRunning
+                    TuiExecutionState::ForegroundRunning
+                        | TuiExecutionState::BackgroundRunning
+                        | TuiExecutionState::CancellationRequested
                 )
             })
     }
@@ -5480,21 +5487,18 @@ where
     /// idle moment instead of being dropped. Every completion queued while waiting is carried by
     /// the single turn this returns.
     pub fn take_ready_auto_turn(&mut self) -> Option<String> {
-        if self.pending_auto_turns == 0 || !self.auto_turn_is_safe() {
+        if !self.auto_turn_is_safe() {
             return None;
         }
 
-        let finished = std::mem::take(&mut self.pending_auto_turns);
+        self.scheduler.set_composer(self.input.clone());
+        let finished = self.scheduler.take_ready_auto_turn()?;
         self.begin_auto_turn(finished);
         Some(auto_turn_prompt(finished))
     }
 
     fn auto_turn_is_safe(&self) -> bool {
-        !self.running
-            && !self.session_loading
-            && self.input.is_empty()
-            && self.dialog.is_none()
-            && !self.palette_open
+        !self.running && !self.session_loading && self.dialog.is_none() && !self.palette_open
     }
 
     /// Opens the runtime-scheduled turn without a user prompt: the transcript records why the
@@ -6058,7 +6062,6 @@ where
             .chain(
                 self.executions()
                     .into_iter()
-                    .take(3)
                     .map(|execution| TranscriptId::Subagent(execution.id)),
             )
             .collect()
@@ -6131,6 +6134,16 @@ where
         let ordinal = self.next_runtime_ordinal;
         self.next_runtime_ordinal = self.next_runtime_ordinal.saturating_add(1);
         self.apply_runtime_event_with_ordinal(ordinal, event);
+    }
+
+    /// Projects only cancellation IDs the execution authority confirmed active.
+    pub fn apply_confirmed_cancellations(&mut self, ids: impl IntoIterator<Item = u64>) {
+        for id in ids {
+            self.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
+                agent: String::new(),
+                event: TuiExecutionEvent::CancellationRequested { id },
+            });
+        }
     }
 
     /// Retains typed runtime metrics in source order without altering turn persistence.
@@ -6286,6 +6299,7 @@ where
                     id
                 }
                 TuiExecutionEvent::Backgrounded { id }
+                | TuiExecutionEvent::CancellationRequested { id }
                 | TuiExecutionEvent::Completed { id }
                 | TuiExecutionEvent::Failed { id }
                 | TuiExecutionEvent::Cancelled { id } => TranscriptId::Subagent(*id),
@@ -6617,6 +6631,9 @@ where
                 return;
             }
             TuiExecutionEvent::Backgrounded { id } => (id, TuiExecutionState::BackgroundRunning),
+            TuiExecutionEvent::CancellationRequested { id } => {
+                (id, TuiExecutionState::CancellationRequested)
+            }
             TuiExecutionEvent::Completed { id } => (id, TuiExecutionState::CompletedRecent),
             TuiExecutionEvent::Failed { id } => (id, TuiExecutionState::Failed),
             TuiExecutionEvent::Cancelled { id } => (id, TuiExecutionState::Cancelled),
@@ -6644,11 +6661,16 @@ where
             );
         execution.state = state;
         execution.last_activity = self.now;
-        if !matches!(state, TuiExecutionState::BackgroundRunning) {
+        if !matches!(
+            state,
+            TuiExecutionState::ForegroundRunning
+                | TuiExecutionState::BackgroundRunning
+                | TuiExecutionState::CancellationRequested
+        ) {
             execution.terminal_at = Some(self.now);
         }
         if finished_in_background {
-            self.pending_auto_turns = self.pending_auto_turns.saturating_add(1);
+            let _ = self.scheduler.reduce(AppEvent::DeferAutoTurn);
         }
         if state == TuiExecutionState::BackgroundRunning
             && let Some(card) = self.conversation.as_mut().and_then(|conversation| {
@@ -6709,7 +6731,9 @@ where
             | agens_core::TuiSubagentUpdate::ToolResult { .. }
             | agens_core::TuiSubagentUpdate::Error { .. } => matches!(
                 execution.state,
-                TuiExecutionState::ForegroundRunning | TuiExecutionState::BackgroundRunning
+                TuiExecutionState::ForegroundRunning
+                    | TuiExecutionState::BackgroundRunning
+                    | TuiExecutionState::CancellationRequested
             ),
             agens_core::TuiSubagentUpdate::Terminal { status, .. } => {
                 status_matches_execution(*status, execution.state)
@@ -7584,7 +7608,23 @@ where
 
     fn handle_surface_focus_key(&mut self, key: Key) -> Option<Action> {
         if self.surface_focus == SurfaceFocus::Activity {
-            return None;
+            return match key {
+                Key::Up => {
+                    self.move_execution_selection(-1);
+                    Some(Action::Render)
+                }
+                Key::Down => {
+                    self.move_execution_selection(1);
+                    Some(Action::Render)
+                }
+                Key::Enter if self.execution_selection.is_some() => {
+                    self.inspect_execution_selection();
+                    Some(Action::Render)
+                }
+                Key::Char('x') => self.selected_execution_cancellation(),
+                Key::Char('X') => Some(Action::CancelAllExecutions),
+                _ => Some(Action::Render),
+            };
         }
         if self.surface_focus != SurfaceFocus::Queue {
             return None;
@@ -7771,6 +7811,23 @@ where
         self.palette_open = false;
         self.input_cursor = 0;
         Action::SubmitBackground(std::mem::take(&mut self.input))
+    }
+
+    fn selected_execution_cancellation(&self) -> Option<Action> {
+        let TranscriptId::Subagent(id) = self.execution_selection? else {
+            return Some(Action::Render);
+        };
+        self.executions
+            .iter()
+            .any(|execution| {
+                execution.id == id
+                    && matches!(
+                        execution.state,
+                        TuiExecutionState::ForegroundRunning | TuiExecutionState::BackgroundRunning
+                    )
+            })
+            .then_some(Action::CancelExecution(id))
+            .or(Some(Action::Render))
     }
 
     fn handle_mouse_wheel_batch(&mut self, directions: &[MouseWheelDirection]) -> Action {
@@ -8165,7 +8222,9 @@ where
         self.executions.iter().any(|execution| {
             matches!(
                 execution.state,
-                TuiExecutionState::ForegroundRunning | TuiExecutionState::BackgroundRunning
+                TuiExecutionState::ForegroundRunning
+                    | TuiExecutionState::BackgroundRunning
+                    | TuiExecutionState::CancellationRequested
             )
         })
     }
@@ -9513,6 +9572,7 @@ where
             | Action::SubmitBackground(_)
             | Action::TransitionToBackground(_)
             | Action::CancelExecution(_)
+            | Action::CancelAllExecutions
             | Action::SendTaskMessage { .. }
             | Action::OpenDialog(_)
             | Action::LoadSessionPage(_)
@@ -9596,6 +9656,7 @@ where
             | Action::SubmitBackground(_)
             | Action::TransitionToBackground(_)
             | Action::CancelExecution(_)
+            | Action::CancelAllExecutions
             | Action::SendTaskMessage { .. }
             | Action::OpenDialog(_)
             | Action::LoadSessionPage(_)
@@ -9929,6 +9990,7 @@ where
         submit,
         transition,
         cancel_execution,
+        Vec::new,
         send_task_message,
         permissions,
         None,
@@ -9942,6 +10004,7 @@ pub fn run_with_default_progress_submit_with_permissions_task_controls_and_ask_u
     F,
     B,
     C,
+    A,
     M,
 >(
     tui: &mut Tui<E>,
@@ -9949,6 +10012,7 @@ pub fn run_with_default_progress_submit_with_permissions_task_controls_and_ask_u
     submit: F,
     transition: B,
     cancel_execution: C,
+    cancel_all_executions: A,
     send_task_message: M,
     permissions: Option<(TuiPermissionBridge, mpsc::Receiver<TuiPermissionRequest>)>,
     ask_user: Option<(TuiAskUserBridge, mpsc::Receiver<TuiAskUserRequest>)>,
@@ -9974,6 +10038,7 @@ where
         + 'static,
     B: Fn(u64) -> bool + Send + Sync + 'static,
     C: Fn(u64) -> bool + Send + Sync + 'static,
+    A: Fn() -> Vec<u64> + Send + Sync + 'static,
     M: Fn(u64, String) -> bool + Send + Sync + 'static,
 {
     tui.enable_busy_policy_routing();
@@ -9981,6 +10046,7 @@ where
     let submit = Arc::new(submit);
     let transition = Arc::new(transition);
     let cancel_execution = Arc::new(cancel_execution);
+    let cancel_all_executions = Arc::new(cancel_all_executions);
     let send_task_message = Arc::new(send_task_message);
     let (sender, receiver) = mpsc::channel();
     let (completion_sender, completion_receiver) = mpsc::channel();
@@ -10219,7 +10285,12 @@ where
                 let _ = transition(id);
             }
             Action::CancelExecution(id) => {
-                let _ = cancel_execution(id);
+                if cancel_execution(id) {
+                    tui.apply_confirmed_cancellations([id]);
+                }
+            }
+            Action::CancelAllExecutions => {
+                tui.apply_confirmed_cancellations(cancel_all_executions());
             }
             Action::SendTaskMessage { id, message } => {
                 let _ = send_task_message(id, message);

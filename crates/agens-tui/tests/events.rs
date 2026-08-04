@@ -3672,10 +3672,7 @@ fn a_running_turn_defers_the_auto_turn_instead_of_dropping_it() {
 
     assert_eq!(tui.take_ready_auto_turn(), None);
 
-    tui.apply_runtime_event(TuiRuntimeEvent::TurnEnded {
-        status: TurnState::Completed,
-        duration: Some(Duration::from_secs(1)),
-    });
+    tui.finish_provider_turn(TuiProviderOutcome::Completed("done".into()));
 
     assert!(tui.take_ready_auto_turn().is_some());
 }
@@ -3704,10 +3701,7 @@ fn simultaneous_background_completions_coalesce_into_one_auto_turn() {
     for id in [7, 8, 9] {
         finish_background_child(&mut tui, id);
     }
-    tui.apply_runtime_event(TuiRuntimeEvent::TurnEnded {
-        status: TurnState::Completed,
-        duration: Some(Duration::from_secs(1)),
-    });
+    tui.finish_provider_turn(TuiProviderOutcome::Completed("done".into()));
 
     let prompt = tui.take_ready_auto_turn().expect("idle schedules the turn");
 
@@ -3738,7 +3732,7 @@ fn the_auto_turn_is_cancellable_and_never_fabricates_a_user_prompt() {
 
     assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Render);
     assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Render);
-    assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Quit);
+    assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Render);
     assert_eq!(tui.engine().cancellations, 1);
 }
 
@@ -4169,6 +4163,7 @@ fn a_cancelled_background_subagent_does_not_schedule_a_turn_of_its_own() {
     let mut tui = Tui::new(FakeEngine::default());
     tui.begin_submission("delegate");
     tui.apply_progress(TurnEvent::StateChanged(TurnState::Completed));
+    tui.finish_provider_turn(TuiProviderOutcome::Completed("delegated".into()));
     tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
         agent: "scout".into(),
         event: TuiExecutionEvent::BackgroundStarted { id: 1 },

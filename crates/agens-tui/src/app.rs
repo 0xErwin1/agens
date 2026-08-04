@@ -139,6 +139,8 @@ pub enum AppEvent {
     TurnFailedFor {
         generation: u64,
     },
+    /// A background completion needs one deferred, coalesced internal turn.
+    DeferAutoTurn,
     /// A terminal key routed through dialog, global, and composer handlers.
     Key(Key, Instant),
     Command(Command, Instant),
@@ -190,6 +192,7 @@ pub struct AppState {
     composer: String,
     dialog: Option<Dialog>,
     exit_armed_until: Option<Instant>,
+    pending_auto_turns: usize,
 }
 
 impl AppState {
@@ -208,6 +211,7 @@ impl AppState {
             composer: String::new(),
             dialog: None,
             exit_armed_until: None,
+            pending_auto_turns: 0,
         }
     }
 
@@ -221,6 +225,10 @@ impl AppState {
             }
             AppEvent::TurnCancelledFor { generation } | AppEvent::TurnFailedFor { generation } => {
                 self.terminate_turn(generation)
+            }
+            AppEvent::DeferAutoTurn => {
+                self.pending_auto_turns = self.pending_auto_turns.saturating_add(1);
+                Vec::new()
             }
             AppEvent::Key(key, now) => self.key(key, now),
             AppEvent::Command(command, now) => self.command(command, now),
@@ -305,6 +313,21 @@ impl AppState {
 
     pub const fn dialog(&self) -> Option<&Dialog> {
         self.dialog.as_ref()
+    }
+
+    /// Starts one coalesced internal turn only after all user work is idle.
+    pub fn take_ready_auto_turn(&mut self) -> Option<usize> {
+        if self.pending_auto_turns == 0
+            || self.lifecycle != TurnLifecycle::Idle
+            || !self.queued_prompts.is_empty()
+            || !self.composer.is_empty()
+        {
+            return None;
+        }
+
+        let finished = std::mem::take(&mut self.pending_auto_turns);
+        let _ = self.begin_turn(String::new());
+        Some(finished)
     }
 
     fn submit_prompt(&mut self, prompt: String) -> Vec<Effect> {

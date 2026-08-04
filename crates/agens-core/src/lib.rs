@@ -3988,6 +3988,7 @@ pub enum TuiExecutionEvent {
     ForegroundStarted { id: u64 },
     BackgroundStarted { id: u64 },
     Backgrounded { id: u64 },
+    CancellationRequested { id: u64 },
     Completed { id: u64 },
     Failed { id: u64 },
     Cancelled { id: u64 },
@@ -3997,6 +3998,7 @@ pub enum TuiExecutionEvent {
 pub enum TuiExecutionState {
     ForegroundRunning,
     BackgroundRunning,
+    CancellationRequested,
     CompletedRecent,
     Failed,
     Cancelled,
