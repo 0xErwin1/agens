@@ -355,6 +355,7 @@ fn project_mcp_is_rejected_before_its_command_substitution_runs() {
     let config_home = temporary.path().join("config");
     let project_root = temporary.path().join("project");
     let marker = temporary.path().join("must-not-exist");
+    std::fs::create_dir_all(project_root.join(".git")).expect("repository marker should exist");
     std::fs::create_dir_all(project_root.join(".agens"))
         .expect("project config directory should exist");
 
@@ -4188,11 +4189,16 @@ fn production_binary_records_each_sessions_own_identity_in_the_evidence_ledger()
 }
 
 #[test]
-fn production_binary_stops_on_mcp_infrastructure_failures_and_persists_emitted_history() {
-    for (name, mode, timeout_ms) in [
-        ("timeout", "call-sleep", 20),
-        ("crash", "call-crash", 1_000),
-        ("malformed protocol", "call-malformed", 1_000),
+fn production_binary_recovers_from_mcp_infrastructure_failures_and_persists_completed_history() {
+    for (name, mode, timeout_ms, expected_tool_error) in [
+        ("timeout", "call-sleep", 20, "tool operation timed out"),
+        ("crash", "call-crash", 1_000, "tool infrastructure failure"),
+        (
+            "malformed protocol",
+            "call-malformed",
+            1_000,
+            "tool infrastructure failure",
+        ),
     ] {
         let temporary = TemporaryDirectory::new(&format!("production-mcp-{name}"));
         let project_root = temporary.path().join("project");
@@ -4201,14 +4207,29 @@ fn production_binary_stops_on_mcp_infrastructure_failures_and_persists_emitted_h
         std::fs::create_dir_all(project_root.join(".git")).expect("project marker should exist");
         std::fs::create_dir_all(&config_home).expect("config directory should exist");
 
-        let server = BoundedScriptedOpenAiMockServer::start(vec![ScriptedOpenAiResponse {
-            required_body_fragments: vec!["files::first".to_owned()],
-            response: native_tool_call_response("call_mcp_infrastructure", "files::first", r#"{}"#),
-        }]);
+        let server = BoundedScriptedOpenAiMockServer::start(vec![
+            ScriptedOpenAiResponse {
+                required_body_fragments: vec!["files::first".to_owned()],
+                response: native_tool_call_response(
+                    "call_mcp_infrastructure",
+                    "files::first",
+                    r#"{}"#,
+                ),
+            },
+            ScriptedOpenAiResponse {
+                required_body_fragments: vec![
+                    "\"call_id\":\"call_mcp_infrastructure\"".to_owned(),
+                    format!("\"output\":{expected_tool_error:?}"),
+                    "!SENTINEL_MCP_TRANSPORT".to_owned(),
+                    "!SENTINEL_MCP_STDERR".to_owned(),
+                ],
+                response: text_response("MCP infrastructure failure handled"),
+            },
+        ]);
         std::fs::write(
             config_home.join("config.toml"),
             format!(
-                "[provider]\ntype = \"openai-api\"\nmodel = \"test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[mcp.files]\ntransport = \"stdio\"\ncommand = \"{}\"\nargs = [{mode:?}]\ntimeout_ms = {timeout_ms}\n",
+                "[provider]\ntype = \"openai-api\"\nmodel = \"test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[mcp.files]\ntransport = \"stdio\"\ncommand = \"{}\"\nargs = [{mode:?}]\ntimeout_ms = {timeout_ms}\n[mcp.files.env]\nFAKE_MCP_TRANSPORT_SECRET = \"SENTINEL_MCP_TRANSPORT\"\nFAKE_MCP_STDERR_SECRET = \"SENTINEL_MCP_STDERR\"\n",
                 server.base_url(),
                 data_directory.display(),
                 env!("CARGO_BIN_EXE_agens-cli-fake-mcp-child"),
@@ -4224,15 +4245,79 @@ fn production_binary_stops_on_mcp_infrastructure_failures_and_persists_emitted_h
             .output()
             .expect("production binary should execute");
 
-        assert_eq!(output.status.code(), Some(1), "{name}");
-        assert_eq!(String::from_utf8_lossy(&output.stdout), "", "{name}");
-        assert_interrupted_session_saved(
-            &temporary,
-            &project_root,
-            &config_home,
-            "run broken MCP tool",
+        let diagnostics = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
         );
-        assert_sqlite_has_interrupted_turn(&data_directory.join("agens.db"));
+
+        assert!(output.status.success(), "{name}: {diagnostics}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "MCP infrastructure failure handled\n",
+            "{name}"
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stderr), "", "{name}");
+        for secret in [
+            "SENTINEL_OPENAI_API_KEY",
+            "SENTINEL_MCP_TRANSPORT",
+            "SENTINEL_MCP_STDERR",
+        ] {
+            assert!(!diagnostics.contains(secret), "{name}: leaked {secret}");
+        }
+
+        let session = SessionStore::open(&data_directory)
+            .expect("session store should open")
+            .load_session_for_resume(1)
+            .expect("completed session should be readable");
+        assert_eq!(
+            session.messages,
+            vec![
+                Message {
+                    role: Role::User,
+                    parts: vec![MessagePart::Text("run broken MCP tool".to_owned())],
+                },
+                Message {
+                    role: Role::Assistant,
+                    parts: vec![MessagePart::ToolCall {
+                        id: "call_mcp_infrastructure".to_owned(),
+                        name: "files::first".to_owned(),
+                        input: r#"{}"#.to_owned(),
+                    }],
+                },
+                Message {
+                    role: Role::Tool,
+                    parts: vec![MessagePart::ToolResult {
+                        tool_call_id: "call_mcp_infrastructure".to_owned(),
+                        content: expected_tool_error.to_owned(),
+                        is_error: true,
+                    }],
+                },
+                Message {
+                    role: Role::Assistant,
+                    parts: vec![MessagePart::Text(
+                        "MCP infrastructure failure handled".to_owned(),
+                    )],
+                },
+            ],
+            "{name}"
+        );
+        assert_eq!(
+            session
+                .latest_attempt
+                .as_ref()
+                .map(agens_core::SessionAttemptSummary::status),
+            Some(agens_core::SessionAttemptStatus::Completed),
+            "{name}"
+        );
+        assert_sqlite_has_no_sentinels(
+            &data_directory.join("agens.db"),
+            &[
+                "SENTINEL_OPENAI_API_KEY",
+                "SENTINEL_MCP_TRANSPORT",
+                "SENTINEL_MCP_STDERR",
+            ],
+        );
 
         server.join();
     }
