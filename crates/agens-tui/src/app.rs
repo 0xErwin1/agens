@@ -108,11 +108,18 @@ pub enum AppEvent {
     /// An explicitly safe conversational prompt was submitted.
     SubmitPrompt(String),
     /// The active turn completed successfully with its final output.
-    TurnCompleted(String),
+    TurnCompletedFor {
+        generation: u64,
+        output: String,
+    },
     /// The active turn was cancelled.
-    TurnCancelled,
+    TurnCancelledFor {
+        generation: u64,
+    },
     /// The active turn failed.
-    TurnFailed,
+    TurnFailedFor {
+        generation: u64,
+    },
     /// A terminal key routed through dialog, global, and composer handlers.
     Key(Key, Instant),
     Command(Command, Instant),
@@ -184,11 +191,11 @@ impl AppState {
     pub fn reduce(&mut self, event: AppEvent) -> Vec<Effect> {
         match event {
             AppEvent::SubmitPrompt(prompt) => self.submit_prompt(prompt),
-            AppEvent::TurnCompleted(output) => self.complete_turn(output),
-            AppEvent::TurnCancelled | AppEvent::TurnFailed => {
-                self.transition_to_idle();
-                self.disarm_exit();
-                self.begin_next_queued_turn().into_iter().collect()
+            AppEvent::TurnCompletedFor { generation, output } => {
+                self.complete_turn(generation, output)
+            }
+            AppEvent::TurnCancelledFor { generation } | AppEvent::TurnFailedFor { generation } => {
+                self.terminate_turn(generation)
             }
             AppEvent::Key(key, now) => self.key(key, now),
             AppEvent::Command(command, now) => self.command(command, now),
@@ -265,12 +272,12 @@ impl AppState {
         Vec::new()
     }
 
-    fn complete_turn(&mut self, output: String) -> Vec<Effect> {
-        self.disarm_exit();
-        let Some(prompt) = self.lifecycle.active().map(|route| route.prompt.clone()) else {
+    fn complete_turn(&mut self, generation: u64, output: String) -> Vec<Effect> {
+        let Some(prompt) = self.active_prompt_for_generation(generation) else {
             return Vec::new();
         };
 
+        self.disarm_exit();
         self.completed_history
             .push((prompt.clone(), output.clone()));
         self.transition_to_idle();
@@ -281,6 +288,23 @@ impl AppState {
         }
 
         effects
+    }
+
+    fn terminate_turn(&mut self, generation: u64) -> Vec<Effect> {
+        if self.active_prompt_for_generation(generation).is_none() {
+            return Vec::new();
+        }
+
+        self.transition_to_idle();
+        self.disarm_exit();
+        self.begin_next_queued_turn().into_iter().collect()
+    }
+
+    fn active_prompt_for_generation(&self, generation: u64) -> Option<String> {
+        self.lifecycle
+            .active()
+            .filter(|route| route.generation == generation)
+            .map(|route| route.prompt.clone())
     }
 
     fn begin_next_queued_turn(&mut self) -> Option<Effect> {

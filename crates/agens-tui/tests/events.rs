@@ -1523,6 +1523,61 @@ fn scheduler_exposes_typed_lifecycle_and_stable_queue_entries() {
 }
 
 #[test]
+fn scheduler_quarantines_stale_terminal_generations_before_dispatch() {
+    let mut app = AppState::new(1);
+    app.reduce(AppEvent::SubmitPrompt("first".into()));
+    app.reduce(AppEvent::SubmitPrompt("second".into()));
+
+    assert!(
+        app.reduce(AppEvent::TurnCompletedFor {
+            generation: 0,
+            output: "stale".into(),
+        })
+        .is_empty()
+    );
+    assert_eq!(
+        app.lifecycle().active().map(|route| route.generation()),
+        Some(1)
+    );
+    assert_eq!(app.queued_prompts(), ["second"]);
+    assert!(app.completed_history().is_empty());
+
+    assert_eq!(
+        app.reduce(AppEvent::TurnCompletedFor {
+            generation: 1,
+            output: "answer".into(),
+        }),
+        vec![
+            Effect::PersistCompleted {
+                prompt: "first".into(),
+                output: "answer".into(),
+            },
+            Effect::StartPrompt("second".into()),
+        ]
+    );
+    assert_eq!(
+        app.lifecycle().active().map(|route| route.generation()),
+        Some(2)
+    );
+}
+
+#[test]
+fn scheduler_quarantines_stale_failure_and_cancellation_before_state_transitions() {
+    for terminal_event in [
+        AppEvent::TurnCancelledFor { generation: 0 },
+        AppEvent::TurnFailedFor { generation: 0 },
+    ] {
+        let mut app = AppState::new(1);
+        app.reduce(AppEvent::SubmitPrompt("first".into()));
+        app.reduce(AppEvent::SubmitPrompt("second".into()));
+        let before = app.clone();
+
+        assert!(app.reduce(terminal_event).is_empty());
+        assert_eq!(app, before);
+    }
+}
+
+#[test]
 fn reducer_starts_idle_prompt_and_persists_only_after_success() {
     let mut app = AppState::new(2);
 
@@ -1534,7 +1589,10 @@ fn reducer_starts_idle_prompt_and_persists_only_after_success() {
     assert!(app.completed_history().is_empty());
 
     assert_eq!(
-        app.reduce(AppEvent::TurnCompleted("answer".into())),
+        app.reduce(AppEvent::TurnCompletedFor {
+            generation: 1,
+            output: "answer".into()
+        }),
         vec![Effect::PersistCompleted {
             prompt: "first".into(),
             output: "answer".into(),
@@ -1560,7 +1618,10 @@ fn reducer_queues_safe_prompts_in_bounded_fifo_order() {
     assert_eq!(app.queued_prompts(), ["second", "third"]);
 
     assert_eq!(
-        app.reduce(AppEvent::TurnCompleted("one".into())),
+        app.reduce(AppEvent::TurnCompletedFor {
+            generation: 1,
+            output: "one".into()
+        }),
         vec![
             Effect::PersistCompleted {
                 prompt: "first".into(),
@@ -1591,7 +1652,10 @@ fn reducer_refuses_prompt_when_running_queue_is_full_without_history() {
 
 #[test]
 fn reducer_terminal_failures_start_the_oldest_queued_prompt_before_later_submissions() {
-    for terminal_event in [AppEvent::TurnCancelled, AppEvent::TurnFailed] {
+    for terminal_event in [
+        AppEvent::TurnCancelledFor { generation: 1 },
+        AppEvent::TurnFailedFor { generation: 1 },
+    ] {
         let mut app = AppState::new(2);
         app.reduce(AppEvent::SubmitPrompt("first".into()));
         app.reduce(AppEvent::SubmitPrompt("queued".into()));
@@ -1726,7 +1790,10 @@ fn command_new_resets_only_after_backend_success_and_running_matrix_refuses_muta
     app.reduce(AppEvent::SubmitPrompt("running".into()));
     app.reduce(AppEvent::SubmitPrompt("first queued".into()));
     app.reduce(AppEvent::SubmitPrompt("second queued".into()));
-    app.reduce(AppEvent::TurnCompleted("answer".into()));
+    app.reduce(AppEvent::TurnCompletedFor {
+        generation: 1,
+        output: "answer".into(),
+    });
     app.set_composer("replacement draft");
     app.set_dialog(Some(Dialog::Command));
 
