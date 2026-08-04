@@ -117,6 +117,9 @@ impl From<AskUserEntry> for AskUserEditing {
 pub(crate) struct AskUserState {
     id: u64,
     request: AskUserRequest,
+    /// The delegated execution that raised this question, if it was not the
+    /// main thread.
+    origin: Option<crate::PromptOrigin>,
     question: usize,
     row: AskUserRow,
     selections: Vec<BTreeSet<usize>>,
@@ -138,7 +141,11 @@ pub(crate) struct AskUserState {
 }
 
 impl AskUserState {
-    pub(crate) fn new(id: u64, request: AskUserRequest) -> Self {
+    pub(crate) fn new(
+        id: u64,
+        request: AskUserRequest,
+        origin: Option<crate::PromptOrigin>,
+    ) -> Self {
         let question_count = request.questions().len();
         Self {
             id,
@@ -146,6 +153,7 @@ impl AskUserState {
             other: vec![String::new(); question_count],
             notes: vec![String::new(); question_count],
             request,
+            origin,
             question: 0,
             row: AskUserRow::Option(0),
             entry: AskUserEntry::Browsing,
@@ -162,6 +170,10 @@ impl AskUserState {
 
     pub(crate) const fn request(&self) -> &AskUserRequest {
         &self.request
+    }
+
+    pub(crate) const fn origin(&self) -> Option<&crate::PromptOrigin> {
+        self.origin.as_ref()
     }
 
     pub(crate) const fn question_index(&self) -> usize {

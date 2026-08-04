@@ -582,6 +582,7 @@ struct AskUserRender<'a> {
     context_scroll: u16,
     incomplete: Option<usize>,
     answered: usize,
+    origin: Option<&'a crate::PromptOrigin>,
 }
 
 impl<'a> AskUserRender<'a> {
@@ -599,6 +600,7 @@ impl<'a> AskUserRender<'a> {
             context_scroll: state.context_scroll(),
             incomplete: state.incomplete(),
             answered: state.answered_count(),
+            origin: state.origin(),
         }
     }
 
@@ -1920,7 +1922,7 @@ const ASK_USER_CONTEXT_KEYS: &str = "pgup/pgdn";
 /// so the scroll ceiling the key handler enforces and the rows the renderer
 /// paints are read off the same measurement.
 struct AskUserFrame<'a> {
-    title: &'a str,
+    title: String,
     shortcuts: Vec<widgets::OverlayShortcut<'static>>,
     layout: widgets::OverlayLayout,
     header: Rect,
@@ -2453,11 +2455,14 @@ fn ask_user_frame<'a>(area: Rect, render: &AskUserRender<'a>) -> Option<AskUserF
         rows.len()
     };
     let shortcuts = ask_user_shortcuts(render);
-    let title = render.request.title().unwrap_or(ASK_USER_DEFAULT_TITLE);
+    let title = prompt_title(
+        render.request.title().unwrap_or(ASK_USER_DEFAULT_TITLE),
+        render.origin,
+    );
     let layout = widgets::OverlayLayout::solve(
         area,
         &widgets::OverlayConfig {
-            title,
+            title: &title,
             tabs: None,
             shortcuts: &shortcuts,
             sizing,
@@ -2579,7 +2584,7 @@ fn render_ask_user(frame: &mut ratatui::Frame<'_>, area: Rect, render: AskUserRe
     } = laid;
 
     let config = widgets::OverlayConfig {
-        title,
+        title: &title,
         tabs: None,
         shortcuts: &shortcuts,
         sizing: widgets::OverlaySizing::ask_user(),
@@ -6950,7 +6955,18 @@ where
     /// Opens a bounded structured question set as a dedicated modal
     /// interaction, sibling to secret entry and device authentication.
     pub fn open_ask_user(&mut self, id: u64, request: AskUserRequest) {
-        self.ask_user = Some(AskUserState::new(id, request));
+        self.open_ask_user_from(id, request, None);
+    }
+
+    /// Opens an interaction that names the delegated execution it came from,
+    /// so the overlay can say who is asking.
+    pub fn open_ask_user_from(
+        &mut self,
+        id: u64,
+        request: AskUserRequest,
+        origin: Option<PromptOrigin>,
+    ) {
+        self.ask_user = Some(AskUserState::new(id, request, origin));
     }
 
     /// A read-only snapshot of the open ask-user interaction, if one exists.
@@ -9781,7 +9797,7 @@ where
             .collect();
             tui.show_selection_dialog(
                 DialogView::selection(
-                    "Permission required",
+                    prompt_title("Permission required", request.origin()),
                     Some(format!("{tool}\n{target}")),
                     entries,
                 )
@@ -10062,6 +10078,19 @@ where
 /// active overlay, if none is already open and the request the drain
 /// received is still genuinely pending. Factored out of the loop so it can
 /// be exercised directly by a test without a live terminal.
+/// Puts the asking subagent in the prompt's own title.
+///
+/// The title is where it has to go rather than the body: with several
+/// subagents running, "allow bash?" is a question you cannot answer
+/// responsibly until you know whose it is, so the answer has to be visible
+/// before the reader starts reading the target.
+fn prompt_title(base: &str, origin: Option<&PromptOrigin>) -> String {
+    match origin {
+        Some(origin) => format!("{base} · {} #{}", origin.agent, origin.execution),
+        None => base.to_owned(),
+    }
+}
+
 fn drain_ask_user_request<E: Engine>(
     tui: &mut Tui<E>,
     active_ask_user: Option<u64>,
@@ -10076,7 +10105,7 @@ fn drain_ask_user_request<E: Engine>(
         return None;
     }
     let id = request.id();
-    tui.open_ask_user(id, request.request().clone());
+    tui.open_ask_user_from(id, request.request().clone(), request.origin().cloned());
     Some(id)
 }
 
