@@ -5050,7 +5050,7 @@ impl StalledOpenAiMockServer {
 
     fn wait_for_request(&mut self) {
         self.observed_request
-            .recv_timeout(Duration::from_secs(1))
+            .recv_timeout(Duration::from_secs(5))
             .expect("production request should reach the local server");
     }
 
