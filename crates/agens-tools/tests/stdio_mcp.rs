@@ -190,12 +190,7 @@ fn no_read_transport() -> (McpStdioTransport, TemporaryDirectory) {
         project_root: std::env::current_dir().unwrap(),
     })
     .unwrap();
-    wait_for_path(&ready_path);
-    assert_eq!(
-        std::fs::read_to_string(ready_path).unwrap().trim(),
-        "4096",
-        "child must shrink stdin so the writer blocks"
-    );
+    wait_for_file_contents(&ready_path, "4096");
 
     (transport, temporary)
 }
@@ -215,12 +210,7 @@ fn blocked_stdin_transport() -> (McpStdioTransport, PathBuf, TemporaryDirectory)
         project_root: std::env::current_dir().unwrap(),
     })
     .unwrap();
-    wait_for_path(&ready_path);
-    assert_eq!(
-        std::fs::read_to_string(ready_path).unwrap().trim(),
-        "4096",
-        "child must shrink stdin so the writer blocks"
-    );
+    wait_for_file_contents(&ready_path, "4096");
 
     (transport, blocked_path, temporary)
 }
@@ -229,6 +219,21 @@ fn wait_for_path(path: &std::path::Path) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while !path.exists() {
         assert!(Instant::now() < deadline, "child should signal readiness");
+        thread::sleep(Duration::from_millis(2));
+    }
+}
+
+fn wait_for_file_contents(path: &std::path::Path, expected: &str) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if std::fs::read_to_string(path).is_ok_and(|content| content.trim() == expected) {
+            return;
+        }
+
+        assert!(
+            Instant::now() < deadline,
+            "child should publish the complete readiness signal"
+        );
         thread::sleep(Duration::from_millis(2));
     }
 }
