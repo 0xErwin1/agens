@@ -124,11 +124,6 @@ impl CliError {
                 "provider",
                 "this session's history outgrew what one request can replay",
             ),
-            HeadlessTurnError::ProviderToolRounds => (
-                ExitStatus::Failure,
-                "provider",
-                "the turn ran its tool-continuation rounds out without finishing",
-            ),
             HeadlessTurnError::ProviderRateLimited => (
                 ExitStatus::Failure,
                 "provider",
@@ -261,10 +256,6 @@ mod tests {
         let history = CliError::runtime(HeadlessTurnError::ProviderHistoryBudget).to_string();
         assert!(history.contains("history"), "{history:?}");
         assert!(!history.contains("context window"), "{history:?}");
-
-        let rounds = CliError::runtime(HeadlessTurnError::ProviderToolRounds).to_string();
-        assert!(rounds.contains("tool-continuation rounds"), "{rounds:?}");
-        assert!(!rounds.contains("context window"), "{rounds:?}");
 
         let context = CliError::runtime(HeadlessTurnError::ProviderContext).to_string();
         assert!(

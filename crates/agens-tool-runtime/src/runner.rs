@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use agens_bus::{BridgeCancel, BridgeTx};
 #[cfg(any(test, feature = "probe"))]
 use agens_core::HeadlessTurnError;
-use agens_core::{HeadlessTurnCancellation, MessagePart, TurnEvent, TurnProgressSink};
+use agens_core::{MessagePart, TurnEvent, TurnProgressSink};
 use agens_core::{SubagentErrorKind, SubagentStatus};
 use agens_core::{TuiExecutionEvent, TuiRuntimeEvent, TuiSubagentEvent};
 #[cfg(any(test, feature = "probe"))]
@@ -602,7 +602,6 @@ impl TaskRunner for ProductionTaskRunner {
             if self.progress_probe.is_some() {
                 let result = TaskTurnResult {
                     output: "probe".into(),
-                    iterations: 1,
                 };
                 if let Some(lifecycle_bridge) = &self.lifecycle_bridge {
                     lifecycle_bridge
@@ -611,32 +610,28 @@ impl TaskRunner for ProductionTaskRunner {
                 return Ok(result);
             }
             if self.lifecycle_bridge.is_some() {
-                while !context
-                    .cancellation
-                    .load(std::sync::atomic::Ordering::Acquire)
-                {
+                while !context.is_cancelled() && !context.is_expired() {
                     if context
                         .execution()
                         .is_some_and(|execution| execution.mode() == TaskLaunchMode::Background)
                     {
                         return Ok(TaskTurnResult {
                             output: "probe".into(),
-                            iterations: 1,
                         });
                     }
                     std::thread::sleep(std::time::Duration::from_millis(1));
                 }
-                return Err(TaskRunnerError::Cancelled);
+                return if context.is_expired() {
+                    Err(TaskRunnerError::TimedOut)
+                } else {
+                    Err(TaskRunnerError::Cancelled)
+                };
             }
             return Ok(TaskTurnResult {
                 output: "probe".into(),
-                iterations: 1,
             });
         }
-        let cancellation = HeadlessTurnCancellation::with_cancellation_and_deadline(
-            Arc::clone(&context.cancellation),
-            None,
-        );
+        let cancellation = context.turn_cancellation();
         let progress = self.lifecycle_bridge.as_ref().zip(context.execution()).map(
             |(lifecycle_bridge, execution)| {
                 let lifecycle_bridge = lifecycle_bridge.clone();
@@ -722,10 +717,7 @@ impl TaskRunner for ProductionTaskRunner {
                 result.as_ref().map(String::as_str),
             );
         }
-        result.map(|output| TaskTurnResult {
-            output,
-            iterations: 1,
-        })
+        result.map(|output| TaskTurnResult { output })
     }
 }
 
@@ -746,7 +738,7 @@ pub fn map_task_turn_error(error: HeadlessTurnError) -> TaskRunnerError {
         HeadlessTurnError::ProviderServer => {
             TaskRunnerError::ProviderFailure(TaskProviderFailure::Server)
         }
-        HeadlessTurnError::MaxIterations => TaskRunnerError::IterationLimit,
+        HeadlessTurnError::MaxIterations => TaskRunnerError::ChildFailure,
         _ => TaskRunnerError::ChildFailure,
     }
 }

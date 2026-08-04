@@ -30,7 +30,7 @@ fn runs_a_validated_skill_in_an_isolated_non_recursive_child_context() {
         &skills_root,
         temporary.path.join("missing"),
         runner,
-        SubagentLimits::new(1, 2, 64, 64, Duration::from_secs(1)).expect("limits"),
+        SubagentLimits::new(1, 64, 64, Duration::from_secs(1)).expect("limits"),
     )
     .expect("discover subagent skill");
 
@@ -77,7 +77,7 @@ fn bounds_concurrent_children_without_allowing_descendants() {
             entered: Arc::clone(&entered),
             release: Arc::clone(&release),
         },
-        SubagentLimits::new(1, 2, 64, 64, Duration::from_secs(1)).expect("limits"),
+        SubagentLimits::new(1, 64, 64, Duration::from_secs(1)).expect("limits"),
     )
     .expect("discover subagent skill");
     let child = tool.clone();
@@ -121,7 +121,7 @@ fn cancellation_and_child_failures_are_isolated_as_sanitized_tool_results() {
             release: Arc::clone(&release),
             calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         },
-        SubagentLimits::new(1, 2, 64, 64, Duration::from_secs(1)).expect("limits"),
+        SubagentLimits::new(1, 64, 64, Duration::from_secs(1)).expect("limits"),
     )
     .expect("discover subagent skill");
     let child = tool.clone();
@@ -161,7 +161,7 @@ fn cancellation_and_child_failures_are_isolated_as_sanitized_tool_results() {
 }
 
 #[test]
-fn rejects_child_results_that_exceed_iteration_or_output_limits() {
+fn accepts_long_child_results_but_still_enforces_the_output_limit() {
     let temporary = TemporaryDirectory::new();
     let skills_root = temporary.path.join("skills");
     write_skill(
@@ -169,18 +169,18 @@ fn rejects_child_results_that_exceed_iteration_or_output_limits() {
         "researcher",
         "---\nname: researcher\ndescription: Research a bounded question\n---\nUse only the supplied context.\n",
     );
-    let limits = SubagentLimits::new(1, 2, 64, 4, Duration::from_secs(1)).expect("limits");
+    let limits = SubagentLimits::new(1, 64, 4, Duration::from_secs(1)).expect("limits");
     let iteration_tool = SubagentTool::discover(
         &skills_root,
         temporary.path.join("missing"),
-        FixedResultRunner(SubagentTurnResult::new("ok", 3)),
+        FixedResultRunner(SubagentTurnResult::new("ok")),
         limits,
     )
     .expect("discover subagent skill");
     let output_tool = SubagentTool::discover(
         &skills_root,
         temporary.path.join("missing"),
-        FixedResultRunner(SubagentTurnResult::new("too long", 1)),
+        FixedResultRunner(SubagentTurnResult::new("too long")),
         limits,
     )
     .expect("discover subagent skill");
@@ -194,8 +194,8 @@ fn rejects_child_results_that_exceed_iteration_or_output_limits() {
         Arc::new(AtomicBool::new(false)),
     );
 
-    assert_eq!(iteration.content, "subagent: iteration limit exceeded");
-    assert!(iteration.is_error);
+    assert_eq!(iteration.content, "ok");
+    assert!(!iteration.is_error);
     assert_eq!(output.content, "subagent: output limit exceeded");
     assert!(output.is_error);
 }
@@ -213,7 +213,7 @@ fn enforces_the_child_deadline_through_the_injected_runner_context() {
         &skills_root,
         temporary.path.join("missing"),
         DeadlineRunner,
-        SubagentLimits::new(1, 2, 64, 64, Duration::from_millis(1)).expect("limits"),
+        SubagentLimits::new(1, 64, 64, Duration::from_millis(1)).expect("limits"),
     )
     .expect("discover subagent skill");
 
@@ -241,7 +241,7 @@ fn inherits_the_live_parent_cancellation_before_child_admission() {
         &skills_root,
         temporary.path.join("missing"),
         runner,
-        SubagentLimits::new(1, 2, 64, 64, Duration::from_secs(1)).expect("limits"),
+        SubagentLimits::new(1, 64, 64, Duration::from_secs(1)).expect("limits"),
     )
     .expect("discover subagent skill");
     let cancellation = HeadlessTurnCancellation::new();
@@ -269,7 +269,7 @@ fn rejects_a_late_child_success_after_the_parent_cancels() {
         &skills_root,
         temporary.path.join("missing"),
         DelayedThenSuccessfulRunner::default(),
-        SubagentLimits::new(1, 2, 64, 64, Duration::from_secs(1)).expect("limits"),
+        SubagentLimits::new(1, 64, 64, Duration::from_secs(1)).expect("limits"),
     )
     .expect("discover subagent skill");
     let cancellation = HeadlessTurnCancellation::new();
@@ -314,7 +314,7 @@ fn uses_the_earlier_parent_deadline_for_the_child() {
         &skills_root,
         temporary.path.join("missing"),
         DeadlineRunner,
-        SubagentLimits::new(1, 2, 64, 64, Duration::from_secs(1)).expect("limits"),
+        SubagentLimits::new(1, 64, 64, Duration::from_secs(1)).expect("limits"),
     )
     .expect("discover subagent skill");
     let parent = ToolExecutionContext::from_headless_adapter(
@@ -343,7 +343,7 @@ fn rejects_oversized_prompt_or_context_before_calling_the_runner() {
         &skills_root,
         temporary.path.join("missing"),
         runner,
-        SubagentLimits::new(1, 2, 4, 64, Duration::from_secs(1)).expect("limits"),
+        SubagentLimits::new(1, 4, 64, Duration::from_secs(1)).expect("limits"),
     )
     .expect("discover subagent skill");
 
@@ -376,7 +376,7 @@ fn returns_by_deadline_and_retains_the_permit_until_a_non_cooperative_runner_fin
         &skills_root,
         temporary.path.join("missing"),
         DelayedThenSuccessfulRunner::default(),
-        SubagentLimits::new(1, 2, 64, 64, Duration::from_millis(5)).expect("limits"),
+        SubagentLimits::new(1, 64, 64, Duration::from_millis(5)).expect("limits"),
     )
     .expect("discover subagent skill");
 
@@ -418,7 +418,7 @@ fn returns_promptly_when_cancellation_reaches_a_non_cooperative_runner() {
         &skills_root,
         temporary.path.join("missing"),
         DelayedThenSuccessfulRunner::default(),
-        SubagentLimits::new(1, 2, 64, 64, Duration::from_secs(1)).expect("limits"),
+        SubagentLimits::new(1, 64, 64, Duration::from_secs(1)).expect("limits"),
     )
     .expect("discover subagent skill");
     let cancellation = Arc::new(AtomicBool::new(false));
@@ -457,14 +457,14 @@ fn converts_panic_and_infrastructure_failures_to_distinct_sanitized_results() {
         &skills_root,
         temporary.path.join("missing"),
         PanicThenSuccessfulRunner::default(),
-        SubagentLimits::new(1, 2, 64, 64, Duration::from_secs(1)).expect("limits"),
+        SubagentLimits::new(1, 64, 64, Duration::from_secs(1)).expect("limits"),
     )
     .expect("discover subagent skill");
     let infrastructure_tool = SubagentTool::discover(
         &skills_root,
         temporary.path.join("missing"),
         InfrastructureFailureRunner,
-        SubagentLimits::new(1, 2, 64, 64, Duration::from_secs(1)).expect("limits"),
+        SubagentLimits::new(1, 64, 64, Duration::from_secs(1)).expect("limits"),
     )
     .expect("discover subagent skill");
 
@@ -507,7 +507,7 @@ fn releases_the_permit_before_publishing_a_panic_result() {
             &skills_root,
             temporary.path.join("missing"),
             PanicThenSuccessfulRunner::default(),
-            SubagentLimits::new(1, 2, 64, 64, Duration::from_secs(1)).expect("limits"),
+            SubagentLimits::new(1, 64, 64, Duration::from_secs(1)).expect("limits"),
         )
         .expect("discover subagent skill");
 
@@ -542,7 +542,7 @@ fn caps_combined_prompt_and_context_before_calling_the_runner() {
         &skills_root,
         temporary.path.join("missing"),
         runner,
-        SubagentLimits::new(1, 2, 4, 64, Duration::from_secs(1)).expect("limits"),
+        SubagentLimits::new(1, 4, 64, Duration::from_secs(1)).expect("limits"),
     )
     .expect("discover subagent skill");
 
@@ -569,7 +569,7 @@ impl SubagentRunner for RecordingRunner {
         _context: &agens_tools::SubagentRunContext,
     ) -> Result<SubagentTurnResult, agens_tools::SubagentRunnerError> {
         *self.observed.lock().expect("record request") = Some(request);
-        Ok(SubagentTurnResult::new("child result", 1))
+        Ok(SubagentTurnResult::new("child result"))
     }
 }
 
@@ -586,7 +586,7 @@ impl SubagentRunner for BlockingRunner {
     ) -> Result<SubagentTurnResult, agens_tools::SubagentRunnerError> {
         self.entered.wait();
         self.release.wait();
-        Ok(SubagentTurnResult::new("child result", 1))
+        Ok(SubagentTurnResult::new("child result"))
     }
 }
 
@@ -631,7 +631,7 @@ impl SubagentRunner for DelayedThenSuccessfulRunner {
             thread::sleep(Duration::from_millis(150));
         }
 
-        Ok(SubagentTurnResult::new("child result", 1))
+        Ok(SubagentTurnResult::new("child result"))
     }
 }
 
@@ -650,7 +650,7 @@ impl SubagentRunner for PanicThenSuccessfulRunner {
             panic!("PARENT_PROVIDER_SECRET_SENTINEL");
         }
 
-        Ok(SubagentTurnResult::new("child result", 1))
+        Ok(SubagentTurnResult::new("child result"))
     }
 }
 
@@ -688,7 +688,7 @@ impl SubagentRunner for DeadlineRunner {
     ) -> Result<SubagentTurnResult, agens_tools::SubagentRunnerError> {
         thread::sleep(Duration::from_millis(5));
         context.check()?;
-        Ok(SubagentTurnResult::new("late", 1))
+        Ok(SubagentTurnResult::new("late"))
     }
 }
 

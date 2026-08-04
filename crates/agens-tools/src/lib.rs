@@ -70,7 +70,7 @@ use std::os::unix::process::CommandExt;
 const MAX_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_PROCESS_OUTPUT: usize = 64 * 1024;
 const MAX_CAPTURED_PROCESS_BYTES: usize = MAX_PROCESS_OUTPUT - 128;
-const DEFAULT_BASH_TIMEOUT: Duration = Duration::from_secs(120);
+const DEFAULT_BASH_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const DEFAULT_WEBFETCH_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_WEBFETCH_BYTES: usize = 100 * 1024;
 const MAX_WEBFETCH_REDIRECTS: usize = 5;
@@ -99,7 +99,6 @@ const MAX_SKILL_RESOURCE_BYTES: u64 = 256 * 1024;
 const MAX_SKILL_NAME_CHARS: usize = 64;
 const MAX_SKILL_DESCRIPTION_CHARS: usize = 1_024;
 const DEFAULT_MAX_SUBAGENT_CONCURRENCY: usize = 4;
-const DEFAULT_MAX_SUBAGENT_ITERATIONS: usize = 32;
 const DEFAULT_MAX_SUBAGENT_INPUT_CHARS: usize = 16 * 1024;
 const DEFAULT_MAX_SUBAGENT_OUTPUT_CHARS: usize = 64 * 1024;
 const DEFAULT_SUBAGENT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -1530,7 +1529,6 @@ impl SubagentInvocation {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SubagentLimits {
     max_concurrent: usize,
-    max_iterations: usize,
     max_input_chars: usize,
     max_output_chars: usize,
     timeout: Duration,
@@ -1539,23 +1537,17 @@ pub struct SubagentLimits {
 impl SubagentLimits {
     pub fn new(
         max_concurrent: usize,
-        max_iterations: usize,
         max_input_chars: usize,
         max_output_chars: usize,
         timeout: Duration,
     ) -> Result<Self, SubagentInputError> {
-        if max_concurrent == 0
-            || max_iterations == 0
-            || max_input_chars == 0
-            || max_output_chars == 0
-            || timeout.is_zero()
+        if max_concurrent == 0 || max_input_chars == 0 || max_output_chars == 0 || timeout.is_zero()
         {
             return Err(SubagentInputError::InvalidLimits);
         }
 
         Ok(Self {
             max_concurrent,
-            max_iterations,
             max_input_chars,
             max_output_chars,
             timeout,
@@ -1567,7 +1559,6 @@ impl Default for SubagentLimits {
     fn default() -> Self {
         Self {
             max_concurrent: DEFAULT_MAX_SUBAGENT_CONCURRENCY,
-            max_iterations: DEFAULT_MAX_SUBAGENT_ITERATIONS,
             max_input_chars: DEFAULT_MAX_SUBAGENT_INPUT_CHARS,
             max_output_chars: DEFAULT_MAX_SUBAGENT_OUTPUT_CHARS,
             timeout: DEFAULT_SUBAGENT_TIMEOUT,
@@ -1629,14 +1620,12 @@ impl SubagentTurnRequest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SubagentTurnResult {
     output: String,
-    iterations: usize,
 }
 
 impl SubagentTurnResult {
-    pub fn new(output: impl Into<String>, iterations: usize) -> Self {
+    pub fn new(output: impl Into<String>) -> Self {
         Self {
             output: output.into(),
-            iterations,
         }
     }
 }
@@ -1655,9 +1644,12 @@ pub struct SubagentRunContext {
 
 impl SubagentRunContext {
     fn inherit(parent: &ToolExecutionContext, timeout: Duration) -> Self {
+        let own_deadline = Instant::now() + timeout;
         Self {
             cancellation: parent.cancellation_handle(),
-            deadline: parent.deadline().min(Instant::now() + timeout),
+            deadline: parent
+                .deadline()
+                .map_or(own_deadline, |deadline| deadline.min(own_deadline)),
         }
     }
 
@@ -1836,14 +1828,8 @@ impl<R: SubagentRunner> SubagentTool<R> {
 
     fn result_output(&self, result: Result<SubagentTurnResult, SubagentRunnerError>) -> ToolOutput {
         match result {
-            Ok(result)
-                if result.iterations <= self.limits.max_iterations
-                    && result.output.chars().count() <= self.limits.max_output_chars =>
-            {
+            Ok(result) if result.output.chars().count() <= self.limits.max_output_chars => {
                 ToolOutput::success(result.output)
-            }
-            Ok(result) if result.iterations > self.limits.max_iterations => {
-                ToolOutput::failure("subagent: iteration limit exceeded")
             }
             Ok(_) => ToolOutput::failure("subagent: output limit exceeded"),
             Err(SubagentRunnerError::ModelFailure) => {
@@ -2024,7 +2010,7 @@ impl std::error::Error for McpTransportError {}
 pub struct McpOperationContext {
     cancellation: Option<Arc<AtomicBool>>,
     headless_cancellation: Option<HeadlessTurnCancellationAdapter>,
-    deadline: Instant,
+    deadline: Option<Instant>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2047,7 +2033,7 @@ impl fmt::Display for ToolExecutionStatus {
 pub struct ToolExecutionContext {
     cancellation: Option<Arc<AtomicBool>>,
     headless_cancellation: Option<HeadlessTurnCancellationAdapter>,
-    deadline: Instant,
+    deadline: Option<Instant>,
     read_filter: Option<PermissionReadFilter>,
 }
 
@@ -2064,7 +2050,7 @@ impl ToolExecutionContext {
         Self {
             cancellation: Some(cancellation),
             headless_cancellation: None,
-            deadline,
+            deadline: Some(deadline),
             read_filter: None,
         }
     }
@@ -2103,9 +2089,7 @@ impl ToolExecutionContext {
 
     /// Adapts core's opaque turn cancellation view without exposing its internals.
     pub fn from_headless_adapter(cancellation: HeadlessTurnCancellationAdapter) -> Self {
-        let deadline = cancellation
-            .deadline()
-            .unwrap_or_else(|| Instant::now() + DEFAULT_BASH_TIMEOUT);
+        let deadline = cancellation.deadline();
         Self {
             cancellation: None,
             headless_cancellation: Some(cancellation),
@@ -2125,7 +2109,8 @@ impl ToolExecutionContext {
     }
 
     pub fn is_expired(&self) -> bool {
-        Instant::now() >= self.deadline
+        self.deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
     }
 
     pub fn check(&self) -> Result<(), ToolExecutionStatus> {
@@ -2140,10 +2125,12 @@ impl ToolExecutionContext {
 
     pub fn remaining(&self) -> Result<Duration, ToolExecutionStatus> {
         self.check()?;
-        Ok(self.deadline.saturating_duration_since(Instant::now()))
+        Ok(self.deadline.map_or(Duration::MAX, |deadline| {
+            deadline.saturating_duration_since(Instant::now())
+        }))
     }
 
-    pub fn deadline(&self) -> Instant {
+    pub fn deadline(&self) -> Option<Instant> {
         self.deadline
     }
 
@@ -2173,7 +2160,7 @@ impl McpOperationContext {
         Self {
             cancellation: Some(cancellation),
             headless_cancellation: None,
-            deadline: Instant::now() + timeout,
+            deadline: Some(Instant::now() + timeout),
         }
     }
 
@@ -2188,7 +2175,8 @@ impl McpOperationContext {
     }
 
     pub fn is_expired(&self) -> bool {
-        Instant::now() >= self.deadline
+        self.deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
     }
 
     pub fn check(&self) -> Result<(), McpTransportError> {
@@ -2203,13 +2191,13 @@ impl McpOperationContext {
 
     pub fn remaining(&self) -> Result<Duration, McpTransportError> {
         self.check()?;
-        Ok(self.deadline.saturating_duration_since(Instant::now()))
+        Ok(self.deadline.map_or(Duration::MAX, |deadline| {
+            deadline.saturating_duration_since(Instant::now())
+        }))
     }
 
     pub fn from_headless_adapter(cancellation: HeadlessTurnCancellationAdapter) -> Self {
-        let deadline = cancellation
-            .deadline()
-            .unwrap_or_else(|| Instant::now() + DEFAULT_BASH_TIMEOUT);
+        let deadline = cancellation.deadline();
         Self {
             cancellation: None,
             headless_cancellation: Some(cancellation),
@@ -2230,7 +2218,7 @@ impl McpOperationContext {
         })
     }
 
-    pub(crate) fn deadline(&self) -> Instant {
+    pub(crate) fn deadline(&self) -> Option<Instant> {
         self.deadline
     }
 }
@@ -3098,7 +3086,13 @@ impl<T: McpTransport> McpClient<T> {
         let context = McpOperationContext {
             cancellation: context.cancellation.as_ref().map(Arc::clone),
             headless_cancellation: context.headless_cancellation.clone(),
-            deadline: context.deadline.min(Instant::now() + self.timeouts.call),
+            deadline: Some(
+                context
+                    .deadline
+                    .map_or(Instant::now() + self.timeouts.call, |deadline| {
+                        deadline.min(Instant::now() + self.timeouts.call)
+                    }),
+            ),
         };
         match self.request(
             McpRequest::CallTool {
@@ -5528,7 +5522,7 @@ impl NativeToolCatalog {
                 };
                 self.tools.bash(
                     BashInput::new(command)
-                        .with_timeout(timeout.min(context.remaining().unwrap_or_default()))
+                        .with_timeout(timeout.min(context.remaining().unwrap_or(Duration::ZERO)))
                         .with_execution_context(context.clone()),
                 )?
             }

@@ -50,7 +50,7 @@ where
         .map(|argument| argument.as_ref().to_owned())
         .collect::<Vec<_>>();
 
-    let cancellation = HeadlessTurnCancellation::with_deadline(std::time::Duration::from_secs(120));
+    let cancellation = HeadlessTurnCancellation::new();
     execute_strings(arguments, dependencies, &cancellation)
 }
 
@@ -88,8 +88,7 @@ where
 
     match arguments {
         Ok(arguments) => {
-            let cancellation =
-                HeadlessTurnCancellation::with_deadline(std::time::Duration::from_secs(120));
+            let cancellation = HeadlessTurnCancellation::new();
             execute_strings(arguments, dependencies, &cancellation)
         }
         Err(error) => error_result(&[], error),

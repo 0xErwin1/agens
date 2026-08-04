@@ -1,11 +1,15 @@
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader, Write};
+use std::ffi::OsStr;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+use std::path::Path;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use agens::{
     CliDependencies, ExitStatus, ModelSelection, ModelSource, bootstrap, execute, execute_os,
@@ -105,8 +109,9 @@ fn isolated_commands_use_distinct_temporary_environment_roots() {
         "XDG_DATA_HOME",
         "AGENS_CONFIG_HOME",
     ] {
-        let path_for = |command: &Command| {
+        let path_for = |command: &IsolatedAgensCommand| {
             command
+                .command()
                 .get_envs()
                 .find_map(|(name, value)| {
                     (name == variable)
@@ -126,6 +131,100 @@ fn isolated_commands_use_distinct_temporary_environment_roots() {
             assert_ne!(second_path, real_path, "{variable} inherited the real path");
         }
     }
+}
+
+#[test]
+fn production_command_output_wait_is_bounded() {
+    const CHILD_MARKER: &str = "AGENS_CLI_BOUNDED_OUTPUT_CHILD";
+
+    if std::env::var_os(CHILD_MARKER).as_deref() == Some(OsStr::new("sleep")) {
+        thread::sleep(Duration::from_secs(1));
+        return;
+    }
+
+    let result = Command::new(std::env::current_exe().expect("test executable should resolve"))
+        .args(["--exact", "production_command_output_wait_is_bounded"])
+        .env(CHILD_MARKER, "sleep")
+        .bounded_output(Duration::from_millis(20));
+
+    let error = result.expect_err("the bounded wait should terminate the sleeping child");
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+}
+
+#[test]
+fn production_command_output_drains_more_than_pipe_capacity() {
+    const CHILD_MARKER: &str = "AGENS_CLI_LARGE_OUTPUT_CHILD";
+    const OUTPUT_BYTES: usize = 2 * 1024 * 1024;
+
+    if std::env::var_os(CHILD_MARKER).is_some() {
+        std::io::stdout()
+            .write_all(&vec![0xa5; OUTPUT_BYTES])
+            .unwrap();
+        std::io::stderr()
+            .write_all(&vec![0xa6; OUTPUT_BYTES])
+            .unwrap();
+        return;
+    }
+
+    let output = Command::new(std::env::current_exe().expect("test executable should resolve"))
+        .args([
+            "--exact",
+            "production_command_output_drains_more_than_pipe_capacity",
+        ])
+        .env(CHILD_MARKER, "1")
+        .bounded_output(Duration::from_secs(2))
+        .expect("large output should be drained while the child runs");
+
+    assert!(output.status.success());
+    assert_eq!(
+        output.stdout.iter().filter(|byte| **byte == 0xa5).count(),
+        OUTPUT_BYTES
+    );
+    assert_eq!(
+        output.stderr.iter().filter(|byte| **byte == 0xa6).count(),
+        OUTPUT_BYTES
+    );
+}
+
+#[test]
+#[cfg(unix)]
+/// The intermediate child intentionally exits without waiting so the outer harness must own and
+/// terminate the descendant process that retains its output pipes.
+#[allow(clippy::zombie_processes)]
+fn production_command_timeout_terminates_descendants_holding_output_pipes() {
+    const CHILD_MARKER: &str = "AGENS_CLI_DESCENDANT_OUTPUT_CHILD";
+
+    match std::env::var(CHILD_MARKER).as_deref() {
+        Ok("child") => {
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "production_command_timeout_terminates_descendants_holding_output_pipes",
+                ])
+                .env(CHILD_MARKER, "descendant")
+                .spawn()
+                .unwrap();
+            return;
+        }
+        Ok("descendant") => {
+            thread::sleep(Duration::from_secs(3));
+            return;
+        }
+        _ => {}
+    }
+
+    let started = Instant::now();
+    let result = Command::new(std::env::current_exe().expect("test executable should resolve"))
+        .args([
+            "--exact",
+            "production_command_timeout_terminates_descendants_holding_output_pipes",
+        ])
+        .env(CHILD_MARKER, "child")
+        .bounded_output(Duration::from_millis(100));
+
+    let error = result.expect_err("a descendant retaining pipes must not defeat the timeout");
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    assert!(started.elapsed() < Duration::from_secs(2));
 }
 
 #[test]
@@ -4730,7 +4829,252 @@ fn write_chatgpt_credentials(config_home: &std::path::Path, access_token: &str) 
     .expect("ChatGPT credentials should be written");
 }
 
-fn isolated_agens_command(temporary: &TemporaryDirectory) -> Command {
+const PRODUCTION_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+
+trait BoundedCommandOutput {
+    fn bounded_output(&mut self, timeout: Duration) -> std::io::Result<Output>;
+}
+
+impl BoundedCommandOutput for Command {
+    fn bounded_output(&mut self, timeout: Duration) -> std::io::Result<Output> {
+        #[cfg(unix)]
+        self.process_group(0);
+
+        let mut child = self
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let process_id = child.id();
+        let stdout_reader = spawn_output_reader(
+            child
+                .stdout
+                .take()
+                .expect("bounded command stdout should be piped"),
+        );
+        let stderr_reader = spawn_output_reader(
+            child
+                .stderr
+                .take()
+                .expect("bounded command stderr should be piped"),
+        );
+        let deadline = Instant::now() + timeout;
+        let mut status = None;
+
+        loop {
+            if status.is_none() {
+                match child.try_wait() {
+                    Ok(observed) => status = observed,
+                    Err(error) => {
+                        return match cleanup_bounded_command(
+                            &mut child,
+                            process_id,
+                            false,
+                            stdout_reader,
+                            stderr_reader,
+                        ) {
+                            Ok(()) => Err(error),
+                            Err(cleanup) => Err(std::io::Error::new(
+                                cleanup.kind(),
+                                format!(
+                                    "bounded command wait failed: {error}; cleanup failed: {cleanup}"
+                                ),
+                            )),
+                        };
+                    }
+                }
+            }
+            if let Some(status) = status
+                && stdout_reader.is_finished()
+                && stderr_reader.is_finished()
+            {
+                let (stdout, stderr) = join_output_readers(stdout_reader, stderr_reader)?;
+                return Ok(Output {
+                    status,
+                    stdout,
+                    stderr,
+                });
+            }
+            if Instant::now() >= deadline {
+                cleanup_bounded_command(
+                    &mut child,
+                    process_id,
+                    status.is_some(),
+                    stdout_reader,
+                    stderr_reader,
+                )?;
+
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("production command exceeded {timeout:?}"),
+                ));
+            }
+
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
+fn cleanup_bounded_command(
+    child: &mut Child,
+    process_id: u32,
+    child_reaped: bool,
+    stdout_reader: thread::JoinHandle<std::io::Result<Vec<u8>>>,
+    stderr_reader: thread::JoinHandle<std::io::Result<Vec<u8>>>,
+) -> std::io::Result<()> {
+    let termination = terminate_process_group(child, process_id);
+    let wait = if child_reaped {
+        Ok(())
+    } else {
+        child.wait().map(|_| ())
+    };
+    let readers = join_output_readers(stdout_reader, stderr_reader).map(|_| ());
+
+    termination?;
+    wait?;
+    readers
+}
+
+fn spawn_output_reader<R>(mut reader: R) -> thread::JoinHandle<std::io::Result<Vec<u8>>>
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output)?;
+        Ok(output)
+    })
+}
+
+fn join_output_reader(
+    reader: thread::JoinHandle<std::io::Result<Vec<u8>>>,
+) -> std::io::Result<Vec<u8>> {
+    reader
+        .join()
+        .map_err(|_| std::io::Error::other("bounded command output reader panicked"))?
+}
+
+fn join_output_readers(
+    stdout: thread::JoinHandle<std::io::Result<Vec<u8>>>,
+    stderr: thread::JoinHandle<std::io::Result<Vec<u8>>>,
+) -> std::io::Result<(Vec<u8>, Vec<u8>)> {
+    let stdout = join_output_reader(stdout);
+    let stderr = join_output_reader(stderr);
+
+    Ok((stdout?, stderr?))
+}
+
+#[cfg(unix)]
+fn terminate_process_group(child: &mut Child, process_id: u32) -> std::io::Result<()> {
+    let process_group = i32::try_from(process_id)
+        .map_err(|_| std::io::Error::other("bounded command process ID is invalid"))?;
+
+    // SAFETY: the child was spawned as the leader of a new process group, and the negative PID
+    // targets that group without granting access to unrelated processes.
+    let result = unsafe { libc::kill(-process_group, libc::SIGKILL) };
+    if result == 0 {
+        return Ok(());
+    }
+
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        let _ = child.kill();
+        Err(error)
+    }
+}
+
+#[cfg(not(unix))]
+fn terminate_process_group(child: &mut Child, _process_id: u32) -> std::io::Result<()> {
+    child.kill()
+}
+
+struct IsolatedAgensCommand {
+    command: Command,
+}
+
+impl IsolatedAgensCommand {
+    fn command(&self) -> &Command {
+        &self.command
+    }
+
+    fn arg<S>(&mut self, argument: S) -> &mut Self
+    where
+        S: AsRef<OsStr>,
+    {
+        self.command.arg(argument);
+        self
+    }
+
+    fn args<I, S>(&mut self, arguments: I) -> &mut Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        self.command.args(arguments);
+        self
+    }
+
+    fn current_dir<P>(&mut self, directory: P) -> &mut Self
+    where
+        P: AsRef<Path>,
+    {
+        self.command.current_dir(directory);
+        self
+    }
+
+    fn env<K, V>(&mut self, key: K, value: V) -> &mut Self
+    where
+        K: AsRef<OsStr>,
+        V: AsRef<OsStr>,
+    {
+        self.command.env(key, value);
+        self
+    }
+
+    fn env_remove<K>(&mut self, key: K) -> &mut Self
+    where
+        K: AsRef<OsStr>,
+    {
+        self.command.env_remove(key);
+        self
+    }
+
+    fn stdin<T>(&mut self, configuration: T) -> &mut Self
+    where
+        T: Into<Stdio>,
+    {
+        self.command.stdin(configuration);
+        self
+    }
+
+    fn stdout<T>(&mut self, configuration: T) -> &mut Self
+    where
+        T: Into<Stdio>,
+    {
+        self.command.stdout(configuration);
+        self
+    }
+
+    fn stderr<T>(&mut self, configuration: T) -> &mut Self
+    where
+        T: Into<Stdio>,
+    {
+        self.command.stderr(configuration);
+        self
+    }
+
+    fn spawn(&mut self) -> std::io::Result<Child> {
+        self.command.spawn()
+    }
+
+    fn output(&mut self) -> std::io::Result<Output> {
+        self.command.bounded_output(PRODUCTION_COMMAND_TIMEOUT)
+    }
+}
+
+fn isolated_agens_command(temporary: &TemporaryDirectory) -> IsolatedAgensCommand {
     static NEXT_COMMAND: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
     let sequence = NEXT_COMMAND.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -4750,7 +5094,7 @@ fn isolated_agens_command(temporary: &TemporaryDirectory) -> Command {
         .env("XDG_CONFIG_HOME", xdg_config_home)
         .env("XDG_DATA_HOME", xdg_data_home)
         .env("AGENS_CONFIG_HOME", agens_config_home);
-    command
+    IsolatedAgensCommand { command }
 }
 
 struct TemporaryDirectory {
@@ -5152,7 +5496,7 @@ impl TaskStalledOpenAiMockServer {
 
     fn wait_for_child_request(&mut self) {
         self.observed_child_request
-            .recv_timeout(Duration::from_secs(1))
+            .recv_timeout(Duration::from_secs(5))
             .expect("production child request should reach the local server");
     }
 

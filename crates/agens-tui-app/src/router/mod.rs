@@ -263,13 +263,6 @@ pub fn tui_provider_outcome(result: Result<String, CliError>) -> TuiProviderOutc
                     .into(),
             }
         }
-        Err(error) if has_error_message(&error, "tool-continuation rounds") => {
-            TuiProviderOutcome::Failed {
-                message: error.to_string(),
-                action: "Ask for a narrower step; the turn kept calling tools without finishing."
-                    .into(),
-            }
-        }
         Err(error) if has_error_message(&error, "network request failed") => {
             TuiProviderOutcome::Failed {
                 message: error.to_string(),

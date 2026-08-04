@@ -20,3 +20,12 @@ fn headless_adapter_reports_an_elapsed_deadline() {
 
     assert_eq!(context.check(), Err(ToolExecutionStatus::TimedOut));
 }
+
+#[test]
+fn headless_adapter_without_a_parent_deadline_does_not_invent_one() {
+    let cancellation = HeadlessTurnCancellation::new();
+    let context = ToolExecutionContext::from_headless_adapter(cancellation.adapter_view());
+
+    assert_eq!(context.deadline(), None);
+    assert_eq!(context.check(), Ok(()));
+}

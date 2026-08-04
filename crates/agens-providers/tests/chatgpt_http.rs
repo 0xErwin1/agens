@@ -1954,7 +1954,7 @@ fn subscription_tool_replay_rejects_replayed_or_malformed_wire_items_without_ret
 }
 
 #[test]
-fn subscription_tool_replay_forwards_error_outputs_and_rejects_item_history_and_round_bounds_before_http()
+fn subscription_tool_replay_forwards_errors_enforces_history_bounds_and_allows_long_round_sequences()
  {
     let directory = temporary_directory("error-output");
     let credentials = write_credentials(&directory);
@@ -2008,9 +2008,9 @@ fn subscription_tool_replay_forwards_error_outputs_and_rejects_item_history_and_
         ProviderDiagnosticKind::ReplayLimitExceeded,
     );
 
-    let directory = temporary_directory("round-bound");
+    let directory = temporary_directory("long-round-sequence");
     let credentials = write_credentials(&directory);
-    let responses = (0..128)
+    let mut responses = (0..129)
         .map(|index| {
             ScriptedResponse::Sse(tool_round_sse(
                 &[],
@@ -2023,36 +2023,27 @@ fn subscription_tool_replay_forwards_error_outputs_and_rejects_item_history_and_
             ))
         })
         .collect::<Vec<_>>();
+    responses.push(ScriptedResponse::Sse(completed_text_sse(
+        "completed after a long synthetic conversation",
+    )));
     let server = ScriptedServer::start(responses);
-    let diagnostic_events = Arc::new(Mutex::new(Vec::new()));
-    let captured = Arc::clone(&diagnostic_events);
-    let diagnostics = ProviderDiagnostics::new(
-        "abc12345",
-        ProviderDiagnosticScope::Parent,
-        Arc::new(move |event| captured.lock().expect("event lock").push(event)),
-    )
-    .expect("diagnostics should be configured");
-    let mut provider = subscription_provider(&credentials, &server).with_diagnostics(diagnostics);
+    let mut provider = subscription_provider(&credentials, &server);
     let mut events = Vec::new();
     assert!(run_with_events(&mut provider, &events, HeadlessTurnCancellation::new()).is_ok());
-    for index in 0..127 {
+    for index in 0..129 {
         events.push(tool_result(&format!("call_{index}"), "ok", false));
-        assert!(run_with_events(&mut provider, &events, HeadlessTurnCancellation::new()).is_ok());
+        let parts = run_with_events(&mut provider, &events, HeadlessTurnCancellation::new())
+            .expect("long continuation sequence should keep running");
+        if index == 128 {
+            assert_eq!(
+                parts,
+                vec![MessagePart::Text(
+                    "completed after a long synthetic conversation".into()
+                )]
+            );
+        }
     }
-    events.push(tool_result("call_127", "ok", false));
-    assert_eq!(
-        run_with_events(&mut provider, &events, HeadlessTurnCancellation::new()),
-        Err(HeadlessTurnPortError::ProviderToolRounds),
-    );
-    let diagnostic_events = diagnostic_events.lock().expect("event lock");
-    let rejected = diagnostic_events.last().expect("limit should be diagnosed");
-    assert_eq!(
-        rejected.event,
-        ProviderDiagnosticKind::ContinuationLimitExceeded
-    );
-    assert_eq!(rejected.class, Some(ProviderDiagnosticClass::Runtime));
-    drop(diagnostic_events);
-    assert_eq!(server.join().len(), 128);
+    assert_eq!(server.join().len(), 130);
     fs::remove_dir_all(directory).expect("temporary directory should be removed");
 }
 

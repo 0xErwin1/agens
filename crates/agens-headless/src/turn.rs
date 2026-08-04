@@ -168,7 +168,7 @@ pub fn run_production_headless_chat_with_progress(
                         model,
                         messages,
                         tools,
-                        std::time::Duration::from_secs(120),
+                        agens_providers::DEFAULT_PROVIDER_REQUEST_TIMEOUT,
                     )
                     .map(|provider| {
                         provider
@@ -210,7 +210,7 @@ pub fn run_production_headless_chat_with_progress(
                         model,
                         messages,
                         tools,
-                        std::time::Duration::from_secs(120),
+                        agens_providers::DEFAULT_PROVIDER_REQUEST_TIMEOUT,
                     )
                     .map(|provider| {
                         provider
@@ -258,7 +258,7 @@ pub fn run_production_headless_chat_with_progress(
                         instructions,
                         messages,
                         tools,
-                        std::time::Duration::from_secs(120),
+                        agens_providers::DEFAULT_PROVIDER_REQUEST_TIMEOUT,
                     )
                     .map(|provider| {
                         provider

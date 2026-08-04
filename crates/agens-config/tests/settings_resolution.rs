@@ -80,10 +80,10 @@ fn typed_views_match_the_limits_the_runtime_hardcodes_today() {
     assert_eq!(tools.max_search_results, 100);
     assert_eq!(tools.max_search_depth, 32);
     assert_eq!(tools.operation_timeout_ms, 5_000);
-    assert_eq!(tools.bash_timeout_ms, 120_000);
+    assert_eq!(tools.bash_timeout_ms, 1_800_000);
 
     let subagents = SubagentSettings::from(&resolved);
-    assert_eq!(subagents.max_iterations, 32);
+    assert_eq!(subagents.check_interval, 32);
     assert_eq!(subagents.max_concurrency, 4);
     assert_eq!(subagents.max_output_chars, 65_536);
 
@@ -95,13 +95,17 @@ fn typed_views_match_the_limits_the_runtime_hardcodes_today() {
 #[test]
 fn typed_views_carry_configured_values() {
     let document = table(
-        "[tools]\nmax_search_depth = 4\nbash_timeout_ms = 30000\n\n[subagents]\nmax_concurrency = 2\n\n[mcp_defaults]\ntimeout_ms = 250\nmax_retries = 3\n",
+        "[tools]\nmax_search_depth = 4\nbash_timeout_ms = 7200000\n\n[subagents]\ncheck_interval = 48\nmax_concurrency = 2\n\n[mcp_defaults]\ntimeout_ms = 250\nmax_retries = 3\n",
     );
 
     let resolved = resolve_settings(&document, &empty(), &document);
 
     assert_eq!(ToolLimitSettings::from(&resolved).max_search_depth, 4);
-    assert_eq!(ToolLimitSettings::from(&resolved).bash_timeout_ms, 30_000);
+    assert_eq!(
+        ToolLimitSettings::from(&resolved).bash_timeout_ms,
+        7_200_000
+    );
+    assert_eq!(SubagentSettings::from(&resolved).check_interval, 48);
     assert_eq!(SubagentSettings::from(&resolved).max_concurrency, 2);
     assert_eq!(McpDefaultSettings::from(&resolved).timeout_ms, 250);
     assert_eq!(McpDefaultSettings::from(&resolved).max_retries, 3);

@@ -24,7 +24,7 @@ const MAX_TASK_DESCRIPTION_CHARS: usize = 16_384;
 const MAX_TASK_MODEL_CHARS: usize = 64;
 const MAX_TASK_SKILLS: usize = 128;
 const MAX_TASK_SKILL_NAME_CHARS: usize = 64;
-const MAX_TASK_ITERATIONS: usize = 32;
+const DEFAULT_TASK_CHECK_INTERVAL: usize = 32;
 const MAX_TASK_OUTPUT_CHARS: usize = 65_536;
 const MAX_TASK_CONCURRENCY: usize = 4;
 const MAX_TASK_AGENT_SCHEMA_DESCRIPTION_CHARS: usize = 160;
@@ -306,12 +306,11 @@ fn task_status(snapshot: &TaskExecutionSnapshot) -> String {
     output
 }
 
-/// Bounds the task tool applies to the subagents it launches. Configured by
-/// the `[subagents]` table; the defaults are the values the runtime used before
-/// they were configurable.
+/// Supervision cadence and resource bounds for subagents launched by the task
+/// tool. Configured by the `[subagents]` table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TaskExecutionLimits {
-    pub max_iterations: usize,
+    pub check_interval: usize,
     pub max_concurrency: usize,
     pub max_output_chars: usize,
 }
@@ -319,7 +318,7 @@ pub struct TaskExecutionLimits {
 impl Default for TaskExecutionLimits {
     fn default() -> Self {
         Self {
-            max_iterations: MAX_TASK_ITERATIONS,
+            check_interval: DEFAULT_TASK_CHECK_INTERVAL,
             max_concurrency: MAX_TASK_CONCURRENCY,
             max_output_chars: MAX_TASK_OUTPUT_CHARS,
         }
@@ -926,7 +925,6 @@ impl TaskTurnRequest {
 
 pub struct TaskTurnResult {
     pub output: String,
-    pub iterations: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -934,7 +932,6 @@ pub enum TaskRunnerError {
     Cancelled,
     TimedOut,
     ProviderFailure(TaskProviderFailure),
-    IterationLimit,
     ChildFailure,
     /// A `permissions:` entry the agent definition could not be delegated
     /// with, named so the parent can correct the definition rather than retry
@@ -976,6 +973,9 @@ pub enum TaskModelResolutionError {
 #[derive(Clone)]
 pub struct TaskRunContext {
     pub cancellation: Arc<AtomicBool>,
+    parent_cancellation: Arc<AtomicBool>,
+    deadline: Option<Instant>,
+    timed_out: Arc<AtomicBool>,
     execution: Option<TaskExecutionLifecycle>,
     registry: TaskExecutionRegistry,
     before_publication: BeforePublicationHook,
@@ -984,11 +984,16 @@ pub struct TaskRunContext {
 impl TaskRunContext {
     fn new(
         cancellation: Arc<AtomicBool>,
+        parent_cancellation: Arc<AtomicBool>,
+        deadline: Option<Instant>,
         execution: TaskExecutionLifecycle,
         registry: TaskExecutionRegistry,
     ) -> Self {
         Self {
             cancellation,
+            parent_cancellation,
+            deadline,
+            timed_out: Arc::new(AtomicBool::new(false)),
             execution: Some(execution),
             registry,
             before_publication: Arc::new(Mutex::new(None)),
@@ -1001,6 +1006,31 @@ impl TaskRunContext {
 
     pub fn execution_registry(&self) -> &TaskExecutionRegistry {
         &self.registry
+    }
+
+    pub const fn deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
+
+    pub fn turn_cancellation(&self) -> agens_core::HeadlessTurnCancellation {
+        agens_core::HeadlessTurnCancellation::with_cancellation_and_deadline(
+            Arc::clone(&self.cancellation),
+            self.deadline,
+        )
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancellation.load(Ordering::Acquire)
+            || self.parent_cancellation.load(Ordering::Acquire)
+    }
+
+    pub fn is_expired(&self) -> bool {
+        self.deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+    }
+
+    fn mark_timed_out(&self) {
+        self.timed_out.store(true, Ordering::Release);
     }
 
     pub fn drain_messages(&self) -> Vec<TaskMessage> {
@@ -1032,7 +1062,10 @@ impl TaskRunContext {
     }
 
     fn terminal_output(&self) -> Option<ToolOutput> {
-        if self.cancellation.load(Ordering::Acquire) {
+        if self.timed_out.load(Ordering::Acquire) || self.is_expired() {
+            return Some(task_terminal(HeadlessTaskTerminal::TimedOut));
+        }
+        if self.is_cancelled() {
             return Some(task_terminal(HeadlessTaskTerminal::Cancelled));
         }
         None
@@ -1389,6 +1422,9 @@ impl<R: TaskRunner> TaskTool<R> {
         if parent.is_cancelled() {
             return Ok(task_terminal(HeadlessTaskTerminal::Cancelled));
         }
+        if parent.is_expired() {
+            return Ok(task_terminal(HeadlessTaskTerminal::TimedOut));
+        }
         let request = match self.resolve(invocation) {
             Ok(request) => request,
             Err(output) => return Ok(output),
@@ -1404,7 +1440,13 @@ impl<R: TaskRunner> TaskTool<R> {
             .registry
             .cancellation_handle(execution_id)
             .expect("admitted task cancellation");
-        let context = TaskRunContext::new(cancellation, lifecycle, self.registry.clone());
+        let context = TaskRunContext::new(
+            cancellation,
+            parent.cancellation_handle(),
+            parent.deadline(),
+            lifecycle,
+            self.registry.clone(),
+        );
         let (sender, receiver) = mpsc::channel();
         let runner = Arc::clone(&self.runner);
         let registry = self.registry.clone();
@@ -1436,6 +1478,13 @@ impl<R: TaskRunner> TaskTool<R> {
             let _ = sender.send(output);
         });
         self.registry.set_worker(execution_id, worker);
+        spawn_inherited_stop_relay(
+            self.registry.clone(),
+            execution_id,
+            context.parent_cancellation.clone(),
+            context.deadline,
+            context.timed_out.clone(),
+        );
 
         if mode == TaskLaunchMode::Background {
             return Ok(background_output(execution_id));
@@ -1445,6 +1494,11 @@ impl<R: TaskRunner> TaskTool<R> {
             if parent.is_cancelled() {
                 self.registry.cancel(execution_id);
                 return Ok(task_terminal(HeadlessTaskTerminal::Cancelled));
+            }
+            if parent.is_expired() {
+                context.mark_timed_out();
+                self.registry.cancel(execution_id);
+                return Ok(task_terminal(HeadlessTaskTerminal::TimedOut));
             }
             if self
                 .registry
@@ -1468,6 +1522,35 @@ impl<R: TaskRunner> TaskTool<R> {
     }
 }
 
+fn spawn_inherited_stop_relay(
+    registry: TaskExecutionRegistry,
+    execution_id: TaskExecutionId,
+    parent_cancellation: Arc<AtomicBool>,
+    deadline: Option<Instant>,
+    timed_out: Arc<AtomicBool>,
+) {
+    thread::spawn(move || {
+        loop {
+            if registry
+                .snapshot(execution_id)
+                .is_none_or(|snapshot| snapshot.terminal.is_some())
+            {
+                return;
+            }
+            if parent_cancellation.load(Ordering::Acquire) {
+                registry.cancel(execution_id);
+                return;
+            }
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                timed_out.store(true, Ordering::Release);
+                registry.cancel(execution_id);
+                return;
+            }
+            thread::sleep(TASK_RESULT_POLL_INTERVAL);
+        }
+    });
+}
+
 fn task_terminal_state(output: &ToolOutput) -> TaskTerminalState {
     match output.terminal() {
         Some(HeadlessTaskTerminal::Cancelled) => TaskTerminalState::Cancelled,
@@ -1481,9 +1564,6 @@ fn task_result_output(result: TaskTurnResult, context: &TaskRunContext) -> ToolO
         return output;
     }
     let limits = context.registry.limits();
-    if result.iterations > limits.max_iterations {
-        return task_terminal(HeadlessTaskTerminal::IterationLimit);
-    }
     if result.output.chars().count() > limits.max_output_chars {
         return task_terminal(HeadlessTaskTerminal::OutputLimit);
     }
@@ -1505,7 +1585,6 @@ fn task_error_output(error: TaskRunnerError) -> ToolOutput {
             output.content.push(']');
             output
         }
-        TaskRunnerError::IterationLimit => task_terminal(HeadlessTaskTerminal::IterationLimit),
         TaskRunnerError::ChildFailure => task_terminal(HeadlessTaskTerminal::ChildFailure),
         TaskRunnerError::DeclarationRejected { reason, tool } => {
             declaration_rejected_output(&tool, reason)

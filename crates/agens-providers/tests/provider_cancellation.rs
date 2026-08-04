@@ -4,13 +4,22 @@ use std::time::{Duration, Instant};
 
 use agens_core::Error;
 use agens_providers::{
-    ProviderCancellation, decode_openai_response_stream, persist_chatgpt_refresh,
+    DEFAULT_PROVIDER_REQUEST_TIMEOUT, ProviderCancellation, decode_openai_response_stream,
+    persist_chatgpt_refresh,
 };
 
 const ACCESS_TOKEN: &str = "synthetic-access-token-should-not-escape";
 const REFRESH_TOKEN: &str = "synthetic-refresh-token-should-not-escape";
 const AUTHORIZATION_HEADER: &str = "Authorization: Bearer synthetic-authorization-header";
 const CREDENTIAL_BODY: &str = "synthetic-credential-body-should-not-escape";
+
+#[test]
+fn the_default_provider_request_timeout_allows_long_responses() {
+    assert_eq!(
+        DEFAULT_PROVIDER_REQUEST_TIMEOUT,
+        Duration::from_secs(10 * 60)
+    );
+}
 
 #[test]
 fn cancelling_a_pending_stream_returns_the_typed_cancelled_outcome_promptly() {
