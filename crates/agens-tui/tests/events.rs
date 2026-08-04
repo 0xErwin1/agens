@@ -422,9 +422,8 @@ fn recovered_failed_prompt_escape_discards_and_successful_resume_replaces_atomic
     });
 
     assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Render);
-    assert!(tui.input().is_empty());
-    assert!(!tui.view().recovered_failed_prompt);
-    assert_eq!(tui.view().status, Some("Recovered prompt discarded."));
+    assert_eq!(tui.input(), "failed prompt");
+    assert!(tui.view().recovered_failed_prompt);
 
     tui.apply_submission_outcome(TuiSubmissionOutcome::SessionResumed {
         message: "Recovered failed prompt.".into(),
@@ -519,7 +518,7 @@ fn transcript_navigation_restores_focus_and_routes_live_child_composer_to_mailbo
         ));
     }
 
-    tui.handle(Event::Key(Key::Escape));
+    focus_viewport(&mut tui);
     tui.handle(Event::Key(Key::Char('g')));
     assert_eq!(tui.handle(Event::Key(Key::Char('t'))), Action::Render);
     assert!(tui.view().dialog.is_some());
@@ -562,15 +561,12 @@ fn transcript_navigation_restores_focus_and_routes_live_child_composer_to_mailbo
     tui.handle(Event::Key(Key::Char('i')));
     assert_eq!(tui.view().focus, TranscriptFocus::Composer);
     assert!(!tui.view().collapse_thinking);
-    // Main was detached by the Escape that focused it at the top of this test:
-    // entering the transcript keymap pins the viewport so a running turn cannot
-    // scroll the row being read out from under it.
-    assert!(!tui.view().following_bottom);
+    assert!(tui.view().following_bottom);
     assert!(tui.view().tool_display_modes.is_empty());
     tui.handle(Event::Key(Key::Char('m')));
     assert_eq!(tui.input(), "m");
 
-    tui.handle(Event::Key(Key::Escape));
+    focus_viewport(&mut tui);
     tui.handle(Event::Key(Key::Char(']')));
     assert!(tui.view().collapse_thinking);
     assert!(!tui.view().following_bottom);
@@ -661,23 +657,11 @@ fn execution_strip_navigation_enters_children_and_backgrounds_the_focused_execut
     }
 
     assert_eq!(tui.handle(Event::Key(Key::Tab)), Action::Render);
-    assert_eq!(tui.view().execution_selection, Some(TranscriptId::Main));
-    assert_eq!(tui.handle(Event::Key(Key::Down)), Action::Render);
-    assert_eq!(
-        tui.view().execution_selection,
-        Some(TranscriptId::Subagent(8))
-    );
-    assert_eq!(tui.handle(Event::Key(Key::Enter)), Action::Render);
-    assert_eq!(tui.view().active_transcript, TranscriptId::Subagent(8));
-    assert_eq!(
-        tui.handle(Event::Key(Key::CtrlB)),
-        Action::TransitionToBackground(8)
-    );
-    tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
-        agent: "writer".into(),
-        event: TuiExecutionEvent::Backgrounded { id: 8 },
-    });
-    assert_eq!(tui.handle(Event::Key(Key::CtrlB)), Action::Render);
+    assert_eq!(tui.view().surface_focus, agens_tui::SurfaceFocus::Queue);
+    assert_eq!(tui.handle(Event::Key(Key::Tab)), Action::Render);
+    assert_eq!(tui.view().surface_focus, agens_tui::SurfaceFocus::Activity);
+    assert_eq!(tui.handle(Event::Key(Key::Tab)), Action::Render);
+    assert_eq!(tui.view().surface_focus, agens_tui::SurfaceFocus::Composer);
     assert_eq!(tui.input(), "next task");
     assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Render);
     assert_eq!(tui.view().active_transcript, TranscriptId::Main);
@@ -726,7 +710,7 @@ fn transcript_picker_outcome_and_gt_use_the_same_main_and_child_entries() {
         ),
     ));
 
-    tui.handle(Event::Key(Key::Escape));
+    focus_viewport(&mut tui);
     tui.handle(Event::Key(Key::Char('g')));
     assert_eq!(tui.handle(Event::Key(Key::Char('t'))), Action::Render);
     let from_gt = format!("{:?}", tui.view().dialog);
@@ -782,7 +766,7 @@ fn viewport_vim_routes_preserve_per_transcript_state() {
         ));
     }
 
-    tui.handle(Event::Key(Key::Escape));
+    focus_viewport(&mut tui);
     tui.handle(Event::Key(Key::Char(']')));
     assert_eq!(tui.view().active_transcript, TranscriptId::Subagent(7));
     tui.handle(Event::Key(Key::CtrlO));
@@ -1014,7 +998,7 @@ fn block_focus_walks_settled_calls_and_opens_only_the_one_it_stands_on() {
     }
     tui.finish_provider_turn(agens_tui::TuiProviderOutcome::Completed("answer".into()));
 
-    tui.handle(Event::Key(Key::Escape));
+    focus_viewport(&mut tui);
     assert_eq!(tui.view().focus, TranscriptFocus::Viewport);
 
     // Focus enters at the newest block, which is the one a reader just watched
@@ -1072,7 +1056,7 @@ fn opening_a_focused_block_does_not_move_the_rows_above_it() {
     }));
     tui.finish_provider_turn(agens_tui::TuiProviderOutcome::Completed("answer".into()));
 
-    tui.handle(Event::Key(Key::Escape));
+    focus_viewport(&mut tui);
     tui.handle(Event::Key(Key::Char('K')));
     assert_eq!(tui.view().focused_call, Some("read-1"));
     let anchored = tui.view().scroll_offset;
@@ -1643,7 +1627,7 @@ fn reducer_refuses_prompt_when_running_queue_is_full_without_history() {
     assert_eq!(
         app.reduce(AppEvent::SubmitPrompt("refused".into())),
         vec![Effect::RefusePrompt(
-            "A response is already in progress.".into()
+            "Prompt queue is full; draft was kept unchanged.".into()
         )]
     );
     assert_eq!(app.queued_prompts(), ["queued"]);
@@ -1691,12 +1675,12 @@ fn command_connected_key_dispatch_prioritizes_dialog_global_and_composer_editing
 
     assert_eq!(
         app.reduce(AppEvent::Key(Key::CtrlC, now)),
-        vec![Effect::ExitWarning]
+        vec![Effect::CancelTurn]
     );
     assert_eq!(app.dialog(), Some(&Dialog::Command));
     assert_eq!(
         app.reduce(AppEvent::Key(Key::CtrlC, now + Duration::from_secs(1))),
-        vec![Effect::CancelTurn, Effect::Quit]
+        vec![Effect::Render]
     );
 
     app.set_dialog(None);
@@ -1715,14 +1699,14 @@ fn command_control_c_warns_then_cancels_if_needed_and_quits() {
     running.reduce(AppEvent::SubmitPrompt("running".into()));
     assert_eq!(
         running.reduce(AppEvent::Command(Command::ControlC, now)),
-        vec![Effect::ExitWarning]
+        vec![Effect::CancelTurn]
     );
     assert_eq!(
         running.reduce(AppEvent::Command(
             Command::ControlC,
             now + Duration::from_secs(1)
         )),
-        vec![Effect::CancelTurn, Effect::Quit]
+        vec![Effect::Render]
     );
 
     let mut idle = AppState::new(1);
@@ -2715,8 +2699,8 @@ fn tui_submission_outcome_local_auth_progress_is_transient_and_cancellable() {
     assert!(text.contains("https://auth.example/device"));
     assert!(text.contains("ABCD-EFGH"));
     assert!(tui.transcript().is_empty());
-    assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Cancel);
-    assert_eq!(tui.engine().cancellations, 1);
+    assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::CancelRoute);
+    assert_eq!(tui.engine().cancellations, 0);
 
     tui.apply_submission_outcome(TuiSubmissionOutcome::LocalActionableError {
         message: "ChatGPT login was cancelled".into(),
@@ -2839,17 +2823,12 @@ fn second_submission_is_rejected_while_a_turn_owns_cancellation() {
     tui.begin_submission("first prompt");
     assert_eq!(tui.handle(Event::Key(Key::Char('s'))), Action::Render);
     assert_eq!(tui.handle(Event::Key(Key::Enter)), Action::Render);
-    assert_eq!(tui.input(), "s");
+    assert_eq!(tui.input(), "");
     assert_eq!(
         tui.transcript(),
-        [
-            agens_tui::TranscriptEntry::User("first prompt".into()),
-            agens_tui::TranscriptEntry::Info("A response is already in progress.".into()),
-        ]
+        [agens_tui::TranscriptEntry::User("first prompt".into()),]
     );
     assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Render);
-    assert_eq!(tui.engine().cancellations, 0);
-    assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Quit);
     assert_eq!(tui.engine().cancellations, 1);
 }
 
@@ -2889,18 +2868,16 @@ fn double_control_c_exits_without_clearing_composer_input() {
 }
 
 #[test]
-fn escape_leaves_the_composer_then_cancels_without_arming_quit() {
+fn escape_is_inert_while_running_and_control_c_requests_cancellation() {
     let mut tui = Tui::new(FakeEngine::default());
-    tui.set_running(true);
+    tui.begin_submission("running");
 
-    // Stopping to read must not cost the turn, so the first Escape only moves
-    // focus and the second is the one that reaches the engine.
     assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Render);
-    assert_eq!(tui.view().focus, TranscriptFocus::Viewport);
+    assert_eq!(tui.view().focus, TranscriptFocus::Composer);
     assert_eq!(tui.engine().cancellations, 0);
     assert!(!tui.view().quit_armed);
 
-    assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Cancel);
+    assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Render);
     assert_eq!(tui.engine().cancellations, 1);
     assert!(!tui.view().quit_armed);
 }
@@ -3160,20 +3137,17 @@ fn ratatui_active_turn_row_distinguishes_waiting_responding_cancelling_and_failu
         .collect::<String>();
     assert!(responding.contains("Responding"));
 
-    assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Render);
-    assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Cancel);
-    renderer.render(tui.view()).unwrap();
-    let cancelling = renderer
-        .terminal()
-        .backend()
-        .buffer()
-        .content
-        .iter()
-        .map(|cell| cell.symbol())
-        .collect::<String>();
-    assert!(cancelling.contains("Cancelling"));
+    assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Render);
+    assert_eq!(tui.engine().cancellations, 1);
+    assert_eq!(
+        tui.view().status,
+        Some("Cancellation requested; waiting for confirmation.")
+    );
 
-    tui.apply_progress(TurnEvent::StateChanged(TurnState::Failed));
+    tui.finish_provider_turn(TuiProviderOutcome::Failed {
+        message: "provider failed".into(),
+        action: "Retry the prompt.".into(),
+    });
     renderer.render(tui.view()).unwrap();
     let failed = renderer
         .terminal()
@@ -3267,7 +3241,7 @@ fn viewport_owner_keys_are_gt_m_and_brackets_with_ctrl_timeline_nav() {
         TuiSubagentEvent::started(8, "writer", "task", TuiExecutionState::ForegroundRunning),
     ));
 
-    tui.handle(Event::Key(Key::Escape));
+    focus_viewport(&mut tui);
     assert_eq!(tui.view().focus, TranscriptFocus::Viewport);
     // `g` is a chord prefix now, so the picker costs its second key.
     assert_eq!(tui.handle(Event::Key(Key::Char('g'))), Action::Render);
@@ -3763,9 +3737,9 @@ fn the_auto_turn_is_cancellable_and_never_fabricates_a_user_prompt() {
     );
 
     assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Render);
-    assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Cancel);
+    assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Render);
+    assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Quit);
     assert_eq!(tui.engine().cancellations, 1);
-    assert_eq!(tui.view().turn_state, Some(TurnState::Cancelled));
 }
 
 fn file_candidates() -> Vec<String> {
@@ -3781,6 +3755,14 @@ fn typed(tui: &mut Tui<FakeEngine>, text: &str) {
     for character in text.chars() {
         tui.handle(Event::Key(Key::Char(character)));
     }
+}
+
+fn focus_viewport(tui: &mut Tui<FakeEngine>) {
+    assert_eq!(
+        tui.handle(Event::MouseDown { column: 4, row: 1 }),
+        Action::Render
+    );
+    assert_eq!(tui.view().focus, TranscriptFocus::Viewport);
 }
 
 #[test]
@@ -3909,8 +3891,12 @@ fn the_file_picker_takes_navigation_keys_before_the_subagent_strip() {
     let mut tui = Tui::new(FakeEngine::default());
     tui.set_file_candidates(file_candidates());
     start_child(&mut tui, 7);
-    tui.handle(Event::Key(Key::Tab));
-    assert!(tui.view().execution_selection.is_some());
+    assert_eq!(tui.handle(Event::Key(Key::Tab)), Action::Render);
+    assert_eq!(tui.view().surface_focus, agens_tui::SurfaceFocus::Queue);
+    assert_eq!(tui.handle(Event::Key(Key::Tab)), Action::Render);
+    assert_eq!(tui.view().surface_focus, agens_tui::SurfaceFocus::Activity);
+    assert_eq!(tui.handle(Event::Key(Key::Tab)), Action::Render);
+    assert_eq!(tui.view().surface_focus, agens_tui::SurfaceFocus::Composer);
 
     typed(&mut tui, "@src/lib");
     tui.handle(Event::Key(Key::Down));
@@ -3935,7 +3921,7 @@ fn a_background_submission_leaves_no_file_picker_behind_for_escape() {
     assert!(tui.view().file_picker.is_none());
 
     assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Render);
-    assert_eq!(tui.view().focus, TranscriptFocus::Viewport);
+    assert_eq!(tui.view().focus, TranscriptFocus::Composer);
 }
 
 #[test]
@@ -4021,8 +4007,8 @@ fn device_auth_overlay_escape_cancels_active_auth_route() {
         user_code: "ABCD-EFGH".into(),
     });
 
-    assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Cancel);
-    assert_eq!(tui.engine().cancellations, 1);
+    assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::CancelRoute);
+    assert_eq!(tui.engine().cancellations, 0);
 }
 
 #[test]

@@ -17,9 +17,63 @@ use agens_session::context::reset_session;
 use agens_session::provider::ProviderKind;
 use agens_tool_runtime::rotation::rotate_agent;
 
-use super::TuiRuntimeRouter;
+use super::{BusyPolicy, TuiRuntimeRouter};
+
+const BUILTIN_BUSY_POLICIES: &[(&str, BusyPolicy)] = &[
+    ("agent", BusyPolicy::Reject),
+    ("bypass", BusyPolicy::Reject),
+    ("connect", BusyPolicy::Reject),
+    ("dangerous", BusyPolicy::Reject),
+    ("disconnect", BusyPolicy::Reject),
+    ("diagnostics", BusyPolicy::Local),
+    ("effort", BusyPolicy::Reject),
+    ("help", BusyPolicy::Local),
+    ("keys", BusyPolicy::Invalid),
+    ("login", BusyPolicy::Reject),
+    ("mcp", BusyPolicy::Local),
+    ("model", BusyPolicy::Reject),
+    ("new", BusyPolicy::Reject),
+    ("provider", BusyPolicy::Reject),
+    ("quit", BusyPolicy::Quit),
+    ("resume", BusyPolicy::Reject),
+    ("select", BusyPolicy::Local),
+    ("sessions", BusyPolicy::Reject),
+    ("subagent", BusyPolicy::Reject),
+    ("subagent-profiles", BusyPolicy::Reject),
+    ("subagents", BusyPolicy::Local),
+];
 
 impl TuiRuntimeRouter {
+    /// Classifies an input against the current built-in, command, and skill catalogs.
+    ///
+    /// The method intentionally performs no route work: callers can decide whether a busy
+    /// submission is queueable before clearing the composer or mutating the scheduler.
+    pub fn classify_busy_input(&self, input: &str) -> BusyPolicy {
+        let Some(name) = command_name(input) else {
+            return BusyPolicy::Queue;
+        };
+
+        if let Some((_, policy)) = BUILTIN_BUSY_POLICIES
+            .iter()
+            .find(|(candidate, _)| *candidate == name)
+        {
+            return *policy;
+        }
+
+        if RESERVED_TUI_COMMANDS.contains(&name) {
+            return BusyPolicy::Invalid;
+        }
+
+        match (self.commands(), self.skills()) {
+            (Ok(commands), Ok(skills))
+                if commands.command(name).is_some() || skills.skill(name).is_some() =>
+            {
+                BusyPolicy::Queue
+            }
+            _ => BusyPolicy::Invalid,
+        }
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub fn resolve(&self, input: String) -> Result<TuiSubmissionOutcome, CliError> {
         self.resolve_with_cancellation(input, &TuiRouteCancellation::new())
@@ -283,4 +337,12 @@ impl TuiRuntimeRouter {
                     .unwrap_or_default()
             })
     }
+}
+
+fn command_name(input: &str) -> Option<&str> {
+    let invocation = input.trim().strip_prefix('/')?;
+    let name_end = invocation
+        .find(char::is_whitespace)
+        .unwrap_or(invocation.len());
+    Some(&invocation[..name_end])
 }

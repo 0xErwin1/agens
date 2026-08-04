@@ -343,6 +343,8 @@ pub enum Action {
     Unchanged,
     /// Send this prompt to the composition layer.
     Submit(String),
+    /// Classify this busy composer draft before mutating the prompt queue.
+    SubmitBusy(String),
     /// Submit a redacted credential through the dedicated route only.
     SubmitSecret {
         action_id: String,
@@ -443,6 +445,13 @@ pub enum TuiSubmissionOutcome {
         display: String,
         prompt: String,
     },
+    /// A catalog-resolved provider turn accepted into the busy prompt queue.
+    BusyProviderTurn {
+        display: String,
+        prompt: String,
+    },
+    /// A busy-session refusal that preserves the composer draft for editing.
+    BusyRefusal(String),
     /// Opens an isolated credential-entry overlay.
     SecretEntry(SecretEntryView),
     LocalInfo(String),
@@ -491,6 +500,8 @@ pub enum TuiSubmissionOutcome {
 #[derive(Clone, Eq, PartialEq)]
 pub enum TuiRouteRequest {
     Input(String),
+    /// Resolve a busy input through the router before scheduler mutation.
+    BusyInput(String),
     /// Opens a device-authentication URL through the application adapter.
     DeviceAuthOpenUrl(String),
     SubmitSecret {
@@ -632,6 +643,7 @@ impl std::fmt::Debug for Action {
             Self::Render => formatter.write_str("Render"),
             Self::Unchanged => formatter.write_str("Unchanged"),
             Self::Submit(value) => formatter.debug_tuple("Submit").field(value).finish(),
+            Self::SubmitBusy(value) => formatter.debug_tuple("SubmitBusy").field(value).finish(),
             Self::SubmitBackground(value) => formatter
                 .debug_tuple("SubmitBackground")
                 .field(value)
@@ -700,6 +712,7 @@ impl std::fmt::Debug for TuiRouteRequest {
                 .field("secret", &"<redacted>")
                 .finish(),
             Self::Input(value) => formatter.debug_tuple("Input").field(value).finish(),
+            Self::BusyInput(value) => formatter.debug_tuple("BusyInput").field(value).finish(),
             Self::DeviceAuthOpenUrl(_) => formatter.write_str("DeviceAuthOpenUrl(<redacted>)"),
             Self::OpenDialog(value) => formatter.debug_tuple("OpenDialog").field(value).finish(),
             Self::DialogAction(value) => {
@@ -4925,6 +4938,7 @@ impl Renderer for PlainRenderer {
 pub struct Tui<E> {
     engine: E,
     scheduler: AppState,
+    busy_policy_routing: bool,
     surface_focus: SurfaceFocus,
     queue_selected: Option<usize>,
     input: String,
@@ -5014,6 +5028,7 @@ where
         Self {
             engine,
             scheduler: AppState::new(queue_capacity),
+            busy_policy_routing: false,
             surface_focus: SurfaceFocus::Composer,
             queue_selected: None,
             hyperlinks: widgets::hyperlinks_enabled(),
@@ -5453,6 +5468,11 @@ where
         self.assistant_streaming = true;
     }
 
+    /// Enables router-owned classification for busy composer submissions.
+    pub fn enable_busy_policy_routing(&mut self) {
+        self.busy_policy_routing = true;
+    }
+
     /// Starts the turn a finished background subagent scheduled, but only at a safe point.
     ///
     /// The shared runtime rejects a concurrent turn, and firing over a composer the user is
@@ -5628,6 +5648,14 @@ where
                 self.begin_submission(display);
                 Some(prompt)
             }
+            TuiSubmissionOutcome::BusyProviderTurn { display, prompt } => {
+                self.enqueue_resolved_composer(display, prompt);
+                None
+            }
+            TuiSubmissionOutcome::BusyRefusal(message) => {
+                self.status = Some(message);
+                None
+            }
             TuiSubmissionOutcome::LocalInfo(message) => {
                 self.set_running(false);
                 self.add_info(message);
@@ -5725,6 +5753,45 @@ where
         }
     }
 
+    /// Applies a route result that was classified while the foreground lifecycle is active.
+    pub fn apply_busy_submission_outcome(
+        &mut self,
+        outcome: TuiSubmissionOutcome,
+    ) -> Option<String> {
+        match outcome {
+            TuiSubmissionOutcome::BusyProviderTurn { display, prompt } => {
+                self.enqueue_resolved_composer(display, prompt);
+                None
+            }
+            TuiSubmissionOutcome::BusyRefusal(message) => {
+                self.status = Some(message);
+                None
+            }
+            TuiSubmissionOutcome::LocalInfo(message) => {
+                self.clear_composer();
+                self.add_info(message);
+                None
+            }
+            TuiSubmissionOutcome::LocalActionableError { message, action }
+            | TuiSubmissionOutcome::SelectionError { message, action } => {
+                self.show_dialog("Action required", format!("{message}\nAction: {action}"));
+                None
+            }
+            TuiSubmissionOutcome::Dialog(dialog) | TuiSubmissionOutcome::SafeDialog(dialog) => {
+                self.clear_composer();
+                self.show_selection_dialog(dialog);
+                None
+            }
+            TuiSubmissionOutcome::TranscriptDialog => {
+                self.clear_composer();
+                self.show_transcript_dialog();
+                None
+            }
+            TuiSubmissionOutcome::Quit => self.apply_submission_outcome(TuiSubmissionOutcome::Quit),
+            outcome => self.apply_submission_outcome(outcome),
+        }
+    }
+
     fn restore_resume_draft(&mut self, draft: String) {
         self.input = draft;
         self.input_cursor = self.input.chars().count();
@@ -5736,7 +5803,36 @@ where
         record.scroll_offset = scroll_offset;
     }
 
-    pub fn finish_provider_turn(&mut self, outcome: TuiProviderOutcome) {
+    pub fn finish_provider_turn(&mut self, outcome: TuiProviderOutcome) -> Option<String> {
+        self.finish_provider_turn_scheduled(outcome)
+            .map(|next| next.prompt)
+    }
+
+    fn finish_provider_turn_scheduled(
+        &mut self,
+        outcome: TuiProviderOutcome,
+    ) -> Option<ScheduledPrompt> {
+        let generation = self
+            .scheduler
+            .lifecycle()
+            .active()
+            .map(ActiveRoute::generation);
+        let terminal_event = match &outcome {
+            TuiProviderOutcome::Completed(output) => {
+                generation.map(|generation| AppEvent::TurnCompletedFor {
+                    generation,
+                    output: output.clone(),
+                })
+            }
+            TuiProviderOutcome::Failed { .. } => {
+                generation.map(|generation| AppEvent::TurnFailedFor { generation })
+            }
+            TuiProviderOutcome::Cancelled { .. } => {
+                generation.map(|generation| AppEvent::TurnCancelledFor { generation })
+            }
+            TuiProviderOutcome::Backgrounded => None,
+        };
+
         match outcome {
             TuiProviderOutcome::Completed(output) => {
                 // Prefer the live stream body when present; heal exact dual-progress
@@ -5791,6 +5887,8 @@ where
             }
             TuiProviderOutcome::Backgrounded => self.set_running(false),
         }
+
+        terminal_event.and_then(|event| next_scheduled_prompt(self.scheduler.reduce(event)))
     }
 
     /// Clears the current visible conversation for a new session.
@@ -7007,7 +7105,7 @@ where
             },
             Key::Escape => {
                 self.device_auth = None;
-                return Action::Render;
+                return Action::CancelRoute;
             }
             _ => {}
         }
@@ -7168,6 +7266,11 @@ where
             .is_some_and(|dialog| dialog.interactive)
         {
             return self.handle_selection_dialog_key(key);
+        }
+
+        if key == Key::Escape && self.dialog.is_some() {
+            self.dialog = None;
+            return Action::Render;
         }
 
         if !self.palette_open && !self.file_picker_open() && key == Key::Tab {
@@ -7438,11 +7541,8 @@ where
                     message: std::mem::take(&mut self.input),
                 }
             }
-            Key::Enter if self.running && self.input.trim() == "/select" => {
-                self.palette_open = false;
-                self.input.clear();
-                self.input_cursor = 0;
-                Action::OpenDialog("select".into())
+            Key::Enter if self.running && self.busy_policy_routing => {
+                Action::SubmitBusy(self.input.clone())
             }
             Key::Enter if self.running => self.enqueue_composer(),
             Key::Enter => {
@@ -7472,14 +7572,22 @@ where
                 self.queue_selected = (!self.scheduler.queued_entries().is_empty()).then_some(0);
                 SurfaceFocus::Queue
             }
-            SurfaceFocus::Queue => SurfaceFocus::Activity,
+            SurfaceFocus::Queue => {
+                if !self.executions.is_empty() {
+                    self.focus_execution_strip();
+                }
+                SurfaceFocus::Activity
+            }
             SurfaceFocus::Activity => SurfaceFocus::Composer,
         };
     }
 
     fn handle_surface_focus_key(&mut self, key: Key) -> Option<Action> {
+        if self.surface_focus == SurfaceFocus::Activity {
+            return None;
+        }
         if self.surface_focus != SurfaceFocus::Queue {
-            return (self.surface_focus == SurfaceFocus::Activity).then_some(Action::Render);
+            return None;
         }
 
         let entries = self.scheduler.queued_entries();
@@ -7568,6 +7676,24 @@ where
         self.recovered_failed_prompt = false;
         self.surface_focus = SurfaceFocus::Composer;
         Action::Render
+    }
+
+    fn clear_composer(&mut self) {
+        self.input.clear();
+        self.input_cursor = 0;
+        self.recovered_failed_prompt = false;
+    }
+
+    fn enqueue_resolved_composer(&mut self, display: String, prompt: String) {
+        let effects = self
+            .scheduler
+            .reduce(AppEvent::QueuePrompt { display, prompt });
+        if let Some(Effect::RefusePrompt(message)) = effects.first() {
+            self.status = Some(message.clone());
+            return;
+        }
+        self.clear_composer();
+        self.surface_focus = SurfaceFocus::Composer;
     }
 
     fn handle_composer_key(&mut self, key: Key) -> Option<Action> {
@@ -7670,15 +7796,16 @@ where
             return Action::Render;
         }
 
-        let bottom = self.detached_scroll_bottom();
+        let following_bottom = self.following_scroll_bottom();
+        let detached_bottom = self.detached_scroll_bottom();
         let record = self.active_record_mut();
         for direction in directions {
             match direction {
                 MouseWheelDirection::Up => {
                     let current = if record.following_bottom {
-                        bottom
+                        following_bottom
                     } else {
-                        record.scroll_offset.min(bottom)
+                        record.scroll_offset.min(detached_bottom)
                     };
                     record.following_bottom = false;
                     record.scroll_offset = current.saturating_sub(MOUSE_SCROLL_ROWS);
@@ -7690,8 +7817,8 @@ where
                     record.scroll_offset = record
                         .scroll_offset
                         .saturating_add(MOUSE_SCROLL_ROWS)
-                        .min(bottom);
-                    record.following_bottom = record.scroll_offset == bottom;
+                        .min(detached_bottom);
+                    record.following_bottom = record.scroll_offset == detached_bottom;
                 }
             }
         }
@@ -7702,9 +7829,14 @@ where
     // mode that Ctrl+K or the wheel could switch by accident would leave the
     // reader typing into a prompt that had quietly stopped accepting text.
     fn scroll_up(&mut self, rows: u16) {
-        let bottom = self.detached_scroll_bottom();
+        let following_bottom = self.following_bottom();
+        let bottom = if following_bottom {
+            self.following_scroll_bottom()
+        } else {
+            self.detached_scroll_bottom()
+        };
         let record = self.active_record_mut();
-        let current = if record.following_bottom {
+        let current = if following_bottom {
             bottom
         } else {
             record.scroll_offset.min(bottom)
@@ -7998,6 +8130,20 @@ where
             return self.handle_copy_selection();
         }
 
+        if matches!(self.scheduler.lifecycle(), TurnLifecycle::Running(_)) {
+            if self
+                .scheduler
+                .reduce(AppEvent::Key(Key::CtrlC, Instant::now()))
+                .contains(&Effect::CancelTurn)
+            {
+                self.engine.cancel();
+                self.status = Some("Cancellation requested; waiting for confirmation.".into());
+            }
+            return Action::Render;
+        }
+        if matches!(self.scheduler.lifecycle(), TurnLifecycle::Cancelling(_)) {
+            return Action::Render;
+        }
         if self.quit_is_armed() {
             self.quit_armed_until = None;
             if self.running || self.has_active_execution() {
@@ -9362,6 +9508,7 @@ where
             Action::Unchanged
             | Action::Render
             | Action::Submit(_)
+            | Action::SubmitBusy(_)
             | Action::SubmitSecret { .. }
             | Action::SubmitBackground(_)
             | Action::TransitionToBackground(_)
@@ -9437,6 +9584,10 @@ where
                 thread::spawn(move || {
                     let _ = sender.send(submit(prompt));
                 });
+                renderer.render(tui.view())?;
+            }
+            Action::SubmitBusy(_) => {
+                tui.enqueue_composer();
                 renderer.render(tui.view())?;
             }
             Action::Unchanged
@@ -9607,10 +9758,28 @@ fn drain_channel<T>(receiver: &mpsc::Receiver<T>, mut apply: impl FnMut(T)) -> C
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct ProviderDrain {
     dirty: bool,
     backlog: bool,
+    next_prompt: Option<ScheduledPrompt>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ScheduledPrompt {
+    display: String,
+    prompt: String,
+}
+
+fn next_scheduled_prompt(effects: Vec<Effect>) -> Option<ScheduledPrompt> {
+    effects.into_iter().find_map(|effect| match effect {
+        Effect::StartPrompt(prompt) => Some(ScheduledPrompt {
+            display: prompt.clone(),
+            prompt,
+        }),
+        Effect::StartQueuedPrompt { display, prompt } => Some(ScheduledPrompt { display, prompt }),
+        _ => None,
+    })
 }
 
 fn drain_provider_channels<E: Engine>(
@@ -9635,9 +9804,10 @@ fn drain_provider_channels<E: Engine>(
     } else {
         ChannelDrain::default()
     };
+    let mut next_prompt = None;
     let completion = if metrics.caught_up && progress.caught_up {
         drain_channel(completion_receiver, |outcome| {
-            tui.finish_provider_turn(outcome)
+            next_prompt = tui.finish_provider_turn_scheduled(outcome);
         })
     } else {
         ChannelDrain::default()
@@ -9649,6 +9819,7 @@ fn drain_provider_channels<E: Engine>(
             || metrics.backlog()
             || completion.backlog()
             || !(metrics.caught_up && progress.caught_up),
+        next_prompt,
     };
     agens_perf::field!(progress = progress.processed as u64);
     agens_perf::field!(metrics = metrics.processed as u64);
@@ -9805,6 +9976,7 @@ where
     C: Fn(u64) -> bool + Send + Sync + 'static,
     M: Fn(u64, String) -> bool + Send + Sync + 'static,
 {
+    tui.enable_busy_policy_routing();
     let route = Arc::new(route);
     let submit = Arc::new(submit);
     let transition = Arc::new(transition);
@@ -9838,6 +10010,18 @@ where
             drain_provider_channels(tui, &metrics_receiver, &receiver, &completion_receiver);
         let mut dirty = std::mem::take(&mut render_requested) || provider.dirty;
         let mut backlog = provider.backlog;
+        if let Some(next) = provider.next_prompt {
+            tui.begin_submission(next.display);
+            let submit = Arc::clone(&submit);
+            let sender = sender.clone();
+            let metrics = metrics_sender.clone();
+            let completion_sender = completion_sender.clone();
+            thread::spawn(move || {
+                let outcome = submit(next.prompt, SubmitOrigin::User, sender, metrics);
+                let _ = completion_sender.send(outcome);
+            });
+            dirty = true;
+        }
         let route_progress = drain_channel(&route_progress_receiver, |progress| {
             tui.apply_route_progress(progress)
         });
@@ -9993,6 +10177,18 @@ where
                     let outcome = route(request, progress, cancellation);
                     let _ = route_sender.send((route_id, outcome));
                 });
+            }
+            Action::SubmitBusy(input) => {
+                let outcome = route(
+                    TuiRouteRequest::BusyInput(input),
+                    route_progress_sender.clone(),
+                    TuiRouteCancellation::new(),
+                );
+                let quit = matches!(outcome, TuiSubmissionOutcome::Quit);
+                let _ = tui.apply_busy_submission_outcome(outcome);
+                if quit {
+                    return Ok(());
+                }
             }
             Action::SubmitSecret { action_id, secret } => {
                 let request = TuiRouteRequest::SubmitSecret { action_id, secret };
@@ -10278,6 +10474,7 @@ fn is_session_resume_request(request: &TuiRouteRequest) -> bool {
             .trim()
             .strip_prefix("/resume ")
             .is_some_and(|identifier| identifier.trim().parse::<i64>().is_ok()),
+        TuiRouteRequest::BusyInput(_) => false,
         TuiRouteRequest::DialogAction(action_id) => is_session_resume_action(action_id),
         TuiRouteRequest::DeviceAuthOpenUrl(_)
         | TuiRouteRequest::SubmitSecret { .. }
@@ -10289,6 +10486,7 @@ fn is_session_resume_request(request: &TuiRouteRequest) -> bool {
 fn is_session_browser_request(request: &TuiRouteRequest) -> bool {
     match request {
         TuiRouteRequest::Input(input) => matches!(input.trim(), "/resume" | "/sessions"),
+        TuiRouteRequest::BusyInput(_) => false,
         TuiRouteRequest::DeviceAuthOpenUrl(_) | TuiRouteRequest::SubmitSecret { .. } => false,
         TuiRouteRequest::OpenDialog(route_id) => route_id == "sessions",
         TuiRouteRequest::SessionPage(_) => true,
@@ -10790,8 +10988,11 @@ mod runtime_tests {
         tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text(
             (0..200).map(|line| format!("line {line}\n")).collect(),
         )));
-        tui.apply_progress(TurnEvent::StateChanged(TurnState::Completed));
-        let bottom = tui.detached_scroll_bottom();
+        assert_eq!(
+            tui.finish_provider_turn(TuiProviderOutcome::Completed("done".into())),
+            None
+        );
+        let bottom = tui.following_scroll_bottom();
         let mut renderer = RecordingRenderer::default();
 
         run_with_runtime_terminal(&mut tui, &mut renderer, terminal).unwrap();
@@ -11578,7 +11779,7 @@ mod runtime_tests {
             .unwrap()
             .scroll_offset;
         assert_eq!(
-            detached_bottom.saturating_sub(scroll_offset),
+            following_bottom.saturating_sub(scroll_offset),
             MOUSE_SCROLL_ROWS
         );
         let transcript_row = tui.screen_layout().transcript.y.saturating_add(1);
@@ -12154,7 +12355,10 @@ mod runtime_tests {
             .iter()
             .map(|span| span.content.as_ref().to_owned())
             .collect::<String>();
-        assert!(notice.contains("Ctrl+C again"), "{notice:?}");
+        assert!(
+            notice.contains("Cancellation requested; waiting for confirmation."),
+            "{notice:?}"
+        );
     }
 
     /// Scrolling is not a mode switch. Ctrl+J/Ctrl+K and the wheel are reachable

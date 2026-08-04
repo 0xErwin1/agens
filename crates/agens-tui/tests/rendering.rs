@@ -522,7 +522,10 @@ fn hovering_a_block_focuses_it_and_adds_nothing_the_keyboard_cannot_do() {
     assert_eq!(tui.view().focused_call, Some("read-1"));
 
     // Every capability hover reaches is one the keyboard already had.
-    tui.handle(Event::Key(Key::Escape));
+    tui.handle(Event::MouseDown {
+        column: 10,
+        row: first,
+    });
     tui.handle(Event::Key(Key::Char('o')));
     assert_eq!(
         tui.view().tool_display_modes.get("read-1"),
@@ -2385,8 +2388,10 @@ fn the_tree_offers_cancel_only_over_a_running_branch_and_the_key_cancels_it() {
         "nothing is selected yet, so the key would act on nothing"
     );
 
-    tui.handle(Event::Key(Key::Escape));
-    tui.handle(Event::Key(Key::Char(']')));
+    tui.handle(Event::Key(Key::Tab));
+    tui.handle(Event::Key(Key::Tab));
+    tui.handle(Event::Key(Key::Down));
+    tui.handle(Event::Key(Key::Enter));
     assert_eq!(tui.view().active_transcript, TranscriptId::Subagent(9));
 
     renderer.render(tui.view()).unwrap();
@@ -3702,7 +3707,9 @@ fn subagent_inspect_dialog_renders_through_the_overlay_shell() {
         );
     }
 
-    tui.handle(Event::Key(Key::Escape));
+    renderer.render(tui.view()).unwrap();
+    let row = rendered_row(&renderer, "Explore") as u16;
+    tui.handle(Event::MouseDown { column: 10, row });
     tui.handle(Event::Key(Key::Char('g')));
     tui.handle(Event::Key(Key::Char('t')));
     renderer.render(tui.view()).unwrap();
@@ -4091,10 +4098,10 @@ fn physical_cursor_follows_main_composer_focus_and_overlay_ownership() {
     renderer.render(tui.view()).unwrap();
     assert!(renderer.terminal().backend().cursor_visible());
 
-    // Focusing the transcript does leave it, and takes the cursor with it.
+    // Escape is inert on the main surface; it must not hide the composer cursor.
     tui.handle(Event::Key(Key::Escape));
     renderer.render(tui.view()).unwrap();
-    assert!(!renderer.terminal().backend().cursor_visible());
+    assert!(renderer.terminal().backend().cursor_visible());
 
     tui.handle(Event::Key(Key::Char('i')));
     renderer.render(tui.view()).unwrap();
@@ -4124,7 +4131,7 @@ fn physical_cursor_follows_main_composer_focus_and_overlay_ownership() {
 
     tui.set_running(true);
     renderer.render(tui.view()).unwrap();
-    assert!(!renderer.terminal().backend().cursor_visible());
+    assert!(renderer.terminal().backend().cursor_visible());
     tui.set_running(false);
 
     tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {

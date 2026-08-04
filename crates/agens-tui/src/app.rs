@@ -65,11 +65,24 @@ impl TurnLifecycle {
 pub struct QueueEntry {
     id: u64,
     prompt: String,
+    resolved_prompt: Option<String>,
 }
 
 impl QueueEntry {
     fn new(id: u64, prompt: String) -> Self {
-        Self { id, prompt }
+        Self {
+            id,
+            prompt,
+            resolved_prompt: None,
+        }
+    }
+
+    fn resolved(id: u64, display: String, prompt: String) -> Self {
+        Self {
+            id,
+            prompt: display,
+            resolved_prompt: Some(prompt),
+        }
     }
 
     /// Returns this entry's stable identifier.
@@ -108,6 +121,11 @@ pub enum Command {
 pub enum AppEvent {
     /// An explicitly safe conversational prompt was submitted.
     SubmitPrompt(String),
+    /// Queues a catalog-resolved provider prompt without exposing it in history.
+    QueuePrompt {
+        display: String,
+        prompt: String,
+    },
     /// The active turn completed successfully with its final output.
     TurnCompletedFor {
         generation: u64,
@@ -133,6 +151,11 @@ pub enum AppEvent {
 pub enum Effect {
     /// Begin a new runtime turn for this prompt.
     StartPrompt(String),
+    /// Begin a queued prompt whose catalog expansion differs from its display text.
+    StartQueuedPrompt {
+        display: String,
+        prompt: String,
+    },
     /// Persist a successfully completed prompt and output pair.
     PersistCompleted {
         prompt: String,
@@ -192,6 +215,7 @@ impl AppState {
     pub fn reduce(&mut self, event: AppEvent) -> Vec<Effect> {
         match event {
             AppEvent::SubmitPrompt(prompt) => self.submit_prompt(prompt),
+            AppEvent::QueuePrompt { display, prompt } => self.queue_prompt(display, prompt),
             AppEvent::TurnCompletedFor { generation, output } => {
                 self.complete_turn(generation, output)
             }
@@ -299,6 +323,22 @@ impl AppState {
         Vec::new()
     }
 
+    fn queue_prompt(&mut self, display: String, prompt: String) -> Vec<Effect> {
+        self.disarm_exit();
+        if self.lifecycle == TurnLifecycle::Idle {
+            return vec![self.begin_turn(display)];
+        }
+
+        if self.queued_prompts.len() == self.queue_capacity {
+            return vec![Effect::RefusePrompt(QUEUE_FULL_REFUSAL.into())];
+        }
+
+        let entry = QueueEntry::resolved(self.next_queue_entry_id, display, prompt);
+        self.next_queue_entry_id += 1;
+        self.queued_prompts.push_back(entry);
+        Vec::new()
+    }
+
     fn complete_turn(&mut self, generation: u64, output: String) -> Vec<Effect> {
         let Some(prompt) = self.active_prompt_for_generation(generation) else {
             return Vec::new();
@@ -335,8 +375,13 @@ impl AppState {
     }
 
     fn begin_next_queued_turn(&mut self) -> Option<Effect> {
-        let next_prompt = self.queued_prompts.pop_front()?.prompt;
-        Some(self.begin_turn(next_prompt))
+        let entry = self.queued_prompts.pop_front()?;
+        let display = entry.prompt;
+        let effect = self.begin_turn(display.clone());
+        match entry.resolved_prompt {
+            Some(prompt) => Some(Effect::StartQueuedPrompt { display, prompt }),
+            None => Some(effect),
+        }
     }
 
     fn begin_turn(&mut self, prompt: String) -> Effect {
@@ -453,14 +498,18 @@ impl AppState {
     }
 
     fn control_c(&mut self, now: Instant) -> Vec<Effect> {
+        if let TurnLifecycle::Running(route) = &self.lifecycle {
+            self.lifecycle = TurnLifecycle::Cancelling(route.clone());
+            self.disarm_exit();
+            return vec![Effect::CancelTurn];
+        }
+        if matches!(self.lifecycle, TurnLifecycle::Cancelling(_)) {
+            self.disarm_exit();
+            return vec![Effect::Render];
+        }
         if self.exit_armed_until.is_some_and(|until| now < until) {
             self.disarm_exit();
-            let mut effects = Vec::with_capacity(2);
-            if self.runtime == Runtime::Running {
-                effects.push(Effect::CancelTurn);
-            }
-            effects.push(Effect::Quit);
-            return effects;
+            return vec![Effect::Quit];
         }
 
         self.exit_armed_until = Some(now + crate::EXIT_WARNING_WINDOW);
