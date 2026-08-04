@@ -19,7 +19,8 @@ pub use agens_core::{
     TuiExecutionState, TuiRuntimeEvent, TuiSubagentEvent,
 };
 pub use app::{
-    ActiveRoute, AppEvent, AppState, Command, Dialog, Effect, QueueEntry, Runtime, TurnLifecycle,
+    ActiveRoute, AppEvent, AppState, Command, Dialog, Effect, PromptObservability,
+    PromptTransition, QueueEntry, Runtime, TurnLifecycle,
 };
 pub use ask_user::{AskUserEditing, AskUserRowSnapshot, AskUserSnapshot};
 pub use bridge::{
@@ -1843,7 +1844,11 @@ fn render_frame_content(frame: &mut ratatui::Frame<'_>, state: &ViewState<'_>) {
             composer = composer.title_bottom(metrics);
         }
         if !state.queue.is_empty() {
-            composer = composer.title_top(Line::raw(queue_title(&state.queue)));
+            composer = composer.title_top(Line::raw(queue_title(
+                &state.queue,
+                layout.composer.width.saturating_sub(2),
+                state.surface_focus == SurfaceFocus::Queue,
+            )));
         }
         frame.render_widget(
             Paragraph::new(composer_layout.text)
@@ -1868,7 +1873,10 @@ fn render_frame_content(frame: &mut ratatui::Frame<'_>, state: &ViewState<'_>) {
                 .composer
                 .x
                 .saturating_add(saturating_u16(cursor_column.saturating_add(2)));
-            frame.set_cursor_position((cursor_x, cursor_y));
+            frame.set_cursor_position((
+                cursor_x.min(area.width.saturating_sub(1)),
+                cursor_y.min(area.height.saturating_sub(1)),
+            ));
         }
     }
 
@@ -2873,14 +2881,26 @@ fn footer_context<'a>(state: &ViewState<'a>) -> widgets::FooterContext<'a> {
     }
 }
 
-fn queue_title(queue: &[&QueueEntry]) -> String {
+fn queue_title(queue: &[&QueueEntry], width: u16, focused: bool) -> String {
+    if focused || width < 52 {
+        return render::bounded_single_line(
+            &format!(
+                " QUEUE ({}) · ↑↓ select · Enter edit · Del remove · Alt↑↓ reorder ",
+                queue.len()
+            ),
+            usize::from(width),
+        );
+    }
     let entries = queue
         .iter()
         .enumerate()
         .map(|(index, entry)| format!("{}. {}", index + 1, entry.prompt()))
         .collect::<Vec<_>>()
         .join(" · ");
-    format!(" Queue ({}) {entries} ", queue.len())
+    render::bounded_single_line(
+        &format!(" Queue ({}) {entries} ", queue.len()),
+        usize::from(width),
+    )
 }
 
 /// Metadata spliced into the composer's border, right-aligned and held one column
@@ -3762,20 +3782,51 @@ fn turn_failure_banner(state: &ViewState<'_>) -> Option<Span<'static>> {
 fn hint_spans(state: &ViewState<'_>) -> Vec<Span<'static>> {
     let mut hints: Vec<(&str, &str)> = Vec::new();
 
-    if state.focus == TranscriptFocus::Viewport {
+    if state.surface_focus == SurfaceFocus::Queue {
+        if state.size.0 < 52 {
+            hints.push(("QUEUE", "Enter edit · Del remove"));
+        } else {
+            hints.extend([
+                ("QUEUE", "selected"),
+                ("↑↓", "select"),
+                ("Enter", "edit"),
+                ("Del", "remove"),
+                ("Alt↑↓", "reorder"),
+                ("Tab", "activity"),
+            ]);
+        }
+    } else if state.surface_focus == SurfaceFocus::Activity {
+        if state.size.0 < 52 {
+            hints.push(("ACTIVITY", "x cancel X all"));
+        } else {
+            hints.extend([
+                ("ACTIVITY", "selected"),
+                ("↑↓", "select"),
+                ("x", "cancel selected"),
+                ("X", "cancel all"),
+                ("Enter", "inspect"),
+                ("Tab", "composer"),
+            ]);
+        }
+    } else if state.focus == TranscriptFocus::Viewport {
         hints.push(("j/k", "scroll"));
         if state.selection.is_some() {
             hints.push(("^⇧C", "copy"));
         }
         if state.running {
-            hints.push(("Esc", "cancel"));
+            hints.push(("Ctrl+C", "cancel"));
         }
         hints.push(("i", "insert"));
     } else {
         if !state.input.is_empty() {
             hints.push(("Enter", if state.running { "queue" } else { "send" }));
         }
-        hints.push(("Esc", if state.running { "stay" } else { "normal" }));
+        if state.running {
+            hints.push(("Ctrl+C", "cancel"));
+            hints.push(("Tab", "queue"));
+        } else {
+            hints.push(("Esc", "normal"));
+        }
     }
     hints.push(("^?", "shortcuts"));
 
@@ -5475,6 +5526,13 @@ where
         self.assistant_streaming = true;
     }
 
+    fn active_generation(&self) -> Option<u64> {
+        self.scheduler
+            .lifecycle()
+            .active()
+            .map(ActiveRoute::generation)
+    }
+
     /// Enables router-owned classification for busy composer submissions.
     pub fn enable_busy_policy_routing(&mut self) {
         self.busy_policy_routing = true;
@@ -5816,24 +5874,30 @@ where
         &mut self,
         outcome: TuiProviderOutcome,
     ) -> Option<ScheduledPrompt> {
-        let generation = self
-            .scheduler
-            .lifecycle()
-            .active()
-            .map(ActiveRoute::generation);
+        let generation = self.active_generation()?;
+
+        self.finish_provider_turn_scheduled_for_generation(generation, outcome)
+    }
+
+    fn finish_provider_turn_scheduled_for_generation(
+        &mut self,
+        generation: u64,
+        outcome: TuiProviderOutcome,
+    ) -> Option<ScheduledPrompt> {
+        if self.active_generation() != Some(generation) {
+            let _ = self
+                .scheduler
+                .reduce(AppEvent::TurnFailedFor { generation });
+            return None;
+        }
+
         let terminal_event = match &outcome {
-            TuiProviderOutcome::Completed(output) => {
-                generation.map(|generation| AppEvent::TurnCompletedFor {
-                    generation,
-                    output: output.clone(),
-                })
-            }
-            TuiProviderOutcome::Failed { .. } => {
-                generation.map(|generation| AppEvent::TurnFailedFor { generation })
-            }
-            TuiProviderOutcome::Cancelled { .. } => {
-                generation.map(|generation| AppEvent::TurnCancelledFor { generation })
-            }
+            TuiProviderOutcome::Completed(output) => Some(AppEvent::TurnCompletedFor {
+                generation,
+                output: output.clone(),
+            }),
+            TuiProviderOutcome::Failed { .. } => Some(AppEvent::TurnFailedFor { generation }),
+            TuiProviderOutcome::Cancelled { .. } => Some(AppEvent::TurnCancelledFor { generation }),
             TuiProviderOutcome::Backgrounded => None,
         };
 
@@ -9847,7 +9911,7 @@ fn drain_provider_channels<E: Engine>(
     tui: &mut Tui<E>,
     metrics_receiver: &mpsc::Receiver<UiEnvelope<TuiRuntimeEvent>>,
     progress_receiver: &mpsc::Receiver<TurnEvent>,
-    completion_receiver: &mpsc::Receiver<TuiProviderOutcome>,
+    completion_receiver: &mpsc::Receiver<(Option<u64>, TuiProviderOutcome)>,
 ) -> ProviderDrain {
     let _perf_drain = agens_perf::span!(
         "tui.drain",
@@ -9867,8 +9931,13 @@ fn drain_provider_channels<E: Engine>(
     };
     let mut next_prompt = None;
     let completion = if metrics.caught_up && progress.caught_up {
-        drain_channel(completion_receiver, |outcome| {
-            next_prompt = tui.finish_provider_turn_scheduled(outcome);
+        drain_channel(completion_receiver, |(generation, outcome)| {
+            next_prompt = match generation {
+                Some(generation) => {
+                    tui.finish_provider_turn_scheduled_for_generation(generation, outcome)
+                }
+                None => tui.finish_provider_turn_scheduled(outcome),
+            };
         })
     } else {
         ChannelDrain::default()
@@ -10078,13 +10147,14 @@ where
         let mut backlog = provider.backlog;
         if let Some(next) = provider.next_prompt {
             tui.begin_submission(next.display);
+            let generation = tui.active_generation();
             let submit = Arc::clone(&submit);
             let sender = sender.clone();
             let metrics = metrics_sender.clone();
             let completion_sender = completion_sender.clone();
             thread::spawn(move || {
                 let outcome = submit(next.prompt, SubmitOrigin::User, sender, metrics);
-                let _ = completion_sender.send(outcome);
+                let _ = completion_sender.send((generation, outcome));
             });
             dirty = true;
         }
@@ -10117,13 +10187,14 @@ where
                     }
                     return;
                 };
+                let generation = tui.active_generation();
                 let submit = Arc::clone(&submit);
                 let sender = sender.clone();
                 let metrics = metrics_sender.clone();
                 let completion_sender = completion_sender.clone();
                 thread::spawn(move || {
                     let outcome = submit(prompt, SubmitOrigin::User, sender, metrics);
-                    let _ = completion_sender.send(outcome);
+                    let _ = completion_sender.send((generation, outcome));
                 });
             })
         } else {
@@ -10179,13 +10250,14 @@ where
         if active_route.is_none()
             && let Some(prompt) = tui.take_ready_auto_turn()
         {
+            let generation = tui.active_generation();
             let submit = Arc::clone(&submit);
             let sender = sender.clone();
             let metrics = metrics_sender.clone();
             let completion_sender = completion_sender.clone();
             thread::spawn(move || {
                 let outcome = submit(prompt, SubmitOrigin::SubagentCompletion, sender, metrics);
-                let _ = completion_sender.send(outcome);
+                let _ = completion_sender.send((generation, outcome));
             });
             dirty = true;
         }
@@ -10278,7 +10350,7 @@ where
                 let completion_sender = completion_sender.clone();
                 thread::spawn(move || {
                     let outcome = submit(prompt, SubmitOrigin::Background, sender, metrics);
-                    let _ = completion_sender.send(outcome);
+                    let _ = completion_sender.send((None, outcome));
                 });
             }
             Action::TransitionToBackground(id) => {
@@ -11388,7 +11460,10 @@ mod runtime_tests {
                 .send(TurnEvent::StateChanged(TurnState::Completed))
                 .unwrap();
             completion_sender
-                .send(TuiProviderOutcome::Completed("delta1delta2".into()))
+                .send((
+                    Some(1),
+                    TuiProviderOutcome::Completed("delta1delta2".into()),
+                ))
                 .unwrap();
         });
         first_received.recv().unwrap();
@@ -11475,7 +11550,7 @@ mod runtime_tests {
             .send(TurnEvent::StateChanged(TurnState::Completed))
             .unwrap();
         completion_sender
-            .send(TuiProviderOutcome::Completed(deltas.concat()))
+            .send((Some(1), TuiProviderOutcome::Completed(deltas.concat())))
             .unwrap();
 
         let first = drain_provider_channels(
@@ -13354,5 +13429,119 @@ mod runtime_tests {
             "the overlay must be gone so `handle_key` stops routing keystrokes into a dead \
              ask-user interaction and returns to ordinary composer handling"
         );
+    }
+
+    #[test]
+    fn terminal_key_mapping_preserves_queue_and_activity_control_keys() {
+        let key = |code, modifiers| {
+            map_key(KeyEvent::new_with_kind(
+                code,
+                modifiers,
+                KeyEventKind::Press,
+            ))
+        };
+
+        assert_eq!(
+            key(KeyCode::Tab, KeyModifiers::NONE),
+            Some(Event::Key(Key::Tab))
+        );
+        assert_eq!(
+            key(KeyCode::Delete, KeyModifiers::NONE),
+            Some(Event::Key(Key::Delete))
+        );
+        assert_eq!(
+            key(KeyCode::Up, KeyModifiers::ALT),
+            Some(Event::Key(Key::AltUp))
+        );
+        assert_eq!(
+            key(KeyCode::Down, KeyModifiers::ALT),
+            Some(Event::Key(Key::AltDown))
+        );
+        assert_eq!(
+            key(KeyCode::Char('x'), KeyModifiers::NONE),
+            Some(Event::Key(Key::Char('x')))
+        );
+        assert_eq!(
+            key(KeyCode::Char('X'), KeyModifiers::SHIFT),
+            Some(Event::Key(Key::Char('X')))
+        );
+        assert_eq!(
+            key(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            Some(Event::Key(Key::CtrlC))
+        );
+    }
+
+    fn assert_provider_channels_discard_stale_terminal(stale_outcome: TuiProviderOutcome) {
+        let mut tui = Tui::with_queue_capacity(NoopEngine, 2);
+        let (_metrics_sender, metrics_receiver) = BridgeTx::bounded(1);
+        let (_progress_sender, progress_receiver) = mpsc::channel();
+        let (completion_sender, completion_receiver) = mpsc::channel();
+
+        tui.begin_submission("first");
+        let first_generation = tui.scheduler.lifecycle().active().unwrap().generation();
+        tui.input = "second".into();
+        tui.enqueue_composer();
+
+        completion_sender
+            .send((
+                Some(first_generation),
+                TuiProviderOutcome::Cancelled {
+                    message: "cancelled".into(),
+                    action: "retry".into(),
+                },
+            ))
+            .unwrap();
+        let next = drain_provider_channels(
+            &mut tui,
+            &metrics_receiver,
+            &progress_receiver,
+            &completion_receiver,
+        )
+        .next_prompt
+        .expect("matching cancellation releases exactly one queued prompt");
+        tui.begin_submission(next.display);
+        let second_generation = tui.scheduler.lifecycle().active().unwrap().generation();
+
+        completion_sender
+            .send((Some(first_generation), stale_outcome))
+            .unwrap();
+        let stale = drain_provider_channels(
+            &mut tui,
+            &metrics_receiver,
+            &progress_receiver,
+            &completion_receiver,
+        );
+
+        assert!(stale.next_prompt.is_none());
+        assert_eq!(
+            tui.scheduler.lifecycle().active().unwrap().generation(),
+            second_generation
+        );
+        assert_eq!(
+            tui.transcript(),
+            [
+                TranscriptEntry::User("first".into()),
+                TranscriptEntry::Error("cancelled".into()),
+                TranscriptEntry::User("second".into()),
+            ]
+        );
+        assert_eq!(tui.scheduler.observability().stale_event_dropped(), 1);
+    }
+
+    #[test]
+    fn provider_channels_discard_out_of_order_terminals_before_projection_or_dispatch() {
+        for stale_outcome in [
+            TuiProviderOutcome::Completed("stale output".into()),
+            TuiProviderOutcome::Failed {
+                message: "stale failure".into(),
+                action: "retry".into(),
+            },
+            TuiProviderOutcome::Cancelled {
+                message: "stale cancellation".into(),
+                action: "retry".into(),
+            },
+        ] {
+            assert_provider_channels_discard_stale_terminal(stale_outcome);
+        }
     }
 }

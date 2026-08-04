@@ -68,6 +68,73 @@ pub struct QueueEntry {
     resolved_prompt: Option<String>,
 }
 
+/// A prompt-scheduler transition safe to expose to local diagnostics.
+///
+/// These variants intentionally carry no route, prompt, task, or user content.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PromptTransition {
+    Queued,
+    Dequeued,
+    Removed,
+    CancellationRequested,
+    CancellationConfirmed,
+    StaleEventDropped,
+    AutoTurnCoalesced,
+}
+
+/// Sanitized counters and transition history for the prompt scheduler.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PromptObservability {
+    queued: u64,
+    dequeued: u64,
+    removed: u64,
+    cancellation_requested: u64,
+    cancellation_confirmed: u64,
+    stale_event_dropped: u64,
+    auto_turn_coalesced: u64,
+    transitions: Vec<PromptTransition>,
+}
+
+impl PromptObservability {
+    pub const fn queued(&self) -> u64 {
+        self.queued
+    }
+    pub const fn dequeued(&self) -> u64 {
+        self.dequeued
+    }
+    pub const fn removed(&self) -> u64 {
+        self.removed
+    }
+    pub const fn cancellation_requested(&self) -> u64 {
+        self.cancellation_requested
+    }
+    pub const fn cancellation_confirmed(&self) -> u64 {
+        self.cancellation_confirmed
+    }
+    pub const fn stale_event_dropped(&self) -> u64 {
+        self.stale_event_dropped
+    }
+    pub const fn auto_turn_coalesced(&self) -> u64 {
+        self.auto_turn_coalesced
+    }
+    pub fn transitions(&self) -> &[PromptTransition] {
+        &self.transitions
+    }
+
+    fn record(&mut self, transition: PromptTransition) {
+        match transition {
+            PromptTransition::Queued => self.queued += 1,
+            PromptTransition::Dequeued => self.dequeued += 1,
+            PromptTransition::Removed => self.removed += 1,
+            PromptTransition::CancellationRequested => self.cancellation_requested += 1,
+            PromptTransition::CancellationConfirmed => self.cancellation_confirmed += 1,
+            PromptTransition::StaleEventDropped => self.stale_event_dropped += 1,
+            PromptTransition::AutoTurnCoalesced => self.auto_turn_coalesced += 1,
+        }
+        self.transitions.push(transition);
+    }
+}
+
 impl QueueEntry {
     fn new(id: u64, prompt: String) -> Self {
         Self {
@@ -179,7 +246,7 @@ pub enum Effect {
 }
 
 /// Application state whose prompt queue has a fixed capacity for its lifetime.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct AppState {
     /// Compatibility projection for consumers that only distinguish busy and idle.
     runtime: Runtime,
@@ -193,7 +260,26 @@ pub struct AppState {
     dialog: Option<Dialog>,
     exit_armed_until: Option<Instant>,
     pending_auto_turns: usize,
+    observability: PromptObservability,
 }
+
+impl PartialEq for AppState {
+    fn eq(&self, other: &Self) -> bool {
+        self.runtime == other.runtime
+            && self.lifecycle == other.lifecycle
+            && self.queued_prompts == other.queued_prompts
+            && self.queue_capacity == other.queue_capacity
+            && self.next_generation == other.next_generation
+            && self.next_queue_entry_id == other.next_queue_entry_id
+            && self.completed_history == other.completed_history
+            && self.composer == other.composer
+            && self.dialog == other.dialog
+            && self.exit_armed_until == other.exit_armed_until
+            && self.pending_auto_turns == other.pending_auto_turns
+    }
+}
+
+impl Eq for AppState {}
 
 impl AppState {
     /// Creates application state with a non-zero, fixed prompt queue capacity.
@@ -212,6 +298,7 @@ impl AppState {
             dialog: None,
             exit_armed_until: None,
             pending_auto_turns: 0,
+            observability: PromptObservability::default(),
         }
     }
 
@@ -227,6 +314,10 @@ impl AppState {
                 self.terminate_turn(generation)
             }
             AppEvent::DeferAutoTurn => {
+                if self.pending_auto_turns > 0 {
+                    self.observability
+                        .record(PromptTransition::AutoTurnCoalesced);
+                }
                 self.pending_auto_turns = self.pending_auto_turns.saturating_add(1);
                 Vec::new()
             }
@@ -270,7 +361,16 @@ impl AppState {
             .queued_prompts
             .iter()
             .position(|entry| entry.id == id)?;
-        self.queued_prompts.remove(position)
+        let entry = self.queued_prompts.remove(position);
+        if entry.is_some() {
+            self.observability.record(PromptTransition::Removed);
+        }
+        entry
+    }
+
+    /// Returns sanitized scheduler counters and content-free transition names.
+    pub const fn observability(&self) -> &PromptObservability {
+        &self.observability
     }
 
     /// Moves an undispatched entry one or more positions while preserving its identity.
@@ -343,6 +443,7 @@ impl AppState {
         let entry = QueueEntry::new(self.next_queue_entry_id, prompt);
         self.next_queue_entry_id += 1;
         self.queued_prompts.push_back(entry);
+        self.observability.record(PromptTransition::Queued);
         Vec::new()
     }
 
@@ -359,11 +460,14 @@ impl AppState {
         let entry = QueueEntry::resolved(self.next_queue_entry_id, display, prompt);
         self.next_queue_entry_id += 1;
         self.queued_prompts.push_back(entry);
+        self.observability.record(PromptTransition::Queued);
         Vec::new()
     }
 
     fn complete_turn(&mut self, generation: u64, output: String) -> Vec<Effect> {
         let Some(prompt) = self.active_prompt_for_generation(generation) else {
+            self.observability
+                .record(PromptTransition::StaleEventDropped);
             return Vec::new();
         };
 
@@ -382,9 +486,15 @@ impl AppState {
 
     fn terminate_turn(&mut self, generation: u64) -> Vec<Effect> {
         if self.active_prompt_for_generation(generation).is_none() {
+            self.observability
+                .record(PromptTransition::StaleEventDropped);
             return Vec::new();
         }
 
+        if matches!(self.lifecycle, TurnLifecycle::Cancelling(_)) {
+            self.observability
+                .record(PromptTransition::CancellationConfirmed);
+        }
         self.transition_to_idle();
         self.disarm_exit();
         self.begin_next_queued_turn().into_iter().collect()
@@ -399,6 +509,7 @@ impl AppState {
 
     fn begin_next_queued_turn(&mut self) -> Option<Effect> {
         let entry = self.queued_prompts.pop_front()?;
+        self.observability.record(PromptTransition::Dequeued);
         let display = entry.prompt;
         let effect = self.begin_turn(display.clone());
         match entry.resolved_prompt {
@@ -524,6 +635,8 @@ impl AppState {
         if let TurnLifecycle::Running(route) = &self.lifecycle {
             self.lifecycle = TurnLifecycle::Cancelling(route.clone());
             self.disarm_exit();
+            self.observability
+                .record(PromptTransition::CancellationRequested);
             return vec![Effect::CancelTurn];
         }
         if matches!(self.lifecycle, TurnLifecycle::Cancelling(_)) {

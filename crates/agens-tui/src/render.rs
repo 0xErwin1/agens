@@ -816,7 +816,7 @@ pub(super) fn turn_status_line(status: TurnStatus<'_>, content_width: usize) -> 
     if !right.is_empty() {
         right.push_str(" · ");
     }
-    right.push_str("esc stop");
+    right.push_str("Ctrl+C cancel");
 
     // The metadata never takes the whole row: the label keeps at least the
     // spinner cell and the gap that separates the two halves.
