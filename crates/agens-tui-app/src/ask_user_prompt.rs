@@ -11,11 +11,13 @@ use std::sync::mpsc::Receiver;
 
 use agens_core::HeadlessTurnCancellation;
 use agens_core::ask_user::{AskUserPort, AskUserReply, AskUserRequest};
-use agens_tui::{TuiAskUserBridge, TuiAskUserRequest};
+use agens_tui::{PromptOrigin, TuiAskUserBridge, TuiAskUserRequest};
 
 /// The terminal UI's implementation of the ask-user port. Each surface owns
 /// its own, so the engine never chooses between them.
-pub struct TuiAskUserPort(pub TuiAskUserBridge);
+/// The second field names the delegated execution asking, or `None` for the
+/// main thread.
+pub struct TuiAskUserPort(pub TuiAskUserBridge, pub Option<PromptOrigin>);
 
 impl AskUserPort for TuiAskUserPort {
     fn ask(
@@ -23,7 +25,8 @@ impl AskUserPort for TuiAskUserPort {
         request: &AskUserRequest,
         cancellation: &HeadlessTurnCancellation,
     ) -> AskUserReply {
-        self.0.wait_for_reply(request.clone(), cancellation)
+        self.0
+            .wait_for_reply(request.clone(), self.1.clone(), cancellation)
     }
 }
 
@@ -57,7 +60,7 @@ mod tests {
     #[test]
     fn the_port_forwards_the_bridges_reply_verbatim() {
         let (bridge, requests) = production_tui_ask_user_bridge();
-        let port = TuiAskUserPort(bridge.clone());
+        let port = TuiAskUserPort(bridge.clone(), None);
         let cancellation = HeadlessTurnCancellation::new();
 
         let request = single_question_request();
@@ -95,7 +98,7 @@ mod tests {
     #[test]
     fn the_port_reports_unavailable_once_the_surface_is_closed() {
         let (bridge, _requests) = production_tui_ask_user_bridge();
-        let port = TuiAskUserPort(bridge.clone());
+        let port = TuiAskUserPort(bridge.clone(), None);
         let cancellation = HeadlessTurnCancellation::new();
 
         assert!(!bridge.close());
@@ -200,7 +203,7 @@ mod tests {
                 .register_native(
                     "native::ask_user",
                     agens_core::ToolAccess::ReadOnly,
-                    AskUserTool::new(Box::new(TuiAskUserPort(bridge.clone()))),
+                    AskUserTool::new(Box::new(TuiAskUserPort(bridge.clone(), None))),
                 )
                 .expect("ask_user tool should register");
 

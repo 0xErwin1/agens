@@ -195,7 +195,10 @@ fn p1c3_completed_background_subagent_notifies_the_next_main_turn() {
         &bootstrap,
         &agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap),
         &agens_tools::SkillCatalog::default(),
-        Box::new(TuiPermissionPrompter(production_tui_permission_bridge().0)),
+        Box::new(TuiPermissionPrompter(
+            production_tui_permission_bridge().0,
+            None,
+        )),
         ProductionTaskRunner::with_progress_probe(
             bootstrap.clone(),
             agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap),

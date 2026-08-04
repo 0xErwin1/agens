@@ -75,7 +75,10 @@ fn a_task_runtimes_permission_policy_is_scoped_to_its_own_root_not_the_bootstrap
             &bootstrap_from_root_b,
             root,
             &SkillCatalog::default(),
-            Box::new(TuiPermissionPrompter(production_tui_permission_bridge().0)),
+            Box::new(TuiPermissionPrompter(
+                production_tui_permission_bridge().0,
+                None,
+            )),
             ProductionTaskRunner::new(bootstrap_from_root_b.clone(), root.to_path_buf()),
             agens_core::RequestConfig::default(),
             None,
@@ -145,7 +148,10 @@ fn u15_a1b1_production_task_runtime_assembles_current_turn_registration() {
         &bootstrap,
         &project_root,
         &SkillCatalog::default(),
-        Box::new(TuiPermissionPrompter(production_tui_permission_bridge().0)),
+        Box::new(TuiPermissionPrompter(
+            production_tui_permission_bridge().0,
+            None,
+        )),
         ProductionTaskRunner::with_probe(
             bootstrap.clone(),
             project_root.clone(),
@@ -228,7 +234,10 @@ fn tui_and_headless_task_tool_construction_delegate_profiles_identically() {
         &bootstrap,
         &project_root,
         &SkillCatalog::default(),
-        Box::new(TuiPermissionPrompter(production_tui_permission_bridge().0)),
+        Box::new(TuiPermissionPrompter(
+            production_tui_permission_bridge().0,
+            None,
+        )),
         ProductionTaskRunner::with_probe(
             bootstrap.clone(),
             project_root.clone(),

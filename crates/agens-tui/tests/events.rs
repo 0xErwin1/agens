@@ -1835,7 +1835,7 @@ fn permission_wait_close_deadline_and_replies_remain_fail_closed() {
     let waiting_bridge = bridge.clone();
     let waiting_cancellation = cancellation.clone();
     let waiting = thread::spawn(move || {
-        waiting_bridge.wait_for_reply("native::bash", "git status", &waiting_cancellation)
+        waiting_bridge.wait_for_reply("native::bash", "git status", None, &waiting_cancellation)
     });
 
     let request = requests.recv_timeout(Duration::from_secs(1)).unwrap();
@@ -1849,7 +1849,7 @@ fn permission_wait_close_deadline_and_replies_remain_fail_closed() {
     let expired = HeadlessTurnCancellation::with_deadline(Duration::from_millis(100));
     let expired_bridge = bridge.clone();
     let expired_wait = thread::spawn(move || {
-        expired_bridge.wait_for_reply("native::write", "README.md", &expired)
+        expired_bridge.wait_for_reply("native::write", "README.md", None, &expired)
     });
     let expired_request = requests.recv_timeout(Duration::from_secs(1)).unwrap();
 
@@ -1862,7 +1862,7 @@ fn permission_wait_close_deadline_and_replies_remain_fail_closed() {
     let allowed = HeadlessTurnCancellation::new();
     let allowed_bridge = bridge.clone();
     let allowed_wait = thread::spawn(move || {
-        allowed_bridge.wait_for_reply("native::write", "README.md", &allowed)
+        allowed_bridge.wait_for_reply("native::write", "README.md", None, &allowed)
     });
     let allowed_request = requests.recv_timeout(Duration::from_secs(1)).unwrap();
 
@@ -2819,6 +2819,7 @@ fn permission_double_control_c_exits_and_runtime_cleanup_can_fail_closed() {
         worker_bridge.wait_for_reply(
             "native::write",
             "notes.md",
+            None,
             &HeadlessTurnCancellation::new(),
         )
     });

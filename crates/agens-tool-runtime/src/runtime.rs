@@ -342,6 +342,9 @@ pub struct ChildDelegation<'a> {
     /// inherit the same way this child inherited the parent's.
     pub parent: TaskParentSelection,
     pub permission_prompter: Option<crate::runner::PrompterFactory>,
+    pub ask_user_port: Option<crate::runner::AskUserPortFactory>,
+    /// Names this execution on every prompt it raises.
+    pub origin: crate::runner::PromptOrigin,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -385,6 +388,39 @@ pub fn production_child_tool_runtime(
     }
 
     let holds = |tool: &str| surface.coordination_tools.contains(&tool);
+
+    if holds("native::ask_user") {
+        // Always registered, never conditional on there being a surface — the
+        // parent does the same. A delegation with no port gets
+        // `UnavailableAskUserPort`, so a headless child asking gets the
+        // domain's own "no interactive surface" answer instead of the tool
+        // silently not existing for it.
+        let port = delegation
+            .as_ref()
+            .and_then(|delegation| {
+                delegation
+                    .ask_user_port
+                    .as_ref()
+                    .map(|build| build(delegation.origin.clone()))
+            })
+            .unwrap_or_else(|| Box::new(UnavailableAskUserPort) as Box<dyn AskUserPort>);
+
+        provider_tools.push(
+            OpenAiFunctionTool::new(
+                "ask_user",
+                "Ask the person at the terminal one or more bounded structured questions",
+                AskUserTool::input_schema(),
+            )
+            .map_err(|_| CliError::configuration("ask_user tool is unavailable"))?,
+        );
+        dispatcher
+            .register_native(
+                "native::ask_user",
+                agens_core::ToolAccess::ReadOnly,
+                AskUserTool::new(port),
+            )
+            .map_err(|_| CliError::configuration("tool catalog is invalid"))?;
+    }
 
     if holds("native::skill") {
         provider_tools.push(
@@ -697,6 +733,11 @@ mod tests {
                         diagnostic_reference: None,
                     },
                     permission_prompter: None,
+                    ask_user_port: None,
+                    origin: crate::runner::PromptOrigin {
+                        execution: 1,
+                        agent: "worker".into(),
+                    },
                 }),
             )
             .expect("the child runtime must build");
@@ -992,6 +1033,7 @@ mod tests {
                 "bash",
                 "git_read",
                 "webfetch",
+                "ask_user",
                 "skill",
                 "task_control",
                 "task_message",
@@ -1065,6 +1107,7 @@ mod tests {
                 "grep",
                 "glob",
                 "git_read",
+                "ask_user",
                 "skill",
                 "task_control",
                 "task_message",
@@ -1488,6 +1531,9 @@ mod tests {
                 .is_none()
         );
 
+        // A child holds `ask_user` only where a port was handed down. The
+        // dangerous runtime above never gets one — it has no surface at all —
+        // and a delegation with no port is a headless one.
         let surface = crate::child_catalog::resolve_child_surface(&[], &[], &[]).unwrap();
         let task_registry = TaskExecutionRegistry::new();
         let execution_id = task_registry.admit(TaskLaunchMode::Foreground).unwrap();
@@ -1502,15 +1548,106 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(child_tools.iter().all(|tool| tool.name() != "ask_user"));
+        assert!(child_tools.iter().any(|tool| tool.name() == "ask_user"));
         assert!(
             child_dispatcher
                 .lock()
                 .unwrap()
                 .canonical_identity("native::ask_user")
-                .is_none()
+                .is_some(),
+            "the tool is always registered; the port decides whether a person is reachable"
         );
 
         std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    /// A subagent that hits a real fork in the work can ask, and the question
+    /// says who is asking. Both halves matter: an anonymous question put in
+    /// front of someone running three subagents is one they cannot answer
+    /// responsibly, which is why the port and the origin arrive together.
+    #[test]
+    fn a_child_given_a_port_can_ask_and_the_question_names_it() {
+        let temporary = tui_session_directory("child-ask-user-attributed");
+        let bootstrap = tui_session_bootstrap(
+            &temporary,
+            &[(
+                "worker",
+                "---\nname: worker\ndescription: work\nmode: subagent\npermissions: []\n---\nWork.\n",
+            )],
+        );
+        let project_root = agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap);
+
+        struct SilentPort;
+
+        impl AskUserPort for SilentPort {
+            fn ask(
+                &self,
+                _: &agens_core::ask_user::AskUserRequest,
+                _: &agens_core::HeadlessTurnCancellation,
+            ) -> agens_core::ask_user::AskUserReply {
+                agens_core::ask_user::AskUserReply::Cancelled
+            }
+        }
+
+        let seen: Arc<Mutex<Vec<crate::runner::PromptOrigin>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&seen);
+        let surface = crate::child_catalog::resolve_child_surface(&[], &[], &[]).unwrap();
+        let task_registry = TaskExecutionRegistry::new();
+        let execution_id = task_registry.admit(TaskLaunchMode::Foreground).unwrap();
+
+        let (tools, dispatcher) = production_child_tool_runtime(
+            &project_root,
+            ToolLimitSettings::default(),
+            &surface,
+            task_registry,
+            execution_id,
+            Some(&SkillCatalog::default()),
+            None,
+            Some(ChildDelegation {
+                bootstrap: &bootstrap,
+                depth: 1,
+                parent: TaskParentSelection {
+                    model: "gpt-5.5".into(),
+                    request_config: agens_core::RequestConfig::default(),
+                    diagnostic_reference: None,
+                },
+                permission_prompter: None,
+                ask_user_port: Some(Arc::new(move |origin: crate::runner::PromptOrigin| {
+                    recorder
+                        .lock()
+                        .expect("the record must be available")
+                        .push(origin);
+                    Box::new(SilentPort) as Box<dyn AskUserPort>
+                })),
+                origin: crate::runner::PromptOrigin {
+                    execution: 7,
+                    agent: "reviewer".into(),
+                },
+            }),
+        )
+        .expect("the child runtime must build");
+
+        assert!(
+            tools.iter().any(|tool| tool.name() == "ask_user"),
+            "the child must be offered ask_user"
+        );
+        assert!(
+            dispatcher
+                .lock()
+                .unwrap()
+                .canonical_identity("native::ask_user")
+                .is_some()
+        );
+
+        // The port is built once, for this execution, and told whose it is —
+        // which is what lets the surface render "reviewer is asking" instead of
+        // an unattributed question.
+        let seen = seen.lock().expect("the record must be available");
+        assert_eq!(seen.len(), 1, "one port per delegated execution");
+        assert_eq!(seen[0].execution, 7);
+        assert_eq!(seen[0].agent, "reviewer");
+
+        drop(seen);
+        std::fs::remove_dir_all(temporary).ok();
     }
 }

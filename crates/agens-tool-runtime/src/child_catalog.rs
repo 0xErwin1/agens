@@ -77,7 +77,12 @@ impl ChildSurfaceRejection {
 /// executor has to hold. Withholding it did not restrict anything: it left
 /// those instructions unexecutable while the parent that wrote them could read
 /// the same skill freely.
-pub const CHILD_NON_CATALOG_TOOLS: [&str; 3] = [
+/// `native::ask_user` is here for the same reason `native::skill` is: a
+/// subagent that hits a real fork in the work has the same standing to ask the
+/// person as the thread that delegated to it. Withholding it did not make a
+/// child safer, it made it guess.
+pub const CHILD_NON_CATALOG_TOOLS: [&str; 4] = [
+    "native::ask_user",
     "native::skill",
     "native::task_control",
     "native::task_message",

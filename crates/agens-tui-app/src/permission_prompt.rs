@@ -8,7 +8,7 @@ use std::io::{IsTerminal, Write};
 use std::sync::mpsc::Receiver;
 
 use agens_core::{HeadlessTurnCancellation, HeadlessTurnPortError};
-use agens_tui::{TuiPermissionBridge, TuiPermissionReply, TuiPermissionRequest};
+use agens_tui::{PromptOrigin, TuiPermissionBridge, TuiPermissionReply, TuiPermissionRequest};
 
 use agens_permissions::{
     PermissionPromptAnswer, PermissionPromptContext, PermissionPrompter, sanitize_permission_target,
@@ -42,7 +42,9 @@ impl PermissionPrompter for TtyPermissionPrompter {
 
 /// The terminal UI's implementation of the permission port. Each surface owns
 /// its own, so the engine never chooses between them.
-pub struct TuiPermissionPrompter(pub TuiPermissionBridge);
+/// The second field names the delegated execution asking, or `None` for the
+/// main thread.
+pub struct TuiPermissionPrompter(pub TuiPermissionBridge, pub Option<PromptOrigin>);
 
 pub fn production_tui_permission_bridge() -> (TuiPermissionBridge, Receiver<TuiPermissionRequest>) {
     TuiPermissionBridge::channel()
@@ -58,6 +60,7 @@ impl PermissionPrompter for TuiPermissionPrompter {
             match self.0.wait_for_reply(
                 agens_core::bare_tool_name(&context.tool_identity).into_owned(),
                 render_permission_prompt(context),
+                self.1.clone(),
                 cancellation,
             ) {
                 TuiPermissionReply::AllowOnce => Ok(PermissionPromptAnswer::AllowOnce),
@@ -226,7 +229,7 @@ mod tests {
                 (request, replied)
             });
             let mut resolver = ProductionPermissionResolver::new(
-                TuiPermissionPrompter(bridge),
+                TuiPermissionPrompter(bridge, None),
                 store,
                 Arc::clone(&grants),
                 Arc::clone(&prompts),

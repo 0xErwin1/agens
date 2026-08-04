@@ -40,9 +40,22 @@ type ProductionTaskProbe = Arc<
     >,
 >;
 
+/// Names the delegated execution a prompt belongs to, so the surface can say
+/// which subagent is asking rather than putting an anonymous question in front
+/// of someone running several.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PromptOrigin {
+    pub execution: u64,
+    pub agent: String,
+}
+
 /// Builds one delegated execution's prompter onto the parent's surface.
 pub type PrompterFactory =
-    Arc<dyn Fn() -> Box<dyn agens_permissions::PermissionPrompter> + Send + Sync>;
+    Arc<dyn Fn(PromptOrigin) -> Box<dyn agens_permissions::PermissionPrompter> + Send + Sync>;
+
+/// Builds one delegated execution's `ask_user` port onto the same surface.
+pub type AskUserPortFactory =
+    Arc<dyn Fn(PromptOrigin) -> Box<dyn agens_core::ask_user::AskUserPort> + Send + Sync>;
 
 #[cfg(any(test, feature = "probe"))]
 struct TestTaskFailure {
@@ -347,6 +360,9 @@ pub struct ProductionTaskRunner {
     /// reach the same person through the same bridge without contending for a
     /// lock while one of them is parked on an answer.
     permission_prompter: Option<PrompterFactory>,
+    /// Builds this runner's executions their own `ask_user` port, so a
+    /// subagent can ask the person a question exactly as the main thread does.
+    ask_user_port: Option<AskUserPortFactory>,
     /// How deep the runtime that owns this runner sits. The parent turn is 0,
     /// so the executions this runner launches are at `depth + 1`.
     depth: usize,
@@ -369,6 +385,7 @@ impl ProductionTaskRunner {
             task_registry: None,
             mcp_registry: None,
             permission_prompter: None,
+            ask_user_port: None,
             depth: 0,
             #[cfg(any(test, feature = "probe"))]
             probe: None,
@@ -399,6 +416,14 @@ impl ProductionTaskRunner {
     #[must_use]
     pub fn with_permission_prompter(mut self, prompter: PrompterFactory) -> Self {
         self.permission_prompter = Some(prompter);
+        self
+    }
+
+    /// Lets delegated executions ask the person a question, on the same
+    /// surface and with the same standing as the main thread's own.
+    #[must_use]
+    pub fn with_ask_user_port(mut self, port: AskUserPortFactory) -> Self {
+        self.ask_user_port = Some(port);
         self
     }
 
@@ -446,6 +471,7 @@ impl ProductionTaskRunner {
             task_registry: None,
             mcp_registry: None,
             permission_prompter: None,
+            ask_user_port: None,
             depth: 0,
             probe: Some(probe),
             progress_probe: None,
@@ -469,6 +495,7 @@ impl ProductionTaskRunner {
             task_registry: None,
             mcp_registry: None,
             permission_prompter: None,
+            ask_user_port: None,
             depth: 0,
             probe: Some(probe),
             progress_probe: Some(progress),
@@ -492,6 +519,7 @@ impl ProductionTaskRunner {
             task_registry: None,
             mcp_registry: None,
             permission_prompter: None,
+            ask_user_port: None,
             depth: 0,
             probe: None,
             progress_probe: None,
@@ -621,6 +649,7 @@ impl TaskRunner for ProductionTaskRunner {
                         execution_id: context.execution().expect("registered task execution").id(),
                         mcp_registry: self.mcp_registry.clone(),
                         permission_prompter: self.permission_prompter.clone(),
+                        ask_user_port: self.ask_user_port.clone(),
                         depth: self.depth + 1,
                     },
                 )
@@ -639,6 +668,7 @@ impl TaskRunner for ProductionTaskRunner {
                 execution_id: context.execution().expect("registered task execution").id(),
                 mcp_registry: self.mcp_registry.clone(),
                 permission_prompter: self.permission_prompter.clone(),
+                ask_user_port: self.ask_user_port.clone(),
                 depth: self.depth + 1,
             },
         );
