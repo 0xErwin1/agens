@@ -22,7 +22,11 @@ use agens_tool_runtime::runner::{ProductionTaskRunner, TuiTaskControls, TuiTaskL
 use agens_tool_runtime::{
     block_on_headless_turn, launch_selected_task as launch_selected_tui_task,
 };
-use agens_tools::{TaskExecutionRegistry, TaskLaunchMode, TaskMessageSource, TaskMessageTarget};
+use agens_tools::TaskExecutionLimits;
+use agens_tools::{
+    TaskExecutionId, TaskExecutionRegistry, TaskLaunchMode, TaskMessageSource, TaskMessageTarget,
+    TaskTerminalState, ToolOutput,
+};
 
 use agens_fixtures::{
     session_bootstrap as tui_session_bootstrap, session_directory as tui_session_directory,
@@ -171,6 +175,114 @@ fn task_mailbox_provider_injects_typed_user_messages_only_at_request_safe_points
             "[coordination source=user untrusted=true]\nsecond".into()
         )]
     );
+}
+
+fn supervision_batches(interval: usize, target_main: bool, calls: usize) -> Vec<Vec<Message>> {
+    let registry = TaskExecutionRegistry::with_limits(TaskExecutionLimits {
+        check_interval: interval,
+        ..TaskExecutionLimits::default()
+    });
+    let id = registry.admit(TaskLaunchMode::Background).unwrap();
+    let target = if target_main {
+        TaskMessageTarget::Main
+    } else {
+        TaskMessageTarget::Execution(id)
+    };
+    let queued = Arc::new(Mutex::new(Vec::new()));
+    let mut provider = TaskMailboxProvider::new(
+        RecordingMailboxProvider {
+            queued: Arc::clone(&queued),
+        },
+        Some(registry),
+        target,
+    );
+    for _ in 0..calls {
+        block_on_headless_turn(provider.next_parts(&[], &HeadlessTurnCancellation::new()))
+            .unwrap()
+            .unwrap();
+    }
+    drop(provider);
+    Arc::try_unwrap(queued).unwrap().into_inner().unwrap()
+}
+
+#[test]
+fn subagent_supervision_uses_the_main_to_execution_mailbox_at_interval_one() {
+    let batches = supervision_batches(1, false, 4);
+
+    assert!(batches[0].is_empty());
+    for batch in &batches[1..] {
+        assert_eq!(batch.len(), 1);
+        let MessagePart::Text(message) = &batch[0].parts[0] else {
+            panic!("supervision is text");
+        };
+        assert!(message.starts_with("[coordination source=main untrusted=true]\n"));
+        assert!(message.contains("still making progress"));
+    }
+}
+
+#[test]
+fn subagent_supervision_repeats_at_interval_two_and_never_targets_main() {
+    let child_batches = supervision_batches(2, false, 5);
+    assert!(child_batches[0].is_empty());
+    assert!(child_batches[1].is_empty());
+    assert_eq!(child_batches[2].len(), 1);
+    assert!(child_batches[3].is_empty());
+    assert_eq!(child_batches[4].len(), 1);
+
+    let main_batches = supervision_batches(1, true, 4);
+    assert!(main_batches.iter().all(Vec::is_empty));
+}
+
+#[test]
+fn subagent_supervision_ignores_a_terminal_execution_race() {
+    let registry = TaskExecutionRegistry::with_limits(TaskExecutionLimits {
+        check_interval: 1,
+        ..TaskExecutionLimits::default()
+    });
+    let id = registry.admit(TaskLaunchMode::Background).unwrap();
+    let mut provider = TaskMailboxProvider::new(
+        RecordingMailboxProvider {
+            queued: Arc::new(Mutex::new(Vec::new())),
+        },
+        Some(registry.clone()),
+        TaskMessageTarget::Execution(id),
+    );
+
+    block_on_headless_turn(provider.next_parts(&[], &HeadlessTurnCancellation::new()))
+        .unwrap()
+        .unwrap();
+    assert!(registry.finish(
+        id,
+        TaskTerminalState::Completed,
+        ToolOutput::success("finished")
+    ));
+
+    let result =
+        block_on_headless_turn(provider.next_parts(&[], &HeadlessTurnCancellation::new())).unwrap();
+    assert!(result.is_ok());
+}
+
+#[test]
+fn subagent_supervision_rejects_an_unknown_execution_as_an_invariant_failure() {
+    let registry = TaskExecutionRegistry::with_limits(TaskExecutionLimits {
+        check_interval: 1,
+        ..TaskExecutionLimits::default()
+    });
+    let mut provider = TaskMailboxProvider::new(
+        RecordingMailboxProvider {
+            queued: Arc::new(Mutex::new(Vec::new())),
+        },
+        Some(registry),
+        TaskMessageTarget::Execution(TaskExecutionId::from_value(99)),
+    );
+
+    block_on_headless_turn(provider.next_parts(&[], &HeadlessTurnCancellation::new()))
+        .unwrap()
+        .unwrap();
+    let result =
+        block_on_headless_turn(provider.next_parts(&[], &HeadlessTurnCancellation::new())).unwrap();
+
+    assert_eq!(result, Err(HeadlessTurnPortError::Provider));
 }
 
 #[test]

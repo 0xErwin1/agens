@@ -44,7 +44,7 @@ pub fn native_tool_limits(settings: ToolLimitSettings) -> agens_tools::NativeToo
 /// names the mechanism that enforces it.
 pub fn task_execution_limits(settings: SubagentSettings) -> agens_tools::TaskExecutionLimits {
     agens_tools::TaskExecutionLimits {
-        max_iterations: settings.max_iterations,
+        check_interval: settings.check_interval,
         max_concurrency: settings.max_concurrency,
         max_output_chars: settings.max_output_chars,
     }
@@ -604,14 +604,14 @@ mod tests {
     fn configured_subagent_limits_bound_the_task_registry() {
         let bootstrap = bootstrap_from_configuration(
             "config-subagent-limits",
-            Some("[subagents]\nmax_iterations = 3\nmax_concurrency = 1\nmax_output_chars = 2048\n"),
+            Some("[subagents]\ncheck_interval = 3\nmax_concurrency = 1\nmax_output_chars = 2048\n"),
             None,
         );
 
         let registry =
             TaskExecutionRegistry::with_limits(task_execution_limits(bootstrap.subagent_limits()));
 
-        assert_eq!(registry.limits().max_iterations, 3);
+        assert_eq!(registry.limits().check_interval, 3);
         assert_eq!(registry.limits().max_output_chars, 2_048);
         assert!(registry.admit(TaskLaunchMode::Background).is_some());
         assert!(registry.admit(TaskLaunchMode::Background).is_none());
@@ -1194,7 +1194,6 @@ mod tests {
                 ));
                 Ok(TaskTurnResult {
                     output: request.description().to_owned(),
-                    iterations: 1,
                 })
             }
         }

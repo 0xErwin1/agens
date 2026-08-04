@@ -38,7 +38,6 @@ impl TaskRunner for CapturingRunner {
         ));
         Ok(TaskTurnResult {
             output: "delegated".to_owned(),
-            iterations: 1,
         })
     }
 }

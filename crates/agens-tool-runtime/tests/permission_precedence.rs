@@ -3522,7 +3522,6 @@ impl agens_tools::TaskRunner for InertTaskRunner {
     ) -> Result<agens_tools::TaskTurnResult, agens_tools::TaskRunnerError> {
         Ok(agens_tools::TaskTurnResult {
             output: request.description().to_owned(),
-            iterations: 1,
         })
     }
 }

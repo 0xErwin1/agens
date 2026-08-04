@@ -3,7 +3,7 @@ use std::process::ExitCode;
 use agens_core::HeadlessTurnCancellation;
 
 fn main() -> ExitCode {
-    let cancellation = HeadlessTurnCancellation::with_deadline(std::time::Duration::from_secs(120));
+    let cancellation = HeadlessTurnCancellation::new();
     let signal_cancellation = cancellation.clone();
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()

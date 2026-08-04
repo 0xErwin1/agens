@@ -20,6 +20,39 @@ const SECRET_BODY_SENTINEL: &str = "SENTINEL_REMOTE_ERROR_BODY";
 const SECRET_HEADER_SENTINEL: &str = "SENTINEL_REMOTE_ERROR_HEADER";
 
 #[test]
+fn persistent_connect_failures_stop_at_the_provider_operation_deadline() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    let started = Instant::now();
+
+    let result = run_provider_with_operation_timeout(
+        format!("http://{address}"),
+        HeadlessTurnCancellation::new(),
+        Duration::from_millis(25),
+    );
+
+    assert_eq!(result, Err(HeadlessTurnPortError::TimedOut));
+    assert!(started.elapsed() < Duration::from_millis(250));
+}
+
+#[test]
+fn shorter_parent_deadline_caps_the_provider_operation_deadline() {
+    let server = LocalResponsesServer::start(ServerMode::DelayedHeaders);
+    let started = Instant::now();
+
+    let result = run_provider_with_operation_timeout(
+        server.base_url(),
+        HeadlessTurnCancellation::with_deadline(Duration::from_millis(25)),
+        Duration::from_secs(1),
+    );
+
+    assert_eq!(result, Err(HeadlessTurnPortError::TimedOut));
+    assert!(started.elapsed() < Duration::from_millis(250));
+    server.join();
+}
+
+#[test]
 fn cancellation_interrupts_connect_headers_stalled_body_and_late_events() {
     for mode in [
         ServerMode::StalledConnect,
@@ -1189,6 +1222,30 @@ fn run_provider(
         timeout,
     )
     .expect("provider should be configured");
+    run_provider_instance(&mut provider, &cancellation)
+}
+
+fn run_provider_with_operation_timeout(
+    base_url: String,
+    cancellation: HeadlessTurnCancellation,
+    timeout: Duration,
+) -> Result<(), HeadlessTurnPortError> {
+    let mut provider = OpenAiResponsesProvider::from_api_key_with_timeout(
+        "test-api-key".into(),
+        Some(&base_url),
+        "test-model".into(),
+        "test prompt".into(),
+        timeout,
+    )
+    .expect("provider should be configured")
+    .with_operation_timeout(timeout);
+    run_provider_instance(&mut provider, &cancellation)
+}
+
+fn run_provider_instance(
+    provider: &mut OpenAiResponsesProvider,
+    cancellation: &HeadlessTurnCancellation,
+) -> Result<(), HeadlessTurnPortError> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_io()
         .enable_time()
@@ -1196,7 +1253,7 @@ fn run_provider(
         .expect("runtime should build");
 
     runtime
-        .block_on(provider.next_parts(&[], &cancellation))
+        .block_on(provider.next_parts(&[], cancellation))
         .map(|_| ())
 }
 

@@ -48,7 +48,7 @@ pub trait HttpWorkerOperation: Send + 'static {
 struct Command {
     request: HttpRequest,
     cancellation: HttpWorkerCancellationProbe,
-    deadline: Instant,
+    deadline: Option<Instant>,
     result: SyncSender<Result<HttpResponse, HttpWorkerError>>,
 }
 struct WorkerState {
@@ -107,7 +107,7 @@ impl HttpWorker {
         &self,
         request: HttpRequest,
         cancellation: HttpWorkerCancellationProbe,
-        deadline: Instant,
+        deadline: impl Into<Option<Instant>>,
     ) -> Result<HttpResponse, HttpWorkerError> {
         if self.state.closing.load(Ordering::Acquire) {
             return Err(HttpWorkerError::Shutdown);
@@ -126,7 +126,7 @@ impl HttpWorker {
         let command = Command {
             request,
             cancellation,
-            deadline,
+            deadline: deadline.into(),
             result,
         };
         if self.commands.try_send(command).is_err() {
@@ -253,7 +253,7 @@ fn run_worker(
 async fn run_request(
     future: HttpWorkerFuture,
     cancellation: &HttpWorkerCancellationProbe,
-    deadline: Instant,
+    deadline: Option<Instant>,
     state: &WorkerState,
 ) -> Result<HttpResponse, HttpWorkerError> {
     let mut ticker = tokio::time::interval(Duration::from_millis(1));
@@ -265,7 +265,7 @@ async fn run_request(
                 if cancellation() {
                     return Err(HttpWorkerError::Cancelled);
                 }
-                if Instant::now() >= deadline {
+                if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                     return Err(HttpWorkerError::TimedOut);
                 }
                 if state.closing.load(Ordering::Acquire) {

@@ -10,16 +10,15 @@ use agens_core::{
     HeadlessPermissionResolver, HeadlessToolCall, HeadlessTurnCancellation, HeadlessTurnError,
     HeadlessTurnPortError, Message, MessagePart, PermissionDecision, PermissionMode,
     PermissionPattern, PermissionPolicy, PermissionRule, PermissionSession, Role, SafetyPredicate,
-    TurnEvent, TurnProgressSink, TurnProvider,
-    run_isolated_headless_turn_with_max_iterations_and_progress,
+    TurnEvent, TurnProgressSink, TurnProvider, run_isolated_headless_turn_with_progress,
 };
 use agens_providers::{
     ChatGptResponsesProvider, MoonshotProvider, OpenAiResponsesProvider, ProgressAwareProvider,
     ProviderDiagnosticClass, ProviderDiagnosticEvent, ProviderDiagnosticScope, ProviderDiagnostics,
 };
 use agens_tools::{
-    TaskExecutionRegistry, TaskMessageSource, TaskMessageTarget, TaskProviderFailure,
-    TaskRunnerError, TaskTurnRequest,
+    TaskExecutionId, TaskExecutionRegistry, TaskMessageSource, TaskMessageTarget,
+    TaskProviderFailure, TaskRegistryError, TaskRunnerError, TaskTurnRequest,
 };
 
 use crate::block_on_headless_turn;
@@ -59,7 +58,6 @@ pub enum ChildRunError {
     Rejected,
     Server,
     Tool,
-    IterationLimit,
     Runtime,
     DeclarationRejected(ChildSurfaceRejection),
 }
@@ -78,9 +76,7 @@ impl ChildRunError {
             Self::Rejected => ProviderDiagnosticClass::Rejected,
             Self::Server => ProviderDiagnosticClass::Server,
             Self::Tool => ProviderDiagnosticClass::Tool,
-            Self::IterationLimit | Self::Runtime | Self::DeclarationRejected(_) => {
-                ProviderDiagnosticClass::Runtime
-            }
+            Self::Runtime | Self::DeclarationRejected(_) => ProviderDiagnosticClass::Runtime,
         }
     }
 
@@ -96,7 +92,6 @@ impl ChildRunError {
             Self::Rejected => Some(SubagentErrorKind::Rejected),
             Self::Server => Some(SubagentErrorKind::Server),
             Self::Tool => Some(SubagentErrorKind::Tool),
-            Self::IterationLimit => Some(SubagentErrorKind::IterationLimit),
             Self::Runtime | Self::DeclarationRejected(_) => Some(SubagentErrorKind::Runtime),
         }
     }
@@ -117,7 +112,6 @@ impl ChildRunError {
             Self::Rejected => TaskRunnerError::ProviderFailure(TaskProviderFailure::Rejected),
             Self::Server => TaskRunnerError::ProviderFailure(TaskProviderFailure::Server),
             Self::Tool | Self::Runtime => TaskRunnerError::ChildFailure,
-            Self::IterationLimit => TaskRunnerError::IterationLimit,
             Self::DeclarationRejected(rejection) => TaskRunnerError::DeclarationRejected {
                 reason: rejection.reason,
                 tool: rejection.tool,
@@ -139,7 +133,7 @@ fn child_run_error(error: HeadlessTurnError) -> ChildRunError {
         HeadlessTurnError::ProviderRejected => ChildRunError::Rejected,
         HeadlessTurnError::ProviderServer => ChildRunError::Server,
         HeadlessTurnError::Tool => ChildRunError::Tool,
-        HeadlessTurnError::MaxIterations => ChildRunError::IterationLimit,
+        HeadlessTurnError::MaxIterations => ChildRunError::Runtime,
         _ => ChildRunError::Runtime,
     }
 }
@@ -289,7 +283,7 @@ pub fn run_production_task(
                     request.model().to_owned(),
                     messages,
                     provider_tools,
-                    std::time::Duration::from_secs(120),
+                    agens_providers::DEFAULT_PROVIDER_REQUEST_TIMEOUT,
                 )
                 .map(|provider| {
                     provider
@@ -327,7 +321,7 @@ pub fn run_production_task(
                 request.model().to_owned(),
                 messages,
                 provider_tools,
-                std::time::Duration::from_secs(120),
+                agens_providers::DEFAULT_PROVIDER_REQUEST_TIMEOUT,
             )
             .map(|provider| {
                 provider
@@ -366,7 +360,7 @@ pub fn run_production_task(
                 task_system_prompt(&request),
                 messages,
                 provider_tools,
-                std::time::Duration::from_secs(120),
+                agens_providers::DEFAULT_PROVIDER_REQUEST_TIMEOUT,
             )
             .map(|provider| {
                 provider
@@ -426,7 +420,11 @@ pub struct TaskMailboxProvider<P> {
     inner: P,
     registry: Option<TaskExecutionRegistry>,
     target: TaskMessageTarget,
+    provider_rounds: usize,
+    check_interval: Option<usize>,
 }
+
+const SUBAGENT_SUPERVISION_CHECK: &str = "[subagent supervision advisory]\nAre you still making progress, or do you need help? If you are blocked, contact the parent with the task_message tool using target=\"main\". This check is advisory; continue working if you are making progress.";
 
 impl<P> TaskMailboxProvider<P> {
     pub fn new(
@@ -434,10 +432,18 @@ impl<P> TaskMailboxProvider<P> {
         registry: Option<TaskExecutionRegistry>,
         target: TaskMessageTarget,
     ) -> Self {
+        let check_interval = match target {
+            TaskMessageTarget::Execution(_) => registry
+                .as_ref()
+                .map(|registry| registry.limits().check_interval),
+            TaskMessageTarget::Main => None,
+        };
         Self {
             inner,
             registry,
             target,
+            provider_rounds: 0,
+            check_interval,
         }
     }
 }
@@ -452,7 +458,7 @@ impl<P: TurnProvider + Send> TurnProvider for TaskMailboxProvider<P> {
         events: &[TurnEvent],
         cancellation: &HeadlessTurnCancellation,
     ) -> Result<Vec<MessagePart>, HeadlessTurnPortError> {
-        let messages = self
+        let mut messages = self
             .registry
             .as_ref()
             .map(|registry| registry.drain_messages(self.target))
@@ -467,8 +473,58 @@ impl<P: TurnProvider + Send> TurnProvider for TaskMailboxProvider<P> {
                 ))],
             })
             .collect::<Vec<_>>();
+        if self.provider_rounds > 0
+            && self
+                .check_interval
+                .is_some_and(|interval| self.provider_rounds.is_multiple_of(interval))
+            && let (Some(registry), TaskMessageTarget::Execution(id)) =
+                (&self.registry, self.target)
+        {
+            messages.extend(supervision_advisory(registry, id)?);
+        }
         self.inner.queue_user_messages(messages)?;
+        self.provider_rounds = self.provider_rounds.saturating_add(1);
         self.inner.next_parts(events, cancellation).await
+    }
+}
+
+/// Queues one best-effort supervision check. A terminal execution is an expected race with task
+/// completion. A message-limit failure can likewise mean another sender filled the still-running
+/// execution's mailbox after this provider drained it. Those two advisory losses are intentionally
+/// non-fatal; every other registry error indicates a broken execution identity or route invariant.
+fn supervision_advisory(
+    registry: &TaskExecutionRegistry,
+    id: TaskExecutionId,
+) -> Result<Vec<Message>, HeadlessTurnPortError> {
+    match registry.send_message(
+        TaskMessageSource::Main,
+        TaskMessageTarget::Execution(id),
+        SUBAGENT_SUPERVISION_CHECK.into(),
+    ) {
+        Ok(()) => Ok(registry
+            .drain_messages(TaskMessageTarget::Execution(id))
+            .into_iter()
+            .map(coordination_message)
+            .collect()),
+        Err(TaskRegistryError::TerminalExecution | TaskRegistryError::MessageLimit) => {
+            Ok(Vec::new())
+        }
+        Err(
+            TaskRegistryError::UnknownExecution
+            | TaskRegistryError::ForbiddenRoute
+            | TaskRegistryError::InvalidControl,
+        ) => Err(HeadlessTurnPortError::Provider),
+    }
+}
+
+fn coordination_message(message: agens_tools::TaskMessage) -> Message {
+    Message {
+        role: Role::User,
+        parts: vec![MessagePart::Text(format!(
+            "[coordination source={} untrusted=true]\n{}",
+            task_message_source_label(message.source()),
+            message.content(),
+        ))],
     }
 }
 
@@ -499,10 +555,6 @@ struct IsolatedTaskTurnContext<'a> {
 
 /// Runs a subagent's isolated turn with no session attempt of its own, so the
 /// facts it emits carry no `session_id`/`attempt_id`.
-fn configured_task_max_iterations(registry: &TaskExecutionRegistry) -> usize {
-    registry.limits().max_iterations
-}
-
 fn run_isolated_task_turn<P>(
     provider: P,
     tool_runtime: SharedToolDispatcher,
@@ -522,7 +574,6 @@ where
         grant_store_root,
         origin,
     } = context;
-    let max_iterations = configured_task_max_iterations(&mailbox.registry);
     let mut provider = TaskMailboxProvider::new(provider, Some(mailbox.registry), mailbox.target);
     let policy = PermissionPolicy::with_safety_predicates(
         PermissionMode::Edit,
@@ -575,20 +626,18 @@ where
         None => ChildPermissionResolver::Unreachable,
     };
     let mut dispatcher = ProductionToolDispatcher::new(tool_runtime, pending);
-    let snapshot =
-        block_on_headless_turn(run_isolated_headless_turn_with_max_iterations_and_progress(
-            &mut provider,
-            &mut gate,
-            &mut resolver,
-            &mut dispatcher,
-            &mut repository,
-            cancellation,
-            max_iterations,
-            progress,
-            None,
-        ))
-        .map_err(|_| ChildRunError::Runtime)?
-        .map_err(child_run_error)?;
+    let snapshot = block_on_headless_turn(run_isolated_headless_turn_with_progress(
+        &mut provider,
+        &mut gate,
+        &mut resolver,
+        &mut dispatcher,
+        &mut repository,
+        cancellation,
+        progress,
+        None,
+    ))
+    .map_err(|_| ChildRunError::Runtime)?
+    .map_err(child_run_error)?;
 
     Ok(snapshot
         .events()
@@ -787,14 +836,23 @@ mod tests {
     /// [`a_child_with_a_surface_asks_the_person_instead_of_denying_for_them`]
     /// pins that half.
     #[test]
-    fn isolated_turn_stops_at_the_task_registrys_configured_iteration_limit() {
+    fn isolated_turn_supervises_a_long_synthetic_conversation_without_stopping_it() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         struct IteratingProvider {
             requests: Arc<AtomicUsize>,
+            queued: Arc<Mutex<Vec<Message>>>,
         }
 
         impl TurnProvider for IteratingProvider {
+            fn queue_user_messages(
+                &mut self,
+                messages: Vec<Message>,
+            ) -> Result<(), HeadlessTurnPortError> {
+                self.queued.lock().unwrap().extend(messages);
+                Ok(())
+            }
+
             fn next_parts(
                 &mut self,
                 _events: &[TurnEvent],
@@ -802,11 +860,19 @@ mod tests {
             ) -> impl std::future::Future<Output = Result<Vec<MessagePart>, HeadlessTurnPortError>> + Send
             {
                 let request = self.requests.fetch_add(1, Ordering::SeqCst) + 1;
-                std::future::ready(Ok(vec![MessagePart::ToolCall {
-                    id: format!("read-{request}"),
-                    name: "native::read".into(),
-                    input: r#"{"path":"notes.md"}"#.into(),
-                }]))
+                let parts = if request <= 34 {
+                    vec![MessagePart::ToolCall {
+                        id: format!("read-{request}"),
+                        name: "native::read".into(),
+                        input: r#"{"path":"notes.md"}"#.into(),
+                    }]
+                } else {
+                    vec![MessagePart::Text(
+                        "completed after sustained progress".into(),
+                    )]
+                };
+
+                std::future::ready(Ok(parts))
             }
         }
 
@@ -840,11 +906,15 @@ mod tests {
         }
 
         let registry = TaskExecutionRegistry::with_limits(agens_tools::TaskExecutionLimits {
-            max_iterations: 3,
+            check_interval: 32,
             max_concurrency: 1,
             max_output_chars: 1_024,
         });
+        let execution_id = registry
+            .admit(agens_tools::TaskLaunchMode::Foreground)
+            .unwrap();
         let requests = Arc::new(AtomicUsize::new(0));
+        let queued = Arc::new(Mutex::new(Vec::new()));
         let mut dispatcher = agens_tools::ToolDispatcher::new();
         dispatcher
             .register_native("native::read", agens_core::ToolAccess::ReadOnly, ReadTool)
@@ -853,6 +923,7 @@ mod tests {
         let result = run_isolated_task_turn(
             IteratingProvider {
                 requests: Arc::clone(&requests),
+                queued: Arc::clone(&queued),
             },
             Arc::new(Mutex::new(dispatcher)),
             IsolatedTaskTurnContext {
@@ -863,7 +934,7 @@ mod tests {
                 surface: &crate::child_catalog::resolve_child_surface(&[], &[], &[]).unwrap(),
                 mailbox: TaskMailboxContext {
                     registry,
-                    target: TaskMessageTarget::Main,
+                    target: TaskMessageTarget::Execution(execution_id),
                 },
                 permission_prompter: None,
                 grant_store_root: std::env::temp_dir(),
@@ -871,8 +942,43 @@ mod tests {
             },
         );
 
-        assert!(matches!(result, Err(ChildRunError::IterationLimit)));
-        assert_eq!(requests.load(Ordering::SeqCst), 3);
+        let Ok(output) = result else {
+            panic!("long-running subagent must complete");
+        };
+        assert_eq!(output, "completed after sustained progress");
+        assert_eq!(requests.load(Ordering::SeqCst), 35);
+        let queued = queued.lock().unwrap();
+        assert_eq!(queued.len(), 1);
+        let MessagePart::Text(check) = &queued[0].parts[0] else {
+            panic!("supervision check must be text");
+        };
+        assert!(check.contains("still making progress"), "{check}");
+        assert!(check.contains("task_message"), "{check}");
+    }
+
+    #[test]
+    fn supervision_drops_an_advisory_when_a_live_mailbox_is_concurrently_full() {
+        let registry = TaskExecutionRegistry::new();
+        let id = registry
+            .admit(agens_tools::TaskLaunchMode::Background)
+            .unwrap();
+        let mut queued = 0;
+
+        loop {
+            match registry.send_message(
+                TaskMessageSource::User,
+                TaskMessageTarget::Execution(id),
+                format!("concurrent message {queued}"),
+            ) {
+                Ok(()) => queued += 1,
+                Err(TaskRegistryError::MessageLimit) => break,
+                Err(error) => panic!("unexpected mailbox error: {error:?}"),
+            }
+        }
+
+        assert!(queued > 0);
+        assert!(supervision_advisory(&registry, id).unwrap().is_empty());
+        assert_eq!(registry.snapshot(id).unwrap().terminal, None);
     }
 
     #[test]
@@ -985,7 +1091,7 @@ mod tests {
 
         let refusal_of = |name: &'static str| {
             let registry = TaskExecutionRegistry::with_limits(agens_tools::TaskExecutionLimits {
-                max_iterations: 3,
+                check_interval: 3,
                 max_concurrency: 1,
                 max_output_chars: 1_024,
             });
@@ -1114,7 +1220,7 @@ mod tests {
         let surface =
             crate::child_catalog::resolve_child_surface(parent_rules, declarations, &[]).unwrap();
         let registry = TaskExecutionRegistry::with_limits(agens_tools::TaskExecutionLimits {
-            max_iterations: 3,
+            check_interval: 3,
             max_concurrency: 1,
             max_output_chars: 4_096,
         });

@@ -20,6 +20,14 @@ use serde_json::json;
 
 static NEXT_ROOT: AtomicUsize = AtomicUsize::new(0);
 
+#[test]
+fn directly_constructed_native_tools_allow_long_test_commands_by_default() {
+    assert_eq!(
+        NativeToolLimits::default().bash_timeout,
+        Duration::from_secs(30 * 60)
+    );
+}
+
 fn project_root() -> std::path::PathBuf {
     let suffix = NEXT_ROOT.fetch_add(1, Ordering::Relaxed);
     let root = std::env::temp_dir().join(format!("agens-tools-{}-{suffix}", std::process::id()));

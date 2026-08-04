@@ -429,7 +429,6 @@ impl SubagentErrorPresentation for SubagentErrorKind {
             Self::Rejected => "Subagent provider request was rejected.",
             Self::Server => "Subagent provider service failed.",
             Self::Tool => "Subagent tool execution failed.",
-            Self::IterationLimit => "Subagent iteration limit reached.",
             Self::Runtime => "Subagent runtime failed.",
         }
     }
@@ -445,7 +444,6 @@ impl SubagentErrorPresentation for SubagentErrorKind {
             Self::Rejected => "Review the request configuration, then retry.",
             Self::Server => "Retry after the provider service recovers.",
             Self::Tool => "Review the tool call and retry.",
-            Self::IterationLimit => "Increase subagents.max_iterations or narrow the task.",
             Self::Runtime => "Retry the subagent request or inspect diagnostics.",
         }
     }
@@ -453,8 +451,7 @@ impl SubagentErrorPresentation for SubagentErrorKind {
 
 #[cfg(test)]
 mod tests {
-    use super::{Parked, PromptOrigin, SubagentErrorPresentation, TuiAskUserBridge};
-    use agens_core::SubagentErrorKind;
+    use super::{Parked, PromptOrigin, TuiAskUserBridge};
     use agens_core::ask_user::{
         AskUserAnswer, AskUserMode, AskUserOption, AskUserQuestion, AskUserReply, AskUserRequest,
         AskUserUnavailable,
@@ -462,18 +459,6 @@ mod tests {
     use std::sync::mpsc;
     use std::sync::{Arc, Barrier};
     use std::thread;
-
-    #[test]
-    fn iteration_limit_has_an_exact_actionable_presentation() {
-        assert_eq!(
-            SubagentErrorKind::IterationLimit.message(),
-            "Subagent iteration limit reached."
-        );
-        assert_eq!(
-            SubagentErrorKind::IterationLimit.action(),
-            "Increase subagents.max_iterations or narrow the task."
-        );
-    }
 
     fn single_question_request() -> AskUserRequest {
         let options = vec![

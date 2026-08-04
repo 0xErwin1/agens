@@ -9,7 +9,7 @@ Agens is a Rust coding-agent CLI with a terminal interface, one-shot chat, guard
 - OpenAI Responses API access with `provider.type = "openai-api"` and `OPENAI_API_KEY` or an existing `auth.json` entry.
 - ChatGPT subscription Responses access with OAuth login through `agens auth login`.
 - Moonshot AI (Kimi) chat-completions access with `provider.type = "moonshotai"` and `MOONSHOT_API_KEY` or an `auth.json` entry, written by `agens auth login api-key moonshotai`.
-- A cancellation-aware provider/tool loop with a 120-second top-level deadline.
+- Cancellation-only CLI turns with optional inherited deadlines and finite provider/tool operation timeouts.
 - Project-confined native tools: `read`, `write`, `list`, `search`, and bounded `bash`.
 - Permission evaluation before tool execution, including global/project TOML rules, temporary unsafe bypass, and persisted project grants. Unresolved approval requests fail closed.
 - MCP tools loaded from global configuration over stdio, streamable HTTP, or SSE transports.
@@ -113,7 +113,9 @@ deny = ["bash(rm *)"]
 
 The optional `[options].data_dir` changes the runtime-state directory. Environment expressions are supported by the configuration parser. MCP server definitions are global-only; project configuration cannot define them.
 
-Beyond the keys above, `[tools]` bounds the native tools (`max_list_entries`, `max_search_entries`, `max_search_results`, `max_search_depth`, `operation_timeout_ms`, `bash_timeout_ms`), `[subagents]` bounds the task tool (`max_iterations`, `max_concurrency`, `max_output_chars`), `[mcp_defaults]` supplies `timeout_ms` and `max_retries` to servers that omit their own, and `[agent]` also accepts `default_agent`, `reasoning_effort`, and `bypass_permission_prompts` (bool, default `false`; global configuration only — see "Command surface" for the runtime `/bypass` toggle). Setting `[options].debug = false` stops agens from capturing diagnostics to disk.
+Beyond the keys above, `[tools]` bounds the native tools (`max_list_entries`, `max_search_entries`, `max_search_results`, `max_search_depth`, `operation_timeout_ms`, `bash_timeout_ms`), `[subagents]` configures advisory progress checks and task-tool resource bounds (`check_interval`, `max_concurrency`, `max_output_chars`), `[mcp_defaults]` supplies `timeout_ms` and `max_retries` to servers that omit their own, and `[agent]` also accepts `default_agent`, `reasoning_effort`, and `bypass_permission_prompts` (bool, default `false`; global configuration only — see "Command surface" for the runtime `/bypass` toggle). Setting `[options].debug = false` stops agens from capturing diagnostics to disk.
+
+Each provider operation has a fixed 10-minute timeout, capped by any earlier inherited deadline.
 
 Every key is validated on load: an unknown key, a wrong type, or a value outside its documented range fails startup and names the offending field. The authoritative list is the settings catalog in `crates/agens-config`; `agens config init` renders it as a commented starter file at `<project-root>/.agens/config.toml` and refuses to overwrite an existing one.
 

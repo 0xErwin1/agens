@@ -182,7 +182,6 @@ mod tests {
             HeadlessTaskTerminal::AgentUnavailable,
             HeadlessTaskTerminal::ModelUnavailable,
             HeadlessTaskTerminal::SkillUnavailable,
-            HeadlessTaskTerminal::IterationLimit,
             HeadlessTaskTerminal::InputLimit,
             HeadlessTaskTerminal::OutputLimit,
             HeadlessTaskTerminal::ConcurrencyLimit,

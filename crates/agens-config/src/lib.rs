@@ -519,19 +519,19 @@ pub const SETTINGS: &[SettingSpec] = &[
         path: "tools.bash_timeout_ms",
         kind: SettingKind::Integer {
             minimum: 1_000,
-            maximum: 3_600_000,
+            maximum: 86_400_000,
         },
-        default: SettingValue::Integer(120_000),
+        default: SettingValue::Integer(1_800_000),
         doc: "Timeout for a bash tool invocation.",
     },
     SettingSpec {
-        path: "subagents.max_iterations",
+        path: "subagents.check_interval",
         kind: SettingKind::Integer {
             minimum: 1,
-            maximum: 64,
+            maximum: 1_000,
         },
         default: SettingValue::Integer(32),
-        doc: "Maximum provider round trips inside a subagent.",
+        doc: "Provider rounds between advisory subagent progress checks.",
     },
     SettingSpec {
         path: "subagents.max_concurrency",
@@ -766,7 +766,7 @@ impl From<&ResolvedSettings> for ToolLimitSettings {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SubagentSettings {
-    pub max_iterations: usize,
+    pub check_interval: usize,
     pub max_concurrency: usize,
     pub max_output_chars: usize,
 }
@@ -774,7 +774,7 @@ pub struct SubagentSettings {
 impl From<&ResolvedSettings> for SubagentSettings {
     fn from(resolved: &ResolvedSettings) -> Self {
         Self {
-            max_iterations: size_setting(resolved, "subagents.max_iterations"),
+            check_interval: size_setting(resolved, "subagents.check_interval"),
             max_concurrency: size_setting(resolved, "subagents.max_concurrency"),
             max_output_chars: size_setting(resolved, "subagents.max_output_chars"),
         }

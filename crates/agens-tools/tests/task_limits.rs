@@ -26,7 +26,7 @@ fn a_configured_concurrency_bounds_admission() {
 #[test]
 fn a_registry_reports_the_limits_it_was_built_with() {
     let limits = TaskExecutionLimits {
-        max_iterations: 3,
+        check_interval: 3,
         max_concurrency: 2,
         max_output_chars: 2_048,
     };
@@ -42,7 +42,7 @@ fn a_registry_reports_the_limits_it_was_built_with() {
 fn the_documented_defaults_match_the_runtime_bounds() {
     let limits = TaskExecutionLimits::default();
 
-    assert_eq!(limits.max_iterations, 32);
+    assert_eq!(limits.check_interval, 32);
     assert_eq!(limits.max_concurrency, 4);
     assert_eq!(limits.max_output_chars, 65_536);
 }

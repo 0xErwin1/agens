@@ -24,11 +24,11 @@ use agens_core::{
 use serde_json::Value;
 
 use crate::{
-    Error, MAX_HTTP_STATUS_ATTEMPTS, MAX_OPENAI_TOOL_CONTINUATION_ROUNDS, MAX_SSE_FRAME_BYTES,
-    OpenAiFunctionTool, ProgressAwareProvider, ProviderDiagnosticClass,
-    ProviderDiagnosticComponent, ProviderDiagnosticKind, ProviderDiagnostics,
-    ProviderFailureDetail, classify_openai_response_status, diagnostic_class_for_port_error,
-    diagnostic_class_for_status, is_transient_http_status, retry_after_from_headers,
+    Error, MAX_HTTP_STATUS_ATTEMPTS, MAX_SSE_FRAME_BYTES, OpenAiFunctionTool,
+    ProgressAwareProvider, ProviderDiagnosticClass, ProviderDiagnosticComponent,
+    ProviderDiagnosticKind, ProviderDiagnostics, ProviderFailureDetail,
+    classify_openai_response_status, diagnostic_class_for_port_error, diagnostic_class_for_status,
+    is_transient_http_status, provider_operation_cancellation, retry_after_from_headers,
     should_retry_transport_error, stop_before_mapping, wait_for_http_retry, wait_for_stop,
 };
 
@@ -58,8 +58,8 @@ pub struct MoonshotProvider {
     request_config: RequestConfig,
     history: Vec<Message>,
     state: TurnState,
-    continuation_rounds: usize,
     client: reqwest::Client,
+    operation_timeout: Duration,
     diagnostics: Option<ProviderDiagnostics>,
     progress: Option<TurnProgressSink>,
     failure_detail: Option<ProviderFailureDetail>,
@@ -130,15 +130,20 @@ impl MoonshotProvider {
             request_config: RequestConfig::default(),
             history,
             state: TurnState::Initial,
-            continuation_rounds: 0,
             client: reqwest::Client::builder()
                 .read_timeout(request_timeout)
                 .build()
                 .map_err(|_| Error::Provider("Moonshot client is unavailable".to_owned()))?,
+            operation_timeout: crate::DEFAULT_PROVIDER_REQUEST_TIMEOUT,
             diagnostics: None,
             progress: None,
             failure_detail: None,
         })
+    }
+
+    pub fn with_operation_timeout(mut self, operation_timeout: Duration) -> Self {
+        self.operation_timeout = operation_timeout;
+        self
     }
 
     #[must_use]
@@ -437,6 +442,9 @@ impl TurnProvider for MoonshotProvider {
         events: &[TurnEvent],
         cancellation: &HeadlessTurnCancellation,
     ) -> Result<Vec<MessagePart>, HeadlessTurnPortError> {
+        let operation_cancellation =
+            provider_operation_cancellation(cancellation, self.operation_timeout);
+        let cancellation = &operation_cancellation;
         // A prior round in this same turn may have recorded detail for an incident it then
         // recovered from. This handle is shared across every round of one attempt, so draining
         // it here keeps that recovered incident from being mistaken for the cause of a later,
@@ -450,10 +458,6 @@ impl TurnProvider for MoonshotProvider {
         match state {
             TurnState::Initial => {}
             TurnState::AwaitingToolResults { event_cursor } => {
-                if self.continuation_rounds >= MAX_OPENAI_TOOL_CONTINUATION_ROUNDS {
-                    return Err(HeadlessTurnPortError::Provider);
-                }
-
                 let Some(new_events) = events.get(event_cursor..) else {
                     return Err(HeadlessTurnPortError::Provider);
                 };
@@ -466,7 +470,6 @@ impl TurnProvider for MoonshotProvider {
                     role: Role::Tool,
                     parts: results,
                 });
-                self.continuation_rounds += 1;
             }
             TurnState::Completed | TurnState::Failed => {
                 return Err(HeadlessTurnPortError::Provider);

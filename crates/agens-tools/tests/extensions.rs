@@ -7,7 +7,7 @@ use std::{
         mpsc,
     },
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use agens_core::{
@@ -1136,11 +1136,6 @@ fn task_description_limit_counts_unicode_scalars_not_bytes() {
 fn task_reports_exact_terminal_taxonomy_without_runner_details() {
     for (runner, expected, terminal) in [
         (
-            TerminalTaskRunner::Iterations,
-            "task: iteration limit reached",
-            HeadlessTaskTerminal::IterationLimit,
-        ),
-        (
             TerminalTaskRunner::Provider,
             "task: provider failure [cause: response protocol]",
             HeadlessTaskTerminal::ProviderFailure,
@@ -1291,7 +1286,7 @@ fn task_cancellation_wins_and_holds_permit_until_worker_exit() {
 }
 
 #[test]
-fn task_has_no_global_deadline_and_finishes_when_the_worker_finishes() {
+fn foreground_task_inherits_the_parent_deadline_and_times_out_deterministically() {
     let (started_sender, started_receiver) = mpsc::channel();
     let (release_sender, release_receiver) = mpsc::channel();
     let task = task_tool(BlockingTaskRunner {
@@ -1311,10 +1306,100 @@ fn task_has_no_global_deadline_and_finishes_when_the_worker_finishes() {
     started_receiver
         .recv_timeout(Duration::from_secs(1))
         .unwrap();
-    thread::sleep(Duration::from_millis(30));
-    assert!(!call.is_finished());
+    let started = Instant::now();
+    assert_eq!(call.join().unwrap(), ToolOutput::failure("task: timed out"));
+    assert!(started.elapsed() < Duration::from_millis(250));
     release_sender.send(()).unwrap();
-    assert_eq!(call.join().unwrap(), ToolOutput::success("done"));
+}
+
+#[test]
+fn background_task_retains_the_inherited_parent_deadline() {
+    let (observed_sender, observed_receiver) = mpsc::channel();
+    let mut task = task_tool(DeadlineAwareTaskRunner {
+        observed: observed_sender,
+    });
+
+    let output = task
+        .execute_with_launch_mode(
+            &ToolExecutionContext::with_timeout(Duration::from_millis(25)),
+            task_arguments(),
+            TaskLaunchMode::Background,
+        )
+        .unwrap();
+
+    assert_eq!(
+        output,
+        ToolOutput::success("Subagent #1 running in background")
+    );
+    let (context_deadline, child_deadline) = observed_receiver
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    assert!(context_deadline.is_some());
+    assert_eq!(child_deadline, context_deadline);
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        let snapshot = task
+            .execution_registry()
+            .snapshot(TaskExecutionId::from_value(1))
+            .unwrap();
+        if snapshot.terminal == Some(TaskTerminalState::Failed) {
+            assert_eq!(
+                snapshot.result,
+                Some(ToolOutput::failure("task: timed out"))
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "background task did not time out"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[test]
+fn background_task_retains_inherited_parent_cancellation() {
+    let (observed_sender, observed_receiver) = mpsc::channel();
+    let mut task = task_tool(DeadlineAwareTaskRunner {
+        observed: observed_sender,
+    });
+    let parent_cancellation = Arc::new(AtomicBool::new(false));
+
+    let output = task
+        .execute_with_launch_mode(
+            &ToolExecutionContext::new(Arc::clone(&parent_cancellation), Duration::from_secs(1)),
+            task_arguments(),
+            TaskLaunchMode::Background,
+        )
+        .unwrap();
+    assert_eq!(
+        output,
+        ToolOutput::success("Subagent #1 running in background")
+    );
+    observed_receiver
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    parent_cancellation.store(true, Ordering::Release);
+
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        let snapshot = task
+            .execution_registry()
+            .snapshot(TaskExecutionId::from_value(1))
+            .unwrap();
+        if snapshot.terminal == Some(TaskTerminalState::Cancelled) {
+            assert_eq!(
+                snapshot.result,
+                Some(ToolOutput::failure("task: cancelled"))
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "background task did not inherit cancellation"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
 }
 
 #[test]
@@ -2200,7 +2285,6 @@ impl TaskRunner for RecordingTaskRunner {
                     .unwrap_or("none"),
                 request.description()
             ),
-            iterations: 1,
         })
     }
 }
@@ -2216,7 +2300,6 @@ impl TaskRunner for CountingTaskRunner {
         self.0.fetch_add(1, Ordering::AcqRel);
         Ok(TaskTurnResult {
             output: "unexpected child execution".into(),
-            iterations: 1,
         })
     }
 }
@@ -2237,7 +2320,6 @@ impl TaskRunner for CapturingTaskRunner {
         ));
         Ok(TaskTurnResult {
             output: "captured".into(),
-            iterations: 1,
         })
     }
 }
@@ -2252,14 +2334,12 @@ impl TaskRunner for OversizedTaskRunner {
     ) -> Result<TaskTurnResult, TaskRunnerError> {
         Ok(TaskTurnResult {
             output: "x".repeat(65_537),
-            iterations: 1,
         })
     }
 }
 
 enum TerminalTaskRunner {
     Success,
-    Iterations,
     Provider,
     Child,
     Panic,
@@ -2276,11 +2356,6 @@ impl TaskRunner for TerminalTaskRunner {
         match self {
             Self::Success => Ok(TaskTurnResult {
                 output: "done".into(),
-                iterations: 1,
-            }),
-            Self::Iterations => Ok(TaskTurnResult {
-                output: "ignored".into(),
-                iterations: 33,
             }),
             Self::Provider => Err(TaskRunnerError::ProviderFailure(
                 agens_tools::TaskProviderFailure::Protocol,
@@ -2304,6 +2379,34 @@ struct BlockingTaskRunner {
     release: Mutex<mpsc::Receiver<()>>,
 }
 
+struct DeadlineAwareTaskRunner {
+    observed: mpsc::Sender<(Option<Instant>, Option<Instant>)>,
+}
+
+impl TaskRunner for DeadlineAwareTaskRunner {
+    fn run(
+        &self,
+        _: TaskTurnRequest,
+        context: &TaskRunContext,
+    ) -> Result<TaskTurnResult, TaskRunnerError> {
+        let child_cancellation = context.turn_cancellation();
+        self.observed
+            .send((
+                context.deadline(),
+                child_cancellation.adapter_view().deadline(),
+            ))
+            .unwrap();
+        while !child_cancellation.is_cancelled() && !child_cancellation.is_expired() {
+            thread::sleep(Duration::from_millis(1));
+        }
+        if child_cancellation.is_expired() {
+            Err(TaskRunnerError::TimedOut)
+        } else {
+            Err(TaskRunnerError::Cancelled)
+        }
+    }
+}
+
 struct ConcurrentTaskRunner {
     started: mpsc::Sender<()>,
     release: Arc<(Mutex<bool>, Condvar)>,
@@ -2324,7 +2427,6 @@ impl TaskRunner for ConcurrentTaskRunner {
 
         Ok(TaskTurnResult {
             output: "done".into(),
-            iterations: 1,
         })
     }
 }
@@ -2362,7 +2464,6 @@ impl TaskRunner for PublicationPausedTaskRunner {
         });
         Ok(TaskTurnResult {
             output: "done".into(),
-            iterations: 1,
         })
     }
 }
@@ -2384,7 +2485,6 @@ impl TaskRunner for LifecycleTaskRunner {
         }
         Ok(TaskTurnResult {
             output: "done".into(),
-            iterations: 1,
         })
     }
 }
@@ -2399,7 +2499,6 @@ impl TaskRunner for BlockingTaskRunner {
         self.release.lock().unwrap().recv().unwrap();
         Ok(TaskTurnResult {
             output: "done".into(),
-            iterations: 1,
         })
     }
 }

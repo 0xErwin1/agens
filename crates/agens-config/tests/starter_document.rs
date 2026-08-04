@@ -80,3 +80,15 @@ fn every_documented_default_matches_the_catalog() {
         );
     }
 }
+
+#[test]
+fn the_removed_subagent_iteration_limit_is_reported_as_unsupported() {
+    let document = parse_toml_document("[subagents]\nmax_iterations = 64\n").unwrap();
+
+    let error = validate_toml_document(&document).unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "invalid configuration field subagents.max_iterations"
+    );
+}

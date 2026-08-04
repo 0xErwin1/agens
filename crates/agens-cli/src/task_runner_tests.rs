@@ -42,7 +42,7 @@ use agens_tui_app::permission_prompt::{TuiPermissionPrompter, production_tui_per
 fn production_task_error_mapping_reserves_provider_for_provider_failures() {
     assert_eq!(
         map_task_turn_error(HeadlessTurnError::MaxIterations),
-        TaskRunnerError::IterationLimit
+        TaskRunnerError::ChildFailure
     );
     assert_eq!(
         map_task_turn_error(HeadlessTurnError::Provider),
@@ -508,14 +508,6 @@ fn production_runner_error_publication_orders_sanitized_typed_failure_before_ter
             "failed",
         ),
         (
-            ChildRunError::IterationLimit,
-            TaskRunnerError::IterationLimit,
-            Some(SubagentErrorKind::IterationLimit),
-            TuiExecutionEvent::Failed { id: 1 },
-            SubagentStatus::Failure,
-            "failed",
-        ),
-        (
             ChildRunError::Runtime,
             TaskRunnerError::ChildFailure,
             Some(SubagentErrorKind::Runtime),
@@ -603,9 +595,6 @@ fn production_runner_error_publication_orders_sanitized_typed_failure_before_ter
                 HeadlessTaskTerminal::ProviderFailure.message(),
                 cause.label()
             ),
-            TaskRunnerError::IterationLimit => {
-                HeadlessTaskTerminal::IterationLimit.message().to_owned()
-            }
             TaskRunnerError::ChildFailure => {
                 HeadlessTaskTerminal::ChildFailure.message().to_owned()
             }

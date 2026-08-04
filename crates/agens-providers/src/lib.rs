@@ -30,14 +30,13 @@ const HTTP_RETRY_FIRST_DELAY: Duration = Duration::from_millis(250);
 const HTTP_RETRY_SECOND_DELAY: Duration = Duration::from_secs(1);
 const HTTP_RETRY_MAX_JITTER: u64 = 100;
 const HTTP_RETRY_AFTER_CAP: Duration = Duration::from_secs(5);
-const DEFAULT_OPENAI_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+pub const DEFAULT_PROVIDER_REQUEST_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// Bounds one SSE frame. Response lifecycle events echo the entire request,
 /// so this has to accommodate a full tool catalogue rather than the largest
 /// plausible model output; a session with many MCP servers exceeds 128 KiB.
 const MAX_SSE_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_CHATGPT_ERROR_BODY_BYTES: usize = 8 * 1024;
 const MAX_TOOL_OUTPUT_BYTES: usize = 8 * 1024;
-const MAX_OPENAI_TOOL_CONTINUATION_ROUNDS: usize = 128;
 /// Items one request may replay.
 ///
 /// The byte budgets below are what actually protect the request; this bounds
@@ -86,11 +85,11 @@ pub struct OpenAiResponsesProvider {
     tools: Vec<OpenAiFunctionTool>,
     parallel_tool_calls: bool,
     client: reqwest::Client,
+    operation_timeout: Duration,
     state: ContinuationState,
     seen_response_ids: BTreeSet<String>,
     seen_item_ids: BTreeSet<String>,
     seen_call_ids: BTreeSet<String>,
-    continuation_rounds: usize,
     progress: Option<TurnProgressSink>,
     diagnostics: Option<ProviderDiagnostics>,
     failure_detail: Option<ProviderFailureDetail>,
@@ -109,13 +108,13 @@ pub struct ChatGptResponsesProvider {
     initial_input: Vec<Value>,
     session_id: String,
     client: reqwest::Client,
+    operation_timeout: Duration,
     tools: Vec<OpenAiFunctionTool>,
     parallel_tool_calls: bool,
     state: ChatGptContinuationState,
     seen_item_ids: BTreeSet<String>,
     seen_call_ids: BTreeSet<String>,
     seen_replay_item_ids: BTreeSet<String>,
-    continuation_rounds: usize,
     progress: Option<TurnProgressSink>,
     diagnostics: Option<ProviderDiagnostics>,
     failure_detail: Option<ProviderFailureDetail>,
@@ -302,7 +301,6 @@ pub enum ProviderDiagnosticKind {
     Terminal,
     AgentUnavailable,
     AgentFallback,
-    ContinuationLimitExceeded,
     ProviderStateInvalid,
     ReplayItemRejected,
     ReplayLimitExceeded,
@@ -317,7 +315,6 @@ impl ProviderDiagnosticKind {
             Self::Terminal => "terminal",
             Self::AgentUnavailable => "agent_unavailable",
             Self::AgentFallback => "agent_fallback",
-            Self::ContinuationLimitExceeded => "continuation_limit_exceeded",
             Self::ProviderStateInvalid => "provider_state_invalid",
             Self::ReplayItemRejected => "replay_item_rejected",
             Self::ReplayLimitExceeded => "replay_limit_exceeded",
@@ -548,7 +545,7 @@ impl OpenAiResponsesProvider {
             base_url,
             model,
             prompt,
-            DEFAULT_OPENAI_REQUEST_TIMEOUT,
+            DEFAULT_PROVIDER_REQUEST_TIMEOUT,
         )
     }
 
@@ -602,15 +599,20 @@ impl OpenAiResponsesProvider {
                 .connect_timeout(request_timeout)
                 .build()
                 .map_err(|_| Error::Provider("OpenAI HTTP client is unavailable".into()))?,
+            operation_timeout: DEFAULT_PROVIDER_REQUEST_TIMEOUT,
             state: ContinuationState::Initial,
             seen_response_ids: BTreeSet::new(),
             seen_item_ids: BTreeSet::new(),
             seen_call_ids: BTreeSet::new(),
-            continuation_rounds: 0,
             progress: None,
             diagnostics: None,
             failure_detail: None,
         })
+    }
+
+    pub fn with_operation_timeout(mut self, operation_timeout: Duration) -> Self {
+        self.operation_timeout = operation_timeout;
+        self
     }
 
     pub fn from_api_key_with_messages_and_tools_and_timeout(
@@ -889,7 +891,7 @@ impl ChatGptResponsesProvider {
             model,
             instructions,
             input,
-            DEFAULT_OPENAI_REQUEST_TIMEOUT,
+            DEFAULT_PROVIDER_REQUEST_TIMEOUT,
         )
     }
 
@@ -980,17 +982,22 @@ impl ChatGptResponsesProvider {
                 .read_timeout(request_timeout)
                 .build()
                 .map_err(|_| Error::Provider("ChatGPT HTTP client is unavailable".into()))?,
+            operation_timeout: DEFAULT_PROVIDER_REQUEST_TIMEOUT,
             tools,
             parallel_tool_calls: true,
             state: ChatGptContinuationState::Initial,
             seen_item_ids: BTreeSet::new(),
             seen_call_ids: BTreeSet::new(),
             seen_replay_item_ids: BTreeSet::new(),
-            continuation_rounds: 0,
             progress: None,
             diagnostics: None,
             failure_detail: None,
         })
+    }
+
+    pub fn with_operation_timeout(mut self, operation_timeout: Duration) -> Self {
+        self.operation_timeout = operation_timeout;
+        self
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1489,6 +1496,22 @@ fn is_transient_http_status(status: u16) -> bool {
     status == 408 || status == 429 || (500..=599).contains(&status)
 }
 
+pub(crate) fn provider_operation_cancellation(
+    parent: &HeadlessTurnCancellation,
+    timeout: Duration,
+) -> HeadlessTurnCancellation {
+    let parent = parent.adapter_view();
+    let operation_deadline = std::time::Instant::now() + timeout;
+    let deadline = parent.deadline().map_or(operation_deadline, |deadline| {
+        deadline.min(operation_deadline)
+    });
+
+    HeadlessTurnCancellation::with_cancellation_and_deadline(
+        parent.cancellation_handle(),
+        Some(deadline),
+    )
+}
+
 fn is_transient_transport_error(error: &reqwest::Error) -> bool {
     error.is_connect() || error.is_request()
 }
@@ -1531,7 +1554,6 @@ fn diagnostic_class_for_port_error(error: HeadlessTurnPortError) -> ProviderDiag
         HeadlessTurnPortError::TimedOut => ProviderDiagnosticClass::Deadline,
         HeadlessTurnPortError::ProviderContext => ProviderDiagnosticClass::Context,
         HeadlessTurnPortError::ProviderHistoryBudget => ProviderDiagnosticClass::Context,
-        HeadlessTurnPortError::ProviderToolRounds => ProviderDiagnosticClass::Runtime,
         HeadlessTurnPortError::ProviderNetwork => ProviderDiagnosticClass::Network,
         HeadlessTurnPortError::ProviderRateLimited => ProviderDiagnosticClass::RateLimited,
         HeadlessTurnPortError::ProviderRejected => ProviderDiagnosticClass::Rejected,
@@ -1684,6 +1706,9 @@ impl TurnProvider for ChatGptResponsesProvider {
         events: &[TurnEvent],
         cancellation: &HeadlessTurnCancellation,
     ) -> Result<Vec<MessagePart>, HeadlessTurnPortError> {
+        let operation_cancellation =
+            provider_operation_cancellation(cancellation, self.operation_timeout);
+        let cancellation = &operation_cancellation;
         // A prior round in this same turn may have recorded detail for an incident it then
         // recovered from (a mid-stream `error` event whose enclosing `next_parts` call still
         // succeeded). This handle is shared across every round of one attempt, so draining it
@@ -1709,13 +1734,6 @@ impl TurnProvider for ChatGptResponsesProvider {
                 pending_calls,
                 event_cursor,
             } => {
-                if self.continuation_rounds >= MAX_OPENAI_TOOL_CONTINUATION_ROUNDS {
-                    return Err(local_chatgpt_failure(
-                        self.diagnostics.as_ref(),
-                        ProviderDiagnosticKind::ContinuationLimitExceeded,
-                        HeadlessTurnPortError::ProviderToolRounds,
-                    ));
-                }
                 let Some(new_events) = events.get(event_cursor..) else {
                     return Err(local_chatgpt_failure(
                         self.diagnostics.as_ref(),
@@ -1828,7 +1846,6 @@ impl TurnProvider for ChatGptResponsesProvider {
         if response.pending_calls.is_empty() {
             self.state = ChatGptContinuationState::Completed;
         } else {
-            self.continuation_rounds += 1;
             self.state = ChatGptContinuationState::AwaitingToolOutputs {
                 replay_history,
                 pending_calls: response.pending_calls,
@@ -1882,6 +1899,9 @@ impl TurnProvider for OpenAiResponsesProvider {
         _events: &[TurnEvent],
         cancellation: &HeadlessTurnCancellation,
     ) -> Result<Vec<MessagePart>, HeadlessTurnPortError> {
+        let operation_cancellation =
+            provider_operation_cancellation(cancellation, self.operation_timeout);
+        let cancellation = &operation_cancellation;
         // A prior round in this same turn may have recorded detail for an incident it then
         // recovered from (a mid-stream `error` event whose enclosing `next_parts` call still
         // succeeded). This handle is shared across every round of one attempt, so draining it
@@ -1956,15 +1976,10 @@ impl TurnProvider for OpenAiResponsesProvider {
         if response.pending_calls.is_empty() {
             self.state = ContinuationState::Completed;
         } else {
-            if self.continuation_rounds == MAX_OPENAI_TOOL_CONTINUATION_ROUNDS {
-                self.state = ContinuationState::Failed;
-                return Err(HeadlessTurnPortError::Provider);
-            }
             let Some(previous_response_id) = response.response_id else {
                 self.state = ContinuationState::Failed;
                 return Err(HeadlessTurnPortError::Provider);
             };
-            self.continuation_rounds += 1;
             self.state = ContinuationState::AwaitingToolOutputs {
                 previous_response_id,
                 pending_calls: response.pending_calls,

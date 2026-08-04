@@ -439,7 +439,6 @@ pub enum SubagentErrorKind {
     Rejected,
     Server,
     Tool,
-    IterationLimit,
     Runtime,
 }
 
@@ -1317,7 +1316,6 @@ pub enum HeadlessTaskTerminal {
     AgentUnavailable,
     ModelUnavailable,
     SkillUnavailable,
-    IterationLimit,
     InputLimit,
     OutputLimit,
     ConcurrencyLimit,
@@ -1338,7 +1336,6 @@ impl HeadlessTaskTerminal {
             Self::AgentUnavailable => "task: requested agent is unavailable",
             Self::ModelUnavailable => "task: requested model is unavailable",
             Self::SkillUnavailable => "task: requested skill is unavailable",
-            Self::IterationLimit => "task: iteration limit reached",
             Self::InputLimit => "task: input exceeds configured bounds",
             Self::OutputLimit => "task: output exceeds configured bounds",
             Self::ConcurrencyLimit => "task: concurrent child limit reached",
@@ -1445,7 +1442,6 @@ pub enum HeadlessTurnPortError {
     ProviderRejected,
     ProviderContext,
     ProviderHistoryBudget,
-    ProviderToolRounds,
     ProviderRateLimited,
     ProviderServer,
     ProviderNetwork,
@@ -1609,7 +1605,6 @@ pub enum HeadlessTurnError {
     /// context sends the reader to shorten a prompt that was never the problem.
     ProviderHistoryBudget,
     /// The turn kept calling tools past the round limit without finishing.
-    ProviderToolRounds,
     ProviderRateLimited,
     ProviderServer,
     ProviderNetwork,
@@ -1634,7 +1629,6 @@ impl fmt::Display for HeadlessTurnError {
             Self::ProviderRejected => "provider rejected the request",
             Self::ProviderContext => "provider rejected the request because it exceeds context",
             Self::ProviderHistoryBudget => "session history outgrew the replay budget",
-            Self::ProviderToolRounds => "turn exceeded the tool continuation rounds",
             Self::ProviderRateLimited => "provider rate limited the request",
             Self::ProviderServer => "provider service failed",
             Self::ProviderNetwork => "provider network request failed",
@@ -1778,6 +1772,35 @@ pub async fn run_isolated_headless_turn_with_max_iterations_and_progress(
         repository,
         cancellation,
         Some(max_iterations),
+        progress,
+        attempt,
+        AskUnreachable::PromptIsUnreachable,
+    )
+    .await
+}
+
+/// Runs an isolated child turn without a total provider-iteration limit.
+/// Cancellation, deadlines, permissions, and all bounded tool resources remain
+/// enforced by their existing contracts.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_isolated_headless_turn_with_progress(
+    provider: &mut impl TurnProvider,
+    permission_gate: &mut impl HeadlessPermissionGate,
+    permission_resolver: &mut impl HeadlessPermissionResolver,
+    dispatcher: &mut impl HeadlessToolDispatcher,
+    repository: &mut impl CompletedTurnRepository,
+    cancellation: &HeadlessTurnCancellation,
+    progress: Option<&TurnProgressSink>,
+    attempt: Option<AttemptKey>,
+) -> Result<CompletedTurnSnapshot, HeadlessTurnError> {
+    run_headless_turn_with_iteration_limit(
+        provider,
+        permission_gate,
+        permission_resolver,
+        dispatcher,
+        repository,
+        cancellation,
+        None,
         progress,
         attempt,
         AskUnreachable::PromptIsUnreachable,
@@ -2113,7 +2136,6 @@ fn map_port_error(error: HeadlessTurnPortError) -> Option<HeadlessTurnError> {
         HeadlessTurnPortError::ProviderHistoryBudget => {
             Some(HeadlessTurnError::ProviderHistoryBudget)
         }
-        HeadlessTurnPortError::ProviderToolRounds => Some(HeadlessTurnError::ProviderToolRounds),
         HeadlessTurnPortError::ProviderRateLimited => Some(HeadlessTurnError::ProviderRateLimited),
         HeadlessTurnPortError::ProviderServer => Some(HeadlessTurnError::ProviderServer),
         HeadlessTurnPortError::ProviderNetwork => Some(HeadlessTurnError::ProviderNetwork),
