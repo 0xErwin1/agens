@@ -59,14 +59,41 @@ impl TuiPermissionRequest {
     }
 }
 
+/// A parked request, kept with the origin that raised it so a refusal can find
+/// its siblings.
+struct Parked<T> {
+    origin: Option<PromptOrigin>,
+    sender: Sender<T>,
+}
+
+/// Collects the other requests raised by `origin`, so refusing one refuses
+/// them all.
+///
+/// Turning a subagent down stops that subagent; the questions it had already
+/// queued are about work that is no longer happening, and answering them one
+/// by one only asks the reader to re-decide something they already decided.
+/// Only an attributed origin groups: `None` is the main thread, which never
+/// has more than one prompt open, so treating "no origin" as a group would
+/// invent a relationship rather than describe one.
+fn siblings_of<T>(pending: &BTreeMap<u64, Parked<T>>, origin: Option<&PromptOrigin>) -> Vec<u64> {
+    let Some(origin) = origin else {
+        return Vec::new();
+    };
+    pending
+        .iter()
+        .filter(|(_, parked)| parked.origin.as_ref() == Some(origin))
+        .map(|(id, _)| *id)
+        .collect()
+}
+
 struct PermissionBridgeState {
     closed: AtomicBool,
     next_id: AtomicU64,
-    pending: Mutex<BTreeMap<u64, Sender<TuiPermissionReply>>>,
+    pending: Mutex<BTreeMap<u64, Parked<TuiPermissionReply>>>,
 }
 
 impl PermissionBridgeState {
-    fn pending(&self) -> std::sync::MutexGuard<'_, BTreeMap<u64, Sender<TuiPermissionReply>>> {
+    fn pending(&self) -> std::sync::MutexGuard<'_, BTreeMap<u64, Parked<TuiPermissionReply>>> {
         self.pending
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -106,7 +133,13 @@ impl TuiPermissionBridge {
 
         let id = self.state.next_id.fetch_add(1, Ordering::Relaxed);
         let (sender, receiver) = mpsc::channel();
-        self.state.pending().insert(id, sender);
+        self.state.pending().insert(
+            id,
+            Parked {
+                origin: origin.clone(),
+                sender,
+            },
+        );
         let request = TuiPermissionRequest {
             id,
             tool: tool.into(),
@@ -135,11 +168,27 @@ impl TuiPermissionBridge {
         }
     }
 
+    /// Resolves one request, and every other one from the same execution when
+    /// the answer was a refusal — see [`siblings_of`].
     pub fn reply(&self, id: u64, reply: TuiPermissionReply) -> bool {
-        self.state
-            .pending()
-            .remove(&id)
-            .is_some_and(|sender| sender.send(reply).is_ok())
+        let mut pending = self.state.pending();
+        let Some(parked) = pending.remove(&id) else {
+            return false;
+        };
+        let delivered = parked.sender.send(reply).is_ok();
+
+        if matches!(
+            reply,
+            TuiPermissionReply::DenyOnce | TuiPermissionReply::DenyAlways
+        ) {
+            for sibling in siblings_of(&pending, parked.origin.as_ref()) {
+                if let Some(parked) = pending.remove(&sibling) {
+                    let _ = parked.sender.send(TuiPermissionReply::DenyOnce);
+                }
+            }
+        }
+
+        delivered
     }
 
     pub fn is_pending(&self, id: u64) -> bool {
@@ -150,8 +199,8 @@ impl TuiPermissionBridge {
         self.state.closed.store(true, Ordering::Release);
         let pending = std::mem::take(&mut *self.state.pending());
         let had_pending = !pending.is_empty();
-        for sender in pending.into_values() {
-            let _ = sender.send(TuiPermissionReply::Cancelled);
+        for parked in pending.into_values() {
+            let _ = parked.sender.send(TuiPermissionReply::Cancelled);
         }
         had_pending
     }
@@ -182,11 +231,11 @@ impl TuiAskUserRequest {
 struct AskUserBridgeState {
     closed: AtomicBool,
     next_id: AtomicU64,
-    pending: Mutex<BTreeMap<u64, Sender<AskUserReply>>>,
+    pending: Mutex<BTreeMap<u64, Parked<AskUserReply>>>,
 }
 
 impl AskUserBridgeState {
-    fn pending(&self) -> std::sync::MutexGuard<'_, BTreeMap<u64, Sender<AskUserReply>>> {
+    fn pending(&self) -> std::sync::MutexGuard<'_, BTreeMap<u64, Parked<AskUserReply>>> {
         self.pending
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -248,7 +297,13 @@ impl TuiAskUserBridge {
 
         let id = self.state.next_id.fetch_add(1, Ordering::Relaxed);
         let (sender, receiver) = mpsc::channel();
-        self.state.pending().insert(id, sender);
+        self.state.pending().insert(
+            id,
+            Parked {
+                origin: origin.clone(),
+                sender,
+            },
+        );
         let tui_request = TuiAskUserRequest {
             id,
             request,
@@ -316,10 +371,24 @@ impl TuiAskUserBridge {
     /// the channel is unbounded — `send` on an unbounded `mpsc` channel never
     /// blocks, so the lock is never held across a wait.
     pub fn reply(&self, id: u64, reply: AskUserReply) -> bool {
-        self.state
-            .pending()
-            .remove(&id)
-            .is_some_and(|sender| sender.send(reply).is_ok())
+        let mut pending = self.state.pending();
+        let Some(parked) = pending.remove(&id) else {
+            return false;
+        };
+        let delivered = parked.sender.send(reply.clone()).is_ok();
+
+        // Cancelling a subagent's question cancels the rest of that
+        // subagent's, for the same reason a refused permission does: the work
+        // they were about is over.
+        if matches!(reply, AskUserReply::Cancelled) {
+            for sibling in siblings_of(&pending, parked.origin.as_ref()) {
+                if let Some(parked) = pending.remove(&sibling) {
+                    let _ = parked.sender.send(AskUserReply::Cancelled);
+                }
+            }
+        }
+
+        delivered
     }
 
     pub fn is_pending(&self, id: u64) -> bool {
@@ -332,8 +401,10 @@ impl TuiAskUserBridge {
         self.state.closed.store(true, Ordering::Release);
         let pending = std::mem::take(&mut *self.state.pending());
         let had_pending = !pending.is_empty();
-        for sender in pending.into_values() {
-            let _ = sender.send(AskUserReply::Unavailable(AskUserUnavailable::SurfaceClosed));
+        for parked in pending.into_values() {
+            let _ = parked
+                .sender
+                .send(AskUserReply::Unavailable(AskUserUnavailable::SurfaceClosed));
         }
         had_pending
     }
@@ -382,7 +453,7 @@ impl SubagentErrorPresentation for SubagentErrorKind {
 
 #[cfg(test)]
 mod tests {
-    use super::{SubagentErrorPresentation, TuiAskUserBridge};
+    use super::{Parked, PromptOrigin, SubagentErrorPresentation, TuiAskUserBridge};
     use agens_core::SubagentErrorKind;
     use agens_core::ask_user::{
         AskUserAnswer, AskUserMode, AskUserOption, AskUserQuestion, AskUserReply, AskUserRequest,
@@ -672,12 +743,104 @@ mod tests {
     /// outcome it was about to declare on its own. Complements the racy
     /// end-to-end test above, which exercises the real scheduling-dependent
     /// path but cannot force this exact interleaving on every run.
+    /// Turning a subagent down ends its queue. Otherwise the reader answers
+    /// "no" and is immediately asked the next question of the same work they
+    /// just stopped — while a different subagent's question, which they have
+    /// not decided anything about, has to survive untouched.
+    #[test]
+    fn refusing_one_subagent_refuses_the_rest_of_its_questions_and_nobody_elses() {
+        let (bridge, _requests) = super::TuiPermissionBridge::channel();
+        let reviewer = PromptOrigin {
+            execution: 7,
+            agent: "reviewer".into(),
+        };
+        let builder = PromptOrigin {
+            execution: 9,
+            agent: "builder".into(),
+        };
+
+        let park = |origin: Option<PromptOrigin>| {
+            let id = bridge
+                .state
+                .next_id
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let (sender, receiver) = mpsc::channel();
+            bridge.state.pending().insert(id, Parked { origin, sender });
+            (id, receiver)
+        };
+
+        let (first, _first_rx) = park(Some(reviewer.clone()));
+        let (second, second_rx) = park(Some(reviewer));
+        let (other, other_rx) = park(Some(builder));
+        let (main, main_rx) = park(None);
+
+        assert!(bridge.reply(first, super::TuiPermissionReply::DenyOnce));
+
+        assert!(
+            !bridge.is_pending(second),
+            "the same subagent's other question must be refused with it"
+        );
+        assert_eq!(
+            second_rx.try_recv(),
+            Ok(super::TuiPermissionReply::DenyOnce)
+        );
+
+        assert!(
+            bridge.is_pending(other),
+            "a different subagent decided nothing and must still be waiting"
+        );
+        assert!(other_rx.try_recv().is_err());
+        assert!(bridge.is_pending(main), "and neither did the main thread");
+        assert!(main_rx.try_recv().is_err());
+    }
+
+    /// Approving is not stopping: the rest of that subagent's queue is still
+    /// live work the reader has not decided about.
+    #[test]
+    fn allowing_one_question_leaves_the_rest_of_that_subagents_queue_alone() {
+        let (bridge, _requests) = super::TuiPermissionBridge::channel();
+        let origin = PromptOrigin {
+            execution: 3,
+            agent: "worker".into(),
+        };
+
+        let park = || {
+            let id = bridge
+                .state
+                .next_id
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let (sender, receiver) = mpsc::channel();
+            bridge.state.pending().insert(
+                id,
+                Parked {
+                    origin: Some(origin.clone()),
+                    sender,
+                },
+            );
+            (id, receiver)
+        };
+
+        let (first, _first_rx) = park();
+        let (second, second_rx) = park();
+
+        assert!(bridge.reply(first, super::TuiPermissionReply::AllowOnce));
+
+        assert!(bridge.is_pending(second));
+        assert!(second_rx.try_recv().is_err());
+    }
+
     #[test]
     fn a_losing_self_reply_defers_to_whatever_already_committed() {
         let (bridge, _requests) = TuiAskUserBridge::channel();
         let (sender, receiver) = mpsc::channel();
         let id = 42;
-        bridge.state.pending().insert(id, sender);
+        bridge.state.pending().insert(
+            id,
+            Parked {
+                origin: None,
+                sender,
+            },
+        );
         assert!(bridge.reply(id, answered_reply()));
 
         let outcome = bridge.resolve_or_defer_to_committed(id, AskUserReply::Cancelled, &receiver);

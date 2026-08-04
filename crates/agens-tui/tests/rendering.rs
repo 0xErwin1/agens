@@ -6178,6 +6178,41 @@ fn rendered_at(tui: &mut Tui<FakeEngine>, width: u16, height: u16) -> RatatuiRen
     renderer
 }
 
+/// With several subagents running, an unattributed question is one the reader
+/// cannot answer responsibly. The name goes in the title, so it is read before
+/// the question itself; the main thread's own questions stay unadorned,
+/// because there is nothing to disambiguate.
+#[test]
+fn a_delegated_question_names_the_subagent_that_raised_it() {
+    let mut tui = Tui::new(FakeEngine);
+    tui.open_ask_user_from(
+        1,
+        three_question_ask_user_request(),
+        Some(agens_tui::PromptOrigin {
+            execution: 7,
+            agent: "reviewer".into(),
+        }),
+    );
+    let renderer = rendered_at(&mut tui, ASK_USER_WIDE_TERMINAL, 30);
+
+    let text = rendered_text(&renderer);
+    assert!(
+        text.contains("reviewer") && text.contains("#7"),
+        "the overlay must say which subagent is asking: {text:?}"
+    );
+
+    let (_main, main_renderer) = open_ask_user(
+        ASK_USER_WIDE_TERMINAL,
+        30,
+        three_question_ask_user_request(),
+    );
+    let main_text = rendered_text(&main_renderer);
+    assert!(
+        !main_text.contains('#'),
+        "the main thread's own question carries no execution marker: {main_text:?}"
+    );
+}
+
 #[test]
 fn ask_user_names_the_action_the_row_actually_performs_on_each_question() {
     let (mut tui, mut renderer) = open_ask_user(
