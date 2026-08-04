@@ -181,9 +181,9 @@ pub enum Key {
     DeleteToLineEnd,
     /// Submits the current input.
     Enter,
-    /// Cancels an active turn when one exists.
+    /// Dismisses overlays or returns from nested views; inert on the main running surface.
     Escape,
-    /// Cancels the active turn and exits.
+    /// Requests foreground cancellation, or retains the existing quit behavior when idle.
     CtrlC,
     /// Copies the active transcript selection through the terminal clipboard.
     CtrlShiftC,
@@ -7805,8 +7805,12 @@ where
         match key.composer_equivalent() {
             Key::Char(character) => self.insert_text(&character.to_string()),
             Key::ShiftEnter => self.insert_text("\n"),
-            Key::Backspace if cursor > 0 => self.replace_chars(cursor - 1, cursor, ""),
-            Key::Delete => self.replace_chars(cursor, cursor.saturating_add(1), ""),
+            Key::Backspace if cursor > 0 => {
+                self.replace_chars(previous_grapheme_boundary(&self.input, cursor), cursor, "");
+            }
+            Key::Delete => {
+                self.replace_chars(cursor, next_grapheme_boundary(&self.input, cursor), "");
+            }
             Key::DeletePreviousWord => {
                 self.replace_chars(previous_word_boundary(&self.input, cursor), cursor, "");
             }
@@ -7819,10 +7823,8 @@ where
             Key::DeleteToLineEnd => {
                 self.replace_chars(cursor, line_end(&self.input, cursor), "");
             }
-            Key::Left => self.input_cursor = cursor.saturating_sub(1),
-            Key::Right => {
-                self.input_cursor = cursor.saturating_add(1).min(self.input.chars().count());
-            }
+            Key::Left => self.input_cursor = previous_grapheme_boundary(&self.input, cursor),
+            Key::Right => self.input_cursor = next_grapheme_boundary(&self.input, cursor),
             Key::PreviousWord => {
                 self.input_cursor = previous_word_boundary(&self.input, cursor);
             }
@@ -8060,8 +8062,8 @@ where
 
     fn replace_chars(&mut self, start: usize, end: usize, replacement: &str) {
         let character_count = self.input.chars().count();
-        let start = start.min(character_count);
-        let end = end.min(character_count).max(start);
+        let start = grapheme_boundary_at_or_before(&self.input, start.min(character_count));
+        let end = grapheme_boundary_at_or_after(&self.input, end.min(character_count)).max(start);
         let start_byte = byte_index(&self.input, start);
         let end_byte = byte_index(&self.input, end);
         self.input.replace_range(start_byte..end_byte, replacement);
@@ -9367,6 +9369,60 @@ fn byte_index(input: &str, character_index: usize) -> usize {
         .char_indices()
         .nth(character_index)
         .map_or(input.len(), |(index, _)| index)
+}
+
+fn previous_grapheme_boundary(input: &str, cursor: usize) -> usize {
+    let mut boundary = 0;
+
+    for grapheme in input.graphemes(true) {
+        let end = boundary + grapheme.chars().count();
+        if end >= cursor {
+            return boundary;
+        }
+        boundary = end;
+    }
+
+    boundary
+}
+
+fn next_grapheme_boundary(input: &str, cursor: usize) -> usize {
+    let mut boundary = 0;
+
+    for grapheme in input.graphemes(true) {
+        boundary += grapheme.chars().count();
+        if cursor < boundary {
+            return boundary;
+        }
+    }
+
+    boundary
+}
+
+fn grapheme_boundary_at_or_before(input: &str, cursor: usize) -> usize {
+    let mut boundary = 0;
+
+    for grapheme in input.graphemes(true) {
+        let end = boundary + grapheme.chars().count();
+        if end > cursor {
+            return boundary;
+        }
+        boundary = end;
+    }
+
+    boundary
+}
+
+fn grapheme_boundary_at_or_after(input: &str, cursor: usize) -> usize {
+    let mut boundary = 0;
+
+    for grapheme in input.graphemes(true) {
+        boundary += grapheme.chars().count();
+        if cursor <= boundary {
+            return boundary;
+        }
+    }
+
+    boundary
 }
 
 fn line_start(input: &str, cursor: usize) -> usize {

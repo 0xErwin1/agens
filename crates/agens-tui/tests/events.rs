@@ -3004,6 +3004,55 @@ fn multiline_editing_and_scroll_follow_are_deterministic() {
 }
 
 #[test]
+fn composer_editing_moves_and_deletes_complete_graphemes() {
+    let mut tui = Tui::new(FakeEngine::default());
+    for character in "e\u{301}🙂z".chars() {
+        tui.handle(Event::Key(Key::Char(character)));
+    }
+
+    tui.handle(Event::Key(Key::Left));
+    assert_eq!(tui.view().input_cursor, 3);
+    tui.handle(Event::Key(Key::Left));
+    assert_eq!(tui.view().input_cursor, 2);
+    tui.handle(Event::Key(Key::Left));
+    assert_eq!(tui.view().input_cursor, 0);
+
+    tui.handle(Event::Key(Key::Right));
+    assert_eq!(tui.view().input_cursor, 2);
+    tui.handle(Event::Key(Key::Backspace));
+    assert_eq!(tui.input(), "🙂z");
+    assert_eq!(tui.view().input_cursor, 0);
+
+    tui.handle(Event::Key(Key::Delete));
+    assert_eq!(tui.input(), "z");
+    assert_eq!(tui.view().input_cursor, 0);
+}
+
+#[test]
+fn composer_insertion_and_word_movement_keep_grapheme_boundaries() {
+    let mut tui = Tui::new(FakeEngine::default());
+    for character in "e\u{301} 🙂".chars() {
+        tui.handle(Event::Key(Key::Char(character)));
+    }
+
+    tui.handle(Event::Key(Key::PreviousWord));
+    assert_eq!(tui.view().input_cursor, 3);
+    tui.handle(Event::Key(Key::PreviousWord));
+    assert_eq!(tui.view().input_cursor, 0);
+    tui.handle(Event::Key(Key::NextWord));
+    assert_eq!(tui.view().input_cursor, 2);
+    tui.handle(Event::Key(Key::Right));
+    assert_eq!(tui.view().input_cursor, 3);
+
+    tui.handle(Event::Key(Key::Char('x')));
+    assert_eq!(tui.input(), "e\u{301} x🙂");
+    assert_eq!(tui.view().input_cursor, 4);
+    tui.handle(Event::Key(Key::Delete));
+    assert_eq!(tui.input(), "e\u{301} x");
+    assert_eq!(tui.view().input_cursor, 4);
+}
+
+#[test]
 fn ratatui_layout_degrades_without_overlapping_at_standard_narrow_and_short_sizes() {
     for (width, height) in [(80, 24), (35, 24), (80, 10)] {
         let backend = TestBackend::new(width, height);
