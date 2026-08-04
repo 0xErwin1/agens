@@ -13,6 +13,7 @@ use agens_tui::{
     SessionDialogRequest, SessionDialogScope, TranscriptEntry, TranscriptFocus, TranscriptId, Tui,
     TuiExecutionEvent, TuiExecutionState, TuiPermissionBridge, TuiPermissionReply, TuiPresentation,
     TuiProviderOutcome, TuiRouteProgress, TuiRuntimeEvent, TuiSubagentEvent, TuiSubmissionOutcome,
+    TurnLifecycle,
 };
 use ratatui::{Terminal, backend::TestBackend};
 use std::{
@@ -1501,6 +1502,27 @@ fn tool_result(id: &str, output: &str) -> ConversationEvent {
 }
 
 #[test]
+fn scheduler_exposes_typed_lifecycle_and_stable_queue_entries() {
+    let mut app = AppState::new(2);
+
+    assert_eq!(app.lifecycle(), &TurnLifecycle::Idle);
+    app.reduce(AppEvent::SubmitPrompt("first".into()));
+
+    let active = app.lifecycle().active().expect("running active route");
+    assert_eq!(active.generation(), 1);
+    assert_eq!(active.prompt(), "first");
+
+    app.reduce(AppEvent::SubmitPrompt("second".into()));
+    app.reduce(AppEvent::SubmitPrompt("third".into()));
+
+    let queued = app.queued_entries();
+    assert_eq!(queued.len(), 2);
+    assert_eq!(queued[0].prompt(), "second");
+    assert_eq!(queued[1].prompt(), "third");
+    assert_ne!(queued[0].id(), queued[1].id());
+}
+
+#[test]
 fn reducer_starts_idle_prompt_and_persists_only_after_success() {
     let mut app = AppState::new(2);
 
@@ -1711,7 +1733,12 @@ fn command_new_resets_only_after_backend_success_and_running_matrix_refuses_muta
     assert_eq!(app.queued_prompts(), ["second queued"]);
 
     assert_eq!(app.reduce(AppEvent::ResetSucceeded), vec![Effect::Render]);
-    assert_eq!(app, AppState::new(2));
+    assert_eq!(app.runtime(), &Runtime::Idle);
+    assert_eq!(app.lifecycle(), &TurnLifecycle::Idle);
+    assert!(app.queued_prompts().is_empty());
+    assert!(app.completed_history().is_empty());
+    assert!(app.composer().is_empty());
+    assert_eq!(app.dialog(), None);
 
     app.reduce(AppEvent::SubmitPrompt("running".into()));
     for command in [

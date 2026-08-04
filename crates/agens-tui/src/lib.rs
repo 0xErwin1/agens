@@ -18,7 +18,9 @@ pub use agens_core::{
     DiffLine, DiffLineKind, NoticeSeverity, ToolResultState, TuiExecution, TuiExecutionEvent,
     TuiExecutionState, TuiRuntimeEvent, TuiSubagentEvent,
 };
-pub use app::{AppEvent, AppState, Command, Dialog, Effect, Runtime};
+pub use app::{
+    ActiveRoute, AppEvent, AppState, Command, Dialog, Effect, QueueEntry, Runtime, TurnLifecycle,
+};
 pub use ask_user::{AskUserEditing, AskUserRowSnapshot, AskUserSnapshot};
 pub use bridge::{
     PromptOrigin, TuiAskUserBridge, TuiAskUserRequest, TuiPermissionBridge, TuiPermissionReply,

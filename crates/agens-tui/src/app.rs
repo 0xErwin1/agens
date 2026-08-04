@@ -15,6 +15,73 @@ pub enum Runtime {
     Running,
 }
 
+/// Identifies the foreground route that owns a runtime turn.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActiveRoute {
+    generation: u64,
+    prompt: String,
+}
+
+impl ActiveRoute {
+    fn new(generation: u64, prompt: String) -> Self {
+        Self { generation, prompt }
+    }
+
+    /// Returns the monotonically increasing route generation.
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Returns the prompt that was dispatched for this route.
+    pub fn prompt(&self) -> &str {
+        &self.prompt
+    }
+}
+
+/// The lifecycle of the one foreground turn owned by the scheduler.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TurnLifecycle {
+    /// No foreground turn is active.
+    Idle,
+    /// A foreground route is running.
+    Running(ActiveRoute),
+    /// The active route has a pending cancellation request.
+    Cancelling(ActiveRoute),
+}
+
+impl TurnLifecycle {
+    /// Returns the route for either active lifecycle state.
+    pub const fn active(&self) -> Option<&ActiveRoute> {
+        match self {
+            Self::Idle => None,
+            Self::Running(route) | Self::Cancelling(route) => Some(route),
+        }
+    }
+}
+
+/// A stable FIFO entry that has not yet been dispatched to history.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueueEntry {
+    id: u64,
+    prompt: String,
+}
+
+impl QueueEntry {
+    fn new(id: u64, prompt: String) -> Self {
+        Self { id, prompt }
+    }
+
+    /// Returns this entry's stable identifier.
+    pub const fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// Returns the queued prompt without adopting it into history.
+    pub fn prompt(&self) -> &str {
+        &self.prompt
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Dialog {
     Command,
@@ -81,10 +148,13 @@ pub enum Effect {
 /// Application state whose prompt queue has a fixed capacity for its lifetime.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AppState {
+    /// Compatibility projection for consumers that only distinguish busy and idle.
     runtime: Runtime,
-    active_prompt: Option<String>,
-    queued_prompts: VecDeque<String>,
+    lifecycle: TurnLifecycle,
+    queued_prompts: VecDeque<QueueEntry>,
     queue_capacity: usize,
+    next_generation: u64,
+    next_queue_entry_id: u64,
     completed_history: Vec<(String, String)>,
     composer: String,
     dialog: Option<Dialog>,
@@ -98,9 +168,11 @@ impl AppState {
 
         Self {
             runtime: Runtime::Idle,
-            active_prompt: None,
+            lifecycle: TurnLifecycle::Idle,
             queued_prompts: VecDeque::with_capacity(queue_capacity),
             queue_capacity,
+            next_generation: 1,
+            next_queue_entry_id: 1,
             completed_history: Vec::new(),
             composer: String::new(),
             dialog: None,
@@ -114,8 +186,7 @@ impl AppState {
             AppEvent::SubmitPrompt(prompt) => self.submit_prompt(prompt),
             AppEvent::TurnCompleted(output) => self.complete_turn(output),
             AppEvent::TurnCancelled | AppEvent::TurnFailed => {
-                self.runtime = Runtime::Idle;
-                self.active_prompt = None;
+                self.transition_to_idle();
                 self.disarm_exit();
                 self.begin_next_queued_turn().into_iter().collect()
             }
@@ -138,9 +209,19 @@ impl AppState {
         &self.runtime
     }
 
+    /// Returns the authoritative foreground lifecycle.
+    pub const fn lifecycle(&self) -> &TurnLifecycle {
+        &self.lifecycle
+    }
+
     /// Returns queued prompts in their FIFO order.
     pub fn queued_prompts(&self) -> Vec<&str> {
-        self.queued_prompts.iter().map(String::as_str).collect()
+        self.queued_prompts.iter().map(QueueEntry::prompt).collect()
+    }
+
+    /// Returns queued entries with stable identities in FIFO order.
+    pub fn queued_entries(&self) -> Vec<&QueueEntry> {
+        self.queued_prompts.iter().collect()
     }
 
     /// Returns only successfully completed prompt/output history.
@@ -168,10 +249,8 @@ impl AppState {
 
     fn submit_prompt(&mut self, prompt: String) -> Vec<Effect> {
         self.disarm_exit();
-        if self.runtime == Runtime::Idle {
-            self.active_prompt = Some(prompt.clone());
-            self.runtime = Runtime::Running;
-            return vec![Effect::StartPrompt(prompt)];
+        if self.lifecycle == TurnLifecycle::Idle {
+            return vec![self.begin_turn(prompt)];
         }
 
         if self.queued_prompts.len() == self.queue_capacity {
@@ -180,19 +259,21 @@ impl AppState {
             )];
         }
 
-        self.queued_prompts.push_back(prompt);
+        let entry = QueueEntry::new(self.next_queue_entry_id, prompt);
+        self.next_queue_entry_id += 1;
+        self.queued_prompts.push_back(entry);
         Vec::new()
     }
 
     fn complete_turn(&mut self, output: String) -> Vec<Effect> {
         self.disarm_exit();
-        let Some(prompt) = self.active_prompt.take() else {
+        let Some(prompt) = self.lifecycle.active().map(|route| route.prompt.clone()) else {
             return Vec::new();
         };
 
         self.completed_history
             .push((prompt.clone(), output.clone()));
-        self.runtime = Runtime::Idle;
+        self.transition_to_idle();
         let mut effects = vec![Effect::PersistCompleted { prompt, output }];
 
         if let Some(effect) = self.begin_next_queued_turn() {
@@ -203,13 +284,23 @@ impl AppState {
     }
 
     fn begin_next_queued_turn(&mut self) -> Option<Effect> {
-        let next_prompt = self.queued_prompts.pop_front()?;
+        let next_prompt = self.queued_prompts.pop_front()?.prompt;
+        Some(self.begin_turn(next_prompt))
+    }
 
-        self.active_prompt = Some(next_prompt.clone());
+    fn begin_turn(&mut self, prompt: String) -> Effect {
+        let generation = self.next_generation;
+        self.next_generation += 1;
+        self.lifecycle = TurnLifecycle::Running(ActiveRoute::new(generation, prompt.clone()));
         self.runtime = Runtime::Running;
         self.disarm_exit();
 
-        Some(Effect::StartPrompt(next_prompt))
+        Effect::StartPrompt(prompt)
+    }
+
+    fn transition_to_idle(&mut self) {
+        self.lifecycle = TurnLifecycle::Idle;
+        self.runtime = Runtime::Idle;
     }
 
     fn command(&mut self, command: Command, now: Instant) -> Vec<Effect> {
@@ -326,8 +417,7 @@ impl AppState {
     }
 
     fn reset_after_backend_success(&mut self) -> Vec<Effect> {
-        self.runtime = Runtime::Idle;
-        self.active_prompt = None;
+        self.transition_to_idle();
         self.queued_prompts.clear();
         self.completed_history.clear();
         self.composer.clear();
