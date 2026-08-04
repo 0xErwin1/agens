@@ -186,7 +186,8 @@ pub struct Skill {
     description: String,
     source: PathBuf,
     directory: PathBuf,
-    directory_descriptor: Arc<fs::File>,
+    root_directory_descriptor: Arc<fs::File>,
+    directory_name: std::ffi::OsString,
 }
 
 impl PartialEq for Skill {
@@ -506,20 +507,9 @@ impl Skill {
     }
 
     pub fn load_instructions(&self) -> Result<String, String> {
-        let mut manifest = open_manifest(&self.directory_descriptor)?
-            .ok_or("skill instructions are unavailable")?;
-        let metadata = manifest
-            .metadata()
-            .map_err(|error| format!("cannot inspect opened manifest: {error}"))?;
-        ensure_single_link_regular_file(&metadata, "manifest must be a single-link regular file")?;
-        let contents = read_bounded_utf8(&mut manifest, MAX_SKILL_MANIFEST_BYTES)?;
+        let directory = self.open_current_directory()?;
+        let contents = self.load_current_manifest(&directory)?;
 
-        parse_skill_manifest(
-            &self.source,
-            &self.directory,
-            Arc::clone(&self.directory_descriptor),
-            &contents,
-        )?;
         split_skill_frontmatter(&contents).map(|(_, body)| body.trim().to_owned())
     }
 
@@ -528,11 +518,12 @@ impl Skill {
             return Err("skill resource name must be a single normal filename".into());
         }
 
-        let class_directory = open_child_directory(
-            &self.directory_descriptor,
-            std::ffi::OsStr::new(class.directory()),
-        )?
-        .ok_or("skill resource class is unavailable")?;
+        let directory = self.open_current_directory()?;
+        self.load_current_manifest(&directory)?;
+
+        let class_directory =
+            open_child_directory(&directory, std::ffi::OsStr::new(class.directory()))?
+                .ok_or("skill resource class is unavailable")?;
         let mut resource = open_child_file(&class_directory, std::ffi::OsStr::new(name))?
             .ok_or("skill resource is unavailable")?;
         let metadata = resource
@@ -549,6 +540,36 @@ impl Skill {
         }
 
         read_bounded_utf8(&mut resource, MAX_SKILL_RESOURCE_BYTES)
+    }
+
+    /// Opens the current skill directory through the audited root descriptor.
+    /// This observes child-directory replacements without reopening a root or
+    /// ancestor pathname that may have been redirected after discovery.
+    fn open_current_directory(&self) -> Result<fs::File, String> {
+        open_child_directory(&self.root_directory_descriptor, &self.directory_name)?
+            .ok_or_else(|| "skill directory is unavailable".into())
+    }
+
+    fn load_current_manifest(&self, directory: &fs::File) -> Result<String, String> {
+        let mut manifest = open_manifest(directory)?.ok_or("skill instructions are unavailable")?;
+        let metadata = manifest
+            .metadata()
+            .map_err(|error| format!("cannot inspect opened manifest: {error}"))?;
+        ensure_single_link_regular_file(&metadata, "manifest must be a single-link regular file")?;
+        let contents = read_bounded_utf8(&mut manifest, MAX_SKILL_MANIFEST_BYTES)?;
+
+        let current = parse_skill_manifest(
+            &self.source,
+            &self.directory,
+            Arc::clone(&self.root_directory_descriptor),
+            self.directory_name.clone(),
+            &contents,
+        )?;
+        if current.name != self.name {
+            return Err("skill manifest name changed after discovery".into());
+        }
+
+        Ok(contents)
     }
 
     pub fn source(&self) -> &Path {
@@ -911,7 +932,7 @@ struct SkillRootLoad {
 #[cfg(unix)]
 fn load_skill_root(root: &Path) -> Result<SkillRootLoad, SkillDiscoveryError> {
     let root_directory = match open_skill_root(root) {
-        Ok(directory) => directory,
+        Ok(directory) => Arc::new(directory),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             return Ok(SkillRootLoad::default());
         }
@@ -985,7 +1006,7 @@ fn load_skill_root(root: &Path) -> Result<SkillRootLoad, SkillDiscoveryError> {
 #[cfg(unix)]
 fn load_skill_manifest(
     root: &Path,
-    root_directory: &fs::File,
+    root_directory: &Arc<fs::File>,
     directory_name: &std::ffi::OsStr,
 ) -> Result<Option<Skill>, SkillDiagnostic> {
     let directory = root.join(directory_name);
@@ -1020,7 +1041,8 @@ fn load_skill_manifest(
     parse_skill_manifest(
         &manifest,
         &directory,
-        Arc::new(directory_descriptor),
+        Arc::clone(root_directory),
+        directory_name.to_os_string(),
         &contents,
     )
     .map(Some)
@@ -1030,7 +1052,8 @@ fn load_skill_manifest(
 fn parse_skill_manifest(
     source: &Path,
     directory: &Path,
-    directory_descriptor: Arc<fs::File>,
+    root_directory_descriptor: Arc<fs::File>,
+    directory_name: std::ffi::OsString,
     contents: &str,
 ) -> Result<Skill, String> {
     let (frontmatter, body) = split_skill_frontmatter(contents)?;
@@ -1049,7 +1072,8 @@ fn parse_skill_manifest(
         description,
         source: source.to_path_buf(),
         directory: directory.to_path_buf(),
-        directory_descriptor,
+        root_directory_descriptor,
+        directory_name,
     })
 }
 
