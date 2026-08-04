@@ -5,6 +5,7 @@ use std::{collections::VecDeque, time::Instant};
 use crate::Key;
 
 const RUNNING_REFUSAL: &str = "This command is unavailable while a response is in progress.";
+const QUEUE_FULL_REFUSAL: &str = "Prompt queue is full; draft was kept unchanged.";
 
 /// Whether the application currently owns an active runtime turn.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -14,6 +15,9 @@ pub enum Runtime {
     /// A turn is active; prompts may enter the fixed-capacity queue.
     Running,
 }
+
+static IDLE_RUNTIME: Runtime = Runtime::Idle;
+static RUNNING_RUNTIME: Runtime = Runtime::Running;
 
 /// Identifies the foreground route that owns a runtime turn.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -64,11 +68,91 @@ impl TurnLifecycle {
 pub struct QueueEntry {
     id: u64,
     prompt: String,
+    resolved_prompt: Option<String>,
+}
+
+/// A prompt-scheduler transition safe to expose to local diagnostics.
+///
+/// These variants intentionally carry no route, prompt, task, or user content.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PromptTransition {
+    Queued,
+    Dequeued,
+    Removed,
+    CancellationRequested,
+    CancellationConfirmed,
+    StaleEventDropped,
+    AutoTurnCoalesced,
+}
+
+/// Sanitized counters and transition history for the prompt scheduler.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PromptObservability {
+    queued: u64,
+    dequeued: u64,
+    removed: u64,
+    cancellation_requested: u64,
+    cancellation_confirmed: u64,
+    stale_event_dropped: u64,
+    auto_turn_coalesced: u64,
+    transitions: Vec<PromptTransition>,
+}
+
+impl PromptObservability {
+    pub const fn queued(&self) -> u64 {
+        self.queued
+    }
+    pub const fn dequeued(&self) -> u64 {
+        self.dequeued
+    }
+    pub const fn removed(&self) -> u64 {
+        self.removed
+    }
+    pub const fn cancellation_requested(&self) -> u64 {
+        self.cancellation_requested
+    }
+    pub const fn cancellation_confirmed(&self) -> u64 {
+        self.cancellation_confirmed
+    }
+    pub const fn stale_event_dropped(&self) -> u64 {
+        self.stale_event_dropped
+    }
+    pub const fn auto_turn_coalesced(&self) -> u64 {
+        self.auto_turn_coalesced
+    }
+    pub fn transitions(&self) -> &[PromptTransition] {
+        &self.transitions
+    }
+
+    fn record(&mut self, transition: PromptTransition) {
+        match transition {
+            PromptTransition::Queued => self.queued += 1,
+            PromptTransition::Dequeued => self.dequeued += 1,
+            PromptTransition::Removed => self.removed += 1,
+            PromptTransition::CancellationRequested => self.cancellation_requested += 1,
+            PromptTransition::CancellationConfirmed => self.cancellation_confirmed += 1,
+            PromptTransition::StaleEventDropped => self.stale_event_dropped += 1,
+            PromptTransition::AutoTurnCoalesced => self.auto_turn_coalesced += 1,
+        }
+        self.transitions.push(transition);
+    }
 }
 
 impl QueueEntry {
     fn new(id: u64, prompt: String) -> Self {
-        Self { id, prompt }
+        Self {
+            id,
+            prompt,
+            resolved_prompt: None,
+        }
+    }
+
+    fn resolved(id: u64, display: String, prompt: String) -> Self {
+        Self {
+            id,
+            prompt: display,
+            resolved_prompt: Some(prompt),
+        }
     }
 
     /// Returns this entry's stable identifier.
@@ -107,12 +191,30 @@ pub enum Command {
 pub enum AppEvent {
     /// An explicitly safe conversational prompt was submitted.
     SubmitPrompt(String),
+    /// Queues a catalog-resolved provider prompt without exposing it in history.
+    QueuePrompt {
+        display: String,
+        prompt: String,
+    },
     /// The active turn completed successfully with its final output.
-    TurnCompleted(String),
+    TurnCompletedFor {
+        generation: u64,
+        output: String,
+    },
     /// The active turn was cancelled.
-    TurnCancelled,
+    TurnCancelledFor {
+        generation: u64,
+    },
     /// The active turn failed.
-    TurnFailed,
+    TurnFailedFor {
+        generation: u64,
+    },
+    /// The active scheduler-owned turn handed work to the background.
+    TurnReleasedFor {
+        generation: u64,
+    },
+    /// A background completion needs one deferred, coalesced internal turn.
+    DeferAutoTurn,
     /// A terminal key routed through dialog, global, and composer handlers.
     Key(Key, Instant),
     Command(Command, Instant),
@@ -125,6 +227,11 @@ pub enum AppEvent {
 pub enum Effect {
     /// Begin a new runtime turn for this prompt.
     StartPrompt(String),
+    /// Begin a queued prompt whose catalog expansion differs from its display text.
+    StartQueuedPrompt {
+        display: String,
+        prompt: String,
+    },
     /// Persist a successfully completed prompt and output pair.
     PersistCompleted {
         prompt: String,
@@ -146,10 +253,8 @@ pub enum Effect {
 }
 
 /// Application state whose prompt queue has a fixed capacity for its lifetime.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct AppState {
-    /// Compatibility projection for consumers that only distinguish busy and idle.
-    runtime: Runtime,
     lifecycle: TurnLifecycle,
     queued_prompts: VecDeque<QueueEntry>,
     queue_capacity: usize,
@@ -159,7 +264,26 @@ pub struct AppState {
     composer: String,
     dialog: Option<Dialog>,
     exit_armed_until: Option<Instant>,
+    pending_auto_turns: usize,
+    observability: PromptObservability,
 }
+
+impl PartialEq for AppState {
+    fn eq(&self, other: &Self) -> bool {
+        self.lifecycle == other.lifecycle
+            && self.queued_prompts == other.queued_prompts
+            && self.queue_capacity == other.queue_capacity
+            && self.next_generation == other.next_generation
+            && self.next_queue_entry_id == other.next_queue_entry_id
+            && self.completed_history == other.completed_history
+            && self.composer == other.composer
+            && self.dialog == other.dialog
+            && self.exit_armed_until == other.exit_armed_until
+            && self.pending_auto_turns == other.pending_auto_turns
+    }
+}
+
+impl Eq for AppState {}
 
 impl AppState {
     /// Creates application state with a non-zero, fixed prompt queue capacity.
@@ -167,7 +291,6 @@ impl AppState {
         assert!(queue_capacity > 0, "prompt queue capacity must be non-zero");
 
         Self {
-            runtime: Runtime::Idle,
             lifecycle: TurnLifecycle::Idle,
             queued_prompts: VecDeque::with_capacity(queue_capacity),
             queue_capacity,
@@ -177,6 +300,8 @@ impl AppState {
             composer: String::new(),
             dialog: None,
             exit_armed_until: None,
+            pending_auto_turns: 0,
+            observability: PromptObservability::default(),
         }
     }
 
@@ -184,11 +309,20 @@ impl AppState {
     pub fn reduce(&mut self, event: AppEvent) -> Vec<Effect> {
         match event {
             AppEvent::SubmitPrompt(prompt) => self.submit_prompt(prompt),
-            AppEvent::TurnCompleted(output) => self.complete_turn(output),
-            AppEvent::TurnCancelled | AppEvent::TurnFailed => {
-                self.transition_to_idle();
-                self.disarm_exit();
-                self.begin_next_queued_turn().into_iter().collect()
+            AppEvent::QueuePrompt { display, prompt } => self.queue_prompt(display, prompt),
+            AppEvent::TurnCompletedFor { generation, output } => {
+                self.complete_turn(generation, output)
+            }
+            AppEvent::TurnCancelledFor { generation }
+            | AppEvent::TurnFailedFor { generation }
+            | AppEvent::TurnReleasedFor { generation } => self.terminate_turn(generation),
+            AppEvent::DeferAutoTurn => {
+                if self.pending_auto_turns > 0 {
+                    self.observability
+                        .record(PromptTransition::AutoTurnCoalesced);
+                }
+                self.pending_auto_turns = self.pending_auto_turns.saturating_add(1);
+                Vec::new()
             }
             AppEvent::Key(key, now) => self.key(key, now),
             AppEvent::Command(command, now) => self.command(command, now),
@@ -205,8 +339,11 @@ impl AppState {
     }
 
     /// Returns the active/idle runtime state.
-    pub const fn runtime(&self) -> &Runtime {
-        &self.runtime
+    pub const fn runtime(&self) -> &'static Runtime {
+        match self.lifecycle {
+            TurnLifecycle::Idle => &IDLE_RUNTIME,
+            TurnLifecycle::Running(_) | TurnLifecycle::Cancelling(_) => &RUNNING_RUNTIME,
+        }
     }
 
     /// Returns the authoritative foreground lifecycle.
@@ -222,6 +359,43 @@ impl AppState {
     /// Returns queued entries with stable identities in FIFO order.
     pub fn queued_entries(&self) -> Vec<&QueueEntry> {
         self.queued_prompts.iter().collect()
+    }
+
+    /// Removes an undispatched entry by its stable identity.
+    pub fn remove_queue_entry(&mut self, id: u64) -> Option<QueueEntry> {
+        let position = self
+            .queued_prompts
+            .iter()
+            .position(|entry| entry.id == id)?;
+        let entry = self.queued_prompts.remove(position);
+        if entry.is_some() {
+            self.observability.record(PromptTransition::Removed);
+        }
+        entry
+    }
+
+    /// Returns sanitized scheduler counters and content-free transition names.
+    pub const fn observability(&self) -> &PromptObservability {
+        &self.observability
+    }
+
+    /// Moves an undispatched entry one or more positions while preserving its identity.
+    pub fn move_queue_entry(&mut self, id: u64, offset: isize) -> bool {
+        let Some(position) = self.queued_prompts.iter().position(|entry| entry.id == id) else {
+            return false;
+        };
+        let destination = position
+            .saturating_add_signed(offset)
+            .min(self.queued_prompts.len().saturating_sub(1));
+        if position == destination {
+            return false;
+        }
+        let entry = self
+            .queued_prompts
+            .remove(position)
+            .expect("located queue entry exists");
+        self.queued_prompts.insert(destination, entry);
+        true
     }
 
     /// Returns only successfully completed prompt/output history.
@@ -247,6 +421,21 @@ impl AppState {
         self.dialog.as_ref()
     }
 
+    /// Starts one coalesced internal turn only after all user work is idle.
+    pub fn take_ready_auto_turn(&mut self) -> Option<usize> {
+        if self.pending_auto_turns == 0
+            || self.lifecycle != TurnLifecycle::Idle
+            || !self.queued_prompts.is_empty()
+            || !self.composer.is_empty()
+        {
+            return None;
+        }
+
+        let finished = std::mem::take(&mut self.pending_auto_turns);
+        let _ = self.begin_turn(String::new());
+        Some(finished)
+    }
+
     fn submit_prompt(&mut self, prompt: String) -> Vec<Effect> {
         self.disarm_exit();
         if self.lifecycle == TurnLifecycle::Idle {
@@ -254,23 +443,41 @@ impl AppState {
         }
 
         if self.queued_prompts.len() == self.queue_capacity {
-            return vec![Effect::RefusePrompt(
-                "A response is already in progress.".into(),
-            )];
+            return vec![Effect::RefusePrompt(QUEUE_FULL_REFUSAL.into())];
         }
 
         let entry = QueueEntry::new(self.next_queue_entry_id, prompt);
         self.next_queue_entry_id += 1;
         self.queued_prompts.push_back(entry);
+        self.observability.record(PromptTransition::Queued);
         Vec::new()
     }
 
-    fn complete_turn(&mut self, output: String) -> Vec<Effect> {
+    fn queue_prompt(&mut self, display: String, prompt: String) -> Vec<Effect> {
         self.disarm_exit();
-        let Some(prompt) = self.lifecycle.active().map(|route| route.prompt.clone()) else {
+        if self.lifecycle == TurnLifecycle::Idle {
+            return vec![self.begin_turn(display)];
+        }
+
+        if self.queued_prompts.len() == self.queue_capacity {
+            return vec![Effect::RefusePrompt(QUEUE_FULL_REFUSAL.into())];
+        }
+
+        let entry = QueueEntry::resolved(self.next_queue_entry_id, display, prompt);
+        self.next_queue_entry_id += 1;
+        self.queued_prompts.push_back(entry);
+        self.observability.record(PromptTransition::Queued);
+        Vec::new()
+    }
+
+    fn complete_turn(&mut self, generation: u64, output: String) -> Vec<Effect> {
+        let Some(prompt) = self.active_prompt_for_generation(generation) else {
+            self.observability
+                .record(PromptTransition::StaleEventDropped);
             return Vec::new();
         };
 
+        self.disarm_exit();
         self.completed_history
             .push((prompt.clone(), output.clone()));
         self.transition_to_idle();
@@ -283,16 +490,44 @@ impl AppState {
         effects
     }
 
+    fn terminate_turn(&mut self, generation: u64) -> Vec<Effect> {
+        if self.active_prompt_for_generation(generation).is_none() {
+            self.observability
+                .record(PromptTransition::StaleEventDropped);
+            return Vec::new();
+        }
+
+        if matches!(self.lifecycle, TurnLifecycle::Cancelling(_)) {
+            self.observability
+                .record(PromptTransition::CancellationConfirmed);
+        }
+        self.transition_to_idle();
+        self.disarm_exit();
+        self.begin_next_queued_turn().into_iter().collect()
+    }
+
+    fn active_prompt_for_generation(&self, generation: u64) -> Option<String> {
+        self.lifecycle
+            .active()
+            .filter(|route| route.generation == generation)
+            .map(|route| route.prompt.clone())
+    }
+
     fn begin_next_queued_turn(&mut self) -> Option<Effect> {
-        let next_prompt = self.queued_prompts.pop_front()?.prompt;
-        Some(self.begin_turn(next_prompt))
+        let entry = self.queued_prompts.pop_front()?;
+        self.observability.record(PromptTransition::Dequeued);
+        let display = entry.prompt;
+        let effect = self.begin_turn(display.clone());
+        match entry.resolved_prompt {
+            Some(prompt) => Some(Effect::StartQueuedPrompt { display, prompt }),
+            None => Some(effect),
+        }
     }
 
     fn begin_turn(&mut self, prompt: String) -> Effect {
         let generation = self.next_generation;
         self.next_generation += 1;
         self.lifecycle = TurnLifecycle::Running(ActiveRoute::new(generation, prompt.clone()));
-        self.runtime = Runtime::Running;
         self.disarm_exit();
 
         Effect::StartPrompt(prompt)
@@ -300,7 +535,6 @@ impl AppState {
 
     fn transition_to_idle(&mut self) {
         self.lifecycle = TurnLifecycle::Idle;
-        self.runtime = Runtime::Idle;
     }
 
     fn command(&mut self, command: Command, now: Instant) -> Vec<Effect> {
@@ -349,7 +583,7 @@ impl AppState {
     }
 
     fn is_unsafe_while_running(&self, command: Command) -> bool {
-        self.runtime == Runtime::Running
+        !matches!(self.lifecycle, TurnLifecycle::Idle)
             && matches!(
                 command,
                 Command::Model | Command::Effort | Command::Session | Command::Agent | Command::New
@@ -402,14 +636,20 @@ impl AppState {
     }
 
     fn control_c(&mut self, now: Instant) -> Vec<Effect> {
+        if let TurnLifecycle::Running(route) = &self.lifecycle {
+            self.lifecycle = TurnLifecycle::Cancelling(route.clone());
+            self.disarm_exit();
+            self.observability
+                .record(PromptTransition::CancellationRequested);
+            return vec![Effect::CancelTurn];
+        }
+        if matches!(self.lifecycle, TurnLifecycle::Cancelling(_)) {
+            self.disarm_exit();
+            return vec![Effect::Render];
+        }
         if self.exit_armed_until.is_some_and(|until| now < until) {
             self.disarm_exit();
-            let mut effects = Vec::with_capacity(2);
-            if self.runtime == Runtime::Running {
-                effects.push(Effect::CancelTurn);
-            }
-            effects.push(Effect::Quit);
-            return effects;
+            return vec![Effect::Quit];
         }
 
         self.exit_armed_until = Some(now + crate::EXIT_WARNING_WINDOW);
@@ -447,7 +687,7 @@ mod tests {
             Command::New,
         ] {
             let mut app = AppState::new(1);
-            app.runtime = Runtime::Running;
+            let _ = app.reduce(AppEvent::SubmitPrompt("active".into()));
             let before = app.clone();
 
             assert_eq!(

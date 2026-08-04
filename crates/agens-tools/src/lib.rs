@@ -232,6 +232,18 @@ pub struct CommandDefinition {
     name: String,
     description: String,
     template: String,
+    busy_policy: CommandBusyPolicy,
+    built_in: bool,
+}
+
+/// Describes how a catalogued command behaves while a TUI provider turn is active.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommandBusyPolicy {
+    Local,
+    ProviderTurn,
+    IdleOnly,
+    Quit,
+    Invalid,
 }
 
 impl CommandDefinition {
@@ -257,7 +269,21 @@ impl CommandDefinition {
             name,
             description,
             template,
+            busy_policy: CommandBusyPolicy::ProviderTurn,
+            built_in: false,
         })
+    }
+
+    pub fn builtin(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        template: impl Into<String>,
+        busy_policy: CommandBusyPolicy,
+    ) -> Result<Self, String> {
+        let mut command = Self::new(name, description, template)?;
+        command.busy_policy = busy_policy;
+        command.built_in = true;
+        Ok(command)
     }
 
     pub fn name(&self) -> &str {
@@ -266,6 +292,14 @@ impl CommandDefinition {
 
     pub fn description(&self) -> &str {
         &self.description
+    }
+
+    pub fn busy_policy(&self) -> CommandBusyPolicy {
+        self.busy_policy
+    }
+
+    pub fn is_builtin(&self) -> bool {
+        self.built_in
     }
 
     pub fn expand(&self, arguments: &str) -> String {
@@ -298,7 +332,9 @@ impl CommandCatalog {
             .collect::<BTreeSet<_>>();
 
         for command in built_ins {
-            catalog.insert(command.clone());
+            let mut command = command.clone();
+            command.built_in = true;
+            catalog.insert(command);
         }
         for command in global.commands {
             if catalog.command(command.name()).is_some() {

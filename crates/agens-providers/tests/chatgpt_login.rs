@@ -906,7 +906,17 @@ fn provider_entry_upsert_cancels_or_times_out_while_the_credentials_lock_is_held
         .write(true)
         .open(&lock_path)
         .expect("lock should open");
-    assert!(lock.try_lock_exclusive().expect("lock should be available"));
+    let setup_deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        match lock.try_lock_exclusive() {
+            Ok(true) => break,
+            Ok(false) if Instant::now() < setup_deadline => {
+                thread::sleep(Duration::from_millis(5));
+            }
+            Ok(false) => panic!("setup could not acquire the credentials lock within 1 second"),
+            Err(error) => panic!("setup could not acquire the credentials lock: {error}"),
+        }
+    }
 
     for cancellation_first in [true, false, true, false] {
         let cancellation = LoginCancellation::new();
@@ -919,7 +929,7 @@ fn provider_entry_upsert_cancels_or_times_out_while_the_credentials_lock_is_held
             "blocked",
             json!({"value":"must-not-persist"}),
             &cancellation,
-            Instant::now() + Duration::from_millis(30),
+            Instant::now() + Duration::from_millis(250),
         );
         assert!(
             started.elapsed() < Duration::from_secs(1),

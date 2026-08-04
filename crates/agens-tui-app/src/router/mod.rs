@@ -17,7 +17,9 @@ use std::sync::{Arc, Mutex};
 
 use crate::profiles::{AgentProfileStore, ProfileEditor};
 use agens_core::HeadlessTurnCancellation;
-use agens_tools::{CommandCatalog, McpStatusHandle, SkillCatalog, ToolDispatcher};
+use agens_tools::{
+    CommandBusyPolicy, CommandCatalog, McpStatusHandle, SkillCatalog, ToolDispatcher,
+};
 use agens_tui::{PaletteEntry, TuiProviderOutcome, TuiSubmissionOutcome};
 
 use crate::extensions::resolved_tui_palette;
@@ -33,6 +35,31 @@ use agens_session::provider::{
 use agens_tool_runtime::mcp::{ProductionMcpRuntime, load_configured_mcp_registry};
 
 pub const TUI_ERROR_ACTION: &str = "Correct the command or runtime condition, then retry.";
+
+/// The only busy-session policy for a resolved input route.
+///
+/// This lives with the router because route classification must happen before
+/// the TUI mutates its prompt queue.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BusyPolicy {
+    Local,
+    Queue,
+    Reject,
+    Quit,
+    Invalid,
+}
+
+impl BusyPolicy {
+    fn from_catalog_policy(policy: CommandBusyPolicy) -> Self {
+        match policy {
+            CommandBusyPolicy::Local => Self::Local,
+            CommandBusyPolicy::ProviderTurn => Self::Queue,
+            CommandBusyPolicy::IdleOnly => Self::Reject,
+            CommandBusyPolicy::Quit => Self::Quit,
+            CommandBusyPolicy::Invalid => Self::Invalid,
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct TuiRuntimeRouter {

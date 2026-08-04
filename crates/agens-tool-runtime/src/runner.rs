@@ -165,6 +165,11 @@ impl TuiTaskLifecycleBridge {
                     .map(|effort| effort.as_str()),
             ),
         ));
+        self.watch_lifecycle(agent, lifecycle);
+    }
+
+    fn watch_lifecycle(&self, agent: String, lifecycle: TaskExecutionLifecycle) {
+        let id = lifecycle.id().value();
         let events = self.events.clone();
         let registry = self.controls.0.clone();
         let terminal_results = Arc::clone(&self.terminal_results);
@@ -172,7 +177,24 @@ impl TuiTaskLifecycleBridge {
         let persist_completed = self.persist_completed.clone();
         std::thread::spawn(move || {
             let mut seen = 1;
+            let mut cancellation_requested = false;
             loop {
+                let requested = registry
+                    .active_snapshots()
+                    .iter()
+                    .find(|snapshot| snapshot.id.value() == id)
+                    .is_some_and(|snapshot| snapshot.cancellation_requested);
+                if requested && !cancellation_requested {
+                    cancellation_requested = true;
+                    let _ = events.publish(
+                        TuiRuntimeEvent::TaskExecution {
+                            agent: agent.clone(),
+                            event: TuiExecutionEvent::CancellationRequested { id },
+                        },
+                        &BridgeCancel::new(),
+                        None,
+                    );
+                }
                 let lifecycle_events = lifecycle.events();
                 for event in &lifecycle_events[seen..] {
                     let event = match *event {
@@ -726,5 +748,47 @@ pub fn map_task_turn_error(error: HeadlessTurnError) -> TaskRunnerError {
         }
         HeadlessTurnError::MaxIterations => TaskRunnerError::IterationLimit,
         _ => TaskRunnerError::ChildFailure,
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_bridge_tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    #[test]
+    fn registry_cancellation_projects_pending_before_terminal_confirmation() {
+        let registry = TaskExecutionRegistry::new();
+        let id = registry.admit(TaskLaunchMode::Background).unwrap();
+        let lifecycle = registry.lifecycle(id).unwrap();
+        let (events, receiver) = BridgeTx::bounded(16);
+        let bridge = TuiTaskLifecycleBridge::new(events, TuiTaskControls(registry.clone()));
+
+        bridge.watch_lifecycle("reviewer".into(), lifecycle);
+
+        assert!(registry.cancel(id));
+        let pending = receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(matches!(
+            pending.into_parts().1,
+            TuiRuntimeEvent::TaskExecution {
+                event: TuiExecutionEvent::CancellationRequested { id: pending_id },
+                ..
+            } if pending_id == id.value()
+        ));
+
+        assert!(registry.finish(
+            id,
+            agens_tools::TaskTerminalState::Cancelled,
+            agens_tools::ToolOutput::failure("task: cancelled"),
+        ));
+        let terminal = receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(matches!(
+            terminal.into_parts().1,
+            TuiRuntimeEvent::TaskExecution {
+                event: TuiExecutionEvent::Cancelled { id: terminal_id },
+                ..
+            } if terminal_id == id.value()
+        ));
     }
 }

@@ -1055,13 +1055,10 @@ fn continuation_rounds_cancel_or_timeout_during_headers_bodies_and_late_sse_with
         let observed_bodies = Arc::new(Mutex::new(server.take_observed_body()));
         let mut provider = scripted_provider(server.base_url());
         let runtime = provider_runtime();
-        let cancellation = match stop {
-            Stop::Cancellation => HeadlessTurnCancellation::new(),
-            Stop::Deadline => HeadlessTurnCancellation::with_deadline(Duration::from_millis(25)),
-        };
+        let setup_cancellation = HeadlessTurnCancellation::new();
 
         runtime
-            .block_on(provider.next_parts(&[], &cancellation))
+            .block_on(provider.next_parts(&[], &setup_cancellation))
             .expect("first response should produce a tool call");
         observed_bodies
             .lock()
@@ -1073,7 +1070,7 @@ fn continuation_rounds_cancel_or_timeout_during_headers_bodies_and_late_sse_with
             runtime
                 .block_on(provider.next_parts(
                     &[tool_result("call_first", "first result", false)],
-                    &cancellation,
+                    &setup_cancellation,
                 ))
                 .expect("second response should produce a tool call");
             observed_bodies
@@ -1094,6 +1091,10 @@ fn continuation_rounds_cancel_or_timeout_during_headers_bodies_and_late_sse_with
         let expected_error = match stop {
             Stop::Cancellation => HeadlessTurnPortError::Cancelled,
             Stop::Deadline => HeadlessTurnPortError::TimedOut,
+        };
+        let cancellation = match stop {
+            Stop::Cancellation => HeadlessTurnCancellation::new(),
+            Stop::Deadline => HeadlessTurnCancellation::with_deadline(Duration::from_millis(250)),
         };
         let cancellation_thread = matches!(stop, Stop::Cancellation).then(|| {
             let canceller = cancellation.clone();

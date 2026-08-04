@@ -159,21 +159,18 @@ fn apply_configured_agent_profile(
     validator: &dyn AgentModelValidator,
 ) -> Result<AgentDefinition, CliError> {
     let session_model = effective_model(bootstrap, context);
-    let session_effort = context
-        .selection
-        .as_ref()
-        .and_then(|selection| selection.reasoning_effort_value())
-        .or_else(|| {
-            context
-                .metadata
-                .as_ref()
-                .and_then(|metadata| metadata.reasoning_effort)
-        })
-        .or_else(|| {
-            bootstrap
-                .reasoning_effort()
-                .and_then(parse_reasoning_effort)
-        });
+    let session_effort = match context.selection.as_ref() {
+        Some(selection) => selection.reasoning_effort_value(),
+        None => context
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.reasoning_effort)
+            .or_else(|| {
+                bootstrap
+                    .reasoning_effort()
+                    .and_then(parse_reasoning_effort)
+            }),
+    };
     let session_root =
         agens_bootstrap::session_root::SessionRoot::confined_to(project_root.to_path_buf());
     let session_config =

@@ -18,7 +18,7 @@ use agens_tui::{TuiPresentation, TuiRouteProgress, TuiRouteRequest};
 
 use super::*;
 use crate::engine::{ProductionTuiEngine, run_tui_prompt_with};
-use crate::extensions::{start_tui_commands, start_tui_skills};
+use crate::extensions::{start_tui_commands, start_tui_skills, tui_builtin_commands};
 use crate::resume::resume_tui_session;
 use crate::session::session_dialog_entry;
 use crate::test_support::{
@@ -2927,7 +2927,11 @@ fn tui_native_select_preserves_running_turn_outcomes_and_terminal_cleanup() {
     assert_eq!(tui.transcript().len(), transcript_count);
     open_running_tui_select(&mut tui, &router);
     assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Render);
-    assert!(tui.view().quit_armed);
+    assert!(!tui.view().quit_armed);
+    assert_eq!(
+        tui.view().status,
+        Some("Cancellation requested; waiting for confirmation.")
+    );
     assert!(tui.view().dialog.is_some());
     assert_eq!(
         tui.handle(Event::Key(Key::Escape)),
@@ -3018,26 +3022,215 @@ fn assert_tui_terminal_restored(control: &TuiTerminalControl) {
 }
 
 fn open_running_tui_select(tui: &mut Tui<ProductionTuiEngine>, router: &TuiRuntimeRouter) -> usize {
+    tui.enable_busy_policy_routing();
     tui.begin_submission("running");
     let transcript_count = tui.transcript().len();
     for character in "/select".chars() {
         tui.handle(Event::Key(Key::Char(character)));
     }
 
-    assert_eq!(
-        tui.handle(Event::Key(Key::Enter)),
-        Action::OpenDialog("select".into())
-    );
+    let Action::SubmitBusy(input) = tui.handle(Event::Key(Key::Enter)) else {
+        panic!("busy /select should route through catalog classification");
+    };
     let outcome = router.route_request(
-        TuiRouteRequest::OpenDialog("select".into()),
+        TuiRouteRequest::BusyInput(input),
         std::sync::mpsc::channel().0,
     );
-    assert!(matches!(outcome, TuiSubmissionOutcome::SafeDialog(_)));
-    assert!(tui.apply_submission_outcome(outcome).is_none());
+    assert!(
+        matches!(
+            outcome,
+            TuiSubmissionOutcome::Dialog(_) | TuiSubmissionOutcome::SafeDialog(_)
+        ),
+        "{outcome:?}"
+    );
+    assert!(tui.apply_busy_submission_outcome(outcome).is_none());
     assert!(tui.view().running);
     assert_eq!(tui.transcript().len(), transcript_count);
 
     transcript_count
+}
+
+#[test]
+fn busy_policy_exhaustively_classifies_builtin_commands_and_catalog_extensions() {
+    let temporary = tui_session_directory("busy-policy-catalog");
+    let bootstrap = tui_session_bootstrap(&temporary, &[]);
+    let project = temporary.join("project");
+    let command_root = project.join(".agens/commands");
+    std::fs::create_dir_all(&command_root).unwrap();
+    std::fs::write(
+        command_root.join("summarize.md"),
+        "---\nname: summarize\ndescription: summarize\n---\nSummarize $ARGUMENTS\n",
+    )
+    .unwrap();
+    write_router_test_skill(&project, "review", "Review $ARGUMENTS");
+
+    let commands = start_tui_commands(
+        &mut Tui::new(ProductionTuiEngine {
+            cancellation: Arc::new(Mutex::new(None)),
+        }),
+        &bootstrap,
+        &project,
+    )
+    .unwrap();
+    let skills = start_tui_skills(
+        &mut Tui::new(ProductionTuiEngine {
+            cancellation: Arc::new(Mutex::new(None)),
+        }),
+        &bootstrap,
+        &project,
+    )
+    .unwrap();
+    let router = TuiRuntimeRouter::new(
+        bootstrap,
+        Arc::new(Mutex::new(SessionContext::fresh())),
+        Arc::new(Mutex::new(None)),
+        Arc::clone(&commands),
+        skills,
+    );
+
+    let built_ins = commands
+        .iter()
+        .filter(|command| command.is_builtin())
+        .collect::<Vec<_>>();
+    assert_eq!(built_ins.len(), tui_builtin_commands().len());
+
+    for command in built_ins {
+        let input = format!("/{} arguments", command.name());
+        assert_eq!(
+            router.classify_busy_input(&input),
+            BusyPolicy::from_catalog_policy(command.busy_policy()),
+            "{input}"
+        );
+    }
+
+    let cases = [
+        ("/agent primary", BusyPolicy::Reject),
+        ("/connect --device-auth", BusyPolicy::Reject),
+        ("/effort high", BusyPolicy::Reject),
+        ("/model gpt-5.6", BusyPolicy::Reject),
+        ("/provider openai-api", BusyPolicy::Reject),
+        ("/resume 42", BusyPolicy::Reject),
+        ("/subagent primary", BusyPolicy::Reject),
+        ("/summarize release", BusyPolicy::Queue),
+        ("/review release", BusyPolicy::Queue),
+        ("plain provider prompt", BusyPolicy::Queue),
+        ("/unknown", BusyPolicy::Invalid),
+    ];
+
+    for (input, expected) in cases {
+        assert_eq!(router.classify_busy_input(input), expected, "{input}");
+    }
+
+    std::fs::remove_dir_all(temporary).unwrap();
+}
+
+#[test]
+fn busy_routes_execute_local_queue_provider_and_preserve_rejected_drafts() {
+    let temporary = tui_session_directory("busy-route-outcomes");
+    let bootstrap = tui_session_bootstrap(&temporary, &[]);
+    let project = temporary.join("project");
+    let command_root = project.join(".agens/commands");
+    std::fs::create_dir_all(&command_root).unwrap();
+    std::fs::write(
+        command_root.join("summarize.md"),
+        "---\nname: summarize\ndescription: summarize\n---\nSummarize $ARGUMENTS\n",
+    )
+    .unwrap();
+    let commands = start_tui_commands(
+        &mut Tui::new(ProductionTuiEngine {
+            cancellation: Arc::new(Mutex::new(None)),
+        }),
+        &bootstrap,
+        &project,
+    )
+    .unwrap();
+    let skills = start_tui_skills(
+        &mut Tui::new(ProductionTuiEngine {
+            cancellation: Arc::new(Mutex::new(None)),
+        }),
+        &bootstrap,
+        &project,
+    )
+    .unwrap();
+    let router = TuiRuntimeRouter::new(
+        bootstrap,
+        Arc::new(Mutex::new(SessionContext::fresh())),
+        Arc::new(Mutex::new(None)),
+        commands,
+        skills,
+    );
+    let mut tui = Tui::with_queue_capacity(
+        ProductionTuiEngine {
+            cancellation: Arc::new(Mutex::new(None)),
+        },
+        1,
+    );
+    tui.enable_busy_policy_routing();
+    tui.begin_submission("active");
+    let transcript_count = tui.transcript().len();
+
+    for character in "/select".chars() {
+        tui.handle(Event::Key(Key::Char(character)));
+    }
+    assert_eq!(
+        tui.handle(Event::Key(Key::Enter)),
+        Action::SubmitBusy("/select".into())
+    );
+    let outcome = router.route_request(
+        TuiRouteRequest::BusyInput("/select".into()),
+        std::sync::mpsc::channel().0,
+    );
+    assert!(tui.apply_busy_submission_outcome(outcome).is_none());
+    assert!(tui.view().running);
+    assert!(tui.input().is_empty());
+    assert_eq!(tui.transcript().len(), transcript_count);
+
+    let mut tui = Tui::with_queue_capacity(
+        ProductionTuiEngine {
+            cancellation: Arc::new(Mutex::new(None)),
+        },
+        1,
+    );
+    tui.enable_busy_policy_routing();
+    tui.begin_submission("active");
+    let transcript_count = tui.transcript().len();
+    for character in "/summarize release".chars() {
+        tui.handle(Event::Key(Key::Char(character)));
+    }
+    assert_eq!(
+        tui.handle(Event::Key(Key::Enter)),
+        Action::SubmitBusy("/summarize release".into())
+    );
+    let outcome = router.route_request(
+        TuiRouteRequest::BusyInput("/summarize release".into()),
+        std::sync::mpsc::channel().0,
+    );
+    assert!(tui.apply_busy_submission_outcome(outcome).is_none());
+    assert_eq!(tui.queue_entries().len(), 1);
+    assert_eq!(tui.queue_entries()[0].prompt(), "/summarize release");
+    assert!(tui.input().is_empty());
+    assert_eq!(tui.transcript().len(), transcript_count);
+
+    for character in "/dangerous".chars() {
+        tui.handle(Event::Key(Key::Char(character)));
+    }
+    assert_eq!(
+        tui.handle(Event::Key(Key::Enter)),
+        Action::SubmitBusy("/dangerous".into())
+    );
+    let outcome = router.route_request(
+        TuiRouteRequest::BusyInput("/dangerous".into()),
+        std::sync::mpsc::channel().0,
+    );
+    assert!(tui.apply_busy_submission_outcome(outcome).is_none());
+    assert_eq!(tui.input(), "/dangerous");
+    assert!(
+        tui.status()
+            .is_some_and(|message| message.contains("unavailable while a response is in progress"))
+    );
+    assert_eq!(tui.transcript().len(), transcript_count);
+
+    std::fs::remove_dir_all(temporary).unwrap();
 }
 
 #[test]

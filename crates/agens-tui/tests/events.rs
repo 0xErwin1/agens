@@ -422,9 +422,8 @@ fn recovered_failed_prompt_escape_discards_and_successful_resume_replaces_atomic
     });
 
     assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Render);
-    assert!(tui.input().is_empty());
-    assert!(!tui.view().recovered_failed_prompt);
-    assert_eq!(tui.view().status, Some("Recovered prompt discarded."));
+    assert_eq!(tui.input(), "failed prompt");
+    assert!(tui.view().recovered_failed_prompt);
 
     tui.apply_submission_outcome(TuiSubmissionOutcome::SessionResumed {
         message: "Recovered failed prompt.".into(),
@@ -519,7 +518,7 @@ fn transcript_navigation_restores_focus_and_routes_live_child_composer_to_mailbo
         ));
     }
 
-    tui.handle(Event::Key(Key::Escape));
+    focus_viewport(&mut tui);
     tui.handle(Event::Key(Key::Char('g')));
     assert_eq!(tui.handle(Event::Key(Key::Char('t'))), Action::Render);
     assert!(tui.view().dialog.is_some());
@@ -562,15 +561,12 @@ fn transcript_navigation_restores_focus_and_routes_live_child_composer_to_mailbo
     tui.handle(Event::Key(Key::Char('i')));
     assert_eq!(tui.view().focus, TranscriptFocus::Composer);
     assert!(!tui.view().collapse_thinking);
-    // Main was detached by the Escape that focused it at the top of this test:
-    // entering the transcript keymap pins the viewport so a running turn cannot
-    // scroll the row being read out from under it.
-    assert!(!tui.view().following_bottom);
+    assert!(tui.view().following_bottom);
     assert!(tui.view().tool_display_modes.is_empty());
     tui.handle(Event::Key(Key::Char('m')));
     assert_eq!(tui.input(), "m");
 
-    tui.handle(Event::Key(Key::Escape));
+    focus_viewport(&mut tui);
     tui.handle(Event::Key(Key::Char(']')));
     assert!(tui.view().collapse_thinking);
     assert!(!tui.view().following_bottom);
@@ -661,23 +657,11 @@ fn execution_strip_navigation_enters_children_and_backgrounds_the_focused_execut
     }
 
     assert_eq!(tui.handle(Event::Key(Key::Tab)), Action::Render);
-    assert_eq!(tui.view().execution_selection, Some(TranscriptId::Main));
-    assert_eq!(tui.handle(Event::Key(Key::Down)), Action::Render);
-    assert_eq!(
-        tui.view().execution_selection,
-        Some(TranscriptId::Subagent(8))
-    );
-    assert_eq!(tui.handle(Event::Key(Key::Enter)), Action::Render);
-    assert_eq!(tui.view().active_transcript, TranscriptId::Subagent(8));
-    assert_eq!(
-        tui.handle(Event::Key(Key::CtrlB)),
-        Action::TransitionToBackground(8)
-    );
-    tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
-        agent: "writer".into(),
-        event: TuiExecutionEvent::Backgrounded { id: 8 },
-    });
-    assert_eq!(tui.handle(Event::Key(Key::CtrlB)), Action::Render);
+    assert_eq!(tui.view().surface_focus, agens_tui::SurfaceFocus::Queue);
+    assert_eq!(tui.handle(Event::Key(Key::Tab)), Action::Render);
+    assert_eq!(tui.view().surface_focus, agens_tui::SurfaceFocus::Activity);
+    assert_eq!(tui.handle(Event::Key(Key::Tab)), Action::Render);
+    assert_eq!(tui.view().surface_focus, agens_tui::SurfaceFocus::Composer);
     assert_eq!(tui.input(), "next task");
     assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Render);
     assert_eq!(tui.view().active_transcript, TranscriptId::Main);
@@ -726,7 +710,7 @@ fn transcript_picker_outcome_and_gt_use_the_same_main_and_child_entries() {
         ),
     ));
 
-    tui.handle(Event::Key(Key::Escape));
+    focus_viewport(&mut tui);
     tui.handle(Event::Key(Key::Char('g')));
     assert_eq!(tui.handle(Event::Key(Key::Char('t'))), Action::Render);
     let from_gt = format!("{:?}", tui.view().dialog);
@@ -782,7 +766,7 @@ fn viewport_vim_routes_preserve_per_transcript_state() {
         ));
     }
 
-    tui.handle(Event::Key(Key::Escape));
+    focus_viewport(&mut tui);
     tui.handle(Event::Key(Key::Char(']')));
     assert_eq!(tui.view().active_transcript, TranscriptId::Subagent(7));
     tui.handle(Event::Key(Key::CtrlO));
@@ -1014,7 +998,7 @@ fn block_focus_walks_settled_calls_and_opens_only_the_one_it_stands_on() {
     }
     tui.finish_provider_turn(agens_tui::TuiProviderOutcome::Completed("answer".into()));
 
-    tui.handle(Event::Key(Key::Escape));
+    focus_viewport(&mut tui);
     assert_eq!(tui.view().focus, TranscriptFocus::Viewport);
 
     // Focus enters at the newest block, which is the one a reader just watched
@@ -1072,7 +1056,7 @@ fn opening_a_focused_block_does_not_move_the_rows_above_it() {
     }));
     tui.finish_provider_turn(agens_tui::TuiProviderOutcome::Completed("answer".into()));
 
-    tui.handle(Event::Key(Key::Escape));
+    focus_viewport(&mut tui);
     tui.handle(Event::Key(Key::Char('K')));
     assert_eq!(tui.view().focused_call, Some("read-1"));
     let anchored = tui.view().scroll_offset;
@@ -1523,6 +1507,61 @@ fn scheduler_exposes_typed_lifecycle_and_stable_queue_entries() {
 }
 
 #[test]
+fn scheduler_quarantines_stale_terminal_generations_before_dispatch() {
+    let mut app = AppState::new(1);
+    app.reduce(AppEvent::SubmitPrompt("first".into()));
+    app.reduce(AppEvent::SubmitPrompt("second".into()));
+
+    assert!(
+        app.reduce(AppEvent::TurnCompletedFor {
+            generation: 0,
+            output: "stale".into(),
+        })
+        .is_empty()
+    );
+    assert_eq!(
+        app.lifecycle().active().map(|route| route.generation()),
+        Some(1)
+    );
+    assert_eq!(app.queued_prompts(), ["second"]);
+    assert!(app.completed_history().is_empty());
+
+    assert_eq!(
+        app.reduce(AppEvent::TurnCompletedFor {
+            generation: 1,
+            output: "answer".into(),
+        }),
+        vec![
+            Effect::PersistCompleted {
+                prompt: "first".into(),
+                output: "answer".into(),
+            },
+            Effect::StartPrompt("second".into()),
+        ]
+    );
+    assert_eq!(
+        app.lifecycle().active().map(|route| route.generation()),
+        Some(2)
+    );
+}
+
+#[test]
+fn scheduler_quarantines_stale_failure_and_cancellation_before_state_transitions() {
+    for terminal_event in [
+        AppEvent::TurnCancelledFor { generation: 0 },
+        AppEvent::TurnFailedFor { generation: 0 },
+    ] {
+        let mut app = AppState::new(1);
+        app.reduce(AppEvent::SubmitPrompt("first".into()));
+        app.reduce(AppEvent::SubmitPrompt("second".into()));
+        let before = app.clone();
+
+        assert!(app.reduce(terminal_event).is_empty());
+        assert_eq!(app, before);
+    }
+}
+
+#[test]
 fn reducer_starts_idle_prompt_and_persists_only_after_success() {
     let mut app = AppState::new(2);
 
@@ -1534,7 +1573,10 @@ fn reducer_starts_idle_prompt_and_persists_only_after_success() {
     assert!(app.completed_history().is_empty());
 
     assert_eq!(
-        app.reduce(AppEvent::TurnCompleted("answer".into())),
+        app.reduce(AppEvent::TurnCompletedFor {
+            generation: 1,
+            output: "answer".into()
+        }),
         vec![Effect::PersistCompleted {
             prompt: "first".into(),
             output: "answer".into(),
@@ -1560,7 +1602,10 @@ fn reducer_queues_safe_prompts_in_bounded_fifo_order() {
     assert_eq!(app.queued_prompts(), ["second", "third"]);
 
     assert_eq!(
-        app.reduce(AppEvent::TurnCompleted("one".into())),
+        app.reduce(AppEvent::TurnCompletedFor {
+            generation: 1,
+            output: "one".into()
+        }),
         vec![
             Effect::PersistCompleted {
                 prompt: "first".into(),
@@ -1582,7 +1627,7 @@ fn reducer_refuses_prompt_when_running_queue_is_full_without_history() {
     assert_eq!(
         app.reduce(AppEvent::SubmitPrompt("refused".into())),
         vec![Effect::RefusePrompt(
-            "A response is already in progress.".into()
+            "Prompt queue is full; draft was kept unchanged.".into()
         )]
     );
     assert_eq!(app.queued_prompts(), ["queued"]);
@@ -1591,7 +1636,10 @@ fn reducer_refuses_prompt_when_running_queue_is_full_without_history() {
 
 #[test]
 fn reducer_terminal_failures_start_the_oldest_queued_prompt_before_later_submissions() {
-    for terminal_event in [AppEvent::TurnCancelled, AppEvent::TurnFailed] {
+    for terminal_event in [
+        AppEvent::TurnCancelledFor { generation: 1 },
+        AppEvent::TurnFailedFor { generation: 1 },
+    ] {
         let mut app = AppState::new(2);
         app.reduce(AppEvent::SubmitPrompt("first".into()));
         app.reduce(AppEvent::SubmitPrompt("queued".into()));
@@ -1627,12 +1675,12 @@ fn command_connected_key_dispatch_prioritizes_dialog_global_and_composer_editing
 
     assert_eq!(
         app.reduce(AppEvent::Key(Key::CtrlC, now)),
-        vec![Effect::ExitWarning]
+        vec![Effect::CancelTurn]
     );
     assert_eq!(app.dialog(), Some(&Dialog::Command));
     assert_eq!(
         app.reduce(AppEvent::Key(Key::CtrlC, now + Duration::from_secs(1))),
-        vec![Effect::CancelTurn, Effect::Quit]
+        vec![Effect::Render]
     );
 
     app.set_dialog(None);
@@ -1651,14 +1699,14 @@ fn command_control_c_warns_then_cancels_if_needed_and_quits() {
     running.reduce(AppEvent::SubmitPrompt("running".into()));
     assert_eq!(
         running.reduce(AppEvent::Command(Command::ControlC, now)),
-        vec![Effect::ExitWarning]
+        vec![Effect::CancelTurn]
     );
     assert_eq!(
         running.reduce(AppEvent::Command(
             Command::ControlC,
             now + Duration::from_secs(1)
         )),
-        vec![Effect::CancelTurn, Effect::Quit]
+        vec![Effect::Render]
     );
 
     let mut idle = AppState::new(1);
@@ -1726,7 +1774,10 @@ fn command_new_resets_only_after_backend_success_and_running_matrix_refuses_muta
     app.reduce(AppEvent::SubmitPrompt("running".into()));
     app.reduce(AppEvent::SubmitPrompt("first queued".into()));
     app.reduce(AppEvent::SubmitPrompt("second queued".into()));
-    app.reduce(AppEvent::TurnCompleted("answer".into()));
+    app.reduce(AppEvent::TurnCompletedFor {
+        generation: 1,
+        output: "answer".into(),
+    });
     app.set_composer("replacement draft");
     app.set_dialog(Some(Dialog::Command));
 
@@ -2648,8 +2699,8 @@ fn tui_submission_outcome_local_auth_progress_is_transient_and_cancellable() {
     assert!(text.contains("https://auth.example/device"));
     assert!(text.contains("ABCD-EFGH"));
     assert!(tui.transcript().is_empty());
-    assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Cancel);
-    assert_eq!(tui.engine().cancellations, 1);
+    assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::CancelRoute);
+    assert_eq!(tui.engine().cancellations, 0);
 
     tui.apply_submission_outcome(TuiSubmissionOutcome::LocalActionableError {
         message: "ChatGPT login was cancelled".into(),
@@ -2772,17 +2823,12 @@ fn second_submission_is_rejected_while_a_turn_owns_cancellation() {
     tui.begin_submission("first prompt");
     assert_eq!(tui.handle(Event::Key(Key::Char('s'))), Action::Render);
     assert_eq!(tui.handle(Event::Key(Key::Enter)), Action::Render);
-    assert_eq!(tui.input(), "s");
+    assert_eq!(tui.input(), "");
     assert_eq!(
         tui.transcript(),
-        [
-            agens_tui::TranscriptEntry::User("first prompt".into()),
-            agens_tui::TranscriptEntry::Info("A response is already in progress.".into()),
-        ]
+        [agens_tui::TranscriptEntry::User("first prompt".into()),]
     );
     assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Render);
-    assert_eq!(tui.engine().cancellations, 0);
-    assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Quit);
     assert_eq!(tui.engine().cancellations, 1);
 }
 
@@ -2803,12 +2849,11 @@ fn resize_updates_the_render_state() {
 #[test]
 fn control_c_warns_then_cancels_and_quits_a_running_turn() {
     let mut tui = Tui::new(FakeEngine::default());
-    tui.set_running(true);
+    tui.begin_submission("active");
 
     assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Render);
-    assert_eq!(tui.engine().cancellations, 0);
-    assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Quit);
     assert_eq!(tui.engine().cancellations, 1);
+    assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Render);
 }
 
 #[test]
@@ -2822,18 +2867,16 @@ fn double_control_c_exits_without_clearing_composer_input() {
 }
 
 #[test]
-fn escape_leaves_the_composer_then_cancels_without_arming_quit() {
+fn escape_is_inert_while_running_and_control_c_requests_cancellation() {
     let mut tui = Tui::new(FakeEngine::default());
-    tui.set_running(true);
+    tui.begin_submission("running");
 
-    // Stopping to read must not cost the turn, so the first Escape only moves
-    // focus and the second is the one that reaches the engine.
     assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Render);
-    assert_eq!(tui.view().focus, TranscriptFocus::Viewport);
+    assert_eq!(tui.view().focus, TranscriptFocus::Composer);
     assert_eq!(tui.engine().cancellations, 0);
     assert!(!tui.view().quit_armed);
 
-    assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Cancel);
+    assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Render);
     assert_eq!(tui.engine().cancellations, 1);
     assert!(!tui.view().quit_armed);
 }
@@ -2852,7 +2895,7 @@ fn permission_double_control_c_exits_and_runtime_cleanup_can_fail_closed() {
     });
     let request = requests.recv_timeout(Duration::from_secs(1)).unwrap();
     let mut tui = Tui::new(FakeEngine::default());
-    tui.set_running(true);
+    tui.begin_submission("active");
     tui.show_selection_dialog(DialogView::selection(
         "Permission required",
         None::<String>,
@@ -2865,9 +2908,8 @@ fn permission_double_control_c_exits_and_runtime_cleanup_can_fail_closed() {
     assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Render);
     assert!(bridge.is_pending(request.id()));
     assert!(tui.view().dialog.is_some());
-    assert_eq!(tui.engine().cancellations, 0);
-    assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Quit);
     assert_eq!(tui.engine().cancellations, 1);
+    assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Render);
     assert!(bridge.close());
     assert_eq!(worker.join().unwrap(), TuiPermissionReply::Cancelled);
 }
@@ -2934,7 +2976,7 @@ fn streaming_events_update_stable_entries_and_preserve_tool_order() {
             TranscriptEntry::Tool("native::read completed: file contents".into()),
         ]
     );
-    assert!(!tui.view().running);
+    assert!(tui.view().running);
 }
 
 #[test]
@@ -2957,6 +2999,55 @@ fn multiline_editing_and_scroll_follow_are_deterministic() {
         tui.handle(Event::Key(Key::Enter)),
         Action::Submit("ab".into())
     );
+}
+
+#[test]
+fn composer_editing_moves_and_deletes_complete_graphemes() {
+    let mut tui = Tui::new(FakeEngine::default());
+    for character in "e\u{301}🙂z".chars() {
+        tui.handle(Event::Key(Key::Char(character)));
+    }
+
+    tui.handle(Event::Key(Key::Left));
+    assert_eq!(tui.view().input_cursor, 3);
+    tui.handle(Event::Key(Key::Left));
+    assert_eq!(tui.view().input_cursor, 2);
+    tui.handle(Event::Key(Key::Left));
+    assert_eq!(tui.view().input_cursor, 0);
+
+    tui.handle(Event::Key(Key::Right));
+    assert_eq!(tui.view().input_cursor, 2);
+    tui.handle(Event::Key(Key::Backspace));
+    assert_eq!(tui.input(), "🙂z");
+    assert_eq!(tui.view().input_cursor, 0);
+
+    tui.handle(Event::Key(Key::Delete));
+    assert_eq!(tui.input(), "z");
+    assert_eq!(tui.view().input_cursor, 0);
+}
+
+#[test]
+fn composer_insertion_and_word_movement_keep_grapheme_boundaries() {
+    let mut tui = Tui::new(FakeEngine::default());
+    for character in "e\u{301} 🙂".chars() {
+        tui.handle(Event::Key(Key::Char(character)));
+    }
+
+    tui.handle(Event::Key(Key::PreviousWord));
+    assert_eq!(tui.view().input_cursor, 3);
+    tui.handle(Event::Key(Key::PreviousWord));
+    assert_eq!(tui.view().input_cursor, 0);
+    tui.handle(Event::Key(Key::NextWord));
+    assert_eq!(tui.view().input_cursor, 2);
+    tui.handle(Event::Key(Key::Right));
+    assert_eq!(tui.view().input_cursor, 3);
+
+    tui.handle(Event::Key(Key::Char('x')));
+    assert_eq!(tui.input(), "e\u{301} x🙂");
+    assert_eq!(tui.view().input_cursor, 4);
+    tui.handle(Event::Key(Key::Delete));
+    assert_eq!(tui.input(), "e\u{301} x");
+    assert_eq!(tui.view().input_cursor, 4);
 }
 
 #[test]
@@ -3093,20 +3184,17 @@ fn ratatui_active_turn_row_distinguishes_waiting_responding_cancelling_and_failu
         .collect::<String>();
     assert!(responding.contains("Responding"));
 
-    assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Render);
-    assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Cancel);
-    renderer.render(tui.view()).unwrap();
-    let cancelling = renderer
-        .terminal()
-        .backend()
-        .buffer()
-        .content
-        .iter()
-        .map(|cell| cell.symbol())
-        .collect::<String>();
-    assert!(cancelling.contains("Cancelling"));
+    assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Render);
+    assert_eq!(tui.engine().cancellations, 1);
+    assert_eq!(
+        tui.view().status,
+        Some("Cancellation requested; waiting for confirmation.")
+    );
 
-    tui.apply_progress(TurnEvent::StateChanged(TurnState::Failed));
+    tui.finish_provider_turn(TuiProviderOutcome::Failed {
+        message: "provider failed".into(),
+        action: "Retry the prompt.".into(),
+    });
     renderer.render(tui.view()).unwrap();
     let failed = renderer
         .terminal()
@@ -3200,7 +3288,7 @@ fn viewport_owner_keys_are_gt_m_and_brackets_with_ctrl_timeline_nav() {
         TuiSubagentEvent::started(8, "writer", "task", TuiExecutionState::ForegroundRunning),
     ));
 
-    tui.handle(Event::Key(Key::Escape));
+    focus_viewport(&mut tui);
     assert_eq!(tui.view().focus, TranscriptFocus::Viewport);
     // `g` is a chord prefix now, so the picker costs its second key.
     assert_eq!(tui.handle(Event::Key(Key::Char('g'))), Action::Render);
@@ -3631,10 +3719,7 @@ fn a_running_turn_defers_the_auto_turn_instead_of_dropping_it() {
 
     assert_eq!(tui.take_ready_auto_turn(), None);
 
-    tui.apply_runtime_event(TuiRuntimeEvent::TurnEnded {
-        status: TurnState::Completed,
-        duration: Some(Duration::from_secs(1)),
-    });
+    tui.finish_provider_turn(TuiProviderOutcome::Completed("done".into()));
 
     assert!(tui.take_ready_auto_turn().is_some());
 }
@@ -3663,10 +3748,7 @@ fn simultaneous_background_completions_coalesce_into_one_auto_turn() {
     for id in [7, 8, 9] {
         finish_background_child(&mut tui, id);
     }
-    tui.apply_runtime_event(TuiRuntimeEvent::TurnEnded {
-        status: TurnState::Completed,
-        duration: Some(Duration::from_secs(1)),
-    });
+    tui.finish_provider_turn(TuiProviderOutcome::Completed("done".into()));
 
     let prompt = tui.take_ready_auto_turn().expect("idle schedules the turn");
 
@@ -3696,9 +3778,9 @@ fn the_auto_turn_is_cancellable_and_never_fabricates_a_user_prompt() {
     );
 
     assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Render);
-    assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Cancel);
+    assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Render);
+    assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Render);
     assert_eq!(tui.engine().cancellations, 1);
-    assert_eq!(tui.view().turn_state, Some(TurnState::Cancelled));
 }
 
 fn file_candidates() -> Vec<String> {
@@ -3714,6 +3796,14 @@ fn typed(tui: &mut Tui<FakeEngine>, text: &str) {
     for character in text.chars() {
         tui.handle(Event::Key(Key::Char(character)));
     }
+}
+
+fn focus_viewport(tui: &mut Tui<FakeEngine>) {
+    assert_eq!(
+        tui.handle(Event::MouseDown { column: 4, row: 1 }),
+        Action::Render
+    );
+    assert_eq!(tui.view().focus, TranscriptFocus::Viewport);
 }
 
 #[test]
@@ -3842,8 +3932,12 @@ fn the_file_picker_takes_navigation_keys_before_the_subagent_strip() {
     let mut tui = Tui::new(FakeEngine::default());
     tui.set_file_candidates(file_candidates());
     start_child(&mut tui, 7);
-    tui.handle(Event::Key(Key::Tab));
-    assert!(tui.view().execution_selection.is_some());
+    assert_eq!(tui.handle(Event::Key(Key::Tab)), Action::Render);
+    assert_eq!(tui.view().surface_focus, agens_tui::SurfaceFocus::Queue);
+    assert_eq!(tui.handle(Event::Key(Key::Tab)), Action::Render);
+    assert_eq!(tui.view().surface_focus, agens_tui::SurfaceFocus::Activity);
+    assert_eq!(tui.handle(Event::Key(Key::Tab)), Action::Render);
+    assert_eq!(tui.view().surface_focus, agens_tui::SurfaceFocus::Composer);
 
     typed(&mut tui, "@src/lib");
     tui.handle(Event::Key(Key::Down));
@@ -3868,7 +3962,7 @@ fn a_background_submission_leaves_no_file_picker_behind_for_escape() {
     assert!(tui.view().file_picker.is_none());
 
     assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Render);
-    assert_eq!(tui.view().focus, TranscriptFocus::Viewport);
+    assert_eq!(tui.view().focus, TranscriptFocus::Composer);
 }
 
 #[test]
@@ -3925,7 +4019,7 @@ fn device_auth_overlay_actions_copy_exact_values_open_and_keep_route_alive() {
         tui.device_auth_clipboard_text(),
         Some("https://auth.example/device")
     );
-    assert!(tui.view().running);
+    assert!(!tui.view().running);
     assert_eq!(tui.handle(Event::Key(Key::Down)), Action::Render);
     assert_eq!(
         tui.handle(Event::Key(Key::Enter)),
@@ -3935,14 +4029,14 @@ fn device_auth_overlay_actions_copy_exact_values_open_and_keep_route_alive() {
         tui.device_auth_clipboard_text(),
         Some("https://auth.example/device")
     );
-    assert!(tui.view().running);
+    assert!(!tui.view().running);
     assert_eq!(tui.handle(Event::Key(Key::Down)), Action::Render);
     assert_eq!(
         tui.handle(Event::Key(Key::Enter)),
         Action::CopyDeviceAuthCode
     );
     assert_eq!(tui.device_auth_clipboard_text(), Some("ABCD-EFGH"));
-    assert!(tui.view().running);
+    assert!(!tui.view().running);
 }
 
 #[test]
@@ -3954,8 +4048,8 @@ fn device_auth_overlay_escape_cancels_active_auth_route() {
         user_code: "ABCD-EFGH".into(),
     });
 
-    assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Cancel);
-    assert_eq!(tui.engine().cancellations, 1);
+    assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::CancelRoute);
+    assert_eq!(tui.engine().cancellations, 0);
 }
 
 #[test]
@@ -4116,6 +4210,7 @@ fn a_cancelled_background_subagent_does_not_schedule_a_turn_of_its_own() {
     let mut tui = Tui::new(FakeEngine::default());
     tui.begin_submission("delegate");
     tui.apply_progress(TurnEvent::StateChanged(TurnState::Completed));
+    tui.finish_provider_turn(TuiProviderOutcome::Completed("delegated".into()));
     tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
         agent: "scout".into(),
         event: TuiExecutionEvent::BackgroundStarted { id: 1 },
@@ -4722,4 +4817,90 @@ fn ask_user_answered_reply_debug_never_carries_answer_content() {
         !rendered.contains('q'),
         "debug must not leak the question id"
     );
+}
+
+#[test]
+fn terminal_progress_does_not_release_foreground_scheduler_ownership() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.enable_busy_policy_routing();
+    tui.begin_submission("first");
+    tui.apply_progress(TurnEvent::StateChanged(TurnState::Completed));
+    tui.handle(Event::Key(Key::Char('n')));
+
+    assert!(tui.view().running);
+    assert_eq!(
+        tui.handle(Event::Key(Key::Enter)),
+        Action::SubmitBusy("n".into())
+    );
+}
+
+#[test]
+fn runtime_turn_end_does_not_release_foreground_scheduler_ownership() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.enable_busy_policy_routing();
+    tui.begin_submission("first");
+    tui.apply_runtime_event(TuiRuntimeEvent::TurnEnded {
+        status: TurnState::Completed,
+        duration: None,
+    });
+    tui.handle(Event::Key(Key::Char('n')));
+
+    assert!(tui.view().running);
+    assert_eq!(
+        tui.handle(Event::Key(Key::Enter)),
+        Action::SubmitBusy("n".into())
+    );
+}
+
+#[test]
+fn scheduler_owned_background_handoff_releases_and_dispatches_the_oldest_fifo_prompt() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.begin_submission("first");
+    tui.handle(Event::Key(Key::Char('n')));
+    assert_eq!(tui.handle(Event::Key(Key::Enter)), Action::Render);
+
+    assert_eq!(
+        tui.finish_provider_turn(TuiProviderOutcome::Backgrounded),
+        Some("n".into())
+    );
+    assert!(tui.view().running);
+}
+
+#[test]
+fn local_route_stays_cancellable_without_claiming_scheduler_foreground_running() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.begin_route();
+    tui.apply_route_progress(TuiRouteProgress::DeviceCode {
+        verification_url: "https://auth.example/device".into(),
+        user_code: "ABCD-EFGH".into(),
+    });
+
+    assert!(!tui.view().running);
+    assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::CancelRoute);
+}
+
+#[test]
+fn terminal_progress_keeps_auto_turn_deferred_until_matching_outcome_after_fifo() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.begin_submission("foreground");
+    finish_background_child(&mut tui, 7);
+    tui.handle(Event::Key(Key::Char('q')));
+    assert_eq!(tui.handle(Event::Key(Key::Enter)), Action::Render);
+
+    tui.apply_progress(TurnEvent::StateChanged(TurnState::Completed));
+    tui.apply_runtime_event(TuiRuntimeEvent::TurnEnded {
+        status: TurnState::Completed,
+        duration: None,
+    });
+    assert_eq!(tui.take_ready_auto_turn(), None);
+
+    assert_eq!(
+        tui.finish_provider_turn(TuiProviderOutcome::Backgrounded),
+        Some("q".into())
+    );
+    assert_eq!(tui.take_ready_auto_turn(), None);
+    tui.begin_submission("q");
+    tui.finish_provider_turn(TuiProviderOutcome::Completed("done".into()));
+
+    assert!(tui.take_ready_auto_turn().is_some());
 }

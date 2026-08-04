@@ -6,7 +6,6 @@ use agens_core::HeadlessTurnError;
 use agens_tui::{TuiPresentation, TuiRouteCancellation, TuiSubmissionOutcome};
 
 use crate::engine::{seed_fresh_tui_context, write_through_bypass_permission_prompts};
-use crate::extensions::RESERVED_TUI_COMMANDS;
 use crate::models::{select_tui_effort, select_tui_model};
 use crate::resume::{commit_tui_session_resume, resume_tui_session};
 use crate::turn::tui_session_presentation;
@@ -17,9 +16,35 @@ use agens_session::context::reset_session;
 use agens_session::provider::ProviderKind;
 use agens_tool_runtime::rotation::rotate_agent;
 
-use super::TuiRuntimeRouter;
+use super::{BusyPolicy, TuiRuntimeRouter};
 
 impl TuiRuntimeRouter {
+    /// Classifies an input against the current built-in, command, and skill catalogs.
+    ///
+    /// The method intentionally performs no route work: callers can decide whether a busy
+    /// submission is queueable before clearing the composer or mutating the scheduler.
+    pub fn classify_busy_input(&self, input: &str) -> BusyPolicy {
+        let Some(name) = command_name(input) else {
+            return BusyPolicy::Queue;
+        };
+
+        let Ok(commands) = self.commands() else {
+            return BusyPolicy::Invalid;
+        };
+        if let Some(command) = commands.command(name) {
+            return BusyPolicy::from_catalog_policy(command.busy_policy());
+        }
+
+        if self
+            .skills()
+            .is_ok_and(|skills| skills.skill(name).is_some())
+        {
+            return BusyPolicy::Queue;
+        }
+
+        BusyPolicy::Invalid
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub fn resolve(&self, input: String) -> Result<TuiSubmissionOutcome, CliError> {
         self.resolve_with_cancellation(input, &TuiRouteCancellation::new())
@@ -135,7 +160,11 @@ impl TuiRuntimeRouter {
                 message: select_tui_effort(&bootstrap, command, &self.session)?,
                 presentation: self.presentation()?,
             },
-            _ if RESERVED_TUI_COMMANDS.contains(&name) => {
+            _ if self
+                .commands()?
+                .command(name)
+                .is_some_and(|command| command.is_builtin()) =>
+            {
                 return Err(CliError::usage(format!("unknown TUI command: {command}")));
             }
             _ => match self.commands()?.command(name) {
@@ -283,4 +312,12 @@ impl TuiRuntimeRouter {
                     .unwrap_or_default()
             })
     }
+}
+
+fn command_name(input: &str) -> Option<&str> {
+    let invocation = input.trim().strip_prefix('/')?;
+    let name_end = invocation
+        .find(char::is_whitespace)
+        .unwrap_or(invocation.len());
+    Some(&invocation[..name_end])
 }

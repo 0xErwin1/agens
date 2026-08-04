@@ -72,6 +72,9 @@ impl TuiRuntimeRouter {
             TuiRouteRequest::Input(input) => {
                 return self.route_with_progress_cancellable(input, progress, cancellation);
             }
+            TuiRouteRequest::BusyInput(input) => {
+                return self.route_busy_input(input, cancellation);
+            }
             TuiRouteRequest::SubmitSecret { action_id, secret } => {
                 return self.submit_secret(action_id, secret);
             }
@@ -122,6 +125,36 @@ impl TuiRuntimeRouter {
                 message: "API-key credentials could not be saved".into(),
                 action: TUI_ERROR_ACTION.into(),
             },
+        }
+    }
+
+    fn route_busy_input(
+        &self,
+        input: String,
+        cancellation: TuiRouteCancellation,
+    ) -> TuiSubmissionOutcome {
+        match self.classify_busy_input(&input) {
+            super::BusyPolicy::Queue => {
+                match self.resolve_with_cancellation(input, &cancellation) {
+                    Ok(TuiSubmissionOutcome::ProviderTurn { display, prompt }) => {
+                        TuiSubmissionOutcome::BusyProviderTurn { display, prompt }
+                    }
+                    Ok(outcome) => outcome,
+                    Err(error) => TuiSubmissionOutcome::LocalActionableError {
+                        message: error.to_string(),
+                        action: TUI_ERROR_ACTION.into(),
+                    },
+                }
+            }
+            super::BusyPolicy::Reject => TuiSubmissionOutcome::BusyRefusal(
+                "This command is unavailable while a response is in progress.".into(),
+            ),
+            super::BusyPolicy::Local | super::BusyPolicy::Quit | super::BusyPolicy::Invalid => self
+                .resolve_with_cancellation(input, &cancellation)
+                .unwrap_or_else(|error| TuiSubmissionOutcome::LocalActionableError {
+                    message: error.to_string(),
+                    action: TUI_ERROR_ACTION.into(),
+                }),
         }
     }
 }
