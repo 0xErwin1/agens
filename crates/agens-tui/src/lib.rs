@@ -233,6 +233,8 @@ pub enum Key {
     End,
     PageUp,
     PageDown,
+    AltUp,
+    AltDown,
     ScrollUp,
     ScrollDown,
     Up,
@@ -793,6 +795,16 @@ pub enum TranscriptFocus {
     Viewport,
 }
 
+/// The discoverable main-surface destination selected with Tab.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SurfaceFocus {
+    Composer,
+    Queue,
+    Activity,
+}
+
+const DEFAULT_PROMPT_QUEUE_CAPACITY: usize = 8;
+
 /// Which user message a jump lands on.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum UserMessageTarget {
@@ -917,6 +929,12 @@ pub struct ViewState<'a> {
     pub size: (u16, u16),
     /// Whether the composed engine has an active turn.
     pub running: bool,
+    /// Main-surface destination selected with Tab.
+    pub surface_focus: SurfaceFocus,
+    /// Whether the composer owns the visible terminal cursor.
+    pub composer_cursor_visible: bool,
+    /// Undispatched prompts shown in FIFO order.
+    pub queue: Vec<&'a QueueEntry>,
     /// Whether a local session restore is being prepared without starting a provider turn.
     pub session_loading: bool,
     /// Whether the current assistant item can still receive ordered text deltas.
@@ -1809,6 +1827,9 @@ fn render_frame_content(frame: &mut ratatui::Frame<'_>, state: &ViewState<'_>) {
         if let Some(metrics) = border_metrics(state, layout.composer) {
             composer = composer.title_bottom(metrics);
         }
+        if !state.queue.is_empty() {
+            composer = composer.title_top(Line::raw(queue_title(&state.queue)));
+        }
         frame.render_widget(
             Paragraph::new(composer_layout.text)
                 .block(composer)
@@ -1818,7 +1839,7 @@ fn render_frame_content(frame: &mut ratatui::Frame<'_>, state: &ViewState<'_>) {
         if visible_inner_width > 0
             && visible_inner_height > 0
             && state.focus == TranscriptFocus::Composer
-            && !state.running
+            && state.surface_focus == SurfaceFocus::Composer
             && !state.session_loading
             && state.dialog.is_none()
             && state.palette.is_none()
@@ -2837,6 +2858,16 @@ fn footer_context<'a>(state: &ViewState<'a>) -> widgets::FooterContext<'a> {
     }
 }
 
+fn queue_title(queue: &[&QueueEntry]) -> String {
+    let entries = queue
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| format!("{}. {}", index + 1, entry.prompt()))
+        .collect::<Vec<_>>()
+        .join(" · ");
+    format!(" Queue ({}) {entries} ", queue.len())
+}
+
 /// Metadata spliced into the composer's border, right-aligned and held one column
 /// off the closing corner, or `None` when the band cannot host it whole.
 ///
@@ -3726,10 +3757,10 @@ fn hint_spans(state: &ViewState<'_>) -> Vec<Span<'static>> {
         }
         hints.push(("i", "insert"));
     } else {
-        if !state.input.is_empty() && !state.running {
-            hints.push(("Enter", "send"));
+        if !state.input.is_empty() {
+            hints.push(("Enter", if state.running { "queue" } else { "send" }));
         }
-        hints.push(("Esc", if state.running { "look" } else { "normal" }));
+        hints.push(("Esc", if state.running { "stay" } else { "normal" }));
     }
     hints.push(("^?", "shortcuts"));
 
@@ -4893,6 +4924,9 @@ impl Renderer for PlainRenderer {
 /// Small event engine shared by the terminal lifecycle and future TUI components.
 pub struct Tui<E> {
     engine: E,
+    scheduler: AppState,
+    surface_focus: SurfaceFocus,
+    queue_selected: Option<usize>,
     input: String,
     input_cursor: usize,
     recovered_failed_prompt: bool,
@@ -4972,8 +5006,16 @@ where
 {
     /// Creates a TUI event engine around an injected application engine handle.
     pub fn new(engine: E) -> Self {
+        Self::with_queue_capacity(engine, DEFAULT_PROMPT_QUEUE_CAPACITY)
+    }
+
+    /// Creates a TUI with the scheduler capacity used for explicit prompts.
+    pub fn with_queue_capacity(engine: E, queue_capacity: usize) -> Self {
         Self {
             engine,
+            scheduler: AppState::new(queue_capacity),
+            surface_focus: SurfaceFocus::Composer,
+            queue_selected: None,
             hyperlinks: widgets::hyperlinks_enabled(),
             color_level: widgets::detect_color_level(
                 std::env::var("NO_COLOR").ok().as_deref(),
@@ -5106,6 +5148,16 @@ where
     /// Returns the input buffer for composition and focused tests.
     pub fn input(&self) -> &str {
         &self.input
+    }
+
+    /// Returns undispatched queue entries in their current FIFO order.
+    pub fn queue_entries(&self) -> Vec<&QueueEntry> {
+        self.scheduler.queued_entries()
+    }
+
+    /// Returns the current non-secret status message.
+    pub fn status(&self) -> Option<&str> {
+        self.status.as_deref()
     }
 
     /// Returns the most recently received terminal size.
@@ -5380,6 +5432,11 @@ where
         self.palette_open = false;
         let prompt = prompt.into();
         self.status = None;
+        if self.scheduler.lifecycle() == &TurnLifecycle::Idle {
+            let _ = self
+                .scheduler
+                .reduce(AppEvent::SubmitPrompt(prompt.clone()));
+        }
         if let Some(conversation) = self.conversation.take() {
             self.completed_conversations.push(conversation);
         }
@@ -6317,6 +6374,9 @@ where
             recovered_failed_prompt: self.recovered_failed_prompt,
             size: self.size,
             running: self.running,
+            surface_focus: self.surface_focus,
+            composer_cursor_visible: self.surface_focus == SurfaceFocus::Composer,
+            queue: self.scheduler.queued_entries(),
             session_loading: self.session_loading,
             assistant_streaming: self.assistant_streaming,
             quit_armed: self.quit_is_armed(),
@@ -6947,7 +7007,7 @@ where
             },
             Key::Escape => {
                 self.device_auth = None;
-                return self.cancel_running();
+                return Action::Render;
             }
             _ => {}
         }
@@ -7110,6 +7170,15 @@ where
             return self.handle_selection_dialog_key(key);
         }
 
+        if !self.palette_open && !self.file_picker_open() && key == Key::Tab {
+            self.cycle_surface_focus();
+            return Action::Render;
+        }
+
+        if let Some(action) = self.handle_surface_focus_key(key) {
+            return action;
+        }
+
         if !self.palette_open && !self.file_picker_open() && !self.executions.is_empty() {
             match key {
                 Key::Tab => {
@@ -7171,7 +7240,7 @@ where
         }
 
         if key == Key::Escape {
-            return self.handle_escape();
+            return Action::Render;
         }
 
         // An open palette or picker is typed into, so it owns the alphabet even
@@ -7375,12 +7444,7 @@ where
                 self.input_cursor = 0;
                 Action::OpenDialog("select".into())
             }
-            Key::Enter if self.running => {
-                self.transcript.push(TranscriptEntry::Info(
-                    "A response is already in progress.".into(),
-                ));
-                Action::Render
-            }
+            Key::Enter if self.running => self.enqueue_composer(),
             Key::Enter => {
                 if self.palette_open {
                     if let Some(route_id) = self.selected_palette_dialog() {
@@ -7400,6 +7464,110 @@ where
             Key::CtrlC => unreachable!("Ctrl+C is handled before focused input"),
             _ => unreachable!("composer keys are handled before global keys"),
         }
+    }
+
+    fn cycle_surface_focus(&mut self) {
+        self.surface_focus = match self.surface_focus {
+            SurfaceFocus::Composer => {
+                self.queue_selected = (!self.scheduler.queued_entries().is_empty()).then_some(0);
+                SurfaceFocus::Queue
+            }
+            SurfaceFocus::Queue => SurfaceFocus::Activity,
+            SurfaceFocus::Activity => SurfaceFocus::Composer,
+        };
+    }
+
+    fn handle_surface_focus_key(&mut self, key: Key) -> Option<Action> {
+        if self.surface_focus != SurfaceFocus::Queue {
+            return (self.surface_focus == SurfaceFocus::Activity).then_some(Action::Render);
+        }
+
+        let entries = self.scheduler.queued_entries();
+        if entries.is_empty() {
+            self.queue_selected = None;
+            return Some(Action::Render);
+        }
+        let selected = self.queue_selected.unwrap_or(0).min(entries.len() - 1);
+        match key {
+            Key::Up => self.queue_selected = Some(selected.saturating_sub(1)),
+            Key::Down => self.queue_selected = Some((selected + 1).min(entries.len() - 1)),
+            Key::AltUp => self.move_selected_queue_entry(-1),
+            Key::AltDown => self.move_selected_queue_entry(1),
+            Key::Delete => self.remove_selected_queue_entry(),
+            Key::Enter => self.edit_selected_queue_entry(),
+            _ => return Some(Action::Render),
+        }
+        Some(Action::Render)
+    }
+
+    fn move_selected_queue_entry(&mut self, offset: isize) {
+        let Some(selected) = self.queue_selected else {
+            return;
+        };
+        let id = {
+            let entries = self.scheduler.queued_entries();
+            let Some(entry) = entries.get(selected) else {
+                return;
+            };
+            entry.id()
+        };
+        if self.scheduler.move_queue_entry(id, offset) {
+            self.queue_selected = Some(
+                selected
+                    .saturating_add_signed(offset)
+                    .min(self.scheduler.queued_entries().len().saturating_sub(1)),
+            );
+        }
+    }
+
+    fn remove_selected_queue_entry(&mut self) {
+        let Some(selected) = self.queue_selected else {
+            return;
+        };
+        let id = {
+            let entries = self.scheduler.queued_entries();
+            let Some(entry) = entries.get(selected) else {
+                return;
+            };
+            entry.id()
+        };
+        let _ = self.scheduler.remove_queue_entry(id);
+        let remaining = self.scheduler.queued_entries().len();
+        self.queue_selected = (remaining > 0).then_some(selected.min(remaining - 1));
+    }
+
+    fn edit_selected_queue_entry(&mut self) {
+        let Some(selected) = self.queue_selected else {
+            return;
+        };
+        let id = {
+            let entries = self.scheduler.queued_entries();
+            let Some(entry) = entries.get(selected) else {
+                return;
+            };
+            entry.id()
+        };
+        let Some(entry) = self.scheduler.remove_queue_entry(id) else {
+            return;
+        };
+        self.input = entry.prompt().to_owned();
+        self.input_cursor = self.input.chars().count();
+        self.surface_focus = SurfaceFocus::Composer;
+        self.queue_selected = None;
+    }
+
+    fn enqueue_composer(&mut self) -> Action {
+        let draft = self.input.clone();
+        let effects = self.scheduler.reduce(AppEvent::SubmitPrompt(draft));
+        if let Some(Effect::RefusePrompt(message)) = effects.first() {
+            self.status = Some(message.clone());
+            return Action::Render;
+        }
+        self.input.clear();
+        self.input_cursor = 0;
+        self.recovered_failed_prompt = false;
+        self.surface_focus = SurfaceFocus::Composer;
+        Action::Render
     }
 
     fn handle_composer_key(&mut self, key: Key) -> Option<Action> {
@@ -7655,22 +7823,7 @@ where
             == TranscriptFocus::Viewport
     }
 
-    /// Focuses the transcript and pins the viewport where the reader left it.
-    ///
-    /// Detaching on entry rather than on the first motion is what makes the
-    /// mode worth entering during a turn: output that keeps arriving would
-    /// otherwise scroll away the very row the reader stopped to read.
-    fn enter_viewport(&mut self) {
-        let bottom = self.detached_scroll_bottom();
-        let record = self.active_record_mut();
-        if record.following_bottom {
-            record.scroll_offset = bottom;
-            record.following_bottom = false;
-        }
-        record.focus = TranscriptFocus::Viewport;
-    }
-
-    /// Drops the painted selection, reporting whether there was one to drop.
+    /// Drops the current transcript selection without changing the active turn.
     fn clear_selection(&mut self) -> bool {
         let record = self.active_record_mut();
         let painted = record.selection.is_some()
@@ -7683,45 +7836,6 @@ where
         record.selecting = false;
 
         painted
-    }
-
-    /// Escape leaves the composer before it reaches the running turn.
-    ///
-    /// Stopping to read and cancelling are different intents, and a reader who
-    /// only wanted to look must not lose the turn to do it. Escape therefore
-    /// always steps out of the composer first; only a second Escape, pressed
-    /// with the transcript already focused and nothing selected, cancels.
-    fn handle_escape(&mut self) -> Action {
-        self.pending_viewport_key = None;
-
-        if self.recovered_failed_prompt {
-            self.input.clear();
-            self.input_cursor = 0;
-            self.recovered_failed_prompt = false;
-            self.active_record_mut().focus = TranscriptFocus::Composer;
-            self.status = Some("Recovered prompt discarded.".into());
-            return Action::Render;
-        }
-
-        if self.dialog.is_some() {
-            self.dialog = None;
-            return Action::Render;
-        }
-
-        if !self.viewport_focused() {
-            self.enter_viewport();
-            return Action::Render;
-        }
-
-        if self.clear_selection() {
-            return Action::Render;
-        }
-
-        if self.running {
-            return self.cancel_running();
-        }
-
-        Action::Render
     }
 
     /// The transcript keymap, applied only while the viewport holds focus.
@@ -7836,14 +7950,6 @@ where
     /// Rows a `Ctrl+D`/`Ctrl+U` step advances.
     fn half_page_rows(&self) -> u16 {
         (self.transcript_page_rows() / 2).max(1)
-    }
-
-    fn cancel_running(&mut self) -> Action {
-        self.palette_open = false;
-        self.engine.cancel();
-        self.quit_armed_until = None;
-        self.turn_state = Some(TurnState::Cancelled);
-        Action::Cancel
     }
 
     fn handle_copy_selection(&mut self) -> Action {
@@ -10383,6 +10489,8 @@ fn map_key(event: KeyEvent) -> Option<Event> {
         (KeyCode::End, _) => Key::End,
         (KeyCode::PageUp, _) => Key::PageUp,
         (KeyCode::PageDown, _) => Key::PageDown,
+        (KeyCode::Up, KeyModifiers::ALT) => Key::AltUp,
+        (KeyCode::Down, KeyModifiers::ALT) => Key::AltDown,
         (KeyCode::Up, _) => Key::Up,
         (KeyCode::Down, _) => Key::Down,
         (KeyCode::Tab, _) => Key::Tab,
@@ -11806,41 +11914,37 @@ mod runtime_tests {
         tui
     }
 
-    /// Escape used to be the cancel key, so a reader who only wanted to scroll
-    /// up and look at something lost the turn to do it.
     #[test]
-    fn escape_focuses_the_transcript_before_it_cancels_a_running_turn() {
+    fn escape_is_inert_on_the_main_surface_while_a_turn_is_running() {
         let mut tui = scrollable_tui();
         tui.running = true;
 
         assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Render);
-        assert_eq!(tui.view().focus, TranscriptFocus::Viewport);
-        assert!(tui.running, "leaving the composer never cancels the turn");
-
-        assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Cancel);
+        assert_eq!(tui.view().focus, TranscriptFocus::Composer);
+        assert!(tui.running);
     }
 
-    /// A selection is the nearer thing to dismiss, so it goes before the turn.
     #[test]
-    fn escape_drops_the_selection_before_it_reaches_the_running_turn() {
+    fn escape_preserves_main_surface_selection_while_a_turn_is_running() {
         let mut tui = selected_tui();
         tui.running = true;
+        let selected = tui.selected_text().map(str::to_owned);
 
         assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Render);
-        assert_eq!(tui.selected_text(), None);
-        assert!(tui.running, "dropping a selection never cancels the turn");
-
-        assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Cancel);
+        assert_eq!(tui.selected_text(), selected.as_deref());
+        assert!(tui.running);
     }
 
-    /// Entering the mode has to pin the viewport, or output arriving during the
-    /// turn scrolls away the row the reader stopped on.
     #[test]
-    fn focusing_the_transcript_detaches_it_from_the_bottom() {
+    fn viewport_navigation_detaches_from_the_bottom() {
         let mut tui = scrollable_tui();
         assert!(tui.following_bottom());
 
-        tui.handle(Event::Key(Key::Escape));
+        let bottom = tui.detached_scroll_bottom();
+        let record = tui.active_record_mut();
+        record.scroll_offset = bottom;
+        record.following_bottom = false;
+        record.focus = TranscriptFocus::Viewport;
         assert!(!tui.following_bottom());
 
         tui.handle(Event::Key(Key::Char('G')));
@@ -11850,7 +11954,7 @@ mod runtime_tests {
     #[test]
     fn viewport_vim_motions_scroll_rows_rather_than_typing_into_the_composer() {
         let mut tui = scrollable_tui();
-        tui.handle(Event::Key(Key::Escape));
+        tui.active_record_mut().focus = TranscriptFocus::Viewport;
 
         let bottom = tui.view().scroll_offset;
         tui.handle(Event::Key(Key::Char('k')));
@@ -11872,7 +11976,7 @@ mod runtime_tests {
     #[test]
     fn braces_walk_the_transcript_prompt_by_prompt_in_both_directions() {
         let mut tui = scrollable_tui();
-        tui.handle(Event::Key(Key::Escape));
+        tui.active_record_mut().focus = TranscriptFocus::Viewport;
         tui.handle(Event::Key(Key::Char('g')));
         tui.handle(Event::Key(Key::Char('g')));
         assert_eq!(tui.view().scroll_offset, 0);
@@ -11918,7 +12022,7 @@ mod runtime_tests {
     #[test]
     fn i_returns_to_the_composer_and_typing_resumes() {
         let mut tui = scrollable_tui();
-        tui.handle(Event::Key(Key::Escape));
+        tui.active_record_mut().focus = TranscriptFocus::Viewport;
 
         assert_eq!(tui.handle(Event::Key(Key::Char('i'))), Action::Render);
         assert_eq!(tui.view().focus, TranscriptFocus::Composer);
@@ -11949,14 +12053,13 @@ mod runtime_tests {
 
         tui.running = true;
         let running = text(&tui);
-        assert!(!running.contains("Enter"), "a turn is already in flight");
+        assert!(running.contains("Enter:queue"), "{running:?}");
 
         tui.running = false;
         tui.handle(Event::Key(Key::Escape));
-        let normal = text(&tui);
-        assert!(normal.contains("NORMAL"), "{normal:?}");
-        assert!(normal.contains("j/k:scroll"), "{normal:?}");
-        assert!(normal.contains("i:insert"), "{normal:?}");
+        let composer = text(&tui);
+        assert_eq!(tui.view().focus, TranscriptFocus::Composer);
+        assert!(composer.contains("Esc:normal"), "{composer:?}");
     }
 
     /// The tree hangs below the composer, so the arrows walk between them as
@@ -12034,8 +12137,8 @@ mod runtime_tests {
         );
 
         tui.handle(Event::Key(Key::Escape));
-        tui.handle(Event::Key(Key::Escape));
-        assert_eq!(tui.view().focus, TranscriptFocus::Viewport);
+        assert_eq!(tui.view().focus, TranscriptFocus::Composer);
+        tui.active_record_mut().focus = TranscriptFocus::Viewport;
         tui.handle(Event::Key(Key::Char('?')));
         assert!(tui.view().dialog.is_some(), "? opens it in Normal mode");
     }
@@ -12315,7 +12418,8 @@ mod runtime_tests {
             press(&mut running, KeyCode::Enter, KeyModifiers::NONE),
             Action::Render
         );
-        assert_eq!(running.input(), "queued 🙂");
+        assert!(running.input().is_empty());
+        assert_eq!(running.queue_entries()[0].prompt(), "queued 🙂");
     }
 
     #[test]

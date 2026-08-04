@@ -5,6 +5,7 @@ use std::{collections::VecDeque, time::Instant};
 use crate::Key;
 
 const RUNNING_REFUSAL: &str = "This command is unavailable while a response is in progress.";
+const QUEUE_FULL_REFUSAL: &str = "Prompt queue is full; draft was kept unchanged.";
 
 /// Whether the application currently owns an active runtime turn.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -231,6 +232,34 @@ impl AppState {
         self.queued_prompts.iter().collect()
     }
 
+    /// Removes an undispatched entry by its stable identity.
+    pub fn remove_queue_entry(&mut self, id: u64) -> Option<QueueEntry> {
+        let position = self
+            .queued_prompts
+            .iter()
+            .position(|entry| entry.id == id)?;
+        self.queued_prompts.remove(position)
+    }
+
+    /// Moves an undispatched entry one or more positions while preserving its identity.
+    pub fn move_queue_entry(&mut self, id: u64, offset: isize) -> bool {
+        let Some(position) = self.queued_prompts.iter().position(|entry| entry.id == id) else {
+            return false;
+        };
+        let destination = position
+            .saturating_add_signed(offset)
+            .min(self.queued_prompts.len().saturating_sub(1));
+        if position == destination {
+            return false;
+        }
+        let entry = self
+            .queued_prompts
+            .remove(position)
+            .expect("located queue entry exists");
+        self.queued_prompts.insert(destination, entry);
+        true
+    }
+
     /// Returns only successfully completed prompt/output history.
     pub fn completed_history(&self) -> &[(String, String)] {
         &self.completed_history
@@ -261,9 +290,7 @@ impl AppState {
         }
 
         if self.queued_prompts.len() == self.queue_capacity {
-            return vec![Effect::RefusePrompt(
-                "A response is already in progress.".into(),
-            )];
+            return vec![Effect::RefusePrompt(QUEUE_FULL_REFUSAL.into())];
         }
 
         let entry = QueueEntry::new(self.next_queue_entry_id, prompt);
