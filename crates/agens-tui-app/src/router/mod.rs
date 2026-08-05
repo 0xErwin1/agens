@@ -269,7 +269,7 @@ pub fn tui_provider_outcome(result: Result<String, CliError>) -> TuiProviderOutc
                 action: "Check the network connection, then retry.".into(),
             }
         }
-        Err(error) if has_error_message(&error, "ChatGPT response protocol failed") => {
+        Err(error) if has_error_message(&error, "provider response protocol failed") => {
             TuiProviderOutcome::Failed {
                 message: error.to_string(),
                 action: "Open /diagnostics for the referenced event, then retry.".into(),

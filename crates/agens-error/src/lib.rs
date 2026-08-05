@@ -104,7 +104,7 @@ impl CliError {
             HeadlessTurnError::Authentication => (
                 ExitStatus::Authentication,
                 "auth",
-                "ChatGPT credentials are unavailable or invalid",
+                "provider credentials are unavailable or invalid",
             ),
             HeadlessTurnError::Provider => {
                 (ExitStatus::Failure, "provider", "provider request failed")
@@ -112,7 +112,7 @@ impl CliError {
             HeadlessTurnError::ProviderRejected => (
                 ExitStatus::Failure,
                 "provider",
-                "ChatGPT request was rejected",
+                "provider request was rejected",
             ),
             HeadlessTurnError::ProviderContext => (
                 ExitStatus::Failure,
@@ -127,10 +127,10 @@ impl CliError {
             HeadlessTurnError::ProviderRateLimited => (
                 ExitStatus::Failure,
                 "provider",
-                "ChatGPT request was rate limited",
+                "provider request was rate limited",
             ),
             HeadlessTurnError::ProviderServer => {
-                (ExitStatus::Failure, "provider", "ChatGPT service failed")
+                (ExitStatus::Failure, "provider", "provider service failed")
             }
             HeadlessTurnError::ProviderNetwork => {
                 (ExitStatus::Failure, "provider", "network request failed")
@@ -138,7 +138,7 @@ impl CliError {
             HeadlessTurnError::ProviderProtocol => (
                 ExitStatus::Failure,
                 "provider",
-                "ChatGPT response protocol failed",
+                "provider response protocol failed",
             ),
             HeadlessTurnError::Permission => (
                 ExitStatus::Failure,
@@ -277,7 +277,7 @@ mod tests {
             .with_failure_detail(Some("HTTP 400 rejected model \"gpt-9-missing\"".to_owned()));
 
         let rendered = error.to_string();
-        assert!(rendered.starts_with("provider: ChatGPT request was rejected"));
+        assert!(rendered.starts_with("provider: provider request was rejected"));
         assert!(rendered.contains("HTTP 400 rejected model \"gpt-9-missing\""));
     }
 

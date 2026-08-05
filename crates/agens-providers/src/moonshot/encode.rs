@@ -5,6 +5,8 @@
 //! is the whole reason this encoder exists separately from the responses-API one
 //! next to it, which continues a server-held thread by id instead.
 
+use std::collections::HashMap;
+
 use agens_core::{Message, MessagePart, ReasoningEffort, Role};
 use serde_json::{Value, json};
 
@@ -19,6 +21,10 @@ pub(super) struct RequestOptions<'a> {
     pub parallel_tool_calls: bool,
     pub reasoning_effort: Option<ReasoningEffort>,
 }
+
+/// Chat-completions history is not valid for the wire (tool_calls adjacency).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct HistoryValidationError;
 
 /// The tool shape Moonshot expects.
 ///
@@ -45,11 +51,31 @@ fn role_name(role: Role) -> &'static str {
     }
 }
 
+/// Collects `tool_call_id → function name` from every ToolCall part so tool
+/// result messages can carry the `name` field Moonshot expects.
+fn tool_call_names(messages: &[Message]) -> HashMap<String, String> {
+    let mut names = HashMap::new();
+
+    for message in messages {
+        for part in &message.parts {
+            if let MessagePart::ToolCall { id, name, .. } = part {
+                names.insert(id.clone(), name.clone());
+            }
+        }
+    }
+
+    names
+}
+
 /// Encodes one message into the zero or more chat-completions messages it maps
 /// onto. A single assistant turn carrying both text and tool calls is one
 /// message, while its tool results are separate `tool` messages, so the counts
 /// do not line up one to one.
-fn encode_message(message: &Message, encoded: &mut Vec<Value>) {
+fn encode_message(
+    message: &Message,
+    tool_names: &HashMap<String, String>,
+    encoded: &mut Vec<Value>,
+) {
     let mut text = String::new();
     let mut reasoning = String::new();
     let mut tool_calls = Vec::new();
@@ -67,11 +93,22 @@ fn encode_message(message: &Message, encoded: &mut Vec<Value>) {
                 tool_call_id,
                 content,
                 ..
-            } => encoded.push(json!({
-                "role": "tool",
-                "tool_call_id": tool_call_id,
-                "content": content,
-            })),
+            } => {
+                let mut tool_message = json!({
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "content": content,
+                });
+
+                if let Some(name) = tool_names.get(tool_call_id) {
+                    tool_message
+                        .as_object_mut()
+                        .expect("a json! object literal is an object")
+                        .insert("name".to_owned(), Value::String(name.clone()));
+                }
+
+                encoded.push(tool_message);
+            }
         }
     }
 
@@ -108,11 +145,76 @@ fn encode_message(message: &Message, encoded: &mut Vec<Value>) {
 }
 
 pub(super) fn encode_messages(messages: &[Message]) -> Vec<Value> {
+    let tool_names = tool_call_names(messages);
     let mut encoded = Vec::new();
+
     for message in messages {
-        encode_message(message, &mut encoded);
+        encode_message(message, &tool_names, &mut encoded);
     }
+
     encoded
+}
+
+/// Chat-completions requires every assistant `tool_calls` batch to be followed
+/// immediately by `role=tool` messages covering exactly those `tool_call_id`s
+/// before any other role appears.
+pub(super) fn validate_chat_completions_history(
+    messages: &[Message],
+) -> Result<(), HistoryValidationError> {
+    validate_encoded_tool_call_adjacency(&encode_messages(messages))
+}
+
+fn validate_encoded_tool_call_adjacency(encoded: &[Value]) -> Result<(), HistoryValidationError> {
+    let mut index = 0;
+
+    while index < encoded.len() {
+        let message = &encoded[index];
+        let role = message.get("role").and_then(Value::as_str).unwrap_or("");
+
+        if role == "assistant"
+            && let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array)
+            && !tool_calls.is_empty()
+        {
+            let expected_ids: Vec<&str> = tool_calls
+                .iter()
+                .map(|call| {
+                    call.get("id")
+                        .and_then(Value::as_str)
+                        .ok_or(HistoryValidationError)
+                })
+                .collect::<Result<_, _>>()?;
+
+            let mut covered = Vec::with_capacity(expected_ids.len());
+            let mut cursor = index + 1;
+
+            while cursor < encoded.len()
+                && encoded[cursor].get("role").and_then(Value::as_str) == Some("tool")
+            {
+                let tool_call_id = encoded[cursor]
+                    .get("tool_call_id")
+                    .and_then(Value::as_str)
+                    .ok_or(HistoryValidationError)?;
+
+                if !expected_ids.contains(&tool_call_id) || covered.contains(&tool_call_id) {
+                    return Err(HistoryValidationError);
+                }
+
+                covered.push(tool_call_id);
+                cursor += 1;
+            }
+
+            if covered.len() != expected_ids.len() {
+                return Err(HistoryValidationError);
+            }
+
+            index = cursor;
+            continue;
+        }
+
+        index += 1;
+    }
+
+    Ok(())
 }
 
 /// The full request body for one streaming call.
@@ -330,8 +432,10 @@ mod tests {
 
         assert_eq!(encoded[2]["role"], json!("tool"));
         assert_eq!(encoded[2]["tool_call_id"], json!("call_0"));
+        assert_eq!(encoded[2]["name"], json!("get_weather"));
         assert_eq!(encoded[2]["content"], json!("sunny"));
         assert_eq!(encoded[3]["tool_call_id"], json!("call_1"));
+        assert_eq!(encoded[3]["name"], json!("get_weather"));
     }
 
     #[test]
@@ -352,5 +456,103 @@ mod tests {
 
         assert_eq!(encoded[0]["content"], json!("checking"));
         assert_eq!(encoded[0]["tool_calls"].as_array().expect("array").len(), 1);
+    }
+
+    #[test]
+    fn unpaired_tool_calls_fail_history_validation() {
+        let messages = [
+            user("weather?"),
+            Message {
+                role: Role::Assistant,
+                parts: vec![MessagePart::ToolCall {
+                    id: "call_0".to_owned(),
+                    name: "get_weather".to_owned(),
+                    input: r#"{"city":"Paris"}"#.to_owned(),
+                }],
+            },
+        ];
+
+        assert_eq!(
+            validate_chat_completions_history(&messages),
+            Err(HistoryValidationError)
+        );
+    }
+
+    #[test]
+    fn a_user_message_between_tool_calls_and_results_fails_validation() {
+        let messages = [
+            user("weather?"),
+            Message {
+                role: Role::Assistant,
+                parts: vec![MessagePart::ToolCall {
+                    id: "call_0".to_owned(),
+                    name: "get_weather".to_owned(),
+                    input: r#"{"city":"Paris"}"#.to_owned(),
+                }],
+            },
+            user("coordination"),
+            Message {
+                role: Role::Tool,
+                parts: vec![MessagePart::ToolResult {
+                    tool_call_id: "call_0".to_owned(),
+                    content: "sunny".to_owned(),
+                    is_error: false,
+                }],
+            },
+        ];
+
+        assert_eq!(
+            validate_chat_completions_history(&messages),
+            Err(HistoryValidationError)
+        );
+    }
+
+    #[test]
+    fn a_complete_multi_tool_batch_validates_and_names_tool_messages() {
+        let messages = [
+            user("weather in Paris and Tokyo?"),
+            Message {
+                role: Role::Assistant,
+                parts: vec![
+                    MessagePart::ToolCall {
+                        id: "call_0".to_owned(),
+                        name: "get_weather".to_owned(),
+                        input: r#"{"city":"Paris"}"#.to_owned(),
+                    },
+                    MessagePart::ToolCall {
+                        id: "call_1".to_owned(),
+                        name: "get_weather".to_owned(),
+                        input: r#"{"city":"Tokyo"}"#.to_owned(),
+                    },
+                ],
+            },
+            Message {
+                role: Role::Tool,
+                parts: vec![
+                    MessagePart::ToolResult {
+                        tool_call_id: "call_0".to_owned(),
+                        content: "sunny".to_owned(),
+                        is_error: false,
+                    },
+                    MessagePart::ToolResult {
+                        tool_call_id: "call_1".to_owned(),
+                        content: "rainy".to_owned(),
+                        is_error: false,
+                    },
+                ],
+            },
+            user("thanks"),
+        ];
+
+        assert_eq!(validate_chat_completions_history(&messages), Ok(()));
+
+        let encoded = encode_messages(&messages);
+        assert_eq!(encoded[2]["role"], json!("tool"));
+        assert_eq!(encoded[2]["name"], json!("get_weather"));
+        assert_eq!(encoded[2]["tool_call_id"], json!("call_0"));
+        assert_eq!(encoded[3]["name"], json!("get_weather"));
+        assert_eq!(encoded[3]["tool_call_id"], json!("call_1"));
+        assert_eq!(encoded[4]["role"], json!("user"));
+        assert_eq!(encoded[4]["content"], json!("thanks"));
     }
 }

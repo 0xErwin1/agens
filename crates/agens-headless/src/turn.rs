@@ -810,7 +810,7 @@ mod tests {
                 .to_string()
                 .contains("stale detail from a recovered mid-stream event")
         );
-        assert_eq!(error.to_string(), "provider: ChatGPT service failed");
+        assert_eq!(error.to_string(), "provider: provider service failed");
     }
 
     fn descriptor(name: &str, enabled: bool) -> McpServerDescriptor {
