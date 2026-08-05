@@ -2880,73 +2880,117 @@ fn footer_context<'a>(state: &ViewState<'a>) -> widgets::FooterContext<'a> {
     }
 }
 
-/// Caps visible queue rows so a full queue cannot starve the transcript.
+/// Caps visible queue message rows so a full queue cannot starve the transcript.
 const MAX_VISIBLE_QUEUE_ROWS: usize = 6;
 
-/// Pending prompts as single-line message rows stacked above the composer.
+/// Rows reserved for the muted queue chrome line under the message stack.
+const QUEUE_STATUS_ROWS: usize = 1;
+
+/// Height budget for a non-empty queue: message rows plus the status line.
+fn queue_layout_rows(queue_len: usize) -> usize {
+    if queue_len == 0 {
+        return 0;
+    }
+    queue_len
+        .min(MAX_VISIBLE_QUEUE_ROWS)
+        .saturating_add(QUEUE_STATUS_ROWS)
+}
+
+/// Pending prompts as numbered message lines above the composer (Grok/OpenCode style).
 fn render_queue(frame: &mut ratatui::Frame<'_>, area: Rect, state: &ViewState<'_>) {
     if area.height == 0 || state.queue.is_empty() {
         return;
     }
 
+    let status_rows = usize::from(area.height > 1).min(QUEUE_STATUS_ROWS);
+    let message_budget = usize::from(area.height).saturating_sub(status_rows);
     let visible = state
         .queue
         .len()
-        .min(usize::from(area.height))
+        .min(message_budget)
         .min(MAX_VISIBLE_QUEUE_ROWS);
     let focused = state.surface_focus == SurfaceFocus::Queue;
-    let bullet = widgets::Glyph::UserBullet.text(state.unicode_level);
     let width = usize::from(area.width);
 
-    let lines = state
+    let mut lines = state
         .queue
         .iter()
         .take(visible)
         .enumerate()
         .map(|(index, entry)| {
             let selected = focused && state.queue_selected == Some(index);
-            queue_row_line(entry.prompt(), bullet, width, selected)
+            queue_row_line(index + 1, entry.prompt(), width, selected)
         })
         .collect::<Vec<_>>();
+
+    if status_rows > 0 {
+        lines.push(queue_status_line(state.queue.len(), focused, width));
+    }
 
     frame.render_widget(Paragraph::new(Text::from(lines)), area);
 }
 
-fn queue_row_line(prompt: &str, bullet: &str, width: usize, selected: bool) -> Line<'static> {
-    let background = if selected {
-        widgets::RolePalette::selection_bg()
-    } else {
-        widgets::RolePalette::user_band()
-    };
+fn queue_row_line(index: usize, prompt: &str, width: usize, selected: bool) -> Line<'static> {
     let text_fg = if selected {
+        widgets::RolePalette::selection_fg()
+    } else {
+        widgets::RolePalette::assistant()
+    };
+    let index_fg = if selected {
         widgets::RolePalette::selection_fg()
     } else {
         widgets::RolePalette::muted()
     };
-    let bullet_fg = if selected {
-        widgets::RolePalette::selection_fg()
-    } else {
-        widgets::RolePalette::user_identity()
+    let background = selected.then_some(widgets::RolePalette::selection_bg());
+    let base = match background {
+        Some(bg) => Style::default().fg(text_fg).bg(bg),
+        None => Style::default().fg(text_fg),
+    };
+    let index_style = match background {
+        Some(bg) => Style::default().fg(index_fg).bg(bg),
+        None => Style::default().fg(index_fg),
     };
 
-    let base = Style::default().fg(text_fg).bg(background);
-    let bullet_style = Style::default().fg(bullet_fg).bg(background);
-    let prefix = format!("  {bullet}  ");
-    let prefix_width = UnicodeWidthStr::width(prefix.as_str());
-    let text = render::bounded_single_line(prompt, width.saturating_sub(prefix_width));
-    let used = prefix_width.saturating_add(UnicodeWidthStr::width(text.as_str()));
+    let label = format!("#{index} ");
+    let label_width = UnicodeWidthStr::width(label.as_str());
+    let text = render::bounded_single_line(prompt, width.saturating_sub(label_width));
+    let used = label_width.saturating_add(UnicodeWidthStr::width(text.as_str()));
     let padding = width.saturating_sub(used);
 
     let mut spans = vec![
-        Span::styled("  ".to_owned(), base),
-        Span::styled(bullet.to_owned(), bullet_style),
-        Span::styled("  ".to_owned(), base),
+        Span::styled(label, index_style),
         Span::styled(text, base),
     ];
     if padding > 0 {
-        spans.push(Span::styled(" ".repeat(padding), base));
+        spans.push(Span::styled(
+            " ".repeat(padding),
+            match background {
+                Some(bg) => Style::default().bg(bg),
+                None => Style::default(),
+            },
+        ));
     }
     Line::from(spans)
+}
+
+fn queue_status_line(count: usize, focused: bool, width: usize) -> Line<'static> {
+    let muted = Style::default().fg(widgets::RolePalette::muted());
+    let accent = Style::default().fg(widgets::RolePalette::chrome());
+    let label = if focused {
+        if count == 1 {
+            "Queued · Enter edit · Del remove".to_owned()
+        } else {
+            format!("Queued ({count}) · Enter edit · Del remove")
+        }
+    } else if count == 1 {
+        "Queued · Tab manage".to_owned()
+    } else {
+        format!("Queued ({count}) · Tab manage")
+    };
+    let text = render::bounded_single_line(&label, width);
+    Line::from(vec![
+        Span::styled(text, if focused { accent } else { muted }),
+    ])
 }
 
 /// Metadata spliced into the composer's border, right-aligned and held one column
@@ -3718,7 +3762,7 @@ fn screen_layout(area: Rect, input: &str, queue_len: usize) -> ScreenLayout {
     let after_composer = area.height.saturating_sub(composer_rows);
     let chrome = bottom_chrome(area.width, area.height).fitted(after_composer);
     let remaining = after_composer.saturating_sub(chrome.rows());
-    let wanted_queue = saturating_u16(queue_len.min(MAX_VISIBLE_QUEUE_ROWS));
+    let wanted_queue = saturating_u16(queue_layout_rows(queue_len));
     let queue_rows = wanted_queue.min(remaining);
     let transcript_rows = remaining.saturating_sub(queue_rows);
     let chunks = Layout::vertical([

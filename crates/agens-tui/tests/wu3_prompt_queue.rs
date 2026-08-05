@@ -149,12 +149,16 @@ fn queue_rows_render_in_fifo_order_without_transcript_admission() {
         .collect::<String>();
 
     assert!(
-        rendered.contains("first queued"),
+        rendered.contains("#1 first queued"),
         "missing first queue row: {rendered:?}"
     );
     assert!(
-        rendered.contains("second queued"),
+        rendered.contains("#2 second queued"),
         "missing second queue row: {rendered:?}"
+    );
+    assert!(
+        rendered.contains("Queued"),
+        "missing queue status line: {rendered:?}"
     );
     assert!(
         !rendered.contains("1. first queued · 2. second queued"),
