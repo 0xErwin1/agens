@@ -7733,25 +7733,7 @@ where
                     message: std::mem::take(&mut self.input),
                 }
             }
-            Key::Enter if self.foreground_running() && self.busy_policy_routing => {
-                Action::SubmitBusy(self.input.clone())
-            }
-            Key::Enter if self.foreground_running() => self.enqueue_composer(),
-            Key::Enter => {
-                if self.palette_open {
-                    if let Some(route_id) = self.selected_palette_dialog() {
-                        self.palette_open = false;
-                        self.input.clear();
-                        self.input_cursor = 0;
-                        return Action::OpenDialog(route_id);
-                    }
-                    self.complete_palette_selection();
-                }
-                self.palette_open = false;
-                self.input_cursor = 0;
-                self.recovered_failed_prompt = false;
-                Action::Submit(std::mem::take(&mut self.input))
-            }
+            Key::Enter => self.submit_composer_or_palette(),
             Key::Escape => unreachable!("Escape is handled before focused input"),
             Key::CtrlC => unreachable!("Ctrl+C is handled before focused input"),
             _ => unreachable!("composer keys are handled before global keys"),
@@ -7791,6 +7773,11 @@ where
                 }
                 Key::Char('x') => self.selected_execution_cancellation(),
                 Key::Char('X') => Some(Action::CancelAllExecutions),
+                // Typing returns to the composer so `/` commands still work mid-turn.
+                key if key.edits_composer() => {
+                    self.surface_focus = SurfaceFocus::Composer;
+                    None
+                }
                 _ => Some(Action::Render),
             };
         }
@@ -7801,7 +7788,8 @@ where
         let entries = self.scheduler.queued_entries();
         if entries.is_empty() {
             self.queue_selected = None;
-            return Some(Action::Render);
+            self.surface_focus = SurfaceFocus::Composer;
+            return None;
         }
         let selected = self.queue_selected.unwrap_or(0).min(entries.len() - 1);
         match key {
@@ -7811,9 +7799,43 @@ where
             Key::AltDown => self.move_selected_queue_entry(1),
             Key::Delete => self.remove_selected_queue_entry(),
             Key::Enter => self.edit_selected_queue_entry(),
+            key if key.edits_composer() => {
+                self.surface_focus = SurfaceFocus::Composer;
+                self.queue_selected = None;
+                return None;
+            }
             _ => return Some(Action::Render),
         }
         Some(Action::Render)
+    }
+
+    /// Resolves Enter from the composer, including an open slash palette.
+    ///
+    /// Busy turns must use the same palette selection path as idle ones: otherwise
+    /// Enter on `/` with a highlighted row submits the bare slash instead of the
+    /// selected command or dialog.
+    fn submit_composer_or_palette(&mut self) -> Action {
+        if self.palette_open {
+            if let Some(route_id) = self.selected_palette_dialog() {
+                self.palette_open = false;
+                self.input.clear();
+                self.input_cursor = 0;
+                return Action::OpenDialog(route_id);
+            }
+            self.complete_palette_selection();
+        }
+        self.palette_open = false;
+
+        if self.foreground_running() && self.busy_policy_routing {
+            return Action::SubmitBusy(self.input.clone());
+        }
+        if self.foreground_running() {
+            return self.enqueue_composer();
+        }
+
+        self.input_cursor = 0;
+        self.recovered_failed_prompt = false;
+        Action::Submit(std::mem::take(&mut self.input))
     }
 
     fn move_selected_queue_entry(&mut self, offset: isize) {
@@ -12728,6 +12750,86 @@ mod runtime_tests {
 
         tui.handle(Event::Key(Key::Char('/')));
         assert!(tui.palette_open, "busy turns must still open / commands");
+        assert_eq!(tui.input(), "/");
+    }
+
+    #[test]
+    fn busy_palette_enter_opens_the_selected_dialog_instead_of_submitting_slash() {
+        let mut tui = Tui::new(NoopEngine);
+        tui.enable_busy_policy_routing();
+        tui.set_palette_entries(vec![
+            PaletteEntry::new("help", "Show commands", "", PaletteEntryKind::BuiltIn)
+                .with_dialog("help"),
+            PaletteEntry::new(
+                "subagent",
+                "Choose subagent",
+                "[name]",
+                PaletteEntryKind::BuiltIn,
+            )
+            .with_dialog("subagent"),
+        ]);
+        tui.begin_submission("active");
+        tui.handle(Event::Key(Key::Char('/')));
+        tui.handle(Event::Key(Key::Down));
+        assert_eq!(
+            tui.handle(Event::Key(Key::Enter)),
+            Action::OpenDialog("subagent".into()),
+            "busy Enter must resolve the highlighted palette row"
+        );
+        assert!(!tui.palette_open);
+        assert!(tui.input().is_empty());
+    }
+
+    #[test]
+    fn busy_palette_renders_registered_commands() {
+        let mut tui = Tui::new(NoopEngine);
+        tui.set_palette_entries(vec![
+            PaletteEntry::new("help", "Show commands", "", PaletteEntryKind::BuiltIn),
+            PaletteEntry::new(
+                "subagent",
+                "Choose subagent",
+                "[name]",
+                PaletteEntryKind::BuiltIn,
+            ),
+        ]);
+        tui.handle(Event::Resize {
+            width: 80,
+            height: 24,
+        });
+        tui.begin_submission("active");
+        tui.handle(Event::Key(Key::Char('/')));
+
+        let mut renderer = RatatuiRenderer::new(
+            RatatuiTerminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap(),
+        );
+        renderer.render(tui.view()).unwrap();
+        let rendered = renderer
+            .terminal()
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(
+            rendered.contains("help") && rendered.contains("subagent"),
+            "busy palette must paint catalog entries: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn typing_from_queue_focus_returns_to_composer_and_opens_the_palette() {
+        let mut tui = Tui::with_queue_capacity(NoopEngine, 2);
+        tui.begin_submission("active");
+        tui.input = "queued".into();
+        tui.enqueue_composer();
+        tui.handle(Event::Key(Key::Tab));
+        assert_eq!(tui.view().surface_focus, SurfaceFocus::Queue);
+
+        tui.handle(Event::Key(Key::Char('/')));
+        assert_eq!(tui.view().surface_focus, SurfaceFocus::Composer);
+        assert!(tui.palette_open);
         assert_eq!(tui.input(), "/");
     }
 
