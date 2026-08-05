@@ -52,7 +52,7 @@ struct Migration {
     ddl: fn() -> String,
 }
 
-const MIGRATIONS: [Migration; 7] = [
+const MIGRATIONS: [Migration; 8] = [
     Migration {
         id: "0001_permission_grants",
         ddl: permission_grants_ddl,
@@ -80,6 +80,10 @@ const MIGRATIONS: [Migration; 7] = [
     Migration {
         id: "0007_model_preference_by_source",
         ddl: model_preference_by_source_ddl,
+    },
+    Migration {
+        id: "0008_prompt_memory",
+        ddl: prompt_memory_ddl,
     },
 ];
 
@@ -372,6 +376,29 @@ fn session_confinement_root_ddl() -> String {
 /// read path falls back to configuration, exactly as `confinement_root` falls back to `project`.
 fn session_bypass_permission_prompts_ddl() -> String {
     "ALTER TABLE sessions ADD COLUMN bypass_permission_prompts INTEGER;".to_owned()
+}
+
+/// Global composer prompt history and independent LIFO stash.
+///
+/// Text-only native columns; history is chronological by `id` ASC, stash is LIFO with the highest
+/// `id` as the stack top. No product-level row cap.
+fn prompt_memory_ddl() -> String {
+    "
+    CREATE TABLE prompt_history (
+        id INTEGER PRIMARY KEY,
+        text TEXT NOT NULL CHECK(text <> ''),
+        created_at INTEGER NOT NULL
+    );
+    CREATE INDEX prompt_history_id ON prompt_history(id);
+
+    CREATE TABLE prompt_stash (
+        id INTEGER PRIMARY KEY,
+        text TEXT NOT NULL CHECK(text <> ''),
+        created_at INTEGER NOT NULL
+    );
+    CREATE INDEX prompt_stash_id ON prompt_stash(id);
+    "
+    .to_owned()
 }
 
 #[cfg(unix)]

@@ -7,6 +7,7 @@ mod bridge;
 mod conversation;
 #[cfg(feature = "perf-audit")]
 pub mod perf;
+mod prompt_memory;
 mod render;
 pub mod shortcuts;
 mod terminal;
@@ -31,6 +32,7 @@ pub use conversation::{
     ActionableError, Conversation, ConversationError, ConversationEvent, SubagentCard, ToolBatch,
     ToolCall, ToolResult, TurnCost,
 };
+pub use prompt_memory::PromptMemoryPersist;
 pub use terminal::{
     PendingPermissions, PermissionReply, TerminalControl, TerminalModeGuard, TerminalOperation,
     teardown,
@@ -223,6 +225,8 @@ pub enum Key {
     CtrlShiftP,
     /// Starts or moves the selected subagent into background execution.
     CtrlB,
+    /// Pushes non-empty composer text onto the LIFO stash, or pops when empty.
+    CtrlS,
     ShiftEnter,
     Left,
     Right,
@@ -489,6 +493,10 @@ pub enum TuiSubmissionOutcome {
     Dialog(DialogView),
     SafeDialog(DialogView),
     TranscriptDialog,
+    /// Open the Tui-owned searchable prompt-history overlay (stores stay on Tui).
+    PromptHistoryOverlay,
+    /// Open the Tui-owned prompt-stash pick/remove overlay (stores stay on Tui).
+    PromptStashOverlay,
     SelectionInfo(String),
     SelectionCancelled,
     RouteCancelled,
@@ -1197,8 +1205,17 @@ enum DialogEntryAction {
     Dispatch(String),
     SafeDispatch(String),
     SelectTranscript(TranscriptId),
+    /// Paste text into the composer and dismiss; never submits.
+    FillComposer(String),
     Cancel,
     ToggleDetails,
+}
+
+/// Which prompt-memory store backs a composer-anchored overlay.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PromptOverlayKind {
+    History,
+    Stash,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1348,6 +1365,24 @@ impl DialogEntry {
             id: None,
         }
     }
+
+    /// Overlay row that pastes `text` into the composer without submitting.
+    fn fill_composer(
+        label: impl AsRef<str>,
+        detail: Option<&str>,
+        text: impl Into<String>,
+        id: Option<String>,
+    ) -> Self {
+        let text = text.into();
+        Self {
+            label: bounded_dialog_text(label.as_ref(), 128),
+            detail: detail.map(|detail| bounded_dialog_text(detail, 256)),
+            search_text: Some(bounded_dialog_text(&text, 512)),
+            selected_detail: None,
+            action: Some(DialogEntryAction::FillComposer(text)),
+            id: id.map(|id| bounded_dialog_text(&id, 128)),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1461,6 +1496,10 @@ pub struct DialogView {
     shortcut_actions: Vec<(char, String)>,
     selected_key_actions: Vec<(Key, String)>,
     overlay_kind: widgets::OverlayKind,
+    /// When set, size/anchor like the slash palette above the composer.
+    composer_anchored: bool,
+    /// Prompt history/stash overlay source for filter rebuild and local keys.
+    prompt_overlay: Option<PromptOverlayKind>,
 }
 
 impl DialogView {
@@ -1491,6 +1530,8 @@ impl DialogView {
             shortcut_actions: Vec::new(),
             selected_key_actions: Vec::new(),
             overlay_kind: widgets::OverlayKind::Picker,
+            composer_anchored: false,
+            prompt_overlay: None,
         }
     }
 
@@ -1640,6 +1681,8 @@ impl DialogView {
             shortcut_actions: Vec::new(),
             selected_key_actions: Vec::new(),
             overlay_kind: widgets::OverlayKind::Picker,
+            composer_anchored: false,
+            prompt_overlay: None,
         }
     }
 }
@@ -1688,7 +1731,8 @@ fn session_dialog_help(scope: SessionDialogScope) -> &'static str {
 }
 
 fn dialog_matches(dialog: &DialogView) -> Vec<(usize, &DialogEntry)> {
-    if dialog.session_entries.is_some() {
+    // Session pages and prompt-memory overlays already filter server/store-side.
+    if dialog.session_entries.is_some() || dialog.prompt_overlay.is_some() {
         return dialog.entries.iter().enumerate().collect();
     }
 
@@ -1708,6 +1752,38 @@ fn dialog_matches(dialog: &DialogView) -> Vec<(usize, &DialogEntry)> {
                     .search_text
                     .as_ref()
                     .is_some_and(|text| text.to_lowercase().contains(&query))
+        })
+        .collect()
+}
+
+const PROMPT_OVERLAY_LIMIT: usize = 64;
+
+fn history_overlay_entries(
+    history: &prompt_memory::PromptHistory,
+    query: &str,
+) -> Vec<DialogEntry> {
+    history
+        .overlay_entries(query, PROMPT_OVERLAY_LIMIT)
+        .into_iter()
+        .map(|entry| {
+            let date = prompt_memory::prompt_entry_date_label(entry.created_at);
+            DialogEntry::fill_composer(&entry.text, Some(&date), entry.text.clone(), None)
+        })
+        .collect()
+}
+
+fn stash_overlay_entries(stash: &prompt_memory::PromptStash, query: &str) -> Vec<DialogEntry> {
+    stash
+        .overlay_entries(query, PROMPT_OVERLAY_LIMIT)
+        .into_iter()
+        .map(|(index, entry)| {
+            let date = prompt_memory::prompt_entry_date_label(entry.created_at);
+            DialogEntry::fill_composer(
+                &entry.text,
+                Some(&date),
+                entry.text.clone(),
+                Some(index.to_string()),
+            )
         })
         .collect()
 }
@@ -1913,7 +1989,7 @@ fn render_frame_content(frame: &mut ratatui::Frame<'_>, state: &ViewState<'_>) {
     }
 
     if let Some(dialog) = state.dialog {
-        render_dialog(frame, area, dialog);
+        render_dialog(frame, area, layout.composer, dialog);
     }
 
     if let Some(palette) = state.palette {
@@ -2957,10 +3033,7 @@ fn queue_row_line(index: usize, prompt: &str, width: usize, selected: bool) -> L
     let used = label_width.saturating_add(UnicodeWidthStr::width(text.as_str()));
     let padding = width.saturating_sub(used);
 
-    let mut spans = vec![
-        Span::styled(label, index_style),
-        Span::styled(text, base),
-    ];
+    let mut spans = vec![Span::styled(label, index_style), Span::styled(text, base)];
     if padding > 0 {
         spans.push(Span::styled(
             " ".repeat(padding),
@@ -2988,9 +3061,10 @@ fn queue_status_line(count: usize, focused: bool, width: usize) -> Line<'static>
         format!("Queued ({count}) · Tab manage")
     };
     let text = render::bounded_single_line(&label, width);
-    Line::from(vec![
-        Span::styled(text, if focused { accent } else { muted }),
-    ])
+    Line::from(vec![Span::styled(
+        text,
+        if focused { accent } else { muted },
+    )])
 }
 
 /// Metadata spliced into the composer's border, right-aligned and held one column
@@ -3152,10 +3226,10 @@ fn render_file_picker(
     widgets::OverlayList::render(frame, layout.content, &rows, offset, rows.len());
 }
 
-fn render_dialog(frame: &mut ratatui::Frame<'_>, area: Rect, dialog: &DialogView) {
+fn render_dialog(frame: &mut ratatui::Frame<'_>, area: Rect, composer: Rect, dialog: &DialogView) {
     let labels = dialog_shortcut_labels(dialog);
     let shortcuts = dialog_shortcuts(&labels);
-    let config = dialog_config(dialog, &shortcuts, area);
+    let config = dialog_config(dialog, &shortcuts, area, composer);
     let Some(layout) = widgets::OverlayLayout::solve(area, &config) else {
         return;
     };
@@ -3504,7 +3578,11 @@ fn dialog_shortcut_labels(dialog: &DialogView) -> DialogShortcutLabels {
         ));
         labels.push((Cow::Borrowed("Enter"), Cow::Borrowed("resume")));
     } else if dialog.interactive {
-        labels.push((Cow::Borrowed("Enter"), Cow::Borrowed("select")));
+        let enter = match dialog.prompt_overlay {
+            Some(_) => "paste",
+            None => "select",
+        };
+        labels.push((Cow::Borrowed("Enter"), Cow::Borrowed(enter)));
     }
     // While search is armed Escape only disarms it, and every letter key is
     // filter text, so advertising the letter bindings there would be a lie.
@@ -3515,6 +3593,9 @@ fn dialog_shortcut_labels(dialog: &DialogView) -> DialogShortcutLabels {
 
     if dialog.refresh_id.is_some() {
         labels.push((Cow::Borrowed("r"), Cow::Borrowed("refresh")));
+    }
+    if dialog.prompt_overlay == Some(PromptOverlayKind::Stash) {
+        labels.push((Cow::Borrowed("x/del"), Cow::Borrowed("remove")));
     }
     if dialog.interactive {
         labels.push((Cow::Borrowed("/"), Cow::Borrowed("search")));
@@ -3534,8 +3615,11 @@ fn dialog_config<'a>(
     dialog: &'a DialogView,
     shortcuts: &'a [widgets::OverlayShortcut<'a>],
     area: Rect,
+    composer: Rect,
 ) -> widgets::OverlayConfig<'a> {
-    let sizing = if dialog.overlay_kind == widgets::OverlayKind::Confirm {
+    let sizing = if dialog.composer_anchored {
+        widgets::OverlaySizing::palette(composer)
+    } else if dialog.overlay_kind == widgets::OverlayKind::Confirm {
         widgets::OverlaySizing::compact()
     } else {
         widgets::OverlaySizing::dialog()
@@ -3551,12 +3635,23 @@ fn dialog_config<'a>(
     }
 }
 
+/// Fallback composer band when only the terminal area is known (paging keys).
+fn approximate_composer_rect(area: Rect) -> Rect {
+    let height = 4u16.min(area.height);
+    Rect::new(
+        area.x,
+        area.y.saturating_add(area.height.saturating_sub(height)),
+        area.width,
+        height,
+    )
+}
+
 /// Entry rows the dialog can show in `area`, shared by the renderer and the
 /// paging keys so navigation never disagrees with what is painted.
 fn dialog_visible_rows(area: Rect, dialog: &DialogView) -> usize {
     let labels = dialog_shortcut_labels(dialog);
     let shortcuts = dialog_shortcuts(&labels);
-    let config = dialog_config(dialog, &shortcuts, area);
+    let config = dialog_config(dialog, &shortcuts, area, approximate_composer_rect(area));
     widgets::OverlayLayout::solve(area, &config).map_or(1, |layout| {
         usize::from(dialog_sections(layout.content, dialog).rows.height).max(1)
     })
@@ -5162,6 +5257,12 @@ pub struct Tui<E> {
     mouse_selection_snapshot: Option<MouseSelectionSnapshot>,
     /// First key of an unfinished viewport chord, such as the `g` of `gg`.
     pending_viewport_key: Option<char>,
+    /// Chronological composer-submit history with Up/Down browse state.
+    prompt_history: prompt_memory::PromptHistory,
+    /// Independent LIFO stash of parked composer drafts (Ctrl+S).
+    prompt_stash: prompt_memory::PromptStash,
+    /// Optional durable persist adapter installed by the composition root.
+    prompt_memory_persist: Option<Box<dyn prompt_memory::PromptMemoryPersist>>,
 }
 
 impl<E> Tui<E>
@@ -5253,6 +5354,9 @@ where
             next_runtime_ordinal: 0,
             mouse_selection_snapshot: None,
             pending_viewport_key: None,
+            prompt_history: prompt_memory::PromptHistory::new(),
+            prompt_stash: prompt_memory::PromptStash::new(),
+            prompt_memory_persist: None,
         }
     }
 
@@ -5898,6 +6002,14 @@ where
                 self.show_transcript_dialog();
                 None
             }
+            TuiSubmissionOutcome::PromptHistoryOverlay => {
+                self.show_history_overlay();
+                None
+            }
+            TuiSubmissionOutcome::PromptStashOverlay => {
+                self.show_stash_overlay();
+                None
+            }
             TuiSubmissionOutcome::SelectionInfo(message) => {
                 self.add_info(message);
                 None
@@ -5953,6 +6065,16 @@ where
             TuiSubmissionOutcome::TranscriptDialog => {
                 self.clear_composer();
                 self.show_transcript_dialog();
+                None
+            }
+            TuiSubmissionOutcome::PromptHistoryOverlay => {
+                self.clear_composer();
+                self.show_history_overlay();
+                None
+            }
+            TuiSubmissionOutcome::PromptStashOverlay => {
+                self.clear_composer();
+                self.show_stash_overlay();
                 None
             }
             TuiSubmissionOutcome::Quit => self.apply_submission_outcome(TuiSubmissionOutcome::Quit),
@@ -6598,6 +6720,74 @@ where
     /// Opens a generic bounded dialog without changing the underlying conversation.
     pub fn show_dialog(&mut self, title: impl Into<String>, body: impl Into<String>) {
         self.dialog = Some(DialogView::informational(title.into(), body.into()));
+    }
+
+    /// Opens the searchable prompt-history overlay (composer-anchored, newest-first, window 64).
+    pub fn show_history_overlay(&mut self) {
+        let entries = history_overlay_entries(&self.prompt_history, "");
+        let mut dialog = DialogView::selection(
+            "Prompt history",
+            Some("/ search · Enter paste · Esc close"),
+            entries,
+        )
+        .with_empty_message("No matching history.");
+        dialog.composer_anchored = true;
+        dialog.prompt_overlay = Some(PromptOverlayKind::History);
+        self.show_selection_dialog(dialog);
+    }
+
+    /// Opens the stash pick/remove overlay (composer-anchored, newest-first, window 64).
+    pub fn show_stash_overlay(&mut self) {
+        let entries = stash_overlay_entries(&self.prompt_stash, "");
+        let mut dialog = DialogView::selection(
+            "Prompt stash",
+            Some("/ search · Enter paste · x/Del remove · Esc close"),
+            entries,
+        )
+        .with_empty_message("No stashed prompts.");
+        dialog.composer_anchored = true;
+        dialog.prompt_overlay = Some(PromptOverlayKind::Stash);
+        self.show_selection_dialog(dialog);
+    }
+
+    /// Seeds pure in-memory history and stash (oldest-first for both).
+    ///
+    /// Called by the composition root after loading durable rows from SQLite.
+    pub fn seed_prompt_memory(
+        &mut self,
+        history: impl IntoIterator<Item = (String, i64)>,
+        stash: impl IntoIterator<Item = (String, i64)>,
+    ) {
+        self.prompt_history = prompt_memory::PromptHistory::from_entries(history.into_iter().map(
+            |(text, created_at)| prompt_memory::PromptEntry::with_created_at(text, created_at),
+        ));
+        self.prompt_stash = prompt_memory::PromptStash::from_entries(stash.into_iter().map(
+            |(text, created_at)| prompt_memory::PromptEntry::with_created_at(text, created_at),
+        ));
+    }
+
+    /// Installs the durable persist adapter. Mutations still update memory first;
+    /// persist failures are ignored for the rest of the session.
+    pub fn install_prompt_memory_persist(
+        &mut self,
+        persist: Box<dyn prompt_memory::PromptMemoryPersist>,
+    ) {
+        self.prompt_memory_persist = Some(persist);
+    }
+
+    fn persist_prompt_history_append(&mut self, entry: &prompt_memory::PromptEntry) {
+        let Some(persist) = self.prompt_memory_persist.as_mut() else {
+            return;
+        };
+        let _ = persist.append_history(&entry.text, entry.created_at);
+    }
+
+    fn persist_prompt_stash_rewrite(&mut self) {
+        let Some(persist) = self.prompt_memory_persist.as_mut() else {
+            return;
+        };
+        let pairs = self.prompt_stash.persist_pairs();
+        let _ = persist.replace_stash(&pairs);
     }
 
     pub fn show_selection_dialog(&mut self, mut dialog: DialogView) {
@@ -7474,6 +7664,16 @@ where
             return action;
         }
 
+        // Prompt history browse owns empty Up and in-browse Up/Down before the
+        // execution strip claims empty Down.
+        if !self.palette_open
+            && !self.file_picker_open()
+            && !self.viewport_focused()
+            && let Some(action) = self.handle_prompt_history_key(key)
+        {
+            return action;
+        }
+
         if !self.palette_open && !self.file_picker_open() && !self.executions.is_empty() {
             match key {
                 Key::Tab => {
@@ -7490,7 +7690,8 @@ where
                 Key::Down
                     if self.execution_selection.is_none()
                         && self.input.is_empty()
-                        && !self.viewport_focused() =>
+                        && !self.viewport_focused()
+                        && !self.prompt_history.is_browsing() =>
                 {
                     self.focus_execution_strip();
                     return Action::Render;
@@ -7590,6 +7791,10 @@ where
                 return Action::Render;
             }
             return self.handle_background_key();
+        }
+
+        if key == Key::CtrlS {
+            return self.handle_prompt_stash_key();
         }
 
         if key == Key::CtrlShiftA {
@@ -7827,7 +8032,9 @@ where
         self.palette_open = false;
 
         if self.foreground_running() && self.busy_policy_routing {
-            return Action::SubmitBusy(self.input.clone());
+            let draft = self.input.clone();
+            self.record_prompt_history(&draft);
+            return Action::SubmitBusy(draft);
         }
         if self.foreground_running() {
             return self.enqueue_composer();
@@ -7835,7 +8042,9 @@ where
 
         self.input_cursor = 0;
         self.recovered_failed_prompt = false;
-        Action::Submit(std::mem::take(&mut self.input))
+        let prompt = std::mem::take(&mut self.input);
+        self.record_prompt_history(&prompt);
+        Action::Submit(prompt)
     }
 
     fn move_selected_queue_entry(&mut self, offset: isize) {
@@ -7896,11 +8105,12 @@ where
 
     fn enqueue_composer(&mut self) -> Action {
         let draft = self.input.clone();
-        let effects = self.scheduler.reduce(AppEvent::SubmitPrompt(draft));
+        let effects = self.scheduler.reduce(AppEvent::SubmitPrompt(draft.clone()));
         if let Some(Effect::RefusePrompt(message)) = effects.first() {
             self.status = Some(message.clone());
             return Action::Render;
         }
+        self.record_prompt_history(&draft);
         self.input.clear();
         self.input_cursor = 0;
         self.recovered_failed_prompt = false;
@@ -7915,15 +8125,85 @@ where
     }
 
     fn enqueue_resolved_composer(&mut self, display: String, prompt: String) {
-        let effects = self
-            .scheduler
-            .reduce(AppEvent::QueuePrompt { display, prompt });
+        let effects = self.scheduler.reduce(AppEvent::QueuePrompt {
+            display,
+            prompt: prompt.clone(),
+        });
         if let Some(Effect::RefusePrompt(message)) = effects.first() {
             self.status = Some(message.clone());
             return;
         }
+        self.record_prompt_history(&prompt);
         self.clear_composer();
         self.surface_focus = SurfaceFocus::Composer;
+    }
+
+    fn record_prompt_history(&mut self, text: &str) {
+        if !self.prompt_history.append(text) {
+            return;
+        }
+        let Some(entry) = self.prompt_history.entries().last().cloned() else {
+            return;
+        };
+        self.persist_prompt_history_append(&entry);
+    }
+
+    fn apply_composer_text(&mut self, text: String) {
+        self.input = text;
+        self.input_cursor = self.input.chars().count();
+        self.recovered_failed_prompt = false;
+        self.clamp_palette_selection();
+        self.refresh_file_picker();
+        self.active_record_mut().focus = TranscriptFocus::Composer;
+    }
+
+    /// Up/Down linear history browse. Returns `None` when the key is not history-owned.
+    fn handle_prompt_history_key(&mut self, key: Key) -> Option<Action> {
+        match key {
+            Key::Up => {
+                let shown = self.prompt_history.browse_up(&self.input)?;
+                self.execution_selection = None;
+                self.apply_composer_text(shown);
+                Some(Action::Render)
+            }
+            Key::Down if self.prompt_history.is_browsing() => {
+                match self.prompt_history.browse_down() {
+                    prompt_memory::BrowseResult::Entry(text) => {
+                        self.apply_composer_text(text);
+                        Some(Action::Render)
+                    }
+                    prompt_memory::BrowseResult::RestoreDraft(draft) => {
+                        self.apply_composer_text(draft);
+                        Some(Action::Render)
+                    }
+                    prompt_memory::BrowseResult::Idle => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Ctrl+S: push non-empty draft, or pop LIFO when empty. Never submits.
+    fn handle_prompt_stash_key(&mut self) -> Action {
+        if !self.input.is_empty() {
+            let text = std::mem::take(&mut self.input);
+            self.input_cursor = 0;
+            self.recovered_failed_prompt = false;
+            self.prompt_history.clear_browse();
+            self.prompt_stash.push(text);
+            self.persist_prompt_stash_rewrite();
+            self.clamp_palette_selection();
+            self.refresh_file_picker();
+            return Action::Render;
+        }
+
+        if let Some(entry) = self.prompt_stash.pop() {
+            self.prompt_history.clear_browse();
+            self.persist_prompt_stash_rewrite();
+            self.apply_composer_text(entry.text);
+        }
+
+        Action::Render
     }
 
     fn handle_composer_key(&mut self, key: Key) -> Option<Action> {
@@ -8196,6 +8476,8 @@ where
         let end_byte = byte_index(&self.input, end);
         self.input.replace_range(start_byte..end_byte, replacement);
         self.input_cursor = start + replacement.chars().count();
+        // Composer edits abandon history browse while keeping the current input.
+        self.prompt_history.clear_browse();
     }
 
     fn viewport_focused(&self) -> bool {
@@ -8569,6 +8851,11 @@ where
                         self.dialog = None;
                         Action::Render
                     }
+                    Some(DialogEntryAction::FillComposer(text)) => {
+                        self.dialog = None;
+                        self.apply_composer_text(text);
+                        Action::Render
+                    }
                     Some(DialogEntryAction::ToggleDetails) => {
                         if let Some(dialog) = self.dialog.as_mut() {
                             dialog.details_open = !dialog.details_open;
@@ -8577,6 +8864,9 @@ where
                     }
                     None => Action::Render,
                 }
+            }
+            Key::Delete if !self.dialog_is_searching() && self.is_prompt_stash_overlay() => {
+                self.remove_selected_stash_overlay_entry()
             }
             // Escape leaves search first, except while a session page is in
             // flight: there it keeps its older job of cancelling that route.
@@ -8621,6 +8911,9 @@ where
     /// character is dropped rather than filtering, which is the whole point of
     /// gating search behind [`DIALOG_SEARCH_KEY`].
     fn dialog_character_binding(&mut self, character: char) -> Action {
+        if character == 'x' && self.is_prompt_stash_overlay() {
+            return self.remove_selected_stash_overlay_entry();
+        }
         if let Some(action_id) = self.dialog.as_ref().and_then(|dialog| {
             dialog
                 .shortcut_actions
@@ -8706,7 +8999,62 @@ where
             edit(&mut dialog.query);
             refresh_dialog_query_action(dialog);
         }
+        self.rebuild_prompt_overlay_entries();
         self.reset_dialog_selection();
+        Action::Render
+    }
+
+    fn is_prompt_stash_overlay(&self) -> bool {
+        self.dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.prompt_overlay == Some(PromptOverlayKind::Stash))
+    }
+
+    /// Rebuild history/stash rows from the full store after a filter edit.
+    fn rebuild_prompt_overlay_entries(&mut self) {
+        let Some(kind) = self
+            .dialog
+            .as_ref()
+            .and_then(|dialog| dialog.prompt_overlay)
+        else {
+            return;
+        };
+        let query = self
+            .dialog
+            .as_ref()
+            .map(|dialog| dialog.query.clone())
+            .unwrap_or_default();
+        let entries = match kind {
+            PromptOverlayKind::History => history_overlay_entries(&self.prompt_history, &query),
+            PromptOverlayKind::Stash => stash_overlay_entries(&self.prompt_stash, &query),
+        };
+        if let Some(dialog) = self.dialog.as_mut() {
+            dialog.entries = entries;
+            dialog.selected = dialog
+                .entries
+                .iter()
+                .position(|entry| entry.action.is_some())
+                .unwrap_or_default();
+            dialog.offset = 0;
+            dialog.details_open = false;
+        }
+    }
+
+    /// Remove the selected stash row, best-effort persist the full stack, keep overlay open.
+    fn remove_selected_stash_overlay_entry(&mut self) -> Action {
+        let index = self.dialog.as_ref().and_then(|dialog| {
+            dialog_matches(dialog)
+                .into_iter()
+                .find(|(row, _)| *row == dialog.selected)
+                .and_then(|(_, entry)| entry.id.as_ref()?.parse::<usize>().ok())
+        });
+        let Some(index) = index else {
+            return Action::Render;
+        };
+
+        let _ = self.prompt_stash.remove(index);
+        self.persist_prompt_stash_rewrite();
+        self.rebuild_prompt_overlay_entries();
         Action::Render
     }
 
@@ -10967,6 +11315,9 @@ fn map_key(event: KeyEvent) -> Option<Event> {
         (KeyCode::Char('b' | 'B'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
             Key::CtrlB
         }
+        (KeyCode::Char('s' | 'S'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+            Key::CtrlS
+        }
         (KeyCode::Char('w' | 'W'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
             Key::DeletePreviousWord
         }
@@ -11995,6 +12346,26 @@ mod runtime_tests {
                 Some(Event::Key(key))
             );
         }
+    }
+
+    #[test]
+    fn maps_ctrl_s_to_prompt_stash_key() {
+        for code in [KeyCode::Char('s'), KeyCode::Char('S')] {
+            assert_eq!(
+                map_key(KeyEvent::new(code, KeyModifiers::CONTROL)),
+                Some(Event::Key(Key::CtrlS))
+            );
+        }
+
+        assert_eq!(
+            map_key(KeyEvent::new_with_kind(
+                KeyCode::Char('s'),
+                KeyModifiers::CONTROL,
+                KeyEventKind::Repeat,
+            )),
+            None,
+            "Ctrl+S is a command and must not auto-repeat"
+        );
     }
 
     #[test]

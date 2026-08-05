@@ -245,10 +245,13 @@ impl TuiRuntimeRouter {
                 Some(render_tui_help(&self.palette_entries()?)),
                 Vec::new(),
             ),
+            // Stores live on Tui; marker outcomes ask the surface to open its overlays.
+            "history" => return Ok(TuiSubmissionOutcome::PromptHistoryOverlay),
             // The catalogue lives in the surface crate that owns the keymap, so
             // a binding cannot change without its description in the same diff.
             "keys" => agens_tui::shortcuts::shortcuts_dialog(),
             "mcp" => mcp_status_dialog(self.mcp_status.snapshot()),
+            "stash" => return Ok(TuiSubmissionOutcome::PromptStashOverlay),
             "mcp:reload" => {
                 self.reload_non_ready_mcp_servers()?;
                 mcp_status_dialog(self.mcp_status.snapshot())

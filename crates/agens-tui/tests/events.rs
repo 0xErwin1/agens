@@ -4904,3 +4904,605 @@ fn terminal_progress_keeps_auto_turn_deferred_until_matching_outcome_after_fifo(
 
     assert!(tui.take_ready_auto_turn().is_some());
 }
+
+fn type_chars(tui: &mut Tui<FakeEngine>, text: &str) {
+    for character in text.chars() {
+        tui.handle(Event::Key(Key::Char(character)));
+    }
+}
+
+fn submit_text(tui: &mut Tui<FakeEngine>, text: &str) -> Action {
+    type_chars(tui, text);
+    tui.handle(Event::Key(Key::Enter))
+}
+
+#[test]
+fn prompt_memory_keys_empty_up_browses_history_without_submit() {
+    let mut tui = Tui::new(FakeEngine::default());
+
+    assert_eq!(
+        submit_text(&mut tui, "older"),
+        Action::Submit("older".into())
+    );
+    assert_eq!(
+        submit_text(&mut tui, "newer"),
+        Action::Submit("newer".into())
+    );
+    assert_eq!(tui.input(), "");
+
+    assert_eq!(tui.handle(Event::Key(Key::Up)), Action::Render);
+    assert_eq!(tui.input(), "newer");
+    assert_eq!(tui.handle(Event::Key(Key::Up)), Action::Render);
+    assert_eq!(tui.input(), "older");
+
+    // Browse never auto-submits.
+    assert_eq!(tui.handle(Event::Key(Key::Up)), Action::Render);
+    assert_eq!(tui.input(), "older");
+}
+
+#[test]
+fn prompt_memory_keys_down_restores_draft_and_empty_non_browse_down_still_focuses_tree() {
+    let mut tui = Tui::new(FakeEngine::default());
+    assert_eq!(
+        submit_text(&mut tui, "first"),
+        Action::Submit("first".into())
+    );
+    assert_eq!(
+        submit_text(&mut tui, "second"),
+        Action::Submit("second".into())
+    );
+
+    assert_eq!(tui.handle(Event::Key(Key::Up)), Action::Render);
+    assert_eq!(tui.input(), "second");
+    assert_eq!(tui.handle(Event::Key(Key::Up)), Action::Render);
+    assert_eq!(tui.input(), "first");
+
+    assert_eq!(tui.handle(Event::Key(Key::Down)), Action::Render);
+    assert_eq!(tui.input(), "second");
+    assert_eq!(tui.handle(Event::Key(Key::Down)), Action::Render);
+    assert_eq!(tui.input(), "");
+
+    // Empty non-browse Down still enters the subagent execution strip.
+    start_child(&mut tui, 11);
+    assert!(tui.view().execution_selection.is_none());
+    assert_eq!(tui.handle(Event::Key(Key::Down)), Action::Render);
+    assert_eq!(
+        tui.view().execution_selection,
+        Some(TranscriptId::Main),
+        "empty non-browse Down must still focus the execution strip"
+    );
+}
+
+#[test]
+fn prompt_memory_keys_ctrl_s_push_pop_and_empty_noop() {
+    let mut tui = Tui::new(FakeEngine::default());
+
+    type_chars(&mut tui, "first");
+    assert_eq!(tui.handle(Event::Key(Key::CtrlS)), Action::Render);
+    assert_eq!(tui.input(), "");
+
+    type_chars(&mut tui, "second");
+    assert_eq!(tui.handle(Event::Key(Key::CtrlS)), Action::Render);
+    assert_eq!(tui.input(), "");
+
+    // Empty + stash → pop LIFO (second, then first); never submits.
+    assert_eq!(tui.handle(Event::Key(Key::CtrlS)), Action::Render);
+    assert_eq!(tui.input(), "second");
+    while !tui.input().is_empty() {
+        tui.handle(Event::Key(Key::Backspace));
+    }
+    assert_eq!(tui.handle(Event::Key(Key::CtrlS)), Action::Render);
+    assert_eq!(tui.input(), "first");
+    while !tui.input().is_empty() {
+        tui.handle(Event::Key(Key::Backspace));
+    }
+
+    // Empty composer + empty stash is a no-op.
+    assert_eq!(tui.handle(Event::Key(Key::CtrlS)), Action::Render);
+    assert_eq!(tui.input(), "");
+    assert_eq!(tui.handle(Event::Key(Key::CtrlS)), Action::Render);
+    assert_eq!(tui.input(), "");
+}
+
+#[test]
+fn prompt_memory_keys_submit_enqueue_and_busy_append_history_with_dedupe_stash_untouched() {
+    let mut tui = Tui::with_queue_capacity(FakeEngine::default(), 4);
+
+    // Stash stays independent of history appends.
+    type_chars(&mut tui, "stash-keep");
+    assert_eq!(tui.handle(Event::Key(Key::CtrlS)), Action::Render);
+
+    // Idle Submit records history, including slash text.
+    assert_eq!(
+        submit_text(&mut tui, "/status"),
+        Action::Submit("/status".into())
+    );
+    assert_eq!(
+        submit_text(&mut tui, "hello"),
+        Action::Submit("hello".into())
+    );
+    // Consecutive-dedupe: same text twice does not grow history.
+    assert_eq!(
+        submit_text(&mut tui, "hello"),
+        Action::Submit("hello".into())
+    );
+
+    // Enqueue path (busy without busy-policy routing) also records.
+    tui.begin_submission("active");
+    assert_eq!(submit_text(&mut tui, "queued-one"), Action::Render);
+    assert_eq!(tui.queue_entries().len(), 1);
+
+    // SubmitBusy path records the draft for history.
+    tui.enable_busy_policy_routing();
+    type_chars(&mut tui, "busy-draft");
+    assert_eq!(
+        tui.handle(Event::Key(Key::Enter)),
+        Action::SubmitBusy("busy-draft".into())
+    );
+
+    // Clear busy/input state for browse assertions.
+    while !tui.input().is_empty() {
+        tui.handle(Event::Key(Key::Backspace));
+    }
+
+    // Newest → older: busy-draft, queued-one, hello, /status
+    assert_eq!(tui.handle(Event::Key(Key::Up)), Action::Render);
+    assert_eq!(tui.input(), "busy-draft");
+    assert_eq!(tui.handle(Event::Key(Key::Up)), Action::Render);
+    assert_eq!(tui.input(), "queued-one");
+    assert_eq!(tui.handle(Event::Key(Key::Up)), Action::Render);
+    assert_eq!(tui.input(), "hello");
+    assert_eq!(tui.handle(Event::Key(Key::Up)), Action::Render);
+    assert_eq!(tui.input(), "/status");
+    // Only one "hello" despite two submits (consecutive-dedupe).
+    assert_eq!(tui.handle(Event::Key(Key::Up)), Action::Render);
+    assert_eq!(tui.input(), "/status");
+
+    // Stash still holds the original entry.
+    while !tui.input().is_empty() {
+        tui.handle(Event::Key(Key::Backspace));
+    }
+    // Leaving browse via Down so stash Ctrl+S is not confused with browse.
+    assert_eq!(tui.handle(Event::Key(Key::Down)), Action::Render);
+    assert_eq!(tui.input(), "");
+    assert_eq!(tui.handle(Event::Key(Key::CtrlS)), Action::Render);
+    assert_eq!(tui.input(), "stash-keep");
+}
+
+#[test]
+fn prompt_memory_keys_composer_edit_clears_browse() {
+    let mut tui = Tui::new(FakeEngine::default());
+    assert_eq!(
+        submit_text(&mut tui, "alpha"),
+        Action::Submit("alpha".into())
+    );
+    assert_eq!(submit_text(&mut tui, "beta"), Action::Submit("beta".into()));
+
+    assert_eq!(tui.handle(Event::Key(Key::Up)), Action::Render);
+    assert_eq!(tui.input(), "beta");
+    assert_eq!(tui.handle(Event::Key(Key::Up)), Action::Render);
+    assert_eq!(tui.input(), "alpha");
+
+    // Edit while browsing keeps the edited input and exits browse.
+    tui.handle(Event::Key(Key::Char('!')));
+    assert_eq!(tui.input(), "alpha!");
+
+    // Down no longer walks history (browse cleared); input stays as edited.
+    assert_eq!(tui.handle(Event::Key(Key::Down)), Action::Render);
+    assert_eq!(tui.input(), "alpha!");
+
+    // Non-empty Up does not re-enter browse.
+    assert_eq!(tui.handle(Event::Key(Key::Up)), Action::Render);
+    assert_eq!(tui.input(), "alpha!");
+}
+
+// --- WU3: prompt history/stash overlays (FillComposer, filter, remove) ---
+
+#[test]
+fn prompt_overlay_history_enter_pastes_without_submit() {
+    let mut tui = Tui::new(FakeEngine::default());
+    assert_eq!(
+        submit_text(&mut tui, "older-entry"),
+        Action::Submit("older-entry".into())
+    );
+    assert_eq!(
+        submit_text(&mut tui, "newer-entry"),
+        Action::Submit("newer-entry".into())
+    );
+    assert_eq!(tui.input(), "");
+
+    tui.show_history_overlay();
+    assert!(tui.view().dialog.is_some());
+    assert_eq!(tui.view().dialog.unwrap().entry_count(), 2);
+
+    // Newest-first: Enter pastes the selected (newest) entry only.
+    assert_eq!(tui.handle(Event::Key(Key::Enter)), Action::Render);
+    assert_eq!(tui.input(), "newer-entry");
+    assert!(tui.view().dialog.is_none());
+    assert_eq!(tui.view().input_cursor, "newer-entry".chars().count());
+
+    // No auto-submit: a second Enter now submits the pasted composer text.
+    assert_eq!(
+        tui.handle(Event::Key(Key::Enter)),
+        Action::Submit("newer-entry".into())
+    );
+}
+
+#[test]
+fn prompt_overlay_history_filter_narrows_list() {
+    let mut tui = Tui::new(FakeEngine::default());
+    assert_eq!(
+        submit_text(&mut tui, "alpha one"),
+        Action::Submit("alpha one".into())
+    );
+    assert_eq!(
+        submit_text(&mut tui, "beta two"),
+        Action::Submit("beta two".into())
+    );
+    assert_eq!(
+        submit_text(&mut tui, "alpha three"),
+        Action::Submit("alpha three".into())
+    );
+
+    tui.show_history_overlay();
+    assert_eq!(tui.view().dialog.unwrap().entry_count(), 3);
+
+    // Arm search and filter by keyword.
+    for character in "/alpha".chars() {
+        assert_eq!(tui.handle(Event::Key(Key::Char(character))), Action::Render);
+    }
+    assert_eq!(
+        tui.view().dialog.unwrap().entry_count(),
+        2,
+        "filter must rebuild from the full store, not only the current window"
+    );
+
+    // Newest matching first → "alpha three".
+    assert_eq!(tui.handle(Event::Key(Key::Enter)), Action::Render);
+    assert_eq!(tui.input(), "alpha three");
+    assert!(tui.view().dialog.is_none());
+}
+
+#[test]
+fn prompt_overlay_stash_enter_pastes_selected_without_submit() {
+    let mut tui = Tui::new(FakeEngine::default());
+
+    type_chars(&mut tui, "stash-a");
+    assert_eq!(tui.handle(Event::Key(Key::CtrlS)), Action::Render);
+    type_chars(&mut tui, "stash-b");
+    assert_eq!(tui.handle(Event::Key(Key::CtrlS)), Action::Render);
+    type_chars(&mut tui, "stash-c");
+    assert_eq!(tui.handle(Event::Key(Key::CtrlS)), Action::Render);
+
+    tui.show_stash_overlay();
+    assert_eq!(tui.view().dialog.unwrap().entry_count(), 3);
+
+    // Newest-first list: C, B, A. Move to non-top entry B and paste.
+    assert_eq!(tui.handle(Event::Key(Key::Down)), Action::Render);
+    assert_eq!(tui.handle(Event::Key(Key::Enter)), Action::Render);
+    assert_eq!(tui.input(), "stash-b");
+    assert!(tui.view().dialog.is_none());
+
+    // Paste does not remove: LIFO pop still yields C then B then A.
+    while !tui.input().is_empty() {
+        tui.handle(Event::Key(Key::Backspace));
+    }
+    assert_eq!(tui.handle(Event::Key(Key::CtrlS)), Action::Render);
+    assert_eq!(tui.input(), "stash-c");
+    while !tui.input().is_empty() {
+        tui.handle(Event::Key(Key::Backspace));
+    }
+    assert_eq!(tui.handle(Event::Key(Key::CtrlS)), Action::Render);
+    assert_eq!(tui.input(), "stash-b");
+}
+
+#[test]
+fn prompt_overlay_stash_x_and_delete_remove_and_rewrite_via_persist() {
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct RecordingState {
+        stash_rewrites: Vec<Vec<(String, i64)>>,
+    }
+
+    struct RecordingPersist {
+        state: Arc<Mutex<RecordingState>>,
+    }
+
+    impl agens_tui::PromptMemoryPersist for RecordingPersist {
+        fn append_history(&mut self, _text: &str, _created_at: i64) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn replace_stash(&mut self, entries: &[(String, i64)]) -> Result<(), String> {
+            self.state
+                .lock()
+                .expect("persist lock")
+                .stash_rewrites
+                .push(entries.to_vec());
+            Ok(())
+        }
+    }
+
+    let state = Arc::new(Mutex::new(RecordingState::default()));
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.install_prompt_memory_persist(Box::new(RecordingPersist {
+        state: Arc::clone(&state),
+    }));
+
+    type_chars(&mut tui, "keep-old");
+    assert_eq!(tui.handle(Event::Key(Key::CtrlS)), Action::Render);
+    type_chars(&mut tui, "remove-me");
+    assert_eq!(tui.handle(Event::Key(Key::CtrlS)), Action::Render);
+    type_chars(&mut tui, "keep-new");
+    assert_eq!(tui.handle(Event::Key(Key::CtrlS)), Action::Render);
+
+    {
+        let rewrites = &state.lock().expect("persist lock").stash_rewrites;
+        assert_eq!(rewrites.len(), 3);
+        assert_eq!(
+            rewrites
+                .last()
+                .expect("seeded stash")
+                .iter()
+                .map(|(text, _)| text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["keep-old", "remove-me", "keep-new"]
+        );
+    }
+
+    tui.show_stash_overlay();
+    // Newest-first: keep-new, remove-me, keep-old → select remove-me.
+    assert_eq!(tui.handle(Event::Key(Key::Down)), Action::Render);
+    assert_eq!(tui.handle(Event::Key(Key::Char('x'))), Action::Render);
+    assert_eq!(tui.view().dialog.unwrap().entry_count(), 2);
+    assert_eq!(tui.input(), "", "remove must not paste into the composer");
+
+    {
+        let last = state
+            .lock()
+            .expect("persist lock")
+            .stash_rewrites
+            .last()
+            .cloned()
+            .expect("rewrite after x");
+        let texts: Vec<&str> = last.iter().map(|(text, _)| text.as_str()).collect();
+        assert_eq!(texts, vec!["keep-old", "keep-new"]);
+        assert!(!texts.contains(&"remove-me"));
+    }
+
+    // Delete also removes the selected row (keep-new is selected first).
+    assert_eq!(tui.handle(Event::Key(Key::Delete)), Action::Render);
+    assert_eq!(tui.view().dialog.unwrap().entry_count(), 1);
+    {
+        let last = state
+            .lock()
+            .expect("persist lock")
+            .stash_rewrites
+            .last()
+            .cloned()
+            .expect("rewrite after delete");
+        let texts: Vec<&str> = last.iter().map(|(text, _)| text.as_str()).collect();
+        assert_eq!(texts, vec!["keep-old"]);
+        assert!(!texts.contains(&"keep-new"));
+    }
+}
+
+#[test]
+fn prompt_overlay_open_does_not_mutate_queued_prompts() {
+    let mut tui = Tui::with_queue_capacity(FakeEngine::default(), 4);
+    tui.begin_submission("active");
+    assert_eq!(submit_text(&mut tui, "queued-one"), Action::Render);
+    assert_eq!(submit_text(&mut tui, "queued-two"), Action::Render);
+    let before: Vec<String> = tui
+        .queue_entries()
+        .iter()
+        .map(|entry| entry.prompt().to_owned())
+        .collect();
+    assert_eq!(
+        before,
+        vec!["queued-one".to_owned(), "queued-two".to_owned()]
+    );
+
+    type_chars(&mut tui, "parked");
+    assert_eq!(tui.handle(Event::Key(Key::CtrlS)), Action::Render);
+
+    tui.show_history_overlay();
+    assert!(tui.view().dialog.is_some());
+    let mid: Vec<String> = tui
+        .queue_entries()
+        .iter()
+        .map(|entry| entry.prompt().to_owned())
+        .collect();
+    assert_eq!(mid, before, "opening history must not touch the FIFO queue");
+    assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Render);
+
+    tui.show_stash_overlay();
+    assert!(tui.view().dialog.is_some());
+    let after: Vec<String> = tui
+        .queue_entries()
+        .iter()
+        .map(|entry| entry.prompt().to_owned())
+        .collect();
+    assert_eq!(after, before, "opening stash must not touch the FIFO queue");
+}
+
+// --- WU5: history/stash independence from FIFO queue + I/O best-effort ---
+
+fn queue_prompt_texts(tui: &Tui<FakeEngine>) -> Vec<String> {
+    tui.queue_entries()
+        .iter()
+        .map(|entry| entry.prompt().to_owned())
+        .collect()
+}
+
+#[test]
+fn queue_untouched_by_stash_history_ops_preserves_capacity_order_and_dispatch() {
+    let mut tui = Tui::with_queue_capacity(FakeEngine::default(), 2);
+    tui.begin_submission("active");
+
+    // Fill FIFO queue to capacity.
+    assert_eq!(submit_text(&mut tui, "q-first"), Action::Render);
+    assert_eq!(submit_text(&mut tui, "q-second"), Action::Render);
+    let before = queue_prompt_texts(&tui);
+    assert_eq!(before, vec!["q-first".to_owned(), "q-second".to_owned()]);
+
+    // Capacity still enforced after enqueue (draft kept, queue unchanged).
+    type_chars(&mut tui, "overflow");
+    assert_eq!(tui.handle(Event::Key(Key::Enter)), Action::Render);
+    assert_eq!(tui.input(), "overflow");
+    assert!(
+        tui.status()
+            .is_some_and(|status| status.contains("queue is full")),
+        "status: {:?}",
+        tui.status()
+    );
+    assert_eq!(queue_prompt_texts(&tui), before);
+
+    // Stash push of the refused draft + another park.
+    assert_eq!(tui.handle(Event::Key(Key::CtrlS)), Action::Render);
+    assert_eq!(tui.input(), "");
+    type_chars(&mut tui, "parked");
+    assert_eq!(tui.handle(Event::Key(Key::CtrlS)), Action::Render);
+    assert_eq!(
+        queue_prompt_texts(&tui),
+        before,
+        "stash push must not touch queue"
+    );
+
+    // History browse (entries from q-first/q-second submits) must not touch queue.
+    assert_eq!(tui.handle(Event::Key(Key::Up)), Action::Render);
+    assert!(!tui.input().is_empty());
+    assert_eq!(tui.handle(Event::Key(Key::Up)), Action::Render);
+    assert_eq!(tui.handle(Event::Key(Key::Down)), Action::Render);
+    assert_eq!(tui.handle(Event::Key(Key::Down)), Action::Render);
+    assert_eq!(tui.input(), "");
+    assert_eq!(
+        queue_prompt_texts(&tui),
+        before,
+        "history browse must not touch queue"
+    );
+
+    // Stash pop still leaves queue alone.
+    assert_eq!(tui.handle(Event::Key(Key::CtrlS)), Action::Render);
+    assert_eq!(tui.input(), "parked");
+    while !tui.input().is_empty() {
+        tui.handle(Event::Key(Key::Backspace));
+    }
+    assert_eq!(
+        queue_prompt_texts(&tui),
+        before,
+        "stash pop must not touch queue"
+    );
+
+    // Capacity still 2 after stash/history churn.
+    type_chars(&mut tui, "still-full");
+    assert_eq!(tui.handle(Event::Key(Key::Enter)), Action::Render);
+    assert_eq!(tui.input(), "still-full");
+    assert_eq!(queue_prompt_texts(&tui), before);
+
+    // FIFO dispatch: finish active → oldest queued is next.
+    assert_eq!(
+        tui.finish_provider_turn(TuiProviderOutcome::Completed("done".into())),
+        Some("q-first".into())
+    );
+    assert_eq!(queue_prompt_texts(&tui), vec!["q-second".to_owned()]);
+    assert_eq!(
+        tui.finish_provider_turn(TuiProviderOutcome::Completed("done-2".into())),
+        Some("q-second".into())
+    );
+    assert!(queue_prompt_texts(&tui).is_empty());
+}
+
+#[test]
+fn history_append_leaves_stash_unchanged_across_submit_and_enqueue() {
+    let mut tui = Tui::with_queue_capacity(FakeEngine::default(), 4);
+
+    type_chars(&mut tui, "stash-a");
+    assert_eq!(tui.handle(Event::Key(Key::CtrlS)), Action::Render);
+    type_chars(&mut tui, "stash-b");
+    assert_eq!(tui.handle(Event::Key(Key::CtrlS)), Action::Render);
+
+    // Idle submits grow history only.
+    assert_eq!(
+        submit_text(&mut tui, "hist-one"),
+        Action::Submit("hist-one".into())
+    );
+    assert_eq!(
+        submit_text(&mut tui, "hist-two"),
+        Action::Submit("hist-two".into())
+    );
+
+    // Busy enqueue also appends history without touching stash.
+    tui.begin_submission("active");
+    assert_eq!(submit_text(&mut tui, "hist-queued"), Action::Render);
+    assert_eq!(queue_prompt_texts(&tui), vec!["hist-queued".to_owned()]);
+
+    // Stash still LIFO: B then A.
+    while !tui.input().is_empty() {
+        tui.handle(Event::Key(Key::Backspace));
+    }
+    assert_eq!(tui.handle(Event::Key(Key::CtrlS)), Action::Render);
+    assert_eq!(tui.input(), "stash-b");
+    while !tui.input().is_empty() {
+        tui.handle(Event::Key(Key::Backspace));
+    }
+    assert_eq!(tui.handle(Event::Key(Key::CtrlS)), Action::Render);
+    assert_eq!(tui.input(), "stash-a");
+
+    // Queue still holds the enqueued prompt after stash pops.
+    assert_eq!(queue_prompt_texts(&tui), vec!["hist-queued".to_owned()]);
+}
+
+#[test]
+fn prompt_memory_write_failure_keeps_in_memory_state_without_panic() {
+    struct FailingPersist;
+
+    impl agens_tui::PromptMemoryPersist for FailingPersist {
+        fn append_history(&mut self, _text: &str, _created_at: i64) -> Result<(), String> {
+            Err("history write failed".into())
+        }
+
+        fn replace_stash(&mut self, _entries: &[(String, i64)]) -> Result<(), String> {
+            Err("stash write failed".into())
+        }
+    }
+
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.install_prompt_memory_persist(Box::new(FailingPersist));
+
+    // History append mutates memory first; failing persist must not panic or roll back.
+    assert_eq!(
+        submit_text(&mut tui, "survives-history-io"),
+        Action::Submit("survives-history-io".into())
+    );
+    assert_eq!(tui.handle(Event::Key(Key::Up)), Action::Render);
+    assert_eq!(tui.input(), "survives-history-io");
+    while !tui.input().is_empty() {
+        tui.handle(Event::Key(Key::Backspace));
+    }
+
+    // Stash push/pop with failing rewrite: memory still LIFO; no panic.
+    type_chars(&mut tui, "stash-io-a");
+    assert_eq!(tui.handle(Event::Key(Key::CtrlS)), Action::Render);
+    assert_eq!(tui.input(), "");
+    type_chars(&mut tui, "stash-io-b");
+    assert_eq!(tui.handle(Event::Key(Key::CtrlS)), Action::Render);
+    assert_eq!(tui.input(), "");
+    assert_eq!(tui.handle(Event::Key(Key::CtrlS)), Action::Render);
+    assert_eq!(tui.input(), "stash-io-b");
+    while !tui.input().is_empty() {
+        tui.handle(Event::Key(Key::Backspace));
+    }
+    assert_eq!(tui.handle(Event::Key(Key::CtrlS)), Action::Render);
+    assert_eq!(tui.input(), "stash-io-a");
+
+    // Overlay remove also best-effort (rewrite fails) without panic.
+    type_chars(&mut tui, "remove-io");
+    assert_eq!(tui.handle(Event::Key(Key::CtrlS)), Action::Render);
+    tui.show_stash_overlay();
+    assert!(tui.view().dialog.is_some());
+    assert_eq!(tui.handle(Event::Key(Key::Char('x'))), Action::Render);
+    assert!(tui.view().dialog.is_some());
+    assert_eq!(tui.view().dialog.unwrap().entry_count(), 0);
+}
