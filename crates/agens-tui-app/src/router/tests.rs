@@ -3544,7 +3544,7 @@ fn provider_failures_render_sanitized_specific_actions() {
         ),
         (
             HeadlessTurnError::ProviderProtocol,
-            "provider: ChatGPT response protocol failed",
+            "provider: provider response protocol failed",
             "Open /diagnostics for the referenced event, then retry.",
         ),
     ] {

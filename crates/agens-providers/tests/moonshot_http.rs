@@ -143,7 +143,115 @@ fn a_tool_call_turn_replays_its_results_in_the_next_request() {
         .find(|message| message["role"] == json!("tool"))
         .expect("the tool result is replayed");
     assert_eq!(tool["tool_call_id"], json!("call_0"));
+    assert_eq!(tool["name"], json!("get_weather"));
     assert_eq!(tool["content"], json!("sunny"));
+}
+
+#[test]
+fn queue_user_messages_during_awaiting_tool_results_place_user_after_tool_results() {
+    let server = SseServer::start(vec![
+        sse(&[
+            json!({"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "id": "call_0",
+                "type": "function", "function": {"name": "get_weather", "arguments": ""}}]},
+                "finish_reason": null}]}),
+            json!({"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0,
+                "function": {"arguments": "{\"city\":\"Paris\"}"}}]}, "finish_reason": null}]}),
+            json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}),
+        ]),
+        sse(&[
+            json!({"choices": [{"index": 0, "delta": {"content": "done"}, "finish_reason": null}]}),
+            json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+        ]),
+    ]);
+
+    let mut provider = provider(&server.address.to_string(), vec![weather_tool()]);
+    let cancellation = HeadlessTurnCancellation::new();
+    let runtime = runtime();
+
+    runtime
+        .block_on(provider.next_parts(&[], &cancellation))
+        .expect("first round should complete");
+
+    provider
+        .queue_user_messages(vec![Message {
+            role: Role::User,
+            parts: vec![MessagePart::Text("coord".to_owned())],
+        }])
+        .expect("queueing while awaiting tool results is allowed");
+
+    let events = vec![TurnEvent::ToolResult(MessagePart::ToolResult {
+        tool_call_id: "call_0".to_owned(),
+        content: "sunny".to_owned(),
+        is_error: false,
+    })];
+    runtime
+        .block_on(provider.next_parts(&events, &cancellation))
+        .expect("continuation should complete");
+
+    let _first = server.take_body();
+    let second = server.take_body();
+    let messages = second["messages"].as_array().expect("messages is an array");
+
+    let assistant_index = messages
+        .iter()
+        .position(|message| {
+            message["role"] == json!("assistant") && message.get("tool_calls").is_some()
+        })
+        .expect("assistant tool_calls message is present");
+    let tool_index = messages
+        .iter()
+        .position(|message| message["role"] == json!("tool"))
+        .expect("tool result is present");
+    let coord_index = messages
+        .iter()
+        .position(|message| {
+            message["role"] == json!("user") && message["content"] == json!("coord")
+        })
+        .expect("coordination user message is present");
+
+    assert!(
+        assistant_index < tool_index && tool_index < coord_index,
+        "expected assistant(tool_calls) → tool → user(coord), got indices assistant={assistant_index} tool={tool_index} coord={coord_index}; messages={messages:?}"
+    );
+    assert_eq!(messages[tool_index]["tool_call_id"], json!("call_0"));
+    assert_eq!(messages[tool_index]["name"], json!("get_weather"));
+}
+
+#[test]
+fn partial_tool_results_fail_without_a_second_http_request() {
+    let server = SseServer::start(vec![sse(&[
+        json!({"choices": [{"index": 0, "delta": {"tool_calls": [
+            {"index": 0, "id": "call_0", "type": "function", "function": {"name": "get_weather", "arguments": "{}"}},
+            {"index": 1, "id": "call_1", "type": "function", "function": {"name": "get_weather", "arguments": "{}"}}
+        ]}, "finish_reason": null}]}),
+        json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}),
+    ])]);
+
+    let mut provider = provider(&server.address.to_string(), vec![weather_tool()]);
+    let cancellation = HeadlessTurnCancellation::new();
+    let runtime = runtime();
+
+    let parts = runtime
+        .block_on(provider.next_parts(&[], &cancellation))
+        .expect("first round should complete");
+    assert_eq!(parts.len(), 2);
+
+    let _first = server.take_body();
+
+    let events = vec![TurnEvent::ToolResult(MessagePart::ToolResult {
+        tool_call_id: "call_0".to_owned(),
+        content: "sunny".to_owned(),
+        is_error: false,
+    })];
+    let error = runtime
+        .block_on(provider.next_parts(&events, &cancellation))
+        .expect_err("partial tool results must fail before HTTP");
+
+    assert_eq!(error, HeadlessTurnPortError::Provider);
+    assert!(
+        server.try_take_body().is_none(),
+        "a second request must not be sent when tool results are incomplete"
+    );
 }
 
 #[test]
@@ -432,6 +540,10 @@ impl SseServer {
         self.bodies
             .recv_timeout(Duration::from_secs(5))
             .expect("server should observe a request")
+    }
+
+    fn try_take_body(&self) -> Option<Value> {
+        self.bodies.try_recv().ok()
     }
 }
 

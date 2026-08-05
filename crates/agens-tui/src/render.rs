@@ -3680,7 +3680,7 @@ mod tests {
     #[test]
     fn error_lines_splits_a_multi_line_message_into_its_own_gutter_rows() {
         let error = crate::ActionableError {
-            message: "provider: ChatGPT request was rejected [ref: abcdef12]\nHTTP 400 rejected model \"x\"".to_owned(),
+            message: "provider: provider request was rejected [ref: abcdef12]\nHTTP 400 rejected model \"x\"".to_owned(),
             action: "Retry.".to_owned(),
         };
 
@@ -3696,7 +3696,7 @@ mod tests {
         assert_eq!(text(&lines[0]), "┌ Error");
         assert_eq!(
             text(&lines[1]),
-            "│ provider: ChatGPT request was rejected [ref: abcdef12]"
+            "│ provider: provider request was rejected [ref: abcdef12]"
         );
         assert_eq!(text(&lines[2]), "│ HTTP 400 rejected model \"x\"");
         assert_eq!(text(&lines[3]), "└ Action: Retry.");

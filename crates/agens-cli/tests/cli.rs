@@ -2472,35 +2472,35 @@ fn production_binary_maps_chatgpt_provider_and_auth_failures_without_leaking_cre
             "forbidden",
             "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned(),
             Some(4),
-            "error: auth: ChatGPT credentials are unavailable or invalid\n",
+            "error: auth: provider credentials are unavailable or invalid\n",
             Some("HTTP 403 rejected model \"test-model\""),
         ),
         (
             "rejected",
             "HTTP/1.1 422 Unprocessable Content\r\nContent-Length: 27\r\nConnection: close\r\n\r\nSENTINEL_CHATGPT_ERROR_BODY".to_owned(),
             Some(1),
-            "error: provider: ChatGPT request was rejected\n",
+            "error: provider: provider request was rejected\n",
             Some("HTTP 422 rejected model \"test-model\"\nSENTINEL_CHATGPT_ERROR_BODY"),
         ),
         (
             "rate limit",
             "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 27\r\nConnection: close\r\n\r\nSENTINEL_CHATGPT_ERROR_BODY".to_owned(),
             Some(1),
-            "error: provider: ChatGPT request was rate limited\n",
+            "error: provider: provider request was rate limited\n",
             None,
         ),
         (
             "server failure",
             "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 27\r\nConnection: close\r\n\r\nSENTINEL_CHATGPT_ERROR_BODY".to_owned(),
             Some(1),
-            "error: provider: ChatGPT service failed\n",
+            "error: provider: provider service failed\n",
             None,
         ),
         (
             "protocol failure",
             sse_response(&[r#"{"type":"response.incomplete","response":{"error":{"message":"SENTINEL_CHATGPT_ERROR_BODY"}}}"#]),
             Some(1),
-            "error: provider: ChatGPT response protocol failed\n",
+            "error: provider: provider response protocol failed\n",
             None,
         ),
     ] {
@@ -3436,7 +3436,7 @@ fn production_binary_rejects_duplicate_and_mismatched_tool_call_protocol_items_b
         assert_eq!(String::from_utf8_lossy(&output.stdout), "", "{name}");
         assert_diagnostic_error(
             &output.stderr,
-            "error: provider: ChatGPT response protocol failed\n",
+            "error: provider: provider response protocol failed\n",
         );
         assert!(!side_effect.exists(), "{name} call must not dispatch");
         assert_no_saved_sessions(&temporary, &project_root, &config_home);
@@ -3682,7 +3682,7 @@ fn production_binary_sanitizes_remote_response_headers_and_body() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(output.status.code(), Some(1));
-    assert_diagnostic_error_text(&diagnostics, "error: provider: ChatGPT service failed\n");
+    assert_diagnostic_error_text(&diagnostics, "error: provider: provider service failed\n");
     for secret in [
         "SENTINEL_OPENAI_API_KEY",
         "SENTINEL_REMOTE_ERROR_HEADER",
@@ -4691,7 +4691,7 @@ fn production_binary_fails_closed_for_mcp_duplicate_replay_and_mismatched_call_i
                 ]),
             }],
             None,
-            "error: provider: ChatGPT response protocol failed\n",
+            "error: provider: provider response protocol failed\n",
         ),
     ] {
         let temporary = TemporaryDirectory::new(&format!("production-mcp-integrity-{name}"));

@@ -42,8 +42,16 @@ enum TurnState {
     /// No request has been sent yet.
     Initial,
     /// The model asked for tool calls; the next call replays their results.
+    ///
+    /// User messages that arrive while tools are outstanding must not enter
+    /// `history` yet: chat-completions requires `role=tool` messages to sit
+    /// immediately after the assistant `tool_calls` message. They wait in
+    /// `pending_user_messages` and are appended only after the tool batch.
     AwaitingToolResults {
         event_cursor: usize,
+        /// `(call_id, tool_name)` in the order the assistant emitted them.
+        pending_calls: Vec<(String, String)>,
+        pending_user_messages: Vec<Message>,
     },
     Completed,
     Failed,
@@ -170,8 +178,11 @@ impl MoonshotProvider {
         self
     }
 
-    fn payload(&self) -> Value {
-        encode::encode_request(
+    fn payload(&self) -> Result<Value, HeadlessTurnPortError> {
+        encode::validate_chat_completions_history(&self.history)
+            .map_err(|_| HeadlessTurnPortError::ProviderProtocol)?;
+
+        Ok(encode::encode_request(
             &self.history,
             &RequestOptions {
                 model: &self.model,
@@ -179,7 +190,7 @@ impl MoonshotProvider {
                 parallel_tool_calls: self.parallel_tool_calls,
                 reasoning_effort: self.request_config.reasoning_effort(),
             },
-        )
+        ))
     }
 
     fn emit(
@@ -416,12 +427,53 @@ async fn read_context_overflow(
     .await
 }
 
-/// The tool results recorded since the last request, in turn order.
-fn tool_results(events: &[TurnEvent]) -> Vec<MessagePart> {
-    events
+/// Correlates ToolResult events with the pending assistant tool calls.
+///
+/// Every pending `call_id` must appear exactly once; unknown or duplicate ids
+/// are rejected before any HTTP request is made. Results are returned in the
+/// same order as `pending_calls` so the wire batch matches the assistant turn.
+fn correlate_tool_results(
+    pending_calls: &[(String, String)],
+    events: &[TurnEvent],
+) -> Result<Vec<MessagePart>, HeadlessTurnPortError> {
+    use std::collections::HashMap;
+
+    let mut by_id = HashMap::new();
+
+    for event in events {
+        let TurnEvent::ToolResult(part @ MessagePart::ToolResult { tool_call_id, .. }) = event
+        else {
+            continue;
+        };
+
+        if !pending_calls.iter().any(|(id, _)| id == tool_call_id)
+            || by_id.contains_key(tool_call_id.as_str())
+        {
+            return Err(HeadlessTurnPortError::Provider);
+        }
+
+        by_id.insert(tool_call_id.as_str(), part.clone());
+    }
+
+    if by_id.len() != pending_calls.len() {
+        return Err(HeadlessTurnPortError::Provider);
+    }
+
+    pending_calls
         .iter()
-        .filter_map(|event| match event {
-            TurnEvent::ToolResult(part) => Some(part.clone()),
+        .map(|(id, _)| {
+            by_id
+                .remove(id.as_str())
+                .ok_or(HeadlessTurnPortError::Provider)
+        })
+        .collect()
+}
+
+fn pending_calls_from_parts(parts: &[MessagePart]) -> Vec<(String, String)> {
+    parts
+        .iter()
+        .filter_map(|part| match part {
+            MessagePart::ToolCall { id, name, .. } => Some((id.clone(), name.clone())),
             _ => None,
         })
         .collect()
@@ -429,12 +481,20 @@ fn tool_results(events: &[TurnEvent]) -> Vec<MessagePart> {
 
 impl TurnProvider for MoonshotProvider {
     fn queue_user_messages(&mut self, messages: Vec<Message>) -> Result<(), HeadlessTurnPortError> {
-        if matches!(self.state, TurnState::Completed | TurnState::Failed) {
-            return Err(HeadlessTurnPortError::Provider);
+        match &mut self.state {
+            TurnState::Initial => {
+                self.history.extend(messages);
+                Ok(())
+            }
+            TurnState::AwaitingToolResults {
+                pending_user_messages,
+                ..
+            } => {
+                pending_user_messages.extend(messages);
+                Ok(())
+            }
+            TurnState::Completed | TurnState::Failed => Err(HeadlessTurnPortError::Provider),
         }
-
-        self.history.extend(messages);
-        Ok(())
     }
 
     async fn next_parts(
@@ -457,26 +517,28 @@ impl TurnProvider for MoonshotProvider {
         let state = std::mem::replace(&mut self.state, TurnState::Failed);
         match state {
             TurnState::Initial => {}
-            TurnState::AwaitingToolResults { event_cursor } => {
+            TurnState::AwaitingToolResults {
+                event_cursor,
+                pending_calls,
+                pending_user_messages,
+            } => {
                 let Some(new_events) = events.get(event_cursor..) else {
                     return Err(HeadlessTurnPortError::Provider);
                 };
-                let results = tool_results(new_events);
-                if results.is_empty() {
-                    return Err(HeadlessTurnPortError::Provider);
-                }
+                let results = correlate_tool_results(&pending_calls, new_events)?;
 
                 self.history.push(Message {
                     role: Role::Tool,
                     parts: results,
                 });
+                self.history.extend(pending_user_messages);
             }
             TurnState::Completed | TurnState::Failed => {
                 return Err(HeadlessTurnPortError::Provider);
             }
         }
 
-        let response = self.send(self.payload(), cancellation).await?;
+        let response = self.send(self.payload()?, cancellation).await?;
         let (parts, usage, wants_tool_results) = self.read_stream(response, cancellation).await?;
 
         if let Some(progress) = &self.progress
@@ -493,6 +555,8 @@ impl TurnProvider for MoonshotProvider {
         self.state = if wants_tool_results {
             TurnState::AwaitingToolResults {
                 event_cursor: events.len(),
+                pending_calls: pending_calls_from_parts(&parts),
+                pending_user_messages: Vec::new(),
             }
         } else {
             TurnState::Completed
