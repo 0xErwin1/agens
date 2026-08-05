@@ -3598,6 +3598,7 @@ fn history_stash_palette_and_open_dialog_open_prompt_overlays() {
     let mut tui = Tui::new(ProductionTuiEngine {
         cancellation: Arc::clone(&cancellation),
     });
+    tui.set_prompt_memory(Box::new(agens_core::EphemeralPromptMemory::new()));
     let router = TuiRuntimeRouter::new(
         bootstrap,
         Arc::clone(&session),
@@ -3679,6 +3680,7 @@ fn history_stash_typed_slash_resolve_opens_overlays_without_provider_turn() {
     let mut tui = Tui::new(ProductionTuiEngine {
         cancellation: Arc::clone(&cancellation),
     });
+    tui.set_prompt_memory(Box::new(agens_core::EphemeralPromptMemory::new()));
     let project_root = temporary.join("project");
     std::fs::create_dir_all(&project_root).unwrap();
     let commands = start_tui_commands(&mut tui, &bootstrap, &project_root).unwrap();

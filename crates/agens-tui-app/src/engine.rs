@@ -10,8 +10,7 @@ use agens_tools::{
     CommandCatalog, SkillCatalog, TaskExecutionRegistry, TaskMessageSource, TaskMessageTarget,
 };
 use agens_tui::{
-    BridgeCancel, Engine as TuiEngine, PromptMemoryPersist, Tui, TuiProviderOutcome,
-    TuiSubmissionOutcome,
+    BridgeCancel, Engine as TuiEngine, Tui, TuiProviderOutcome, TuiSubmissionOutcome,
     run_with_default_progress_submit_with_permissions_task_controls_and_ask_user,
 };
 
@@ -71,44 +70,15 @@ fn interactive_turn_cancellation() -> HeadlessTurnCancellation {
     HeadlessTurnCancellation::new()
 }
 
-/// Adapter from unified SQLite prompt memory into the TUI's pure in-memory stores.
-struct StorePromptMemoryPersist {
-    store: PromptMemoryStore,
-}
-
-impl PromptMemoryPersist for StorePromptMemoryPersist {
-    fn append_history(&mut self, text: &str, created_at: i64) -> Result<(), String> {
-        self.store
-            .append_history_at(text, Some(created_at))
-            .map(|_| ())
-            .map_err(|error| error.to_string())
-    }
-
-    fn replace_stash(&mut self, entries: &[(String, i64)]) -> Result<(), String> {
-        self.store
-            .replace_stash(entries)
-            .map_err(|error| error.to_string())
-    }
-}
-
-/// Best-effort open of `agens.db` prompt tables, seed pure stores, install persist.
-fn seed_prompt_memory_from_store<E: TuiEngine>(tui: &mut Tui<E>, data_directory: &std::path::Path) {
+/// Best-effort open of SQLite prompt memory and install it on the surface port.
+fn install_prompt_memory_from_store<E: TuiEngine>(
+    tui: &mut Tui<E>,
+    data_directory: &std::path::Path,
+) {
     let Ok(store) = PromptMemoryStore::open(data_directory) else {
         return;
     };
-
-    let history = store.list_history().unwrap_or_default();
-    let stash = store.list_stash().unwrap_or_default();
-
-    tui.seed_prompt_memory(
-        history
-            .into_iter()
-            .map(|entry| (entry.text, entry.created_at)),
-        stash
-            .into_iter()
-            .map(|entry| (entry.text, entry.created_at)),
-    );
-    tui.install_prompt_memory_persist(Box::new(StorePromptMemoryPersist { store }));
+    tui.set_prompt_memory(Box::new(store));
 }
 
 /// Installs the trace recorder when `AGENS_PERF_TRACE` names a directory.
@@ -150,7 +120,7 @@ pub fn run_production_tui_with_profile_store(
         cancellation: Arc::clone(&cancellation),
     };
     let mut tui = Tui::new(engine);
-    seed_prompt_memory_from_store(&mut tui, bootstrap.data_directory());
+    install_prompt_memory_from_store(&mut tui, bootstrap.data_directory());
     configure_tui_project_identity(&mut tui, bootstrap);
     tui.set_collapse_thinking(bootstrap.collapse_thinking);
     if let Some(identifier) = resume {

@@ -7,7 +7,6 @@ mod bridge;
 mod conversation;
 #[cfg(feature = "perf-audit")]
 pub mod perf;
-mod prompt_memory;
 mod render;
 pub mod shortcuts;
 mod terminal;
@@ -32,7 +31,6 @@ pub use conversation::{
     ActionableError, Conversation, ConversationError, ConversationEvent, SubagentCard, ToolBatch,
     ToolCall, ToolResult, TurnCost,
 };
-pub use prompt_memory::PromptMemoryPersist;
 pub use terminal::{
     PendingPermissions, PermissionReply, TerminalControl, TerminalModeGuard, TerminalOperation,
     teardown,
@@ -54,6 +52,7 @@ use std::{
 
 use agens_core::SubagentStatus;
 use agens_core::SubmitOrigin;
+use agens_core::{HistoryBrowseResult, PromptMemory};
 use agens_core::ask_user::{AskUserMode, AskUserQuestion, AskUserReply, AskUserRequest};
 use agens_core::{MessagePart, TurnEvent, TurnState, Usage};
 use ask_user::{AskUserEntry, AskUserOutcome, AskUserRow, AskUserState};
@@ -1758,34 +1757,69 @@ fn dialog_matches(dialog: &DialogView) -> Vec<(usize, &DialogEntry)> {
 
 const PROMPT_OVERLAY_LIMIT: usize = 64;
 
-fn history_overlay_entries(
-    history: &prompt_memory::PromptHistory,
-    query: &str,
-) -> Vec<DialogEntry> {
-    history
-        .overlay_entries(query, PROMPT_OVERLAY_LIMIT)
+fn history_overlay_entries(memory: &dyn PromptMemory, query: &str) -> Vec<DialogEntry> {
+    memory
+        .history_overlay(query, PROMPT_OVERLAY_LIMIT)
         .into_iter()
         .map(|entry| {
-            let date = prompt_memory::prompt_entry_date_label(entry.created_at);
+            let date = prompt_entry_date_label(entry.created_at);
             DialogEntry::fill_composer(&entry.text, Some(&date), entry.text.clone(), None)
         })
         .collect()
 }
 
-fn stash_overlay_entries(stash: &prompt_memory::PromptStash, query: &str) -> Vec<DialogEntry> {
-    stash
-        .overlay_entries(query, PROMPT_OVERLAY_LIMIT)
+fn stash_overlay_entries(memory: &dyn PromptMemory, query: &str) -> Vec<DialogEntry> {
+    memory
+        .stash_overlay(query, PROMPT_OVERLAY_LIMIT)
         .into_iter()
-        .map(|(index, entry)| {
-            let date = prompt_memory::prompt_entry_date_label(entry.created_at);
+        .map(|entry| {
+            let date = prompt_entry_date_label(entry.created_at);
             DialogEntry::fill_composer(
                 &entry.text,
                 Some(&date),
                 entry.text.clone(),
-                Some(index.to_string()),
+                Some(entry.store_index.to_string()),
             )
         })
         .collect()
+}
+
+/// Date portion (`YYYY-MM-DD`) of a unix-seconds timestamp for overlay right labels.
+fn prompt_entry_date_label(created_at: i64) -> String {
+    format_unix_secs_rfc3339(created_at)
+        .get(..10)
+        .unwrap_or("")
+        .to_owned()
+}
+
+/// Format unix seconds as `YYYY-MM-DDTHH:MM:SSZ` for overlay labels.
+fn format_unix_secs_rfc3339(secs: i64) -> String {
+    let secs = u64::try_from(secs.max(0)).unwrap_or(0);
+
+    const SECS_PER_DAY: u64 = 86_400;
+    const DAYS_PER_CYCLE: u64 = 146_097;
+    const SECS_PER_HOUR: u64 = 3_600;
+    const SECS_PER_MIN: u64 = 60;
+
+    let days = secs / SECS_PER_DAY;
+    let day_secs = secs % SECS_PER_DAY;
+    let hour = day_secs / SECS_PER_HOUR;
+    let minute = (day_secs % SECS_PER_HOUR) / SECS_PER_MIN;
+    let second = day_secs % SECS_PER_MIN;
+
+    // Civil date from days since Unix epoch (1970-01-01), Howard Hinnant algorithm.
+    let z = days + 719_468;
+    let era = z / DAYS_PER_CYCLE;
+    let doe = z - era * DAYS_PER_CYCLE;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+
+    format!("{year:04}-{m:02}-{d:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
 
 /// Ratatui renderer usable with both real terminals and `TestBackend`.
@@ -5257,12 +5291,8 @@ pub struct Tui<E> {
     mouse_selection_snapshot: Option<MouseSelectionSnapshot>,
     /// First key of an unfinished viewport chord, such as the `g` of `gg`.
     pending_viewport_key: Option<char>,
-    /// Chronological composer-submit history with Up/Down browse state.
-    prompt_history: prompt_memory::PromptHistory,
-    /// Independent LIFO stash of parked composer drafts (Ctrl+S).
-    prompt_stash: prompt_memory::PromptStash,
-    /// Optional durable persist adapter installed by the composition root.
-    prompt_memory_persist: Option<Box<dyn prompt_memory::PromptMemoryPersist>>,
+    /// Optional prompt history/stash port installed by the composition root.
+    prompt_memory: Option<Box<dyn PromptMemory>>,
 }
 
 impl<E> Tui<E>
@@ -5354,9 +5384,7 @@ where
             next_runtime_ordinal: 0,
             mouse_selection_snapshot: None,
             pending_viewport_key: None,
-            prompt_history: prompt_memory::PromptHistory::new(),
-            prompt_stash: prompt_memory::PromptStash::new(),
-            prompt_memory_persist: None,
+            prompt_memory: None,
         }
     }
 
@@ -6724,7 +6752,11 @@ where
 
     /// Opens the searchable prompt-history overlay (composer-anchored, newest-first, window 64).
     pub fn show_history_overlay(&mut self) {
-        let entries = history_overlay_entries(&self.prompt_history, "");
+        let entries = self
+            .prompt_memory
+            .as_ref()
+            .map(|memory| history_overlay_entries(memory.as_ref(), ""))
+            .unwrap_or_default();
         let mut dialog = DialogView::selection(
             "Prompt history",
             Some("/ search · Enter paste · Esc close"),
@@ -6738,7 +6770,11 @@ where
 
     /// Opens the stash pick/remove overlay (composer-anchored, newest-first, window 64).
     pub fn show_stash_overlay(&mut self) {
-        let entries = stash_overlay_entries(&self.prompt_stash, "");
+        let entries = self
+            .prompt_memory
+            .as_ref()
+            .map(|memory| stash_overlay_entries(memory.as_ref(), ""))
+            .unwrap_or_default();
         let mut dialog = DialogView::selection(
             "Prompt stash",
             Some("/ search · Enter paste · x/Del remove · Esc close"),
@@ -6750,44 +6786,9 @@ where
         self.show_selection_dialog(dialog);
     }
 
-    /// Seeds pure in-memory history and stash (oldest-first for both).
-    ///
-    /// Called by the composition root after loading durable rows from SQLite.
-    pub fn seed_prompt_memory(
-        &mut self,
-        history: impl IntoIterator<Item = (String, i64)>,
-        stash: impl IntoIterator<Item = (String, i64)>,
-    ) {
-        self.prompt_history = prompt_memory::PromptHistory::from_entries(history.into_iter().map(
-            |(text, created_at)| prompt_memory::PromptEntry::with_created_at(text, created_at),
-        ));
-        self.prompt_stash = prompt_memory::PromptStash::from_entries(stash.into_iter().map(
-            |(text, created_at)| prompt_memory::PromptEntry::with_created_at(text, created_at),
-        ));
-    }
-
-    /// Installs the durable persist adapter. Mutations still update memory first;
-    /// persist failures are ignored for the rest of the session.
-    pub fn install_prompt_memory_persist(
-        &mut self,
-        persist: Box<dyn prompt_memory::PromptMemoryPersist>,
-    ) {
-        self.prompt_memory_persist = Some(persist);
-    }
-
-    fn persist_prompt_history_append(&mut self, entry: &prompt_memory::PromptEntry) {
-        let Some(persist) = self.prompt_memory_persist.as_mut() else {
-            return;
-        };
-        let _ = persist.append_history(&entry.text, entry.created_at);
-    }
-
-    fn persist_prompt_stash_rewrite(&mut self) {
-        let Some(persist) = self.prompt_memory_persist.as_mut() else {
-            return;
-        };
-        let pairs = self.prompt_stash.persist_pairs();
-        let _ = persist.replace_stash(&pairs);
+    /// Installs the prompt history/stash port. Surfaces only route keys through this trait.
+    pub fn set_prompt_memory(&mut self, memory: Box<dyn PromptMemory>) {
+        self.prompt_memory = Some(memory);
     }
 
     pub fn show_selection_dialog(&mut self, mut dialog: DialogView) {
@@ -7691,7 +7692,7 @@ where
                     if self.execution_selection.is_none()
                         && self.input.is_empty()
                         && !self.viewport_focused()
-                        && !self.prompt_history.is_browsing() =>
+                        && !self.prompt_memory.as_ref().is_some_and(|memory| memory.is_browsing()) =>
                 {
                     self.focus_execution_strip();
                     return Action::Render;
@@ -8139,13 +8140,10 @@ where
     }
 
     fn record_prompt_history(&mut self, text: &str) {
-        if !self.prompt_history.append(text) {
-            return;
-        }
-        let Some(entry) = self.prompt_history.entries().last().cloned() else {
+        let Some(memory) = self.prompt_memory.as_mut() else {
             return;
         };
-        self.persist_prompt_history_append(&entry);
+        let _ = memory.record_submission(text);
     }
 
     fn apply_composer_text(&mut self, text: String) {
@@ -8161,22 +8159,28 @@ where
     fn handle_prompt_history_key(&mut self, key: Key) -> Option<Action> {
         match key {
             Key::Up => {
-                let shown = self.prompt_history.browse_up(&self.input)?;
+                let shown = self.prompt_memory.as_mut()?.browse_up(&self.input)?;
                 self.execution_selection = None;
                 self.apply_composer_text(shown);
                 Some(Action::Render)
             }
-            Key::Down if self.prompt_history.is_browsing() => {
-                match self.prompt_history.browse_down() {
-                    prompt_memory::BrowseResult::Entry(text) => {
+            Key::Down
+                if self
+                    .prompt_memory
+                    .as_ref()
+                    .is_some_and(|memory| memory.is_browsing()) =>
+            {
+                let result = self.prompt_memory.as_mut()?.browse_down();
+                match result {
+                    HistoryBrowseResult::Entry(text) => {
                         self.apply_composer_text(text);
                         Some(Action::Render)
                     }
-                    prompt_memory::BrowseResult::RestoreDraft(draft) => {
+                    HistoryBrowseResult::RestoreDraft(draft) => {
                         self.apply_composer_text(draft);
                         Some(Action::Render)
                     }
-                    prompt_memory::BrowseResult::Idle => None,
+                    HistoryBrowseResult::Idle => None,
                 }
             }
             _ => None,
@@ -8185,22 +8189,45 @@ where
 
     /// Ctrl+S: push non-empty draft, or pop LIFO when empty. Never submits.
     fn handle_prompt_stash_key(&mut self) -> Action {
+        if self.prompt_memory.is_none() {
+            return Action::Render;
+        }
+
         if !self.input.is_empty() {
             let text = std::mem::take(&mut self.input);
             self.input_cursor = 0;
             self.recovered_failed_prompt = false;
-            self.prompt_history.clear_browse();
-            self.prompt_stash.push(text);
-            self.persist_prompt_stash_rewrite();
+
+            let push_failed = {
+                let memory = self.prompt_memory.as_mut().expect("checked above");
+                memory.clear_browse();
+                memory.stash_push(&text).is_err()
+            };
+
+            if push_failed {
+                // Restore the draft when durable push fails so the user does not lose input.
+                self.input = text;
+                self.input_cursor = self.input.chars().count();
+            }
+
             self.clamp_palette_selection();
             self.refresh_file_picker();
             return Action::Render;
         }
 
-        if let Some(entry) = self.prompt_stash.pop() {
-            self.prompt_history.clear_browse();
-            self.persist_prompt_stash_rewrite();
-            self.apply_composer_text(entry.text);
+        let popped = {
+            let memory = self.prompt_memory.as_mut().expect("checked above");
+            match memory.stash_pop() {
+                Ok(Some(text)) => {
+                    memory.clear_browse();
+                    Some(text)
+                }
+                _ => None,
+            }
+        };
+
+        if let Some(text) = popped {
+            self.apply_composer_text(text);
         }
 
         Action::Render
@@ -8477,7 +8504,9 @@ where
         self.input.replace_range(start_byte..end_byte, replacement);
         self.input_cursor = start + replacement.chars().count();
         // Composer edits abandon history browse while keeping the current input.
-        self.prompt_history.clear_browse();
+        if let Some(memory) = self.prompt_memory.as_mut() {
+            memory.clear_browse();
+        }
     }
 
     fn viewport_focused(&self) -> bool {
@@ -9024,9 +9053,14 @@ where
             .as_ref()
             .map(|dialog| dialog.query.clone())
             .unwrap_or_default();
-        let entries = match kind {
-            PromptOverlayKind::History => history_overlay_entries(&self.prompt_history, &query),
-            PromptOverlayKind::Stash => stash_overlay_entries(&self.prompt_stash, &query),
+        let entries = match (kind, self.prompt_memory.as_ref()) {
+            (PromptOverlayKind::History, Some(memory)) => {
+                history_overlay_entries(memory.as_ref(), &query)
+            }
+            (PromptOverlayKind::Stash, Some(memory)) => {
+                stash_overlay_entries(memory.as_ref(), &query)
+            }
+            _ => Vec::new(),
         };
         if let Some(dialog) = self.dialog.as_mut() {
             dialog.entries = entries;
@@ -9040,7 +9074,7 @@ where
         }
     }
 
-    /// Remove the selected stash row, best-effort persist the full stack, keep overlay open.
+    /// Remove the selected stash row through the prompt-memory port; keep overlay open.
     fn remove_selected_stash_overlay_entry(&mut self) -> Action {
         let index = self.dialog.as_ref().and_then(|dialog| {
             dialog_matches(dialog)
@@ -9052,8 +9086,9 @@ where
             return Action::Render;
         };
 
-        let _ = self.prompt_stash.remove(index);
-        self.persist_prompt_stash_rewrite();
+        if let Some(memory) = self.prompt_memory.as_mut() {
+            let _ = memory.stash_remove_at(index);
+        }
         self.rebuild_prompt_overlay_entries();
         Action::Render
     }

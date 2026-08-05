@@ -4916,9 +4916,22 @@ fn submit_text(tui: &mut Tui<FakeEngine>, text: &str) -> Action {
     tui.handle(Event::Key(Key::Enter))
 }
 
+
+fn tui_with_prompt_memory() -> Tui<FakeEngine> {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.set_prompt_memory(Box::new(agens_core::EphemeralPromptMemory::new()));
+    tui
+}
+
+fn tui_with_prompt_memory_capacity(capacity: usize) -> Tui<FakeEngine> {
+    let mut tui = Tui::with_queue_capacity(FakeEngine::default(), capacity);
+    tui.set_prompt_memory(Box::new(agens_core::EphemeralPromptMemory::new()));
+    tui
+}
+
 #[test]
 fn prompt_memory_keys_empty_up_browses_history_without_submit() {
-    let mut tui = Tui::new(FakeEngine::default());
+    let mut tui = tui_with_prompt_memory();
 
     assert_eq!(
         submit_text(&mut tui, "older"),
@@ -4942,7 +4955,7 @@ fn prompt_memory_keys_empty_up_browses_history_without_submit() {
 
 #[test]
 fn prompt_memory_keys_down_restores_draft_and_empty_non_browse_down_still_focuses_tree() {
-    let mut tui = Tui::new(FakeEngine::default());
+    let mut tui = tui_with_prompt_memory();
     assert_eq!(
         submit_text(&mut tui, "first"),
         Action::Submit("first".into())
@@ -4975,7 +4988,7 @@ fn prompt_memory_keys_down_restores_draft_and_empty_non_browse_down_still_focuse
 
 #[test]
 fn prompt_memory_keys_ctrl_s_push_pop_and_empty_noop() {
-    let mut tui = Tui::new(FakeEngine::default());
+    let mut tui = tui_with_prompt_memory();
 
     type_chars(&mut tui, "first");
     assert_eq!(tui.handle(Event::Key(Key::CtrlS)), Action::Render);
@@ -5006,7 +5019,7 @@ fn prompt_memory_keys_ctrl_s_push_pop_and_empty_noop() {
 
 #[test]
 fn prompt_memory_keys_submit_enqueue_and_busy_append_history_with_dedupe_stash_untouched() {
-    let mut tui = Tui::with_queue_capacity(FakeEngine::default(), 4);
+    let mut tui = tui_with_prompt_memory_capacity(4);
 
     // Stash stays independent of history appends.
     type_chars(&mut tui, "stash-keep");
@@ -5071,7 +5084,7 @@ fn prompt_memory_keys_submit_enqueue_and_busy_append_history_with_dedupe_stash_u
 
 #[test]
 fn prompt_memory_keys_composer_edit_clears_browse() {
-    let mut tui = Tui::new(FakeEngine::default());
+    let mut tui = tui_with_prompt_memory();
     assert_eq!(
         submit_text(&mut tui, "alpha"),
         Action::Submit("alpha".into())
@@ -5100,7 +5113,7 @@ fn prompt_memory_keys_composer_edit_clears_browse() {
 
 #[test]
 fn prompt_overlay_history_enter_pastes_without_submit() {
-    let mut tui = Tui::new(FakeEngine::default());
+    let mut tui = tui_with_prompt_memory();
     assert_eq!(
         submit_text(&mut tui, "older-entry"),
         Action::Submit("older-entry".into())
@@ -5130,7 +5143,7 @@ fn prompt_overlay_history_enter_pastes_without_submit() {
 
 #[test]
 fn prompt_overlay_history_filter_narrows_list() {
-    let mut tui = Tui::new(FakeEngine::default());
+    let mut tui = tui_with_prompt_memory();
     assert_eq!(
         submit_text(&mut tui, "alpha one"),
         Action::Submit("alpha one".into())
@@ -5165,7 +5178,7 @@ fn prompt_overlay_history_filter_narrows_list() {
 
 #[test]
 fn prompt_overlay_stash_enter_pastes_selected_without_submit() {
-    let mut tui = Tui::new(FakeEngine::default());
+    let mut tui = tui_with_prompt_memory();
 
     type_chars(&mut tui, "stash-a");
     assert_eq!(tui.handle(Event::Key(Key::CtrlS)), Action::Render);
@@ -5197,38 +5210,8 @@ fn prompt_overlay_stash_enter_pastes_selected_without_submit() {
 }
 
 #[test]
-fn prompt_overlay_stash_x_and_delete_remove_and_rewrite_via_persist() {
-    use std::sync::{Arc, Mutex};
-
-    #[derive(Default)]
-    struct RecordingState {
-        stash_rewrites: Vec<Vec<(String, i64)>>,
-    }
-
-    struct RecordingPersist {
-        state: Arc<Mutex<RecordingState>>,
-    }
-
-    impl agens_tui::PromptMemoryPersist for RecordingPersist {
-        fn append_history(&mut self, _text: &str, _created_at: i64) -> Result<(), String> {
-            Ok(())
-        }
-
-        fn replace_stash(&mut self, entries: &[(String, i64)]) -> Result<(), String> {
-            self.state
-                .lock()
-                .expect("persist lock")
-                .stash_rewrites
-                .push(entries.to_vec());
-            Ok(())
-        }
-    }
-
-    let state = Arc::new(Mutex::new(RecordingState::default()));
-    let mut tui = Tui::new(FakeEngine::default());
-    tui.install_prompt_memory_persist(Box::new(RecordingPersist {
-        state: Arc::clone(&state),
-    }));
+fn prompt_overlay_stash_x_and_delete_remove_selected_rows() {
+    let mut tui = tui_with_prompt_memory();
 
     type_chars(&mut tui, "keep-old");
     assert_eq!(tui.handle(Event::Key(Key::CtrlS)), Action::Render);
@@ -5237,60 +5220,28 @@ fn prompt_overlay_stash_x_and_delete_remove_and_rewrite_via_persist() {
     type_chars(&mut tui, "keep-new");
     assert_eq!(tui.handle(Event::Key(Key::CtrlS)), Action::Render);
 
-    {
-        let rewrites = &state.lock().expect("persist lock").stash_rewrites;
-        assert_eq!(rewrites.len(), 3);
-        assert_eq!(
-            rewrites
-                .last()
-                .expect("seeded stash")
-                .iter()
-                .map(|(text, _)| text.as_str())
-                .collect::<Vec<_>>(),
-            vec!["keep-old", "remove-me", "keep-new"]
-        );
-    }
-
     tui.show_stash_overlay();
+    assert_eq!(tui.view().dialog.unwrap().entry_count(), 3);
+
     // Newest-first: keep-new, remove-me, keep-old → select remove-me.
     assert_eq!(tui.handle(Event::Key(Key::Down)), Action::Render);
     assert_eq!(tui.handle(Event::Key(Key::Char('x'))), Action::Render);
     assert_eq!(tui.view().dialog.unwrap().entry_count(), 2);
     assert_eq!(tui.input(), "", "remove must not paste into the composer");
 
-    {
-        let last = state
-            .lock()
-            .expect("persist lock")
-            .stash_rewrites
-            .last()
-            .cloned()
-            .expect("rewrite after x");
-        let texts: Vec<&str> = last.iter().map(|(text, _)| text.as_str()).collect();
-        assert_eq!(texts, vec!["keep-old", "keep-new"]);
-        assert!(!texts.contains(&"remove-me"));
-    }
-
     // Delete also removes the selected row (keep-new is selected first).
     assert_eq!(tui.handle(Event::Key(Key::Delete)), Action::Render);
     assert_eq!(tui.view().dialog.unwrap().entry_count(), 1);
-    {
-        let last = state
-            .lock()
-            .expect("persist lock")
-            .stash_rewrites
-            .last()
-            .cloned()
-            .expect("rewrite after delete");
-        let texts: Vec<&str> = last.iter().map(|(text, _)| text.as_str()).collect();
-        assert_eq!(texts, vec!["keep-old"]);
-        assert!(!texts.contains(&"keep-new"));
-    }
+
+    // Remaining LIFO top is keep-old.
+    assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Render);
+    assert_eq!(tui.handle(Event::Key(Key::CtrlS)), Action::Render);
+    assert_eq!(tui.input(), "keep-old");
 }
 
 #[test]
 fn prompt_overlay_open_does_not_mutate_queued_prompts() {
-    let mut tui = Tui::with_queue_capacity(FakeEngine::default(), 4);
+    let mut tui = tui_with_prompt_memory_capacity(4);
     tui.begin_submission("active");
     assert_eq!(submit_text(&mut tui, "queued-one"), Action::Render);
     assert_eq!(submit_text(&mut tui, "queued-two"), Action::Render);
@@ -5338,7 +5289,7 @@ fn queue_prompt_texts(tui: &Tui<FakeEngine>) -> Vec<String> {
 
 #[test]
 fn queue_untouched_by_stash_history_ops_preserves_capacity_order_and_dispatch() {
-    let mut tui = Tui::with_queue_capacity(FakeEngine::default(), 2);
+    let mut tui = tui_with_prompt_memory_capacity(2);
     tui.begin_submission("active");
 
     // Fill FIFO queue to capacity.
@@ -5416,7 +5367,7 @@ fn queue_untouched_by_stash_history_ops_preserves_capacity_order_and_dispatch() 
 
 #[test]
 fn history_append_leaves_stash_unchanged_across_submit_and_enqueue() {
-    let mut tui = Tui::with_queue_capacity(FakeEngine::default(), 4);
+    let mut tui = tui_with_prompt_memory_capacity(4);
 
     type_chars(&mut tui, "stash-a");
     assert_eq!(tui.handle(Event::Key(Key::CtrlS)), Action::Render);
@@ -5455,54 +5406,72 @@ fn history_append_leaves_stash_unchanged_across_submit_and_enqueue() {
 }
 
 #[test]
-fn prompt_memory_write_failure_keeps_in_memory_state_without_panic() {
-    struct FailingPersist;
+fn prompt_memory_write_failure_does_not_panic_and_restores_stash_draft() {
+    use agens_core::{
+        HistoryBrowseResult, PromptMemory, PromptMemoryError, PromptOverlayItem,
+    };
 
-    impl agens_tui::PromptMemoryPersist for FailingPersist {
-        fn append_history(&mut self, _text: &str, _created_at: i64) -> Result<(), String> {
-            Err("history write failed".into())
+    struct FailingPromptMemory;
+
+    impl PromptMemory for FailingPromptMemory {
+        fn record_submission(&mut self, _text: &str) -> Result<bool, PromptMemoryError> {
+            Err(PromptMemoryError::new("history write failed"))
         }
 
-        fn replace_stash(&mut self, _entries: &[(String, i64)]) -> Result<(), String> {
-            Err("stash write failed".into())
+        fn browse_up(&mut self, _composer_input: &str) -> Option<String> {
+            None
+        }
+
+        fn browse_down(&mut self) -> HistoryBrowseResult {
+            HistoryBrowseResult::Idle
+        }
+
+        fn clear_browse(&mut self) {}
+
+        fn is_browsing(&self) -> bool {
+            false
+        }
+
+        fn stash_push(&mut self, _text: &str) -> Result<bool, PromptMemoryError> {
+            Err(PromptMemoryError::new("stash write failed"))
+        }
+
+        fn stash_pop(&mut self) -> Result<Option<String>, PromptMemoryError> {
+            Err(PromptMemoryError::new("stash pop failed"))
+        }
+
+        fn stash_remove_at(&mut self, _index: usize) -> Result<bool, PromptMemoryError> {
+            Err(PromptMemoryError::new("stash remove failed"))
+        }
+
+        fn history_overlay(&self, _query: &str, _limit: usize) -> Vec<PromptOverlayItem> {
+            Vec::new()
+        }
+
+        fn stash_overlay(&self, _query: &str, _limit: usize) -> Vec<PromptOverlayItem> {
+            Vec::new()
         }
     }
 
     let mut tui = Tui::new(FakeEngine::default());
-    tui.install_prompt_memory_persist(Box::new(FailingPersist));
+    tui.set_prompt_memory(Box::new(FailingPromptMemory));
 
-    // History append mutates memory first; failing persist must not panic or roll back.
+    // Submit still routes; failed record does not panic or invent history.
     assert_eq!(
         submit_text(&mut tui, "survives-history-io"),
         Action::Submit("survives-history-io".into())
     );
     assert_eq!(tui.handle(Event::Key(Key::Up)), Action::Render);
-    assert_eq!(tui.input(), "survives-history-io");
-    while !tui.input().is_empty() {
-        tui.handle(Event::Key(Key::Backspace));
-    }
+    assert_eq!(tui.input(), "");
 
-    // Stash push/pop with failing rewrite: memory still LIFO; no panic.
+    // Stash push failure restores the draft so the user does not lose input.
     type_chars(&mut tui, "stash-io-a");
-    assert_eq!(tui.handle(Event::Key(Key::CtrlS)), Action::Render);
-    assert_eq!(tui.input(), "");
-    type_chars(&mut tui, "stash-io-b");
-    assert_eq!(tui.handle(Event::Key(Key::CtrlS)), Action::Render);
-    assert_eq!(tui.input(), "");
-    assert_eq!(tui.handle(Event::Key(Key::CtrlS)), Action::Render);
-    assert_eq!(tui.input(), "stash-io-b");
-    while !tui.input().is_empty() {
-        tui.handle(Event::Key(Key::Backspace));
-    }
     assert_eq!(tui.handle(Event::Key(Key::CtrlS)), Action::Render);
     assert_eq!(tui.input(), "stash-io-a");
 
-    // Overlay remove also best-effort (rewrite fails) without panic.
-    type_chars(&mut tui, "remove-io");
-    assert_eq!(tui.handle(Event::Key(Key::CtrlS)), Action::Render);
+    // Overlay remove failure is best-effort and must not panic.
     tui.show_stash_overlay();
     assert!(tui.view().dialog.is_some());
     assert_eq!(tui.handle(Event::Key(Key::Char('x'))), Action::Render);
     assert!(tui.view().dialog.is_some());
-    assert_eq!(tui.view().dialog.unwrap().entry_count(), 0);
 }

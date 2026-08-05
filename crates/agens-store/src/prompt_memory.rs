@@ -1,19 +1,25 @@
-//! Global prompt history and LIFO stash in the unified `agens.db`.
+//! SQLite-backed [`PromptMemory`] for the unified `agens.db`.
 //!
-//! History is chronological by `id` ASC with consecutive-text dedupe on append.
-//! Stash is an independent LIFO (highest `id` is the top). Neither store has a
-//! product-level row cap. Text only — no attachment columns.
+//! Domain browse/dedupe/overlay logic lives in [`PromptMemoryState`]. This
+//! adapter loads tables on open and keeps SQLite consistent with in-memory
+//! state: durable mutators write SQLite first, then update state; on SQLite
+//! failure state is left unchanged. Browse ops are memory-only.
 
 use std::{
     fmt,
     path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
+use agens_core::{
+    HistoryBrowseResult, PromptMemory, PromptMemoryEntry, PromptMemoryError, PromptMemoryState,
+    PromptOverlayItem,
+};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::database;
 
-/// One durable prompt row from history or stash.
+/// One durable prompt row from history or stash (includes SQLite id).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredPrompt {
     pub id: i64,
@@ -52,12 +58,20 @@ impl fmt::Display for PromptMemoryStoreError {
 
 impl std::error::Error for PromptMemoryStoreError {}
 
+impl From<PromptMemoryStoreError> for PromptMemoryError {
+    fn from(error: PromptMemoryStoreError) -> Self {
+        PromptMemoryError::new(error.to_string())
+    }
+}
+
 /// Runtime store for global composer history and independent LIFO stash.
 ///
 /// Shares the unified `agens.db` file with sessions, preferences, and grants.
+/// Holds an in-memory [`PromptMemoryState`] mirror loaded at open.
 pub struct PromptMemoryStore {
     database_path: PathBuf,
     connection: Connection,
+    state: PromptMemoryState,
 }
 
 impl PromptMemoryStore {
@@ -65,14 +79,21 @@ impl PromptMemoryStore {
         let (database_path, connection) = database::open_unified_database(data_directory.as_ref())
             .map_err(PromptMemoryStoreError::from_database)?;
 
-        Ok(Self {
+        let mut store = Self {
             database_path,
             connection,
-        })
+            state: PromptMemoryState::new(),
+        };
+        store.reload_state_from_db()?;
+        Ok(store)
     }
 
     pub fn database_path(&self) -> PathBuf {
         self.database_path.clone()
+    }
+
+    pub fn state(&self) -> &PromptMemoryState {
+        &self.state
     }
 
     /// Chronological history, oldest first (`id` ASC).
@@ -87,70 +108,32 @@ impl PromptMemoryStore {
         &mut self,
         text: &str,
     ) -> Result<Option<StoredPrompt>, PromptMemoryStoreError> {
-        self.append_history_at(text, None)
-    }
-
-    /// Append with an explicit unix-seconds timestamp (used by the TUI persist adapter).
-    pub fn append_history_at(
-        &mut self,
-        text: &str,
-        created_at: Option<i64>,
-    ) -> Result<Option<StoredPrompt>, PromptMemoryStoreError> {
         validate_prompt_text(text)?;
 
-        let last_text: Option<String> = self
-            .connection
-            .query_row(
-                "SELECT text FROM prompt_history ORDER BY id DESC LIMIT 1",
-                [],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|error| {
-                PromptMemoryStoreError::operation(
-                    "read last history row",
-                    &self.database_path,
-                    error,
-                )
-            })?;
-
-        if last_text.as_deref() == Some(text) {
+        if self
+            .state
+            .history()
+            .last()
+            .is_some_and(|entry| entry.text == text)
+        {
+            self.state.clear_browse();
             return Ok(None);
         }
 
-        match created_at {
-            Some(created_at) => {
-                self.connection
-                    .execute(
-                        "INSERT INTO prompt_history (text, created_at) VALUES (?1, ?2)",
-                        params![text, created_at],
-                    )
-                    .map_err(|error| {
-                        PromptMemoryStoreError::operation(
-                            "append history",
-                            &self.database_path,
-                            error,
-                        )
-                    })?;
-            }
-            None => {
-                self.connection
-                    .execute(
-                        "INSERT INTO prompt_history (text, created_at)
-                         VALUES (?1, CAST(strftime('%s','now') AS INTEGER))",
-                        params![text],
-                    )
-                    .map_err(|error| {
-                        PromptMemoryStoreError::operation(
-                            "append history",
-                            &self.database_path,
-                            error,
-                        )
-                    })?;
-            }
-        }
+        let created_at = unix_now_secs();
+        self.connection
+            .execute(
+                "INSERT INTO prompt_history (text, created_at) VALUES (?1, ?2)",
+                params![text, created_at],
+            )
+            .map_err(|error| {
+                PromptMemoryStoreError::operation("append history", &self.database_path, error)
+            })?;
 
         let id = self.connection.last_insert_rowid();
+        let recorded = self.state.record_submission_at(text, created_at);
+        debug_assert!(recorded);
+
         self.load_row("prompt_history", id).map(Some)
     }
 
@@ -161,42 +144,20 @@ impl PromptMemoryStore {
 
     /// Push onto the LIFO top (append row).
     pub fn push_stash(&mut self, text: &str) -> Result<StoredPrompt, PromptMemoryStoreError> {
-        self.push_stash_at(text, None)
-    }
-
-    /// Push with an explicit unix-seconds timestamp.
-    pub fn push_stash_at(
-        &mut self,
-        text: &str,
-        created_at: Option<i64>,
-    ) -> Result<StoredPrompt, PromptMemoryStoreError> {
         validate_prompt_text(text)?;
 
-        match created_at {
-            Some(created_at) => {
-                self.connection
-                    .execute(
-                        "INSERT INTO prompt_stash (text, created_at) VALUES (?1, ?2)",
-                        params![text, created_at],
-                    )
-                    .map_err(|error| {
-                        PromptMemoryStoreError::operation("push stash", &self.database_path, error)
-                    })?;
-            }
-            None => {
-                self.connection
-                    .execute(
-                        "INSERT INTO prompt_stash (text, created_at)
-                         VALUES (?1, CAST(strftime('%s','now') AS INTEGER))",
-                        params![text],
-                    )
-                    .map_err(|error| {
-                        PromptMemoryStoreError::operation("push stash", &self.database_path, error)
-                    })?;
-            }
-        }
+        let created_at = unix_now_secs();
+        self.connection
+            .execute(
+                "INSERT INTO prompt_stash (text, created_at) VALUES (?1, ?2)",
+                params![text, created_at],
+            )
+            .map_err(|error| {
+                PromptMemoryStoreError::operation("push stash", &self.database_path, error)
+            })?;
 
         let id = self.connection.last_insert_rowid();
+        self.state.stash_push_at(text, created_at);
         self.load_row("prompt_stash", id)
     }
 
@@ -230,6 +191,7 @@ impl PromptMemoryStore {
                 PromptMemoryStoreError::operation("pop stash", &self.database_path, error)
             })?;
 
+        let _ = self.state.stash_pop();
         Ok(Some(entry))
     }
 
@@ -249,6 +211,7 @@ impl PromptMemoryStore {
                 PromptMemoryStoreError::operation("remove stash", &self.database_path, error)
             })?;
 
+        let _ = self.state.stash_remove_at(index);
         Ok(Some(entry))
     }
 
@@ -286,6 +249,28 @@ impl PromptMemoryStore {
             PromptMemoryStoreError::operation("commit stash rewrite", &self.database_path, error)
         })?;
 
+        self.state.seed_stash(
+            entries
+                .iter()
+                .map(|(text, created_at)| PromptMemoryEntry::with_created_at(text, *created_at)),
+        );
+        Ok(())
+    }
+
+    fn reload_state_from_db(&mut self) -> Result<(), PromptMemoryStoreError> {
+        let history = self.list_history()?;
+        let stash = self.list_stash()?;
+
+        self.state.seed_history(
+            history
+                .into_iter()
+                .map(|row| PromptMemoryEntry::with_created_at(row.text, row.created_at)),
+        );
+        self.state.seed_stash(
+            stash
+                .into_iter()
+                .map(|row| PromptMemoryEntry::with_created_at(row.text, row.created_at)),
+        );
         Ok(())
     }
 
@@ -345,9 +330,66 @@ impl PromptMemoryStore {
     }
 }
 
+impl PromptMemory for PromptMemoryStore {
+    fn record_submission(&mut self, text: &str) -> Result<bool, PromptMemoryError> {
+        self.append_history(text)
+            .map(|row| row.is_some())
+            .map_err(PromptMemoryError::from)
+    }
+
+    fn browse_up(&mut self, composer_input: &str) -> Option<String> {
+        self.state.browse_up(composer_input)
+    }
+
+    fn browse_down(&mut self) -> HistoryBrowseResult {
+        self.state.browse_down()
+    }
+
+    fn clear_browse(&mut self) {
+        self.state.clear_browse();
+    }
+
+    fn is_browsing(&self) -> bool {
+        self.state.is_browsing()
+    }
+
+    fn stash_push(&mut self, text: &str) -> Result<bool, PromptMemoryError> {
+        self.push_stash(text)
+            .map(|_| true)
+            .map_err(PromptMemoryError::from)
+    }
+
+    fn stash_pop(&mut self) -> Result<Option<String>, PromptMemoryError> {
+        self.pop_stash()
+            .map(|row| row.map(|entry| entry.text))
+            .map_err(PromptMemoryError::from)
+    }
+
+    fn stash_remove_at(&mut self, index: usize) -> Result<bool, PromptMemoryError> {
+        self.remove_stash_at(index)
+            .map(|row| row.is_some())
+            .map_err(PromptMemoryError::from)
+    }
+
+    fn history_overlay(&self, query: &str, limit: usize) -> Vec<PromptOverlayItem> {
+        self.state.history_overlay(query, limit)
+    }
+
+    fn stash_overlay(&self, query: &str, limit: usize) -> Vec<PromptOverlayItem> {
+        self.state.stash_overlay(query, limit)
+    }
+}
+
 fn validate_prompt_text(text: &str) -> Result<(), PromptMemoryStoreError> {
     if text.is_empty() {
         return Err(PromptMemoryStoreError::detail("prompt text is required"));
     }
     Ok(())
+}
+
+fn unix_now_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
 }
