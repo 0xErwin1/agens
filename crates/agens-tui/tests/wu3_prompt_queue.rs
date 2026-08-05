@@ -148,7 +148,17 @@ fn queue_rows_render_in_fifo_order_without_transcript_admission() {
         .map(|cell| cell.symbol())
         .collect::<String>();
 
-    assert!(rendered.contains("1. first queued"));
-    assert!(rendered.contains("2. second queued"));
+    assert!(
+        rendered.contains("first queued"),
+        "missing first queue row: {rendered:?}"
+    );
+    assert!(
+        rendered.contains("second queued"),
+        "missing second queue row: {rendered:?}"
+    );
+    assert!(
+        !rendered.contains("1. first queued · 2. second queued"),
+        "queue must not be crammed into a single border title: {rendered:?}"
+    );
     assert_eq!(tui.transcript().len(), 1);
 }

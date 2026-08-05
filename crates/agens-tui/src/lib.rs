@@ -951,6 +951,8 @@ pub struct ViewState<'a> {
     pub composer_cursor_visible: bool,
     /// Undispatched prompts shown in FIFO order.
     pub queue: Vec<&'a QueueEntry>,
+    /// Selected queue index while [`SurfaceFocus::Queue`] is active.
+    pub queue_selected: Option<usize>,
     /// Whether a local session restore is being prepared without starting a provider turn.
     pub session_loading: bool,
     /// Whether the current assistant item can still receive ordered text deltas.
@@ -1751,7 +1753,7 @@ fn render_frame_content(frame: &mut ratatui::Frame<'_>, state: &ViewState<'_>) {
     let notice = notice_spans(state);
     let layout = {
         let _perf_layout = agens_perf::span!("tui.frame.layout");
-        screen_layout(area, state.input)
+        screen_layout(area, state.input, state.queue.len())
     };
 
     let row_width = layout
@@ -1843,13 +1845,6 @@ fn render_frame_content(frame: &mut ratatui::Frame<'_>, state: &ViewState<'_>) {
         if let Some(metrics) = border_metrics(state, layout.composer) {
             composer = composer.title_bottom(metrics);
         }
-        if !state.queue.is_empty() {
-            composer = composer.title_top(Line::raw(queue_title(
-                &state.queue,
-                layout.composer.width.saturating_sub(2),
-                state.surface_focus == SurfaceFocus::Queue,
-            )));
-        }
         frame.render_widget(
             Paragraph::new(composer_layout.text)
                 .block(composer)
@@ -1878,6 +1873,10 @@ fn render_frame_content(frame: &mut ratatui::Frame<'_>, state: &ViewState<'_>) {
                 cursor_y.min(area.height.saturating_sub(1)),
             ));
         }
+    }
+
+    if layout.queue.height > 0 {
+        render_queue(frame, layout.queue, state);
     }
 
     if layout.notice.height > 0 {
@@ -2881,26 +2880,73 @@ fn footer_context<'a>(state: &ViewState<'a>) -> widgets::FooterContext<'a> {
     }
 }
 
-fn queue_title(queue: &[&QueueEntry], width: u16, focused: bool) -> String {
-    if focused || width < 52 {
-        return render::bounded_single_line(
-            &format!(
-                " QUEUE ({}) · ↑↓ select · Enter edit · Del remove · Alt↑↓ reorder ",
-                queue.len()
-            ),
-            usize::from(width),
-        );
+/// Caps visible queue rows so a full queue cannot starve the transcript.
+const MAX_VISIBLE_QUEUE_ROWS: usize = 6;
+
+/// Pending prompts as single-line message rows stacked above the composer.
+fn render_queue(frame: &mut ratatui::Frame<'_>, area: Rect, state: &ViewState<'_>) {
+    if area.height == 0 || state.queue.is_empty() {
+        return;
     }
-    let entries = queue
+
+    let visible = state
+        .queue
+        .len()
+        .min(usize::from(area.height))
+        .min(MAX_VISIBLE_QUEUE_ROWS);
+    let focused = state.surface_focus == SurfaceFocus::Queue;
+    let bullet = widgets::Glyph::UserBullet.text(state.unicode_level);
+    let width = usize::from(area.width);
+
+    let lines = state
+        .queue
         .iter()
+        .take(visible)
         .enumerate()
-        .map(|(index, entry)| format!("{}. {}", index + 1, entry.prompt()))
-        .collect::<Vec<_>>()
-        .join(" · ");
-    render::bounded_single_line(
-        &format!(" Queue ({}) {entries} ", queue.len()),
-        usize::from(width),
-    )
+        .map(|(index, entry)| {
+            let selected = focused && state.queue_selected == Some(index);
+            queue_row_line(entry.prompt(), bullet, width, selected)
+        })
+        .collect::<Vec<_>>();
+
+    frame.render_widget(Paragraph::new(Text::from(lines)), area);
+}
+
+fn queue_row_line(prompt: &str, bullet: &str, width: usize, selected: bool) -> Line<'static> {
+    let background = if selected {
+        widgets::RolePalette::selection_bg()
+    } else {
+        widgets::RolePalette::user_band()
+    };
+    let text_fg = if selected {
+        widgets::RolePalette::selection_fg()
+    } else {
+        widgets::RolePalette::muted()
+    };
+    let bullet_fg = if selected {
+        widgets::RolePalette::selection_fg()
+    } else {
+        widgets::RolePalette::user_identity()
+    };
+
+    let base = Style::default().fg(text_fg).bg(background);
+    let bullet_style = Style::default().fg(bullet_fg).bg(background);
+    let prefix = format!("  {bullet}  ");
+    let prefix_width = UnicodeWidthStr::width(prefix.as_str());
+    let text = render::bounded_single_line(prompt, width.saturating_sub(prefix_width));
+    let used = prefix_width.saturating_add(UnicodeWidthStr::width(text.as_str()));
+    let padding = width.saturating_sub(used);
+
+    let mut spans = vec![
+        Span::styled("  ".to_owned(), base),
+        Span::styled(bullet.to_owned(), bullet_style),
+        Span::styled("  ".to_owned(), base),
+        Span::styled(text, base),
+    ];
+    if padding > 0 {
+        spans.push(Span::styled(" ".repeat(padding), base));
+    }
+    Line::from(spans)
 }
 
 /// Metadata spliced into the composer's border, right-aligned and held one column
@@ -3490,6 +3536,7 @@ fn dialog_empty_message(dialog: &DialogView) -> &str {
 
 struct ScreenLayout {
     transcript: Rect,
+    queue: Rect,
     composer: Rect,
     notice: Rect,
     tree: Rect,
@@ -3662,27 +3709,28 @@ fn composer_rows(height: u16, input: &str, width: usize) -> u16 {
     }
 }
 
-fn screen_layout(area: Rect, input: &str) -> ScreenLayout {
+fn screen_layout(area: Rect, input: &str, queue_len: usize) -> ScreenLayout {
     let area = conversation_surface(area);
     let gutter = chrome_gutter(area.width);
     let composer_width = area.width.saturating_sub(gutter.saturating_mul(2));
     let inner_width = usize::from(composer_width.saturating_sub(3).max(1));
     let composer_rows = composer_rows(area.height, input, inner_width).min(area.height);
-    let chrome =
-        bottom_chrome(area.width, area.height).fitted(area.height.saturating_sub(composer_rows));
-    let transcript_rows = area
-        .height
-        .saturating_sub(composer_rows)
-        .saturating_sub(chrome.rows());
+    let after_composer = area.height.saturating_sub(composer_rows);
+    let chrome = bottom_chrome(area.width, area.height).fitted(after_composer);
+    let remaining = after_composer.saturating_sub(chrome.rows());
+    let wanted_queue = saturating_u16(queue_len.min(MAX_VISIBLE_QUEUE_ROWS));
+    let queue_rows = wanted_queue.min(remaining);
+    let transcript_rows = remaining.saturating_sub(queue_rows);
     let chunks = Layout::vertical([
         Constraint::Length(transcript_rows),
+        Constraint::Length(queue_rows),
         Constraint::Length(composer_rows),
         Constraint::Length(chrome.rows()),
     ])
     .split(area);
 
     let gutter = Margin::new(chrome_gutter(area.width), 0);
-    let bands = chrome.placed(chunks[2].inner(gutter));
+    let bands = chrome.placed(chunks[3].inner(gutter));
     // The transcript keeps its own left indent, so only the right edge is owed
     // the gutter. Without it the prose ran past the composer it belongs to, and
     // a line that outruns the box you typed it into reads as a different column.
@@ -3693,7 +3741,8 @@ fn screen_layout(area: Rect, input: &str) -> ScreenLayout {
 
     ScreenLayout {
         transcript,
-        composer: chunks[1].inner(gutter),
+        queue: chunks[1].inner(gutter),
+        composer: chunks[2].inner(gutter),
         notice: bands.notice,
         tree: bands.tree,
         footer: bands.footer,
@@ -6184,7 +6233,7 @@ where
     /// same rows the renderer paints.
     fn screen_layout(&self) -> ScreenLayout {
         let area = Rect::new(0, 0, self.size.0.max(1), self.size.1.max(1));
-        screen_layout(area, &self.input)
+        screen_layout(area, &self.input, self.scheduler.queued_entries().len())
     }
 
     /// Selects a transcript from a click on the subagent tree.
@@ -6569,6 +6618,7 @@ where
             surface_focus: self.surface_focus,
             composer_cursor_visible: self.surface_focus == SurfaceFocus::Composer,
             queue: self.scheduler.queued_entries(),
+            queue_selected: self.queue_selected,
             session_loading: self.session_loading,
             assistant_streaming: self.assistant_streaming,
             quit_armed: self.quit_is_armed(),
@@ -13145,8 +13195,17 @@ mod runtime_tests {
 
     #[test]
     fn bottom_chrome_bands_share_one_gutter_that_collapses_on_narrow_terminals() {
-        let layout = screen_layout(Rect::new(0, 0, 120, 24), "");
-        for band in [layout.composer, layout.notice, layout.tree, layout.footer] {
+        let layout = screen_layout(Rect::new(0, 0, 120, 24), "", 0);
+        for band in [
+            layout.composer,
+            layout.notice,
+            layout.tree,
+            layout.footer,
+            layout.queue,
+        ] {
+            if band.height == 0 {
+                continue;
+            }
             assert_eq!(band.x, CHROME_GUTTER, "{band:?}");
             assert_eq!(band.width, 120 - 2 * CHROME_GUTTER, "{band:?}");
         }
@@ -13156,6 +13215,7 @@ mod runtime_tests {
         assert_eq!(layout.transcript.x, 0);
         assert_eq!(layout.transcript.right(), 120 - CHROME_GUTTER);
         assert_eq!(layout.composer.right(), layout.transcript.right());
+        assert_eq!(layout.queue.height, 0);
 
         assert_eq!(
             [0_u16, 1, 24, 26, 28, 30, 32, 120].map(chrome_gutter),
@@ -13163,7 +13223,7 @@ mod runtime_tests {
         );
 
         for width in 0..=64_u16 {
-            let layout = screen_layout(Rect::new(0, 0, width, 24), "");
+            let layout = screen_layout(Rect::new(0, 0, width, 24), "", 0);
             assert!(layout.composer.right() <= width, "width {width}");
             assert!(
                 layout.composer.width >= width.min(MIN_GUTTERED_COMPOSER_WIDTH),
@@ -13171,6 +13231,12 @@ mod runtime_tests {
                 layout.composer
             );
         }
+
+        let with_queue = screen_layout(Rect::new(0, 0, 120, 24), "", 3);
+        assert_eq!(with_queue.queue.height, 3);
+        assert_eq!(with_queue.queue.x, CHROME_GUTTER);
+        assert_eq!(with_queue.queue.width, with_queue.composer.width);
+        assert_eq!(with_queue.queue.bottom(), with_queue.composer.y);
     }
 
     #[test]
@@ -13215,7 +13281,7 @@ mod runtime_tests {
         );
         assert_eq!(windows_lines.rows, 2);
 
-        let layout = screen_layout(Rect::new(0, 0, 30, 12), input);
+        let layout = screen_layout(Rect::new(0, 0, 30, 12), input, 0);
         assert_eq!(layout.composer.height, 4);
 
         let mut tui = Tui::new(NoopEngine);

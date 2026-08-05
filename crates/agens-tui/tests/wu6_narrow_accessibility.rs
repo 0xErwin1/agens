@@ -57,9 +57,10 @@ fn narrow_surface_keeps_composer_queue_and_activity_controls_reachable() {
     assert_eq!(tui.view().surface_focus, SurfaceFocus::Queue);
     renderer.render(tui.view()).unwrap();
     let queue = rendered_text(&renderer);
+    assert!(queue.contains("queued"), "queue row missing: {queue:?}");
     assert!(queue.contains("QUEUE"), "{queue:?}");
-    assert!(queue.contains("select"), "{queue:?}");
     assert!(queue.contains("edit"), "{queue:?}");
+    assert!(queue.contains("Del") || queue.contains("remove"), "{queue:?}");
 
     tui.handle(Event::Key(Key::Tab));
     assert_eq!(tui.view().surface_focus, SurfaceFocus::Activity);
