@@ -37,9 +37,8 @@ pub fn select_subagent(
     let mut context = session
         .lock()
         .map_err(|_| CliError::storage("TUI session is unavailable"))?;
-    if context.running {
-        return Err(CliError::runtime(HeadlessTurnError::State));
-    }
+    // Safe while a parent turn is running: selected_subagent only affects the
+    // next selected subagent launch, not the in-flight foreground turn.
     context.selected_subagent = Some(agent.name.clone());
     Ok(format!("Subagent: {}.", agent.name))
 }

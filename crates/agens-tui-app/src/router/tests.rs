@@ -3110,7 +3110,9 @@ fn busy_policy_exhaustively_classifies_builtin_commands_and_catalog_extensions()
         ("/model gpt-5.6", BusyPolicy::Reject),
         ("/provider openai-api", BusyPolicy::Reject),
         ("/resume 42", BusyPolicy::Reject),
-        ("/subagent primary", BusyPolicy::Reject),
+        ("/subagent primary", BusyPolicy::Local),
+        ("/subagent-profiles", BusyPolicy::Local),
+        ("/subagents", BusyPolicy::Local),
         ("/summarize release", BusyPolicy::Queue),
         ("/review release", BusyPolicy::Queue),
         ("plain provider prompt", BusyPolicy::Queue),
@@ -3229,6 +3231,94 @@ fn busy_routes_execute_local_queue_provider_and_preserve_rejected_drafts() {
             .is_some_and(|message| message.contains("unavailable while a response is in progress"))
     );
     assert_eq!(tui.transcript().len(), transcript_count);
+
+    std::fs::remove_dir_all(temporary).unwrap();
+}
+
+#[test]
+fn busy_subagent_commands_run_locally_without_queueing_or_refusing() {
+    let temporary = tui_session_directory("busy-subagent-local");
+    let bootstrap = tui_session_bootstrap(
+        &temporary,
+        &[(
+            "reviewer",
+            "---\nname: reviewer\ndescription: reviewer\nmode: subagent\npermissions: []\n---\nReview work.\n",
+        )],
+    );
+    let project = temporary.join("project");
+    let commands = start_tui_commands(
+        &mut Tui::new(ProductionTuiEngine {
+            cancellation: Arc::new(Mutex::new(None)),
+        }),
+        &bootstrap,
+        &project,
+    )
+    .unwrap();
+    let skills = start_tui_skills(
+        &mut Tui::new(ProductionTuiEngine {
+            cancellation: Arc::new(Mutex::new(None)),
+        }),
+        &bootstrap,
+        &project,
+    )
+    .unwrap();
+    let session = Arc::new(Mutex::new(SessionContext {
+        running: true,
+        ..SessionContext::fresh()
+    }));
+    let router = TuiRuntimeRouter::new(
+        bootstrap,
+        Arc::clone(&session),
+        Arc::new(Mutex::new(None)),
+        commands,
+        skills,
+    );
+    let mut tui = Tui::with_queue_capacity(
+        ProductionTuiEngine {
+            cancellation: Arc::new(Mutex::new(None)),
+        },
+        2,
+    );
+    tui.enable_busy_policy_routing();
+    tui.begin_submission("active");
+
+    assert_eq!(router.classify_busy_input("/subagent reviewer"), BusyPolicy::Local);
+    assert_eq!(router.classify_busy_input("/subagent"), BusyPolicy::Local);
+    assert_eq!(
+        router.classify_busy_input("/subagent-profiles"),
+        BusyPolicy::Local
+    );
+
+    for character in "/subagent reviewer".chars() {
+        tui.handle(Event::Key(Key::Char(character)));
+    }
+    assert_eq!(
+        tui.handle(Event::Key(Key::Enter)),
+        Action::SubmitBusy("/subagent reviewer".into())
+    );
+    let outcome = router.route_request(
+        TuiRouteRequest::BusyInput("/subagent reviewer".into()),
+        std::sync::mpsc::channel().0,
+    );
+    assert!(tui.apply_busy_submission_outcome(outcome).is_none());
+    assert!(tui.queue_entries().is_empty());
+    assert!(tui.view().running);
+    assert_eq!(
+        session.lock().unwrap().selected_subagent.as_deref(),
+        Some("reviewer")
+    );
+
+    let dialog = router.route_request(
+        TuiRouteRequest::BusyInput("/subagent".into()),
+        std::sync::mpsc::channel().0,
+    );
+    assert!(
+        matches!(
+            dialog,
+            TuiSubmissionOutcome::Dialog(_) | TuiSubmissionOutcome::SafeDialog(_)
+        ),
+        "{dialog:?}"
+    );
 
     std::fs::remove_dir_all(temporary).unwrap();
 }

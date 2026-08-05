@@ -208,7 +208,8 @@ const TUI_BUILT_INS: &[TuiBuiltinCommand] = &[
         "Choose an eligible configured subagent",
         "[name]",
         Some("subagent"),
-        CommandBusyPolicy::IdleOnly,
+        // Selection only affects the next selected launch, not the live turn.
+        CommandBusyPolicy::Local,
         true,
         19,
     ),
@@ -217,7 +218,7 @@ const TUI_BUILT_INS: &[TuiBuiltinCommand] = &[
         "Edit subagent model profiles",
         "",
         Some("subagent-profiles"),
-        CommandBusyPolicy::IdleOnly,
+        CommandBusyPolicy::Local,
         false,
         17,
     ),

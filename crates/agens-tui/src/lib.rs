@@ -8154,7 +8154,9 @@ where
             self.dialog = None;
         }
         self.replace_chars(self.input_cursor, self.input_cursor, text);
-        if !self.foreground_running() && self.input == "/" {
+        // Slash commands remain available while a turn is running; busy policy
+        // decides which ones execute immediately, queue as provider turns, or refuse.
+        if self.input == "/" {
             self.palette_open = true;
             self.palette_selected = 0;
         }
@@ -12716,6 +12718,17 @@ mod runtime_tests {
         tui.active_record_mut().focus = TranscriptFocus::Viewport;
         tui.handle(Event::Key(Key::Char('g')));
         assert_eq!(tui.input(), "/g", "the palette query kept the key");
+    }
+
+    #[test]
+    fn slash_opens_the_command_palette_while_a_turn_is_running() {
+        let mut tui = Tui::new(NoopEngine);
+        tui.begin_submission("active");
+        assert!(tui.view().running);
+
+        tui.handle(Event::Key(Key::Char('/')));
+        assert!(tui.palette_open, "busy turns must still open / commands");
+        assert_eq!(tui.input(), "/");
     }
 
     /// Ctrl+D and Ctrl+U carry two meanings; the composer must keep its own.
