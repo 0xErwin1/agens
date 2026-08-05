@@ -10092,15 +10092,20 @@ fn drain_provider_channels<E: Engine>(
     let mut next_prompt = None;
     let completion = if metrics.caught_up && progress.caught_up {
         drain_channel(completion_receiver, |(generation, outcome)| {
-            next_prompt = match generation {
+            // Only adopt a newly scheduled prompt. Later terminals in the same
+            // drain (stale foreground generations or detached background outcomes)
+            // must not clear a queue handoff already taken from an earlier terminal.
+            match generation {
                 Some(generation) => {
-                    tui.finish_provider_turn_scheduled_for_generation(generation, outcome)
+                    if let Some(next) =
+                        tui.finish_provider_turn_scheduled_for_generation(generation, outcome)
+                        && next_prompt.is_none()
+                    {
+                        next_prompt = Some(next);
+                    }
                 }
-                None => {
-                    tui.finish_detached_provider_turn(outcome);
-                    None
-                }
-            };
+                None => tui.finish_detached_provider_turn(outcome),
+            }
         })
     } else {
         ChannelDrain::default()
@@ -13277,7 +13282,8 @@ mod runtime_tests {
         }
 
         let with_queue = screen_layout(Rect::new(0, 0, 120, 24), "", 3);
-        assert_eq!(with_queue.queue.height, 3);
+        // Three message rows plus the muted Queued status line.
+        assert_eq!(with_queue.queue.height, 4);
         assert_eq!(with_queue.queue.x, CHROME_GUTTER);
         assert_eq!(with_queue.queue.width, with_queue.composer.width);
         assert_eq!(with_queue.queue.bottom(), with_queue.composer.y);
@@ -13760,5 +13766,52 @@ mod runtime_tests {
         assert!(tui.view().running);
         assert_eq!(tui.scheduler.queued_prompts(), vec!["queued"]);
         assert!(tui.take_ready_auto_turn().is_none());
+    }
+
+    #[test]
+    fn later_terminals_in_the_same_drain_cannot_wipe_a_queued_next_prompt() {
+        let mut tui = Tui::with_queue_capacity(NoopEngine, 2);
+        let (_metrics_sender, metrics_receiver) = BridgeTx::bounded(1);
+        let (_progress_sender, progress_receiver) = mpsc::channel();
+        let (completion_sender, completion_receiver) = mpsc::channel();
+
+        tui.begin_submission("active");
+        let generation = tui.scheduler.lifecycle().active().unwrap().generation();
+        tui.input = "queued next".into();
+        tui.enqueue_composer();
+
+        completion_sender
+            .send((
+                Some(generation),
+                TuiProviderOutcome::Completed("done".into()),
+            ))
+            .unwrap();
+        // A detached terminal often arrives in the same frame as the foreground
+        // completion. Assigning `next_prompt = None` from it used to drop the FIFO
+        // handoff after the queue entry was already dequeued.
+        completion_sender
+            .send((None, TuiProviderOutcome::Backgrounded))
+            .unwrap();
+        // A stale re-delivery of the same generation must not clear it either.
+        completion_sender
+            .send((
+                Some(generation),
+                TuiProviderOutcome::Completed("stale".into()),
+            ))
+            .unwrap();
+
+        let drain = drain_provider_channels(
+            &mut tui,
+            &metrics_receiver,
+            &progress_receiver,
+            &completion_receiver,
+        );
+
+        assert_eq!(
+            drain.next_prompt.map(|next| next.prompt),
+            Some("queued next".into())
+        );
+        assert!(tui.scheduler.queued_prompts().is_empty());
+        assert!(tui.view().running);
     }
 }
