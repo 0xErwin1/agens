@@ -3282,7 +3282,10 @@ fn busy_subagent_commands_run_locally_without_queueing_or_refusing() {
     tui.enable_busy_policy_routing();
     tui.begin_submission("active");
 
-    assert_eq!(router.classify_busy_input("/subagent reviewer"), BusyPolicy::Local);
+    assert_eq!(
+        router.classify_busy_input("/subagent reviewer"),
+        BusyPolicy::Local
+    );
     assert_eq!(router.classify_busy_input("/subagent"), BusyPolicy::Local);
     assert_eq!(
         router.classify_busy_input("/subagent-profiles"),
@@ -3582,4 +3585,179 @@ fn provider_specific_actions_reject_malformed_diagnostic_references() {
             TuiProviderOutcome::Failed { action, .. } if action == TUI_ERROR_ACTION
         ));
     }
+}
+
+// --- WU4: /history and /stash slash builtins open Tui-owned overlays ---
+
+#[test]
+fn history_stash_palette_and_open_dialog_open_prompt_overlays() {
+    let temporary = tui_session_directory("history-stash-overlays");
+    let bootstrap = tui_session_bootstrap(&temporary, &[]);
+    let session = Arc::new(Mutex::new(SessionContext::fresh()));
+    let cancellation = Arc::new(Mutex::new(None));
+    let mut tui = Tui::new(ProductionTuiEngine {
+        cancellation: Arc::clone(&cancellation),
+    });
+    tui.set_prompt_memory(Box::new(agens_core::EphemeralPromptMemory::new()));
+    let router = TuiRuntimeRouter::new(
+        bootstrap,
+        Arc::clone(&session),
+        cancellation,
+        Arc::new(CommandCatalog::default()),
+        Arc::new(SkillCatalog::default()),
+    );
+    tui.set_palette_entries(router.palette_entries().unwrap());
+    let (progress, _) = std::sync::mpsc::channel();
+
+    // Seed stores via the same key paths users use (submit + Ctrl+S).
+    for character in "history-seed".chars() {
+        tui.handle(Event::Key(Key::Char(character)));
+    }
+    assert_eq!(
+        tui.handle(Event::Key(Key::Enter)),
+        Action::Submit("history-seed".into())
+    );
+    for character in "stash-seed".chars() {
+        tui.handle(Event::Key(Key::Char(character)));
+    }
+    assert_eq!(tui.handle(Event::Key(Key::CtrlS)), Action::Render);
+
+    open_tui_palette_dialog(&mut tui, &router, "/hi", "history", progress.clone());
+    let history_text = render_tui_test_backend(&tui, 80, 24);
+    assert!(
+        history_text.contains("Prompt history"),
+        "palette /history must open history overlay: {history_text:?}"
+    );
+    assert!(
+        history_text.contains("history-seed"),
+        "history overlay must list seeded entry: {history_text:?}"
+    );
+    assert!(tui.view().dialog.is_some());
+    assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Render);
+
+    open_tui_palette_dialog(&mut tui, &router, "/sta", "stash", progress.clone());
+    let stash_text = render_tui_test_backend(&tui, 80, 24);
+    assert!(
+        stash_text.contains("Prompt stash"),
+        "palette /stash must open stash overlay: {stash_text:?}"
+    );
+    assert!(
+        stash_text.contains("stash-seed"),
+        "stash overlay must list seeded entry: {stash_text:?}"
+    );
+    assert!(tui.view().dialog.is_some());
+    assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Render);
+
+    // OpenDialog route ids also open Tui-owned builders (no router-held stores).
+    let outcome = router.route_request(
+        TuiRouteRequest::OpenDialog("history".into()),
+        progress.clone(),
+    );
+    assert!(tui.apply_submission_outcome(outcome).is_none());
+    assert!(
+        render_tui_test_backend(&tui, 80, 24).contains("Prompt history"),
+        "OpenDialog(history) must open the history overlay"
+    );
+    assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Render);
+
+    let outcome = router.route_request(TuiRouteRequest::OpenDialog("stash".into()), progress);
+    assert!(tui.apply_submission_outcome(outcome).is_none());
+    assert!(
+        render_tui_test_backend(&tui, 80, 24).contains("Prompt stash"),
+        "OpenDialog(stash) must open the stash overlay"
+    );
+
+    assert!(session.lock().unwrap().messages.is_empty());
+    std::fs::remove_dir_all(temporary).unwrap();
+}
+
+#[test]
+fn history_stash_typed_slash_resolve_opens_overlays_without_provider_turn() {
+    let temporary = tui_session_directory("history-stash-resolve");
+    let bootstrap = tui_session_bootstrap(&temporary, &[]);
+    let session = Arc::new(Mutex::new(SessionContext::fresh()));
+    let cancellation = Arc::new(Mutex::new(None));
+    let mut tui = Tui::new(ProductionTuiEngine {
+        cancellation: Arc::clone(&cancellation),
+    });
+    tui.set_prompt_memory(Box::new(agens_core::EphemeralPromptMemory::new()));
+    let project_root = temporary.join("project");
+    std::fs::create_dir_all(&project_root).unwrap();
+    let commands = start_tui_commands(&mut tui, &bootstrap, &project_root).unwrap();
+    let skills = start_tui_skills(&mut tui, &bootstrap, &project_root).unwrap();
+    let router = TuiRuntimeRouter::new(
+        bootstrap,
+        Arc::clone(&session),
+        cancellation,
+        commands,
+        skills,
+    );
+    tui.set_palette_entries(router.palette_entries().unwrap());
+
+    for character in "typed-history".chars() {
+        tui.handle(Event::Key(Key::Char(character)));
+    }
+    assert_eq!(
+        tui.handle(Event::Key(Key::Enter)),
+        Action::Submit("typed-history".into())
+    );
+
+    let history_outcome = router.route("/history".into());
+    assert!(
+        !matches!(
+            history_outcome,
+            TuiSubmissionOutcome::ProviderTurn { .. }
+                | TuiSubmissionOutcome::BusyProviderTurn { .. }
+        ),
+        "typed /history must not become a provider turn: {history_outcome:?}"
+    );
+    assert!(tui.apply_submission_outcome(history_outcome).is_none());
+    let history_text = render_tui_test_backend(&tui, 80, 24);
+    assert!(
+        history_text.contains("Prompt history"),
+        "typed /history must open history overlay: {history_text:?}"
+    );
+    assert!(
+        history_text.contains("typed-history") || history_text.contains("/history"),
+        "overlay or recorded history should be visible: {history_text:?}"
+    );
+    assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Render);
+
+    for character in "typed-stash".chars() {
+        tui.handle(Event::Key(Key::Char(character)));
+    }
+    assert_eq!(tui.handle(Event::Key(Key::CtrlS)), Action::Render);
+
+    let stash_outcome = router.route("/stash".into());
+    assert!(
+        !matches!(
+            stash_outcome,
+            TuiSubmissionOutcome::ProviderTurn { .. }
+                | TuiSubmissionOutcome::BusyProviderTurn { .. }
+        ),
+        "typed /stash must not become a provider turn: {stash_outcome:?}"
+    );
+    assert!(tui.apply_submission_outcome(stash_outcome).is_none());
+    let stash_text = render_tui_test_backend(&tui, 80, 24);
+    assert!(
+        stash_text.contains("Prompt stash"),
+        "typed /stash must open stash overlay: {stash_text:?}"
+    );
+    assert!(
+        stash_text.contains("typed-stash"),
+        "stash overlay must list seeded entry: {stash_text:?}"
+    );
+
+    // Builtins must be registered in the palette catalog.
+    let names: Vec<_> = router
+        .palette_entries()
+        .unwrap()
+        .iter()
+        .map(|entry| entry.name().to_owned())
+        .collect();
+    assert!(names.iter().any(|name| name == "history"), "{names:?}");
+    assert!(names.iter().any(|name| name == "stash"), "{names:?}");
+
+    assert!(session.lock().unwrap().messages.is_empty());
+    std::fs::remove_dir_all(temporary).unwrap();
 }

@@ -41,7 +41,7 @@ use agens_headless::{
 };
 use agens_session::context::{ResumeDraft, SessionContext};
 use agens_session::provider::CredentialResolver;
-use agens_store::SessionStore;
+use agens_store::{PromptMemoryStore, SessionStore};
 use agens_tool_runtime::runner::{ProductionTaskRunner, TuiTaskControls, TuiTaskLifecycleBridge};
 use agens_tool_runtime::runtime::task_execution_limits;
 use agens_tool_runtime::task::{
@@ -68,6 +68,17 @@ impl TuiEngine for ProductionTuiEngine {
 
 fn interactive_turn_cancellation() -> HeadlessTurnCancellation {
     HeadlessTurnCancellation::new()
+}
+
+/// Best-effort open of SQLite prompt memory and install it on the surface port.
+fn install_prompt_memory_from_store<E: TuiEngine>(
+    tui: &mut Tui<E>,
+    data_directory: &std::path::Path,
+) {
+    let Ok(store) = PromptMemoryStore::open(data_directory) else {
+        return;
+    };
+    tui.set_prompt_memory(Box::new(store));
 }
 
 /// Installs the trace recorder when `AGENS_PERF_TRACE` names a directory.
@@ -109,6 +120,7 @@ pub fn run_production_tui_with_profile_store(
         cancellation: Arc::clone(&cancellation),
     };
     let mut tui = Tui::new(engine);
+    install_prompt_memory_from_store(&mut tui, bootstrap.data_directory());
     configure_tui_project_identity(&mut tui, bootstrap);
     tui.set_collapse_thinking(bootstrap.collapse_thinking);
     if let Some(identifier) = resume {
@@ -455,6 +467,8 @@ pub fn run_tui_prompt(
                 | TuiSubmissionOutcome::Dialog(_)
                 | TuiSubmissionOutcome::SafeDialog(_)
                 | TuiSubmissionOutcome::TranscriptDialog
+                | TuiSubmissionOutcome::PromptHistoryOverlay
+                | TuiSubmissionOutcome::PromptStashOverlay
                 | TuiSubmissionOutcome::SelectionCancelled
                 | TuiSubmissionOutcome::RouteCancelled
                 | TuiSubmissionOutcome::SelectionError { .. } => {

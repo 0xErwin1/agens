@@ -16,11 +16,16 @@ pub mod ask_user;
 mod permission_precedence;
 mod permission_target;
 pub mod prompt;
+pub mod prompt_memory;
 pub mod redaction;
 mod request_config;
 
 pub use permission_precedence::{
     declarations_deny_every_target, prevailing_decision, prevailing_rule_decision,
+};
+pub use prompt_memory::{
+    EphemeralPromptMemory, HistoryBrowseResult, PromptMemory, PromptMemoryEntry,
+    PromptMemoryError, PromptMemoryState, PromptOverlayItem,
 };
 pub use request_config::{ReasoningEffort, RequestConfig, RequestConfigError};
 

@@ -105,6 +105,15 @@ pub const SHORTCUTS: &[ShortcutGroup] = &[
             shortcut("Ctrl+B", "Move a subagent to the background"),
         ],
     },
+    ShortcutGroup {
+        title: "Prompt memory",
+        shortcuts: &[
+            shortcut("Up / Down", "Browse prompt history when the input is empty"),
+            shortcut("Ctrl+S", "Stash the draft, or pop the last stashed prompt"),
+            shortcut("/history", "Search and paste from prompt history"),
+            shortcut("/stash", "Pick or remove a stashed prompt"),
+        ],
+    },
 ];
 
 /// The catalogue as a searchable, read-only overlay.
