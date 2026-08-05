@@ -8196,6 +8196,9 @@ where
                 // Restore the draft when durable push fails so the user does not lose input.
                 self.input = text;
                 self.input_cursor = self.input.chars().count();
+                self.add_info("Could not save to stash.");
+            } else {
+                self.add_info("Saved to stash.");
             }
 
             self.clamp_palette_selection();

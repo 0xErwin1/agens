@@ -5010,10 +5010,12 @@ fn prompt_memory_keys_ctrl_s_push_pop_and_empty_noop() {
     type_chars(&mut tui, "first");
     assert_eq!(tui.handle(Event::Key(Key::CtrlS)), Action::Render);
     assert_eq!(tui.input(), "");
+    assert_eq!(tui.status(), Some("Saved to stash."));
 
     type_chars(&mut tui, "second");
     assert_eq!(tui.handle(Event::Key(Key::CtrlS)), Action::Render);
     assert_eq!(tui.input(), "");
+    assert_eq!(tui.status(), Some("Saved to stash."));
 
     // Empty + stash → pop LIFO (second, then first); never submits.
     assert_eq!(tui.handle(Event::Key(Key::CtrlS)), Action::Render);
