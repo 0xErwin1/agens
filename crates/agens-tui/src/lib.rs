@@ -597,7 +597,6 @@ struct AskUserRender<'a> {
     entry_cursor: usize,
     context_option: usize,
     context_scroll: u16,
-    incomplete: Option<usize>,
     answered: usize,
     origin: Option<&'a crate::PromptOrigin>,
 }
@@ -615,7 +614,6 @@ impl<'a> AskUserRender<'a> {
             entry_cursor: state.entry_cursor(),
             context_option: state.context_option(),
             context_scroll: state.context_scroll(),
-            incomplete: state.incomplete(),
             answered: state.answered_count(),
             origin: state.origin(),
         }
@@ -1925,7 +1923,7 @@ fn render_frame_content(frame: &mut ratatui::Frame<'_>, state: &ViewState<'_>) {
     }
 
     if let Some(ask_user) = state.ask_user {
-        render_ask_user(frame, area, ask_user);
+        render_ask_user(frame, area, layout.composer, ask_user);
     }
 
     if let Some(secret_entry) = state.secret_entry {
@@ -1942,10 +1940,8 @@ fn render_frame_content(frame: &mut ratatui::Frame<'_>, state: &ViewState<'_>) {
 /// Composed rather than guessed: the narrowest option column that still shows a
 /// label with its selection marker is 33 columns, the narrowest column that
 /// wraps prose without turning it into a ladder is 32, and the divider gutter
-/// between them costs [`ASK_USER_COLUMN_GAP`]. It is also exactly the inner
-/// width a classic 80-column terminal resolves to under
-/// [`widgets::OverlaySizing::ask_user`], which is the narrowest terminal where
-/// the second column still earns its space.
+/// between them costs [`ASK_USER_COLUMN_GAP`]. Full-width above-composer sizing
+/// reaches this inner width on a classic 80-column terminal (minus gutters).
 const ASK_USER_TWO_COLUMN_MIN_WIDTH: u16 = 68;
 /// Space, divider rule, space between the two columns.
 const ASK_USER_COLUMN_GAP: u16 = 3;
@@ -2029,12 +2025,10 @@ fn ask_user_shortcuts(render: &AskUserRender<'_>) -> Vec<widgets::OverlayShortcu
             label: "question",
         });
     }
-    if question.allow_other() {
-        shortcuts.push(widgets::OverlayShortcut {
-            key: "o",
-            label: "other",
-        });
-    }
+    shortcuts.push(widgets::OverlayShortcut {
+        key: "o",
+        label: "other",
+    });
     if question.allow_note() {
         shortcuts.push(widgets::OverlayShortcut {
             key: "n",
@@ -2215,7 +2209,7 @@ fn ask_user_context_lines(text: &str, width: u16) -> Vec<String> {
 fn ask_user_header_lines(render: &AskUserRender<'_>, width: u16) -> Vec<Line<'static>> {
     let muted = Style::default().fg(widgets::RolePalette::muted());
     let total = render.request.questions().len();
-    let mut status = vec![
+    let status = vec![
         Span::styled(
             format!("Question {}/{total}", render.question + 1),
             Style::default().fg(widgets::RolePalette::navigation()),
@@ -2230,13 +2224,6 @@ fn ask_user_header_lines(render: &AskUserRender<'_>, width: u16) -> Vec<Line<'st
             },
         ),
     ];
-    if let Some(index) = render.incomplete {
-        status.push(Span::styled("  ·  ", muted));
-        status.push(Span::styled(
-            format!("answer question {} first", index + 1),
-            Style::default().fg(widgets::RolePalette::warning()),
-        ));
-    }
 
     let question = render.current();
     let mut lines = vec![Line::from(status)];
@@ -2307,15 +2294,13 @@ fn ask_user_rows<'a>(
         }
     }
 
-    if question.allow_other() {
-        rows.push(ask_user_buffer_row(
-            "other",
-            render.other,
-            (render.entry == AskUserEntry::Other).then_some(render.entry_cursor),
-            "press o to type your own answer",
-            width,
-        ));
-    }
+    rows.push(ask_user_buffer_row(
+        "other",
+        render.other,
+        (render.entry == AskUserEntry::Other).then_some(render.entry_cursor),
+        "press o to type your own answer",
+        width,
+    ));
     if question.allow_note() {
         rows.push(ask_user_buffer_row(
             "note",
@@ -2328,35 +2313,28 @@ fn ask_user_rows<'a>(
 
     rows.push(widgets::OverlayRow::new(""));
     let last = render.question + 1 == render.request.questions().len();
-    let blocked = render.answered < render.request.questions().len();
-    let mut action = |row: AskUserRow, label: &'static str, right: Option<&'static str>| {
+    let mut action = |row: AskUserRow, label: &'static str| {
         let highlighted = render.row == row;
         if highlighted {
             selected_row = rows.len();
         }
         rows.push(widgets::OverlayRow {
             label: Cow::Borrowed(label),
-            right_label: right.map(Cow::Borrowed),
             selected: highlighted,
-            dimmed: right.is_some() && !highlighted,
             ..widgets::OverlayRow::default()
         });
     };
-    // Only the last question can submit, so only there can the set be
-    // incomplete in a way this row is about.
+    // Unanswered questions may be submitted as skips; the last proceed row is
+    // always a real submit rather than a blocked affordance.
     if last {
-        action(
-            AskUserRow::Proceed,
-            "Submit answers",
-            blocked.then_some("incomplete"),
-        );
+        action(AskUserRow::Proceed, "Submit answers");
     } else {
-        action(AskUserRow::Proceed, "Next question", None);
+        action(AskUserRow::Proceed, "Next question");
     }
     if question.allow_discuss() {
-        action(AskUserRow::Discuss, "Discuss this in chat instead", None);
+        action(AskUserRow::Discuss, "Discuss this in chat instead");
     }
-    action(AskUserRow::Cancel, "Cancel", None);
+    action(AskUserRow::Cancel, "Cancel");
 
     (rows, selected_row)
 }
@@ -2472,8 +2450,12 @@ const fn ask_user_list_offset(selected: usize, height: usize, total: usize) -> u
 
 /// Resolves the whole overlay before anything is painted.
 #[allow(clippy::too_many_lines)]
-fn ask_user_frame<'a>(area: Rect, render: &AskUserRender<'a>) -> Option<AskUserFrame<'a>> {
-    let sizing = widgets::OverlaySizing::ask_user();
+fn ask_user_frame<'a>(
+    area: Rect,
+    composer: Rect,
+    render: &AskUserRender<'a>,
+) -> Option<AskUserFrame<'a>> {
+    let sizing = widgets::OverlaySizing::ask_user(composer);
     let inner = sizing.inner_width(area)?;
     let has_context = ask_user_has_context(render);
     let two_column = has_context && inner >= ASK_USER_TWO_COLUMN_MIN_WIDTH;
@@ -2606,8 +2588,13 @@ fn ask_user_stacked_split(body: Rect, rows: usize, context_lines: usize) -> (Rec
     )
 }
 
-fn render_ask_user(frame: &mut ratatui::Frame<'_>, area: Rect, render: AskUserRender<'_>) {
-    let Some(laid) = ask_user_frame(area, &render) else {
+fn render_ask_user(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    composer: Rect,
+    render: AskUserRender<'_>,
+) {
+    let Some(laid) = ask_user_frame(area, composer, &render) else {
         return;
     };
     let AskUserFrame {
@@ -2632,7 +2619,7 @@ fn render_ask_user(frame: &mut ratatui::Frame<'_>, area: Rect, render: AskUserRe
         title: &title,
         tabs: None,
         shortcuts: &shortcuts,
-        sizing: widgets::OverlaySizing::ask_user(),
+        sizing: widgets::OverlaySizing::ask_user(composer),
         desired_content_rows: layout.content.height,
     };
     widgets::OverlayFrame::render(frame, &layout, &config);
@@ -7356,7 +7343,8 @@ where
         };
         let render = AskUserRender::of(state);
         let area = Rect::new(0, 0, self.size.0, self.size.1);
-        ask_user_frame(area, &render).map_or(0, |laid| laid.max_context_scroll)
+        let composer = self.screen_layout().composer;
+        ask_user_frame(area, composer, &render).map_or(0, |laid| laid.max_context_scroll)
     }
 
     fn clamp_ask_user_context_scroll(&mut self) {

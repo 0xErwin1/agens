@@ -223,8 +223,6 @@ pub enum AskUserReplyError {
     UnknownOption,
     DuplicateOption,
     MultipleSelectionsInSingleMode,
-    EmptySelection,
-    OtherNotAllowed,
     BlankOther,
     OtherTooLong,
     OtherControlCharacter,
@@ -463,11 +461,11 @@ fn validate_answer(
         return Err(AskUserReplyError::MultipleSelectionsInSingleMode);
     }
 
+    // Free-text "other" is always accepted when present: the interactive surface
+    // always offers it, independent of the agent's `allow_other` flag. A blank
+    // `Some` is still rejected so callers cannot smuggle empty strings as
+    // answers; an omitted `other` with no selection is a skipped question.
     if let Some(other) = answer.other.as_deref() {
-        if !question.allow_other {
-            return Err(AskUserReplyError::OtherNotAllowed);
-        }
-
         validate_free_text(
             other,
             MAX_ASK_USER_FREE_TEXT_CHARS,
@@ -479,12 +477,6 @@ fn validate_answer(
 
     if let Some(note) = answer.note.as_deref() {
         validate_note(question, note)?;
-    }
-
-    let has_other_answer = matches!(&answer.other, Some(other) if !is_blank(other));
-
-    if answer.selected.is_empty() && !has_other_answer {
-        return Err(AskUserReplyError::EmptySelection);
     }
 
     Ok(())

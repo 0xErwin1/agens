@@ -292,9 +292,46 @@ fn answered_envelope_has_the_exact_documented_bytes() {
     assert_eq!(
         output.content,
         "{\"status\":\"answered\",\"answers\":[\
-         {\"question_id\":\"plan\",\"selected\":[\"b\"],\"other\":null,\"note\":\"prefer the smaller diff\"},\
-         {\"question_id\":\"steps\",\"selected\":[\"x\",\"y\"],\"other\":null,\"note\":null}\
+         {\"question_id\":\"plan\",\"answered\":true,\"selected\":[\"b\"],\"other\":null,\"note\":\"prefer the smaller diff\"},\
+         {\"question_id\":\"steps\",\"answered\":true,\"selected\":[\"x\",\"y\"],\"other\":null,\"note\":null}\
          ]}"
+    );
+}
+
+#[test]
+fn skipped_questions_are_marked_answered_false_in_the_envelope() {
+    let reply = AskUserReply::Answered(vec![
+        AskUserAnswer {
+            question_id: "plan".into(),
+            selected: vec![],
+            other: None,
+            note: None,
+        },
+        AskUserAnswer {
+            question_id: "steps".into(),
+            selected: vec!["x".into()],
+            other: None,
+            note: None,
+        },
+    ]);
+    let (port, _) = ScriptedPort::new(reply);
+
+    let output = execute_with_port(request_value(), port, &ready_context()).expect("executed");
+
+    assert!(!output.is_error);
+    assert!(
+        output.content.contains(
+            "\"question_id\":\"plan\",\"answered\":false,\"selected\":[],\"other\":null,\"note\":null"
+        ),
+        "skipped plan must carry answered:false: {}",
+        output.content
+    );
+    assert!(
+        output
+            .content
+            .contains("\"question_id\":\"steps\",\"answered\":true,\"selected\":[\"x\"]"),
+        "answered steps must carry answered:true: {}",
+        output.content
     );
 }
 

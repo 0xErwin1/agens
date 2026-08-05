@@ -549,15 +549,26 @@ fn accepts_a_note_when_allowed() {
 }
 
 #[test]
-fn rejects_free_text_when_other_not_allowed() {
+fn accepts_free_text_even_when_other_not_allowed_on_the_question() {
     let request = valid_request();
     let mut reply_answer = answered("plan", &[]);
     reply_answer.other = Some("neither, use C".to_owned());
     let reply = AskUserReply::Answered(vec![reply_answer]);
 
-    assert_eq!(
-        request.validate_reply(&reply).unwrap_err(),
-        AskUserReplyError::OtherNotAllowed
+    assert!(
+        request.validate_reply(&reply).is_ok(),
+        "free-text other is always accepted, independent of allow_other"
+    );
+}
+
+#[test]
+fn accepts_a_skipped_question_with_empty_selection_and_no_other() {
+    let request = valid_request();
+    let reply = AskUserReply::Answered(vec![answered("plan", &[])]);
+
+    assert!(
+        request.validate_reply(&reply).is_ok(),
+        "empty selection without other is a skipped question, not an error"
     );
 }
 

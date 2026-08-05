@@ -276,6 +276,11 @@ fn encode_answered(request: &AskUserRequest, answers: &[AskUserAnswer]) -> Strin
 /// only ever equal today because `validate_answered_reply` enforces that
 /// equality before this function is reached, but this function no longer
 /// relies on that upstream guarantee to produce a trustworthy id.
+///
+/// Key order is fixed: `question_id`, `answered`, `selected`, `other`, `note`.
+/// `answered` is false when the user left the question with no selection and
+/// no free-text other (a deliberate skip); a note alone does not count as an
+/// answer.
 fn encode_answer(question: &AskUserQuestion, answer: &AskUserAnswer) -> String {
     let selected: Vec<&str> = question
         .options()
@@ -289,9 +294,13 @@ fn encode_answer(question: &AskUserQuestion, answer: &AskUserAnswer) -> String {
         })
         .collect();
 
+    let answered = !selected.is_empty()
+        || matches!(answer.other.as_deref(), Some(other) if !other.trim().is_empty());
+
     format!(
-        "{{\"question_id\":{},\"selected\":{},\"other\":{},\"note\":{}}}",
+        "{{\"question_id\":{},\"answered\":{},\"selected\":{},\"other\":{},\"note\":{}}}",
         json_string(question.id()),
+        if answered { "true" } else { "false" },
         json_string_array(&selected),
         json_optional_string(answer.other.as_deref()),
         json_optional_string(answer.note.as_deref()),
@@ -393,8 +402,13 @@ mod tests {
             keys.sort_unstable();
             assert_eq!(
                 keys,
-                ["note", "other", "question_id", "selected"],
+                ["answered", "note", "other", "question_id", "selected"],
                 "hostile input {hostile:?} changed the answer object's key set"
+            );
+            assert_eq!(
+                object["answered"],
+                serde_json::Value::Bool(true),
+                "hostile input {hostile:?} should still mark the answer as answered"
             );
 
             assert_eq!(

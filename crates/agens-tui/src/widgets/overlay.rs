@@ -202,23 +202,23 @@ impl OverlaySizing {
         })
     }
 
-    /// Centered overlay for a structured question set and its context pane.
+    /// Structured question set pinned directly above the composer.
     ///
-    /// Wider and taller than [`Self::dialog`] because the frame has to hold a
-    /// header, an option list with a sub-line under every option, the action
-    /// rows, and — above the two-column threshold — a context pane beside all
-    /// of that. At `dialog()`'s 96 columns the context pane would never be
-    /// wide enough to show a diagram without cutting it.
-    pub(crate) const fn ask_user() -> Self {
+    /// Anchored like the slash palette so the reader can still see the
+    /// transcript and type into the same visual band. Wider and taller than
+    /// [`Self::palette`] because the frame holds a header, an option list with
+    /// a sub-line under every option, free-text rows, action rows, and — above
+    /// the two-column threshold — a context pane beside all of that.
+    pub(crate) const fn ask_user(composer: Rect) -> Self {
         Self {
-            width_pct: 90,
+            width_pct: 100,
             min_width: 48,
             max_width: 120,
-            max_height: 24,
+            max_height: 20,
             v_margin: 0,
             h_pad: 1,
             v_pad: 0,
-            anchor: OverlayAnchor::Center,
+            anchor: OverlayAnchor::Above(composer),
         }
     }
 

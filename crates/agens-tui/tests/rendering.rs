@@ -6360,7 +6360,8 @@ fn ask_user_resizing_across_the_layout_threshold_preserves_every_interaction_sta
 
     tui.handle(Event::Key(Key::Tab));
     tui.handle(Event::Key(Key::Down));
-    tui.handle(Event::Key(Key::Enter));
+    // Space selects without advancing so free-text edits stay on question 2.
+    tui.handle(Event::Key(Key::Char(' ')));
     for character in "oOTHER_TEXT".chars() {
         tui.handle(Event::Key(Key::Char(character)));
     }
@@ -6560,33 +6561,61 @@ fn ask_user_context_keeps_diagram_rows_and_truncates_an_unbreakable_line() {
 }
 
 #[test]
-fn ask_user_header_reports_completion_and_names_the_question_that_blocks_submission() {
+fn ask_user_header_reports_completion_progress() {
     let (mut tui, mut renderer) = open_ask_user(
         ASK_USER_WIDE_TERMINAL,
         30,
         three_question_ask_user_request(),
     );
-    tui.handle(Event::Key(Key::Enter));
+    // Space selects without advancing so the header still describes question 1.
+    tui.handle(Event::Key(Key::Char(' ')));
     renderer.render(tui.view()).unwrap();
     let answered_one = rendered_text(&renderer);
     assert!(answered_one.contains("1 of 3 answered"), "{answered_one:?}");
-
-    // Submission lives on the last question, so that is where an incomplete
-    // set is refused.
-    tui.handle(Event::Key(Key::Tab));
-    tui.handle(Event::Key(Key::Tab));
-    for _ in 0..2 {
-        tui.handle(Event::Key(Key::Down));
-    }
-    tui.handle(Event::Key(Key::Enter));
-    renderer.render(tui.view()).unwrap();
-
-    let blocked = rendered_text(&renderer);
     assert!(
-        blocked.contains("answer question 2 first"),
-        "an incomplete submission names the question that blocks it: {blocked:?}"
+        !answered_one.contains("answer question"),
+        "submit is never blocked, so the header must not name a blocking question: {answered_one:?}"
     );
-    assert!(tui.ask_user_snapshot().is_some(), "nothing was submitted");
+    assert!(
+        answered_one.contains("other:"),
+        "free-text other is always offered: {answered_one:?}"
+    );
+}
+
+#[test]
+fn ask_user_overlay_sits_flush_above_the_composer() {
+    let (tui, renderer) = open_ask_user(
+        ASK_USER_WIDE_TERMINAL,
+        30,
+        three_question_ask_user_request(),
+    );
+    let _ = tui;
+    let composer_top = composer_top_row(&renderer);
+    let buffer = renderer.terminal().backend().buffer();
+
+    // The rounded top border of the ask-user frame (╭) must land above the
+    // composer, and the frame's bottom border (╰) must sit on the row that
+    // touches the composer's top (frame.bottom() == composer.y).
+    let frame_bottom = (0..buffer.area.height)
+        .rev()
+        .find(|row| {
+            (0..buffer.area.width).any(|col| {
+                let symbol = buffer[(col, *row)].symbol();
+                symbol == "╰" || symbol == "╯"
+            })
+        })
+        .expect("ask-user frame has a bottom border");
+
+    assert_eq!(
+        frame_bottom + 1,
+        composer_top,
+        "ask-user bottom must pin to the composer top (frame.bottom() == composer.y); \
+         frame_bottom={frame_bottom} composer_top={composer_top}"
+    );
+    assert!(
+        frame_bottom < composer_top,
+        "overlay must sit strictly above the composer"
+    );
 }
 
 /// The settled render cache is only bypassed when something actually moved, so

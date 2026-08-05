@@ -70,7 +70,6 @@ pub struct AskUserSnapshot {
     pub note: String,
     pub editing: AskUserEditing,
     pub entry_cursor: usize,
-    pub incomplete: Option<usize>,
     pub discuss_available: bool,
     pub context_scroll: u16,
 }
@@ -137,7 +136,6 @@ pub(crate) struct AskUserState {
     /// it, instead of blanking the explanation they are still consulting.
     context_option: usize,
     context_scroll: u16,
-    incomplete: Option<usize>,
 }
 
 impl AskUserState {
@@ -160,7 +158,6 @@ impl AskUserState {
             entry_cursor: 0,
             context_option: 0,
             context_scroll: 0,
-            incomplete: None,
         }
     }
 
@@ -212,10 +209,6 @@ impl AskUserState {
         self.context_scroll
     }
 
-    pub(crate) const fn incomplete(&self) -> Option<usize> {
-        self.incomplete
-    }
-
     /// How many questions currently hold a valid answer.
     pub(crate) fn answered_count(&self) -> usize {
         (0..self.request.questions().len())
@@ -245,7 +238,6 @@ impl AskUserState {
             note: self.notes[self.question].clone(),
             editing: self.entry.into(),
             entry_cursor: self.entry_cursor,
-            incomplete: self.incomplete,
             discuss_available: self.current_allows_discuss(),
             context_scroll: self.context_scroll,
         }
@@ -337,8 +329,10 @@ impl AskUserState {
         self.request.questions()[self.question].allow_discuss()
     }
 
+    /// Free-text "other" is always available on this surface, independent of
+    /// the agent's `allow_other` flag.
     fn current_allows_other(&self) -> bool {
-        self.request.questions()[self.question].allow_other()
+        true
     }
 
     fn current_allows_note(&self) -> bool {
@@ -443,13 +437,21 @@ impl AskUserState {
 
     fn activate_row(&mut self) -> AskUserOutcome {
         match self.row {
-            AskUserRow::Option(index) => self.toggle_or_select(index),
+            AskUserRow::Option(index) => {
+                let selected = self.toggle_or_select(index);
+                if !self.is_last_question() {
+                    return self.move_to_next_question();
+                }
+                selected
+            }
             AskUserRow::Proceed => self.proceed(),
             AskUserRow::Discuss => self.discuss(),
             AskUserRow::Cancel => AskUserOutcome::Resolved(AskUserReply::Cancelled),
         }
     }
 
+    /// Space on an option toggles selection without advancing, so multi-select
+    /// can accumulate choices before the reader moves on with Enter or Proceed.
     fn activate_option_row(&mut self) -> AskUserOutcome {
         match self.row {
             AskUserRow::Option(index) => self.toggle_or_select(index),
@@ -476,7 +478,6 @@ impl AskUserState {
                 }
             }
         }
-        self.clear_incomplete_if_resolved();
         AskUserOutcome::Changed
     }
 
@@ -590,19 +591,7 @@ impl AskUserState {
 
     fn commit_entry(&mut self) -> AskUserOutcome {
         self.close_entry();
-        self.clear_incomplete_if_resolved();
         AskUserOutcome::Changed
-    }
-
-    /// Clears a stale "answer this question first" flag once the flagged
-    /// question itself becomes answered, so the header does not keep
-    /// pointing at a question the user has already fixed.
-    fn clear_incomplete_if_resolved(&mut self) {
-        if let Some(index) = self.incomplete
-            && self.question_is_answered(index)
-        {
-            self.incomplete = None;
-        }
     }
 
     fn scroll_context(&mut self, direction: i32, max: u16) -> AskUserOutcome {
@@ -625,12 +614,7 @@ impl AskUserState {
     }
 
     fn question_is_answered(&self, index: usize) -> bool {
-        let allow_other = self.request.questions()[index].allow_other();
-        !self.selections[index].is_empty() || (allow_other && !self.other[index].trim().is_empty())
-    }
-
-    fn first_incomplete(&self) -> Option<usize> {
-        (0..self.request.questions().len()).find(|index| !self.question_is_answered(*index))
+        !self.selections[index].is_empty() || !self.other[index].trim().is_empty()
     }
 
     pub(crate) fn is_last_question(&self) -> bool {
@@ -639,10 +623,8 @@ impl AskUserState {
 
     /// Carries the interaction forward from the proceed row.
     ///
-    /// On any question but the last this only advances; it deliberately does
-    /// not refuse an unanswered question, because the reader may well be
-    /// walking the set to read it before deciding, and the completeness check
-    /// still runs — once — where the interaction actually ends.
+    /// On any question but the last this only advances; unanswered questions
+    /// are left as skips and accepted at submit time.
     fn proceed(&mut self) -> AskUserOutcome {
         if self.is_last_question() {
             return self.submit();
@@ -650,25 +632,11 @@ impl AskUserState {
         self.move_to_next_question()
     }
 
-    /// Ends the interaction, or moves to whatever is stopping it from ending.
+    /// Ends the interaction with whatever answers are present.
     ///
-    /// Naming the unanswered question is not enough once submission lives on
-    /// the last question: the reader would be told "answer question 2 first"
-    /// while standing on question 5, and left to find it. The cursor goes
-    /// there, and the flag stays to say why the view moved.
+    /// Unanswered questions go out as empty selections so the model can see
+    /// which ones the reader skipped.
     fn submit(&mut self) -> AskUserOutcome {
-        if let Some(index) = self.first_incomplete() {
-            let repeated = self.incomplete == Some(index);
-            self.incomplete = Some(index);
-
-            let moved = self.focus_question(index);
-            if repeated && matches!(moved, AskUserOutcome::Unchanged) {
-                return AskUserOutcome::Unchanged;
-            }
-            return AskUserOutcome::Changed;
-        }
-
-        self.incomplete = None;
         AskUserOutcome::Resolved(AskUserReply::Answered(self.build_answers()))
     }
 

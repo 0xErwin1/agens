@@ -4347,7 +4347,8 @@ fn ask_user_navigation_preserves_a_valid_answer_on_the_first_question() {
     tui.open_ask_user(1, three_question_ask_user_request());
 
     tui.handle(Event::Key(Key::Down));
-    tui.handle(Event::Key(Key::Enter));
+    // Space selects without advancing, so free-text edits stay on question 0.
+    tui.handle(Event::Key(Key::Char(' ')));
     type_into_buffer(&mut tui, 'o', "extra");
     type_into_buffer(&mut tui, 'n', "fyi");
 
@@ -4366,7 +4367,8 @@ fn ask_user_navigation_preserves_a_valid_answer_on_the_first_question() {
 #[test]
 fn ask_user_single_choice_replaces_previous_selection() {
     let mut tui = Tui::new(FakeEngine::default());
-    tui.open_ask_user(1, three_question_ask_user_request());
+    // Single-question set: Enter selects without advancing past the last item.
+    tui.open_ask_user(1, single_question_ask_user_request(false, false, false));
 
     tui.handle(Event::Key(Key::Enter));
     tui.handle(Event::Key(Key::Down));
@@ -4382,11 +4384,12 @@ fn ask_user_multiple_choice_toggles_selections() {
     tui.open_ask_user(1, three_question_ask_user_request());
 
     tui.handle(Event::Key(Key::Tab));
-    tui.handle(Event::Key(Key::Enter));
+    // Space toggles without advancing so multi-select can accumulate choices.
+    tui.handle(Event::Key(Key::Char(' ')));
     tui.handle(Event::Key(Key::Down));
     tui.handle(Event::Key(Key::Char(' ')));
     tui.handle(Event::Key(Key::Up));
-    tui.handle(Event::Key(Key::Enter));
+    tui.handle(Event::Key(Key::Char(' ')));
 
     let snapshot = tui.ask_user_snapshot().expect("ask-user still open");
     assert_eq!(snapshot.question_index, 1);
@@ -4394,25 +4397,49 @@ fn ask_user_multiple_choice_toggles_selections() {
 }
 
 #[test]
-fn ask_user_char_o_opens_free_text_only_when_allowed() {
-    let mut disallowed = Tui::new(FakeEngine::default());
-    disallowed.open_ask_user(1, single_question_ask_user_request(false, false, false));
+fn ask_user_char_o_always_opens_free_text() {
+    let mut without_flag = Tui::new(FakeEngine::default());
+    without_flag.open_ask_user(1, single_question_ask_user_request(false, false, false));
     assert_eq!(
-        disallowed.handle(Event::Key(Key::Char('o'))),
-        Action::Unchanged
+        without_flag.handle(Event::Key(Key::Char('o'))),
+        Action::Render
     );
     assert_eq!(
-        disallowed.ask_user_snapshot().unwrap().editing,
-        AskUserEditing::Browsing
-    );
-
-    let mut allowed = Tui::new(FakeEngine::default());
-    allowed.open_ask_user(1, single_question_ask_user_request(true, false, false));
-    assert_eq!(allowed.handle(Event::Key(Key::Char('o'))), Action::Render);
-    assert_eq!(
-        allowed.ask_user_snapshot().unwrap().editing,
+        without_flag.ask_user_snapshot().unwrap().editing,
         AskUserEditing::Other
     );
+
+    let mut with_flag = Tui::new(FakeEngine::default());
+    with_flag.open_ask_user(1, single_question_ask_user_request(true, false, false));
+    assert_eq!(with_flag.handle(Event::Key(Key::Char('o'))), Action::Render);
+    assert_eq!(
+        with_flag.ask_user_snapshot().unwrap().editing,
+        AskUserEditing::Other
+    );
+}
+
+#[test]
+fn ask_user_enter_on_option_advances_to_the_next_question() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.open_ask_user(1, three_question_ask_user_request());
+
+    assert_eq!(tui.handle(Event::Key(Key::Enter)), Action::Render);
+    let snapshot = tui.ask_user_snapshot().expect("still open");
+    assert_eq!(snapshot.question_index, 1);
+    assert_eq!(snapshot.row, AskUserRowSnapshot::Option(0));
+
+    // On the last question, Enter selects and stays so Submit remains reachable.
+    tui.handle(Event::Key(Key::Tab));
+    assert_eq!(
+        tui.ask_user_snapshot().unwrap().question_index,
+        2,
+        "tab reaches the last question"
+    );
+    assert_eq!(tui.handle(Event::Key(Key::Enter)), Action::Render);
+    let last = tui.ask_user_snapshot().expect("still open on last question");
+    assert_eq!(last.question_index, 2);
+    assert_eq!(last.selected, vec![0]);
+    assert_eq!(last.row, AskUserRowSnapshot::Option(0));
 }
 
 #[test]
@@ -4470,48 +4497,33 @@ fn ask_user_typed_buffer_commits_on_enter_survives_escape_then_second_escape_can
 }
 
 #[test]
-fn ask_user_submit_while_incomplete_sets_incomplete_index_without_resolving() {
+fn ask_user_submit_while_incomplete_resolves_with_empty_answers() {
+    let request = single_question_ask_user_request(false, false, false);
     let mut tui = Tui::new(FakeEngine::default());
-    tui.open_ask_user(1, single_question_ask_user_request(false, false, false));
+    tui.open_ask_user(1, request.clone());
 
-    tui.handle(Event::Key(Key::Down));
-    tui.handle(Event::Key(Key::Down));
+    walk_to_proceed_row(&mut tui);
     let action = tui.handle(Event::Key(Key::Enter));
 
-    assert_eq!(action, Action::Render);
-    let snapshot = tui
-        .ask_user_snapshot()
-        .expect("submit failed, not resolved");
-    assert_eq!(snapshot.incomplete, Some(0));
-    assert_eq!(
-        snapshot.row,
-        AskUserRowSnapshot::Option(0),
-        "a refused submission must put the cursor on the question it is refusing over, \
-         not merely name it"
-    );
-}
-
-#[test]
-fn ask_user_incomplete_flag_clears_once_the_flagged_question_becomes_answered() {
-    let mut tui = Tui::new(FakeEngine::default());
-    tui.open_ask_user(1, single_question_ask_user_request(false, false, false));
-
-    tui.handle(Event::Key(Key::Down));
-    tui.handle(Event::Key(Key::Down));
-    let flagged = tui.handle(Event::Key(Key::Enter));
-    assert_eq!(flagged, Action::Render);
-    assert_eq!(tui.ask_user_snapshot().unwrap().incomplete, Some(0));
-
-    tui.handle(Event::Key(Key::Up));
-    tui.handle(Event::Key(Key::Up));
-    let answered = tui.handle(Event::Key(Key::Enter));
-    assert_eq!(answered, Action::Render);
-
-    let snapshot = tui.ask_user_snapshot().expect("ask-user still open");
-    assert_eq!(
-        snapshot.incomplete, None,
-        "answering the flagged question must clear the flag without a second submit attempt"
-    );
+    match action {
+        Action::AskUserReply {
+            id,
+            reply: AskUserReply::Answered(answers),
+        } => {
+            assert_eq!(id, 1);
+            assert_eq!(answers.len(), 1);
+            assert!(answers[0].selected.is_empty());
+            assert_eq!(answers[0].other, None);
+            assert!(
+                request
+                    .validate_reply(&AskUserReply::Answered(answers))
+                    .is_ok(),
+                "skipped questions must pass core validation"
+            );
+        }
+        other => panic!("incomplete submit must resolve, got {other:?}"),
+    }
+    assert!(tui.ask_user_snapshot().is_none());
 }
 
 #[test]
@@ -4560,17 +4572,13 @@ fn ask_user_proceed_row_advances_until_the_last_question_where_it_submits() {
 
     // Advancing is not a submission attempt, so it must move on even with
     // nothing answered anywhere. This is what separates a `Next` row from a
-    // `Submit` row that happens to land on the next unanswered question.
+    // `Submit` row.
     walk_to_proceed_row(&mut tui);
     assert_eq!(tui.handle(Event::Key(Key::Enter)), Action::Render);
     let snapshot = tui.ask_user_snapshot().expect("still open");
     assert_eq!(
         snapshot.question_index, 1,
         "proceeding must advance without answering anything"
-    );
-    assert_eq!(
-        snapshot.incomplete, None,
-        "advancing must not refuse anything, so it must not flag anything"
     );
 
     tui.handle(Event::Key(Key::Tab));
@@ -4580,8 +4588,9 @@ fn ask_user_proceed_row_advances_until_the_last_question_where_it_submits() {
         0
     );
 
+    // Select with Space so Enter on Proceed only advances (does not re-select).
     let proceed = |tui: &mut Tui<FakeEngine>| {
-        tui.handle(Event::Key(Key::Enter));
+        tui.handle(Event::Key(Key::Char(' ')));
         walk_to_proceed_row(tui);
         tui.handle(Event::Key(Key::Enter))
     };
@@ -4605,43 +4614,51 @@ fn ask_user_proceed_row_advances_until_the_last_question_where_it_submits() {
             reply: AskUserReply::Answered(answers),
         } => {
             assert_eq!(id, 4);
-            assert_eq!(answers.len(), 3, "every question is answered once");
+            assert_eq!(answers.len(), 3, "every question is present once");
+            assert_eq!(answers[0].selected, vec!["a".to_owned()]);
+            assert_eq!(answers[1].selected, vec!["a".to_owned()]);
+            assert_eq!(answers[2].selected, vec!["a".to_owned()]);
         }
         other => panic!("the last question's proceed row must submit, got {other:?}"),
     }
     assert!(tui.ask_user_snapshot().is_none());
 }
 
-/// A refused submission has to hand the reader the question it is refusing
-/// over, across the whole set — naming it while leaving them parked three
-/// questions away is the dead end this pins.
+/// Submit from the last question always resolves, even when earlier questions
+/// were left unanswered — those land as empty selected/other entries.
 #[test]
-fn ask_user_submit_from_the_last_question_moves_to_the_unanswered_one() {
+fn ask_user_submit_from_the_last_question_accepts_skipped_questions() {
+    let request = three_question_ask_user_request();
     let mut tui = Tui::new(FakeEngine::default());
-    tui.open_ask_user(5, three_question_ask_user_request());
+    tui.open_ask_user(5, request.clone());
 
+    // Answer only the last question, leave the first two skipped.
     tui.handle(Event::Key(Key::Tab));
+    tui.handle(Event::Key(Key::Tab));
+    assert_eq!(tui.ask_user_snapshot().unwrap().question_index, 2);
     tui.handle(Event::Key(Key::Enter));
-    tui.handle(Event::Key(Key::Tab));
-    tui.handle(Event::Key(Key::Enter));
-    tui.handle(Event::Key(Key::Tab));
-
-    let snapshot = tui.ask_user_snapshot().expect("still open");
-    assert_eq!(snapshot.question_index, 0, "Tab wraps back to the first");
-
-    tui.handle(Event::Key(Key::Tab));
-    tui.handle(Event::Key(Key::Tab));
     walk_to_proceed_row(&mut tui);
     let action = tui.handle(Event::Key(Key::Enter));
 
-    assert_eq!(action, Action::Render, "an incomplete set must not resolve");
-    let snapshot = tui.ask_user_snapshot().expect("still open");
-    assert_eq!(snapshot.incomplete, Some(0));
-    assert_eq!(
-        snapshot.question_index, 0,
-        "the refused submission must take the reader to the unanswered question"
-    );
-    assert_eq!(snapshot.row, AskUserRowSnapshot::Option(0));
+    match action {
+        Action::AskUserReply {
+            id,
+            reply: AskUserReply::Answered(answers),
+        } => {
+            assert_eq!(id, 5);
+            assert_eq!(answers.len(), 3);
+            assert!(answers[0].selected.is_empty());
+            assert!(answers[1].selected.is_empty());
+            assert_eq!(answers[2].selected, vec!["a".to_owned()]);
+            assert!(
+                request
+                    .validate_reply(&AskUserReply::Answered(answers))
+                    .is_ok()
+            );
+        }
+        other => panic!("submit with skips must resolve, got {other:?}"),
+    }
+    assert!(tui.ask_user_snapshot().is_none());
 }
 
 /// The note field is a text field, and a text field whose caret only ever
