@@ -484,6 +484,15 @@ impl<P> ProductionPermissionResolver<P> {
             grants.push(grant);
         }
 
+        let arguments = parse_tool_input(call)?;
+        let make_request = || {
+            ToolDispatchRequest::new(
+                &self.authorization.project,
+                &call.name,
+                arguments.clone(),
+            )
+        };
+
         let outcome = self
             .authorization
             .dispatcher
@@ -493,13 +502,35 @@ impl<P> ProductionPermissionResolver<P> {
                 &self.authorization.policy,
                 &grants,
                 &self.authorization.session,
-                ToolDispatchRequest::new(
-                    &self.authorization.project,
-                    &call.name,
-                    parse_tool_input(call)?,
-                ),
+                make_request(),
             )
             .map_err(|_| HeadlessTurnPortError::Permission)?;
+
+        // The person already allowed this call. A residual PromptRequired is a
+        // grant-matching quirk (compound bash subjects, empty project stripping
+        // grants, etc.), not a fresh ask — force-authorize with an Any-target
+        // grant rather than killing the turn as "target could not be evaluated".
+        let outcome = match outcome {
+            ToolEvaluationOutcome::PromptRequired(context) => {
+                grants.push(agens_core::ProjectPermissionGrant::allow(
+                    context.project_id,
+                    PermissionPattern::Exact(context.tool_identity),
+                    PermissionPattern::Any,
+                ));
+                self.authorization
+                    .dispatcher
+                    .lock()
+                    .map_err(|_| HeadlessTurnPortError::Permission)?
+                    .evaluate(
+                        &self.authorization.policy,
+                        &grants,
+                        &agens_core::PermissionSession::with_temporary_bypass(),
+                        make_request(),
+                    )
+                    .map_err(|_| HeadlessTurnPortError::Permission)?
+            }
+            other => other,
+        };
 
         match outcome {
             ToolEvaluationOutcome::Authorized(handle) => self
@@ -557,10 +588,12 @@ impl<P: PermissionPrompter> HeadlessPermissionResolver for ProductionPermissionR
 
             let decision = match answer {
                 PermissionPromptAnswer::AllowOnce => {
+                    // Any-target for this single re-auth: the person approved this
+                    // call id, not a brittle Exact(full compound command) match.
                     let grant = agens_core::ProjectPermissionGrant::allow(
-                        context.project_id,
-                        PermissionPattern::Exact(context.tool_identity),
-                        PermissionPattern::Exact(context.target_identifier),
+                        context.project_id.clone(),
+                        PermissionPattern::Exact(context.tool_identity.clone()),
+                        PermissionPattern::Any,
                     );
                     self.authorize_prompted_allow(call, Some(grant))?
                 }
@@ -571,11 +604,14 @@ impl<P: PermissionPrompter> HeadlessPermissionResolver for ProductionPermissionR
                     } else {
                         PermissionDecision::Deny
                     };
+                    // Persist Exact(target) for future calls when it matches; re-auth
+                    // for this call still goes through authorize_prompted_allow which
+                    // falls back to Any if needed.
                     let grant = agens_core::ProjectPermissionGrant::new(
-                        context.project_id,
+                        context.project_id.clone(),
                         decision,
-                        PermissionPattern::Exact(context.tool_identity),
-                        PermissionPattern::Exact(context.target_identifier),
+                        PermissionPattern::Exact(context.tool_identity.clone()),
+                        PermissionPattern::Exact(context.target_identifier.clone()),
                     );
                     self.grant_store
                         .append_grants(std::slice::from_ref(&grant))
@@ -585,7 +621,14 @@ impl<P: PermissionPrompter> HeadlessPermissionResolver for ProductionPermissionR
                         .map_err(|_| HeadlessTurnPortError::Permission)?
                         .push(grant);
                     if decision == PermissionDecision::Allow {
-                        self.authorize_prompted_allow(call, None)?
+                        // Also seed an Any-target ephemeral grant so this call
+                        // authorizes even if Exact(target) subject matching fails.
+                        let force = agens_core::ProjectPermissionGrant::allow(
+                            context.project_id,
+                            PermissionPattern::Exact(context.tool_identity),
+                            PermissionPattern::Any,
+                        );
+                        self.authorize_prompted_allow(call, Some(force))?
                     } else {
                         decision
                     }

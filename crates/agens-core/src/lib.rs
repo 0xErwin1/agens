@@ -1859,6 +1859,10 @@ enum AskUnreachable {
 enum PreflightAuthorization {
     InvalidArguments,
     UnresolvablePermission,
+    /// The interactive approval path failed after the model was already asked
+    /// (grant re-auth quirk, surface error). The call is refused as a tool
+    /// result so the turn continues — it must not abort the agent.
+    PermissionResolutionFailed,
     UnknownTool,
     Decided(PermissionDecision),
     UnreachablePromptDenial,
@@ -1962,24 +1966,41 @@ async fn run_headless_turn_with_iteration_limit(
             };
             let asked = decision == PermissionDecision::Ask;
             check_cancelled(&mut coordinator, cancellation)?;
-            let decision = resolve_permission_decision(
-                decision,
-                &call,
-                permission_resolver,
-                &mut coordinator,
-                cancellation,
-            )
-            .await?;
-            check_cancelled(&mut coordinator, cancellation)?;
-
-            let authorization = if asked
-                && decision == PermissionDecision::Deny
-                && ask_unreachable == AskUnreachable::PromptIsUnreachable
-            {
-                PreflightAuthorization::UnreachablePromptDenial
-            } else {
+            let authorization = if !asked {
                 PreflightAuthorization::Decided(decision)
+            } else {
+                match permission_resolver.resolve(&call, cancellation).await {
+                    Ok(resolved) => {
+                        if resolved == PermissionDecision::Deny
+                            && ask_unreachable == AskUnreachable::PromptIsUnreachable
+                        {
+                            PreflightAuthorization::UnreachablePromptDenial
+                        } else {
+                            PreflightAuthorization::Decided(resolved)
+                        }
+                    }
+                    // Only cancel / hard timeout end the turn. Every other
+                    // approval-path failure is a tool refusal the model can
+                    // recover from — never "permission target could not be
+                    // evaluated" aborting the whole agent run.
+                    Err(HeadlessTurnPortError::Cancelled) => {
+                        return Err(finish_port_error(
+                            &mut coordinator,
+                            HeadlessTurnPortError::Cancelled,
+                            HeadlessTurnError::Cancelled,
+                        ));
+                    }
+                    Err(HeadlessTurnPortError::TimedOut) => {
+                        return Err(finish_port_error(
+                            &mut coordinator,
+                            HeadlessTurnPortError::TimedOut,
+                            HeadlessTurnError::TimedOut,
+                        ));
+                    }
+                    Err(_) => PreflightAuthorization::PermissionResolutionFailed,
+                }
             };
+            check_cancelled(&mut coordinator, cancellation)?;
             preflight.push((call, authorization));
         }
 
@@ -2001,6 +2022,12 @@ async fn run_headless_turn_with_iteration_limit(
                         Some(facts) => output.with_facts(facts),
                         None => output,
                     }
+                }
+                PreflightAuthorization::PermissionResolutionFailed => {
+                    HeadlessToolOutput::failure(
+                        "tool call refused: the permission approval for this call could not be \
+                         completed; try the call again, or use a simpler single command",
+                    )
                 }
                 PreflightAuthorization::UnknownTool => HeadlessToolOutput::failure(
                     "tool call refused: this session has no tool by that name; it was not denied \
@@ -2071,25 +2098,6 @@ fn headless_tool_call(part: &MessagePart) -> Option<HeadlessToolCall> {
         name: name.clone(),
         input: input.clone(),
     })
-}
-
-async fn resolve_permission_decision(
-    decision: PermissionDecision,
-    call: &HeadlessToolCall,
-    permission_resolver: &mut impl HeadlessPermissionResolver,
-    coordinator: &mut TurnCoordinator,
-    cancellation: &HeadlessTurnCancellation,
-) -> Result<PermissionDecision, HeadlessTurnError> {
-    if decision != PermissionDecision::Ask {
-        return Ok(decision);
-    }
-
-    permission_resolver
-        .resolve(call, cancellation)
-        .await
-        .map_err(|error| {
-            finish_port_error(coordinator, error, HeadlessTurnError::PermissionEvaluation)
-        })
 }
 
 fn check_cancelled(

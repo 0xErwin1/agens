@@ -134,9 +134,10 @@ pub fn prepare_loaded_tui_session_resume(
         bypass_permission_prompts,
     } = loaded;
     agens_callcount::note_session_resume_projection();
-    // History projection is best-effort: a malformed transcript must not lock
-    // the user out of their own session. Enter with empty history and a notice.
-    let (restored_history, history_notice) = match Conversation::from_messages_with_parser(
+    // Always project history. The conversation restorer is best-effort and
+    // never discards a saved turn — resume must show what was persisted,
+    // including failed and incomplete tool rows.
+    let restored_history = Conversation::from_messages_with_parser(
         &history_without_subagent_turns(&session.messages),
         |name, input| {
             let bare = name
@@ -145,13 +146,11 @@ pub fn prepare_loaded_tui_session_resume(
                 .unwrap_or(name);
             agens_core::ToolInput::parse(bare, input)
         },
-    ) {
-        Ok(history) => (history, None),
-        Err(_) => (
-            Vec::new(),
-            Some("session history could not be fully restored; opened without transcript".to_owned()),
-        ),
-    };
+    )
+    .unwrap_or_else(|_| {
+        // API keeps Result for callers; production parser always returns Ok.
+        Vec::new()
+    });
     let saved_provider = session.metadata.provider_id.as_deref();
     let provider = saved_provider.and_then(ProviderKind::parse);
     let selection_provider =
@@ -201,18 +200,13 @@ pub fn prepare_loaded_tui_session_resume(
     context.bypass_permissions = bypass_permission_prompts
         .or(configured_bypass)
         .unwrap_or(false);
-    if let Some(notice) = history_notice {
-        context.resume_notice = Some(notice);
-    }
     if let Some(boundary) = retry_boundary {
         if let Some(status) = session
             .latest_attempt
             .as_ref()
             .map(agens_core::SessionAttemptSummary::status)
         {
-            if context.resume_notice.is_none() {
-                context.resume_notice = resume_retry_notice(status).map(str::to_owned);
-            }
+            context.resume_notice = resume_retry_notice(status).map(str::to_owned);
         }
         // A runtime-scheduled turn is not the user's to retry, so its prompt is
         // never handed back to the composer.
@@ -1042,28 +1036,23 @@ mod tests {
         let mut invalid = load_tui_session_for_resume(&bootstrap, metadata.id).unwrap();
         invalid.session.messages = vec![Message {
             role: Role::Assistant,
-            parts: vec![MessagePart::Text("orphan".into())],
+            parts: vec![MessagePart::Text("orphan assistant still visible".into())],
         }];
-        // Malformed history must still open the session (empty transcript + notice).
-        let degraded = prepare_loaded_tui_session_resume(
+        // Odd message order must still open with the saved text visible.
+        let restored = prepare_loaded_tui_session_resume(
             &bootstrap,
             metadata.id,
             invalid,
             &credentials,
         )
         .expect("malformed history must not block session entry");
+        assert_eq!(restored.history.len(), 1);
         assert!(
-            degraded.history.is_empty(),
-            "unprojectable history opens with an empty transcript"
-        );
-        assert!(
-            degraded
-                .context
-                .resume_notice
-                .as_deref()
-                .is_some_and(|notice| notice.contains("history")),
-            "resume should surface a history-restoration notice: {:?}",
-            degraded.context.resume_notice
+            restored.history[0]
+                .live_markdown
+                .contains("orphan assistant still visible"),
+            "saved assistant text must remain in the restored transcript: {:?}",
+            restored.history[0].live_markdown
         );
 
         std::fs::remove_dir_all(temporary).unwrap();

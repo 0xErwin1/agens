@@ -844,79 +844,111 @@ fn denied_permissions_emit_sanitized_tool_results_and_continue_without_dispatch(
 }
 
 #[test]
-fn permission_evaluation_errors_remain_distinct_from_unresolved_asks() {
-    for resolver_error in [false, true] {
-        let mut provider = Provider {
-            iterations: vec![Ok(vec![MessagePart::ToolCall {
+fn gate_permission_errors_still_end_the_turn() {
+    struct FailingGate;
+
+    impl HeadlessPermissionGate for FailingGate {
+        fn evaluate(
+            &mut self,
+            _call: &HeadlessToolCall,
+            _cancellation: &HeadlessTurnCancellation,
+        ) -> impl Future<Output = Result<PermissionDecision, HeadlessTurnPortError>> + Send {
+            ready(Err(HeadlessTurnPortError::Permission))
+        }
+    }
+
+    let mut provider = Provider {
+        iterations: vec![Ok(vec![MessagePart::ToolCall {
+            id: "permission-error".into(),
+            name: "read".into(),
+            input: "credential=do-not-expose".into(),
+        }])],
+    };
+    let mut repository = Repository::default();
+    let mut failing_gate = FailingGate;
+    let mut resolver = PermissionResolver::default();
+
+    let result = block_on_ready(run_headless_turn(
+        &mut provider,
+        &mut failing_gate,
+        &mut resolver,
+        &mut ToolDispatcher::default(),
+        &mut repository,
+        &HeadlessTurnCancellation::new(),
+    ));
+
+    assert_eq!(result, Err(HeadlessTurnError::PermissionEvaluation));
+    assert!(repository.snapshots.is_empty());
+}
+
+#[test]
+fn resolver_permission_errors_refuse_the_call_and_let_the_agent_continue() {
+    struct FailingResolver;
+
+    impl HeadlessPermissionResolver for FailingResolver {
+        fn resolve(
+            &mut self,
+            _call: &HeadlessToolCall,
+            _cancellation: &HeadlessTurnCancellation,
+        ) -> impl Future<Output = Result<PermissionDecision, HeadlessTurnPortError>> + Send {
+            ready(Err(HeadlessTurnPortError::Permission))
+        }
+    }
+
+    let mut provider = Provider {
+        iterations: vec![
+            Ok(vec![MessagePart::ToolCall {
                 id: "permission-error".into(),
                 name: "read".into(),
                 input: "credential=do-not-expose".into(),
-            }])],
-        };
-        let mut repository = Repository::default();
-        let mut gate = PermissionGate {
-            decisions: vec![PermissionDecision::Ask],
-            denial_facts: None,
-        };
-        let mut resolver = PermissionResolver {
-            decisions: vec![PermissionDecision::Allow],
-        };
+            }]),
+            Ok(vec![MessagePart::Text("recovered after tool refusal".into())]),
+        ],
+    };
+    let mut repository = Repository::default();
+    let mut gate = PermissionGate {
+        decisions: vec![PermissionDecision::Ask],
+        denial_facts: None,
+    };
+    let mut failing_resolver = FailingResolver;
 
-        let result = if resolver_error {
-            struct FailingResolver;
+    let snapshot = block_on_ready(run_headless_turn(
+        &mut provider,
+        &mut gate,
+        &mut failing_resolver,
+        &mut ToolDispatcher::default(),
+        &mut repository,
+        &HeadlessTurnCancellation::new(),
+    ))
+    .expect("approval-path failure must not abort the turn");
 
-            impl HeadlessPermissionResolver for FailingResolver {
-                fn resolve(
-                    &mut self,
-                    _call: &HeadlessToolCall,
-                    _cancellation: &HeadlessTurnCancellation,
-                ) -> impl Future<Output = Result<PermissionDecision, HeadlessTurnPortError>> + Send
-                {
-                    ready(Err(HeadlessTurnPortError::Permission))
-                }
-            }
-
-            let mut failing_resolver = FailingResolver;
-            block_on_ready(run_headless_turn(
-                &mut provider,
-                &mut gate,
-                &mut failing_resolver,
-                &mut ToolDispatcher::default(),
-                &mut repository,
-                &HeadlessTurnCancellation::new(),
-            ))
-        } else {
-            struct FailingGate;
-
-            impl HeadlessPermissionGate for FailingGate {
-                fn evaluate(
-                    &mut self,
-                    _call: &HeadlessToolCall,
-                    _cancellation: &HeadlessTurnCancellation,
-                ) -> impl Future<Output = Result<PermissionDecision, HeadlessTurnPortError>> + Send
-                {
-                    ready(Err(HeadlessTurnPortError::Permission))
-                }
-            }
-
-            let mut failing_gate = FailingGate;
-            block_on_ready(run_headless_turn(
-                &mut provider,
-                &mut failing_gate,
-                &mut resolver,
-                &mut ToolDispatcher::default(),
-                &mut repository,
-                &HeadlessTurnCancellation::new(),
-            ))
-        };
-
-        assert_eq!(result, Err(HeadlessTurnError::PermissionEvaluation));
-        assert_eq!(
-            HeadlessTurnError::PermissionEvaluation.to_string(),
-            "permission evaluation failed"
-        );
-        assert!(repository.snapshots.is_empty());
-    }
+    let tool_results: Vec<_> = snapshot
+        .events()
+        .iter()
+        .filter_map(|event| match event {
+            TurnEvent::ToolResult(MessagePart::ToolResult {
+                content, is_error, ..
+            }) => Some((content.as_str(), *is_error)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(tool_results.len(), 1, "{tool_results:?}");
+    assert!(tool_results[0].1, "refusal is an error tool result");
+    assert!(
+        tool_results[0].0.contains("permission approval"),
+        "model-visible refusal: {}",
+        tool_results[0].0
+    );
+    assert!(
+        snapshot.events().iter().any(|event| matches!(
+            event,
+            TurnEvent::ProviderPart(MessagePart::Text(text))
+                if text.contains("recovered after tool refusal")
+        )),
+        "agent must get another iteration: {:?}",
+        snapshot.events()
+    );
+    assert_eq!(repository.snapshots.len(), 1);
 }
 
 #[test]

@@ -39,6 +39,7 @@ pub use widgets::{ColorLevel, DisplayMode, UnicodeLevel};
 
 use std::{
     borrow::Cow,
+    cell::RefCell,
     collections::{BTreeMap, BTreeSet, VecDeque},
     io::{self, Stdout, Write},
     sync::{
@@ -1005,6 +1006,11 @@ pub struct ViewState<'a> {
     pub scroll_offset: u16,
     /// Absolute wrapped transcript anchors used to paint application-owned mouse selection.
     pub selection: Option<TranscriptSelection>,
+    /// Cached selectable index for the active transcript at the current row width.
+    ///
+    /// Shared across paint and mouse hit-testing so a drag does not rebuild the
+    /// full grapheme index on every pointer event.
+    pub(crate) selectable: SharedSelectable,
     /// Current provider and model selected by the CLI composition root.
     pub provider_model: &'a str,
     /// Optional reasoning effort label for the footer.
@@ -1901,14 +1907,9 @@ fn render_frame_content(frame: &mut ratatui::Frame<'_>, state: &ViewState<'_>) {
         screen_layout(area, state.input, state.queue.len())
     };
 
-    let row_width = layout
-        .transcript
-        .width
-        .saturating_sub(TRANSCRIPT_ROW_INDENT);
-    let transcript = {
-        let _perf_select = agens_perf::span!("tui.transcript.select", row_width = row_width);
-        SelectableTranscript::from_lines(&rendered_transcript(state, row_width), row_width)
-    };
+    let transcript = state.selectable.arc();
+    let _perf_select =
+        agens_perf::span!("tui.transcript.select", rows = transcript.rows.len() as u64);
     let visible_rows = layout
         .transcript
         .height
@@ -4794,8 +4795,49 @@ struct SelectableCell {
     /// A continuation row opens with the indent that keeps it under its
     /// paragraph. That indent exists because the terminal is narrow, so it is
     /// painted and highlighted like everything else but never copied.
+    ///
+    /// Leading accent and bullet gutter columns are also non-copyable so a
+    /// drag that starts at column zero does not pull chrome spaces into the
+    /// clipboard.
     copyable: bool,
 }
+
+/// Cached [`SelectableTranscript`] keyed by content epoch, transcript, and width.
+struct SelectableCache {
+    epoch: u64,
+    transcript_id: TranscriptId,
+    row_width: u16,
+    transcript: Arc<SelectableTranscript>,
+}
+
+/// View-facing handle to a shared selectable index.
+///
+/// Equality is pointer identity only: render snapshots compare presentation
+/// state, not the full grapheme table that paint reuses.
+#[derive(Clone, Debug)]
+struct SharedSelectable(Arc<SelectableTranscript>);
+
+impl SharedSelectable {
+    fn empty() -> Self {
+        Self(Arc::new(SelectableTranscript::default()))
+    }
+
+    fn from_arc(transcript: Arc<SelectableTranscript>) -> Self {
+        Self(transcript)
+    }
+
+    fn arc(&self) -> Arc<SelectableTranscript> {
+        Arc::clone(&self.0)
+    }
+}
+
+impl PartialEq for SharedSelectable {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for SharedSelectable {}
 
 /// What separates a row from the one below it in the copied text.
 ///
@@ -4824,6 +4866,8 @@ struct SelectableTranscript {
 impl SelectableTranscript {
     fn from_lines(lines: &[Line<'_>], width: u16) -> Self {
         let width = width.max(1);
+        let chrome_width =
+            saturating_u16(widgets::ACCENT_WIDTH.saturating_add(widgets::GUTTER_WIDTH));
         let mut rows = Vec::new();
 
         let mut continues_into_this_line = false;
@@ -4847,6 +4891,18 @@ impl SelectableTranscript {
             if joined.is_some() {
                 cells.pop();
             }
+
+            // Accent bar + bullet gutter occupy the first chrome columns of a
+            // block row. They paint with the row but must not enter the clipboard.
+            let mut chrome_column = 0_u16;
+            for cell in &mut cells {
+                if chrome_column >= chrome_width {
+                    break;
+                }
+                cell.copyable = false;
+                chrome_column = chrome_column.saturating_add(cell.width);
+            }
+
             if continues_into_this_line {
                 for cell in cells
                     .iter_mut()
@@ -5140,7 +5196,7 @@ fn ordered_selection(selection: TranscriptSelection) -> (TranscriptPosition, Tra
 }
 
 struct MouseSelectionSnapshot {
-    transcript: SelectableTranscript,
+    transcript: Arc<SelectableTranscript>,
     content_x: u16,
     content_y: u16,
     content_right: u16,
@@ -5442,6 +5498,10 @@ pub struct Tui<E> {
     now: Duration,
     next_runtime_ordinal: u64,
     mouse_selection_snapshot: Option<MouseSelectionSnapshot>,
+    /// Content generation for the selectable transcript cache.
+    selectable_epoch: u64,
+    /// Last built selectable index; reused across paint and mouse hit-tests.
+    selectable_cache: RefCell<Option<SelectableCache>>,
     /// First key of an unfinished viewport chord, such as the `g` of `gg`.
     pending_viewport_key: Option<char>,
     /// Optional prompt history/stash port installed by the composition root.
@@ -5537,6 +5597,8 @@ where
             now: Duration::ZERO,
             next_runtime_ordinal: 0,
             mouse_selection_snapshot: None,
+            selectable_epoch: 0,
+            selectable_cache: RefCell::new(None),
             pending_viewport_key: None,
             prompt_memory: None,
         }
@@ -5568,7 +5630,18 @@ where
                 .unwrap_or_else(|| self.begin_mouse_selection(column, row)),
             Event::MouseDrag { column, row } => self.update_mouse_selection(column, row, true),
             Event::MouseUp { column, row } => self.update_mouse_selection(column, row, false),
-            Event::MouseMove { column, row } => self.hover_block(column, row),
+            Event::MouseMove { column, row } => {
+                if self
+                    .transcripts
+                    .get(&self.active_transcript)
+                    .expect("active transcript always exists")
+                    .selecting
+                {
+                    self.update_mouse_selection(column, row, true)
+                } else {
+                    self.hover_block(column, row)
+                }
+            }
             Event::Paste(text) if self.secret_entry.is_some() => {
                 self.quit_armed_until = None;
                 self.append_secret_text(&text);
@@ -5654,6 +5727,7 @@ where
         let record = self.active_record_mut();
         record.collapse_thinking = collapse;
         record.thinking_user_pinned = !collapse;
+        self.bump_selectable_epoch();
     }
 
     pub fn set_agent_catalog<I, S>(&mut self, eligible: I)
@@ -5732,6 +5806,7 @@ where
         {
             self.restored_syntax_ready_at = None;
             self.highlight_restored_syntax = true;
+            self.bump_selectable_epoch();
         }
         self.executions.retain(|execution| {
             execution
@@ -5833,6 +5908,7 @@ where
             widgets::ExpandMode::Streaming
         };
         record.collapse_thinking = matches!(mode.finish_stream(), widgets::ExpandMode::Collapsed);
+        self.bump_selectable_epoch();
     }
 
     /// Supplies concise provider, model, and active-session context for the terminal surface.
@@ -5918,6 +5994,7 @@ where
         }
         self.set_foreground_presentation(true);
         self.assistant_streaming = true;
+        self.bump_selectable_epoch();
     }
 
     fn active_generation(&self) -> Option<u64> {
@@ -6413,6 +6490,7 @@ where
         self.placeholder_failure = false;
         self.active_tool = None;
         self.clear_current_session_transcripts();
+        self.bump_selectable_epoch();
     }
 
     pub fn replace_history(
@@ -6443,6 +6521,7 @@ where
         self.turn_state = None;
         self.active_tool = None;
         self.clear_current_session_transcripts();
+        self.bump_selectable_epoch();
         {
             let record = self.active_record_mut();
             record.tool_display_modes.clear();
@@ -6474,6 +6553,7 @@ where
             TranscriptId::Main
         };
         self.execution_selection = Some(self.active_transcript);
+        self.bump_selectable_epoch();
     }
 
     fn active_record_mut(&mut self) -> &mut TranscriptRecord {
@@ -6625,9 +6705,13 @@ where
         }
 
         let index = usize::from(row.saturating_sub(layout.tree.y));
-        let id = (*fitted_subagent_tree(&self.view(), layout.tree.height, layout.tree.width)
-            .1
-            .get(index)?)?;
+        let id = (*fitted_subagent_tree(
+            &self.view_without_selectable(),
+            layout.tree.height,
+            layout.tree.width,
+        )
+        .1
+        .get(index)?)?;
         self.execution_selection = Some(id);
         self.select_transcript(id);
         Some(Action::Render)
@@ -6656,6 +6740,7 @@ where
         if !self.admit_runtime_event(ordinal, &event) {
             return;
         }
+        self.bump_selectable_epoch();
 
         match &event {
             TuiRuntimeEvent::TurnStarted => self.turn_state = Some(TurnState::Requesting),
@@ -7015,6 +7100,18 @@ where
 
     /// Returns an immutable snapshot for a renderer.
     pub fn view(&self) -> ViewState<'_> {
+        let mut state = self.view_without_selectable();
+        let row_width = self.transcript_row_width();
+        state.selectable =
+            SharedSelectable::from_arc(self.selectable_transcript_for(&state, row_width));
+        state
+    }
+
+    /// View fields without building the selectable index.
+    ///
+    /// Scroll bounds only need row counts, and rebuilding the full grapheme
+    /// index for every wheel tick is what the light path exists to avoid.
+    fn view_without_selectable(&self) -> ViewState<'_> {
         let active = self
             .transcripts
             .get(&self.active_transcript)
@@ -7042,6 +7139,7 @@ where
             following_bottom: active.following_bottom,
             scroll_offset: active.scroll_offset,
             selection: active.selection,
+            selectable: SharedSelectable::empty(),
             provider_model: &self.provider_model,
             reasoning_effort: self.reasoning_effort.as_deref(),
             context_window: self.context_window,
@@ -7110,6 +7208,53 @@ where
             turn_started_at: self.turn_started_at,
             turn_activity: self.current_activity(),
         }
+    }
+
+    /// Content width available to selectable transcript rows.
+    fn transcript_row_width(&self) -> u16 {
+        self.screen_layout()
+            .transcript
+            .width
+            .saturating_sub(TRANSCRIPT_ROW_INDENT)
+            .max(1)
+    }
+
+    /// Invalidates the cached selectable index after transcript content or modes change.
+    fn bump_selectable_epoch(&mut self) {
+        self.selectable_epoch = self.selectable_epoch.saturating_add(1);
+        self.selectable_cache.borrow_mut().take();
+    }
+
+    /// Returns the selectable transcript for the active view, rebuilding only on key mismatch.
+    fn selectable_transcript_for(
+        &self,
+        state: &ViewState<'_>,
+        row_width: u16,
+    ) -> Arc<SelectableTranscript> {
+        let row_width = row_width.max(1);
+        let epoch = self.selectable_epoch;
+        let transcript_id = state.active_transcript;
+
+        if let Some(cache) = self.selectable_cache.borrow().as_ref()
+            && cache.epoch == epoch
+            && cache.transcript_id == transcript_id
+            && cache.row_width == row_width
+        {
+            return Arc::clone(&cache.transcript);
+        }
+
+        let _perf_select = agens_perf::span!("tui.transcript.select", row_width = row_width);
+        let transcript = Arc::new(SelectableTranscript::from_lines(
+            &rendered_transcript(state, row_width),
+            row_width,
+        ));
+        *self.selectable_cache.borrow_mut() = Some(SelectableCache {
+            epoch,
+            transcript_id,
+            row_width,
+            transcript: Arc::clone(&transcript),
+        });
+        transcript
     }
 
     /// Live tool activity of the subagent the tree currently focuses.
@@ -7349,6 +7494,19 @@ where
         {
             return Action::Render;
         }
+
+        let mut scrolled = false;
+        if dragging {
+            scrolled = self.auto_scroll_selection_edge(row);
+        }
+
+        let previous_head = self
+            .transcripts
+            .get(&self.active_transcript)
+            .expect("active transcript always exists")
+            .selection
+            .map(|selection| selection.head);
+
         if let Some(position) = self
             .mouse_selection_snapshot
             .as_ref()
@@ -7357,7 +7515,17 @@ where
         {
             selection.head = position;
         }
+
         if dragging {
+            let head = self
+                .transcripts
+                .get(&self.active_transcript)
+                .expect("active transcript always exists")
+                .selection
+                .map(|selection| selection.head);
+            if !scrolled && head == previous_head {
+                return Action::Unchanged;
+            }
             return Action::Render;
         }
 
@@ -7394,19 +7562,80 @@ where
         Action::Render
     }
 
+    /// Scrolls the transcript one row when a drag rests on a content edge.
+    ///
+    /// Returns whether the scroll offset moved, so the caller can repaint even
+    /// when the pointer column did not change.
+    fn auto_scroll_selection_edge(&mut self, row: u16) -> bool {
+        let Some(snapshot) = self.mouse_selection_snapshot.as_ref() else {
+            return false;
+        };
+        let content_y = snapshot.content_y;
+        let content_bottom = snapshot.content_bottom;
+        if content_bottom <= content_y {
+            return false;
+        }
+
+        let direction = if row <= content_y.saturating_add(1) {
+            -1_i16
+        } else if row.saturating_add(1) >= content_bottom {
+            1_i16
+        } else {
+            return false;
+        };
+
+        let previous = {
+            let record = self
+                .transcripts
+                .get(&self.active_transcript)
+                .expect("active transcript always exists");
+            if record.following_bottom {
+                self.following_scroll_bottom()
+            } else {
+                record.scroll_offset
+            }
+        };
+
+        if direction < 0 {
+            if previous == 0 {
+                return false;
+            }
+            let record = self.active_record_mut();
+            record.following_bottom = false;
+            record.scroll_offset = previous.saturating_sub(1);
+        } else {
+            let bottom = self.detached_scroll_bottom();
+            if previous >= bottom {
+                return false;
+            }
+            let record = self.active_record_mut();
+            record.following_bottom = false;
+            record.scroll_offset = previous.saturating_add(1).min(bottom);
+        }
+
+        let scroll = self
+            .transcripts
+            .get(&self.active_transcript)
+            .expect("active transcript always exists")
+            .scroll_offset;
+        if let Some(snapshot) = self.mouse_selection_snapshot.as_mut() {
+            snapshot.scroll = scroll;
+        }
+        true
+    }
+
     fn capture_mouse_selection_snapshot(&self) -> Option<MouseSelectionSnapshot> {
         if self.dialog.is_some() || self.palette_open {
             return None;
         }
-        let view = self.view();
+        let view = self.view_without_selectable();
         let layout = self.screen_layout();
         let row_width = layout
             .transcript
             .width
             .saturating_sub(TRANSCRIPT_ROW_INDENT)
             .max(1);
-        let transcript =
-            SelectableTranscript::from_lines(&rendered_transcript(&view, row_width), row_width);
+        let transcript = self.selectable_transcript_for(&view, row_width);
         let chrome_rows = transcript_chrome_rows(view.following_bottom);
         let bottom = saturating_u16(transcript.rows.len().saturating_sub(usize::from(
             layout.transcript.height.saturating_sub(chrome_rows),
@@ -7419,6 +7648,9 @@ where
 
         Some(MouseSelectionSnapshot {
             transcript,
+            // Cells start at column 0 of the paragraph content, which already
+            // includes the accent bar. The block's left padding is the only
+            // chrome outside that coordinate space.
             content_x: layout.transcript.x.saturating_add(TRANSCRIPT_ROW_INDENT),
             content_y: layout.transcript.y.saturating_add(1),
             content_right: layout.transcript.right(),
@@ -7432,6 +7664,7 @@ where
 
     /// Applies ordered runtime progress without changing completed persistence semantics.
     pub fn apply_progress(&mut self, event: TurnEvent) {
+        self.bump_selectable_epoch();
         match event {
             TurnEvent::ProviderPart(MessagePart::Text(delta)) => {
                 self.project_conversation(ConversationEvent::MarkdownDelta(delta.clone()));
@@ -8047,6 +8280,7 @@ where
             Key::CtrlY => {
                 let record = self.active_record_mut();
                 record.history_expanded = !record.history_expanded;
+                self.bump_selectable_epoch();
                 Action::Render
             }
             Key::CtrlJ => {
@@ -8652,7 +8886,7 @@ where
 
     fn max_scroll_offset_with_chrome(&self, chrome_rows: u16) -> u16 {
         let layout = self.screen_layout();
-        let view = self.view();
+        let view = self.view_without_selectable();
         let visible_rows = usize::from(layout.transcript.height.saturating_sub(chrome_rows));
         let row_width = layout
             .transcript
@@ -9605,6 +9839,7 @@ where
         let next = current.toggle_detail();
         record.collapse_thinking = !next.is_visible();
         record.thinking_user_pinned = next.is_visible();
+        self.bump_selectable_epoch();
     }
 
     /// Moves the transcript's tool output detail one step along its cycle.
@@ -9666,6 +9901,7 @@ where
             Some(index) => index.saturating_sub(1),
         };
         record.focused_call = Some(calls[next].clone());
+        self.bump_selectable_epoch();
     }
 
     /// Cycles the detail of the focused block alone.
@@ -9685,6 +9921,7 @@ where
             .unwrap_or(record.tool_detail);
         let next = current.next();
         record.tool_display_modes.insert(call_id, next);
+        self.bump_selectable_epoch();
         self.report_detail_level("block", next);
     }
 
@@ -9701,6 +9938,7 @@ where
         for call_id in completed_call_ids {
             record.tool_display_modes.insert(call_id, next);
         }
+        self.bump_selectable_epoch();
         self.report_detail_level("tools", next);
     }
 
@@ -9804,7 +10042,7 @@ where
             .width
             .saturating_sub(TRANSCRIPT_ROW_INDENT)
             .max(1);
-        let view = self.view();
+        let view = self.view_without_selectable();
         let scroll = usize::from(if view.following_bottom {
             self.detached_scroll_bottom()
         } else {
@@ -9831,6 +10069,7 @@ where
         }
 
         record.focused_call = hovered;
+        self.bump_selectable_epoch();
         Action::Render
     }
 
@@ -9887,6 +10126,7 @@ where
     }
 
     fn project_conversation(&mut self, event: ConversationEvent) {
+        self.bump_selectable_epoch();
         if self.apply_conversation_event(event).is_err() {
             self.conversation
                 .as_mut()
@@ -12743,6 +12983,7 @@ mod runtime_tests {
         tui.active_record_mut()
             .transcript
             .push(TranscriptEntry::Info("alpha café 🙂 omega".into()));
+        tui.bump_selectable_epoch();
 
         assert_eq!(
             tui.handle(Event::MouseDown { column: 24, row: 1 }),
@@ -12766,6 +13007,121 @@ mod runtime_tests {
         );
         assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Render);
         assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Quit);
+    }
+
+    #[test]
+    fn mouse_move_extends_selection_while_selecting() {
+        let mut tui = Tui::new(NoopEngine);
+        tui.handle(Event::Resize {
+            width: 80,
+            height: 12,
+        });
+        tui.active_record_mut()
+            .transcript
+            .push(TranscriptEntry::Info("alpha café 🙂 omega".into()));
+        tui.bump_selectable_epoch();
+
+        assert_eq!(
+            tui.handle(Event::MouseDown { column: 24, row: 1 }),
+            Action::Render
+        );
+        // Many terminals emit Move (not Drag) while the button is held.
+        assert_eq!(
+            tui.handle(Event::MouseMove { column: 30, row: 1 }),
+            Action::Render
+        );
+        assert_eq!(tui.selected_text(), None);
+        assert_eq!(
+            tui.handle(Event::MouseUp { column: 30, row: 1 }),
+            Action::Render
+        );
+        assert_eq!(tui.selected_text(), Some("café 🙂"));
+    }
+
+    #[test]
+    fn mouse_drag_to_the_same_cell_is_a_no_op_render() {
+        let mut tui = Tui::new(NoopEngine);
+        tui.handle(Event::Resize {
+            width: 80,
+            height: 12,
+        });
+        tui.active_record_mut()
+            .transcript
+            .push(TranscriptEntry::Info("alpha café 🙂 omega".into()));
+        tui.bump_selectable_epoch();
+
+        assert_eq!(
+            tui.handle(Event::MouseDown { column: 24, row: 1 }),
+            Action::Render
+        );
+        assert_eq!(
+            tui.handle(Event::MouseDrag { column: 30, row: 1 }),
+            Action::Render
+        );
+        assert_eq!(
+            tui.handle(Event::MouseDrag { column: 30, row: 1 }),
+            Action::Unchanged
+        );
+        assert_eq!(
+            tui.handle(Event::MouseMove { column: 30, row: 1 }),
+            Action::Unchanged
+        );
+    }
+
+    #[test]
+    fn selectable_transcript_marks_leading_chrome_non_copyable() {
+        let accent = " ".repeat(widgets::ACCENT_WIDTH);
+        let gutter = " ".repeat(widgets::GUTTER_WIDTH);
+        let line = Line::raw(format!("{accent}{gutter}hello world"));
+        let transcript = SelectableTranscript::from_lines(&[line], 40);
+        let chrome_end = saturating_u16(widgets::ACCENT_WIDTH + widgets::GUTTER_WIDTH);
+
+        assert_eq!(
+            transcript.selected_text(TranscriptSelection {
+                anchor: TranscriptPosition { row: 0, column: 0 },
+                head: TranscriptPosition {
+                    row: 0,
+                    column: chrome_end.saturating_sub(1),
+                },
+            }),
+            Ok(String::new()),
+            "accent + gutter alone must not copy"
+        );
+        assert_eq!(
+            transcript.selected_text(TranscriptSelection {
+                anchor: TranscriptPosition { row: 0, column: 0 },
+                head: TranscriptPosition {
+                    row: 0,
+                    column: chrome_end.saturating_add(4),
+                },
+            }),
+            Ok("hello".into()),
+            "selection that starts on chrome still copies content cells"
+        );
+    }
+
+    #[test]
+    fn selectable_cache_reuses_transcript_across_view_calls() {
+        let mut tui = Tui::new(NoopEngine);
+        tui.handle(Event::Resize {
+            width: 80,
+            height: 12,
+        });
+        tui.active_record_mut()
+            .transcript
+            .push(TranscriptEntry::Info("cache me".into()));
+        tui.bump_selectable_epoch();
+
+        let first = tui.view().selectable.arc();
+        let second = tui.view().selectable.arc();
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "unchanged content must reuse the cached selectable transcript"
+        );
+        assert!(
+            !first.rows.is_empty(),
+            "cached selectable transcript must be non-empty after content exists"
+        );
     }
 
     #[test]
@@ -13543,6 +13899,7 @@ mod runtime_tests {
         tui.active_record_mut()
             .transcript
             .push(TranscriptEntry::Info("alpha café 🙂 omega".into()));
+        tui.bump_selectable_epoch();
 
         tui.handle(Event::MouseDown { column: 24, row: 1 });
         tui.handle(Event::MouseDrag { column: 30, row: 1 });

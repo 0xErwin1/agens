@@ -217,13 +217,40 @@ impl Conversation {
     /// Restored tool call names are qualified (e.g. `native::read`), unlike
     /// the bare names carried by the live event stream; callers that reuse a
     /// bare-name parser must strip the `native::`/`mcp::` prefix themselves.
+    ///
+    /// **Restore never discards history.** Live event apply is strict (orphan
+    /// tool results, wrong role order). Persisted sessions can still carry
+    /// incomplete or reordered rows after failed turns; this path best-effort
+    /// projects every part it can so resume always shows what was saved.
     pub fn from_messages_with_parser(
         messages: &[Message],
         parse_tool_input: impl Fn(&str, &str) -> ToolInput,
     ) -> Result<Vec<Self>, ConversationError> {
+        Ok(Self::from_messages_best_effort(messages, parse_tool_input))
+    }
+
+    /// Always succeeds: projects every recoverable part of `messages` into
+    /// settled conversations. Used by resume so a single bad row cannot wipe
+    /// the entire transcript.
+    fn from_messages_best_effort(
+        messages: &[Message],
+        parse_tool_input: impl Fn(&str, &str) -> ToolInput,
+    ) -> Vec<Self> {
         let mut conversations = Vec::new();
         let mut current: Option<Self> = None;
         let mut pending_system = Vec::new();
+
+        let ensure_current = |current: &mut Option<Self>, pending_system: &mut Vec<String>| {
+            if current.is_none() {
+                let mut conversation = Self::new(String::new());
+                conversation.settled = true;
+                for message in pending_system.drain(..) {
+                    let _ = conversation.apply(ConversationEvent::Info(message));
+                }
+                *current = Some(conversation);
+            }
+        };
+
         for message in messages {
             match message.role {
                 Role::System => {
@@ -231,10 +258,9 @@ impl Conversation {
                         conversations.push(conversation);
                     }
                     for part in &message.parts {
-                        let MessagePart::Text(text) = part else {
-                            return Err(ConversationError::InvalidMessageOrder);
-                        };
-                        pending_system.push(text.clone());
+                        if let MessagePart::Text(text) = part {
+                            pending_system.push(text.clone());
+                        }
                     }
                 }
                 Role::User => {
@@ -244,27 +270,22 @@ impl Conversation {
                     let mut conversation = Self::new(String::new());
                     conversation.settled = true;
                     for message in pending_system.drain(..) {
-                        conversation.apply(ConversationEvent::Info(message))?;
+                        let _ = conversation.apply(ConversationEvent::Info(message));
                     }
                     let mut media_ordinal = 0_usize;
                     for part in &message.parts {
                         match part {
                             MessagePart::Text(text) => {
-                                // A turn the runtime scheduled had no user prompt when it
-                                // ran. Restoring its coordination text as a user message
-                                // puts words in the reader's mouth — words that say, in
-                                // their own text, that the user did not send them.
                                 if let Some(notice) = crate::runtime_scheduled_notice(text) {
-                                    conversation.apply(ConversationEvent::Info(notice))?;
+                                    let _ = conversation.apply(ConversationEvent::Info(notice));
                                     continue;
                                 }
                                 conversation.user.push_str(text);
-                                let item = ConversationItem::User(text.clone());
-                                conversation.items.push(item);
+                                conversation
+                                    .items
+                                    .push(ConversationItem::User(text.clone()));
                             }
                             MessagePart::Media { mime, .. } => {
-                                // Path-free chip for completed history: source paths are never
-                                // persisted, so resume projects an elided marker only.
                                 media_ordinal += 1;
                                 let chip = media_resume_chip(media_ordinal, mime);
                                 if !conversation.user.is_empty() {
@@ -273,75 +294,116 @@ impl Conversation {
                                 conversation.user.push_str(&chip);
                                 conversation.items.push(ConversationItem::User(chip));
                             }
-                            MessagePart::Reasoning(_)
-                            | MessagePart::ToolCall { .. }
-                            | MessagePart::ToolResult { .. } => {
-                                return Err(ConversationError::InvalidMessageOrder);
+                            // Unexpected roles on a user row: keep text surface via info.
+                            MessagePart::Reasoning(text) => {
+                                let _ = conversation
+                                    .apply(ConversationEvent::ReasoningDelta(text.clone()));
+                            }
+                            MessagePart::ToolCall { id, name, input } => {
+                                let _ = conversation.apply(ConversationEvent::ToolCall {
+                                    call_id: id.clone(),
+                                    name: name.clone(),
+                                    input: input.clone(),
+                                    parsed: parse_tool_input(name, input),
+                                });
+                            }
+                            MessagePart::ToolResult {
+                                tool_call_id,
+                                content,
+                                is_error,
+                            } => {
+                                apply_restored_tool_result(
+                                    &mut conversation,
+                                    tool_call_id,
+                                    content,
+                                    *is_error,
+                                    &parse_tool_input,
+                                );
                             }
                         }
                     }
                     current = Some(conversation);
                 }
                 Role::Assistant => {
-                    let conversation = current
-                        .as_mut()
-                        .ok_or(ConversationError::InvalidMessageOrder)?;
+                    ensure_current(&mut current, &mut pending_system);
+                    let conversation = current.as_mut().expect("ensure_current");
                     for part in &message.parts {
-                        let event = match part {
+                        match part {
                             MessagePart::Text(text) => {
-                                ConversationEvent::MarkdownDelta(text.clone())
+                                let _ = conversation
+                                    .apply(ConversationEvent::MarkdownDelta(text.clone()));
                             }
                             MessagePart::Reasoning(text) => {
-                                ConversationEvent::ReasoningDelta(text.clone())
+                                let _ = conversation
+                                    .apply(ConversationEvent::ReasoningDelta(text.clone()));
                             }
                             MessagePart::ToolCall { id, name, input } => {
-                                ConversationEvent::ToolCall {
-                                    call_id: id.clone(),
+                                let mut call_id = id.clone();
+                                if conversation.has_call(&call_id) {
+                                    // Duplicate ids across a long session must not drop the call.
+                                    call_id = format!("{call_id}#{}", conversation.items.len());
+                                }
+                                let _ = conversation.apply(ConversationEvent::ToolCall {
+                                    call_id,
                                     name: name.clone(),
                                     input: input.clone(),
                                     parsed: parse_tool_input(name, input),
-                                }
+                                });
                             }
-                            MessagePart::ToolResult { .. } => {
-                                return Err(ConversationError::InvalidMessageOrder);
+                            MessagePart::ToolResult {
+                                tool_call_id,
+                                content,
+                                is_error,
+                            } => {
+                                apply_restored_tool_result(
+                                    conversation,
+                                    tool_call_id,
+                                    content,
+                                    *is_error,
+                                    &parse_tool_input,
+                                );
                             }
-                            // Assistant messages never carry durable media; surface chips land in Phase 6.
-                            MessagePart::Media { .. } => {
-                                return Err(ConversationError::InvalidMessageOrder);
+                            MessagePart::Media { mime, .. } => {
+                                let _ = conversation.apply(ConversationEvent::Info(format!(
+                                    "[restored media: {mime}]"
+                                )));
                             }
-                        };
-                        conversation.apply(event)?;
+                        }
                     }
                 }
                 Role::Tool => {
-                    let conversation = current
-                        .as_mut()
-                        .ok_or(ConversationError::InvalidMessageOrder)?;
+                    ensure_current(&mut current, &mut pending_system);
+                    let conversation = current.as_mut().expect("ensure_current");
                     for part in &message.parts {
-                        let MessagePart::ToolResult {
+                        if let MessagePart::ToolResult {
                             tool_call_id,
                             content,
                             is_error,
                         } = part
-                        else {
-                            return Err(ConversationError::InvalidMessageOrder);
-                        };
-                        conversation.apply(ConversationEvent::ToolResult {
-                            call_id: tool_call_id.clone(),
-                            output: content.clone(),
-                            is_error: *is_error,
-                        })?;
+                        {
+                            apply_restored_tool_result(
+                                conversation,
+                                tool_call_id,
+                                content,
+                                *is_error,
+                                &parse_tool_input,
+                            );
+                        } else if let MessagePart::Text(text) = part {
+                            let _ = conversation
+                                .apply(ConversationEvent::MarkdownDelta(text.clone()));
+                        }
                     }
                 }
             }
         }
+
         if !pending_system.is_empty() {
-            return Err(ConversationError::InvalidMessageOrder);
+            ensure_current(&mut current, &mut pending_system);
         }
         if let Some(conversation) = current {
             conversations.push(conversation);
         }
-        Ok(conversations)
+        conversations
     }
 
     pub(crate) const fn is_settled(&self) -> bool {
@@ -688,6 +750,10 @@ impl Conversation {
             .find(|call| call.call_id == call_id)
     }
 
+    fn has_call(&self, call_id: &str) -> bool {
+        self.find_call(call_id).is_some()
+    }
+
     fn find_call_mut(&mut self, call_id: &str) -> Option<&mut ToolCall> {
         self.tool_batches
             .iter_mut()
@@ -791,6 +857,43 @@ mod tests {
         }
     }
 
+    #[test]
+    fn restore_keeps_orphan_assistant_and_tool_output_without_failing() {
+        use agens_core::{Message, MessagePart, Role};
+
+        let messages = vec![
+            Message {
+                role: Role::Assistant,
+                parts: vec![MessagePart::Text("no user row above me".into())],
+            },
+            Message {
+                role: Role::Tool,
+                parts: vec![MessagePart::ToolResult {
+                    tool_call_id: "missing-call".into(),
+                    content: "still visible output".into(),
+                    is_error: true,
+                }],
+            },
+        ];
+
+        let restored = Conversation::from_messages(&messages).expect("restore always Ok");
+        assert_eq!(restored.len(), 1);
+        assert!(
+            restored[0].live_markdown.contains("no user row above me"),
+            "assistant text kept: {}",
+            restored[0].live_markdown
+        );
+        assert!(
+            restored[0].tool_batches.iter().any(|batch| batch
+                .calls
+                .iter()
+                .any(|call| call.result.as_ref().is_some_and(|result| {
+                    result.output.contains("still visible output")
+                }))),
+            "orphan tool result kept under a synthetic call"
+        );
+    }
+
     /// Parallel batches announce every call before any result. The transcript
     /// item stream must still pair each body under its own header so the
     /// renderer never paints two headers and then two bodies.
@@ -827,6 +930,38 @@ mod tests {
             "out-of-order results still pair under their calls: {kinds:?}"
         );
     }
+}
+
+/// Applies a restored tool result, synthesizing a placeholder call when the
+/// matching call is missing so failed/partial sessions still show their output.
+fn apply_restored_tool_result(
+    conversation: &mut Conversation,
+    tool_call_id: &str,
+    content: &str,
+    is_error: bool,
+    parse_tool_input: &impl Fn(&str, &str) -> ToolInput,
+) {
+    if !conversation.has_call(tool_call_id) {
+        let name = "restored";
+        let input = "{}";
+        let _ = conversation.apply(ConversationEvent::ToolCall {
+            call_id: tool_call_id.to_owned(),
+            name: name.to_owned(),
+            input: input.to_owned(),
+            parsed: parse_tool_input(name, input),
+        });
+    }
+    if conversation
+        .find_call(tool_call_id)
+        .is_some_and(|call| call.result.is_some())
+    {
+        return;
+    }
+    let _ = conversation.apply(ConversationEvent::ToolResult {
+        call_id: tool_call_id.to_owned(),
+        output: content.to_owned(),
+        is_error,
+    });
 }
 
 fn push_text_item(items: &mut Vec<ConversationItem>, text: String, reasoning: bool) {
