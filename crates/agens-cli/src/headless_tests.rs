@@ -968,6 +968,8 @@ fn production_resumed_headless_turn_replays_typed_history_and_appends_to_the_sam
             effective_capabilities: None,
             pending_system_reminder: None,
             skills: None,
+            media_ids: Vec::new(),
+            media_mimes: Vec::new(),
         },
     );
     request.pending_system_reminder =

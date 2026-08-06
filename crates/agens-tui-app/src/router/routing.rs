@@ -8,6 +8,7 @@ use agens_tui::{
 };
 
 use agens_auth::ChatGptAuthFlow;
+use agens_error::CliError;
 use agens_providers::chatgpt_login::upsert_provider_entry;
 use agens_session::provider::ProviderKind;
 
@@ -75,6 +76,9 @@ impl TuiRuntimeRouter {
             TuiRouteRequest::BusyInput(input) => {
                 return self.route_busy_input(input, cancellation);
             }
+            TuiRouteRequest::AttachClipboardImage { bytes, mime } => {
+                return self.attach_clipboard_image(bytes, mime);
+            }
             TuiRouteRequest::SubmitSecret { action_id, secret } => {
                 return self.submit_secret(action_id, secret);
             }
@@ -94,6 +98,34 @@ impl TuiRuntimeRouter {
             message: error.to_string(),
             action: TUI_ERROR_ACTION.into(),
         })
+    }
+
+    fn attach_clipboard_image(&self, bytes: Vec<u8>, mime: Option<String>) -> TuiSubmissionOutcome {
+        let result = (|| {
+            let bootstrap = self.bootstrap()?;
+            let mut session = self
+                .session
+                .lock()
+                .map_err(|_| CliError::storage("TUI session is unavailable"))?;
+            let (media_id, mime) =
+                crate::files::ingest_tui_media_bytes(&bootstrap, &bytes, mime.as_deref())?;
+            session.push_pending_media(media_id, mime);
+            let media_chips = session.pending_media_chip_labels();
+            let chip = media_chips
+                .last()
+                .cloned()
+                .unwrap_or_else(|| "[Image #?]".into());
+            Ok(TuiSubmissionOutcome::MediaAttached {
+                message: format!("Attached {chip} from clipboard."),
+                media_chips,
+            })
+        })();
+        result.unwrap_or_else(
+            |error: CliError| TuiSubmissionOutcome::LocalActionableError {
+                message: error.to_string(),
+                action: TUI_ERROR_ACTION.into(),
+            },
+        )
     }
 
     fn submit_secret(&self, action_id: String, secret: SecretInput) -> TuiSubmissionOutcome {

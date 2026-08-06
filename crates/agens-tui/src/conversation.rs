@@ -246,21 +246,39 @@ impl Conversation {
                     for message in pending_system.drain(..) {
                         conversation.apply(ConversationEvent::Info(message))?;
                     }
+                    let mut media_ordinal = 0_usize;
                     for part in &message.parts {
-                        let MessagePart::Text(text) = part else {
-                            return Err(ConversationError::InvalidMessageOrder);
-                        };
-                        // A turn the runtime scheduled had no user prompt when it
-                        // ran. Restoring its coordination text as a user message
-                        // puts words in the reader's mouth — words that say, in
-                        // their own text, that the user did not send them.
-                        if let Some(notice) = crate::runtime_scheduled_notice(text) {
-                            conversation.apply(ConversationEvent::Info(notice))?;
-                            continue;
+                        match part {
+                            MessagePart::Text(text) => {
+                                // A turn the runtime scheduled had no user prompt when it
+                                // ran. Restoring its coordination text as a user message
+                                // puts words in the reader's mouth — words that say, in
+                                // their own text, that the user did not send them.
+                                if let Some(notice) = crate::runtime_scheduled_notice(text) {
+                                    conversation.apply(ConversationEvent::Info(notice))?;
+                                    continue;
+                                }
+                                conversation.user.push_str(text);
+                                let item = ConversationItem::User(text.clone());
+                                conversation.items.push(item);
+                            }
+                            MessagePart::Media { mime, .. } => {
+                                // Path-free chip for completed history: source paths are never
+                                // persisted, so resume projects an elided marker only.
+                                media_ordinal += 1;
+                                let chip = media_resume_chip(media_ordinal, mime);
+                                if !conversation.user.is_empty() {
+                                    conversation.user.push(' ');
+                                }
+                                conversation.user.push_str(&chip);
+                                conversation.items.push(ConversationItem::User(chip));
+                            }
+                            MessagePart::Reasoning(_)
+                            | MessagePart::ToolCall { .. }
+                            | MessagePart::ToolResult { .. } => {
+                                return Err(ConversationError::InvalidMessageOrder);
+                            }
                         }
-                        conversation.user.push_str(text);
-                        let item = ConversationItem::User(text.clone());
-                        conversation.items.push(item);
                     }
                     current = Some(conversation);
                 }
@@ -285,6 +303,10 @@ impl Conversation {
                                 }
                             }
                             MessagePart::ToolResult { .. } => {
+                                return Err(ConversationError::InvalidMessageOrder);
+                            }
+                            // Assistant messages never carry durable media; surface chips land in Phase 6.
+                            MessagePart::Media { .. } => {
                                 return Err(ConversationError::InvalidMessageOrder);
                             }
                         };
@@ -680,6 +702,15 @@ fn push_text_item(items: &mut Vec<ConversationItem>, text: String, reasoning: bo
         | (Some(ConversationItem::Assistant(current)), false) => current.push_str(&text),
         (_, true) => items.push(ConversationItem::Reasoning(text)),
         (_, false) => items.push(ConversationItem::Assistant(text)),
+    }
+}
+
+/// Path-free resume marker for a durable media part (`[Image #N]` / `[File #N]`).
+fn media_resume_chip(ordinal: usize, mime: &str) -> String {
+    if mime.starts_with("image/") {
+        format!("[Image #{ordinal}]")
+    } else {
+        format!("[File #{ordinal}]")
     }
 }
 

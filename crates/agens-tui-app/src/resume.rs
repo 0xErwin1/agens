@@ -212,6 +212,12 @@ pub fn prepare_loaded_tui_session_resume(
         // never handed back to the composer.
         if !agens_tui::is_runtime_scheduled_prompt(boundary.prompt()) {
             context.resume_draft = Some(ResumeDraft::new(boundary.prompt().to_owned()));
+            // Restore durable media ids only (no source path) so retry re-encodes from the store.
+            for media_id in boundary.media_ids() {
+                let (mime, _path) = agens_store::open_media(bootstrap.data_directory(), *media_id)
+                    .map_err(|_| CliError::storage("saved session media is unavailable"))?;
+                context.push_pending_media(*media_id, mime);
+            }
         }
     }
     reconcile_persisted_active_agent(bootstrap, &mut context)?;
@@ -245,6 +251,7 @@ pub fn commit_tui_session_resume(
     let presentation = tui_session_presentation(bootstrap, &resumed);
     let message = resumed.note();
     let draft = resumed.resume_draft.take().map(ResumeDraft::into_inner);
+    let media_chips = resumed.pending_media_chip_labels();
     let resume_error = resumed.resume_error.clone();
     resumed.resume_notice = None;
     if cancellation.is_cancelled() {
@@ -269,6 +276,7 @@ pub fn commit_tui_session_resume(
         presentation,
         history,
         draft,
+        media_chips,
         resume_error,
         file_candidates,
         palette_entries,
@@ -455,6 +463,8 @@ mod tests {
             effective_capabilities: None,
             pending_system_reminder: None,
             skills: None,
+            media_ids: Vec::new(),
+            media_mimes: Vec::new(),
         }
     }
 
@@ -703,8 +713,14 @@ mod tests {
             resumable: false,
         };
         let retry_prompt = "retry exact café 🙂";
+        let media = agens_store::ingest_media_bytes(
+            bootstrap.data_directory(),
+            b"retry-media",
+            "image/png",
+        )
+        .unwrap();
         let attempt = store
-            .begin_session_attempt(&metadata, retry_prompt.into())
+            .begin_session_attempt_with_media(&metadata, retry_prompt.into(), vec![media.id])
             .unwrap();
         store
             .finish_session_attempt(attempt.key(), SessionAttemptStatus::Failed, 30)
@@ -718,6 +734,14 @@ mod tests {
             loaded.retry_boundary.as_ref().map(RetryBoundary::prompt),
             Some(retry_prompt)
         );
+        assert_eq!(
+            loaded
+                .retry_boundary
+                .as_ref()
+                .map(RetryBoundary::media_ids)
+                .unwrap(),
+            &[media.id]
+        );
         let prepared = prepare_loaded_tui_session_resume(
             &bootstrap,
             attempt.key().session_id(),
@@ -726,6 +750,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(prepared.context.resume_draft.as_deref(), Some(retry_prompt));
+        assert_eq!(prepared.context.pending_media_ids, vec![media.id]);
+        assert_eq!(
+            prepared.context.pending_media_mimes,
+            vec!["image/png".to_owned()]
+        );
+        assert_eq!(
+            prepared.context.pending_media_chip_labels(),
+            vec!["[Image #1]".to_owned()]
+        );
         assert!(!format!("{prepared:?}").contains(retry_prompt));
         assert_eq!(
             prepared.context.note(),
@@ -743,11 +776,13 @@ mod tests {
         )
         .unwrap();
         assert!(session.lock().unwrap().resume_draft.is_none());
+        assert_eq!(session.lock().unwrap().pending_media_ids, vec![media.id]);
         assert_restored_retry_draft_ui(outcome.clone(), retry_prompt);
         let TuiSubmissionOutcome::SessionResumed {
             message,
             history,
             draft,
+            media_chips,
             ..
         } = outcome
         else {
@@ -759,6 +794,7 @@ mod tests {
         );
         assert!(history.is_empty());
         assert_eq!(draft.as_deref(), Some(retry_prompt));
+        assert_eq!(media_chips, vec!["[Image #1]".to_owned()]);
         assert_eq!(call_counts(), Counts(1, 1, 0, 0));
 
         let reopened = SessionStore::open(bootstrap.data_directory()).unwrap();

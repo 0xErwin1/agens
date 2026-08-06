@@ -88,7 +88,8 @@ fn the_ledger_records_each_applied_migration_once() {
             "0005_session_confinement_root",
             "0006_session_bypass_permission_prompts",
             "0007_model_preference_by_source",
-            "0008_prompt_memory"
+            "0008_prompt_memory",
+            "0009_media"
         ]
     );
 
@@ -152,6 +153,7 @@ fn an_unknown_ledger_id_is_tolerated_and_known_missing_migrations_still_apply() 
             ),
             ("0007_model_preference_by_source".to_owned(), rows[6].1),
             ("0008_prompt_memory".to_owned(), rows[7].1),
+            ("0009_media".to_owned(), rows[8].1),
             ("9999_unknown".to_owned(), 0),
         ]
     );
@@ -396,7 +398,8 @@ fn a_partially_applied_database_is_completed() {
             "0005_session_confinement_root",
             "0006_session_bypass_permission_prompts",
             "0007_model_preference_by_source",
-            "0008_prompt_memory"
+            "0008_prompt_memory",
+            "0009_media"
         ]
     );
 
@@ -478,7 +481,8 @@ fn all_three_domains_share_one_database_file() {
             "0005_session_confinement_root",
             "0006_session_bypass_permission_prompts",
             "0007_model_preference_by_source",
-            "0008_prompt_memory"
+            "0008_prompt_memory",
+            "0009_media"
         ]
     );
 
@@ -555,7 +559,8 @@ fn a_bootstrap_only_ledger_with_no_user_tables_is_accepted() {
             "0005_session_confinement_root",
             "0006_session_bypass_permission_prompts",
             "0007_model_preference_by_source",
-            "0008_prompt_memory"
+            "0008_prompt_memory",
+            "0009_media"
         ]
     );
 

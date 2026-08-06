@@ -26,6 +26,92 @@ pub struct ModelMetadata {
     /// this model, excluding the implicit `"default"` level every model accepts.
     /// Empty when the source has no per-model effort capability data.
     pub reasoning_efforts: Vec<&'static str>,
+    /// Declared input modalities (for example `text`, `image`, `pdf`, `video`).
+    /// Empty means modalities are unknown — fail closed when attachments are present.
+    pub input_modalities: Vec<String>,
+    /// Optional explicit input MIME allowlist. When non-empty, only listed MIMEs
+    /// are accepted even if a broader modality would otherwise match.
+    pub input_mimes: Vec<String>,
+}
+
+impl ModelMetadata {
+    /// Returns whether this model accepts the given input MIME type.
+    ///
+    /// - `Some(true)` — catalog declares support via modality or explicit MIME
+    /// - `Some(false)` — catalog is known and does not support this MIME
+    /// - `None` — modalities unknown (missing from catalog)
+    pub fn accepts_input_mime(&self, mime: &str) -> Option<bool> {
+        if self.input_modalities.is_empty() && self.input_mimes.is_empty() {
+            return None;
+        }
+
+        let mime = mime.trim();
+        if mime.is_empty() {
+            return Some(false);
+        }
+
+        let normalized = mime.to_ascii_lowercase();
+
+        if !self.input_mimes.is_empty() {
+            let allowed = self
+                .input_mimes
+                .iter()
+                .any(|candidate| candidate.eq_ignore_ascii_case(&normalized));
+            return Some(allowed);
+        }
+
+        let Some(modality) = modality_for_mime(&normalized) else {
+            return Some(false);
+        };
+
+        Some(
+            self.input_modalities
+                .iter()
+                .any(|candidate| candidate.eq_ignore_ascii_case(modality)),
+        )
+    }
+}
+
+/// Looks up a model across bundled catalogs and returns input MIME acceptance.
+///
+/// Returns `None` when the model is unknown or its modalities were not pinned.
+pub fn accepts_input_mime(model_id: &str, mime: &str) -> Option<bool> {
+    metadata_for(model_id).and_then(|model| model.accepts_input_mime(mime))
+}
+
+fn metadata_for(model_id: &str) -> Option<ModelMetadata> {
+    for source in [
+        ModelSource::OpenAiApi,
+        ModelSource::ChatGptSubscription,
+        ModelSource::MoonshotApi,
+    ] {
+        if let Ok(models) = source_models(source)
+            && let Some(model) = models.into_iter().find(|model| model.id == model_id)
+        {
+            return Some(model);
+        }
+    }
+
+    None
+}
+
+/// Maps a MIME type onto a catalog modality label.
+///
+/// Unknown MIME families return `None` so a known catalog rejects them.
+fn modality_for_mime(mime: &str) -> Option<&'static str> {
+    if mime == "application/pdf" {
+        return Some("pdf");
+    }
+    if let Some((top_level, _)) = mime.split_once('/') {
+        return match top_level {
+            "image" => Some("image"),
+            "video" => Some("video"),
+            "audio" => Some("audio"),
+            "text" => Some("text"),
+            _ => None,
+        };
+    }
+    None
 }
 
 #[derive(Debug)]
@@ -334,6 +420,17 @@ fn bundled_capabilities(model: &str) -> (Option<u64>, Option<bool>) {
 }
 
 fn pinned_model(id: &str, name: &str, context: u64, output: u64, reasoning: bool) -> ModelMetadata {
+    pinned_model_with_modalities(id, name, context, output, reasoning, &["text", "image"])
+}
+
+fn pinned_model_with_modalities(
+    id: &str,
+    name: &str,
+    context: u64,
+    output: u64,
+    reasoning: bool,
+    modalities: &[&str],
+) -> ModelMetadata {
     ModelMetadata {
         id: id.to_owned(),
         name: Some(name.to_owned()),
@@ -343,6 +440,11 @@ fn pinned_model(id: &str, name: &str, context: u64, output: u64, reasoning: bool
         input_price: None,
         output_price: None,
         reasoning_efforts: Vec::new(),
+        input_modalities: modalities
+            .iter()
+            .map(|modality| (*modality).to_owned())
+            .collect(),
+        input_mimes: Vec::new(),
     }
 }
 
@@ -383,6 +485,8 @@ fn parse_moonshot_models(snapshot: &[u8]) -> Result<Vec<ModelMetadata>, ModelReg
                         .collect()
                 })
                 .unwrap_or_default(),
+            input_modalities: model.input_modalities,
+            input_mimes: model.input_mimes,
         })
         .collect())
 }
@@ -431,6 +535,8 @@ pub fn parse_models(snapshot: &[u8]) -> Result<Vec<ModelMetadata>, ModelRegistry
                 input_price: model.input_price,
                 output_price: model.output_price,
                 reasoning_efforts: Vec::new(),
+                input_modalities: model.input_modalities,
+                input_mimes: model.input_mimes,
             })
         })
         .collect::<Vec<_>>();
@@ -484,6 +590,10 @@ struct SnapshotModel {
     input_price: Option<f64>,
     output_price: Option<f64>,
     supported: Option<bool>,
+    #[serde(default)]
+    input_modalities: Vec<String>,
+    #[serde(default)]
+    input_mimes: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -499,6 +609,10 @@ struct MoonshotSnapshotModel {
     context_length: u64,
     #[serde(default)]
     reasoning_efforts: Option<MoonshotReasoningEfforts>,
+    #[serde(default)]
+    input_modalities: Vec<String>,
+    #[serde(default)]
+    input_mimes: Vec<String>,
 }
 
 /// `default_effort` is part of the wire shape but is not read here: Agens'
@@ -578,7 +692,7 @@ mod tests {
 
         assert_eq!(
             crate::bundled_snapshot_checksum(),
-            "75086c4979636664367c3031c023b20479fb66296b197fe612b2b624696b5984"
+            "30146e401e82d0ec0230f40319650691762cd54401b966598af27bd1868bc56a"
         );
         assert_eq!(
             models.first().map(|model| model.id.as_str()),
@@ -609,6 +723,8 @@ mod tests {
                 input_price: None,
                 output_price: Some(0.6),
                 reasoning_efforts: Vec::new(),
+                input_modalities: Vec::new(),
+                input_mimes: Vec::new(),
             },
             crate::ModelMetadata {
                 id: "known".to_owned(),
@@ -619,6 +735,8 @@ mod tests {
                 input_price: Some(2.5),
                 output_price: Some(10.0),
                 reasoning_efforts: Vec::new(),
+                input_modalities: Vec::new(),
+                input_mimes: Vec::new(),
             },
         ]);
 
@@ -742,5 +860,142 @@ mod tests {
         assert_eq!(crate::default_model(Some("moonshot")), None);
         assert_eq!(crate::default_model(Some("")), None);
         assert_eq!(crate::default_model(None), None);
+    }
+
+    #[test]
+    fn accepts_input_mime_is_unknown_when_modalities_are_absent() {
+        let model = crate::ModelMetadata {
+            id: "unknown-modalities".to_owned(),
+            name: None,
+            context: None,
+            output: None,
+            reasoning: None,
+            input_price: None,
+            output_price: None,
+            reasoning_efforts: Vec::new(),
+            input_modalities: Vec::new(),
+            input_mimes: Vec::new(),
+        };
+
+        assert_eq!(model.accepts_input_mime("image/png"), None);
+        assert_eq!(
+            crate::accepts_input_mime("not-a-real-model-xyz", "image/png"),
+            None
+        );
+    }
+
+    #[test]
+    fn accepts_input_mime_returns_true_for_supported_modality_and_false_for_unsupported() {
+        let model = crate::ModelMetadata {
+            id: "vision".to_owned(),
+            name: None,
+            context: None,
+            output: None,
+            reasoning: None,
+            input_price: None,
+            output_price: None,
+            reasoning_efforts: Vec::new(),
+            input_modalities: vec!["text".into(), "image".into()],
+            input_mimes: Vec::new(),
+        };
+
+        assert_eq!(model.accepts_input_mime("image/png"), Some(true));
+        assert_eq!(model.accepts_input_mime("IMAGE/JPEG"), Some(true));
+        assert_eq!(model.accepts_input_mime("application/pdf"), Some(false));
+        assert_eq!(model.accepts_input_mime("video/mp4"), Some(false));
+    }
+
+    #[test]
+    fn accepts_input_mime_honors_explicit_mime_allowlist() {
+        let model = crate::ModelMetadata {
+            id: "narrow".to_owned(),
+            name: None,
+            context: None,
+            output: None,
+            reasoning: None,
+            input_price: None,
+            output_price: None,
+            reasoning_efforts: Vec::new(),
+            input_modalities: vec!["image".into()],
+            input_mimes: vec!["image/png".into()],
+        };
+
+        assert_eq!(model.accepts_input_mime("image/png"), Some(true));
+        assert_eq!(model.accepts_input_mime("image/jpeg"), Some(false));
+    }
+
+    #[test]
+    fn parse_models_reads_input_modalities_and_mimes() {
+        let snapshot = br#"{
+                "source": "https://models.dev",
+                "revision": "test",
+                "models": [
+                    {
+                        "id": "with-modalities",
+                        "supported": true,
+                        "input_modalities": ["text", "image", "pdf"],
+                        "input_mimes": ["image/png", "application/pdf"]
+                    },
+                    {
+                        "id": "without-modalities",
+                        "supported": true
+                    }
+                ]
+            }"#;
+
+        let models = crate::parse_models(snapshot).expect("snapshot parses");
+        let with = models
+            .iter()
+            .find(|model| model.id == "with-modalities")
+            .expect("with-modalities present");
+        let without = models
+            .iter()
+            .find(|model| model.id == "without-modalities")
+            .expect("without-modalities present");
+
+        assert_eq!(
+            with.input_modalities,
+            vec!["text".to_owned(), "image".to_owned(), "pdf".to_owned()]
+        );
+        assert_eq!(
+            with.input_mimes,
+            vec!["image/png".to_owned(), "application/pdf".to_owned()]
+        );
+        assert!(without.input_modalities.is_empty());
+        assert!(without.input_mimes.is_empty());
+        assert_eq!(with.accepts_input_mime("image/png"), Some(true));
+        assert_eq!(without.accepts_input_mime("image/png"), None);
+    }
+
+    #[test]
+    fn bundled_catalog_pins_modalities_for_known_models() {
+        assert_eq!(
+            crate::accepts_input_mime("gpt-4.1", "image/png"),
+            Some(true)
+        );
+        assert_eq!(
+            crate::accepts_input_mime("gpt-4.1", "application/pdf"),
+            Some(true)
+        );
+        assert_eq!(
+            crate::accepts_input_mime("gpt-4.1-nano", "application/pdf"),
+            Some(false)
+        );
+        assert_eq!(
+            crate::accepts_input_mime("kimi-k3", "image/jpeg"),
+            Some(true)
+        );
+        assert_eq!(
+            crate::accepts_input_mime("kimi-k3", "video/mp4"),
+            Some(true)
+        );
+        assert_eq!(
+            crate::accepts_input_mime("kimi-k3", "application/pdf"),
+            Some(false)
+        );
+        assert_eq!(
+            crate::accepts_input_mime("gpt-5.5", "image/png"),
+            Some(true)
+        );
     }
 }

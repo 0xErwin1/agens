@@ -15,8 +15,9 @@ mod turn;
 
 pub use outcome::{HeadlessChatCompletion, HeadlessChatFailure};
 pub use request::{
-    HeadlessChatRequest, apply_session_to_request, explicit_task_delegation_prompt,
-    provider_messages, seed_configured_reasoning_effort,
+    HeadlessChatRequest, MediaPreflightError, apply_session_to_request,
+    explicit_task_delegation_prompt, preflight_request_media, provider_messages,
+    seed_configured_reasoning_effort,
 };
 pub use subagents::{
     RequestedSubagent, interrupted_turn_note, record_requested_subagent, record_tool_result_fact,

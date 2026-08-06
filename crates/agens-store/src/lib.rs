@@ -12,9 +12,14 @@ use rusqlite::{Connection, Transaction, TransactionBehavior, params};
 
 mod database;
 mod fact_store;
+mod media;
 mod prompt_memory;
 mod session_writer;
 pub use fact_store::{ToolFactStore, ToolFactStoreError};
+pub use media::{
+    MAX_MEDIA_BYTES, MediaRecord, MediaStoreError, guess_mime_from_bytes, guess_mime_from_path,
+    ingest_media_bytes, ingest_media_path, is_media_mime, media_chip_label, open_media,
+};
 pub use prompt_memory::{PromptMemoryStore, PromptMemoryStoreError, StoredPrompt};
 pub use session_writer::{
     SessionCursor, SessionPage, StoredSession, TranscriptCursor, TranscriptPage,
@@ -977,7 +982,7 @@ fn normalized_session_schema_v5_with_required_terminal_retry_prompts() -> String
              sequence INTEGER NOT NULL CHECK(sequence > 0),
              status TEXT NOT NULL CHECK(status IN('running', 'completed', 'cancelled', 'failed', 'provider_error', 'interrupted')),
              failure_kind TEXT CHECK(failure_kind IN('cancelled', 'failed', 'provider_error', 'interrupted')),
-             retry_prompt TEXT CHECK(retry_prompt IS NULL OR (length(CAST(retry_prompt AS BLOB)) BETWEEN 1 AND 65536)),
+             retry_prompt TEXT CHECK(retry_prompt IS NULL OR (length(CAST(retry_prompt AS BLOB)) BETWEEN 0 AND 65536)),
              started_at INTEGER NOT NULL,
              finished_at INTEGER,
              completed_turn_sequence INTEGER,
@@ -1016,6 +1021,60 @@ fn normalized_session_schema_v7() -> String {
     normalized_session_schema_v6().replacen(
         "CHECK(resumable = (completed_turn_count > 0))",
         "bypass_permission_prompts INTEGER,\n        CHECK(resumable = (completed_turn_count > 0))",
+        1,
+    )
+}
+
+/// Expected normalized session tables after migration `0009_media`: rebuilt `message_parts` admit
+/// durable media refs, and `session_attempts` carries JSON `retry_media_ids` (ids only, no paths).
+///
+/// `ALTER TABLE … ADD COLUMN` rewrites `session_attempts` with the new column immediately after
+/// `completed_turn_sequence` and attaches the column CHECK before the foreign keys; the expected
+/// SQL must match that on-disk shape, not a hand-written ideal layout.
+fn normalized_session_schema_v8() -> String {
+    let with_media_parts = normalized_session_schema_v7().replacen(
+        "CREATE TABLE message_parts (
+        session_id INTEGER NOT NULL,
+        message_sequence INTEGER NOT NULL,
+        sequence INTEGER NOT NULL CHECK(sequence >= 0),
+        kind TEXT NOT NULL CHECK(kind IN('text', 'reasoning', 'tool_call', 'tool_result')),
+        text TEXT,
+        call_id TEXT,
+        name TEXT,
+        input_json TEXT,
+        content TEXT,
+        is_error INTEGER CHECK(is_error IN(0, 1)),
+        PRIMARY KEY(session_id, message_sequence, sequence),
+        FOREIGN KEY(session_id, message_sequence) REFERENCES messages(session_id, sequence) ON DELETE CASCADE,
+        CHECK((kind IN('text', 'reasoning') AND text IS NOT NULL AND call_id IS NULL AND name IS NULL AND input_json IS NULL AND content IS NULL AND is_error IS NULL) OR (kind = 'tool_call' AND text IS NULL AND call_id IS NOT NULL AND call_id <> '' AND name IS NOT NULL AND name <> '' AND input_json IS NOT NULL AND content IS NULL AND is_error IS NULL) OR (kind = 'tool_result' AND text IS NULL AND call_id IS NOT NULL AND call_id <> '' AND name IS NULL AND input_json IS NULL AND content IS NOT NULL AND is_error IS NOT NULL))
+    );",
+        "CREATE TABLE message_parts (
+        session_id INTEGER NOT NULL,
+        message_sequence INTEGER NOT NULL,
+        sequence INTEGER NOT NULL CHECK(sequence >= 0),
+        kind TEXT NOT NULL CHECK(kind IN('text', 'reasoning', 'tool_call', 'tool_result', 'media')),
+        text TEXT,
+        call_id TEXT,
+        name TEXT,
+        input_json TEXT,
+        content TEXT,
+        is_error INTEGER CHECK(is_error IN(0, 1)),
+        media_id INTEGER,
+        mime TEXT,
+        PRIMARY KEY(session_id, message_sequence, sequence),
+        FOREIGN KEY(session_id, message_sequence) REFERENCES messages(session_id, sequence) ON DELETE CASCADE,
+        FOREIGN KEY(media_id) REFERENCES media(id),
+        CHECK((kind IN('text', 'reasoning') AND text IS NOT NULL AND call_id IS NULL AND name IS NULL AND input_json IS NULL AND content IS NULL AND is_error IS NULL AND media_id IS NULL AND mime IS NULL) OR (kind = 'tool_call' AND text IS NULL AND call_id IS NOT NULL AND call_id <> '' AND name IS NOT NULL AND name <> '' AND input_json IS NOT NULL AND content IS NULL AND is_error IS NULL AND media_id IS NULL AND mime IS NULL) OR (kind = 'tool_result' AND text IS NULL AND call_id IS NOT NULL AND call_id <> '' AND name IS NULL AND input_json IS NULL AND content IS NOT NULL AND is_error IS NOT NULL AND media_id IS NULL AND mime IS NULL) OR (kind = 'media' AND text IS NULL AND call_id IS NULL AND name IS NULL AND input_json IS NULL AND content IS NULL AND is_error IS NULL AND media_id IS NOT NULL AND mime IS NOT NULL AND mime <> ''))
+    );",
+        1,
+    );
+
+    with_media_parts.replacen(
+        "completed_turn_sequence INTEGER,
+             FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE,",
+        "completed_turn_sequence INTEGER, retry_media_ids TEXT
+        CHECK(retry_media_ids IS NULL OR (json_valid(retry_media_ids) AND json_type(retry_media_ids) = 'array')),
+             FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE,",
         1,
     )
 }
@@ -1130,7 +1189,7 @@ fn validate_v5_schema(
     database_path: &Path,
 ) -> Result<(), SessionStoreError> {
     validate_legacy_archive(connection, database_path)?;
-    validate_normalized_session_schema(connection, database_path, &normalized_session_schema_v7())
+    validate_normalized_session_schema(connection, database_path, &normalized_session_schema_v8())
 }
 
 fn validate_normalized_session_schema(
@@ -1472,6 +1531,9 @@ fn encode_turn_event(event: &TurnEvent) -> EncodedTurnEvent<'_> {
         },
         TurnEvent::ProviderPart(MessagePart::ToolResult { .. }) => {
             unreachable!("completed snapshots reject provider tool results")
+        }
+        TurnEvent::ProviderPart(MessagePart::Media { .. }) => {
+            unreachable!("completed snapshots reject provider media parts")
         }
         TurnEvent::ToolCallRequested { id, name, input } => EncodedTurnEvent {
             kind: "tool_call_requested",

@@ -24,8 +24,8 @@ pub use permission_precedence::{
     declarations_deny_every_target, prevailing_decision, prevailing_rule_decision,
 };
 pub use prompt_memory::{
-    EphemeralPromptMemory, HistoryBrowseResult, PromptMemory, PromptMemoryEntry,
-    PromptMemoryError, PromptMemoryState, PromptOverlayItem,
+    EphemeralPromptMemory, HistoryBrowseResult, PromptMemory, PromptMemoryEntry, PromptMemoryError,
+    PromptMemoryState, PromptOverlayItem,
 };
 pub use request_config::{ReasoningEffort, RequestConfig, RequestConfigError};
 
@@ -56,6 +56,10 @@ pub enum MessagePart {
         tool_call_id: String,
         content: String,
         is_error: bool,
+    },
+    Media {
+        media_id: i64,
+        mime: String,
     },
 }
 
@@ -99,7 +103,8 @@ fn validate_session_message_part(
     part: &MessagePart,
 ) -> Result<(), SessionMessageError> {
     let allowed = match role {
-        Role::System | Role::User => matches!(part, MessagePart::Text(_)),
+        Role::System => matches!(part, MessagePart::Text(_)),
+        Role::User => matches!(part, MessagePart::Text(_) | MessagePart::Media { .. }),
         Role::Assistant => matches!(
             part,
             MessagePart::Text(_) | MessagePart::Reasoning(_) | MessagePart::ToolCall { .. }
@@ -121,6 +126,7 @@ fn validate_session_message_part(
             content,
             ..
         } => !tool_call_id.is_empty() && !content.is_empty(),
+        MessagePart::Media { media_id, mime } => *media_id > 0 && !mime.is_empty(),
     };
 
     nonempty.then_some(()).ok_or(SessionMessageError::EmptyPart)
@@ -318,15 +324,28 @@ pub enum SessionAttemptSummaryError {
 pub struct RetryBoundary {
     key: AttemptKey,
     prompt: String,
+    media_ids: Vec<i64>,
 }
 
 impl RetryBoundary {
-    pub fn new(key: AttemptKey, prompt: String) -> Result<Self, RetryBoundaryError> {
-        if prompt.is_empty() || prompt.len() > MAX_RETRY_PROMPT_BYTES {
+    pub fn new(
+        key: AttemptKey,
+        prompt: String,
+        media_ids: Vec<i64>,
+    ) -> Result<Self, RetryBoundaryError> {
+        if prompt.len() > MAX_RETRY_PROMPT_BYTES {
+            return Err(RetryBoundaryError::InvalidPrompt);
+        }
+        // Media-only turns may carry an empty prompt when media_ids is non-empty.
+        if prompt.is_empty() && media_ids.is_empty() {
             return Err(RetryBoundaryError::InvalidPrompt);
         }
 
-        Ok(Self { key, prompt })
+        Ok(Self {
+            key,
+            prompt,
+            media_ids,
+        })
     }
 
     pub const fn key(&self) -> AttemptKey {
@@ -335,6 +354,10 @@ impl RetryBoundary {
 
     pub fn prompt(&self) -> &str {
         &self.prompt
+    }
+
+    pub fn media_ids(&self) -> &[i64] {
+        &self.media_ids
     }
 }
 
@@ -3406,6 +3429,19 @@ mod tests {
     };
 
     #[test]
+    fn retry_boundary_carries_media_ids_without_source_paths() {
+        let key = AttemptKey::new(1, 2).unwrap();
+        let boundary = RetryBoundary::new(key, "retry me".into(), vec![9, 11]).unwrap();
+
+        assert_eq!(boundary.key(), key);
+        assert_eq!(boundary.prompt(), "retry me");
+        assert_eq!(boundary.media_ids(), &[9, 11]);
+        assert!(RetryBoundary::new(key, String::new(), vec![1]).is_ok());
+        assert!(RetryBoundary::new(key, String::new(), Vec::new()).is_err());
+        assert!(RetryBoundary::new(key, "ok".into(), Vec::new()).is_ok());
+    }
+
+    #[test]
     fn session_attempt_domain_rejects_invalid_status_category_and_recovery_shapes() {
         assert!(
             SessionAttemptSummary::new(
@@ -3456,8 +3492,12 @@ mod tests {
         );
         assert_eq!(RecoveryOutcome::Stale.summary(), None);
 
-        assert!(RetryBoundary::new(AttemptKey::new(1, 2).unwrap(), "retry".into()).is_ok());
-        assert!(RetryBoundary::new(AttemptKey::new(1, 2).unwrap(), String::new()).is_err());
+        assert!(
+            RetryBoundary::new(AttemptKey::new(1, 2).unwrap(), "retry".into(), Vec::new()).is_ok()
+        );
+        assert!(
+            RetryBoundary::new(AttemptKey::new(1, 2).unwrap(), String::new(), Vec::new()).is_err()
+        );
     }
 
     #[test]

@@ -51,6 +51,15 @@ const TUI_BUILT_INS: &[TuiBuiltinCommand] = &[
         7,
     ),
     TuiBuiltinCommand::new(
+        "attach",
+        "Attach a media file for the next turn",
+        "<path>",
+        None,
+        CommandBusyPolicy::Local,
+        false,
+        23,
+    ),
+    TuiBuiltinCommand::new(
         "bypass",
         "Toggle skipping permission prompts",
         "",
@@ -859,6 +868,7 @@ mod tests {
                 "subagents",
                 "history",
                 "stash",
+                "attach",
                 "review",
                 "shared",
                 "inspect",

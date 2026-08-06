@@ -5,14 +5,26 @@
 //! is the whole reason this encoder exists separately from the responses-API one
 //! next to it, which continues a server-held thread by id instead.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use agens_core::{Message, MessagePart, ReasoningEffort, Role};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use serde_json::{Value, json};
 
 use crate::OpenAiFunctionTool;
 
 use super::compat;
+
+/// Durable media blobs keyed by `media_id` for chat-completions image_url encoding.
+pub(super) type MediaBlobs = BTreeMap<i64, Vec<u8>>;
+
+/// Failures while mapping domain messages onto the chat-completions wire shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum EncodeError {
+    MediaUnavailable { media_id: i64 },
+    UnsupportedMediaMime { mime: String },
+}
 
 /// Everything a request body depends on beyond the conversation itself.
 pub(super) struct RequestOptions<'a> {
@@ -67,6 +79,31 @@ fn tool_call_names(messages: &[Message]) -> HashMap<String, String> {
     names
 }
 
+fn media_data_url(mime: &str, bytes: &[u8]) -> String {
+    format!("data:{mime};base64,{}", BASE64_STANDARD.encode(bytes))
+}
+
+fn moonshot_image_content_item(
+    media_id: i64,
+    mime: &str,
+    media_blobs: &MediaBlobs,
+) -> Result<Value, EncodeError> {
+    let Some(bytes) = media_blobs.get(&media_id) else {
+        return Err(EncodeError::MediaUnavailable { media_id });
+    };
+
+    if !mime.starts_with("image/") {
+        return Err(EncodeError::UnsupportedMediaMime {
+            mime: mime.to_owned(),
+        });
+    }
+
+    Ok(json!({
+        "type": "image_url",
+        "image_url": { "url": media_data_url(mime, bytes) },
+    }))
+}
+
 /// Encodes one message into the zero or more chat-completions messages it maps
 /// onto. A single assistant turn carrying both text and tool calls is one
 /// message, while its tool results are separate `tool` messages, so the counts
@@ -74,15 +111,23 @@ fn tool_call_names(messages: &[Message]) -> HashMap<String, String> {
 fn encode_message(
     message: &Message,
     tool_names: &HashMap<String, String>,
+    media_blobs: &MediaBlobs,
     encoded: &mut Vec<Value>,
-) {
+) -> Result<(), EncodeError> {
     let mut text = String::new();
     let mut reasoning = String::new();
     let mut tool_calls = Vec::new();
+    let mut content_items = Vec::new();
+    let mut has_media = false;
 
     for part in &message.parts {
         match part {
-            MessagePart::Text(value) => text.push_str(value),
+            MessagePart::Text(value) => {
+                text.push_str(value);
+                if !value.is_empty() {
+                    content_items.push(json!({ "type": "text", "text": value }));
+                }
+            }
             MessagePart::Reasoning(value) => reasoning.push_str(value),
             MessagePart::ToolCall { id, name, input } => tool_calls.push(json!({
                 "id": id,
@@ -109,15 +154,19 @@ fn encode_message(
 
                 encoded.push(tool_message);
             }
+            MessagePart::Media { media_id, mime } => {
+                has_media = true;
+                content_items.push(moonshot_image_content_item(*media_id, mime, media_blobs)?);
+            }
         }
     }
 
     if message.role == Role::Tool {
-        return;
+        return Ok(());
     }
 
-    if text.is_empty() && reasoning.is_empty() && tool_calls.is_empty() {
-        return;
+    if text.is_empty() && reasoning.is_empty() && tool_calls.is_empty() && !has_media {
+        return Ok(());
     }
 
     let mut encoded_message = json!({ "role": role_name(message.role) });
@@ -126,10 +175,15 @@ fn encode_message(
         .expect("a json! object literal is an object");
 
     if tool_calls.is_empty() {
-        object.insert("content".to_owned(), Value::String(text));
+        if has_media {
+            object.insert("content".to_owned(), Value::Array(content_items));
+        } else {
+            object.insert("content".to_owned(), Value::String(text));
+        }
     } else {
         // An assistant message that only calls tools still needs the key, and
         // Moonshot rejects an empty string where it accepts an explicit null.
+        // Media is user-only in the domain; tool_calls stay on the string/null shape.
         object.insert(
             "content".to_owned(),
             if text.is_empty() {
@@ -142,17 +196,21 @@ fn encode_message(
     }
 
     encoded.push(encoded_message);
+    Ok(())
 }
 
-pub(super) fn encode_messages(messages: &[Message]) -> Vec<Value> {
+pub(super) fn encode_messages(
+    messages: &[Message],
+    media_blobs: &MediaBlobs,
+) -> Result<Vec<Value>, EncodeError> {
     let tool_names = tool_call_names(messages);
     let mut encoded = Vec::new();
 
     for message in messages {
-        encode_message(message, &tool_names, &mut encoded);
+        encode_message(message, &tool_names, media_blobs, &mut encoded)?;
     }
 
-    encoded
+    Ok(encoded)
 }
 
 /// Chat-completions requires every assistant `tool_calls` batch to be followed
@@ -160,8 +218,10 @@ pub(super) fn encode_messages(messages: &[Message]) -> Vec<Value> {
 /// before any other role appears.
 pub(super) fn validate_chat_completions_history(
     messages: &[Message],
+    media_blobs: &MediaBlobs,
 ) -> Result<(), HistoryValidationError> {
-    validate_encoded_tool_call_adjacency(&encode_messages(messages))
+    let encoded = encode_messages(messages, media_blobs).map_err(|_| HistoryValidationError)?;
+    validate_encoded_tool_call_adjacency(&encoded)
 }
 
 fn validate_encoded_tool_call_adjacency(encoded: &[Value]) -> Result<(), HistoryValidationError> {
@@ -221,10 +281,14 @@ fn validate_encoded_tool_call_adjacency(encoded: &[Value]) -> Result<(), History
 ///
 /// Usage only arrives when `stream_options.include_usage` asks for it, so the
 /// key is always present rather than conditional on anything.
-pub(super) fn encode_request(messages: &[Message], options: &RequestOptions<'_>) -> Value {
+pub(super) fn encode_request(
+    messages: &[Message],
+    options: &RequestOptions<'_>,
+    media_blobs: &MediaBlobs,
+) -> Result<Value, EncodeError> {
     let mut request = json!({
         "model": options.model,
-        "messages": encode_messages(messages),
+        "messages": encode_messages(messages, media_blobs)?,
         "stream": true,
         "stream_options": { "include_usage": true },
     });
@@ -251,7 +315,7 @@ pub(super) fn encode_request(messages: &[Message], options: &RequestOptions<'_>)
         );
     }
 
-    request
+    Ok(request)
 }
 
 #[cfg(test)]
@@ -283,9 +347,14 @@ mod tests {
         }
     }
 
+    fn empty_media() -> MediaBlobs {
+        MediaBlobs::new()
+    }
+
     #[test]
     fn a_request_always_asks_for_usage_in_the_stream() {
-        let request = encode_request(&[user("hello")], &options("kimi-k3", &[]));
+        let request =
+            encode_request(&[user("hello")], &options("kimi-k3", &[]), &empty_media()).unwrap();
 
         assert_eq!(request["stream"], json!(true));
         assert_eq!(request["stream_options"]["include_usage"], json!(true));
@@ -293,7 +362,8 @@ mod tests {
 
     #[test]
     fn a_request_carries_no_output_cap_and_no_openai_only_keys() {
-        let request = encode_request(&[user("hello")], &options("kimi-k3", &[]));
+        let request =
+            encode_request(&[user("hello")], &options("kimi-k3", &[]), &empty_media()).unwrap();
         let object = request.as_object().expect("request is an object");
 
         for absent in ["max_tokens", "max_completion_tokens", "store", "thinking"] {
@@ -304,7 +374,12 @@ mod tests {
     #[test]
     fn tools_are_sent_without_a_strict_flag() {
         let tools = [tool()];
-        let request = encode_request(&[user("weather?")], &options("kimi-k3", &tools));
+        let request = encode_request(
+            &[user("weather?")],
+            &options("kimi-k3", &tools),
+            &empty_media(),
+        )
+        .unwrap();
 
         let function = &request["tools"][0]["function"];
         assert_eq!(function["name"], json!("get_weather"));
@@ -322,21 +397,22 @@ mod tests {
         let mut enabled = options("kimi-k3", &tools);
         enabled.parallel_tool_calls = true;
         assert_eq!(
-            encode_request(&[user("weather?")], &enabled)["parallel_tool_calls"],
+            encode_request(&[user("weather?")], &enabled, &empty_media()).unwrap()["parallel_tool_calls"],
             json!(true)
         );
 
         let mut disabled = options("kimi-k3", &tools);
         disabled.parallel_tool_calls = false;
         assert_eq!(
-            encode_request(&[user("weather?")], &disabled)["parallel_tool_calls"],
+            encode_request(&[user("weather?")], &disabled, &empty_media()).unwrap()["parallel_tool_calls"],
             json!(false)
         );
     }
 
     #[test]
     fn a_toolless_request_omits_every_tool_related_key() {
-        let request = encode_request(&[user("hello")], &options("kimi-k3", &[]));
+        let request =
+            encode_request(&[user("hello")], &options("kimi-k3", &[]), &empty_media()).unwrap();
         let object = request.as_object().expect("request is an object");
 
         for absent in ["tools", "tool_choice", "parallel_tool_calls"] {
@@ -349,13 +425,13 @@ mod tests {
         let mut with_effort = options("kimi-k3", &[]);
         with_effort.reasoning_effort = Some(ReasoningEffort::Max);
         assert_eq!(
-            encode_request(&[user("hello")], &with_effort)["reasoning_effort"],
+            encode_request(&[user("hello")], &with_effort, &empty_media()).unwrap()["reasoning_effort"],
             json!("max")
         );
 
         let mut other_model = options("kimi-k2.6", &[]);
         other_model.reasoning_effort = Some(ReasoningEffort::Max);
-        let request = encode_request(&[user("hello")], &other_model);
+        let request = encode_request(&[user("hello")], &other_model, &empty_media()).unwrap();
         assert!(
             request
                 .as_object()
@@ -376,10 +452,83 @@ mod tests {
             user("hello"),
         ];
 
-        let encoded = encode_messages(&messages);
+        let encoded = encode_messages(&messages, &BTreeMap::new()).expect("encode");
 
         assert_eq!(encoded[0]["role"], json!("system"));
         assert_eq!(encoded[0]["content"], json!("be brief"));
+    }
+
+    #[test]
+    fn multimodal_user_content_becomes_a_text_and_image_url_array() {
+        let messages = [Message {
+            role: Role::User,
+            parts: vec![
+                MessagePart::Text("what is this?".to_owned()),
+                MessagePart::Media {
+                    media_id: 11,
+                    mime: "image/png".to_owned(),
+                },
+            ],
+        }];
+        let mut media = BTreeMap::new();
+        media.insert(11, b"fake-png-bytes".to_vec());
+
+        let encoded = encode_messages(&messages, &media).expect("multimodal encode");
+
+        assert_eq!(encoded[0]["role"], json!("user"));
+        let content = encoded[0]["content"].as_array().expect("content array");
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0], json!({"type": "text", "text": "what is this?"}));
+        assert_eq!(content[1]["type"], json!("image_url"));
+        assert_eq!(
+            content[1]["image_url"]["url"],
+            json!("data:image/png;base64,ZmFrZS1wbmctYnl0ZXM=")
+        );
+    }
+
+    #[test]
+    fn media_only_user_message_is_a_single_image_url_item() {
+        let messages = [Message {
+            role: Role::User,
+            parts: vec![MessagePart::Media {
+                media_id: 4,
+                mime: "image/jpeg".to_owned(),
+            }],
+        }];
+        let mut media = BTreeMap::new();
+        media.insert(4, b"jpeg-bytes".to_vec());
+
+        let encoded = encode_messages(&messages, &media).expect("media-only encode");
+
+        let content = encoded[0]["content"].as_array().expect("content array");
+        assert_eq!(content.len(), 1);
+        assert_eq!(
+            content[0]["image_url"]["url"],
+            json!("data:image/jpeg;base64,anBlZy1ieXRlcw==")
+        );
+    }
+
+    #[test]
+    fn text_only_user_content_remains_a_plain_string() {
+        let encoded = encode_messages(&[user("hello")], &BTreeMap::new()).expect("text encode");
+        assert_eq!(encoded[0]["content"], json!("hello"));
+        assert!(encoded[0]["content"].is_string());
+    }
+
+    #[test]
+    fn missing_media_blob_fails_encode() {
+        let messages = [Message {
+            role: Role::User,
+            parts: vec![MessagePart::Media {
+                media_id: 99,
+                mime: "image/png".to_owned(),
+            }],
+        }];
+
+        assert_eq!(
+            encode_messages(&messages, &BTreeMap::new()),
+            Err(EncodeError::MediaUnavailable { media_id: 99 })
+        );
     }
 
     #[test]
@@ -418,7 +567,7 @@ mod tests {
             },
         ];
 
-        let encoded = encode_messages(&messages);
+        let encoded = encode_messages(&messages, &empty_media()).expect("encode");
 
         assert_eq!(encoded.len(), 4);
         assert_eq!(encoded[1]["role"], json!("assistant"));
@@ -452,7 +601,7 @@ mod tests {
             ],
         }];
 
-        let encoded = encode_messages(&messages);
+        let encoded = encode_messages(&messages, &empty_media()).expect("encode");
 
         assert_eq!(encoded[0]["content"], json!("checking"));
         assert_eq!(encoded[0]["tool_calls"].as_array().expect("array").len(), 1);
@@ -473,7 +622,7 @@ mod tests {
         ];
 
         assert_eq!(
-            validate_chat_completions_history(&messages),
+            validate_chat_completions_history(&messages, &empty_media()),
             Err(HistoryValidationError)
         );
     }
@@ -502,7 +651,7 @@ mod tests {
         ];
 
         assert_eq!(
-            validate_chat_completions_history(&messages),
+            validate_chat_completions_history(&messages, &empty_media()),
             Err(HistoryValidationError)
         );
     }
@@ -544,9 +693,12 @@ mod tests {
             user("thanks"),
         ];
 
-        assert_eq!(validate_chat_completions_history(&messages), Ok(()));
+        assert_eq!(
+            validate_chat_completions_history(&messages, &empty_media()),
+            Ok(())
+        );
 
-        let encoded = encode_messages(&messages);
+        let encoded = encode_messages(&messages, &empty_media()).expect("encode");
         assert_eq!(encoded[2]["role"], json!("tool"));
         assert_eq!(encoded[2]["name"], json!("get_weather"));
         assert_eq!(encoded[2]["tool_call_id"], json!("call_0"));

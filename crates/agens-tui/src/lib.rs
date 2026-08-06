@@ -52,8 +52,8 @@ use std::{
 
 use agens_core::SubagentStatus;
 use agens_core::SubmitOrigin;
-use agens_core::{HistoryBrowseResult, PromptMemory};
 use agens_core::ask_user::{AskUserMode, AskUserQuestion, AskUserReply, AskUserRequest};
+use agens_core::{HistoryBrowseResult, PromptMemory};
 use agens_core::{MessagePart, TurnEvent, TurnState, Usage};
 use ask_user::{AskUserEntry, AskUserOutcome, AskUserRow, AskUserState};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
@@ -216,6 +216,8 @@ pub enum Key {
     CtrlShiftN,
     /// Opens the eligible subagent selection dialog.
     CtrlShiftA,
+    /// Requests an OS clipboard image attach (Ctrl+V when an image is available).
+    CtrlV,
     /// Opens the subagent model profile editor.
     CtrlShiftM,
     /// Toggles the visible dangerous-mode session state through the composition layer.
@@ -347,6 +349,8 @@ pub enum Action {
     Unchanged,
     /// Send this prompt to the composition layer.
     Submit(String),
+    /// Request OS clipboard image ingest (Ctrl+V when image data is available).
+    AttachClipboardImage,
     /// Classify this busy composer draft before mutating the prompt queue.
     SubmitBusy(String),
     /// Submit a redacted credential through the dedicated route only.
@@ -460,6 +464,11 @@ pub enum TuiSubmissionOutcome {
     /// Opens an isolated credential-entry overlay.
     SecretEntry(SecretEntryView),
     LocalInfo(String),
+    /// Local attach succeeded: update path-free composer chips and status.
+    MediaAttached {
+        message: String,
+        media_chips: Vec<String>,
+    },
     LocalActionableError {
         message: String,
         action: String,
@@ -477,6 +486,8 @@ pub enum TuiSubmissionOutcome {
         presentation: TuiPresentation,
         history: Vec<Conversation>,
         draft: Option<String>,
+        /// Path-free media chips restored from the retry boundary (ids only; no paths).
+        media_chips: Vec<String>,
         resume_error: Option<String>,
         /// The `@` picker candidates for the resumed session's OWN root. Without this, a
         /// post-startup resume would leave whatever candidates were set at TUI startup (or by an
@@ -513,6 +524,11 @@ pub enum TuiRouteRequest {
     BusyInput(String),
     /// Opens a device-authentication URL through the application adapter.
     DeviceAuthOpenUrl(String),
+    /// Ingest OS clipboard image bytes into the durable media store.
+    AttachClipboardImage {
+        bytes: Vec<u8>,
+        mime: Option<String>,
+    },
     SubmitSecret {
         action_id: String,
         secret: SecretInput,
@@ -650,6 +666,7 @@ impl std::fmt::Debug for Action {
             Self::Render => formatter.write_str("Render"),
             Self::Unchanged => formatter.write_str("Unchanged"),
             Self::Submit(value) => formatter.debug_tuple("Submit").field(value).finish(),
+            Self::AttachClipboardImage => formatter.write_str("AttachClipboardImage"),
             Self::SubmitBusy(value) => formatter.debug_tuple("SubmitBusy").field(value).finish(),
             Self::SubmitBackground(value) => formatter
                 .debug_tuple("SubmitBackground")
@@ -722,6 +739,11 @@ impl std::fmt::Debug for TuiRouteRequest {
             Self::Input(value) => formatter.debug_tuple("Input").field(value).finish(),
             Self::BusyInput(value) => formatter.debug_tuple("BusyInput").field(value).finish(),
             Self::DeviceAuthOpenUrl(_) => formatter.write_str("DeviceAuthOpenUrl(<redacted>)"),
+            Self::AttachClipboardImage { bytes, mime } => formatter
+                .debug_struct("AttachClipboardImage")
+                .field("bytes", &bytes.len())
+                .field("mime", mime)
+                .finish(),
             Self::OpenDialog(value) => formatter.debug_tuple("OpenDialog").field(value).finish(),
             Self::DialogAction(value) => {
                 formatter.debug_tuple("DialogAction").field(value).finish()
@@ -944,6 +966,8 @@ pub struct ViewState<'a> {
     pub owner_label: &'a str,
     /// The editable prompt text.
     pub input: &'a str,
+    /// Path-free media chips staged for the next turn (`[Image #N]`, …).
+    pub media_chips: &'a [String],
     /// Whether the composer contains a recovered failed prompt that can be retried or discarded.
     pub recovered_failed_prompt: bool,
     /// Current terminal dimensions.
@@ -1950,6 +1974,12 @@ fn render_frame_content(frame: &mut ratatui::Frame<'_>, state: &ViewState<'_>) {
             .borders(Borders::ALL)
             .padding(Padding::left(1))
             .border_style(Style::default().fg(composer_color));
+        if !state.media_chips.is_empty() {
+            composer = composer.title_top(
+                Line::from(state.media_chips.join(" "))
+                    .style(Style::default().fg(widgets::RolePalette::muted())),
+            );
+        }
         if let Some(metrics) = border_metrics(state, layout.composer) {
             composer = composer.title_bottom(metrics);
         }
@@ -4027,7 +4057,7 @@ fn hint_spans(state: &ViewState<'_>) -> Vec<Span<'static>> {
         }
         hints.push(("i", "insert"));
     } else {
-        if !state.input.is_empty() {
+        if !state.input.is_empty() || !state.media_chips.is_empty() {
             hints.push(("Enter", if state.running { "queue" } else { "send" }));
         }
         if state.running {
@@ -5210,6 +5240,8 @@ pub struct Tui<E> {
     queue_selected: Option<usize>,
     input: String,
     input_cursor: usize,
+    /// Path-free media chips staged for the next turn (`[Image #N]`, …).
+    media_chips: Vec<String>,
     recovered_failed_prompt: bool,
     size: (u16, u16),
     local_route_active: bool,
@@ -5316,6 +5348,7 @@ where
             ),
             input: String::new(),
             input_cursor: 0,
+            media_chips: Vec::new(),
             recovered_failed_prompt: false,
             size: (80, 24),
             local_route_active: false,
@@ -5952,6 +5985,14 @@ where
                 self.add_info(message);
                 None
             }
+            TuiSubmissionOutcome::MediaAttached {
+                message,
+                media_chips,
+            } => {
+                self.set_media_chips(media_chips);
+                self.add_info(message);
+                None
+            }
             TuiSubmissionOutcome::LocalActionableError { message, action } => {
                 self.show_dialog("Action required", format!("{message}\nAction: {action}"));
                 None
@@ -5978,6 +6019,7 @@ where
                 presentation,
                 history,
                 draft,
+                media_chips,
                 resume_error,
                 file_candidates,
                 palette_entries,
@@ -5990,6 +6032,7 @@ where
                 self.input.clear();
                 self.input_cursor = 0;
                 self.recovered_failed_prompt = false;
+                self.set_media_chips(media_chips);
                 if let Some(draft) = draft {
                     self.restore_resume_draft(draft);
                 }
@@ -6108,6 +6151,21 @@ where
         record.scroll_offset = scroll_offset;
     }
 
+    /// Replaces composer media chips with path-free labels (e.g. `[Image #1]`).
+    pub fn set_media_chips(&mut self, chips: Vec<String>) {
+        self.media_chips = chips;
+    }
+
+    /// Current path-free media chips shown above the composer.
+    pub fn media_chips(&self) -> &[String] {
+        &self.media_chips
+    }
+
+    /// Clears staged media chips (after a successful submit or discard).
+    pub fn clear_media_chips(&mut self) {
+        self.media_chips.clear();
+    }
+
     pub fn finish_provider_turn(&mut self, outcome: TuiProviderOutcome) -> Option<String> {
         self.finish_provider_turn_scheduled(outcome)
             .map(|next| next.prompt)
@@ -6176,6 +6234,7 @@ where
                 } else {
                     self.transcript.push(TranscriptEntry::Assistant(body));
                 }
+                self.media_chips.clear();
                 self.set_foreground_presentation(false);
             }
             TuiProviderOutcome::Failed { message, action } => {
@@ -6834,6 +6893,7 @@ where
                 .collect(),
             owner_label: &active.owner_label,
             input: &self.input,
+            media_chips: &self.media_chips,
             recovered_failed_prompt: self.recovered_failed_prompt,
             size: self.size,
             running: self.foreground_running(),
@@ -7680,7 +7740,10 @@ where
                     if self.execution_selection.is_none()
                         && self.input.is_empty()
                         && !self.viewport_focused()
-                        && !self.prompt_memory.as_ref().is_some_and(|memory| memory.is_browsing()) =>
+                        && !self
+                            .prompt_memory
+                            .as_ref()
+                            .is_some_and(|memory| memory.is_browsing()) =>
                 {
                     self.focus_execution_strip();
                     return Action::Render;
@@ -7784,6 +7847,10 @@ where
 
         if key == Key::CtrlS {
             return self.handle_prompt_stash_key();
+        }
+
+        if key == Key::CtrlV {
+            return Action::AttachClipboardImage;
         }
 
         if key == Key::CtrlShiftA {
@@ -7915,7 +7982,12 @@ where
                 Action::Render
             }
             Key::Up | Key::Down | Key::Tab => Action::Render,
-            Key::Enter if self.input.is_empty() || self.session_loading => Action::Render,
+            Key::Enter
+                if (self.input.is_empty() && self.media_chips.is_empty())
+                    || self.session_loading =>
+            {
+                Action::Render
+            }
             Key::Enter if self.active_transcript != TranscriptId::Main => {
                 let TranscriptId::Subagent(id) = self.active_transcript else {
                     unreachable!("non-main transcript is a subagent");
@@ -8031,6 +8103,8 @@ where
 
         self.input_cursor = 0;
         self.recovered_failed_prompt = false;
+        // Keep media_chips until the provider turn completes successfully so a
+        // preflight / early failure can leave staged chips visible for retry.
         let prompt = std::mem::take(&mut self.input);
         self.record_prompt_history(&prompt);
         Action::Submit(prompt)
@@ -8111,6 +8185,7 @@ where
         self.input.clear();
         self.input_cursor = 0;
         self.recovered_failed_prompt = false;
+        self.media_chips.clear();
     }
 
     fn enqueue_resolved_composer(&mut self, display: String, prompt: String) {
@@ -10186,7 +10261,8 @@ where
                 terminal.copy_selection(&text)?;
                 renderer.render(tui.view())?;
             }
-            Action::Unchanged
+            Action::AttachClipboardImage
+            | Action::Unchanged
             | Action::Render
             | Action::Submit(_)
             | Action::SubmitBusy(_)
@@ -10272,7 +10348,8 @@ where
                 tui.enqueue_composer();
                 renderer.render(tui.view())?;
             }
-            Action::Unchanged
+            Action::AttachClipboardImage
+            | Action::Unchanged
             | Action::Render
             | Action::SubmitSecret { .. }
             | Action::SubmitBackground(_)
@@ -10882,6 +10959,16 @@ where
                     let _ = route_sender.send((route_id, outcome));
                 });
             }
+            Action::AttachClipboardImage => {
+                if let Some((bytes, mime)) = read_os_clipboard_image() {
+                    let outcome = route(
+                        TuiRouteRequest::AttachClipboardImage { bytes, mime },
+                        route_progress_sender.clone(),
+                        TuiRouteCancellation::new(),
+                    );
+                    let _ = tui.apply_submission_outcome(outcome);
+                }
+            }
             Action::SubmitBusy(input) => {
                 let outcome = route(
                     TuiRouteRequest::BusyInput(input),
@@ -11186,6 +11273,7 @@ fn is_session_resume_request(request: &TuiRouteRequest) -> bool {
         TuiRouteRequest::BusyInput(_) => false,
         TuiRouteRequest::DialogAction(action_id) => is_session_resume_action(action_id),
         TuiRouteRequest::DeviceAuthOpenUrl(_)
+        | TuiRouteRequest::AttachClipboardImage { .. }
         | TuiRouteRequest::SubmitSecret { .. }
         | TuiRouteRequest::OpenDialog(_)
         | TuiRouteRequest::SessionPage(_) => false,
@@ -11196,11 +11284,39 @@ fn is_session_browser_request(request: &TuiRouteRequest) -> bool {
     match request {
         TuiRouteRequest::Input(input) => matches!(input.trim(), "/resume" | "/sessions"),
         TuiRouteRequest::BusyInput(_) => false,
-        TuiRouteRequest::DeviceAuthOpenUrl(_) | TuiRouteRequest::SubmitSecret { .. } => false,
+        TuiRouteRequest::DeviceAuthOpenUrl(_)
+        | TuiRouteRequest::AttachClipboardImage { .. }
+        | TuiRouteRequest::SubmitSecret { .. } => false,
         TuiRouteRequest::OpenDialog(route_id) => route_id == "sessions",
         TuiRouteRequest::SessionPage(_) => true,
         TuiRouteRequest::DialogAction(_) => false,
     }
+}
+
+/// Reads an image from the OS clipboard when available (arboard → PNG).
+///
+/// Text clipboard pastes continue to use bracketed paste (`Event::Paste`).
+fn read_os_clipboard_image() -> Option<(Vec<u8>, Option<String>)> {
+    let mut clipboard = arboard::Clipboard::new().ok()?;
+    let image = clipboard.get_image().ok()?;
+    let width = u32::try_from(image.width).ok()?;
+    let height = u32::try_from(image.height).ok()?;
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let buffer = image::RgbaImage::from_raw(width, height, image.bytes.into_owned())?;
+    let mut png = Vec::new();
+    let encoder = image::codecs::png::PngEncoder::new(&mut png);
+    use image::ImageEncoder;
+    encoder
+        .write_image(
+            buffer.as_raw(),
+            width,
+            height,
+            image::ExtendedColorType::Rgba8,
+        )
+        .ok()?;
+    Some((png, Some("image/png".into())))
 }
 
 fn sync_terminal_size<E: Engine>(tui: &mut Tui<E>) -> io::Result<()> {
@@ -11343,6 +11459,9 @@ fn map_key(event: KeyEvent) -> Option<Event> {
         }
         (KeyCode::Char('s' | 'S'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
             Key::CtrlS
+        }
+        (KeyCode::Char('v' | 'V'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+            Key::CtrlV
         }
         (KeyCode::Char('w' | 'W'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
             Key::DeletePreviousWord
@@ -11954,6 +12073,7 @@ mod runtime_tests {
             presentation: TuiPresentation::new("provider", "model", "session #2"),
             history,
             draft: None,
+            media_chips: Vec::new(),
             resume_error: None,
             file_candidates: Vec::new(),
             palette_entries: Vec::new(),

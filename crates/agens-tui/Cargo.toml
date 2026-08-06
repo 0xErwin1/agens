@@ -19,6 +19,8 @@ required-features = ["perf-audit"]
 agens-bus = { path = "../agens-bus" }
 agens-core = { path = "../agens-core" }
 agens-perf = { path = "../agens-perf" }
+arboard = { version = "3", default-features = false, features = ["image-data", "wayland-data-control"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
 arborium = { version = "2.18.1", default-features = false, features = [
   "lang-bash",
   "lang-c",

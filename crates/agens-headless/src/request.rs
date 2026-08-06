@@ -29,6 +29,94 @@ pub struct HeadlessChatRequest {
     pub effective_capabilities: Option<EffectiveCapabilitySet>,
     pub pending_system_reminder: Option<String>,
     pub skills: Option<Arc<SkillCatalog>>,
+    /// Durable media ids for this user turn (order preserved; retry boundary uses these).
+    pub media_ids: Vec<i64>,
+    /// Mime types aligned with [`Self::media_ids`] (same length when media is present).
+    pub media_mimes: Vec<String>,
+}
+
+/// Why media preflight refused to send a request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MediaPreflightError {
+    /// `media_ids` and `media_mimes` lengths differ.
+    LengthMismatch {
+        media_ids: usize,
+        media_mimes: usize,
+    },
+    /// Model catalog is known and does not accept this MIME.
+    UnsupportedMime { model: String, mime: String },
+    /// Attachments present but model modalities are unknown — fail closed.
+    UnknownModality { model: String, mime: String },
+}
+
+impl std::fmt::Display for MediaPreflightError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LengthMismatch {
+                media_ids,
+                media_mimes,
+            } => write!(
+                formatter,
+                "media_ids length ({media_ids}) does not match media_mimes length ({media_mimes})"
+            ),
+            Self::UnsupportedMime { model, mime } => {
+                write!(
+                    formatter,
+                    "model {model} does not accept attachment mime {mime}"
+                )
+            }
+            Self::UnknownModality { model, mime } => write!(
+                formatter,
+                "model {model} input modalities are unknown; refusing attachment mime {mime}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for MediaPreflightError {}
+
+/// Capability-gates request media against the model catalog before any provider I/O.
+///
+/// Empty media is always accepted. When media is present on the current turn **or** in
+/// history `MessagePart::Media` entries, unknown modalities fail closed.
+pub fn preflight_request_media(
+    model_id: &str,
+    request: &HeadlessChatRequest,
+) -> Result<(), MediaPreflightError> {
+    if request.media_ids.len() != request.media_mimes.len() {
+        return Err(MediaPreflightError::LengthMismatch {
+            media_ids: request.media_ids.len(),
+            media_mimes: request.media_mimes.len(),
+        });
+    }
+
+    for mime in &request.media_mimes {
+        gate_mime(model_id, mime)?;
+    }
+
+    for message in &request.history {
+        for part in &message.parts {
+            if let MessagePart::Media { mime, .. } = part {
+                gate_mime(model_id, mime)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn gate_mime(model_id: &str, mime: &str) -> Result<(), MediaPreflightError> {
+    match agens_models::accepts_input_mime(model_id, mime) {
+        Some(true) => Ok(()),
+        Some(false) => Err(MediaPreflightError::UnsupportedMime {
+            model: model_id.to_owned(),
+            mime: mime.to_owned(),
+        }),
+        None => Err(MediaPreflightError::UnknownModality {
+            model: model_id.to_owned(),
+            mime: mime.to_owned(),
+        }),
+    }
 }
 
 pub fn provider_messages(
@@ -56,9 +144,31 @@ pub fn provider_messages(
     }
     messages.push(Message {
         role: Role::User,
-        parts: vec![MessagePart::Text(request.prompt.clone())],
+        parts: user_turn_parts(request),
     });
     messages
+}
+
+/// Builds the multi-part user content for the current turn.
+fn user_turn_parts(request: &HeadlessChatRequest) -> Vec<MessagePart> {
+    let mut parts = Vec::new();
+
+    if !request.prompt.is_empty() {
+        parts.push(MessagePart::Text(request.prompt.clone()));
+    }
+
+    for (media_id, mime) in request.media_ids.iter().zip(request.media_mimes.iter()) {
+        parts.push(MessagePart::Media {
+            media_id: *media_id,
+            mime: mime.clone(),
+        });
+    }
+
+    if parts.is_empty() {
+        parts.push(MessagePart::Text(request.prompt.clone()));
+    }
+
+    parts
 }
 
 fn replay_safe_history(history: &[Message]) -> Vec<Message> {
@@ -74,7 +184,7 @@ fn replay_safe_history(history: &[Message]) -> Vec<Message> {
                     .entry(tool_call_id.as_str())
                     .or_insert(0_usize) += 1;
             }
-            MessagePart::Text(_) | MessagePart::Reasoning(_) => {}
+            MessagePart::Text(_) | MessagePart::Reasoning(_) | MessagePart::Media { .. } => {}
         }
     }
     let mut retained_call_ids = BTreeSet::new();
@@ -239,6 +349,8 @@ mod tests {
             effective_capabilities: None,
             pending_system_reminder: None,
             skills: None,
+            media_ids: Vec::new(),
+            media_mimes: Vec::new(),
         }
     }
 
@@ -386,5 +498,135 @@ mod tests {
         let twice = explicit_task_delegation_prompt(&once);
 
         assert_eq!(twice, once);
+    }
+
+    #[test]
+    fn provider_messages_emits_media_parts_for_media_ids() {
+        let mut request = bare_request();
+        request.prompt = "look at this".into();
+        request.media_ids = vec![7, 11];
+        request.media_mimes = vec!["image/png".into(), "image/jpeg".into()];
+
+        let messages = provider_messages(&request, false);
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, Role::User);
+        assert_eq!(
+            messages[0].parts,
+            vec![
+                MessagePart::Text("look at this".into()),
+                MessagePart::Media {
+                    media_id: 7,
+                    mime: "image/png".into(),
+                },
+                MessagePart::Media {
+                    media_id: 11,
+                    mime: "image/jpeg".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn provider_messages_allows_media_only_user_turn() {
+        let mut request = bare_request();
+        request.prompt = String::new();
+        request.media_ids = vec![3];
+        request.media_mimes = vec!["image/png".into()];
+
+        let messages = provider_messages(&request, false);
+
+        assert_eq!(
+            messages[0].parts,
+            vec![MessagePart::Media {
+                media_id: 3,
+                mime: "image/png".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn preflight_accepts_supported_mime_for_catalog_model() {
+        let mut request = bare_request();
+        request.media_ids = vec![1];
+        request.media_mimes = vec!["image/png".into()];
+
+        assert_eq!(preflight_request_media("gpt-4.1", &request), Ok(()));
+    }
+
+    #[test]
+    fn preflight_rejects_unsupported_mime_for_catalog_model() {
+        let mut request = bare_request();
+        request.media_ids = vec![1];
+        request.media_mimes = vec!["application/pdf".into()];
+
+        assert_eq!(
+            preflight_request_media("gpt-4.1-nano", &request),
+            Err(MediaPreflightError::UnsupportedMime {
+                model: "gpt-4.1-nano".into(),
+                mime: "application/pdf".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn preflight_fails_closed_when_model_modalities_are_unknown() {
+        let mut request = bare_request();
+        request.media_ids = vec![1];
+        request.media_mimes = vec!["image/png".into()];
+
+        assert_eq!(
+            preflight_request_media("not-a-real-model-xyz", &request),
+            Err(MediaPreflightError::UnknownModality {
+                model: "not-a-real-model-xyz".into(),
+                mime: "image/png".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn preflight_allows_empty_media_even_for_unknown_models() {
+        let request = bare_request();
+
+        assert_eq!(
+            preflight_request_media("not-a-real-model-xyz", &request),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn preflight_rejects_media_id_mime_length_mismatch() {
+        let mut request = bare_request();
+        request.media_ids = vec![1, 2];
+        request.media_mimes = vec!["image/png".into()];
+
+        assert_eq!(
+            preflight_request_media("gpt-4.1", &request),
+            Err(MediaPreflightError::LengthMismatch {
+                media_ids: 2,
+                media_mimes: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn preflight_rejects_history_media_unsupported_by_current_model() {
+        // Current turn has no media; history carries an attachment the model rejects.
+        let mut request = bare_request();
+        request.history = vec![Message {
+            role: Role::User,
+            parts: vec![MessagePart::Media {
+                media_id: 3,
+                mime: "application/pdf".into(),
+            }],
+        }];
+
+        assert_eq!(
+            preflight_request_media("gpt-4.1-nano", &request),
+            Err(MediaPreflightError::UnsupportedMime {
+                model: "gpt-4.1-nano".into(),
+                mime: "application/pdf".into(),
+            })
+        );
     }
 }

@@ -52,7 +52,7 @@ struct Migration {
     ddl: fn() -> String,
 }
 
-const MIGRATIONS: [Migration; 8] = [
+const MIGRATIONS: [Migration; 9] = [
     Migration {
         id: "0001_permission_grants",
         ddl: permission_grants_ddl,
@@ -84,6 +84,10 @@ const MIGRATIONS: [Migration; 8] = [
     Migration {
         id: "0008_prompt_memory",
         ddl: prompt_memory_ddl,
+    },
+    Migration {
+        id: "0009_media",
+        ddl: media_ddl,
     },
 ];
 
@@ -401,6 +405,145 @@ fn prompt_memory_ddl() -> String {
     .to_owned()
 }
 
+/// Durable media index plus message-part and retry-boundary support for multimodal attachments.
+///
+/// Blobs live at `{data_directory}/media/{sha256}` outside SQLite. `message_parts` is rebuilt so
+/// existing CHECK constraints can admit `kind = 'media'` with `media_id`/`mime`; pre-existing
+/// parts copy through with those columns NULL. `retry_media_ids` is JSON text of media ids only —
+/// never source paths — so resume/retry can resolve blobs without the original file path.
+fn media_ddl() -> String {
+    "
+    CREATE TABLE media (
+        id INTEGER PRIMARY KEY,
+        sha256 TEXT NOT NULL UNIQUE CHECK(length(sha256) = 64),
+        mime TEXT NOT NULL CHECK(mime <> ''),
+        byte_len INTEGER NOT NULL CHECK(byte_len > 0 AND byte_len <= 10485760),
+        created_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE message_parts_new (
+        session_id INTEGER NOT NULL,
+        message_sequence INTEGER NOT NULL,
+        sequence INTEGER NOT NULL CHECK(sequence >= 0),
+        kind TEXT NOT NULL CHECK(kind IN('text', 'reasoning', 'tool_call', 'tool_result', 'media')),
+        text TEXT,
+        call_id TEXT,
+        name TEXT,
+        input_json TEXT,
+        content TEXT,
+        is_error INTEGER CHECK(is_error IN(0, 1)),
+        media_id INTEGER,
+        mime TEXT,
+        PRIMARY KEY(session_id, message_sequence, sequence),
+        FOREIGN KEY(session_id, message_sequence) REFERENCES messages(session_id, sequence) ON DELETE CASCADE,
+        FOREIGN KEY(media_id) REFERENCES media(id),
+        CHECK((kind IN('text', 'reasoning') AND text IS NOT NULL AND call_id IS NULL AND name IS NULL AND input_json IS NULL AND content IS NULL AND is_error IS NULL AND media_id IS NULL AND mime IS NULL) OR (kind = 'tool_call' AND text IS NULL AND call_id IS NOT NULL AND call_id <> '' AND name IS NOT NULL AND name <> '' AND input_json IS NOT NULL AND content IS NULL AND is_error IS NULL AND media_id IS NULL AND mime IS NULL) OR (kind = 'tool_result' AND text IS NULL AND call_id IS NOT NULL AND call_id <> '' AND name IS NULL AND input_json IS NULL AND content IS NOT NULL AND is_error IS NOT NULL AND media_id IS NULL AND mime IS NULL) OR (kind = 'media' AND text IS NULL AND call_id IS NULL AND name IS NULL AND input_json IS NULL AND content IS NULL AND is_error IS NULL AND media_id IS NOT NULL AND mime IS NOT NULL AND mime <> ''))
+    );
+    INSERT INTO message_parts_new (
+        session_id, message_sequence, sequence, kind, text, call_id, name, input_json, content, is_error, media_id, mime
+    )
+    SELECT
+        session_id, message_sequence, sequence, kind, text, call_id, name, input_json, content, is_error, NULL, NULL
+    FROM message_parts;
+    DROP TABLE message_parts;
+    CREATE TABLE message_parts (
+        session_id INTEGER NOT NULL,
+        message_sequence INTEGER NOT NULL,
+        sequence INTEGER NOT NULL CHECK(sequence >= 0),
+        kind TEXT NOT NULL CHECK(kind IN('text', 'reasoning', 'tool_call', 'tool_result', 'media')),
+        text TEXT,
+        call_id TEXT,
+        name TEXT,
+        input_json TEXT,
+        content TEXT,
+        is_error INTEGER CHECK(is_error IN(0, 1)),
+        media_id INTEGER,
+        mime TEXT,
+        PRIMARY KEY(session_id, message_sequence, sequence),
+        FOREIGN KEY(session_id, message_sequence) REFERENCES messages(session_id, sequence) ON DELETE CASCADE,
+        FOREIGN KEY(media_id) REFERENCES media(id),
+        CHECK((kind IN('text', 'reasoning') AND text IS NOT NULL AND call_id IS NULL AND name IS NULL AND input_json IS NULL AND content IS NULL AND is_error IS NULL AND media_id IS NULL AND mime IS NULL) OR (kind = 'tool_call' AND text IS NULL AND call_id IS NOT NULL AND call_id <> '' AND name IS NOT NULL AND name <> '' AND input_json IS NOT NULL AND content IS NULL AND is_error IS NULL AND media_id IS NULL AND mime IS NULL) OR (kind = 'tool_result' AND text IS NULL AND call_id IS NOT NULL AND call_id <> '' AND name IS NULL AND input_json IS NULL AND content IS NOT NULL AND is_error IS NOT NULL AND media_id IS NULL AND mime IS NULL) OR (kind = 'media' AND text IS NULL AND call_id IS NULL AND name IS NULL AND input_json IS NULL AND content IS NULL AND is_error IS NULL AND media_id IS NOT NULL AND mime IS NOT NULL AND mime <> ''))
+    );
+    INSERT INTO message_parts (
+        session_id, message_sequence, sequence, kind, text, call_id, name, input_json, content, is_error, media_id, mime
+    )
+    SELECT
+        session_id, message_sequence, sequence, kind, text, call_id, name, input_json, content, is_error, media_id, mime
+    FROM message_parts_new;
+    DROP TABLE message_parts_new;
+    CREATE INDEX parts_message_order ON message_parts(session_id, message_sequence, sequence);
+
+    ALTER TABLE session_attempts ADD COLUMN retry_media_ids TEXT
+        CHECK(retry_media_ids IS NULL OR (json_valid(retry_media_ids) AND json_type(retry_media_ids) = 'array'));
+
+    -- Allow empty retry_prompt for media-only turns (length 0). Application code still rejects
+    -- empty prompt when media_ids is also empty. Rebuild without RENAME so sqlite_schema keeps
+    -- the unquoted table name the normalized schema validator expects.
+    CREATE TABLE session_attempts_media (
+        id INTEGER PRIMARY KEY,
+        session_id INTEGER NOT NULL,
+        sequence INTEGER NOT NULL CHECK(sequence > 0),
+        status TEXT NOT NULL CHECK(status IN('running', 'completed', 'cancelled', 'failed', 'provider_error', 'interrupted')),
+        failure_kind TEXT CHECK(failure_kind IN('cancelled', 'failed', 'provider_error', 'interrupted')),
+        retry_prompt TEXT CHECK(retry_prompt IS NULL OR (length(CAST(retry_prompt AS BLOB)) BETWEEN 0 AND 65536)),
+        started_at INTEGER NOT NULL,
+        finished_at INTEGER,
+        completed_turn_sequence INTEGER, retry_media_ids TEXT
+        CHECK(retry_media_ids IS NULL OR (json_valid(retry_media_ids) AND json_type(retry_media_ids) = 'array')),
+        FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE,
+        FOREIGN KEY(session_id, completed_turn_sequence) REFERENCES turns(session_id, sequence) ON DELETE SET NULL,
+        CHECK((status = 'running' AND failure_kind IS NULL AND retry_prompt IS NOT NULL AND finished_at IS NULL AND completed_turn_sequence IS NULL) OR
+              (status = 'completed' AND failure_kind IS NULL AND retry_prompt IS NULL AND finished_at IS NOT NULL AND completed_turn_sequence IS NOT NULL) OR
+              (status = 'cancelled' AND failure_kind = 'cancelled' AND finished_at IS NOT NULL AND completed_turn_sequence IS NULL) OR
+              (status = 'failed' AND failure_kind = 'failed' AND finished_at IS NOT NULL AND completed_turn_sequence IS NULL) OR
+              (status = 'provider_error' AND failure_kind = 'provider_error' AND finished_at IS NOT NULL AND completed_turn_sequence IS NULL) OR
+              (status = 'interrupted' AND failure_kind = 'interrupted' AND finished_at IS NOT NULL AND completed_turn_sequence IS NULL))
+    );
+    INSERT INTO session_attempts_media (
+        id, session_id, sequence, status, failure_kind, retry_prompt, started_at, finished_at,
+        completed_turn_sequence, retry_media_ids
+    )
+    SELECT
+        id, session_id, sequence, status, failure_kind, retry_prompt, started_at, finished_at,
+        completed_turn_sequence, retry_media_ids
+    FROM session_attempts;
+    DROP TABLE session_attempts;
+    CREATE TABLE session_attempts (
+        id INTEGER PRIMARY KEY,
+        session_id INTEGER NOT NULL,
+        sequence INTEGER NOT NULL CHECK(sequence > 0),
+        status TEXT NOT NULL CHECK(status IN('running', 'completed', 'cancelled', 'failed', 'provider_error', 'interrupted')),
+        failure_kind TEXT CHECK(failure_kind IN('cancelled', 'failed', 'provider_error', 'interrupted')),
+        retry_prompt TEXT CHECK(retry_prompt IS NULL OR (length(CAST(retry_prompt AS BLOB)) BETWEEN 0 AND 65536)),
+        started_at INTEGER NOT NULL,
+        finished_at INTEGER,
+        completed_turn_sequence INTEGER, retry_media_ids TEXT
+        CHECK(retry_media_ids IS NULL OR (json_valid(retry_media_ids) AND json_type(retry_media_ids) = 'array')),
+        FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE,
+        FOREIGN KEY(session_id, completed_turn_sequence) REFERENCES turns(session_id, sequence) ON DELETE SET NULL,
+        CHECK((status = 'running' AND failure_kind IS NULL AND retry_prompt IS NOT NULL AND finished_at IS NULL AND completed_turn_sequence IS NULL) OR
+              (status = 'completed' AND failure_kind IS NULL AND retry_prompt IS NULL AND finished_at IS NOT NULL AND completed_turn_sequence IS NOT NULL) OR
+              (status = 'cancelled' AND failure_kind = 'cancelled' AND finished_at IS NOT NULL AND completed_turn_sequence IS NULL) OR
+              (status = 'failed' AND failure_kind = 'failed' AND finished_at IS NOT NULL AND completed_turn_sequence IS NULL) OR
+              (status = 'provider_error' AND failure_kind = 'provider_error' AND finished_at IS NOT NULL AND completed_turn_sequence IS NULL) OR
+              (status = 'interrupted' AND failure_kind = 'interrupted' AND finished_at IS NOT NULL AND completed_turn_sequence IS NULL))
+    );
+    INSERT INTO session_attempts (
+        id, session_id, sequence, status, failure_kind, retry_prompt, started_at, finished_at,
+        completed_turn_sequence, retry_media_ids
+    )
+    SELECT
+        id, session_id, sequence, status, failure_kind, retry_prompt, started_at, finished_at,
+        completed_turn_sequence, retry_media_ids
+    FROM session_attempts_media;
+    DROP TABLE session_attempts_media;
+    CREATE UNIQUE INDEX session_attempts_session_sequence ON session_attempts(session_id, sequence);
+    CREATE UNIQUE INDEX session_attempts_one_running ON session_attempts(session_id) WHERE status = 'running';
+    CREATE INDEX session_attempts_latest ON session_attempts(session_id, sequence DESC, id DESC);
+    "
+    .to_owned()
+}
+
 #[cfg(unix)]
 fn restrict_permissions(path: &Path, maximum_mode: u32) -> Result<(), DatabaseError> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -609,6 +752,7 @@ mod tests {
                     "started_at",
                     "finished_at",
                     "completed_turn_sequence",
+                    "retry_media_ids",
                 ],
             ),
             (
@@ -712,6 +856,7 @@ mod tests {
                     "started_at",
                     "finished_at",
                     "completed_turn_sequence",
+                    "retry_media_ids",
                 ],
             ),
             (

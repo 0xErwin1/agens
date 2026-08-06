@@ -368,6 +368,8 @@ mod tests {
                 effective_capabilities: None,
                 pending_system_reminder: None,
                 skills: None,
+                media_ids: Vec::new(),
+                media_mimes: Vec::new(),
             },
         );
         assert_eq!(request.active_agent.as_deref(), Some("reviewer"));
@@ -620,6 +622,8 @@ mod tests {
                 effective_capabilities: None,
                 pending_system_reminder: None,
                 skills: None,
+                media_ids: Vec::new(),
+                media_mimes: Vec::new(),
             },
         );
 
@@ -649,6 +653,8 @@ mod tests {
                 effective_capabilities: None,
                 pending_system_reminder: None,
                 skills: None,
+                media_ids: Vec::new(),
+                media_mimes: Vec::new(),
             },
         );
 

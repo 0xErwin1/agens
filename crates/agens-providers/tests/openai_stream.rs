@@ -1,7 +1,10 @@
+use std::collections::BTreeMap;
+
 use agens_core::{Error, Message, MessagePart, Role, TurnEvent, Usage};
 use agens_providers::{
     OpenAiFunctionTool, decode_openai_response_events, decode_openai_response_events_with_usage,
     encode_openai_response_request, encode_openai_response_request_with_messages,
+    encode_openai_response_request_with_messages_and_media,
     encode_openai_response_request_with_tools,
 };
 use serde_json::json;
@@ -20,6 +23,106 @@ fn encodes_a_text_user_prompt_as_a_streaming_responses_request() {
     assert_eq!(
         request,
         r#"{"input":[{"content":"Where is Paris?","role":"user"}],"model":"gpt-5.6","stream":true}"#
+    );
+}
+
+#[test]
+fn encodes_user_media_as_responses_input_image_data_url() {
+    let messages = vec![Message {
+        role: Role::User,
+        parts: vec![
+            MessagePart::Text("describe this".to_owned()),
+            MessagePart::Media {
+                media_id: 7,
+                mime: "image/png".to_owned(),
+            },
+        ],
+    }];
+    let mut media = BTreeMap::new();
+    media.insert(7, b"fake-png-bytes".to_vec());
+
+    let request =
+        encode_openai_response_request_with_messages_and_media("gpt-5.6", &messages, &[], &media)
+            .expect("multimodal user turn should encode");
+
+    let body: serde_json::Value = serde_json::from_str(&request).expect("json");
+    let content = &body["input"][0]["content"];
+    assert_eq!(body["input"][0]["role"], json!("user"));
+    assert_eq!(
+        content[0],
+        json!({"type": "input_text", "text": "describe this"})
+    );
+    assert_eq!(content[1]["type"], json!("input_image"));
+    assert_eq!(
+        content[1]["image_url"],
+        json!("data:image/png;base64,ZmFrZS1wbmctYnl0ZXM=")
+    );
+}
+
+#[test]
+fn encodes_media_only_user_turn_as_input_image() {
+    let messages = vec![Message {
+        role: Role::User,
+        parts: vec![MessagePart::Media {
+            media_id: 3,
+            mime: "image/jpeg".to_owned(),
+        }],
+    }];
+    let mut media = BTreeMap::new();
+    media.insert(3, b"jpeg-bytes".to_vec());
+
+    let request =
+        encode_openai_response_request_with_messages_and_media("gpt-5.6", &messages, &[], &media)
+            .expect("media-only user turn should encode");
+
+    let body: serde_json::Value = serde_json::from_str(&request).expect("json");
+    let content = body["input"][0]["content"]
+        .as_array()
+        .expect("content array");
+    assert_eq!(content.len(), 1);
+    assert_eq!(content[0]["type"], json!("input_image"));
+    assert_eq!(
+        content[0]["image_url"],
+        json!("data:image/jpeg;base64,anBlZy1ieXRlcw==")
+    );
+}
+
+#[test]
+fn rejects_user_media_when_blob_is_missing() {
+    let messages = vec![Message {
+        role: Role::User,
+        parts: vec![MessagePart::Media {
+            media_id: 99,
+            mime: "image/png".to_owned(),
+        }],
+    }];
+
+    assert_eq!(
+        encode_openai_response_request_with_messages_and_media(
+            "gpt-5.6",
+            &messages,
+            &[],
+            &BTreeMap::new(),
+        ),
+        Err(Error::Provider(
+            "OpenAI request error: media blob unavailable for media_id 99".to_owned()
+        ))
+    );
+}
+
+#[test]
+fn text_only_history_still_encodes_without_media_map_entries() {
+    let messages = vec![Message {
+        role: Role::User,
+        parts: vec![MessagePart::Text("hello".to_owned())],
+    }];
+
+    let request =
+        encode_openai_response_request_with_messages("gpt-5.6", &messages, &[]).expect("text");
+    let body: serde_json::Value = serde_json::from_str(&request).expect("json");
+    assert_eq!(
+        body["input"][0]["content"][0],
+        json!({"type": "input_text", "text": "hello"})
     );
 }
 

@@ -276,7 +276,11 @@ impl PromptMemoryState {
     }
 }
 
-fn overlay_items(entries: &[PromptMemoryEntry], query: &str, limit: usize) -> Vec<PromptOverlayItem> {
+fn overlay_items(
+    entries: &[PromptMemoryEntry],
+    query: &str,
+    limit: usize,
+) -> Vec<PromptOverlayItem> {
     let query_lower = query.to_ascii_lowercase();
     entries
         .iter()

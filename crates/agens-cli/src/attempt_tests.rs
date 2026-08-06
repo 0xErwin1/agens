@@ -172,6 +172,7 @@ mod tests {
             &mut store,
             terminal_failure,
             "terminal failure".into(),
+            Vec::new(),
             |_attempt| Err(CliError::runtime(HeadlessTurnError::Cancelled)),
             |_, _| Err(agens_session::attempt::AttemptStoreError),
         )
@@ -377,6 +378,7 @@ mod tests {
             &mut store,
             metadata.clone(),
             "inspect failure".into(),
+            Vec::new(),
             |_attempt| Err(CliError::runtime(HeadlessTurnError::ProviderNetwork)),
             |store, write| write_terminal_attempt_with_history(store, write, &partial_turn),
         )
@@ -441,6 +443,8 @@ mod tests {
             effective_capabilities: None,
             pending_system_reminder: None,
             skills: None,
+            media_ids: Vec::new(),
+            media_mimes: Vec::new(),
         }
     }
 
@@ -515,6 +519,7 @@ mod tests {
             &mut store,
             metadata.clone(),
             "explore the runtime".into(),
+            Vec::new(),
             |_attempt| Err(CliError::runtime(HeadlessTurnError::TimedOut)),
             |store, write| {
                 assert_eq!(write.status, agens_core::SessionAttemptStatus::Cancelled);
@@ -642,6 +647,7 @@ mod tests {
             &mut store,
             terminal_metadata.clone(),
             "terminal retry prompt".into(),
+            Vec::new(),
             |_attempt| Err(CliError::runtime(HeadlessTurnError::Cancelled)),
             |_, _| Err(agens_session::attempt::AttemptStoreError),
         )

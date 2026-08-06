@@ -24,7 +24,7 @@ use agens_core::{
 use serde_json::Value;
 
 use crate::{
-    Error, MAX_HTTP_STATUS_ATTEMPTS, MAX_SSE_FRAME_BYTES, OpenAiFunctionTool,
+    Error, MAX_HTTP_STATUS_ATTEMPTS, MAX_SSE_FRAME_BYTES, MediaBlobs, OpenAiFunctionTool,
     ProgressAwareProvider, ProviderDiagnosticClass, ProviderDiagnosticComponent,
     ProviderDiagnosticKind, ProviderDiagnostics, ProviderFailureDetail,
     classify_openai_response_status, diagnostic_class_for_port_error, diagnostic_class_for_status,
@@ -71,6 +71,7 @@ pub struct MoonshotProvider {
     diagnostics: Option<ProviderDiagnostics>,
     progress: Option<TurnProgressSink>,
     failure_detail: Option<ProviderFailureDetail>,
+    media_blobs: MediaBlobs,
 }
 
 impl MoonshotProvider {
@@ -146,7 +147,14 @@ impl MoonshotProvider {
             diagnostics: None,
             progress: None,
             failure_detail: None,
+            media_blobs: MediaBlobs::new(),
         })
+    }
+
+    #[must_use]
+    pub fn with_media_blobs(mut self, media_blobs: MediaBlobs) -> Self {
+        self.media_blobs = media_blobs;
+        self
     }
 
     pub fn with_operation_timeout(mut self, operation_timeout: Duration) -> Self {
@@ -179,10 +187,10 @@ impl MoonshotProvider {
     }
 
     fn payload(&self) -> Result<Value, HeadlessTurnPortError> {
-        encode::validate_chat_completions_history(&self.history)
+        encode::validate_chat_completions_history(&self.history, &self.media_blobs)
             .map_err(|_| HeadlessTurnPortError::ProviderProtocol)?;
 
-        Ok(encode::encode_request(
+        encode::encode_request(
             &self.history,
             &RequestOptions {
                 model: &self.model,
@@ -190,7 +198,9 @@ impl MoonshotProvider {
                 parallel_tool_calls: self.parallel_tool_calls,
                 reasoning_effort: self.request_config.reasoning_effort(),
             },
-        ))
+            &self.media_blobs,
+        )
+        .map_err(|_| HeadlessTurnPortError::Provider)
     }
 
     fn emit(

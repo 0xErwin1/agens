@@ -81,19 +81,29 @@ fn session_messages_preserve_all_typed_part_payloads() {
     }
 }
 
+fn media_part(media_id: i64, mime: &str) -> MessagePart {
+    MessagePart::Media {
+        media_id,
+        mime: mime.into(),
+    }
+}
+
 #[test]
 fn session_messages_reject_empty_and_role_incompatible_parts() {
     for (role, part) in [
         (Role::System, MessagePart::Reasoning("reasoning".into())),
         (Role::System, tool_call("id", "read", "{}")),
         (Role::System, tool_result("id", "result", false)),
+        (Role::System, media_part(1, "image/png")),
         (Role::User, MessagePart::Reasoning("reasoning".into())),
         (Role::User, tool_call("id", "read", "{}")),
         (Role::User, tool_result("id", "result", false)),
         (Role::Assistant, tool_result("id", "result", false)),
+        (Role::Assistant, media_part(1, "image/png")),
         (Role::Tool, MessagePart::Text("text".into())),
         (Role::Tool, MessagePart::Reasoning("reasoning".into())),
         (Role::Tool, tool_call("id", "read", "{}")),
+        (Role::Tool, media_part(1, "image/png")),
     ] {
         assert_eq!(
             SessionMessage::try_from(Message {
@@ -114,6 +124,8 @@ fn session_messages_reject_empty_and_role_incompatible_parts() {
         (Role::Assistant, tool_call("id", "read", "")),
         (Role::Tool, tool_result("", "result", false)),
         (Role::Tool, tool_result("id", "", false)),
+        (Role::User, media_part(0, "image/png")),
+        (Role::User, media_part(1, "")),
     ] {
         assert_eq!(
             SessionMessage::try_from(Message {
@@ -131,6 +143,34 @@ fn session_messages_reject_empty_and_role_incompatible_parts() {
         }),
         Err(SessionMessageError::EmptyParts)
     );
+}
+
+#[test]
+fn user_session_messages_accept_media_parts_with_text() {
+    let message = Message {
+        role: Role::User,
+        parts: vec![
+            MessagePart::Text("describe this".into()),
+            media_part(42, "image/png"),
+        ],
+    };
+
+    let session_message = SessionMessage::try_from(message.clone()).unwrap();
+
+    assert_eq!(session_message.as_message(), &message);
+    assert_eq!(session_message.into_message(), message);
+}
+
+#[test]
+fn user_session_messages_accept_media_only_parts() {
+    let message = Message {
+        role: Role::User,
+        parts: vec![media_part(7, "image/jpeg")],
+    };
+
+    let session_message = SessionMessage::try_from(message.clone()).unwrap();
+
+    assert_eq!(session_message.as_message(), &message);
 }
 
 #[test]

@@ -31,6 +31,10 @@ pub struct SessionContext {
     pub resume_notice: Option<String>,
     pub agent_correction_pending: bool,
     pub resume_draft: Option<ResumeDraft>,
+    /// Durable media ids staged for the next user turn (composer chips / retry restore).
+    /// Surfaces call store ingest; this holds only ids + mimes, never blob bytes or paths.
+    pub pending_media_ids: Vec<i64>,
+    pub pending_media_mimes: Vec<String>,
     pub selected_subagent: Option<String>,
     pub dangerous_mode: bool,
     /// Whether `Ask` permission prompts are bypassed for this session. Seeded from
@@ -221,6 +225,8 @@ impl SessionContext {
             resume_notice: None,
             agent_correction_pending: false,
             resume_draft: None,
+            pending_media_ids: Vec::new(),
+            pending_media_mimes: Vec::new(),
             selected_subagent: None,
             dangerous_mode: false,
             bypass_permissions: false,
@@ -254,11 +260,36 @@ impl SessionContext {
             resume_notice: None,
             agent_correction_pending: false,
             resume_draft: None,
+            pending_media_ids: Vec::new(),
+            pending_media_mimes: Vec::new(),
             selected_subagent: None,
             dangerous_mode: false,
             bypass_permissions: false,
             running: false,
         }
+    }
+
+    /// Stages a durable media attachment for the next user turn.
+    pub fn push_pending_media(&mut self, media_id: i64, mime: String) {
+        self.pending_media_ids.push(media_id);
+        self.pending_media_mimes.push(mime);
+    }
+
+    /// Takes staged media for the next turn (clears pending).
+    pub fn take_pending_media(&mut self) -> (Vec<i64>, Vec<String>) {
+        (
+            std::mem::take(&mut self.pending_media_ids),
+            std::mem::take(&mut self.pending_media_mimes),
+        )
+    }
+
+    /// Composer chip labels for staged media (`[Image #N]` / `[File #N]`).
+    pub fn pending_media_chip_labels(&self) -> Vec<String> {
+        self.pending_media_mimes
+            .iter()
+            .enumerate()
+            .map(|(index, mime)| agens_store::media_chip_label(index + 1, mime))
+            .collect()
     }
 
     pub fn note(&self) -> String {

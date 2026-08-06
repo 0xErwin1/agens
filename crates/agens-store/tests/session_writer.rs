@@ -8,7 +8,7 @@ use agens_core::{
     MAX_RETRY_PROMPT_BYTES, Message, MessagePart, ReasoningEffort, RecoveryOutcome, Role,
     SessionAttemptFailureKind, SessionAttemptStatus, SessionMessage, SessionMetadata,
 };
-use agens_store::{SessionCursor, SessionStore, StoredSession};
+use agens_store::{SessionCursor, SessionStore, StoredSession, ingest_media_bytes};
 use rusqlite::Connection;
 
 static NEXT_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
@@ -1314,6 +1314,210 @@ fn appends_completed_turn_when_a_concurrent_subagent_turn_advanced_the_count() {
             "parent",
         ]
     );
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn media_parts_round_trip_without_source_path() {
+    let directory = directory();
+    let media = ingest_media_bytes(&directory, b"session-media", "image/png").unwrap();
+    let metadata = SessionMetadata {
+        id: 11,
+        project: "project".into(),
+        title: "title".into(),
+        active_agent: "primary".into(),
+        provider_id: None,
+        model_id: None,
+        reasoning_effort: None,
+        created_at: 10,
+        updated_at: 20,
+        completed_turn_count: 0,
+        resumable: false,
+    };
+    let completed = turn(vec![
+        Message {
+            role: Role::User,
+            parts: vec![
+                MessagePart::Text("what is this".into()),
+                MessagePart::Media {
+                    media_id: media.id,
+                    mime: media.mime.clone(),
+                },
+            ],
+        },
+        Message {
+            role: Role::Assistant,
+            parts: vec![MessagePart::Text("an image".into())],
+        },
+    ]);
+    let mut store = SessionStore::open(&directory).unwrap();
+    let attempt = store
+        .begin_session_attempt(&metadata, "retry with media".into())
+        .unwrap();
+
+    assert_eq!(
+        store
+            .persist_completed_session_attempt(attempt.key(), &metadata, &completed, 21)
+            .unwrap(),
+        AttemptFinishOutcome::Finished
+    );
+
+    let stored = store.load_session_for_resume(metadata.id).unwrap();
+    assert_eq!(
+        stored.messages[0].parts,
+        vec![
+            MessagePart::Text("what is this".into()),
+            MessagePart::Media {
+                media_id: media.id,
+                mime: "image/png".into(),
+            },
+        ]
+    );
+
+    let connection = Connection::open(store.database_path()).unwrap();
+    let (kind, media_id, mime, text): (String, Option<i64>, Option<String>, Option<String>) =
+        connection
+            .query_row(
+                "SELECT kind, media_id, mime, text FROM message_parts
+                 WHERE session_id = ?1 AND message_sequence = 1 AND sequence = 1",
+                [metadata.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+    assert_eq!(kind, "media");
+    assert_eq!(media_id, Some(media.id));
+    assert_eq!(mime.as_deref(), Some("image/png"));
+    assert_eq!(text, None);
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn begin_session_attempt_allows_empty_prompt_when_media_ids_present() {
+    let directory = directory();
+    let media = ingest_media_bytes(&directory, b"media-only", "image/png").unwrap();
+    let metadata = SessionMetadata {
+        id: 21,
+        project: "project".into(),
+        title: "title".into(),
+        active_agent: "primary".into(),
+        provider_id: None,
+        model_id: None,
+        reasoning_effort: None,
+        created_at: 10,
+        updated_at: 20,
+        completed_turn_count: 0,
+        resumable: false,
+    };
+    let mut store = SessionStore::open(&directory).unwrap();
+
+    let attempt = store
+        .begin_session_attempt_with_media(&metadata, String::new(), vec![media.id])
+        .expect("empty prompt with media must begin");
+    let boundary = store.load_retry_boundary(attempt.key()).unwrap().unwrap();
+    assert_eq!(boundary.prompt(), "");
+    assert_eq!(boundary.media_ids(), &[media.id]);
+
+    assert!(
+        store
+            .begin_session_attempt_with_media(
+                &SessionMetadata {
+                    id: 22,
+                    project: "other".into(),
+                    title: "other".into(),
+                    active_agent: "primary".into(),
+                    provider_id: None,
+                    model_id: None,
+                    reasoning_effort: None,
+                    created_at: 10,
+                    updated_at: 20,
+                    completed_turn_count: 0,
+                    resumable: false,
+                },
+                String::new(),
+                Vec::new(),
+            )
+            .is_err(),
+        "empty prompt without media must still fail"
+    );
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn retry_boundary_round_trips_media_ids_without_source_paths() {
+    let directory = directory();
+    let first = ingest_media_bytes(&directory, b"retry-a", "image/png").unwrap();
+    let second = ingest_media_bytes(&directory, b"retry-b", "image/jpeg").unwrap();
+    let metadata = SessionMetadata {
+        id: 12,
+        project: "project".into(),
+        title: "title".into(),
+        active_agent: "primary".into(),
+        provider_id: None,
+        model_id: None,
+        reasoning_effort: None,
+        created_at: 10,
+        updated_at: 20,
+        completed_turn_count: 0,
+        resumable: false,
+    };
+    let mut store = SessionStore::open(&directory).unwrap();
+    let attempt = store
+        .begin_session_attempt_with_media(
+            &metadata,
+            "private multimodal draft".into(),
+            vec![first.id, second.id],
+        )
+        .unwrap();
+
+    let boundary = store.load_retry_boundary(attempt.key()).unwrap().unwrap();
+    assert_eq!(boundary.prompt(), "private multimodal draft");
+    assert_eq!(boundary.media_ids(), &[first.id, second.id]);
+
+    let connection = Connection::open(store.database_path()).unwrap();
+    let stored_json: Option<String> = connection
+        .query_row(
+            "SELECT retry_media_ids FROM session_attempts WHERE id = ?1",
+            [attempt.key().attempt_id()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let json = stored_json.expect("retry_media_ids must be stored");
+    assert_eq!(json, format!("[{},{}]", first.id, second.id));
+    assert!(!json.contains('/'));
+    assert!(!json.contains("source"));
+
+    let empty = store
+        .begin_session_attempt_with_media(
+            &SessionMetadata {
+                id: 13,
+                project: "other".into(),
+                title: "other".into(),
+                active_agent: "primary".into(),
+                provider_id: None,
+                model_id: None,
+                reasoning_effort: None,
+                created_at: 10,
+                updated_at: 20,
+                completed_turn_count: 0,
+                resumable: false,
+            },
+            "text only".into(),
+            Vec::new(),
+        )
+        .unwrap();
+    let empty_boundary = store.load_retry_boundary(empty.key()).unwrap().unwrap();
+    assert_eq!(empty_boundary.media_ids(), &[] as &[i64]);
+    let empty_json: Option<String> = connection
+        .query_row(
+            "SELECT retry_media_ids FROM session_attempts WHERE id = ?1",
+            [empty.key().attempt_id()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(empty_json, None);
 
     fs::remove_dir_all(directory).unwrap();
 }

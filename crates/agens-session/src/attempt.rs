@@ -61,11 +61,21 @@ impl AttemptActivityRegistry {
         metadata: &SessionMetadata,
         prompt: String,
     ) -> Result<agens_core::SessionAttemptSummary, BeginSessionAttemptError> {
+        self.begin_and_register_with_media(store, metadata, prompt, Vec::new())
+    }
+
+    pub fn begin_and_register_with_media(
+        &self,
+        store: &mut SessionStore,
+        metadata: &SessionMetadata,
+        prompt: String,
+        media_ids: Vec<i64>,
+    ) -> Result<agens_core::SessionAttemptSummary, BeginSessionAttemptError> {
         let mut active = self
             .active
             .lock()
             .map_err(|_| BeginSessionAttemptError::Store)?;
-        let attempt = store.begin_session_attempt(metadata, prompt)?;
+        let attempt = store.begin_session_attempt_with_media(metadata, prompt, media_ids)?;
         active.push(ScopedAttemptKey {
             database_path: store.database_path(),
             key: attempt.key(),
@@ -257,6 +267,7 @@ pub fn run_session_attempt_lifecycle(
         store,
         metadata,
         prompt,
+        Vec::new(),
         |_attempt| runtime(),
         |store, write| write_terminal_attempt(store, write, interrupted_note),
     )
@@ -276,6 +287,7 @@ pub fn run_session_attempt_lifecycle_with_terminal_writer(
     store: &mut SessionStore,
     mut metadata: SessionMetadata,
     prompt: String,
+    media_ids: Vec<i64>,
     runtime: impl FnOnce(AttemptKey) -> Result<(CompletedTurnSnapshot, CompletedSessionTurn), CliError>,
     terminal_writer: impl FnOnce(
         &mut SessionStore,
@@ -283,7 +295,7 @@ pub fn run_session_attempt_lifecycle_with_terminal_writer(
     ) -> Result<Option<PartialTurnRecord>, AttemptStoreError>,
 ) -> Result<SessionAttemptCompletion, AttemptLifecycleError> {
     let attempt = registry
-        .begin_and_register(store, &metadata, prompt.clone())
+        .begin_and_register_with_media(store, &metadata, prompt.clone(), media_ids)
         .map_err(AttemptLifecycleError::Begin)?;
     let _registered = RegisteredAttempt {
         registry,

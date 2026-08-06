@@ -3761,3 +3761,75 @@ fn history_stash_typed_slash_resolve_opens_overlays_without_provider_turn() {
     assert!(session.lock().unwrap().messages.is_empty());
     std::fs::remove_dir_all(temporary).unwrap();
 }
+
+#[test]
+fn attach_command_ingests_media_and_returns_path_free_chips() {
+    let temporary = tui_session_directory("attach-command");
+    let bootstrap = tui_session_bootstrap(&temporary, &[]);
+    let _store = SessionStore::open(bootstrap.data_directory()).unwrap();
+    let project = temporary.join("project");
+    std::fs::write(project.join("photo.png"), b"photo-bytes").unwrap();
+
+    let session = Arc::new(Mutex::new(SessionContext::fresh()));
+    let router = TuiRuntimeRouter::new(
+        bootstrap,
+        Arc::clone(&session),
+        Arc::new(Mutex::new(None)),
+        Arc::new(CommandCatalog::default()),
+        Arc::new(SkillCatalog::default()),
+    );
+    let (progress, _) = std::sync::mpsc::channel();
+    let outcome =
+        router.route_request(TuiRouteRequest::Input("/attach photo.png".into()), progress);
+
+    let TuiSubmissionOutcome::MediaAttached {
+        message,
+        media_chips,
+    } = outcome
+    else {
+        panic!("expected MediaAttached, got {outcome:?}");
+    };
+    assert!(message.contains("[Image #1]"), "{message}");
+    assert_eq!(media_chips, vec!["[Image #1]".to_owned()]);
+    assert_eq!(session.lock().unwrap().pending_media_ids.len(), 1);
+    assert_eq!(
+        session.lock().unwrap().pending_media_mimes,
+        vec!["image/png".to_owned()]
+    );
+    // Path-free: chips and message must not echo the source path.
+    assert!(!message.contains("photo.png"));
+    assert!(!media_chips.iter().any(|chip| chip.contains("photo")));
+
+    std::fs::remove_dir_all(temporary).unwrap();
+}
+
+#[test]
+fn clipboard_image_route_ingests_bytes() {
+    let temporary = tui_session_directory("clipboard-image");
+    let bootstrap = tui_session_bootstrap(&temporary, &[]);
+    let _store = SessionStore::open(bootstrap.data_directory()).unwrap();
+    let session = Arc::new(Mutex::new(SessionContext::fresh()));
+    let router = TuiRuntimeRouter::new(
+        bootstrap,
+        Arc::clone(&session),
+        Arc::new(Mutex::new(None)),
+        Arc::new(CommandCatalog::default()),
+        Arc::new(SkillCatalog::default()),
+    );
+    let png = vec![0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n', 9, 9, 9];
+    let (progress, _) = std::sync::mpsc::channel();
+    let outcome = router.route_request(
+        TuiRouteRequest::AttachClipboardImage {
+            bytes: png,
+            mime: None,
+        },
+        progress,
+    );
+    let TuiSubmissionOutcome::MediaAttached { media_chips, .. } = outcome else {
+        panic!("expected MediaAttached, got {outcome:?}");
+    };
+    assert_eq!(media_chips, vec!["[Image #1]".to_owned()]);
+    assert_eq!(session.lock().unwrap().pending_media_ids.len(), 1);
+
+    std::fs::remove_dir_all(temporary).unwrap();
+}

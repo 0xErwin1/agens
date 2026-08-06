@@ -1,8 +1,14 @@
+use std::path::{Path, PathBuf};
+
 use agens_tools::ReadFileInput;
 
 use agens_bootstrap::Bootstrap;
 use agens_error::{CliError, ExitStatus};
 use agens_session::context::SessionContext;
+use agens_store::{
+    guess_mime_from_bytes, guess_mime_from_path, ingest_media_bytes, ingest_media_path,
+    is_media_mime,
+};
 use agens_tool_runtime::runtime::open_native_tools;
 
 const TUI_SELECT_FILE_LIMIT: usize = 100;
@@ -70,6 +76,14 @@ pub fn tui_select_candidates(
         .collect())
 }
 
+/// Result of expanding `@` tokens: UTF-8 text files are inlined; media files are ingested.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExpandedTuiPrompt {
+    pub text: String,
+    pub media_ids: Vec<i64>,
+    pub media_mimes: Vec<String>,
+}
+
 /// Resolves the root the same way [`tui_file_candidates_with_limit`] does; see that function's
 /// documentation for why the session's own recorded root must be used instead of re-deriving the
 /// process's discovered root.
@@ -78,31 +92,153 @@ pub fn expand_tui_file_reference(
     bootstrap: &Bootstrap,
     prompt: &str,
 ) -> Result<String, CliError> {
+    Ok(expand_tui_prompt_with_media(context, bootstrap, prompt)?.text)
+}
+
+/// Expands `@path` tokens: media paths are ingested (ids returned, token omitted from text);
+/// UTF-8 text paths are inlined as before.
+///
+/// Media paths use the same project-root confinement as text `@` / `read_file`: `..`, absolute
+/// paths outside the root, and symlink escapes are rejected.
+pub fn expand_tui_prompt_with_media(
+    context: &SessionContext,
+    bootstrap: &Bootstrap,
+    prompt: &str,
+) -> Result<ExpandedTuiPrompt, CliError> {
     let project_root = agens_session::root::resolve_tui_session_root(context, bootstrap)?;
     let tools = open_native_tools(&project_root, bootstrap.tool_limits())?;
     let mut expanded = String::with_capacity(prompt.len());
+    let mut media_ids = Vec::new();
+    let mut media_mimes = Vec::new();
 
     for segment in prompt.split_inclusive(char::is_whitespace) {
         let token = segment.trim_end_matches(char::is_whitespace);
         let whitespace = &segment[token.len()..];
         if let Some(path) = token.strip_prefix('@').filter(|path| !path.is_empty()) {
-            let output = tools
-                .read_file(ReadFileInput::new(path))
-                .map_err(|_| CliError::new(ExitStatus::Failure, "file", "read failed"))?;
-            if output.is_error {
-                return Err(CliError::new(ExitStatus::Failure, "file", output.content));
+            if let Some(mime) = guess_mime_from_path(Path::new(path)).filter(|m| is_media_mime(m)) {
+                let absolute = confine_project_path(&project_root, Path::new(path))?;
+                let record = ingest_media_path(bootstrap.data_directory(), &absolute, &mime)
+                    .map_err(|error| {
+                        CliError::new(
+                            ExitStatus::Failure,
+                            "file",
+                            format!("attach failed: {error}"),
+                        )
+                    })?;
+                media_ids.push(record.id);
+                media_mimes.push(record.mime);
+            } else {
+                let output = tools
+                    .read_file(ReadFileInput::new(path))
+                    .map_err(|_| CliError::new(ExitStatus::Failure, "file", "read failed"))?;
+                if output.is_error {
+                    return Err(CliError::new(ExitStatus::Failure, "file", output.content));
+                }
+                expanded.push_str(&format!(
+                    "<file path=\"{path}\">\n{}\n</file>",
+                    output.content
+                ));
             }
-            expanded.push_str(&format!(
-                "<file path=\"{path}\">\n{}\n</file>",
-                output.content
-            ));
         } else {
             expanded.push_str(token);
         }
         expanded.push_str(whitespace);
     }
 
-    Ok(expanded)
+    Ok(ExpandedTuiPrompt {
+        text: expanded,
+        media_ids,
+        media_mimes,
+    })
+}
+
+/// Ingests a path into the durable media store (surface calls ingest only).
+pub fn ingest_tui_media_path(
+    bootstrap: &Bootstrap,
+    path: &Path,
+) -> Result<(i64, String), CliError> {
+    let mime = guess_mime_from_path(path)
+        .filter(|mime| is_media_mime(mime))
+        .ok_or_else(|| CliError::usage(format!("unsupported media type: {}", path.display())))?;
+    let record = ingest_media_path(bootstrap.data_directory(), path, &mime).map_err(|error| {
+        CliError::storage(format!("attach failed for {}: {error}", path.display()))
+    })?;
+    Ok((record.id, record.mime))
+}
+
+/// Ingests raw image/PDF bytes (clipboard paste path).
+pub fn ingest_tui_media_bytes(
+    bootstrap: &Bootstrap,
+    bytes: &[u8],
+    mime_hint: Option<&str>,
+) -> Result<(i64, String), CliError> {
+    let mime = mime_hint
+        .map(str::to_owned)
+        .or_else(|| guess_mime_from_bytes(bytes))
+        .filter(|mime| is_media_mime(mime))
+        .ok_or_else(|| CliError::usage("clipboard image type is unsupported"))?;
+    let record = ingest_media_bytes(bootstrap.data_directory(), bytes, &mime)
+        .map_err(|error| CliError::storage(format!("clipboard attach failed: {error}")))?;
+    Ok((record.id, record.mime))
+}
+
+/// Resolves `/attach PATH` relative to the session project root when not absolute.
+///
+/// Absolute paths must still resolve under the session project root; `..` and symlink escapes are
+/// rejected the same way as `@` media expansion.
+pub fn resolve_attach_path(
+    context: &SessionContext,
+    bootstrap: &Bootstrap,
+    raw: &str,
+) -> Result<PathBuf, CliError> {
+    let project_root = agens_session::root::resolve_tui_session_root(context, bootstrap)?;
+    confine_project_path(&project_root, Path::new(raw.trim()))
+}
+
+/// Confines an attach path to `project_root`: rejects empty paths, `..` traversal, targets outside
+/// the root, and symlink escapes (via canonicalize). Relative paths resolve under the root;
+/// absolute paths are accepted only when they stay under the root.
+pub(crate) fn confine_project_path(project_root: &Path, raw: &Path) -> Result<PathBuf, CliError> {
+    if raw.as_os_str().is_empty() {
+        return Err(CliError::usage("attach path is empty"));
+    }
+
+    let candidate = if raw.is_absolute() {
+        raw.to_path_buf()
+    } else {
+        if raw.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        }) {
+            return Err(CliError::new(
+                ExitStatus::Failure,
+                "file",
+                "path: traversal is not allowed",
+            ));
+        }
+        project_root.join(raw)
+    };
+
+    let root = project_root
+        .canonicalize()
+        .map_err(|error| CliError::new(ExitStatus::Failure, "file", format!("path: {error}")))?;
+    let resolved = candidate
+        .canonicalize()
+        .map_err(|error| CliError::new(ExitStatus::Failure, "file", format!("path: {error}")))?;
+
+    if !resolved.starts_with(&root) {
+        return Err(CliError::new(
+            ExitStatus::Failure,
+            "file",
+            "path: outside project root",
+        ));
+    }
+
+    Ok(resolved)
 }
 
 #[cfg(test)]
@@ -201,6 +337,109 @@ mod tests {
                 .to_string(),
             "file: read: file exceeds 1048576 byte limit"
         );
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn at_media_path_ingests_instead_of_utf8_inline() {
+        let temporary = tui_session_directory("files-media-at");
+        let bootstrap = tui_session_bootstrap(&temporary, &[]);
+        let _store = SessionStore::open(bootstrap.data_directory()).unwrap();
+        let context = SessionContext::fresh();
+        let project = temporary.join("project");
+        std::fs::write(project.join("shot.png"), b"png-bytes").unwrap();
+        std::fs::write(project.join("notes.txt"), "hello notes").unwrap();
+
+        let expanded =
+            expand_tui_prompt_with_media(&context, &bootstrap, "see @shot.png and @notes.txt")
+                .unwrap();
+        assert_eq!(expanded.media_ids.len(), 1);
+        assert_eq!(expanded.media_mimes, vec!["image/png".to_owned()]);
+        assert!(
+            !expanded.text.contains("png-bytes"),
+            "media must not be inlined as text: {}",
+            expanded.text
+        );
+        assert!(
+            expanded.text.contains("<file path=\"notes.txt\">"),
+            "UTF-8 @ text expansion must remain: {}",
+            expanded.text
+        );
+        assert!(expanded.text.contains("hello notes"));
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn at_media_path_rejects_parent_traversal_and_outside_absolute_paths() {
+        let temporary = tui_session_directory("files-media-confine");
+        let bootstrap = tui_session_bootstrap(&temporary, &[]);
+        let _store = SessionStore::open(bootstrap.data_directory()).unwrap();
+        let context = SessionContext::fresh();
+        let project = temporary.join("project");
+        std::fs::write(project.join("inside.png"), b"inside-png").unwrap();
+        std::fs::write(temporary.join("outside.png"), b"outside-png").unwrap();
+
+        let err = expand_tui_prompt_with_media(&context, &bootstrap, "see @../outside.png")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("traversal") || err.contains("outside project root"),
+            "{err}"
+        );
+
+        let outside_absolute = temporary.join("outside.png");
+        let err = expand_tui_prompt_with_media(
+            &context,
+            &bootstrap,
+            &format!("see @{}", outside_absolute.display()),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("outside project root") || err.contains("traversal"),
+            "{err}"
+        );
+
+        let ok = expand_tui_prompt_with_media(&context, &bootstrap, "see @inside.png").unwrap();
+        assert_eq!(ok.media_ids.len(), 1);
+        assert_eq!(ok.media_mimes, vec!["image/png".to_owned()]);
+
+        let confined =
+            resolve_attach_path(&context, &bootstrap, outside_absolute.to_str().unwrap())
+                .unwrap_err()
+                .to_string();
+        assert!(
+            confined.contains("outside project root") || confined.contains("traversal"),
+            "{confined}"
+        );
+
+        let attach_ok = resolve_attach_path(&context, &bootstrap, "inside.png").unwrap();
+        assert_eq!(
+            attach_ok.canonicalize().unwrap(),
+            project.join("inside.png").canonicalize().unwrap()
+        );
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn ingest_tui_media_path_and_bytes_produce_durable_ids() {
+        let temporary = tui_session_directory("files-ingest");
+        let bootstrap = tui_session_bootstrap(&temporary, &[]);
+        let _store = SessionStore::open(bootstrap.data_directory()).unwrap();
+        let path = temporary.join("project/clip.png");
+        std::fs::write(&path, b"clip-png").unwrap();
+
+        let (id, mime) = ingest_tui_media_path(&bootstrap, &path).unwrap();
+        assert!(id > 0);
+        assert_eq!(mime, "image/png");
+
+        let png = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n', 1, 2, 3];
+        let (id2, mime2) = ingest_tui_media_bytes(&bootstrap, &png, None).unwrap();
+        assert!(id2 > 0);
+        assert_eq!(mime2, "image/png");
 
         std::fs::remove_dir_all(temporary).unwrap();
     }

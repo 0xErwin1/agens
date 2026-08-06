@@ -124,6 +124,9 @@ pub(crate) struct ChatArgs {
     pub(crate) mode: Option<String>,
     #[arg(long)]
     pub(crate) dangerously_allow_all: bool,
+    // Repeatable media paths; ingest happens in `commands/chat` after bootstrap.
+    #[arg(long = "attach", value_name = "PATH", action = clap::ArgAction::Append)]
+    pub(crate) attach: Vec<std::path::PathBuf>,
     // Every trailing token clap does not recognize as one of the flags
     // above: the prompt itself, any extra positional, and any
     // unrecognized flag. `allow_hyphen_values` is intentionally NOT set

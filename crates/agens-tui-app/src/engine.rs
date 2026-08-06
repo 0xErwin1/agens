@@ -16,7 +16,7 @@ use agens_tui::{
 
 use crate::ask_user_prompt::{TuiAskUserPort, production_tui_ask_user_bridge};
 use crate::extensions::{start_tui_commands, start_tui_skills};
-use crate::files::{expand_tui_file_reference, tui_picker_file_candidates};
+use crate::files::{expand_tui_prompt_with_media, tui_picker_file_candidates};
 use crate::metrics::{TuiMetricsPublisher, finish_tui_metrics};
 use crate::models::seed_remembered_tui_selection;
 #[cfg(any(test, feature = "test-support"))]
@@ -139,6 +139,7 @@ pub fn run_production_tui_with_profile_store(
         let presentation = tui_session_presentation(bootstrap, &resumed);
         let message = resumed.note();
         let draft = resumed.resume_draft.take().map(ResumeDraft::into_inner);
+        let media_chips = resumed.pending_media_chip_labels();
         let resume_error = resumed.resume_error.clone();
         resumed.resume_notice = None;
         tui.apply_submission_outcome(TuiSubmissionOutcome::SessionResumed {
@@ -146,6 +147,7 @@ pub fn run_production_tui_with_profile_store(
             presentation,
             history,
             draft,
+            media_chips,
             resume_error,
             // The real picker candidates and palette are set below, once the session's own root
             // is resolved and `start_tui_skills`/`start_tui_commands` have run against it.
@@ -455,6 +457,7 @@ pub fn run_tui_prompt(
             );
             match router.resolve(command.to_owned())? {
                 TuiSubmissionOutcome::LocalInfo(message)
+                | TuiSubmissionOutcome::MediaAttached { message, .. }
                 | TuiSubmissionOutcome::SelectionInfo(message)
                 | TuiSubmissionOutcome::ResetSucceeded { message, .. }
                 | TuiSubmissionOutcome::ContextChanged { message, .. }
@@ -498,11 +501,11 @@ pub fn run_tui_prompt_with(
     skills: Option<Arc<SkillCatalog>>,
     run: impl FnOnce(HeadlessChatRequest) -> Result<HeadlessChatCompletion, HeadlessChatFailure>,
 ) -> Result<String, CliError> {
-    let prompt = {
+    let expanded = {
         let context = session
             .lock()
             .map_err(|_| CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable"))?;
-        expand_tui_file_reference(&context, bootstrap, prompt)?
+        expand_tui_prompt_with_media(&context, bootstrap, prompt)?
     };
     let request = {
         let mut session = session
@@ -512,10 +515,17 @@ pub fn run_tui_prompt_with(
             return Err(CliError::runtime(HeadlessTurnError::State));
         }
         session.running = true;
+        // Snapshot staged media into the request without clearing yet. Preflight and other
+        // early failures must leave chips staged; clear only after success or after the
+        // attempt has produced partial history (media then lives on the session/retry path).
+        let mut media_ids = session.pending_media_ids.clone();
+        let mut media_mimes = session.pending_media_mimes.clone();
+        media_ids.extend(expanded.media_ids);
+        media_mimes.extend(expanded.media_mimes);
         let mut request = agens_headless::apply_session_to_request(
             &session,
             HeadlessChatRequest {
-                prompt,
+                prompt: expanded.text,
                 history: Vec::new(),
                 model: None,
                 system_prompt: None,
@@ -530,6 +540,8 @@ pub fn run_tui_prompt_with(
                 effective_capabilities: None,
                 pending_system_reminder: None,
                 skills: skills.clone(),
+                media_ids,
+                media_mimes,
             },
         );
         if let Some(skills) = skills {
@@ -550,6 +562,15 @@ pub fn run_tui_prompt_with(
         .lock()
         .map_err(|_| CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable"))?;
     session.running = false;
+    let clear_pending_media = match &completion {
+        Ok(_) => true,
+        Err(failure) => failure.partial.is_some(),
+        // Preflight / begin failures keep staged media so chips remain for retry.
+    };
+    if clear_pending_media {
+        session.pending_media_ids.clear();
+        session.pending_media_mimes.clear();
+    }
     let result = complete_tui_turn(&mut session, completion, consumed_reminder);
     if let Some(identifier) = session.identifier {
         // Best-effort, like the write above: this call gets another attempt on every subsequent
@@ -729,6 +750,8 @@ mod tests {
             effective_capabilities: None,
             pending_system_reminder: None,
             skills: None,
+            media_ids: Vec::new(),
+            media_mimes: Vec::new(),
         }
     }
 
@@ -807,6 +830,34 @@ mod tests {
             .expect("profile should select a model after reset");
         assert_eq!(selection.model(), "gpt-5.6-sol");
         assert_eq!(selection.reasoning_effort(), Some("high"));
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn preflight_failure_keeps_pending_media_staged() {
+        let temporary = tui_session_directory("pending-media-preflight");
+        let bootstrap = tui_session_bootstrap(&temporary, &[]);
+        let _store = SessionStore::open(bootstrap.data_directory()).unwrap();
+        let session = Arc::new(Mutex::new(SessionContext::fresh()));
+        {
+            let mut locked = session.lock().unwrap();
+            locked.push_pending_media(42, "image/png".into());
+        }
+
+        let result = run_tui_prompt_with(&bootstrap, "describe", &session, None, |_| {
+            Err(HeadlessChatFailure::from(CliError::configuration(
+                "model gpt-4.1-nano does not accept attachment mime application/pdf",
+            )))
+        });
+        assert!(result.is_err(), "preflight-style failure must surface");
+        let locked = session.lock().unwrap();
+        assert_eq!(
+            locked.pending_media_ids,
+            vec![42],
+            "staged media must remain after early failure"
+        );
+        assert_eq!(locked.pending_media_mimes, vec!["image/png".to_owned()]);
 
         std::fs::remove_dir_all(temporary).unwrap();
     }

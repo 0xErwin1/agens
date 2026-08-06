@@ -6,6 +6,7 @@ use agens_core::HeadlessTurnError;
 use agens_tui::{TuiPresentation, TuiRouteCancellation, TuiSubmissionOutcome};
 
 use crate::engine::{seed_fresh_tui_context, write_through_bypass_permission_prompts};
+use crate::files::{ingest_tui_media_path, resolve_attach_path};
 use crate::models::{select_tui_effort, select_tui_model};
 use crate::resume::{commit_tui_session_resume, resume_tui_session};
 use crate::turn::tui_session_presentation;
@@ -80,6 +81,7 @@ impl TuiRuntimeRouter {
             "/mcp" => self.open_dialog("mcp")?,
             "/select" => self.open_dialog("select")?,
             "/stash" => self.open_dialog("stash")?,
+            command if command.starts_with("/attach") => self.attach_media(command)?,
             "/quit" => TuiSubmissionOutcome::Quit,
             "/sessions" | "/resume" => self.open_dialog("sessions")?,
             "/connect" => self.open_dialog("connect")?,
@@ -217,6 +219,32 @@ impl TuiRuntimeRouter {
         Ok(TuiSubmissionOutcome::ContextChanged {
             message: format!("Dangerous mode: {}.", if enabled { "on" } else { "off" }),
             presentation: self.presentation()?,
+        })
+    }
+
+    /// `/attach PATH` — ingest via store, stage media ids on the session, return path-free chips.
+    pub(super) fn attach_media(&self, command: &str) -> Result<TuiSubmissionOutcome, CliError> {
+        let raw = command
+            .strip_prefix("/attach")
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .ok_or_else(|| CliError::usage("attach requires a path: /attach <path>"))?;
+        let bootstrap = self.bootstrap()?;
+        let mut session = self
+            .session
+            .lock()
+            .map_err(|_| CliError::storage("TUI session is unavailable"))?;
+        let path = resolve_attach_path(&session, &bootstrap, raw)?;
+        let (media_id, mime) = ingest_tui_media_path(&bootstrap, &path)?;
+        session.push_pending_media(media_id, mime);
+        let media_chips = session.pending_media_chip_labels();
+        let chip = media_chips
+            .last()
+            .cloned()
+            .unwrap_or_else(|| "[Image #?]".into());
+        Ok(TuiSubmissionOutcome::MediaAttached {
+            message: format!("Attached {chip}."),
+            media_chips,
         })
     }
 

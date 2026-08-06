@@ -626,7 +626,7 @@ fn help_and_version_are_successful_without_bootstrapping_configuration() {
     assert_eq!(chat_help.status, ExitStatus::Success);
     assert_eq!(
         chat_help.stdout,
-        "run a headless agent turn\n\nUsage: agens chat [OPTIONS] [PROMPT]...\n\nArguments:\n  [PROMPT]...  \n\nOptions:\n      --model <MODEL>                    \n      --system <SYSTEM>                  \n      --max-iterations <MAX_ITERATIONS>  \n      --mode <chat|edit>                 \n      --dangerously-allow-all            \n  -h, --help                             Print help\n"
+        "run a headless agent turn\n\nUsage: agens chat [OPTIONS] [PROMPT]...\n\nArguments:\n  [PROMPT]...  \n\nOptions:\n      --model <MODEL>                    \n      --system <SYSTEM>                  \n      --max-iterations <MAX_ITERATIONS>  \n      --mode <chat|edit>                 \n      --dangerously-allow-all            \n      --attach <PATH>                    \n  -h, --help                             Print help\n"
     );
     assert_eq!(version.status, ExitStatus::Success);
     assert_eq!(version.stdout, "agens 0.1.0\n");

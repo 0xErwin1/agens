@@ -249,6 +249,7 @@ fn transcript_admission_retention_session_resume_keeps_restored_history_summary_
         ])
         .unwrap(),
         draft: None,
+        media_chips: Vec::new(),
         resume_error: None,
         file_candidates: Vec::new(),
         palette_entries: Vec::new(),
@@ -337,6 +338,7 @@ fn session_resume_success_replaces_prepared_state_in_one_outcome() {
         presentation: TuiPresentation::new("new-provider", "new-model", "session #2"),
         history,
         draft: None,
+        media_chips: Vec::new(),
         resume_error: None,
         file_candidates: Vec::new(),
         palette_entries: Vec::new(),
@@ -371,6 +373,7 @@ fn failed_session_resume_restores_exact_draft_with_history_at_composer_bottom() 
         presentation: TuiPresentation::new("openai-chatgpt", "gpt-5.5", "session #327"),
         history: vec![Conversation::new("completed prompt")],
         draft: Some("retry exact café 🙂".into()),
+        media_chips: Vec::new(),
         resume_error: None,
         file_candidates: Vec::new(),
         palette_entries: Vec::new(),
@@ -416,6 +419,7 @@ fn recovered_failed_prompt_escape_discards_and_successful_resume_replaces_atomic
         presentation: TuiPresentation::new("provider", "model", "session #1"),
         history: Vec::new(),
         draft: Some("failed prompt".into()),
+        media_chips: Vec::new(),
         resume_error: None,
         file_candidates: Vec::new(),
         palette_entries: Vec::new(),
@@ -430,6 +434,7 @@ fn recovered_failed_prompt_escape_discards_and_successful_resume_replaces_atomic
         presentation: TuiPresentation::new("provider", "model", "session #2"),
         history: Vec::new(),
         draft: Some("older failed prompt".into()),
+        media_chips: Vec::new(),
         resume_error: None,
         file_candidates: Vec::new(),
         palette_entries: Vec::new(),
@@ -439,6 +444,7 @@ fn recovered_failed_prompt_escape_discards_and_successful_resume_replaces_atomic
         presentation: TuiPresentation::new("provider", "model", "session #3"),
         history: Vec::new(),
         draft: None,
+        media_chips: Vec::new(),
         resume_error: None,
         file_candidates: Vec::new(),
         palette_entries: Vec::new(),
@@ -3664,6 +3670,66 @@ fn a_finished_background_subagent_fires_one_main_turn_while_idle() {
     assert!(tui.take_ready_auto_turn().is_none());
 }
 
+#[test]
+fn resume_projects_user_media_parts_as_path_free_chips() {
+    let restored = Conversation::from_messages(&[
+        Message {
+            role: Role::User,
+            parts: vec![
+                MessagePart::Text("look".into()),
+                MessagePart::Media {
+                    media_id: 9,
+                    mime: "image/png".into(),
+                },
+                MessagePart::Media {
+                    media_id: 11,
+                    mime: "application/pdf".into(),
+                },
+            ],
+        },
+        Message {
+            role: Role::Assistant,
+            parts: vec![MessagePart::Text("ok".into())],
+        },
+    ])
+    .expect("user media must restore without InvalidMessageOrder");
+
+    let turn = restored.last().expect("one restored turn");
+    assert!(
+        turn.user.contains("[Image #1]"),
+        "image chip missing: {}",
+        turn.user
+    );
+    assert!(
+        turn.user.contains("[File #2]"),
+        "file chip missing: {}",
+        turn.user
+    );
+    assert!(
+        !turn.user.contains('/') && !turn.user.contains("media_id"),
+        "resume chips must be path-free: {}",
+        turn.user
+    );
+}
+
+#[test]
+fn media_only_composer_submit_with_empty_text() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.set_media_chips(vec!["[Image #1]".into()]);
+    assert!(tui.input().is_empty());
+
+    let action = tui.handle(Event::Key(Key::Enter));
+    assert!(
+        matches!(action, Action::Submit(ref prompt) if prompt.is_empty()),
+        "empty text with staged media must submit, got {action:?}"
+    );
+    assert_eq!(
+        tui.media_chips(),
+        &["[Image #1]".to_owned()][..],
+        "chips stay until the provider turn succeeds"
+    );
+}
+
 /// The provider is told about a scheduled turn in a user-role message, so that
 /// is what the session store keeps. Replaying it verbatim showed the reader a
 /// prompt of their own that said the user had not sent it.
@@ -4436,7 +4502,9 @@ fn ask_user_enter_on_option_advances_to_the_next_question() {
         "tab reaches the last question"
     );
     assert_eq!(tui.handle(Event::Key(Key::Enter)), Action::Render);
-    let last = tui.ask_user_snapshot().expect("still open on last question");
+    let last = tui
+        .ask_user_snapshot()
+        .expect("still open on last question");
     assert_eq!(last.question_index, 2);
     assert_eq!(last.selected, vec![0]);
     assert_eq!(last.row, AskUserRowSnapshot::Option(0));
@@ -4933,7 +5001,6 @@ fn submit_text(tui: &mut Tui<FakeEngine>, text: &str) -> Action {
     tui.handle(Event::Key(Key::Enter))
 }
 
-
 fn tui_with_prompt_memory() -> Tui<FakeEngine> {
     let mut tui = Tui::new(FakeEngine::default());
     tui.set_prompt_memory(Box::new(agens_core::EphemeralPromptMemory::new()));
@@ -5426,9 +5493,7 @@ fn history_append_leaves_stash_unchanged_across_submit_and_enqueue() {
 
 #[test]
 fn prompt_memory_write_failure_does_not_panic_and_restores_stash_draft() {
-    use agens_core::{
-        HistoryBrowseResult, PromptMemory, PromptMemoryError, PromptOverlayItem,
-    };
+    use agens_core::{HistoryBrowseResult, PromptMemory, PromptMemoryError, PromptOverlayItem};
 
     struct FailingPromptMemory;
 

@@ -69,11 +69,38 @@ pub fn completed_session_turn(
     snapshot: &CompletedTurnSnapshot,
     pending_system_reminder: Option<&str>,
 ) -> Result<CompletedSessionTurn, CliError> {
-    completed_session_turn_from_events(prompt, snapshot.events(), pending_system_reminder)
+    completed_session_turn_with_media(prompt, &[], snapshot, pending_system_reminder)
+}
+
+/// Like [`completed_session_turn`], but persists path-free user [`MessagePart::Media`]
+/// parts alongside the prompt text (same shape as the live headless request).
+pub fn completed_session_turn_with_media(
+    prompt: &str,
+    media: &[(i64, String)],
+    snapshot: &CompletedTurnSnapshot,
+    pending_system_reminder: Option<&str>,
+) -> Result<CompletedSessionTurn, CliError> {
+    completed_session_turn_from_events_with_media(
+        prompt,
+        media,
+        snapshot.events(),
+        pending_system_reminder,
+    )
 }
 
 pub fn completed_session_turn_from_events(
     prompt: &str,
+    events: &[TurnEvent],
+    pending_system_reminder: Option<&str>,
+) -> Result<CompletedSessionTurn, CliError> {
+    completed_session_turn_from_events_with_media(prompt, &[], events, pending_system_reminder)
+}
+
+/// Builds a durable completed turn whose user message includes text (when non-empty)
+/// and path-free media refs. Media-only turns (empty prompt + media) are valid.
+pub fn completed_session_turn_from_events_with_media(
+    prompt: &str,
+    media: &[(i64, String)],
     events: &[TurnEvent],
     pending_system_reminder: Option<&str>,
 ) -> Result<CompletedSessionTurn, CliError> {
@@ -86,7 +113,7 @@ pub fn completed_session_turn_from_events(
         .collect::<Vec<_>>();
     messages.push(Message {
         role: Role::User,
-        parts: vec![MessagePart::Text(prompt.to_owned())],
+        parts: durable_user_parts(prompt, media),
     });
     let mut role = None;
     let mut parts = Vec::new();
@@ -119,6 +146,30 @@ pub fn completed_session_turn_from_events(
         .map_err(|_| CliError::storage("completed session could not be encoded"))?;
     CompletedSessionTurn::new(messages)
         .map_err(|_| CliError::storage("completed session could not be encoded"))
+}
+
+/// User parts for durable history: text if non-empty, then path-free media refs.
+/// Falls back to a single text part when both prompt and media are empty so the
+/// empty-prompt legacy path still produces a (failing-or-valid) user message shape.
+fn durable_user_parts(prompt: &str, media: &[(i64, String)]) -> Vec<MessagePart> {
+    let mut parts = Vec::new();
+
+    if !prompt.is_empty() {
+        parts.push(MessagePart::Text(prompt.to_owned()));
+    }
+
+    for (media_id, mime) in media {
+        parts.push(MessagePart::Media {
+            media_id: *media_id,
+            mime: mime.clone(),
+        });
+    }
+
+    if parts.is_empty() {
+        parts.push(MessagePart::Text(prompt.to_owned()));
+    }
+
+    parts
 }
 
 fn push_coalesced_part(parts: &mut Vec<MessagePart>, part: MessagePart) {
@@ -340,6 +391,76 @@ fn flush_parts(messages: &mut Vec<Message>, role: Role, parts: &mut Vec<MessageP
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completed_turn_with_media_persists_text_and_path_free_media_parts() {
+        let events = [TurnEvent::ProviderPart(MessagePart::Text(
+            "saw the image".into(),
+        ))];
+        let media = [
+            (7_i64, "image/png".to_owned()),
+            (11, "image/jpeg".to_owned()),
+        ];
+
+        let turn =
+            completed_session_turn_from_events_with_media("describe this", &media, &events, None)
+                .expect("text plus media should encode");
+
+        let user = &turn.messages()[0];
+        assert_eq!(user.role, Role::User);
+        assert_eq!(
+            user.parts,
+            vec![
+                MessagePart::Text("describe this".into()),
+                MessagePart::Media {
+                    media_id: 7,
+                    mime: "image/png".into(),
+                },
+                MessagePart::Media {
+                    media_id: 11,
+                    mime: "image/jpeg".into(),
+                },
+            ]
+        );
+        for part in &user.parts {
+            match part {
+                MessagePart::Media { media_id, mime } => {
+                    assert!(*media_id > 0);
+                    assert!(!mime.is_empty());
+                }
+                MessagePart::Text(text) => assert!(!text.is_empty()),
+                other => panic!("unexpected durable user part: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn completed_turn_media_only_empty_prompt_skips_empty_text_part() {
+        let events = [TurnEvent::ProviderPart(MessagePart::Text("ok".into()))];
+        let media = [(3_i64, "image/png".to_owned())];
+
+        let turn = completed_session_turn_from_events_with_media("", &media, &events, None)
+            .expect("media-only turn must not hit EmptyPart");
+
+        assert_eq!(
+            turn.messages()[0].parts,
+            vec![MessagePart::Media {
+                media_id: 3,
+                mime: "image/png".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn completed_turn_without_media_api_stays_text_only() {
+        let events = [TurnEvent::ProviderPart(MessagePart::Text("reply".into()))];
+        let turn = completed_session_turn_from_events("hello", &events, None).unwrap();
+
+        assert_eq!(
+            turn.messages()[0].parts,
+            vec![MessagePart::Text("hello".into())]
+        );
+    }
 
     #[test]
     fn completed_turn_coalesces_adjacent_streamed_text_and_reasoning_fragments() {

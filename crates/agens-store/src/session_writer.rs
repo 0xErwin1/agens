@@ -17,6 +17,8 @@ type PersistedPart = (
     Option<String>,
     Option<String>,
     Option<bool>,
+    Option<i64>,
+    Option<String>,
 );
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -83,10 +85,24 @@ impl SessionStore {
         metadata: &SessionMetadata,
         retry_prompt: String,
     ) -> Result<SessionAttemptSummary, BeginSessionAttemptError> {
-        if retry_prompt.is_empty() || retry_prompt.len() > MAX_RETRY_PROMPT_BYTES {
+        self.begin_session_attempt_with_media(metadata, retry_prompt, Vec::new())
+    }
+
+    pub fn begin_session_attempt_with_media(
+        &mut self,
+        metadata: &SessionMetadata,
+        retry_prompt: String,
+        media_ids: Vec<i64>,
+    ) -> Result<SessionAttemptSummary, BeginSessionAttemptError> {
+        if retry_prompt.len() > MAX_RETRY_PROMPT_BYTES {
+            return Err(BeginSessionAttemptError::Store);
+        }
+        // Media-only turns may begin with an empty prompt when media_ids is non-empty.
+        if retry_prompt.is_empty() && media_ids.is_empty() {
             return Err(BeginSessionAttemptError::Store);
         }
         validate_attempt_metadata(metadata).map_err(|_| BeginSessionAttemptError::Store)?;
+        let retry_media_ids = encode_retry_media_ids(&media_ids);
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -117,7 +133,7 @@ impl SessionStore {
         }
         transaction
             .execute(
-                "UPDATE session_attempts SET retry_prompt = NULL
+                "UPDATE session_attempts SET retry_prompt = NULL, retry_media_ids = NULL
                  WHERE session_id = ?1 AND retry_prompt IS NOT NULL",
                 [session_id],
             )
@@ -131,9 +147,15 @@ impl SessionStore {
         .map_err(|_| BeginSessionAttemptError::Store)?;
         transaction
             .execute(
-                "INSERT INTO session_attempts(session_id, sequence, status, retry_prompt, started_at)
-                 VALUES (?1, ?2, 'running', ?3, ?4)",
-                params![session_id, sequence, retry_prompt, metadata.updated_at],
+                "INSERT INTO session_attempts(session_id, sequence, status, retry_prompt, retry_media_ids, started_at)
+                 VALUES (?1, ?2, 'running', ?3, ?4, ?5)",
+                params![
+                    session_id,
+                    sequence,
+                    retry_prompt,
+                    retry_media_ids,
+                    metadata.updated_at
+                ],
             )
             .map_err(|_| BeginSessionAttemptError::Store)?;
         let key = AttemptKey::new(session_id, transaction.last_insert_rowid())
@@ -277,7 +299,7 @@ impl SessionStore {
         let changed = transaction
             .execute(
                 "UPDATE session_attempts
-                 SET status = 'completed', retry_prompt = NULL, finished_at = ?1, completed_turn_sequence = ?2
+                 SET status = 'completed', retry_prompt = NULL, retry_media_ids = NULL, finished_at = ?1, completed_turn_sequence = ?2
                  WHERE id = ?3 AND session_id = ?4 AND status = 'running'",
                 params![finished_at, completed_turn_sequence, key.attempt_id(), key.session_id()],
             )
@@ -370,7 +392,7 @@ impl SessionStore {
         let changed = transaction
             .execute(
                 "UPDATE session_attempts
-                 SET status = ?1, failure_kind = ?2, retry_prompt = NULL, finished_at = ?3
+                 SET status = ?1, failure_kind = ?2, retry_prompt = NULL, retry_media_ids = NULL, finished_at = ?3
                  WHERE id = ?4 AND session_id = ?5 AND status = 'running'",
                 params![
                     attempt_status(status),
@@ -634,7 +656,7 @@ impl SessionStore {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT messages.sequence, role, kind, text, call_id, name, input_json, content, is_error
+                "SELECT messages.sequence, role, kind, text, call_id, name, input_json, content, is_error, media_id, mime
                  FROM messages JOIN message_parts ON messages.session_id = message_parts.session_id
                      AND messages.sequence = message_parts.message_sequence
                  WHERE messages.session_id = ?1 AND messages.sequence BETWEEN ?2 AND ?3
@@ -655,6 +677,8 @@ impl SessionStore {
                     row.get::<_, Option<String>>(6)?,
                     row.get::<_, Option<String>>(7)?,
                     row.get::<_, Option<bool>>(8)?,
+                    row.get::<_, Option<i64>>(9)?,
+                    row.get::<_, Option<String>>(10)?,
                 ))
             })
             .map_err(|error| {
@@ -665,10 +689,21 @@ impl SessionStore {
         let mut sequence = None;
 
         for row in rows {
-            let (message_sequence, role, kind, text, call_id, name, input, content, is_error) = row
-                .map_err(|error| {
-                    SessionStoreError::operation("read transcript page", &self.database_path, error)
-                })?;
+            let (
+                message_sequence,
+                role,
+                kind,
+                text,
+                call_id,
+                name,
+                input,
+                content,
+                is_error,
+                media_id,
+                mime,
+            ) = row.map_err(|error| {
+                SessionStoreError::operation("read transcript page", &self.database_path, error)
+            })?;
 
             if sequence != Some(message_sequence) {
                 messages.push(Message {
@@ -684,7 +719,9 @@ impl SessionStore {
                 .parts
                 .push(decode_part(
                     &kind,
-                    (text, call_id, name, input, content, is_error),
+                    (
+                        text, call_id, name, input, content, is_error, media_id, mime,
+                    ),
                     &self.database_path,
                 )?);
         }
@@ -748,12 +785,17 @@ impl SessionStore {
         &self,
         key: AttemptKey,
     ) -> Result<Option<RetryBoundary>, SessionStoreError> {
-        let prompt = self
+        let row = self
             .connection
             .query_row(
-                "SELECT retry_prompt FROM session_attempts WHERE id = ?1 AND session_id = ?2",
+                "SELECT retry_prompt, retry_media_ids FROM session_attempts WHERE id = ?1 AND session_id = ?2",
                 params![key.attempt_id(), key.session_id()],
-                |row| row.get::<_, Option<String>>(0),
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                    ))
+                },
             )
             .optional()
             .map_err(|error| {
@@ -762,20 +804,26 @@ impl SessionStore {
                     &self.database_path,
                     error,
                 )
-            })?
-            .flatten();
+            })?;
 
-        prompt
-            .map(|prompt| {
-                RetryBoundary::new(key, prompt).map_err(|error| {
-                    SessionStoreError::operation(
-                        "validate attempt retry boundary",
-                        &self.database_path,
-                        format!("{error:?}"),
-                    )
-                })
+        let Some((prompt, media_ids_json)) = row else {
+            return Ok(None);
+        };
+
+        let Some(prompt) = prompt else {
+            return Ok(None);
+        };
+
+        let media_ids = decode_retry_media_ids(media_ids_json.as_deref(), &self.database_path)?;
+        RetryBoundary::new(key, prompt, media_ids)
+            .map(Some)
+            .map_err(|error| {
+                SessionStoreError::operation(
+                    "validate attempt retry boundary",
+                    &self.database_path,
+                    format!("{error:?}"),
+                )
             })
-            .transpose()
     }
 
     /// The literal filesystem root a session's tools must be confined to.
@@ -886,7 +934,7 @@ impl SessionStore {
             ));
         };
         let mut statement = self.connection.prepare(
-            "SELECT messages.sequence, role, kind, text, call_id, name, input_json, content, is_error
+            "SELECT messages.sequence, role, kind, text, call_id, name, input_json, content, is_error, media_id, mime
              FROM messages JOIN message_parts ON messages.session_id = message_parts.session_id
                  AND messages.sequence = message_parts.message_sequence
              WHERE messages.session_id = ?1 ORDER BY messages.sequence, message_parts.sequence",
@@ -903,6 +951,8 @@ impl SessionStore {
                     row.get::<_, Option<String>>(6)?,
                     row.get::<_, Option<String>>(7)?,
                     row.get::<_, Option<bool>>(8)?,
+                    row.get::<_, Option<i64>>(9)?,
+                    row.get::<_, Option<String>>(10)?,
                 ))
             })
             .map_err(|error| {
@@ -911,14 +961,21 @@ impl SessionStore {
         let mut messages = Vec::new();
         let mut sequence = None;
         for row in rows {
-            let (message_sequence, role, kind, text, call_id, name, input, content, is_error) = row
-                .map_err(|error| {
-                    SessionStoreError::operation(
-                        "read session messages",
-                        &self.database_path,
-                        error,
-                    )
-                })?;
+            let (
+                message_sequence,
+                role,
+                kind,
+                text,
+                call_id,
+                name,
+                input,
+                content,
+                is_error,
+                media_id,
+                mime,
+            ) = row.map_err(|error| {
+                SessionStoreError::operation("read session messages", &self.database_path, error)
+            })?;
             if sequence != Some(message_sequence) {
                 messages.push(Message {
                     role: decode_role(&role, &self.database_path)?,
@@ -932,7 +989,9 @@ impl SessionStore {
                 .parts
                 .push(decode_part(
                     &kind,
-                    (text, call_id, name, input, content, is_error),
+                    (
+                        text, call_id, name, input, content, is_error, media_id, mime,
+                    ),
                     &self.database_path,
                 )?);
         }
@@ -1362,6 +1421,10 @@ fn insert_message_part(
             "INSERT INTO message_parts (session_id, message_sequence, sequence, kind, call_id, content, is_error) VALUES (?1, ?2, ?3, 'tool_result', ?4, ?5, ?6)",
             params![session_id, message_sequence, sequence, tool_call_id, content, is_error],
         ),
+        MessagePart::Media { media_id, mime } => transaction.execute(
+            "INSERT INTO message_parts (session_id, message_sequence, sequence, kind, media_id, mime) VALUES (?1, ?2, ?3, 'media', ?4, ?5)",
+            params![session_id, message_sequence, sequence, media_id, mime],
+        ),
     };
     result.map_err(|error| {
         SessionStoreError::operation("create message part", database_path, error)
@@ -1492,7 +1555,7 @@ fn decode_role(role: &str, database_path: &std::path::Path) -> Result<Role, Sess
 
 fn decode_part(
     kind: &str,
-    (text, call_id, name, input, content, is_error): PersistedPart,
+    (text, call_id, name, input, content, is_error, media_id, mime): PersistedPart,
     database_path: &std::path::Path,
 ) -> Result<MessagePart, SessionStoreError> {
     let part = match kind {
@@ -1510,10 +1573,38 @@ fn decode_part(
             }),
             _ => None,
         },
+        "media" => match (media_id, mime) {
+            (Some(media_id), Some(mime)) => Some(MessagePart::Media { media_id, mime }),
+            _ => None,
+        },
         _ => None,
     };
     part.ok_or_else(|| {
         SessionStoreError::operation("decode session message part", database_path, "invalid part")
+    })
+}
+
+fn encode_retry_media_ids(media_ids: &[i64]) -> Option<String> {
+    if media_ids.is_empty() {
+        None
+    } else {
+        Some(
+            serde_json::to_string(media_ids)
+                .expect("media id list serializes to compact JSON array"),
+        )
+    }
+}
+
+fn decode_retry_media_ids(
+    value: Option<&str>,
+    database_path: &std::path::Path,
+) -> Result<Vec<i64>, SessionStoreError> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+
+    serde_json::from_str(value).map_err(|error| {
+        SessionStoreError::operation("decode retry media ids", database_path, error)
     })
 }
 

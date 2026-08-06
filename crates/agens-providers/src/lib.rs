@@ -17,6 +17,8 @@ use agens_core::{
     Error, HeadlessTurnCancellation, HeadlessTurnPortError, Message, MessagePart, RequestConfig,
     Role, TurnEvent, TurnProgressSink, TurnProvider, Usage,
 };
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use fs4::fs_std::FileExt;
 use serde_json::Value;
 use time::OffsetDateTime;
@@ -93,6 +95,7 @@ pub struct OpenAiResponsesProvider {
     progress: Option<TurnProgressSink>,
     diagnostics: Option<ProviderDiagnostics>,
     failure_detail: Option<ProviderFailureDetail>,
+    media_blobs: MediaBlobs,
 }
 
 /// ChatGPT subscription Responses transport using existing auth.json credentials.
@@ -118,6 +121,7 @@ pub struct ChatGptResponsesProvider {
     progress: Option<TurnProgressSink>,
     diagnostics: Option<ProviderDiagnostics>,
     failure_detail: Option<ProviderFailureDetail>,
+    media_blobs: MediaBlobs,
 }
 
 /// Carries the raw detail a provider failure produced, from the point a body
@@ -607,6 +611,7 @@ impl OpenAiResponsesProvider {
             progress: None,
             diagnostics: None,
             failure_detail: None,
+            media_blobs: MediaBlobs::new(),
         })
     }
 
@@ -623,7 +628,27 @@ impl OpenAiResponsesProvider {
         tools: Vec<OpenAiFunctionTool>,
         request_timeout: Duration,
     ) -> Result<Self, Error> {
-        let initial_input = resumed_input(&model, &messages, &tools)?;
+        Self::from_api_key_with_messages_tools_timeout_and_media(
+            api_key,
+            base_url,
+            model,
+            messages,
+            tools,
+            request_timeout,
+            MediaBlobs::new(),
+        )
+    }
+
+    pub fn from_api_key_with_messages_tools_timeout_and_media(
+        api_key: String,
+        base_url: Option<&str>,
+        model: String,
+        messages: Vec<Message>,
+        tools: Vec<OpenAiFunctionTool>,
+        request_timeout: Duration,
+        media_blobs: MediaBlobs,
+    ) -> Result<Self, Error> {
+        let initial_input = resumed_input_with_media(&model, &messages, &tools, &media_blobs)?;
         let mut provider = Self::from_api_key_with_tools_and_timeout(
             api_key,
             base_url,
@@ -633,6 +658,7 @@ impl OpenAiResponsesProvider {
             request_timeout,
         )?;
         provider.initial_input = Value::Array(initial_input);
+        provider.media_blobs = media_blobs;
         Ok(provider)
     }
 
@@ -653,6 +679,11 @@ impl OpenAiResponsesProvider {
 
     pub fn with_failure_detail(mut self, failure_detail: ProviderFailureDetail) -> Self {
         self.failure_detail = Some(failure_detail);
+        self
+    }
+
+    pub fn with_media_blobs(mut self, media_blobs: MediaBlobs) -> Self {
+        self.media_blobs = media_blobs;
         self
     }
 
@@ -992,6 +1023,7 @@ impl ChatGptResponsesProvider {
             progress: None,
             diagnostics: None,
             failure_detail: None,
+            media_blobs: MediaBlobs::new(),
         })
     }
 
@@ -1011,7 +1043,32 @@ impl ChatGptResponsesProvider {
         tools: Vec<OpenAiFunctionTool>,
         request_timeout: Duration,
     ) -> Result<Self, Error> {
-        let initial_input = resumed_input(&model, &messages, &tools)?;
+        Self::from_credentials_with_messages_tools_timeout_auth_and_media(
+            credentials_path,
+            base_url,
+            oauth_url,
+            model,
+            instructions,
+            messages,
+            tools,
+            request_timeout,
+            MediaBlobs::new(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_credentials_with_messages_tools_timeout_auth_and_media(
+        credentials_path: &Path,
+        base_url: Option<&str>,
+        oauth_url: Option<&str>,
+        model: String,
+        instructions: String,
+        messages: Vec<Message>,
+        tools: Vec<OpenAiFunctionTool>,
+        request_timeout: Duration,
+        media_blobs: MediaBlobs,
+    ) -> Result<Self, Error> {
+        let initial_input = resumed_input_with_media(&model, &messages, &tools, &media_blobs)?;
         let mut provider = Self::from_credentials_with_tools_and_timeout_and_auth_url(
             credentials_path,
             base_url,
@@ -1023,6 +1080,7 @@ impl ChatGptResponsesProvider {
             request_timeout,
         )?;
         provider.initial_input = initial_input;
+        provider.media_blobs = media_blobs;
         Ok(provider)
     }
 
@@ -1043,6 +1101,11 @@ impl ChatGptResponsesProvider {
 
     pub fn with_failure_detail(mut self, failure_detail: ProviderFailureDetail) -> Self {
         self.failure_detail = Some(failure_detail);
+        self
+    }
+
+    pub fn with_media_blobs(mut self, media_blobs: MediaBlobs) -> Self {
+        self.media_blobs = media_blobs;
         self
     }
 
@@ -1684,7 +1747,7 @@ fn emit_retry_terminal(
 
 impl TurnProvider for ChatGptResponsesProvider {
     fn queue_user_messages(&mut self, messages: Vec<Message>) -> Result<(), HeadlessTurnPortError> {
-        let input = queued_user_input(messages)?;
+        let input = queued_user_input(messages, &self.media_blobs)?;
         match &mut self.state {
             ChatGptContinuationState::Initial => self.initial_input.extend(input),
             ChatGptContinuationState::AwaitingToolOutputs { replay_history, .. } => {
@@ -1877,7 +1940,7 @@ impl ProgressAwareProvider for ChatGptResponsesProvider {
 
 impl TurnProvider for OpenAiResponsesProvider {
     fn queue_user_messages(&mut self, messages: Vec<Message>) -> Result<(), HeadlessTurnPortError> {
-        let input = queued_user_input(messages)?;
+        let input = queued_user_input(messages, &self.media_blobs)?;
         match &mut self.state {
             ContinuationState::Initial => self
                 .initial_input
@@ -2142,7 +2205,10 @@ fn correlated_tool_outputs(
         .collect()
 }
 
-fn queued_user_input(messages: Vec<Message>) -> Result<Vec<Value>, HeadlessTurnPortError> {
+fn queued_user_input(
+    messages: Vec<Message>,
+    media_blobs: &MediaBlobs,
+) -> Result<Vec<Value>, HeadlessTurnPortError> {
     messages
         .into_iter()
         .map(|message| {
@@ -2155,6 +2221,10 @@ fn queued_user_input(messages: Vec<Message>) -> Result<Vec<Value>, HeadlessTurnP
                 .map(|part| match part {
                     MessagePart::Text(text) if !text.is_empty() => {
                         Ok(serde_json::json!({"type": "input_text", "text": text}))
+                    }
+                    MessagePart::Media { media_id, mime } => {
+                        responses_media_content_item(media_id, &mime, media_blobs)
+                            .map_err(|_| HeadlessTurnPortError::Provider)
                     }
                     _ => Err(HeadlessTurnPortError::Provider),
                 })
@@ -2590,10 +2660,31 @@ fn coalesced_message_parts(parts: &[MessagePart]) -> Vec<MessagePart> {
     coalesced
 }
 
+/// Durable media blobs keyed by `media_id`, resolved by the caller before wire encoding.
+pub type MediaBlobs = BTreeMap<i64, Vec<u8>>;
+
 pub fn encode_openai_response_request_with_messages(
     model: &str,
     messages: &[Message],
     tools: &[OpenAiFunctionTool],
+) -> Result<String, Error> {
+    encode_openai_response_request_with_messages_and_media(
+        model,
+        messages,
+        tools,
+        &MediaBlobs::new(),
+    )
+}
+
+/// Encodes a resumed Responses history, substituting durable media ids with base64 data URLs.
+///
+/// OpenAI Responses accepts images as `input_image` with `image_url` set to a `data:` URL
+/// (or https). Blobs must be supplied by the caller; this crate does not open the media store.
+pub fn encode_openai_response_request_with_messages_and_media(
+    model: &str,
+    messages: &[Message],
+    tools: &[OpenAiFunctionTool],
+    media_blobs: &MediaBlobs,
 ) -> Result<String, Error> {
     if model.trim().is_empty() || messages.is_empty() {
         return Err(invalid_resumed_history());
@@ -2619,6 +2710,9 @@ pub fn encode_openai_response_request_with_messages(
                     .map(|part| match part {
                         MessagePart::Text(text) if !text.is_empty() => {
                             Ok(serde_json::json!({ "type": "input_text", "text": text }))
+                        }
+                        MessagePart::Media { media_id, mime } if message.role == Role::User => {
+                            responses_media_content_item(*media_id, mime, media_blobs)
                         }
                         _ => Err(invalid_resumed_history()),
                     })
@@ -2719,12 +2813,62 @@ pub fn encode_openai_response_request_with_messages(
     Ok(request.to_string())
 }
 
+fn media_data_url(mime: &str, bytes: &[u8]) -> String {
+    format!("data:{mime};base64,{}", BASE64_STANDARD.encode(bytes))
+}
+
+fn responses_media_content_item(
+    media_id: i64,
+    mime: &str,
+    media_blobs: &MediaBlobs,
+) -> Result<Value, Error> {
+    let Some(bytes) = media_blobs.get(&media_id) else {
+        return Err(Error::Provider(format!(
+            "OpenAI request error: media blob unavailable for media_id {media_id}"
+        )));
+    };
+
+    if mime.starts_with("image/") {
+        return Ok(serde_json::json!({
+            "type": "input_image",
+            "image_url": media_data_url(mime, bytes),
+        }));
+    }
+
+    if mime == "application/pdf" {
+        return Ok(serde_json::json!({
+            "type": "input_file",
+            "filename": "attachment.pdf",
+            "file_data": media_data_url(mime, bytes),
+        }));
+    }
+
+    Err(Error::Provider(format!(
+        "OpenAI request error: unsupported media mime {mime}"
+    )))
+}
+
+#[cfg(test)]
 fn resumed_input(
     model: &str,
     messages: &[Message],
     tools: &[OpenAiFunctionTool],
 ) -> Result<Vec<Value>, Error> {
-    let request = encode_openai_response_request_with_messages(model, messages, tools)?;
+    resumed_input_with_media(model, messages, tools, &MediaBlobs::new())
+}
+
+fn resumed_input_with_media(
+    model: &str,
+    messages: &[Message],
+    tools: &[OpenAiFunctionTool],
+    media_blobs: &MediaBlobs,
+) -> Result<Vec<Value>, Error> {
+    let request = encode_openai_response_request_with_messages_and_media(
+        model,
+        messages,
+        tools,
+        media_blobs,
+    )?;
     serde_json::from_str::<Value>(&request)
         .ok()
         .and_then(|request| request.get("input").cloned())
@@ -3594,10 +3738,13 @@ mod tests {
     #[test]
     fn queued_coordination_encodes_only_nonempty_user_text_as_user_input() {
         assert_eq!(
-            queued_user_input(vec![Message {
-                role: Role::User,
-                parts: vec![MessagePart::Text("coordination".into())],
-            }])
+            queued_user_input(
+                vec![Message {
+                    role: Role::User,
+                    parts: vec![MessagePart::Text("coordination".into())],
+                }],
+                &MediaBlobs::new(),
+            )
             .unwrap(),
             vec![serde_json::json!({
                 "role": "user",
@@ -3605,11 +3752,76 @@ mod tests {
             })],
         );
         assert!(
-            queued_user_input(vec![Message {
-                role: Role::System,
-                parts: vec![MessagePart::Text("forbidden".into())],
-            }])
+            queued_user_input(
+                vec![Message {
+                    role: Role::System,
+                    parts: vec![MessagePart::Text("forbidden".into())],
+                }],
+                &MediaBlobs::new(),
+            )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn chatgpt_resumed_input_uses_the_same_media_encode_path_as_openai() {
+        let messages = vec![Message {
+            role: Role::User,
+            parts: vec![
+                MessagePart::Text("look".into()),
+                MessagePart::Media {
+                    media_id: 5,
+                    mime: "image/png".into(),
+                },
+            ],
+        }];
+        let mut media = MediaBlobs::new();
+        media.insert(5, b"fake-png-bytes".to_vec());
+
+        let input = resumed_input_with_media("gpt-5.6", &messages, &[], &media)
+            .expect("ChatGPT resume path should encode media");
+
+        assert_eq!(input[0]["role"], serde_json::json!("user"));
+        assert_eq!(
+            input[0]["content"][0],
+            serde_json::json!({"type": "input_text", "text": "look"})
+        );
+        assert_eq!(
+            input[0]["content"][1]["type"],
+            serde_json::json!("input_image")
+        );
+        assert_eq!(
+            input[0]["content"][1]["image_url"],
+            serde_json::json!("data:image/png;base64,ZmFrZS1wbmctYnl0ZXM=")
+        );
+    }
+
+    #[test]
+    fn queued_user_input_encodes_media_parts_with_blobs() {
+        let mut media = MediaBlobs::new();
+        media.insert(2, b"jpeg-bytes".to_vec());
+
+        let input = queued_user_input(
+            vec![Message {
+                role: Role::User,
+                parts: vec![
+                    MessagePart::Text("caption".into()),
+                    MessagePart::Media {
+                        media_id: 2,
+                        mime: "image/jpeg".into(),
+                    },
+                ],
+            }],
+            &media,
+        )
+        .expect("queued media should encode");
+
+        assert_eq!(
+            input[0]["content"][1],
+            serde_json::json!({
+                "type": "input_image",
+                "image_url": "data:image/jpeg;base64,anBlZy1ieXRlcw==",
+            })
         );
     }
 

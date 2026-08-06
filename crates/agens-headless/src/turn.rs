@@ -4,7 +4,7 @@
 
 use crate::outcome::{HeadlessChatCompletion, HeadlessChatFailure};
 use crate::request::HeadlessChatRequest;
-use crate::request::{explicit_task_delegation_prompt, provider_messages};
+use crate::request::{explicit_task_delegation_prompt, preflight_request_media, provider_messages};
 use crate::subagents::{interrupted_turn_note, record_tool_result_fact};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
@@ -15,10 +15,10 @@ use agens_core::{
     run_headless_turn_with_max_iterations_and_progress,
 };
 use agens_providers::{
-    ChatGptResponsesProvider, MoonshotProvider, OpenAiFunctionTool, OpenAiResponsesProvider,
-    ProgressAwareProvider, ProviderDiagnosticScope, ProviderFailureDetail,
+    ChatGptResponsesProvider, MediaBlobs, MoonshotProvider, OpenAiFunctionTool,
+    OpenAiResponsesProvider, ProgressAwareProvider, ProviderDiagnosticScope, ProviderFailureDetail,
 };
-use agens_store::{PermissionGrantStore, SessionStore, ToolFactStore};
+use agens_store::{PermissionGrantStore, SessionStore, ToolFactStore, open_media};
 use agens_tools::{
     EffectiveCapabilitySet, McpErrorCategory, McpLifecycleState, McpStatusHandle, TaskMessageTarget,
 };
@@ -40,7 +40,8 @@ use agens_session::attempt::{
 };
 use agens_session::provider::ProviderKind;
 use agens_session::turns::{
-    completed_session_turn, completed_session_turn_from_events, next_session_metadata,
+    completed_session_turn_from_events_with_media, completed_session_turn_with_media,
+    next_session_metadata,
 };
 use agens_tool_runtime::block_on_headless_turn;
 use agens_tool_runtime::child::TaskMailboxProvider;
@@ -161,7 +162,7 @@ pub fn run_production_headless_chat_with_progress(
                     include_system_prompt: true,
                     failure_detail: failure_detail.clone(),
                 },
-                move |model, messages, tools, request_config| {
+                move |model, messages, tools, request_config, media_blobs| {
                     OpenAiResponsesProvider::from_api_key_with_messages_and_tools_and_timeout(
                         api_key,
                         base_url.as_deref(),
@@ -176,6 +177,7 @@ pub fn run_production_headless_chat_with_progress(
                             .with_request_config(request_config)
                             .with_diagnostics(provider_diagnostics)
                             .with_failure_detail(failure_detail.clone())
+                            .with_media_blobs(media_blobs)
                     })
                     .map_err(|error| {
                         provider_construction_error(
@@ -203,7 +205,7 @@ pub fn run_production_headless_chat_with_progress(
                     include_system_prompt: true,
                     failure_detail: failure_detail.clone(),
                 },
-                move |model, messages, tools, request_config| {
+                move |model, messages, tools, request_config, media_blobs| {
                     MoonshotProvider::from_api_key_with_messages_and_tools_and_timeout(
                         api_key,
                         base_url.as_deref(),
@@ -218,6 +220,7 @@ pub fn run_production_headless_chat_with_progress(
                             .with_request_config(request_config)
                             .with_diagnostics(provider_diagnostics)
                             .with_failure_detail(failure_detail.clone())
+                            .with_media_blobs(media_blobs)
                     })
                     .map_err(|error| {
                         provider_construction_error(
@@ -249,7 +252,7 @@ pub fn run_production_headless_chat_with_progress(
                     include_system_prompt: false,
                     failure_detail: failure_detail.clone(),
                 },
-                move |model, messages, tools, request_config| {
+                move |model, messages, tools, request_config, media_blobs| {
                     ChatGptResponsesProvider::from_credentials_with_messages_and_tools_and_timeout_and_auth_url(
                         &credentials_path,
                         base_url.as_deref(),
@@ -266,6 +269,7 @@ pub fn run_production_headless_chat_with_progress(
                             .with_request_config(request_config)
                             .with_diagnostics(provider_diagnostics)
                             .with_failure_detail(failure_detail.clone())
+                            .with_media_blobs(media_blobs)
                     })
                     .map_err(|error| {
                         provider_construction_error(
@@ -475,6 +479,32 @@ fn mcp_failure_notice_lines(status: &McpStatusHandle) -> Vec<String> {
         .collect()
 }
 
+/// Loads durable media blobs for every media id on the request and in its history.
+fn load_media_blobs_for_request(
+    data_directory: &std::path::Path,
+    request: &HeadlessChatRequest,
+) -> Result<MediaBlobs, CliError> {
+    let mut ids = BTreeSet::new();
+    ids.extend(request.media_ids.iter().copied());
+    for message in &request.history {
+        for part in &message.parts {
+            if let MessagePart::Media { media_id, .. } = part {
+                ids.insert(*media_id);
+            }
+        }
+    }
+
+    let mut blobs = MediaBlobs::new();
+    for media_id in ids {
+        let (_mime, path) = open_media(data_directory, media_id)
+            .map_err(|error| CliError::storage(format!("media {media_id}: {error}")))?;
+        let bytes = std::fs::read(&path)
+            .map_err(|error| CliError::storage(format!("media {media_id}: {error}")))?;
+        blobs.insert(media_id, bytes);
+    }
+    Ok(blobs)
+}
+
 fn run_production_headless_chat_with_provider<P>(
     request: HeadlessChatRequest,
     context: HeadlessProviderContext<'_>,
@@ -483,6 +513,7 @@ fn run_production_headless_chat_with_provider<P>(
         Vec<Message>,
         Vec<OpenAiFunctionTool>,
         agens_core::RequestConfig,
+        MediaBlobs,
     ) -> Result<P, CliError>,
 ) -> Result<HeadlessChatCompletion, HeadlessChatFailure>
 where
@@ -496,6 +527,9 @@ where
             Some("openai-chatgpt") => "gpt-5.5".to_owned(),
             _ => "gpt-4.1".to_owned(),
         });
+    // Capability gate before any provider construction or network I/O.
+    preflight_request_media(&model, &request)
+        .map_err(|error| HeadlessChatFailure::from(CliError::configuration(error.to_string())))?;
     let session_provider = context.bootstrap.provider_type().map(str::to_owned);
     let session_model = model.clone();
     let session_effort = request
@@ -602,11 +636,20 @@ where
     let terminal_partial_events = Arc::clone(&partial_events);
     let partial_prompt = request.prompt.clone();
     let partial_system_reminder = request.pending_system_reminder.clone();
+    let partial_media: Vec<(i64, String)> = request
+        .media_ids
+        .iter()
+        .copied()
+        .zip(request.media_mimes.iter().cloned())
+        .collect();
+    let media_blobs = load_media_blobs_for_request(context.bootstrap.data_directory(), &request)
+        .map_err(HeadlessChatFailure::from)?;
     let completion = run_session_attempt_lifecycle_with_terminal_writer(
         active_session_attempts(),
         &mut store,
         metadata,
         request.prompt.clone(),
+        request.media_ids.clone(),
         |attempt_key| {
             // Discards whatever an earlier use of this handle left behind before this attempt's
             // own provider is even built. See `attach_recorded_failure_detail`: a successful
@@ -618,6 +661,7 @@ where
                 provider_messages(&request, context.include_system_prompt),
                 provider_tools,
                 request.request_config.clone(),
+                media_blobs,
             )?;
             // Live SSE already emits ProviderPart/Usage through the provider sink.
             // Headless flush_progress would re-send those and double TUI text/tools.
@@ -687,8 +731,9 @@ where
                 )),
             }?;
             let snapshot = attach_recorded_failure_detail(turn_outcome, &context.failure_detail)?;
-            let turn = completed_session_turn(
+            let turn = completed_session_turn_with_media(
                 &request.prompt,
+                &partial_media,
                 &snapshot,
                 request.pending_system_reminder.as_deref(),
             )?;
@@ -702,8 +747,9 @@ where
             if !events.has_partial_history() {
                 return write_terminal_attempt(store, write, &interrupted_turn_note(&[]));
             }
-            let turn = completed_session_turn_from_events(
+            let turn = completed_session_turn_from_events_with_media(
                 &partial_prompt,
+                &partial_media,
                 &events.events,
                 partial_system_reminder.as_deref(),
             )
