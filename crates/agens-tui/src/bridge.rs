@@ -42,6 +42,8 @@ pub struct TuiPermissionRequest {
     id: u64,
     tool: String,
     target: String,
+    access: String,
+    reason: Option<String>,
     origin: Option<PromptOrigin>,
 }
 
@@ -56,6 +58,14 @@ impl TuiPermissionRequest {
 
     pub fn details(&self) -> (&str, &str) {
         (&self.tool, &self.target)
+    }
+
+    pub fn access(&self) -> &str {
+        &self.access
+    }
+
+    pub fn reason(&self) -> Option<&str> {
+        self.reason.as_deref()
     }
 }
 
@@ -117,18 +127,29 @@ impl TuiPermissionBridge {
         (Self { requests, state }, receiver)
     }
 
+    /// Parks the calling thread until the request is answered, cancelled, or
+    /// the surface disconnects.
+    ///
+    /// The deadline `cancellation` may carry is deliberately never read. A
+    /// permission question is blocking without qualification: the only things
+    /// that may end one are the person answering it, the person cancelling,
+    /// and the surface going away. This holds even when the caller hands over
+    /// a cancellation whose deadline has already passed, so no future caller
+    /// can reintroduce a timeout by supplying one.
+    ///
+    /// `tool` is the bare name a rule is written against; `target` is already
+    /// sanitized for display; `access` is a short access label (e.g. `Write`).
     pub fn wait_for_reply(
         &self,
         tool: impl Into<String>,
         target: impl Into<String>,
+        access: impl Into<String>,
+        reason: Option<String>,
         origin: Option<PromptOrigin>,
         cancellation: &HeadlessTurnCancellation,
     ) -> TuiPermissionReply {
         if cancellation.is_cancelled() || self.state.closed.load(Ordering::Acquire) {
             return TuiPermissionReply::Cancelled;
-        }
-        if cancellation.is_expired() {
-            return TuiPermissionReply::DeadlineExpired;
         }
 
         let id = self.state.next_id.fetch_add(1, Ordering::Relaxed);
@@ -144,6 +165,8 @@ impl TuiPermissionBridge {
             id,
             tool: tool.into(),
             target: target.into(),
+            access: access.into(),
+            reason,
             origin,
         };
         if self.requests.send(request).is_err() {
@@ -154,10 +177,6 @@ impl TuiPermissionBridge {
             if cancellation.is_cancelled() || self.state.closed.load(Ordering::Acquire) {
                 let _ = self.reply(id, TuiPermissionReply::Cancelled);
                 return TuiPermissionReply::Cancelled;
-            }
-            if cancellation.is_expired() {
-                let _ = self.reply(id, TuiPermissionReply::DeadlineExpired);
-                return TuiPermissionReply::DeadlineExpired;
             }
 
             match receiver.recv_timeout(RETRY_QUANTUM) {

@@ -744,3 +744,69 @@ fn safety_predicates_precede_rules_and_bypass() {
         PermissionDecision::Deny
     );
 }
+
+/// An Allow once/always grant stores `Exact(full command)`. Compound bash
+/// targets expand into per-invocation subjects; without matching the full
+/// target, re-evaluation after the user allows fails and surfaces as
+/// "permission target could not be evaluated".
+#[test]
+fn allow_exact_full_compound_bash_command_matches_the_request() {
+    let command = "cd /tmp && git commit -m msg";
+    let request =
+        PermissionRequest::new("project", "native::bash", command, ToolAccess::Write);
+    let grant = ProjectPermissionGrant::allow(
+        "project",
+        PermissionPattern::Exact("native::bash".into()),
+        PermissionPattern::Exact(command.into()),
+    );
+    let policy = PermissionPolicy::new(PermissionMode::Edit, vec![]);
+
+    assert_eq!(
+        policy.evaluate(&request, &[grant], &PermissionSession::new()),
+        PermissionDecision::Allow,
+        "Allow Exact(full compound command) must authorize that exact call"
+    );
+}
+
+/// A permissive glob must cover every invocation, not merely the full line.
+/// `git*` on `cd x && rm y` must not authorize the `rm`.
+#[test]
+fn allow_glob_git_star_does_not_match_compound_with_non_git_invocation() {
+    let command = "cd /tmp && rm -rf victim";
+    let request =
+        PermissionRequest::new("project", "native::bash", command, ToolAccess::Write);
+    let grant = ProjectPermissionGrant::allow(
+        "project",
+        PermissionPattern::Exact("native::bash".into()),
+        PermissionPattern::glob_for_target_kind("git*", PermissionTargetKind::FreeFormText)
+            .expect("git* is a valid free-form glob"),
+    );
+    let policy = PermissionPolicy::new(PermissionMode::Edit, vec![]);
+
+    assert_eq!(
+        policy.evaluate(&request, &[grant], &PermissionSession::new()),
+        PermissionDecision::Ask,
+        "Allow Glob git* must not cover a compound command with non-git parts"
+    );
+}
+
+/// When every invocation matches the allow glob, the compound command is covered.
+#[test]
+fn allow_glob_git_star_matches_compound_of_only_git_invocations() {
+    let command = "git status && git log";
+    let request =
+        PermissionRequest::new("project", "native::bash", command, ToolAccess::Write);
+    let grant = ProjectPermissionGrant::allow(
+        "project",
+        PermissionPattern::Exact("native::bash".into()),
+        PermissionPattern::glob_for_target_kind("git*", PermissionTargetKind::FreeFormText)
+            .expect("git* is a valid free-form glob"),
+    );
+    let policy = PermissionPolicy::new(PermissionMode::Edit, vec![]);
+
+    assert_eq!(
+        policy.evaluate(&request, &[grant], &PermissionSession::new()),
+        PermissionDecision::Allow,
+        "Allow Glob git* must cover a compound command whose every invocation is git"
+    );
+}

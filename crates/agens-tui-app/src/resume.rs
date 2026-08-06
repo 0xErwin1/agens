@@ -4,9 +4,10 @@
 //! completed-subagent cards shown for its history.
 
 use std::collections::BTreeSet;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use agens_core::{HeadlessTurnError, Message, MessagePart, RetryBoundary, SessionAttemptStatus};
+use agens_core::{HeadlessTurnError, Message, MessagePart, RetryBoundary};
 use agens_store::{SessionStore, StoredSession};
 use agens_tools::SkillCatalog;
 use agens_tui::{
@@ -96,32 +97,22 @@ pub fn load_tui_session_for_resume(
     let session = store
         .load_session_for_resume(identifier)
         .map_err(|_| CliError::storage("saved session is unavailable"))?;
+    // A missing retry boundary is not fatal: enter the session without a draft.
     let retry_boundary = session
         .latest_attempt
         .as_ref()
         .filter(|attempt| resume_retry_notice(attempt.status()).is_some())
-        .map(|attempt| {
-            store
-                .load_retry_boundary(attempt.key())
-                .map_err(|_| CliError::storage("saved session is unavailable"))
-        })
-        .transpose()?
-        .flatten();
-    if session.metadata.completed_turn_count == 0
-        && session
-            .latest_attempt
-            .as_ref()
-            .is_none_or(|attempt| attempt.status() != SessionAttemptStatus::Running)
-        && retry_boundary.is_none()
-    {
-        return Err(CliError::storage("saved session is unavailable"));
-    }
-    let confinement_root = store
-        .confinement_root(identifier)
-        .map_err(|_| CliError::storage("saved session is unavailable"))?;
-    let bypass_permission_prompts = store
-        .bypass_permission_prompts(identifier)
-        .map_err(|_| CliError::storage("saved session is unavailable"))?;
+        .and_then(|attempt| store.load_retry_boundary(attempt.key()).ok().flatten());
+    // A saved row is enough to enter. Zero completed turns (failed first turn,
+    // aborted attempt, empty shell) must still open — never block the door on
+    // "this session looks incomplete".
+    let confinement_root = store.confinement_root(identifier).unwrap_or_else(|_| {
+        bootstrap
+            .project_root
+            .clone()
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+    });
+    let bypass_permission_prompts = store.bypass_permission_prompts(identifier).ok().flatten();
     Ok(LoadedTuiSessionResume {
         session,
         retry_boundary,
@@ -143,7 +134,9 @@ pub fn prepare_loaded_tui_session_resume(
         bypass_permission_prompts,
     } = loaded;
     agens_callcount::note_session_resume_projection();
-    let restored_history = Conversation::from_messages_with_parser(
+    // History projection is best-effort: a malformed transcript must not lock
+    // the user out of their own session. Enter with empty history and a notice.
+    let (restored_history, history_notice) = match Conversation::from_messages_with_parser(
         &history_without_subagent_turns(&session.messages),
         |name, input| {
             let bare = name
@@ -152,8 +145,13 @@ pub fn prepare_loaded_tui_session_resume(
                 .unwrap_or(name);
             agens_core::ToolInput::parse(bare, input)
         },
-    )
-    .map_err(|_| CliError::storage("saved session is unavailable"))?;
+    ) {
+        Ok(history) => (history, None),
+        Err(_) => (
+            Vec::new(),
+            Some("session history could not be fully restored; opened without transcript".to_owned()),
+        ),
+    };
     let saved_provider = session.metadata.provider_id.as_deref();
     let provider = saved_provider.and_then(ProviderKind::parse);
     let selection_provider =
@@ -162,14 +160,10 @@ pub fn prepare_loaded_tui_session_resume(
         (Some(model), Some(provider)) => {
             let mut selector = ModelSelection::for_source(model, provider.source());
             if selector.apply_model(model).is_err() {
-                selector
-                    .apply_unverified_model(model)
-                    .map_err(|_| CliError::storage("saved session selection is unavailable"))?;
+                let _ = selector.apply_unverified_model(model);
             }
             if let Some(effort) = session.metadata.reasoning_effort {
-                selector
-                    .apply_reasoning_effort(effort.as_str())
-                    .map_err(|_| CliError::storage("saved session selection is unavailable"))?;
+                let _ = selector.apply_reasoning_effort(effort.as_str());
             }
             Some(selector)
         }
@@ -186,8 +180,13 @@ pub fn prepare_loaded_tui_session_resume(
         .map(|_| "connect or choose provider".to_owned());
     let session_root =
         agens_bootstrap::session_root::SessionRoot::confined_to(confinement_root.clone());
-    let session_config =
-        agens_bootstrap::session_config::SessionConfig::resolve(&session_root, bootstrap)?;
+    // Config resolve is preferred for bypass defaults, but must not block entry.
+    let configured_bypass = agens_bootstrap::session_config::SessionConfig::resolve(
+        &session_root,
+        bootstrap,
+    )
+    .ok()
+    .map(|config| config.bypass_permission_prompts());
     let mut context = SessionContext::restored(
         identifier,
         session.metadata,
@@ -199,24 +198,34 @@ pub fn prepare_loaded_tui_session_resume(
     context.resume_error = resume_error;
     // A resumed session's own recorded value wins over configuration; configuration only seeds a
     // session that never recorded one (pre-migration row, or one that never completed a turn).
-    context.bypass_permissions =
-        bypass_permission_prompts.unwrap_or_else(|| session_config.bypass_permission_prompts());
+    context.bypass_permissions = bypass_permission_prompts
+        .or(configured_bypass)
+        .unwrap_or(false);
+    if let Some(notice) = history_notice {
+        context.resume_notice = Some(notice);
+    }
     if let Some(boundary) = retry_boundary {
-        let status = session
+        if let Some(status) = session
             .latest_attempt
             .as_ref()
             .map(agens_core::SessionAttemptSummary::status)
-            .ok_or_else(|| CliError::storage("saved session is unavailable"))?;
-        context.resume_notice = resume_retry_notice(status).map(str::to_owned);
+        {
+            if context.resume_notice.is_none() {
+                context.resume_notice = resume_retry_notice(status).map(str::to_owned);
+            }
+        }
         // A runtime-scheduled turn is not the user's to retry, so its prompt is
         // never handed back to the composer.
         if !agens_tui::is_runtime_scheduled_prompt(boundary.prompt()) {
             context.resume_draft = Some(ResumeDraft::new(boundary.prompt().to_owned()));
             // Restore durable media ids only (no source path) so retry re-encodes from the store.
+            // A missing blob must not block entry.
             for media_id in boundary.media_ids() {
-                let (mime, _path) = agens_store::open_media(bootstrap.data_directory(), *media_id)
-                    .map_err(|_| CliError::storage("saved session media is unavailable"))?;
-                context.push_pending_media(*media_id, mime);
+                if let Ok((mime, _path)) =
+                    agens_store::open_media(bootstrap.data_directory(), *media_id)
+                {
+                    context.push_pending_media(*media_id, mime);
+                }
             }
         }
     }
@@ -1035,12 +1044,27 @@ mod tests {
             role: Role::Assistant,
             parts: vec![MessagePart::Text("orphan".into())],
         }];
-        let before_error = session.lock().unwrap().clone();
+        // Malformed history must still open the session (empty transcript + notice).
+        let degraded = prepare_loaded_tui_session_resume(
+            &bootstrap,
+            metadata.id,
+            invalid,
+            &credentials,
+        )
+        .expect("malformed history must not block session entry");
         assert!(
-            prepare_loaded_tui_session_resume(&bootstrap, metadata.id, invalid, &credentials,)
-                .is_err()
+            degraded.history.is_empty(),
+            "unprojectable history opens with an empty transcript"
         );
-        assert_eq!(*session.lock().unwrap(), before_error);
+        assert!(
+            degraded
+                .context
+                .resume_notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("history")),
+            "resume should surface a history-restoration notice: {:?}",
+            degraded.context.resume_notice
+        );
 
         std::fs::remove_dir_all(temporary).unwrap();
     }

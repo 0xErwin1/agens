@@ -426,15 +426,26 @@ impl Conversation {
                     output: output.clone(),
                     is_error,
                 });
-                self.items.push(ConversationItem::ToolResult {
-                    call_id,
+                // Pair each result with its call in the transcript, even when
+                // results arrive after a whole parallel batch of calls. Appending
+                // would paint every header and then every body; inserting after
+                // the call paints call₁, body₁, call₂, body₂.
+                let item = ConversationItem::ToolResult {
+                    call_id: call_id.clone(),
                     output,
                     is_error,
-                });
+                };
+                self.insert_after_tool_call(&call_id, item);
             }
             ConversationEvent::Diff { call_id, lines } => {
                 self.diffs.extend(lines.clone());
-                self.items.push(ConversationItem::Diff { call_id, lines });
+                // Keep diffs with their call/result block, not after later tools
+                // in the same batch.
+                let item = ConversationItem::Diff {
+                    call_id: call_id.clone(),
+                    lines,
+                };
+                self.insert_tool_follow_up(&call_id, item);
             }
             ConversationEvent::Error { message, action } => {
                 let error = ActionableError::sanitized(message, action);
@@ -683,6 +694,65 @@ impl Conversation {
             .flat_map(|batch| &mut batch.calls)
             .find(|call| call.call_id == call_id)
     }
+
+    /// Index of the transcript item that opened `call_id`, if any.
+    fn tool_call_item_index(&self, call_id: &str) -> Option<usize> {
+        self.items.iter().position(|item| {
+            matches!(
+                item,
+                ConversationItem::ToolCall {
+                    call_id: id,
+                    ..
+                } if id == call_id
+            )
+        })
+    }
+
+    /// Places a result immediately after its call header.
+    ///
+    /// Any diffs already parked after the call stay after the result so the
+    /// reader still sees header → body → patch for one tool before the next
+    /// tool in the batch.
+    fn insert_after_tool_call(&mut self, call_id: &str, item: ConversationItem) {
+        let Some(call_pos) = self.tool_call_item_index(call_id) else {
+            // The call was found in the batch table before this ran; a missing
+            // item would mean the two projections diverged, which is a logic
+            // bug. Keep the transcript complete rather than dropping the body.
+            self.items.push(item);
+            return;
+        };
+        self.items.insert(call_pos + 1, item);
+    }
+
+    /// Places a diff after the call and any result (or earlier diffs) for that
+    /// same call, so parallel batch tools do not sandwich a patch under a
+    /// later command's header.
+    fn insert_tool_follow_up(&mut self, call_id: &str, item: ConversationItem) {
+        let Some(call_pos) = self.tool_call_item_index(call_id) else {
+            self.items.push(item);
+            return;
+        };
+
+        let mut insert_at = call_pos + 1;
+        while insert_at < self.items.len() {
+            let same_call = match &self.items[insert_at] {
+                ConversationItem::ToolResult {
+                    call_id: id,
+                    ..
+                }
+                | ConversationItem::Diff {
+                    call_id: id,
+                    ..
+                } => id == call_id,
+                _ => false,
+            };
+            if !same_call {
+                break;
+            }
+            insert_at += 1;
+        }
+        self.items.insert(insert_at, item);
+    }
 }
 
 pub(crate) fn subagent_activity(name: &str) -> Option<&'static str> {
@@ -696,6 +766,69 @@ pub(crate) fn subagent_activity(name: &str) -> Option<&'static str> {
         _ => None,
     }
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agens_core::ToolInput;
+
+    fn tool_call(id: &str) -> ConversationEvent {
+        ConversationEvent::ToolCall {
+            call_id: id.into(),
+            name: id.into(),
+            input: id.into(),
+            parsed: ToolInput::Other {
+                name: id.into(),
+                raw: id.into(),
+            },
+        }
+    }
+
+    fn tool_result(id: &str, output: &str) -> ConversationEvent {
+        ConversationEvent::ToolResult {
+            call_id: id.into(),
+            output: output.into(),
+            is_error: false,
+        }
+    }
+
+    /// Parallel batches announce every call before any result. The transcript
+    /// item stream must still pair each body under its own header so the
+    /// renderer never paints two headers and then two bodies.
+    #[test]
+    fn tool_results_insert_beside_their_calls_not_after_the_batch() {
+        let mut conversation = Conversation::new("inspect");
+        for event in [
+            tool_call("one"),
+            tool_call("two"),
+            tool_result("two", "files"),
+            tool_result("one", "contents"),
+        ] {
+            conversation.apply(event).unwrap();
+        }
+
+        let kinds: Vec<String> = conversation
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                ConversationItem::ToolCall { call_id, .. } => Some(format!("call:{call_id}")),
+                ConversationItem::ToolResult { call_id, .. } => Some(format!("result:{call_id}")),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            kinds,
+            [
+                "call:one".to_owned(),
+                "result:one".to_owned(),
+                "call:two".to_owned(),
+                "result:two".to_owned(),
+            ],
+            "out-of-order results still pair under their calls: {kinds:?}"
+        );
+    }
+}
+
 fn push_text_item(items: &mut Vec<ConversationItem>, text: String, reasoning: bool) {
     match (items.last_mut(), reasoning) {
         (Some(ConversationItem::Reasoning(current)), true)

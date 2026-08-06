@@ -1037,8 +1037,22 @@ fn typed_turn_blocks_group_tools_with_status_duration_and_preview() {
     assert!(text.contains("read src/lib.rs"), "{text:?}");
     assert!(text.contains("grep needle"), "{text:?}");
     assert!(
-        text.find("grep preview") < text.find("read preview"),
-        "out-of-order results must keep arrival order: {text:?}"
+        text.find("src/lib.rs") < text.find("needle"),
+        "batch calls keep announcement order: {text:?}"
+    );
+    assert!(
+        text.find("read preview") < text.find("grep preview"),
+        "each tool body follows its own header (call order), not result arrival order: {text:?}"
+    );
+    // Header of the second call must not sit between the first call's body and
+    // the first call itself: call₁ → body₁ → call₂ → body₂.
+    let read_header = text.find("src/lib.rs").expect("read header");
+    let read_body = text.find("read preview").expect("read body");
+    let grep_header = text.find("needle").expect("grep header");
+    let grep_body = text.find("grep preview").expect("grep body");
+    assert!(
+        read_header < read_body && read_body < grep_header && grep_header < grep_body,
+        "paired order broken: {text:?}"
     );
     assert!(!text.contains("└ read"), "{text:?}");
     assert!(!text.contains("└ grep"), "{text:?}");
@@ -6237,14 +6251,73 @@ fn ask_user_names_the_action_the_row_actually_performs_on_each_question() {
         !text.contains("Submit answers"),
         "nothing can be submitted from the first of three questions: {text:?}"
     );
+    assert!(
+        !text.contains("Review answers"),
+        "review is only on the last question: {text:?}"
+    );
 
     tui.handle(Event::Key(Key::Tab));
     tui.handle(Event::Key(Key::Tab));
     renderer.render(tui.view()).unwrap();
 
     let text = rendered_text(&renderer);
-    assert!(text.contains("Submit answers"), "{text:?}");
+    assert!(
+        text.contains("Review answers"),
+        "last question opens review rather than submitting immediately: {text:?}"
+    );
     assert!(!text.contains("Next question"), "{text:?}");
+    assert!(
+        !text.contains("Submit answers"),
+        "submit is only offered from the review screen: {text:?}"
+    );
+}
+
+#[test]
+fn ask_user_review_lists_every_prompt_and_selected_label_before_submit() {
+    let (mut tui, mut renderer) = open_ask_user(
+        ASK_USER_WIDE_TERMINAL,
+        36,
+        three_question_ask_user_request(),
+    );
+
+    // Answer each question with its first option, advancing via Enter.
+    tui.handle(Event::Key(Key::Enter));
+    tui.handle(Event::Key(Key::Enter));
+    tui.handle(Event::Key(Key::Enter));
+    // On the last question Enter selected option without advancing; open review.
+    walk_to_proceed_for_render(&mut tui);
+    tui.handle(Event::Key(Key::Enter));
+    renderer.render(tui.view()).unwrap();
+
+    let text = rendered_text(&renderer);
+    assert!(text.contains("Review your answers"), "{text:?}");
+    assert!(text.contains("PROMPT_q1"), "{text:?}");
+    assert!(text.contains("PROMPT_q2"), "{text:?}");
+    assert!(text.contains("PROMPT_q3"), "{text:?}");
+    assert!(text.contains("q1_A"), "{text:?}");
+    assert!(text.contains("q2_A"), "{text:?}");
+    assert!(text.contains("q3_A"), "{text:?}");
+    assert!(text.contains("Submit answers"), "{text:?}");
+    assert!(text.contains("Cancel"), "{text:?}");
+    assert!(
+        !text.contains("Next question"),
+        "review has no next-question affordance: {text:?}"
+    );
+    assert!(
+        !text.contains("other:"),
+        "review has no free-text entry rows: {text:?}"
+    );
+}
+
+/// Walks Down onto the proceed row without asserting via events helpers.
+fn walk_to_proceed_for_render(tui: &mut Tui<FakeEngine>) {
+    for _ in 0..8 {
+        if tui.ask_user_snapshot().map(|s| s.row) == Some(agens_tui::AskUserRowSnapshot::Proceed) {
+            return;
+        }
+        tui.handle(Event::Key(Key::Down));
+    }
+    panic!("proceed row must be reachable");
 }
 
 /// The complaint this pins: typing past the width of the row left the reader
@@ -6617,6 +6690,55 @@ fn ask_user_overlay_sits_flush_above_the_composer() {
     assert!(
         frame_bottom < composer_top,
         "overlay must sit strictly above the composer"
+    );
+}
+
+/// The ask-user frame must share the composer's left and right edges, not a
+/// hard-coded column cap that leaves a gap on wide terminals.
+#[test]
+fn ask_user_overlay_width_matches_the_composer() {
+    const WIDE: u16 = 140;
+    let (tui, renderer) = open_ask_user(WIDE, 30, three_question_ask_user_request());
+    let _ = tui;
+    let buffer = renderer.terminal().backend().buffer();
+    let composer_top = composer_top_row(&renderer);
+
+    let composer_left = (0..buffer.area.width)
+        .find(|col| buffer[(*col, composer_top)].symbol() == "┌")
+        .expect("composer left border");
+    let composer_right = (0..buffer.area.width)
+        .rev()
+        .find(|col| buffer[(*col, composer_top)].symbol() == "┐")
+        .expect("composer right border");
+
+    let frame_top = (0..composer_top)
+        .find(|row| {
+            (0..buffer.area.width).any(|col| {
+                let symbol = buffer[(col, *row)].symbol();
+                symbol == "╭" || symbol == "╮"
+            })
+        })
+        .expect("ask-user frame has a top border");
+    let frame_left = (0..buffer.area.width)
+        .find(|col| buffer[(*col, frame_top)].symbol() == "╭")
+        .expect("ask-user left border");
+    let frame_right = (0..buffer.area.width)
+        .rev()
+        .find(|col| buffer[(*col, frame_top)].symbol() == "╮")
+        .expect("ask-user right border");
+
+    assert_eq!(
+        frame_left, composer_left,
+        "ask-user left must align with composer left; frame_left={frame_left} composer_left={composer_left}"
+    );
+    assert_eq!(
+        frame_right, composer_right,
+        "ask-user right must align with composer right; frame_right={frame_right} composer_right={composer_right}"
+    );
+    assert_eq!(
+        frame_right - frame_left + 1,
+        composer_right - composer_left + 1,
+        "ask-user frame width must equal composer width on a {WIDE}-col terminal"
     );
 }
 

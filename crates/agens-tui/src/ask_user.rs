@@ -29,11 +29,11 @@ const ASK_USER_CONTEXT_PAGE_STEP: u16 = 10;
 pub(crate) enum AskUserRow {
     Option(usize),
     /// The row that carries the interaction forward: the next question while
-    /// any remain, and the submission itself on the last one. It is a single
-    /// row rather than two because its position never moves — the reader's
-    /// hand learns one place to press Enter — while what pressing it means is
-    /// exactly the difference between "there is more to answer" and "there is
-    /// not".
+    /// any remain, review on the last question, and final submit while
+    /// reviewing. It is a single row rather than two because its position
+    /// never moves — the reader's hand learns one place to press Enter —
+    /// while what pressing it means is exactly the difference between "there
+    /// is more to answer", "check everything once", and "send".
     Proceed,
     Discuss,
     Cancel,
@@ -72,6 +72,8 @@ pub struct AskUserSnapshot {
     pub entry_cursor: usize,
     pub discuss_available: bool,
     pub context_scroll: u16,
+    /// Whether the reader is on the pre-submit review of every answer.
+    pub reviewing: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -136,6 +138,10 @@ pub(crate) struct AskUserState {
     /// it, instead of blanking the explanation they are still consulting.
     context_option: usize,
     context_scroll: u16,
+    /// Pre-submit screen that lists every question with its answer before the
+    /// final commit. While true the list shows only review content plus
+    /// Submit/Cancel — no option rows, free-text entry, or discuss.
+    reviewing: bool,
 }
 
 impl AskUserState {
@@ -158,6 +164,7 @@ impl AskUserState {
             entry_cursor: 0,
             context_option: 0,
             context_scroll: 0,
+            reviewing: false,
         }
     }
 
@@ -209,6 +216,22 @@ impl AskUserState {
         self.context_scroll
     }
 
+    pub(crate) const fn reviewing(&self) -> bool {
+        self.reviewing
+    }
+
+    pub(crate) fn selections(&self) -> &[BTreeSet<usize>] {
+        &self.selections
+    }
+
+    pub(crate) fn others(&self) -> &[String] {
+        &self.other
+    }
+
+    pub(crate) fn notes(&self) -> &[String] {
+        &self.notes
+    }
+
     /// How many questions currently hold a valid answer.
     pub(crate) fn answered_count(&self) -> usize {
         (0..self.request.questions().len())
@@ -238,8 +261,9 @@ impl AskUserState {
             note: self.notes[self.question].clone(),
             editing: self.entry.into(),
             entry_cursor: self.entry_cursor,
-            discuss_available: self.current_allows_discuss(),
+            discuss_available: self.current_allows_discuss() && !self.reviewing,
             context_scroll: self.context_scroll,
+            reviewing: self.reviewing,
         }
     }
 
@@ -326,24 +350,36 @@ impl AskUserState {
     }
 
     fn current_allows_discuss(&self) -> bool {
-        self.request.questions()[self.question].allow_discuss()
+        !self.reviewing && self.request.questions()[self.question].allow_discuss()
     }
 
     /// Free-text "other" is always available on this surface, independent of
-    /// the agent's `allow_other` flag.
+    /// the agent's `allow_other` flag — except while reviewing, where only
+    /// Submit and Cancel are live.
     fn current_allows_other(&self) -> bool {
-        true
+        !self.reviewing
     }
 
     fn current_allows_note(&self) -> bool {
-        self.request.questions()[self.question].allow_note()
+        !self.reviewing && self.request.questions()[self.question].allow_note()
     }
 
     fn row_count(&self) -> usize {
+        if self.reviewing {
+            // Proceed + Cancel only.
+            return 2;
+        }
         self.current_question_options_len() + 2 + usize::from(self.current_allows_discuss())
     }
 
     fn row_index(&self, row: AskUserRow) -> usize {
+        if self.reviewing {
+            return match row {
+                AskUserRow::Proceed => 0,
+                AskUserRow::Cancel => 1,
+                AskUserRow::Option(_) | AskUserRow::Discuss => 0,
+            };
+        }
         let options = self.current_question_options_len();
         match row {
             AskUserRow::Option(index) => index,
@@ -354,6 +390,13 @@ impl AskUserState {
     }
 
     fn row_at(&self, index: usize) -> AskUserRow {
+        if self.reviewing {
+            return if index == 0 {
+                AskUserRow::Proceed
+            } else {
+                AskUserRow::Cancel
+            };
+        }
         let options = self.current_question_options_len();
         if index < options {
             return AskUserRow::Option(index);
@@ -389,7 +432,9 @@ impl AskUserState {
     }
 
     fn move_to_question(&mut self, target: usize) -> AskUserOutcome {
-        if target == self.question {
+        // Leaving review counts as a real navigation even when the question
+        // index does not change (single-question Tab/Left, or re-focus).
+        if target == self.question && !self.reviewing {
             return AskUserOutcome::Unchanged;
         }
         self.focus_question(target)
@@ -402,13 +447,15 @@ impl AskUserState {
     /// treats "already there" as nothing to do. This is used where the point
     /// is to put the reader in front of something specific, and landing on the
     /// right question with the cursor still parked on a button would not be
-    /// that.
+    /// that. Always leaves review mode.
     fn focus_question(&mut self, target: usize) -> AskUserOutcome {
-        let settled = self.question == target
+        let settled = !self.reviewing
+            && self.question == target
             && self.row == AskUserRow::Option(0)
             && self.context_option == 0
             && self.context_scroll == 0;
 
+        self.reviewing = false;
         self.question = target;
         self.row = AskUserRow::Option(0);
         self.context_option = 0;
@@ -436,6 +483,13 @@ impl AskUserState {
     }
 
     fn activate_row(&mut self) -> AskUserOutcome {
+        if self.reviewing {
+            return match self.row {
+                AskUserRow::Proceed => self.submit(),
+                AskUserRow::Cancel => AskUserOutcome::Resolved(AskUserReply::Cancelled),
+                AskUserRow::Option(_) | AskUserRow::Discuss => AskUserOutcome::Unchanged,
+            };
+        }
         match self.row {
             AskUserRow::Option(index) => {
                 let selected = self.toggle_or_select(index);
@@ -453,6 +507,9 @@ impl AskUserState {
     /// Space on an option toggles selection without advancing, so multi-select
     /// can accumulate choices before the reader moves on with Enter or Proceed.
     fn activate_option_row(&mut self) -> AskUserOutcome {
+        if self.reviewing {
+            return AskUserOutcome::Unchanged;
+        }
         match self.row {
             AskUserRow::Option(index) => self.toggle_or_select(index),
             AskUserRow::Proceed | AskUserRow::Discuss | AskUserRow::Cancel => {
@@ -623,13 +680,25 @@ impl AskUserState {
 
     /// Carries the interaction forward from the proceed row.
     ///
-    /// On any question but the last this only advances; unanswered questions
+    /// On any question but the last this only advances; on the last it opens
+    /// the review screen; while reviewing it submits. Unanswered questions
     /// are left as skips and accepted at submit time.
     fn proceed(&mut self) -> AskUserOutcome {
-        if self.is_last_question() {
+        if self.reviewing {
             return self.submit();
         }
+        if self.is_last_question() {
+            return self.enter_review();
+        }
         self.move_to_next_question()
+    }
+
+    /// Opens the pre-submit review of every answer.
+    fn enter_review(&mut self) -> AskUserOutcome {
+        self.close_entry();
+        self.reviewing = true;
+        self.row = AskUserRow::Proceed;
+        AskUserOutcome::Changed
     }
 
     /// Ends the interaction with whatever answers are present.

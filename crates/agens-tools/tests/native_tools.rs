@@ -630,6 +630,43 @@ fn a_successful_read_reports_its_path() {
 }
 
 #[test]
+fn absolute_paths_under_the_project_root_are_accepted_and_rewritten() {
+    let root = project_root();
+    let tools = NativeTools::open(&root).unwrap();
+    let absolute = root.join("nested/absolute.txt");
+
+    let written = tools
+        .write_file(WriteFileInput::new(&absolute, "absolute body\n"))
+        .unwrap();
+    assert!(
+        !written.is_error,
+        "absolute path under the root must write: {written:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("nested/absolute.txt")).unwrap(),
+        "absolute body\n"
+    );
+
+    let read = tools.read_file(ReadFileInput::new(&absolute)).unwrap();
+    assert!(!read.is_error, "absolute read under the root: {read:?}");
+    assert!(read.content.contains("absolute body"));
+
+    // Outside the root stays blocked (confinement), not a ban on absolute form.
+    let outside = project_root().join("secret.txt");
+    fs::write(&outside, "nope").unwrap();
+    assert_eq!(
+        tools
+            .write_file(WriteFileInput::new(&outside, "escape"))
+            .unwrap(),
+        ToolOutput::failure("path: outside project root")
+    );
+    assert_eq!(fs::read_to_string(&outside).unwrap(), "nope");
+
+    fs::remove_dir_all(root).unwrap();
+    fs::remove_dir_all(outside.parent().unwrap()).unwrap();
+}
+
+#[test]
 fn confined_read_write_creates_parents_and_reads_one_based_ranges() {
     let root = project_root();
     let tools = NativeTools::open(&root).unwrap();
@@ -1130,7 +1167,7 @@ fn grep_and_glob_reject_escape_patterns_and_skip_external_symlinks() {
         tools
             .grep(GrepInput::new("EXTERNAL_SENTINEL").with_path(&outside))
             .unwrap(),
-        ToolOutput::failure("path: must be a non-empty relative path")
+        ToolOutput::failure("path: outside project root")
     );
 
     for pattern in ["../**", "/**", r"C:\\**", r"\\\\server\\share\\**"] {

@@ -622,6 +622,11 @@ struct AskUserRender<'a> {
     context_scroll: u16,
     answered: usize,
     origin: Option<&'a crate::PromptOrigin>,
+    reviewing: bool,
+    /// All questions' selections, for the review list.
+    selections: &'a [BTreeSet<usize>],
+    others: &'a [String],
+    notes: &'a [String],
 }
 
 impl<'a> AskUserRender<'a> {
@@ -639,6 +644,10 @@ impl<'a> AskUserRender<'a> {
             context_scroll: state.context_scroll(),
             answered: state.answered_count(),
             origin: state.origin(),
+            reviewing: state.reviewing(),
+            selections: state.selections(),
+            others: state.others(),
+            notes: state.notes(),
         }
     }
 
@@ -1535,7 +1544,9 @@ impl DialogView {
             .unwrap_or_default();
         Self {
             title: bounded_dialog_text(title.as_ref(), 64),
-            help: help.map(|help| bounded_dialog_text(help.as_ref(), 2_048)),
+            // Preserve newlines so confirm bodies (full bash commands, paths)
+            // can wrap across rows instead of collapsing into one caption.
+            help: help.map(|help| bounded_dialog_multiline(help.as_ref(), 4_096)),
             entries,
             query: String::new(),
             searching: false,
@@ -1686,7 +1697,9 @@ impl DialogView {
     fn informational(title: impl AsRef<str>, body: impl AsRef<str>) -> Self {
         Self {
             title: bounded_dialog_text(title.as_ref(), 64),
-            help: Some(bounded_dialog_text(body.as_ref(), 2_048)),
+            // Bodies carry "message\nAction: …"; collapsing newlines made Action
+            // run into the message (unavailableAction:). Multiline keeps layout.
+            help: Some(bounded_dialog_multiline(body.as_ref(), 2_048)),
             entries: Vec::new(),
             query: String::new(),
             searching: false,
@@ -2126,7 +2139,11 @@ struct AskUserFrame<'a> {
 ///
 /// When it does not, the pane is not merely empty — the two-column layout would
 /// spend half the overlay on nothing, so the list keeps the whole width.
+/// Review has no option rows, so the context column is never useful there.
 fn ask_user_has_context(render: &AskUserRender<'_>) -> bool {
+    if render.reviewing {
+        return false;
+    }
     render
         .current()
         .options()
@@ -2147,6 +2164,23 @@ fn ask_user_shortcuts(render: &AskUserRender<'_>) -> Vec<widgets::OverlayShortcu
     let question = render.current();
     if render.entry != AskUserEntry::Browsing {
         return ask_user_entry_shortcuts(ask_user_has_context(render));
+    }
+
+    if render.reviewing {
+        return vec![
+            widgets::OverlayShortcut {
+                key: "↑↓",
+                label: "move",
+            },
+            widgets::OverlayShortcut {
+                key: "Enter",
+                label: "submit",
+            },
+            widgets::OverlayShortcut {
+                key: "esc",
+                label: "cancel",
+            },
+        ];
     }
 
     let mut shortcuts = vec![
@@ -2351,7 +2385,11 @@ fn ask_user_header_lines(render: &AskUserRender<'_>, width: u16) -> Vec<Line<'st
     let total = render.request.questions().len();
     let status = vec![
         Span::styled(
-            format!("Question {}/{total}", render.question + 1),
+            if render.reviewing {
+                format!("Review · {total} questions")
+            } else {
+                format!("Question {}/{total}", render.question + 1)
+            },
             Style::default().fg(widgets::RolePalette::navigation()),
         ),
         Span::styled("  ·  ", muted),
@@ -2365,8 +2403,18 @@ fn ask_user_header_lines(render: &AskUserRender<'_>, width: u16) -> Vec<Line<'st
         ),
     ];
 
-    let question = render.current();
     let mut lines = vec![Line::from(status)];
+    if render.reviewing {
+        lines.push(Line::styled(
+            "Review your answers".to_owned(),
+            Style::default()
+                .fg(widgets::RolePalette::assistant())
+                .add_modifier(Modifier::BOLD),
+        ));
+        return lines;
+    }
+
+    let question = render.current();
     lines.extend(
         wrapped_prose_lines(question.prompt(), width)
             .into_iter()
@@ -2401,6 +2449,10 @@ fn ask_user_rows<'a>(
     render: &AskUserRender<'a>,
     width: u16,
 ) -> (Vec<widgets::OverlayRow<'a>>, usize) {
+    if render.reviewing {
+        return ask_user_review_rows(render);
+    }
+
     let question = render.current();
     let multiple = question.mode() == AskUserMode::Multiple;
     let mut rows: Vec<widgets::OverlayRow<'a>> = Vec::new();
@@ -2464,10 +2516,10 @@ fn ask_user_rows<'a>(
             ..widgets::OverlayRow::default()
         });
     };
-    // Unanswered questions may be submitted as skips; the last proceed row is
-    // always a real submit rather than a blocked affordance.
+    // Last question opens review rather than submitting immediately, so the
+    // reader can still check skipped items before the final commit.
     if last {
-        action(AskUserRow::Proceed, "Submit answers");
+        action(AskUserRow::Proceed, "Review answers");
     } else {
         action(AskUserRow::Proceed, "Next question");
     }
@@ -2477,6 +2529,86 @@ fn ask_user_rows<'a>(
     action(AskUserRow::Cancel, "Cancel");
 
     (rows, selected_row)
+}
+
+/// Review-mode list: every question with its chosen answer, then Submit/Cancel.
+fn ask_user_review_rows<'a>(
+    render: &AskUserRender<'a>,
+) -> (Vec<widgets::OverlayRow<'a>>, usize) {
+    let mut rows: Vec<widgets::OverlayRow<'a>> = Vec::new();
+    let mut selected_row = 0;
+
+    for (index, question) in render.request.questions().iter().enumerate() {
+        let selected = render.selections.get(index);
+        let other = render.others.get(index).map(String::as_str).unwrap_or("");
+        let note = render.notes.get(index).map(String::as_str).unwrap_or("");
+
+        rows.push(widgets::OverlayRow {
+            label: Cow::Owned(question.prompt().to_owned()),
+            dimmed: false,
+            ..widgets::OverlayRow::default()
+        });
+        rows.push(widgets::OverlayRow {
+            label: Cow::Owned(format!(
+                "→ {}",
+                ask_user_answer_summary(question, selected, other)
+            )),
+            indent: 1,
+            dimmed: true,
+            ..widgets::OverlayRow::default()
+        });
+        if !note.trim().is_empty() {
+            rows.push(widgets::OverlayRow {
+                label: Cow::Owned(format!("note: {note}")),
+                indent: 1,
+                dimmed: true,
+                ..widgets::OverlayRow::default()
+            });
+        }
+    }
+
+    rows.push(widgets::OverlayRow::new(""));
+
+    let mut action = |row: AskUserRow, label: &'static str| {
+        let highlighted = render.row == row;
+        if highlighted {
+            selected_row = rows.len();
+        }
+        rows.push(widgets::OverlayRow {
+            label: Cow::Borrowed(label),
+            selected: highlighted,
+            ..widgets::OverlayRow::default()
+        });
+    };
+    action(AskUserRow::Proceed, "Submit answers");
+    action(AskUserRow::Cancel, "Cancel");
+
+    (rows, selected_row)
+}
+
+/// Human label for one question's stored answer (options, free-text, or skip).
+fn ask_user_answer_summary(
+    question: &AskUserQuestion,
+    selected: Option<&BTreeSet<usize>>,
+    other: &str,
+) -> String {
+    let mut parts = Vec::new();
+    if let Some(selected) = selected {
+        for index in selected {
+            if let Some(option) = question.options().get(*index) {
+                parts.push(option.label().to_owned());
+            }
+        }
+    }
+    let other = other.trim();
+    if !other.is_empty() {
+        parts.push(other.to_owned());
+    }
+    if parts.is_empty() {
+        "(skipped)".to_owned()
+    } else {
+        parts.join(", ")
+    }
 }
 
 /// The caret drawn at the insertion point of an open buffer.
@@ -3479,7 +3611,9 @@ fn dialog_help_lines(dialog: &DialogView, width: u16) -> Vec<String> {
         return Vec::new();
     };
 
-    if dialog_help_is_body(dialog) {
+    // Confirm overlays (permission) and informational bodies wrap so long
+    // commands/paths stay readable instead of being mid-line ellipsized.
+    if dialog_help_is_body(dialog) || dialog.overlay_kind == widgets::OverlayKind::Confirm {
         return wrapped_prose_lines(help, width);
     }
 
@@ -3668,10 +3802,10 @@ fn dialog_config<'a>(
     area: Rect,
     composer: Rect,
 ) -> widgets::OverlayConfig<'a> {
+    // Confirm uses the full dialog sizing so a long bash command can wrap in
+    // the help band without the compact max-height clipping it to one line.
     let sizing = if dialog.composer_anchored {
         widgets::OverlaySizing::palette(composer)
-    } else if dialog.overlay_kind == widgets::OverlayKind::Confirm {
-        widgets::OverlaySizing::compact()
     } else {
         widgets::OverlaySizing::dialog()
     };
@@ -10869,8 +11003,12 @@ where
             .collect();
             tui.show_selection_dialog(
                 DialogView::selection(
-                    prompt_title("Permission required", request.origin()),
-                    Some(format!("{tool}\n{target}")),
+                    prompt_title(permission_dialog_title(tool), request.origin()),
+                    Some(permission_dialog_body(
+                        target,
+                        request.access(),
+                        request.reason(),
+                    )),
                     entries,
                 )
                 .as_confirm(),
@@ -11189,6 +11327,35 @@ fn prompt_title(base: &str, origin: Option<&PromptOrigin>) -> String {
         Some(origin) => format!("{base} · {} #{}", origin.agent, origin.execution),
         None => base.to_owned(),
     }
+}
+
+/// Title for a permission confirm, keyed off the bare tool name.
+fn permission_dialog_title(tool: &str) -> &'static str {
+    match tool {
+        "bash" => "Bash command",
+        "write" | "edit" => "Write file",
+        "read" | "list" | "search" | "glob" | "grep" | "git_read" => "Read access",
+        "webfetch" => "Network access",
+        _ => "Permission required",
+    }
+}
+
+/// Multi-line body for a permission confirm: full target, access, optional reason.
+///
+/// Newlines are preserved so the target can wrap without being collapsed into
+/// a single ellipsized caption.
+fn permission_dialog_body(target: &str, access: &str, reason: Option<&str>) -> String {
+    let mut body = target.to_owned();
+    if !access.is_empty() {
+        body.push('\n');
+        body.push_str("Access: ");
+        body.push_str(access);
+    }
+    if let Some(reason) = reason.filter(|reason| !reason.is_empty()) {
+        body.push('\n');
+        body.push_str(reason);
+    }
+    body
 }
 
 fn drain_ask_user_request<E: Engine>(
@@ -13666,7 +13833,29 @@ mod runtime_tests {
             vec![DialogEntry::action("Allow once", "permission:1:allow-once")],
         )
         .as_confirm();
-        assert_eq!(dialog_desired_rows(&confirm, 30), 2);
+        // Help keeps its newlines and wraps for Confirm; two help lines + one entry.
+        assert_eq!(dialog_desired_rows(&confirm, 30), 3);
+        assert_eq!(
+            dialog_help_lines(&confirm, 40),
+            vec!["native::read", "/work/alpha"]
+        );
+    }
+
+    #[test]
+    fn permission_dialog_body_keeps_the_full_target_and_access() {
+        assert_eq!(permission_dialog_title("bash"), "Bash command");
+        assert_eq!(permission_dialog_title("write"), "Write file");
+        assert_eq!(permission_dialog_title("probe::tool"), "Permission required");
+
+        let body = permission_dialog_body(
+            "cd /tmp && git commit -m long-message",
+            "Write",
+            Some("permission policy requires confirmation"),
+        );
+        assert!(body.contains("cd /tmp && git commit -m long-message"));
+        assert!(body.contains("Access: Write"));
+        assert!(body.contains("permission policy requires confirmation"));
+        assert!(!body.contains('…'));
     }
 
     #[test]

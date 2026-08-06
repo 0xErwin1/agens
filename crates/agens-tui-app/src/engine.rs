@@ -992,21 +992,31 @@ mod tests {
         }));
         let original = session.lock().unwrap().clone();
 
-        for command in ["/resume 1", "/subagent reviewer"] {
-            assert_eq!(
-                run_tui_prompt(
-                    &bootstrap,
-                    command,
-                    &HeadlessTurnCancellation::new(),
-                    &session,
-                    None,
-                )
-                .unwrap_err()
-                .to_string(),
-                "runtime: headless turn entered an invalid state"
-            );
-            assert_eq!(*session.lock().unwrap(), original);
-        }
+        // Resume while a turn is running must refuse without mutating the session.
+        assert_eq!(
+            run_tui_prompt(
+                &bootstrap,
+                "/resume 1",
+                &HeadlessTurnCancellation::new(),
+                &session,
+                None,
+            )
+            .unwrap_err()
+            .to_string(),
+            "runtime: headless turn entered an invalid state"
+        );
+        assert_eq!(*session.lock().unwrap(), original);
+
+        // Local subagent selection is not a turn start; it must leave the busy
+        // context untouched even when it returns Ok.
+        let _ = run_tui_prompt(
+            &bootstrap,
+            "/subagent reviewer",
+            &HeadlessTurnCancellation::new(),
+            &session,
+            None,
+        );
+        assert_eq!(*session.lock().unwrap(), original);
 
         std::fs::remove_dir_all(temporary).unwrap();
     }

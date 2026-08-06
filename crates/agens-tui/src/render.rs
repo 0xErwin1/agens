@@ -25,7 +25,7 @@ use crate::conversation::ConversationItem;
 use crate::widgets::{
     ACCENT_WIDTH, BlockContent, BlockLine, DisplayMode, GUTTER_WIDTH, Glyph, RolePalette,
     RowAccent, RowBullet, RowState, StatusGlyph, ThinkingBlock, ToolCallBlock, ToolResultBlock,
-    UnicodeLevel, VerbGroup,
+    UnicodeLevel, VerbGroup, format_ask_user_result_lines, is_ask_user_tool_name,
 };
 use crate::{Conversation, DiffLine, DiffLineKind, ToolResultState, TuiRuntimeEvent};
 
@@ -596,7 +596,8 @@ fn tool_call_block(
 ///
 /// A body block only exists once the call carries a result, so an absent mode
 /// entry has to resolve the same way `ToolCallBlock::default_mode` resolves it
-/// for a settled call: hidden until the reader asks for it.
+/// for a settled call: hidden until the reader asks for it. Settled ask_user
+/// defaults to Truncated so the human answer summary is visible immediately.
 fn tool_result_body_block(
     context: &ItemContext<'_>,
     call_id: &str,
@@ -607,11 +608,19 @@ fn tool_result_body_block(
         return RenderedBlock::hidden();
     }
 
+    let ask_user_call = find_tool_call(context.conversation, call_id)
+        .filter(|call| is_ask_user_tool_name(&call.name));
     let mode = context
         .tool_display_modes
         .get(call_id)
         .copied()
-        .unwrap_or(DisplayMode::Collapsed);
+        .unwrap_or_else(|| {
+            if ask_user_call.is_some() {
+                DisplayMode::Truncated
+            } else {
+                DisplayMode::Collapsed
+            }
+        });
     if mode == DisplayMode::Collapsed {
         return RenderedBlock::hidden();
     }
@@ -622,7 +631,12 @@ fn tool_result_body_block(
         .content_width
         .saturating_sub(TOOL_BODY_INDENT)
         .max(1);
-    let full_body = tool_result_body(call_id, output, body_width, failed);
+    let full_body = if let Some(call) = ask_user_call {
+        ask_user_result_body(&call.input, output, body_width, failed)
+            .unwrap_or_else(|| tool_result_body(call_id, output, body_width, failed))
+    } else {
+        tool_result_body(call_id, output, body_width, failed)
+    };
     let body = match mode {
         DisplayMode::Collapsed => Vec::new(),
         DisplayMode::Truncated => crate::widgets::bounded_tool_preview(&full_body),
@@ -640,6 +654,45 @@ fn tool_result_body_block(
         call_id: Some(call_id.to_owned()),
         closes_call: true,
     }
+}
+
+fn find_tool_call<'a>(
+    conversation: &'a Conversation,
+    call_id: &str,
+) -> Option<&'a crate::conversation::ToolCall> {
+    conversation
+        .tool_batches
+        .iter()
+        .flat_map(|batch| &batch.calls)
+        .find(|call| call.call_id == call_id)
+}
+
+/// Human answer lines for ask_user, or `None` when the envelope is unreadable.
+fn ask_user_result_body(
+    input: &str,
+    output: &str,
+    content_width: usize,
+    failed: bool,
+) -> Option<Arc<[Line<'static>]>> {
+    let lines = format_ask_user_result_lines(input, output)?;
+    let color = if failed {
+        RolePalette::error()
+    } else {
+        RolePalette::muted()
+    };
+    let style = Style::default().fg(color);
+    let described: Vec<Line<'static>> = lines
+        .into_iter()
+        .flat_map(|line| {
+            let clipped = if line.width() > content_width && content_width > 0 {
+                bounded_single_line(&line, content_width)
+            } else {
+                line
+            };
+            vec![Line::from(Span::styled(clipped, style))]
+        })
+        .collect();
+    Some(Arc::from(described))
 }
 
 fn assistant_block(text: &str, content_width: usize, highlight_syntax: bool) -> RenderedBlock {

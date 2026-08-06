@@ -56,20 +56,26 @@ impl PermissionPrompter for TuiPermissionPrompter {
         context: &PermissionPromptContext,
         cancellation: &HeadlessTurnCancellation,
     ) -> Result<PermissionPromptAnswer, HeadlessTurnPortError> {
-        {
-            match self.0.wait_for_reply(
-                agens_core::bare_tool_name(&context.tool_identity).into_owned(),
-                render_permission_prompt(context),
-                self.1.clone(),
-                cancellation,
-            ) {
-                TuiPermissionReply::AllowOnce => Ok(PermissionPromptAnswer::AllowOnce),
-                TuiPermissionReply::AllowAlways => Ok(PermissionPromptAnswer::AllowAlways),
-                TuiPermissionReply::DenyOnce => Ok(PermissionPromptAnswer::DenyOnce),
-                TuiPermissionReply::DenyAlways => Ok(PermissionPromptAnswer::DenyAlways),
-                TuiPermissionReply::Cancelled => Err(HeadlessTurnPortError::Cancelled),
-                TuiPermissionReply::DeadlineExpired => Err(HeadlessTurnPortError::TimedOut),
-            }
+        let tool = agens_core::bare_tool_name(&context.tool_identity).into_owned();
+        let target =
+            sanitize_permission_target(&context.tool_identity, &context.target_identifier);
+        let access = format!("{:?}", context.access);
+        let reason = (!context.reason.is_empty()).then(|| context.reason.clone());
+
+        match self.0.wait_for_reply(
+            tool,
+            target,
+            access,
+            reason,
+            self.1.clone(),
+            cancellation,
+        ) {
+            TuiPermissionReply::AllowOnce => Ok(PermissionPromptAnswer::AllowOnce),
+            TuiPermissionReply::AllowAlways => Ok(PermissionPromptAnswer::AllowAlways),
+            TuiPermissionReply::DenyOnce => Ok(PermissionPromptAnswer::DenyOnce),
+            TuiPermissionReply::DenyAlways => Ok(PermissionPromptAnswer::DenyAlways),
+            TuiPermissionReply::Cancelled => Err(HeadlessTurnPortError::Cancelled),
+            TuiPermissionReply::DeadlineExpired => Err(HeadlessTurnPortError::TimedOut),
         }
     }
 }
@@ -364,8 +370,9 @@ mod tests {
         assert!(!prompt.contains("SENTINEL_JSON"));
     }
 
-    /// A `bash` prompt withholds the command line, and the context it is asked
-    /// about comes from the dispatcher rather than from a literal written here.
+    /// A `bash` prompt shows the command with shaped secrets redacted, and the
+    /// context it is asked about comes from the dispatcher rather than from a
+    /// literal written here.
     ///
     /// A prompt context carries the dispatcher's own identity for the tool
     /// (`native:4:bash`), not the qualified name a rule is written in. A guard
@@ -375,7 +382,7 @@ mod tests {
     /// here is built the way production builds it: register the tool, evaluate
     /// a call against a policy that asks, and prompt with what comes back.
     #[test]
-    fn a_prompt_for_a_bash_call_withholds_the_command_the_dispatcher_named_it_by() {
+    fn a_prompt_for_a_bash_call_shows_the_command_with_secrets_redacted() {
         struct BashLikeTool;
 
         impl DispatchTool for BashLikeTool {
@@ -416,7 +423,7 @@ mod tests {
                 agens_tools::ToolDispatchRequest::new(
                     "project",
                     "bash",
-                    serde_json::json!({"command": "curl -H 'Bearer SENTINEL_COMMAND'"}),
+                    serde_json::json!({"command": "curl -H 'Bearer SENTINEL_COMMAND' https://example.test"}),
                 ),
             )
             .expect("the call must be decidable");
@@ -427,12 +434,16 @@ mod tests {
         let prompt = render_permission_prompt(&context);
 
         assert!(
-            prompt.contains("[command redacted]"),
-            "a bash prompt must withhold the command line it was asked about: {prompt}"
+            prompt.contains("curl") && prompt.contains("https://example.test"),
+            "a bash prompt must show the command so the person can decide: {prompt}"
         );
         assert!(
             !prompt.contains("SENTINEL_COMMAND"),
-            "the command line must not reach the prompt at all: {prompt}"
+            "shaped secrets in the command must be redacted: {prompt}"
+        );
+        assert!(
+            !prompt.contains("[command redacted]"),
+            "the command must not be wiped wholesale: {prompt}"
         );
         assert!(
             prompt.contains("bash") && !prompt.contains("native:4:"),

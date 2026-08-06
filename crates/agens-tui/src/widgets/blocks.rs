@@ -515,10 +515,21 @@ fn header_parts(parsed: &ToolInput) -> HeaderParts {
 /// bounded — while nested objects and arrays stay shape-only, since those are
 /// the payloads worth dumping nowhere. Complete raw arguments remain reachable
 /// through [`DisplayMode::Expanded`].
+///
+/// `ask_user` is special-cased: a nested `questions` array would otherwise
+/// collapse to `questions=[n]`, which tells the reader nothing about what was
+/// asked. The human summary carries the count and a truncated first prompt.
 fn summarize_args(tool_name: &str, raw: &str) -> String {
     let trimmed = raw.trim();
     if !trimmed.starts_with('{') {
         return redact_credential_values(&collapse_whitespace(trimmed));
+    }
+
+    let short = short_tool_name(tool_name);
+    if is_ask_user_tool_name(&short)
+        && let Some(summary) = summarize_ask_user_args(trimmed)
+    {
+        return summary;
     }
 
     tool_name
@@ -526,6 +537,43 @@ fn summarize_args(tool_name: &str, raw: &str) -> String {
         .and_then(|_| safe_resource_summary(trimmed))
         .or_else(|| summarize_arguments_by_value(trimmed))
         .unwrap_or_else(|| format_key_shape(&object_keys(trimmed)))
+}
+
+/// Whether a short or full tool name refers to the structured ask-user tool.
+pub(crate) fn is_ask_user_tool_name(name: &str) -> bool {
+    let short = short_tool_name(name);
+    short == "ask_user" || short.ends_with("::ask_user") || short.ends_with("_ask_user")
+}
+
+/// `{1 question · …}` / `{3 questions · …}` from an ask_user input payload.
+fn summarize_ask_user_args(raw: &str) -> Option<String> {
+    let Value::Object(arguments) = serde_json::from_str(raw).ok()? else {
+        return None;
+    };
+    let questions = arguments.get("questions")?.as_array()?;
+    if questions.is_empty() {
+        return None;
+    }
+
+    let count = questions.len();
+    let count_label = if count == 1 {
+        "1 question".to_owned()
+    } else {
+        format!("{count} questions")
+    };
+
+    let first_prompt = questions
+        .first()
+        .and_then(|question| question.get("prompt"))
+        .and_then(Value::as_str)
+        .map(collapse_whitespace)
+        .filter(|prompt| !prompt.is_empty())
+        .map(|prompt| truncate_operand(&prompt, MAX_SUMMARIZED_VALUE_WIDTH));
+
+    Some(match first_prompt {
+        Some(prompt) => format!("{{{count_label} · {prompt}}}"),
+        None => format!("{{{count_label}}}"),
+    })
 }
 
 /// Bounded `key=value` pairs for a JSON object's own members.
@@ -694,6 +742,62 @@ fn truncate_operand(operand: &str, budget: usize) -> String {
     clipped
 }
 
+/// Greedy wrap of a shell command for transcript body rows (no mid-path ellipsis).
+fn wrap_command_lines(command: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return Vec::new();
+    }
+    if command.width() <= width {
+        return vec![command.to_owned()];
+    }
+
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0usize;
+
+    for word in command.split_whitespace() {
+        let word_width = word.width();
+        if current.is_empty() {
+            if word_width <= width {
+                current.push_str(word);
+                current_width = word_width;
+            } else {
+                let mut rest = word;
+                while !rest.is_empty() {
+                    let mut take = 0usize;
+                    let mut taken_width = 0usize;
+                    for (index, character) in rest.char_indices() {
+                        let character_width = character.width().unwrap_or(0);
+                        if taken_width + character_width > width && take > 0 {
+                            break;
+                        }
+                        take = index + character.len_utf8();
+                        taken_width += character_width;
+                    }
+                    lines.push(rest[..take].to_owned());
+                    rest = &rest[take..];
+                }
+            }
+            continue;
+        }
+
+        if current_width + 1 + word_width <= width {
+            current.push(' ');
+            current.push_str(word);
+            current_width += 1 + word_width;
+        } else {
+            lines.push(std::mem::take(&mut current));
+            current.push_str(word);
+            current_width = word_width;
+        }
+    }
+
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
 /// Tool call header/args, wrapped as `BlockContent` with a typed per-tool header.
 ///
 /// The header never renders raw JSON; the complete raw `input` is exposed only
@@ -776,26 +880,55 @@ impl BlockContent for ToolCallBlock<'_> {
             .iter()
             .map(|span| span.content.width())
             .sum::<usize>();
-        let mut header = tool_header(
-            self.parsed,
-            self.content_width.saturating_sub(suffix_width).max(1),
-        );
+        let header_budget = self.content_width.saturating_sub(suffix_width).max(1);
+        let mut header = tool_header(self.parsed, header_budget);
         header.spans.extend(suffix);
         lines
             .push(BlockLine::with_bullet(header, RowBullet::Activity(self.state)).accented(accent));
 
         if mode == DisplayMode::Expanded {
             lines.push(BlockLine::new(ToolRow::args(self.input)).accented(accent));
+        } else if mode == DisplayMode::Truncated {
+            // When the bash header ellipsizes the command, keep the full
+            // (secret-redacted) command on following rows so Truncated is still
+            // auditable without forcing Expanded.
+            if let ToolInput::Bash { command } = self.parsed {
+                let collapsed = collapse_whitespace(command);
+                let parts = header_parts(self.parsed);
+                let verb_width = if parts.verb.is_empty() {
+                    0
+                } else {
+                    parts.verb.width() + 1
+                };
+                let operand_budget = header_budget.saturating_sub(verb_width).max(1);
+                if collapsed.width() > operand_budget {
+                    let redacted = redact_credential_values(&collapsed);
+                    for chunk in wrap_command_lines(&redacted, self.content_width.max(1)) {
+                        lines.push(
+                            BlockLine::new(Line::from(Span::styled(
+                                chunk,
+                                Style::default().fg(RolePalette::machine()),
+                            )))
+                            .accented(accent),
+                        );
+                    }
+                }
+            }
         }
         lines
     }
 
     /// A settled call costs one row and keeps its raw input behind the audit
     /// mode; a pending one keeps a bounded preview so live work stays visible
-    /// while it happens.
+    /// while it happens. Settled `ask_user` defaults to Truncated so the
+    /// human answer summary is visible without forcing a full expand.
     fn default_mode(&self) -> DisplayMode {
         if self.result.is_some() {
-            DisplayMode::Collapsed
+            if tool_input_is_ask_user(self.parsed) {
+                DisplayMode::Truncated
+            } else {
+                DisplayMode::Collapsed
+            }
         } else {
             DisplayMode::Truncated
         }
@@ -844,6 +977,171 @@ fn short_tool_name(name: &str) -> String {
         .or_else(|| name.strip_prefix("mcp::"))
         .unwrap_or(name)
         .to_owned()
+}
+
+fn tool_input_is_ask_user(parsed: &ToolInput) -> bool {
+    matches!(parsed, ToolInput::Other { name, .. } if is_ask_user_tool_name(name))
+}
+
+/// Human-readable body lines for a settled `ask_user` tool result.
+///
+/// Maps option ids back to labels via the call's input when present. Returns
+/// `None` when the payload is not a recognized ask_user envelope so the caller
+/// can fall back to the ordinary tool-output renderer.
+pub(crate) fn format_ask_user_result_lines(input: &str, output: &str) -> Option<Vec<String>> {
+    let Value::Object(result) = serde_json::from_str(output.trim()).ok()? else {
+        return None;
+    };
+    let status = result.get("status")?.as_str()?;
+
+    match status {
+        "cancelled" => Some(vec!["cancelled".to_owned()]),
+        "unavailable" => {
+            let reason = result
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("interactive surface unavailable");
+            Some(vec![format!("unavailable · {reason}")])
+        }
+        "discuss" => {
+            let question = result
+                .get("question_id")
+                .and_then(Value::as_str)
+                .unwrap_or("question");
+            let mut lines = vec![format!("discuss · {question}")];
+            if let Some(note) = result.get("note").and_then(Value::as_str)
+                && !note.trim().is_empty()
+            {
+                lines.push(format!("  note: {note}"));
+            }
+            Some(lines)
+        }
+        "answered" => {
+            let answers = result.get("answers")?.as_array()?;
+            let questions = parse_ask_user_input_questions(input).unwrap_or_default();
+            let total = answers.len().max(questions.len());
+            let answered_count = answers
+                .iter()
+                .filter(|answer| answer.get("answered").and_then(Value::as_bool) == Some(true))
+                .count();
+            let mut lines = vec![format!("answered · {answered_count}/{total}")];
+
+            for (index, answer) in answers.iter().enumerate() {
+                let question_id = answer
+                    .get("question_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("?");
+                let question = questions
+                    .iter()
+                    .find(|question| question.id == question_id)
+                    .or_else(|| questions.get(index));
+                let prompt = question
+                    .map(|question| question.prompt.as_str())
+                    .filter(|prompt| !prompt.is_empty())
+                    .unwrap_or(question_id);
+                let answer_text = ask_user_result_answer_text(answer, question);
+                lines.push(format!("  {prompt} → {answer_text}"));
+                if let Some(note) = answer.get("note").and_then(Value::as_str)
+                    && !note.trim().is_empty()
+                {
+                    lines.push(format!("    note: {note}"));
+                }
+            }
+            Some(lines)
+        }
+        _ => None,
+    }
+}
+
+#[derive(Clone, Debug)]
+struct AskUserInputQuestion {
+    id: String,
+    prompt: String,
+    options: Vec<(String, String)>,
+}
+
+fn parse_ask_user_input_questions(input: &str) -> Option<Vec<AskUserInputQuestion>> {
+    let Value::Object(arguments) = serde_json::from_str(input.trim()).ok()? else {
+        return None;
+    };
+    let questions = arguments.get("questions")?.as_array()?;
+    let mut parsed = Vec::with_capacity(questions.len());
+    for question in questions {
+        let object = question.as_object()?;
+        let id = object.get("id").and_then(Value::as_str).unwrap_or("").to_owned();
+        let prompt = object
+            .get("prompt")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        let mut options = Vec::new();
+        if let Some(items) = object.get("options").and_then(Value::as_array) {
+            for option in items {
+                let Some(option) = option.as_object() else {
+                    continue;
+                };
+                let option_id = option
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
+                let label = option
+                    .get("label")
+                    .and_then(Value::as_str)
+                    .unwrap_or(option_id.as_str())
+                    .to_owned();
+                if !option_id.is_empty() {
+                    options.push((option_id, label));
+                }
+            }
+        }
+        parsed.push(AskUserInputQuestion { id, prompt, options });
+    }
+    Some(parsed)
+}
+
+fn ask_user_result_answer_text(
+    answer: &Value,
+    question: Option<&AskUserInputQuestion>,
+) -> String {
+    let selected_ids: Vec<&str> = answer
+        .get("selected")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let other = answer
+        .get("other")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    let mut parts = Vec::new();
+    for id in selected_ids {
+        let label = question
+            .and_then(|question| {
+                question
+                    .options
+                    .iter()
+                    .find(|(option_id, _)| option_id == id)
+                    .map(|(_, label)| label.as_str())
+            })
+            .unwrap_or(id);
+        parts.push(label.to_owned());
+    }
+    if let Some(other) = other {
+        parts.push(other.to_owned());
+    }
+
+    if parts.is_empty() {
+        "(skipped)".to_owned()
+    } else {
+        parts.join(", ")
+    }
 }
 
 #[cfg(test)]
@@ -994,6 +1292,77 @@ mod tests {
                 skill: "deploy".into()
             }),
             "Skill deploy"
+        );
+    }
+
+    #[test]
+    fn ask_user_header_summarizes_question_count_and_first_prompt() {
+        let one = header_of(&ToolInput::Other {
+            name: "native::ask_user".into(),
+            raw: r#"{"questions":[{"id":"q1","prompt":"¿Por dónde arrancamos la migración?","mode":"single","options":[{"id":"a","label":"A"}]}]}"#.into(),
+        });
+        assert!(one.starts_with("ask_user {1 question"), "{one:?}");
+        assert!(
+            one.contains("¿Por dónde arrancamos"),
+            "first prompt must reach the header: {one:?}"
+        );
+        assert!(
+            !one.contains("questions=[1]"),
+            "nested arrays must not collapse to a bare count: {one:?}"
+        );
+
+        let three = header_of(&ToolInput::Other {
+            name: "native::ask_user".into(),
+            raw: r#"{"questions":[
+                {"id":"q1","prompt":"One","mode":"single","options":[{"id":"a","label":"A"}]},
+                {"id":"q2","prompt":"Two","mode":"single","options":[{"id":"a","label":"A"}]},
+                {"id":"q3","prompt":"Three","mode":"single","options":[{"id":"a","label":"A"}]}
+            ]}"#.into(),
+        });
+        assert!(three.contains("3 questions"), "{three:?}");
+        assert!(three.contains("One"), "{three:?}");
+    }
+
+    #[test]
+    fn ask_user_result_body_maps_selected_ids_to_labels() {
+        let input = r#"{"questions":[{"id":"q1","prompt":"Pick a path","mode":"single","options":[{"id":"a","label":"Big bang"},{"id":"b","label":"Phased"}]}]}"#;
+        let output = r#"{"status":"answered","answers":[{"question_id":"q1","answered":true,"selected":["b"],"other":null,"note":"careful"}]}"#;
+        let lines = format_ask_user_result_lines(input, output).expect("answered envelope");
+        let joined = lines.join("\n");
+        assert!(joined.contains("answered · 1/1"), "{joined:?}");
+        assert!(joined.contains("Pick a path → Phased"), "{joined:?}");
+        assert!(joined.contains("note: careful"), "{joined:?}");
+        assert!(!joined.contains(r#""status""#), "raw JSON must not be primary: {joined:?}");
+
+        let cancelled = format_ask_user_result_lines(input, r#"{"status":"cancelled"}"#)
+            .expect("cancelled envelope");
+        assert_eq!(cancelled, vec!["cancelled".to_owned()]);
+    }
+
+    #[test]
+    fn settled_ask_user_defaults_to_truncated_display_mode() {
+        let raw = r#"{"questions":[{"id":"q1","prompt":"Hi","mode":"single","options":[{"id":"a","label":"A"}]}]}"#;
+        let parsed = ToolInput::Other {
+            name: "native::ask_user".into(),
+            raw: raw.into(),
+        };
+        let result = ToolResultBlock {
+            status: "Success · 12ms".into(),
+            failed: false,
+            size: "1 line · 40 B".into(),
+        };
+        let block = ToolCallBlock {
+            input: raw,
+            parsed: &parsed,
+            batch: None,
+            content_width: 80,
+            state: RowState::Success,
+            result: Some(&result),
+        };
+        assert_eq!(
+            block.default_mode(),
+            DisplayMode::Truncated,
+            "settled ask_user must show its human summary by default"
         );
     }
 
@@ -1522,5 +1891,59 @@ mod tests {
 
         let expanded = block.lines(DisplayMode::Expanded);
         assert_eq!(expanded.len(), 2, "expanded call shows its raw input row");
+    }
+
+    #[test]
+    fn truncated_bash_shows_the_full_command_when_the_header_ellipsizes_it() {
+        let command = "cd /very/long/path/to/the/project/root && git commit -m 'long message that will not fit'";
+        let parsed = ToolInput::Bash {
+            command: command.into(),
+        };
+        let block = ToolCallBlock {
+            input: r#"{"command":"unused"}"#,
+            parsed: &parsed,
+            batch: None,
+            content_width: 40,
+            state: RowState::Running,
+            result: None,
+        };
+
+        let truncated = block.lines(DisplayMode::Truncated);
+        assert!(
+            truncated.len() > 1,
+            "truncated bash with a long command must add body rows, got {} rows",
+            truncated.len()
+        );
+        let body = truncated
+            .iter()
+            .skip(1)
+            .map(|row| line_text(&row.line))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            body.contains("git commit") && body.contains("/very/long/path"),
+            "full command must remain readable under Truncated: {body}"
+        );
+        assert!(
+            !body.contains('…'),
+            "body rows wrap rather than ellipsizing: {body}"
+        );
+
+        let short = ToolInput::Bash {
+            command: "git status".into(),
+        };
+        let short_block = ToolCallBlock {
+            input: "{}",
+            parsed: &short,
+            batch: None,
+            content_width: 80,
+            state: RowState::Running,
+            result: None,
+        };
+        assert_eq!(
+            short_block.lines(DisplayMode::Truncated).len(),
+            1,
+            "a command that fits the header needs no extra body row"
+        );
     }
 }

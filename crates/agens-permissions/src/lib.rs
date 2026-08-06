@@ -535,9 +535,6 @@ impl<P: PermissionPrompter> HeadlessPermissionResolver for ProductionPermissionR
             if cancellation.is_cancelled() {
                 return Err(HeadlessTurnPortError::Cancelled);
             }
-            if cancellation.is_expired() {
-                return Err(HeadlessTurnPortError::TimedOut);
-            }
 
             let context = self
                 .prompts
@@ -545,13 +542,17 @@ impl<P: PermissionPrompter> HeadlessPermissionResolver for ProductionPermissionR
                 .map_err(|_| HeadlessTurnPortError::Permission)?
                 .remove(&call.id)
                 .ok_or(HeadlessTurnPortError::Permission)?;
-            let answer = self.prompt.prompt(&context, cancellation)?;
+            // While a person is answering, only cancel ends the wait — never
+            // the turn deadline. Pass a cancel-only view so a surface that
+            // still reads deadlines cannot time out a parked question.
+            let human_wait = HeadlessTurnCancellation::with_cancellation_and_deadline(
+                cancellation.adapter_view().cancellation_handle(),
+                None,
+            );
+            let answer = self.prompt.prompt(&context, &human_wait)?;
 
             if cancellation.is_cancelled() || answer == PermissionPromptAnswer::Cancel {
                 return Err(HeadlessTurnPortError::Cancelled);
-            }
-            if cancellation.is_expired() {
-                return Err(HeadlessTurnPortError::TimedOut);
             }
 
             let decision = match answer {
@@ -876,11 +877,12 @@ fn parse_tool_input(call: &HeadlessToolCall) -> Result<serde_json::Value, Headle
 ///
 /// `tool` is whatever spelling the caller holds, including a dispatcher
 /// identity, so it is reduced through [`agens_core::bare_tool_name`] before
-/// anything is decided on it. A `bash` target is the command line itself and is
-/// withheld whole: there is no part of it this can be sure carries no secret.
+/// anything is decided on it. A `bash` target is the command line itself: shaped
+/// secrets are redacted in place so the person can still read what will run.
+/// WebFetch URLs keep their host/path while credentials and query are stripped.
 pub fn sanitize_permission_target(tool: &str, target: &str) -> String {
     if agens_core::bare_tool_name(tool) == "bash" {
-        return "[command redacted]".into();
+        return agens_core::redaction::redact_credential_values(target);
     }
 
     if serde_json::from_str::<serde_json::Value>(target).is_ok() {
@@ -930,7 +932,7 @@ mod tests {
     use agens_core::{
         Error, HeadlessPermissionGate, HeadlessToolCall, HeadlessTurnCancellation,
         HeadlessTurnPortError, PermissionDecision, PermissionMode, PermissionPattern,
-        PermissionPolicy, PermissionSession, ToolAccess,
+        PermissionPolicy, PermissionRule, PermissionSession, ToolAccess,
     };
     use agens_tools::{
         AskUserTool, DispatchTool, ToolDispatchRequest, ToolDispatcher, ToolEvaluationOutcome,
@@ -1328,5 +1330,117 @@ mod tests {
             .unwrap();
 
         assert!(matches!(outcome, ToolEvaluationOutcome::Authorized(_)));
+    }
+
+    /// A person taking longer than the turn deadline must still be able to allow
+    /// a prompted call. The resolver strips the deadline before the surface wait
+    /// and never maps an elapsed deadline to TimedOut around the prompt.
+    #[test]
+    fn permission_prompt_succeeds_after_the_turn_deadline_elapses_during_the_wait() {
+        struct SleepingAllowPrompter;
+
+        impl PermissionPrompter for SleepingAllowPrompter {
+            fn prompt(
+                &mut self,
+                _: &PermissionPromptContext,
+                cancellation: &HeadlessTurnCancellation,
+            ) -> Result<PermissionPromptAnswer, HeadlessTurnPortError> {
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                assert!(
+                    !cancellation.is_expired(),
+                    "the human-wait cancellation must not carry a deadline"
+                );
+                Ok(PermissionPromptAnswer::AllowOnce)
+            }
+        }
+
+        struct PathTool;
+
+        impl DispatchTool for PathTool {
+            fn permission_target(
+                &self,
+                arguments: &serde_json::Value,
+            ) -> Result<String, Error> {
+                Ok(arguments["path"].as_str().unwrap_or_default().to_owned())
+            }
+
+            fn execute(
+                &mut self,
+                _: &agens_tools::ToolExecutionContext,
+                _: serde_json::Value,
+            ) -> Result<agens_tools::ToolOutput, Error> {
+                Ok(agens_tools::ToolOutput::success("ok"))
+            }
+        }
+
+        let directory = std::env::temp_dir().join(format!(
+            "agens-permission-deadline-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+
+        let dispatcher = Arc::new(Mutex::new(ToolDispatcher::new()));
+        dispatcher
+            .lock()
+            .expect("dispatcher lock")
+            .register_native("native::write", ToolAccess::Write, PathTool)
+            .expect("write tool should register");
+
+        let grants = Arc::new(Mutex::new(Vec::new()));
+        let allowed = Arc::new(Mutex::new(BTreeMap::new()));
+        let prompts = Arc::new(Mutex::new(BTreeMap::new()));
+        let policy = PermissionPolicy::new(
+            PermissionMode::Edit,
+            vec![PermissionRule::global(
+                PermissionDecision::Ask,
+                PermissionPattern::Exact("native::write".into()),
+                PermissionPattern::Exact("notes.md".into()),
+            )],
+        );
+        let call = HeadlessToolCall {
+            id: "current".into(),
+            name: "native::write".into(),
+            input: r#"{"path":"notes.md","content":"body"}"#.into(),
+        };
+        let cancellation = HeadlessTurnCancellation::with_deadline(std::time::Duration::from_millis(5));
+        let mut gate = ProductionPermissionGate::new(
+            policy.clone(),
+            Arc::clone(&grants),
+            PermissionSession::new(),
+            "project".into(),
+            Arc::clone(&dispatcher),
+            Arc::clone(&allowed),
+            Arc::clone(&prompts),
+        );
+        let store = PermissionGrantStore::open(&directory).expect("grant store should open");
+        let mut resolver = ProductionPermissionResolver::new(
+            SleepingAllowPrompter,
+            store,
+            Arc::clone(&grants),
+            Arc::clone(&prompts),
+            ProductionPromptAuthorization {
+                policy,
+                session: PermissionSession::new(),
+                project: "project".into(),
+                dispatcher: Arc::clone(&dispatcher),
+                allowed: Arc::clone(&allowed),
+            },
+        );
+
+        assert_eq!(
+            run_ready(gate.evaluate(&call, &cancellation)),
+            Ok(PermissionDecision::Ask)
+        );
+        assert_eq!(
+            run_ready(resolver.resolve(&call, &cancellation)),
+            Ok(PermissionDecision::Allow),
+            "an elapsed turn deadline during the prompt must not fail the allow"
+        );
+
+        let _ = std::fs::remove_dir_all(&directory);
     }
 }

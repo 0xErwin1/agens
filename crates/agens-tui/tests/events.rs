@@ -1919,7 +1919,14 @@ fn permission_wait_close_deadline_and_replies_remain_fail_closed() {
     let waiting_bridge = bridge.clone();
     let waiting_cancellation = cancellation.clone();
     let waiting = thread::spawn(move || {
-        waiting_bridge.wait_for_reply("native::bash", "git status", None, &waiting_cancellation)
+        waiting_bridge.wait_for_reply(
+            "bash",
+            "git status",
+            "Write",
+            None,
+            None,
+            &waiting_cancellation,
+        )
     });
 
     let request = requests.recv_timeout(Duration::from_secs(1)).unwrap();
@@ -1929,24 +1936,44 @@ fn permission_wait_close_deadline_and_replies_remain_fail_closed() {
     assert_eq!(waiting.join().unwrap(), TuiPermissionReply::Cancelled);
     assert!(!bridge.reply(request.id(), TuiPermissionReply::AllowAlways));
 
+    // An already-expired deadline must not end a parked permission question;
+    // only the person's answer (or cancel / surface close) may.
     let (bridge, requests) = TuiPermissionBridge::channel();
-    let expired = HeadlessTurnCancellation::with_deadline(Duration::from_millis(100));
+    let expired = HeadlessTurnCancellation::with_deadline(Duration::ZERO);
     let expired_bridge = bridge.clone();
     let expired_wait = thread::spawn(move || {
-        expired_bridge.wait_for_reply("native::write", "README.md", None, &expired)
+        expired_bridge.wait_for_reply(
+            "write",
+            "README.md",
+            "Write",
+            None,
+            None,
+            &expired,
+        )
     });
     let expired_request = requests.recv_timeout(Duration::from_secs(1)).unwrap();
-
+    thread::sleep(Duration::from_millis(100));
+    assert!(
+        bridge.is_pending(expired_request.id()),
+        "permission wait must ignore an elapsed deadline while a person answers"
+    );
+    assert!(bridge.reply(expired_request.id(), TuiPermissionReply::AllowAlways));
     assert_eq!(
         expired_wait.join().unwrap(),
-        TuiPermissionReply::DeadlineExpired
+        TuiPermissionReply::AllowAlways
     );
-    assert!(!bridge.reply(expired_request.id(), TuiPermissionReply::AllowAlways));
 
     let allowed = HeadlessTurnCancellation::new();
     let allowed_bridge = bridge.clone();
     let allowed_wait = thread::spawn(move || {
-        allowed_bridge.wait_for_reply("native::write", "README.md", None, &allowed)
+        allowed_bridge.wait_for_reply(
+            "write",
+            "README.md",
+            "Write",
+            None,
+            None,
+            &allowed,
+        )
     });
     let allowed_request = requests.recv_timeout(Duration::from_secs(1)).unwrap();
 
@@ -2893,8 +2920,10 @@ fn permission_double_control_c_exits_and_runtime_cleanup_can_fail_closed() {
     let worker_bridge = bridge.clone();
     let worker = thread::spawn(move || {
         worker_bridge.wait_for_reply(
-            "native::write",
+            "write",
             "notes.md",
+            "Write",
+            None,
             None,
             &HeadlessTurnCancellation::new(),
         )
@@ -4564,6 +4593,7 @@ fn ask_user_typed_buffer_commits_on_enter_survives_escape_then_second_escape_can
     assert!(tui.ask_user_snapshot().is_none());
 }
 
+/// Enter on Proceed from review commits empty answers for unanswered items.
 #[test]
 fn ask_user_submit_while_incomplete_resolves_with_empty_answers() {
     let request = single_question_ask_user_request(false, false, false);
@@ -4571,6 +4601,10 @@ fn ask_user_submit_while_incomplete_resolves_with_empty_answers() {
     tui.open_ask_user(1, request.clone());
 
     walk_to_proceed_row(&mut tui);
+    assert_eq!(tui.handle(Event::Key(Key::Enter)), Action::Render);
+    let snapshot = tui.ask_user_snapshot().expect("review must open first");
+    assert!(snapshot.reviewing, "last-question proceed opens review");
+
     let action = tui.handle(Event::Key(Key::Enter));
 
     match action {
@@ -4605,6 +4639,9 @@ fn ask_user_submit_when_complete_resolves_answered_in_request_order() {
     type_into_buffer(&mut tui, 'n', "nb");
     tui.handle(Event::Key(Key::Down));
     tui.handle(Event::Key(Key::Down));
+    // Last question: Proceed opens review rather than submitting.
+    assert_eq!(tui.handle(Event::Key(Key::Enter)), Action::Render);
+    assert!(tui.ask_user_snapshot().expect("open").reviewing);
     let action = tui.handle(Event::Key(Key::Enter));
 
     match action {
@@ -4631,16 +4668,16 @@ fn ask_user_submit_when_complete_resolves_answered_in_request_order() {
 }
 
 /// Walks the proceed row down the whole question set. On every question but
-/// the last it may only advance — never resolve — and on the last it is the
-/// submission.
+/// the last it may only advance — never resolve — and on the last it opens
+/// review; Submit from review commits.
 #[test]
-fn ask_user_proceed_row_advances_until_the_last_question_where_it_submits() {
+fn ask_user_proceed_row_advances_until_the_last_question_where_it_opens_review() {
     let mut tui = Tui::new(FakeEngine::default());
     tui.open_ask_user(4, three_question_ask_user_request());
 
     // Advancing is not a submission attempt, so it must move on even with
     // nothing answered anywhere. This is what separates a `Next` row from a
-    // `Submit` row.
+    // review / submit row.
     walk_to_proceed_row(&mut tui);
     assert_eq!(tui.handle(Event::Key(Key::Enter)), Action::Render);
     let snapshot = tui.ask_user_snapshot().expect("still open");
@@ -4676,7 +4713,16 @@ fn ask_user_proceed_row_advances_until_the_last_question_where_it_submits() {
         2
     );
 
-    match proceed(&mut tui) {
+    assert_eq!(
+        proceed(&mut tui),
+        Action::Render,
+        "last-question proceed must open review, not resolve"
+    );
+    let review = tui.ask_user_snapshot().expect("still open");
+    assert!(review.reviewing);
+    assert_eq!(review.row, AskUserRowSnapshot::Proceed);
+
+    match tui.handle(Event::Key(Key::Enter)) {
         Action::AskUserReply {
             id,
             reply: AskUserReply::Answered(answers),
@@ -4687,15 +4733,15 @@ fn ask_user_proceed_row_advances_until_the_last_question_where_it_submits() {
             assert_eq!(answers[1].selected, vec!["a".to_owned()]);
             assert_eq!(answers[2].selected, vec!["a".to_owned()]);
         }
-        other => panic!("the last question's proceed row must submit, got {other:?}"),
+        other => panic!("review submit must resolve answered, got {other:?}"),
     }
     assert!(tui.ask_user_snapshot().is_none());
 }
 
-/// Submit from the last question always resolves, even when earlier questions
-/// were left unanswered — those land as empty selected/other entries.
+/// Submit from review always resolves, even when earlier questions were left
+/// unanswered — those land as empty selected/other entries.
 #[test]
-fn ask_user_submit_from_the_last_question_accepts_skipped_questions() {
+fn ask_user_submit_from_review_accepts_skipped_questions() {
     let request = three_question_ask_user_request();
     let mut tui = Tui::new(FakeEngine::default());
     tui.open_ask_user(5, request.clone());
@@ -4706,6 +4752,8 @@ fn ask_user_submit_from_the_last_question_accepts_skipped_questions() {
     assert_eq!(tui.ask_user_snapshot().unwrap().question_index, 2);
     tui.handle(Event::Key(Key::Enter));
     walk_to_proceed_row(&mut tui);
+    assert_eq!(tui.handle(Event::Key(Key::Enter)), Action::Render);
+    assert!(tui.ask_user_snapshot().unwrap().reviewing);
     let action = tui.handle(Event::Key(Key::Enter));
 
     match action {
@@ -4727,6 +4775,58 @@ fn ask_user_submit_from_the_last_question_accepts_skipped_questions() {
         other => panic!("submit with skips must resolve, got {other:?}"),
     }
     assert!(tui.ask_user_snapshot().is_none());
+}
+
+#[test]
+fn ask_user_last_question_proceed_opens_review_without_resolving() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.open_ask_user(1, three_question_ask_user_request());
+
+    tui.handle(Event::Key(Key::Tab));
+    tui.handle(Event::Key(Key::Tab));
+    walk_to_proceed_row(&mut tui);
+    assert_eq!(tui.handle(Event::Key(Key::Enter)), Action::Render);
+
+    let snapshot = tui.ask_user_snapshot().expect("must stay open in review");
+    assert!(snapshot.reviewing);
+    assert_eq!(snapshot.row, AskUserRowSnapshot::Proceed);
+}
+
+#[test]
+fn ask_user_escape_while_reviewing_cancels_the_whole_interaction() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.open_ask_user(2, single_question_ask_user_request(false, false, false));
+
+    walk_to_proceed_row(&mut tui);
+    assert_eq!(tui.handle(Event::Key(Key::Enter)), Action::Render);
+    assert!(tui.ask_user_snapshot().unwrap().reviewing);
+
+    assert_eq!(
+        tui.handle(Event::Key(Key::Escape)),
+        Action::AskUserReply {
+            id: 2,
+            reply: AskUserReply::Cancelled,
+        }
+    );
+    assert!(tui.ask_user_snapshot().is_none());
+}
+
+#[test]
+fn ask_user_leaving_review_via_tab_returns_to_browse() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.open_ask_user(3, three_question_ask_user_request());
+
+    tui.handle(Event::Key(Key::Tab));
+    tui.handle(Event::Key(Key::Tab));
+    walk_to_proceed_row(&mut tui);
+    tui.handle(Event::Key(Key::Enter));
+    assert!(tui.ask_user_snapshot().unwrap().reviewing);
+
+    assert_eq!(tui.handle(Event::Key(Key::Tab)), Action::Render);
+    let snapshot = tui.ask_user_snapshot().expect("still open");
+    assert!(!snapshot.reviewing);
+    assert_eq!(snapshot.question_index, 0);
+    assert_eq!(snapshot.row, AskUserRowSnapshot::Option(0));
 }
 
 /// The note field is a text field, and a text field whose caret only ever

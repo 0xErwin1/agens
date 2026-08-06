@@ -2642,9 +2642,11 @@ impl PermissionRequest {
     /// A shell target is several calls at once, so the two directions of that
     /// question are not the same. A restrictive rule selects the command when
     /// ANY of its invocations is selected — a deny on `rm` has to hold in
-    /// `cd /tmp && rm -rf x`. A permissive rule selects it only when EVERY
-    /// invocation is selected, because authorizing `git*` is not authorization
-    /// for whatever was chained onto it.
+    /// `cd /tmp && rm -rf x`. A permissive rule selects it when the pattern
+    /// matches the full target (so an Allow-once Exact grant of the compound
+    /// command re-authorizes that exact call) or when EVERY invocation is
+    /// selected, because authorizing `git*` is not authorization for whatever
+    /// was chained onto it.
     ///
     /// A path is one act rather than several, so both directions reduce to the
     /// same question there: the rule selects the call when it names the file
@@ -2663,7 +2665,9 @@ impl PermissionRequest {
 
         match decision {
             _ if self.subjects.is_empty() => pattern.matches(&self.target),
-            PermissionDecision::Allow => self.subjects.iter().all(selects),
+            PermissionDecision::Allow => {
+                pattern.matches(&self.target) || self.subjects.iter().all(selects)
+            }
             PermissionDecision::Ask | PermissionDecision::Deny => {
                 pattern.matches(&self.target) || self.subjects.iter().any(selects)
             }

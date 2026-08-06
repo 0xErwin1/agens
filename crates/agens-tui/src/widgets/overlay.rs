@@ -205,15 +205,22 @@ impl OverlaySizing {
     /// Structured question set pinned directly above the composer.
     ///
     /// Anchored like the slash palette so the reader can still see the
-    /// transcript and type into the same visual band. Wider and taller than
-    /// [`Self::palette`] because the frame holds a header, an option list with
-    /// a sub-line under every option, free-text rows, action rows, and — above
-    /// the two-column threshold — a context pane beside all of that.
+    /// transcript and type into the same visual band. Width matches the
+    /// composer (not a fixed column cap) so the frame and the input band
+    /// share one vertical edge. Taller than [`Self::palette`] because the
+    /// frame holds a header, an option list with a sub-line under every
+    /// option, free-text rows, action rows, and — above the two-column
+    /// threshold — a context pane beside all of that.
     pub(crate) const fn ask_user(composer: Rect) -> Self {
         Self {
             width_pct: 100,
             min_width: 48,
-            max_width: 120,
+            // Match the composer width; frame_metrics still clamps to available space.
+            max_width: if composer.width == 0 {
+                1
+            } else {
+                composer.width
+            },
             max_height: 20,
             v_margin: 0,
             h_pad: 1,

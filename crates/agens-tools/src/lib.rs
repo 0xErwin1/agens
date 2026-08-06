@@ -4207,9 +4207,12 @@ impl NativeTools {
         if let Err(output) = self.ensure_project_root_is_stable() {
             return Ok(output);
         }
-        if let Err(output) = self.validate_relative(&input.path) {
-            return Ok(output);
-        }
+        let path = match self.resolve_confined_path(&input.path) {
+            Ok(path) => path,
+            Err(output) => return Ok(output),
+        };
+        let mut input = input;
+        input.path = path;
         if input
             .range
             .is_some_and(|(offset, limit)| offset == 0 || limit == 0)
@@ -4281,9 +4284,12 @@ impl NativeTools {
         input: WriteFileInput,
         context: Option<&ToolExecutionContext>,
     ) -> Result<ToolOutput, Error> {
-        if let Err(output) = self.validate_relative(&input.path) {
-            return Ok(Self::failed_write_facts(&input.path, output));
-        }
+        let path = match self.resolve_confined_path(&input.path) {
+            Ok(path) => path,
+            Err(output) => return Ok(Self::failed_write_facts(&input.path, output)),
+        };
+        let mut input = input;
+        input.path = path;
 
         #[cfg(unix)]
         let result = write_file_confined(
@@ -4337,9 +4343,12 @@ impl NativeTools {
         input: EditFileInput,
         context: Option<&ToolExecutionContext>,
     ) -> Result<ToolOutput, Error> {
-        if let Err(output) = self.validate_relative(&input.path) {
-            return Ok(Self::failed_edit_facts(&input.path, output));
-        }
+        let path = match self.resolve_confined_path(&input.path) {
+            Ok(path) => path,
+            Err(output) => return Ok(Self::failed_edit_facts(&input.path, output)),
+        };
+        let mut input = input;
+        input.path = path;
         if input.old.is_empty() {
             return Ok(Self::failed_edit_facts(
                 &input.path,
@@ -4964,9 +4973,9 @@ impl NativeTools {
     }
 
     fn resolve_existing(&self, path: &Path) -> Result<PathBuf, ToolOutput> {
-        self.validate_relative(path)?;
+        let relative = self.resolve_confined_path(path)?;
 
-        let path = fs::canonicalize(self.project_root.join(path))
+        let path = fs::canonicalize(self.project_root.join(relative))
             .map_err(|error| ToolOutput::failure(format!("path: {error}")))?;
 
         if path.starts_with(&self.project_root) {
@@ -5096,21 +5105,69 @@ impl NativeTools {
         Ok(())
     }
 
-    fn validate_relative(&self, path: &Path) -> Result<(), ToolOutput> {
-        if path.as_os_str().is_empty() || path.is_absolute() {
-            return Err(ToolOutput::failure(
-                "path: must be a non-empty relative path",
-            ));
+    /// Resolves a user/tool path into a project-relative path safe for confined openat.
+    ///
+    /// Absolute paths are accepted when they lie under the confinement root
+    /// (future multi-workspace roots will extend the same rewrite). Outside the
+    /// root still fails as outside project root — that is confinement, not a
+    /// ban on absolute spelling. Explicit permission denies remain the policy
+    /// layer for blocking paths that would otherwise be in scope.
+    fn resolve_confined_path(&self, path: &Path) -> Result<PathBuf, ToolOutput> {
+        if path.as_os_str().is_empty() {
+            return Err(ToolOutput::failure("path: must be a non-empty path"));
         }
 
-        if path
+        let relative = if path.is_absolute() {
+            self.absolute_path_under_root(path)?
+        } else {
+            path.to_path_buf()
+        };
+
+        if relative.as_os_str().is_empty() {
+            return Err(ToolOutput::failure("path: path must name a file"));
+        }
+
+        if relative
             .components()
             .all(|component| matches!(component, Component::Normal(_) | Component::CurDir))
         {
-            Ok(())
+            Ok(relative)
         } else {
             Err(ToolOutput::failure("path: traversal is not allowed"))
         }
+    }
+
+    /// Maps an absolute path under the confinement root to a relative path.
+    fn absolute_path_under_root(&self, path: &Path) -> Result<PathBuf, ToolOutput> {
+        let root = &self.project_root;
+        if let Ok(relative) = path.strip_prefix(root) {
+            if relative.as_os_str().is_empty() {
+                return Err(ToolOutput::failure("path: path must name a file"));
+            }
+            return Ok(relative.to_path_buf());
+        }
+
+        // Lexical strip failed (symlink components, non-canonical spelling).
+        // Resolve an existing path, or its parent for not-yet-created files.
+        let resolved = if path.exists() {
+            fs::canonicalize(path).map_err(|_| ToolOutput::failure("path: outside project root"))?
+        } else {
+            let parent = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .ok_or_else(|| ToolOutput::failure("path: outside project root"))?;
+            let file_name = path
+                .file_name()
+                .ok_or_else(|| ToolOutput::failure("path: path must name a file"))?;
+            let parent = fs::canonicalize(parent)
+                .map_err(|_| ToolOutput::failure("path: outside project root"))?;
+            parent.join(file_name)
+        };
+
+        resolved
+            .strip_prefix(root)
+            .map(Path::to_path_buf)
+            .map_err(|_| ToolOutput::failure("path: outside project root"))
     }
 
     fn ensure_project_root_is_stable(&self) -> Result<(), ToolOutput> {
