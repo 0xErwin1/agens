@@ -222,11 +222,20 @@ impl MoonshotProvider {
         }
     }
 
+    /// Sends one request, bounding the wait for its first sign of life.
+    ///
+    /// `client.execute` resolves as soon as the response headers arrive, so the
+    /// request's read timeout — which bounds a stream that is already producing
+    /// bytes — never starts on a connection that accepts and then stays silent.
+    /// That silence is the stall this bounds: `FIRST_RESPONSE_BYTE_TIMEOUT`
+    /// covers headers plus the first body byte, and `read_stream` reuses the
+    /// same deadline so the window is not spent twice.
     async fn send(
         &self,
         payload: Value,
         cancellation: &HeadlessTurnCancellation,
-    ) -> Result<reqwest::Response, HeadlessTurnPortError> {
+    ) -> Result<(reqwest::Response, tokio::time::Instant), HeadlessTurnPortError> {
+        let first_byte_deadline = tokio::time::Instant::now() + crate::FIRST_RESPONSE_BYTE_TIMEOUT;
         let mut attempt = 0;
         let mut last_transient_status = None;
         let mut saw_request_timeout = false;
@@ -250,6 +259,13 @@ impl MoonshotProvider {
                     response
                 }
                 stop = wait_for_stop(cancellation) => return Err(stop),
+                () = tokio::time::sleep_until(first_byte_deadline) => {
+                    crate::emit_first_byte_stall(
+                        self.diagnostics.as_ref(),
+                        ProviderDiagnosticComponent::ChatCompletions,
+                    );
+                    return Err(HeadlessTurnPortError::ProviderNetwork);
+                }
             };
 
             let response = match response {
@@ -325,7 +341,7 @@ impl MoonshotProvider {
                 return Err(classify_openai_response_status(status, context_exceeded));
             }
 
-            return Ok(response);
+            return Ok((response, first_byte_deadline));
         }
     }
 
@@ -335,13 +351,20 @@ impl MoonshotProvider {
     /// sharing it: the two agree on SSE framing and disagree on everything
     /// inside a frame, and generalizing the loop would mean editing a provider
     /// this change is not otherwise touching.
+    ///
+    /// The first chunk is bounded by the `first_byte_deadline` `send` already
+    /// started, so the window covers the response headers plus the first body
+    /// byte exactly once. Once the stream has started, the request's read
+    /// timeout resumes bounding it.
     async fn read_stream(
         &self,
         mut response: reqwest::Response,
+        first_byte_deadline: tokio::time::Instant,
         cancellation: &HeadlessTurnCancellation,
     ) -> Result<(Vec<MessagePart>, Option<Usage>, bool), HeadlessTurnPortError> {
         let mut decoder = CompletionsDecoder::new();
         let mut frame = Vec::new();
+        let mut first_byte_deadline = Some(first_byte_deadline);
 
         loop {
             let next_chunk = tokio::select! {
@@ -352,7 +375,21 @@ impl MoonshotProvider {
                     })?
                 }
                 stop = wait_for_stop(cancellation) => return Err(stop),
+                () = async {
+                    match first_byte_deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    crate::emit_first_byte_stall(
+                        self.diagnostics.as_ref(),
+                        ProviderDiagnosticComponent::ChatCompletions,
+                    );
+                    return Err(HeadlessTurnPortError::ProviderNetwork);
+                }
             };
+
+            first_byte_deadline = None;
 
             let Some(chunk) = next_chunk else {
                 stop_before_mapping(cancellation)?;
@@ -548,8 +585,10 @@ impl TurnProvider for MoonshotProvider {
             }
         }
 
-        let response = self.send(self.payload()?, cancellation).await?;
-        let (parts, usage, wants_tool_results) = self.read_stream(response, cancellation).await?;
+        let (response, first_byte_deadline) = self.send(self.payload()?, cancellation).await?;
+        let (parts, usage, wants_tool_results) = self
+            .read_stream(response, first_byte_deadline, cancellation)
+            .await?;
 
         if let Some(progress) = &self.progress
             && let Some(usage) = usage

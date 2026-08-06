@@ -442,6 +442,47 @@ fn a_cancelled_turn_reports_cancellation_rather_than_a_provider_failure() {
 }
 
 #[test]
+fn a_response_that_never_sends_a_first_byte_fails_as_a_network_stall() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("server should bind");
+    let address = listener.local_addr().expect("address should be available");
+    let worker = thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("server should accept a request");
+        // Hold the connection open without writing a single response byte:
+        // dropping it would fail fast for the wrong reason (a closed socket),
+        // which is not the stall this test is about.
+        let _held = stream;
+        thread::sleep(Duration::from_secs(120));
+    });
+
+    // The request timeout stands far above the first-byte window so the only
+    // clock that can end this turn is the stall window itself — a shorter
+    // request timeout would make this test pass for the wrong reason.
+    let mut provider = MoonshotProvider::from_api_key_with_tools_and_timeout(
+        "test-key".to_owned(),
+        Some(&format!("http://{address}/v1")),
+        "kimi-k3".to_owned(),
+        "hello".to_owned(),
+        Vec::new(),
+        Duration::from_secs(600),
+    )
+    .expect("provider should build");
+    let cancellation = HeadlessTurnCancellation::new();
+
+    let started = std::time::Instant::now();
+    let error = runtime()
+        .block_on(provider.next_parts(&[], &cancellation))
+        .expect_err("a response that never starts must not read as a slow turn");
+    let elapsed = started.elapsed();
+
+    assert_eq!(error, HeadlessTurnPortError::ProviderNetwork);
+    assert!(
+        elapsed < Duration::from_secs(110),
+        "a stalled response must fail near the first-byte window, not the 600s read timeout: {elapsed:?}"
+    );
+    drop(worker);
+}
+
+#[test]
 fn queued_user_messages_join_the_replayed_history() {
     let server = SseServer::start(vec![sse(&[
         json!({"choices": [{"index": 0, "delta": {"content": "ok"}, "finish_reason": null}]}),

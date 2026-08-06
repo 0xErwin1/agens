@@ -26,8 +26,12 @@ pub enum TurnActivity<'a> {
     LoadingSession,
     /// The turn is running but has not reached a state worth naming yet.
     Working,
-    /// The request is out and nothing has come back.
-    Waiting,
+    /// The request is out and nothing has come back; `elapsed` is how long
+    /// it has been waiting, so a stalled provider is distinguishable from a
+    /// hang.
+    Waiting {
+        elapsed: Option<Duration>,
+    },
     /// Reasoning tokens are arriving; `elapsed` is how long they have been.
     Thinking {
         elapsed: Option<Duration>,
@@ -51,6 +55,8 @@ pub struct ActivityInputs<'a> {
     pub retry: Option<RetryActivity>,
     /// How long the current reasoning stretch has been running, when one is.
     pub reasoning_elapsed: Option<Duration>,
+    /// How long the request has been out with nothing back yet, when it is.
+    pub waiting_elapsed: Option<Duration>,
 }
 
 impl<'a> TurnActivity<'a> {
@@ -70,7 +76,9 @@ impl<'a> TurnActivity<'a> {
                 Some(elapsed) => Self::Thinking {
                     elapsed: Some(elapsed),
                 },
-                None => Self::Waiting,
+                None => Self::Waiting {
+                    elapsed: inputs.waiting_elapsed,
+                },
             },
             Some(TurnState::Streaming) => Self::Responding,
             Some(TurnState::Dispatching) => Self::UsingTool {
@@ -90,7 +98,7 @@ impl<'a> TurnActivity<'a> {
             Self::Ready => Cow::Borrowed("Ready"),
             Self::LoadingSession => Cow::Borrowed("Loading session…"),
             Self::Working => Cow::Borrowed("Working"),
-            Self::Waiting => Cow::Borrowed("Waiting"),
+            Self::Waiting { .. } => Cow::Borrowed("Waiting"),
             Self::Thinking { .. } => Cow::Borrowed("Reasoning"),
             Self::Responding => Cow::Borrowed("Responding"),
             Self::UsingTool { .. } => Cow::Borrowed("Using tool"),
@@ -105,7 +113,15 @@ impl<'a> TurnActivity<'a> {
     pub fn status_label(self) -> String {
         match self {
             Self::Working => "Working…".to_owned(),
-            Self::Waiting => "Waiting for the model…".to_owned(),
+            Self::Waiting { elapsed } => match elapsed {
+                Some(elapsed) => {
+                    format!(
+                        "Waiting for the model… {}",
+                        reasoning_duration_label(elapsed)
+                    )
+                }
+                None => "Waiting for the model…".to_owned(),
+            },
             Self::Thinking { elapsed } => match elapsed {
                 Some(elapsed) => format!("Reasoning… {}", reasoning_duration_label(elapsed)),
                 None => "Reasoning…".to_owned(),
@@ -182,7 +198,32 @@ mod tests {
             active_tool: None,
             retry: None,
             reasoning_elapsed: None,
+            waiting_elapsed: None,
         }
+    }
+
+    #[test]
+    fn waiting_reports_how_long_the_request_has_been_out() {
+        let activity = TurnActivity::derive(ActivityInputs {
+            turn_state: Some(TurnState::Requesting),
+            running: true,
+            waiting_elapsed: Some(Duration::from_secs(45)),
+            ..inputs()
+        });
+
+        assert_eq!(activity.status_label(), "Waiting for the model… 45s");
+        assert_eq!(activity.footer_label(), "Waiting");
+    }
+
+    #[test]
+    fn waiting_without_an_elapsed_keeps_the_plain_label() {
+        let activity = TurnActivity::derive(ActivityInputs {
+            turn_state: Some(TurnState::Requesting),
+            running: true,
+            ..inputs()
+        });
+
+        assert_eq!(activity.status_label(), "Waiting for the model…");
     }
 
     #[test]

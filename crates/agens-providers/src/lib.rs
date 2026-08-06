@@ -33,6 +33,15 @@ const HTTP_RETRY_SECOND_DELAY: Duration = Duration::from_secs(1);
 const HTTP_RETRY_MAX_JITTER: u64 = 100;
 const HTTP_RETRY_AFTER_CAP: Duration = Duration::from_secs(5);
 pub const DEFAULT_PROVIDER_REQUEST_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+/// Bounds how long a response may stay silent before its first body byte.
+///
+/// The request/read timeout bounds a stream that is already producing bytes;
+/// it says nothing about a response that never starts. A reasoning model can
+/// legitimately think for a while before its first delta, so this window sits
+/// far above any plausible thinking gap and far below the read timeout: a
+/// response that has sent nothing after this long is a stalled connection,
+/// not a slow turn.
+pub const FIRST_RESPONSE_BYTE_TIMEOUT: Duration = Duration::from_secs(90);
 /// Bounds one SSE frame. Response lifecycle events echo the entire request,
 /// so this has to accommodate a full tool catalogue rather than the largest
 /// plausible model output; a session with many MCP servers exceeds 128 KiB.
@@ -2281,6 +2290,25 @@ fn stream_read_failure(
     }
 
     protocol_failure
+}
+
+/// Records the terminal diagnostic for a response that never sent a first
+/// byte, so the stall is distinguishable in the diagnostics log from a turn
+/// that streamed and then failed.
+pub(crate) fn emit_first_byte_stall(
+    diagnostics: Option<&ProviderDiagnostics>,
+    component: ProviderDiagnosticComponent,
+) {
+    if let Some(diagnostics) = diagnostics {
+        diagnostics.emit(
+            component,
+            ProviderDiagnosticKind::Terminal,
+            1,
+            None,
+            None,
+            Some(ProviderDiagnosticClass::Network),
+        );
+    }
 }
 
 async fn decode_http_response_stream(

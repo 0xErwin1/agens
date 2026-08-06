@@ -5615,6 +5615,8 @@ pub struct Tui<E> {
     pending_retry: Option<RetryActivity>,
     /// Tick clock reading when the current reasoning stretch began.
     reasoning_started_at: Option<Duration>,
+    /// Tick clock reading when the request went out with nothing back yet.
+    waiting_started_at: Option<Duration>,
     runtime_events: Vec<TuiRuntimeEvent>,
     turn_duration: Option<Duration>,
     turn_started_at: Option<Duration>,
@@ -5722,6 +5724,7 @@ where
             active_tool: None,
             pending_retry: None,
             reasoning_started_at: None,
+            waiting_started_at: None,
             runtime_events: Vec::new(),
             turn_duration: None,
             turn_started_at: None,
@@ -6931,12 +6934,16 @@ where
         self.bump_selectable_epoch();
 
         match &event {
-            TuiRuntimeEvent::TurnStarted => self.turn_state = Some(TurnState::Requesting),
+            TuiRuntimeEvent::TurnStarted => {
+                self.turn_state = Some(TurnState::Requesting);
+                self.waiting_started_at = Some(self.now);
+            }
             TuiRuntimeEvent::TurnEnded { status, duration } => {
                 let finishing = self.foreground_running();
                 self.turn_state = Some(*status);
                 self.turn_duration = *duration;
                 self.active_tool = None;
+                self.waiting_started_at = None;
                 if finishing {
                     self.auto_collapse_thinking_on_finish();
                 }
@@ -7862,6 +7869,7 @@ where
                 self.turn_state = Some(TurnState::Streaming);
                 self.clear_provider_retry();
                 self.reasoning_started_at = None;
+                self.waiting_started_at = None;
                 match self.transcript.last_mut() {
                     Some(TranscriptEntry::Assistant(text)) => text.push_str(&delta),
                     _ => self.transcript.push(TranscriptEntry::Assistant(delta)),
@@ -7870,6 +7878,7 @@ where
             TurnEvent::ProviderPart(MessagePart::Reasoning(delta)) => {
                 self.project_conversation(ConversationEvent::ReasoningDelta(delta.clone()));
                 self.clear_provider_retry();
+                self.waiting_started_at = None;
                 if self.reasoning_started_at.is_none() {
                     self.reasoning_started_at = Some(self.now);
                 }
@@ -7895,6 +7904,7 @@ where
                 self.turn_state = Some(TurnState::Dispatching);
                 self.clear_provider_retry();
                 self.reasoning_started_at = None;
+                self.waiting_started_at = None;
                 self.active_tool = (!hidden_task).then_some(name.clone());
                 if !hidden_task {
                     self.transcript
@@ -7975,6 +7985,9 @@ where
             retry: self.pending_retry,
             reasoning_elapsed: self
                 .reasoning_started_at
+                .map(|started| self.now.saturating_sub(started)),
+            waiting_elapsed: self
+                .waiting_started_at
                 .map(|started| self.now.saturating_sub(started)),
         })
     }
