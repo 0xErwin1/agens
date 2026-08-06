@@ -70,7 +70,8 @@ use std::os::unix::process::CommandExt;
 const MAX_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_PROCESS_OUTPUT: usize = 64 * 1024;
 const MAX_CAPTURED_PROCESS_BYTES: usize = MAX_PROCESS_OUTPUT - 128;
-const DEFAULT_BASH_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const DEFAULT_BASH_TIMEOUT: Duration = Duration::from_secs(2 * 60);
+const MAX_BASH_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const DEFAULT_WEBFETCH_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_WEBFETCH_BYTES: usize = 100 * 1024;
 const MAX_WEBFETCH_REDIRECTS: usize = 5;
@@ -5024,8 +5025,9 @@ impl NativeTools {
                     &output,
                     "unavailable",
                     Some(&format!(
-                        "bash: timed out after {}ms",
-                        input.timeout.as_millis()
+                        "bash: timed out after {}ms. If this command is expected to take longer, retry with a larger timeout value in milliseconds (max: {}ms).",
+                        input.timeout.as_millis(),
+                        MAX_BASH_TIMEOUT.as_millis()
                     )),
                 ));
             }
@@ -5601,9 +5603,9 @@ impl NativeToolCatalog {
             ),
             native_metadata(
                 "native::bash",
-                "Run a bounded shell command in the project root",
+                "Run a bounded shell command in the project root. Default timeout: 2 minutes. Maximum timeout: 10 minutes. Pass timeout_ms to override.",
                 ToolAccess::Write,
-                serde_json::json!({"type":"object","additionalProperties":false,"required":["command"],"properties":{"command":{"type":"string"},"timeout_ms":{"type":"integer","minimum":1}}}),
+                serde_json::json!({"type":"object","additionalProperties":false,"required":["command"],"properties":{"command":{"type":"string"},"timeout_ms":{"type":"integer","minimum":1,"maximum":600000}}}),
             ),
             native_metadata(
                 "native::git_read",
@@ -5718,14 +5720,24 @@ impl NativeToolCatalog {
                 };
                 let timeout = match arguments.get("timeout_ms") {
                     Some(timeout) => match timeout.as_u64() {
-                        Some(timeout) => Duration::from_millis(timeout),
+                        Some(ms) => {
+                            let requested = Duration::from_millis(ms);
+                            if requested > MAX_BASH_TIMEOUT {
+                                return Ok(ToolOutput::failure(format!(
+                                    "bash: timeout {}ms exceeds maximum allowed {}ms",
+                                    ms,
+                                    MAX_BASH_TIMEOUT.as_millis()
+                                )));
+                            }
+                            requested
+                        }
                         None => return Ok(ToolOutput::failure("bash: timeout must be an integer")),
                     },
                     None => self.tools.limits.bash_timeout,
                 };
                 self.tools.bash(
                     BashInput::new(command)
-                        .with_timeout(timeout.min(context.remaining().unwrap_or(Duration::ZERO)))
+                        .with_timeout(timeout)
                         .with_execution_context(context.clone()),
                 )?
             }
@@ -6481,6 +6493,63 @@ mod native_tool_tests {
 
         assert!(output.is_error);
         assert_eq!(output.facts(), None);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bash_timeout_message_suggests_retry() {
+        let root = project_root();
+        let tools = NativeTools::open(&root).unwrap();
+
+        let output = tools
+            .bash(BashInput::new("sleep 5").with_timeout(Duration::from_millis(50)))
+            .unwrap();
+
+        assert!(output.is_error);
+        assert!(output.content.contains("timed out after"));
+        assert!(output.content.contains("retry with a larger timeout"));
+        assert!(output.content.contains("max:"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bash_rejects_timeout_above_max() {
+        let root = project_root();
+        let tools = NativeTools::open(&root).unwrap();
+        let catalog = NativeToolCatalog::new(tools);
+        let context = ToolExecutionContext::with_timeout(Duration::from_secs(60));
+
+        let result = catalog.execute(
+            "native::bash",
+            serde_json::json!({"command": "echo test", "timeout_ms": 999999999}),
+            &context,
+        );
+
+        let output = result.unwrap();
+        assert!(output.is_error);
+        assert!(output.content.contains("exceeds maximum allowed"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bash_accepts_timeout_up_to_max() {
+        let root = project_root();
+        let tools = NativeTools::open(&root).unwrap();
+        let catalog = NativeToolCatalog::new(tools);
+        let context = ToolExecutionContext::with_timeout(Duration::from_secs(60));
+
+        let result = catalog.execute(
+            "native::bash",
+            serde_json::json!({"command": "echo test", "timeout_ms": 600000}),
+            &context,
+        );
+
+        assert!(result.is_ok());
+        let output = result.unwrap();
+        assert!(!output.is_error);
 
         fs::remove_dir_all(root).unwrap();
     }

@@ -24,7 +24,7 @@ static NEXT_ROOT: AtomicUsize = AtomicUsize::new(0);
 fn directly_constructed_native_tools_allow_long_test_commands_by_default() {
     assert_eq!(
         NativeToolLimits::default().bash_timeout,
-        Duration::from_secs(30 * 60)
+        Duration::from_secs(2 * 60)
     );
 }
 
@@ -275,7 +275,7 @@ fn bash_enforces_one_total_labeled_output_budget_and_reports_timeout() {
     assert_eq!(
         timeout,
         ToolOutput::failure(
-            "[stdout]\n[stderr]\n[bash: timed out after 25ms]\n[exit status: unavailable]\n"
+            "[stdout]\n[stderr]\n[bash: timed out after 25ms. If this command is expected to take longer, retry with a larger timeout value in milliseconds (max: 600000ms).]\n[exit status: unavailable]\n"
         )
     );
 
@@ -388,7 +388,7 @@ fn bash_timeout_kills_its_process_group_and_descendants() {
             .bash(BashInput::new(command).with_timeout(Duration::from_millis(25)))
             .unwrap(),
         ToolOutput::failure(
-            "[stdout]\n[stderr]\n[bash: timed out after 25ms]\n[exit status: unavailable]\n"
+            "[stdout]\n[stderr]\n[bash: timed out after 25ms. If this command is expected to take longer, retry with a larger timeout value in milliseconds (max: 600000ms).]\n[exit status: unavailable]\n"
         )
     );
     thread::sleep(Duration::from_millis(1100));
@@ -553,7 +553,7 @@ fn catalog_applies_a_positive_bash_timeout_override() {
             )
             .unwrap(),
         ToolOutput::failure(
-            "[stdout]\n[stderr]\n[bash: timed out after 25ms]\n[exit status: unavailable]\n"
+            "[stdout]\n[stderr]\n[bash: timed out after 25ms. If this command is expected to take longer, retry with a larger timeout value in milliseconds (max: 600000ms).]\n[exit status: unavailable]\n"
         )
     );
 
@@ -578,7 +578,7 @@ fn catalog_falls_back_to_the_configured_bash_timeout() {
             )
             .unwrap(),
         ToolOutput::failure(
-            "[stdout]\n[stderr]\n[bash: timed out after 25ms]\n[exit status: unavailable]\n"
+            "[stdout]\n[stderr]\n[bash: timed out after 25ms. If this command is expected to take longer, retry with a larger timeout value in milliseconds (max: 600000ms).]\n[exit status: unavailable]\n"
         )
     );
 
