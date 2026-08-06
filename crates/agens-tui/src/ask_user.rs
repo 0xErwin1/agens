@@ -492,6 +492,18 @@ impl AskUserState {
         }
         match self.row {
             AskUserRow::Option(index) => {
+                let mode = self.request.questions()[self.question].mode();
+                if self.is_last_question()
+                    && mode == AskUserMode::Single
+                    && self.selections[self.question].contains(&index)
+                {
+                    // Single mode, last question, cursor on the chosen option:
+                    // Enter here cannot change the answer (it is a no-op as a
+                    // selection), so it reads as "move on" and opens review.
+                    // Moving to another option and pressing Enter still corrects
+                    // the selection; multiple mode still accumulates in place.
+                    return self.enter_review();
+                }
                 let selected = self.toggle_or_select(index);
                 if !self.is_last_question() {
                     return self.move_to_next_question();

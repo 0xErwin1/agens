@@ -1988,14 +1988,7 @@ fn permission_wait_close_deadline_and_replies_remain_fail_closed() {
     let expired = HeadlessTurnCancellation::with_deadline(Duration::ZERO);
     let expired_bridge = bridge.clone();
     let expired_wait = thread::spawn(move || {
-        expired_bridge.wait_for_reply(
-            "write",
-            "README.md",
-            "Write",
-            None,
-            None,
-            &expired,
-        )
+        expired_bridge.wait_for_reply("write", "README.md", "Write", None, None, &expired)
     });
     let expired_request = requests.recv_timeout(Duration::from_secs(1)).unwrap();
     thread::sleep(Duration::from_millis(100));
@@ -2012,14 +2005,7 @@ fn permission_wait_close_deadline_and_replies_remain_fail_closed() {
     let allowed = HeadlessTurnCancellation::new();
     let allowed_bridge = bridge.clone();
     let allowed_wait = thread::spawn(move || {
-        allowed_bridge.wait_for_reply(
-            "write",
-            "README.md",
-            "Write",
-            None,
-            None,
-            &allowed,
-        )
+        allowed_bridge.wait_for_reply("write", "README.md", "Write", None, None, &allowed)
     });
     let allowed_request = requests.recv_timeout(Duration::from_secs(1)).unwrap();
 
@@ -4569,7 +4555,8 @@ fn ask_user_enter_on_option_advances_to_the_next_question() {
     assert_eq!(snapshot.question_index, 1);
     assert_eq!(snapshot.row, AskUserRowSnapshot::Option(0));
 
-    // On the last question, Enter selects and stays so Submit remains reachable.
+    // On the last question, the first Enter answers it and stays; a second
+    // Enter has no answer left to give, so it opens the review screen.
     tui.handle(Event::Key(Key::Tab));
     assert_eq!(
         tui.ask_user_snapshot().unwrap().question_index,
@@ -4583,6 +4570,67 @@ fn ask_user_enter_on_option_advances_to_the_next_question() {
     assert_eq!(last.question_index, 2);
     assert_eq!(last.selected, vec![0]);
     assert_eq!(last.row, AskUserRowSnapshot::Option(0));
+
+    assert_eq!(tui.handle(Event::Key(Key::Enter)), Action::Render);
+    assert!(tui.ask_user_snapshot().expect("review open").reviewing);
+}
+
+#[test]
+fn ask_user_enter_on_answered_last_question_reaches_submit_in_two_keystrokes() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.open_ask_user(1, single_question_ask_user_request(false, false, false));
+
+    // First Enter answers the question and stays.
+    assert_eq!(tui.handle(Event::Key(Key::Enter)), Action::Render);
+    let snapshot = tui.ask_user_snapshot().expect("still open");
+    assert_eq!(snapshot.selected, vec![0]);
+    assert_eq!(snapshot.row, AskUserRowSnapshot::Option(0));
+
+    // Second Enter opens the review screen, where Enter submits.
+    assert_eq!(tui.handle(Event::Key(Key::Enter)), Action::Render);
+    assert!(tui.ask_user_snapshot().expect("review open").reviewing);
+    tui.handle(Event::Key(Key::Enter));
+    assert!(tui.ask_user_snapshot().is_none());
+}
+
+#[test]
+fn ask_user_enter_on_unanswered_last_question_never_leaves_the_options() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.open_ask_user(1, three_question_ask_user_request());
+
+    // Land on the last question without answering it: Enter answers in place,
+    // so a reader can never jump past the question without answering first.
+    tui.handle(Event::Key(Key::Tab));
+    tui.handle(Event::Key(Key::Tab));
+    assert_eq!(tui.handle(Event::Key(Key::Enter)), Action::Render);
+    let snapshot = tui.ask_user_snapshot().expect("still open");
+    assert_eq!(snapshot.question_index, 2);
+    assert_eq!(snapshot.selected, vec![0]);
+    assert_eq!(snapshot.row, AskUserRowSnapshot::Option(0));
+}
+
+#[test]
+fn ask_user_last_multiple_question_accumulates_with_space_then_submits() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.open_ask_user(1, three_question_ask_user_request());
+
+    // On the multiple question, Enter on an option advances like anywhere
+    // else; Space is the accumulate-in-place key.
+    tui.handle(Event::Key(Key::Tab));
+    tui.handle(Event::Key(Key::Char(' ')));
+    tui.handle(Event::Key(Key::Down));
+    tui.handle(Event::Key(Key::Char(' ')));
+    let snapshot = tui.ask_user_snapshot().expect("still open");
+    assert_eq!(snapshot.question_index, 1);
+    assert_eq!(snapshot.selected, vec![0, 1]);
+
+    // Proceed carries the accumulated answer to the last question.
+    tui.handle(Event::Key(Key::Down));
+    walk_to_proceed_row(&mut tui);
+    assert_eq!(tui.handle(Event::Key(Key::Enter)), Action::Render);
+    let last = tui.ask_user_snapshot().expect("still open");
+    assert_eq!(last.question_index, 2);
+    assert!(!last.reviewing);
 }
 
 #[test]
@@ -5020,7 +5068,10 @@ fn ask_user_no_op_keys_report_unchanged() {
     let mut reselect = Tui::new(FakeEngine::default());
     reselect.open_ask_user(1, single_question_ask_user_request(false, false, false));
     reselect.handle(Event::Key(Key::Enter));
-    assert_eq!(reselect.handle(Event::Key(Key::Enter)), Action::Unchanged);
+    // Enter on the already-selected option of the answered last question is a
+    // selection no-op, so it advances to the review screen instead.
+    assert_eq!(reselect.handle(Event::Key(Key::Enter)), Action::Render);
+    assert!(reselect.ask_user_snapshot().expect("review open").reviewing);
 }
 
 #[test]
