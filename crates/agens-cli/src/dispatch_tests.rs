@@ -793,10 +793,12 @@ fn production_dispatcher_preserves_safe_native_failure_reason() {
         sanitized_native_tool_failure("glob: /home/user/private token=SECRET remote body details"),
         "glob: [path] token=[redacted: 6 characters] remote body details"
     );
-    assert_eq!(
-        sanitized_native_tool_failure("glob: path is outside project root"),
-        "glob: path validation failed"
+    let outside = sanitized_native_tool_failure("glob: path is outside project root");
+    assert!(
+        outside.contains("outside the project workspace"),
+        "{outside}"
     );
+    assert!(outside.starts_with("glob:"), "{outside}");
 }
 
 /// A per-tool MCP timeout must not terminate the parent turn: the model needs the failed result

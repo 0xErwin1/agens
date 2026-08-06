@@ -979,6 +979,43 @@ fn the_tool_detail_cycle_walks_both_ways_through_its_three_levels() {
     );
 }
 
+/// Full tool detail opens a modal overlay (Grok-style) instead of expanding the
+/// transcript. Preview stays inline; Esc dismisses the overlay.
+#[test]
+fn full_tool_detail_opens_a_scrollable_overlay_with_args_and_output() {
+    let mut tui = turn_with_reasoning_and_a_settled_call();
+    tui.handle(Event::Resize {
+        width: 100,
+        height: 30,
+    });
+
+    assert!(tui.view().tool_overlay.is_none());
+    tui.handle(Event::Key(Key::CtrlO)); // Truncated
+    tui.handle(Event::Key(Key::CtrlO)); // Expanded → overlay
+    assert_eq!(tui.view().tool_detail, DisplayMode::Expanded);
+    let overlay = tui
+        .view()
+        .tool_overlay
+        .expect("full detail must open the tool overlay");
+    assert_eq!(overlay.call_id, "read-1");
+    assert!(
+        overlay.output.contains("TOOL_BODY"),
+        "overlay carries the tool output: {:?}",
+        overlay.output
+    );
+    // Transcript keeps a short preview, not the full expanded dump.
+    assert_eq!(
+        tui.view().tool_display_modes.get("read-1"),
+        Some(&DisplayMode::Truncated)
+    );
+
+    tui.handle(Event::Key(Key::Escape));
+    assert!(
+        tui.view().tool_overlay.is_none(),
+        "Escape closes the tool overlay"
+    );
+}
+
 /// AGN-109 collapses every settled call, so the detail it hides has to be
 /// reachable one block at a time — a transcript-wide cycle answers "how much of
 /// everything", not "what is in this one".

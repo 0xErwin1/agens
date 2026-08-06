@@ -3453,6 +3453,41 @@ pub enum ToolEvaluationOutcome {
     Authorized(AuthorizedToolCall),
 }
 
+/// Shared identity / target projection for policy evaluate and post-prompt allow.
+struct PreparedEvaluation {
+    dispatcher_id: u64,
+    registration_version: u64,
+    identity: ToolIdentity,
+    access: ToolAccess,
+    arguments: serde_json::Value,
+    policy: PermissionPolicy,
+    grants: Vec<ProjectPermissionGrant>,
+    permission: PermissionRequest,
+}
+
+impl PreparedEvaluation {
+    fn into_authorized_call(self) -> AuthorizedToolCall {
+        let read_filter = PermissionReadFilter::new(
+            self.policy,
+            self.grants,
+            self.permission.project.clone(),
+            self.identity.0.clone(),
+            self.permission.access,
+        );
+
+        AuthorizedToolCall {
+            dispatcher_id: self.dispatcher_id,
+            registration_version: self.registration_version,
+            identity: self.identity,
+            projected_target: self.permission.target,
+            access: self.access,
+            arguments_digest: digest_arguments(&self.arguments),
+            arguments: self.arguments,
+            read_filter,
+        }
+    }
+}
+
 /// Opaque proof that a specific registered tool was authorized for one request.
 /// Its fields are deliberately private: callers cannot construct or alter a call.
 #[derive(Debug)]
@@ -3720,6 +3755,29 @@ impl ToolDispatcher {
         self.evaluate_with_policy_override(policy, grants, session, request, false)
     }
 
+    /// Authorizes a call the person already approved at the interactive prompt.
+    ///
+    /// Peer agents treat human Allow as the decision: they do not re-run policy
+    /// and re-ask. Agens still applies hard safety (worktree escape, chat-mode
+    /// write ban, configured global deny). Soft `ask` rules, configured floors,
+    /// and grant-matching quirks must not turn an explicit Allow into
+    /// `PromptRequired` again — that is what freezes the agent on "approval
+    /// could not be completed" after the person already said yes.
+    pub fn authorize_after_human_approval(
+        &self,
+        policy: &PermissionPolicy,
+        request: ToolDispatchRequest,
+    ) -> Result<ToolEvaluationOutcome, Error> {
+        let prepared = self.prepare_evaluation(policy, &[], request)?;
+        if !prepared.policy.hard_safety_allows(&prepared.permission) {
+            return Ok(ToolEvaluationOutcome::Denied);
+        }
+
+        Ok(ToolEvaluationOutcome::Authorized(
+            prepared.into_authorized_call(),
+        ))
+    }
+
     /// Evaluates identity, arguments, target projection, and hard safety
     /// before consulting policy.
     ///
@@ -3736,13 +3794,43 @@ impl ToolDispatcher {
         request: ToolDispatchRequest,
         unmatched_allow: bool,
     ) -> Result<ToolEvaluationOutcome, Error> {
+        let prepared = self.prepare_evaluation(policy, grants, request)?;
+
+        if !prepared.policy.hard_safety_allows(&prepared.permission) {
+            return Ok(ToolEvaluationOutcome::Denied);
+        }
+
+        match prepared.policy.evaluate_with_unmatched_override(
+            &prepared.permission,
+            &prepared.grants,
+            &[],
+            session,
+            unmatched_allow,
+        ) {
+            PermissionDecision::Deny => Ok(ToolEvaluationOutcome::Denied),
+            PermissionDecision::Ask => Ok(ToolEvaluationOutcome::PromptRequired(
+                PermissionPromptContext::from_request(&prepared.permission),
+            )),
+            PermissionDecision::Allow => Ok(ToolEvaluationOutcome::Authorized(
+                prepared.into_authorized_call(),
+            )),
+        }
+    }
+
+    fn prepare_evaluation(
+        &self,
+        policy: &PermissionPolicy,
+        grants: &[ProjectPermissionGrant],
+        request: ToolDispatchRequest,
+    ) -> Result<PreparedEvaluation, Error> {
         let identity = self
             .aliases
             .get(&request.qualified_tool_name)
-            .ok_or_else(|| Error::Tool("unknown tool".into()))?;
+            .ok_or_else(|| Error::Tool("unknown tool".into()))?
+            .clone();
         let registered = self
             .tools
-            .get(identity)
+            .get(&identity)
             .ok_or_else(|| Error::Tool("unknown tool".into()))?;
         let policy = policy.normalized_tool_aliases(|name| {
             self.aliases.get(name).map(|identity| identity.0.clone())
@@ -3759,48 +3847,22 @@ impl ToolDispatcher {
             registered.access,
             &reach,
         );
-        let grants: &[ProjectPermissionGrant] = if permission.project.trim().is_empty() {
-            &[]
+        let grants = if permission.project.trim().is_empty() {
+            Vec::new()
         } else {
-            &grants
+            grants
         };
 
-        if !policy.hard_safety_allows(&permission) {
-            return Ok(ToolEvaluationOutcome::Denied);
-        }
-
-        match policy.evaluate_with_unmatched_override(
-            &permission,
+        Ok(PreparedEvaluation {
+            dispatcher_id: self.dispatcher_id,
+            registration_version: registered.version,
+            identity,
+            access: registered.access,
+            arguments: request.arguments,
+            policy,
             grants,
-            &[],
-            session,
-            unmatched_allow,
-        ) {
-            PermissionDecision::Deny => Ok(ToolEvaluationOutcome::Denied),
-            PermissionDecision::Ask => Ok(ToolEvaluationOutcome::PromptRequired(
-                PermissionPromptContext::from_request(&permission),
-            )),
-            PermissionDecision::Allow => {
-                let read_filter = PermissionReadFilter::new(
-                    policy,
-                    grants.to_vec(),
-                    permission.project.clone(),
-                    identity.0.clone(),
-                    permission.access,
-                );
-
-                Ok(ToolEvaluationOutcome::Authorized(AuthorizedToolCall {
-                    dispatcher_id: self.dispatcher_id,
-                    registration_version: registered.version,
-                    identity: identity.clone(),
-                    projected_target: permission.target,
-                    access: permission.access,
-                    arguments_digest: digest_arguments(&request.arguments),
-                    arguments: request.arguments,
-                    read_filter,
-                }))
-            }
-        }
+            permission,
+        })
     }
 
     pub fn execute(
@@ -4279,40 +4341,60 @@ impl NativeTools {
         self.edit_file_with_context(input, None)
     }
 
-    fn write_file_with_context(
+    /// Writes after the permission gate has decided (when `context` is set).
+    ///
+    /// Out-of-workspace paths are allowed only with a context — that is the
+    /// peer "Allow on external path" path. Direct [`Self::write_file`] still
+    /// hard-fails outside the root.
+    pub fn write_file_with_context(
         &self,
         input: WriteFileInput,
         context: Option<&ToolExecutionContext>,
     ) -> Result<ToolOutput, Error> {
-        let path = match self.resolve_confined_path(&input.path) {
-            Ok(path) => path,
+        // Peer agents (OpenCode, Claude, Codex) treat out-of-workspace paths as
+        // a permission decision, not a hard tool failure. By the time this
+        // runs with a ToolExecutionContext, the permission gate has already
+        // Allow'd the call (or bypass converted Ask → Allow). Unconfined
+        // absolute writes therefore only open after that decision.
+        let target = match self.resolve_authorized_write_path(&input.path, context) {
+            Ok(target) => target,
             Err(output) => return Ok(Self::failed_write_facts(&input.path, output)),
         };
-        let mut input = input;
-        input.path = path;
 
-        #[cfg(unix)]
-        let result = write_file_confined(
-            &self.project_root_dir,
-            &input.path,
-            input.content.as_bytes(),
-            context,
-        );
+        let result = match &target {
+            AuthorizedWritePath::Confined(relative) => {
+                #[cfg(unix)]
+                {
+                    write_file_confined(
+                        &self.project_root_dir,
+                        relative,
+                        input.content.as_bytes(),
+                        context,
+                    )
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = relative;
+                    Err(ToolOutput::failure(
+                        "write: secure confined writes are unavailable on this platform",
+                    ))
+                }
+            }
+            AuthorizedWritePath::External(absolute) => {
+                write_file_external(absolute, input.content.as_bytes(), context)
+            }
+        };
 
-        #[cfg(not(unix))]
-        let result = Err(ToolOutput::failure(
-            "write: secure confined writes are unavailable on this platform",
-        ));
-
+        let display_path = target.display_path();
         match result {
             Ok(is_new_file) => {
                 let bytes_written = input.content.len();
                 let lines_written = input.content.lines().count();
 
                 Ok(
-                    ToolOutput::success(format!("wrote {}", input.path.display())).with_facts(
+                    ToolOutput::success(format!("wrote {display_path}")).with_facts(
                         ToolResultFacts::Write {
-                            path: FactPath::new(&input.path.display().to_string()),
+                            path: FactPath::new(&display_path),
                             outcome: ToolOutcome::Succeeded,
                             written: Some(WriteMagnitude {
                                 is_new_file,
@@ -4323,7 +4405,7 @@ impl NativeTools {
                     ),
                 )
             }
-            Err(output) => Ok(Self::failed_write_facts(&input.path, output)),
+            Err(output) => Ok(Self::failed_write_facts(Path::new(&display_path), output)),
         }
     }
 
@@ -4343,40 +4425,50 @@ impl NativeTools {
         input: EditFileInput,
         context: Option<&ToolExecutionContext>,
     ) -> Result<ToolOutput, Error> {
-        let path = match self.resolve_confined_path(&input.path) {
-            Ok(path) => path,
+        let target = match self.resolve_authorized_write_path(&input.path, context) {
+            Ok(target) => target,
             Err(output) => return Ok(Self::failed_edit_facts(&input.path, output)),
         };
-        let mut input = input;
-        input.path = path;
         if input.old.is_empty() {
             return Ok(Self::failed_edit_facts(
-                &input.path,
+                Path::new(&target.display_path()),
                 ToolOutput::failure("edit: old text is required"),
             ));
         }
         if input.old == input.new {
             return Ok(Self::failed_edit_facts(
-                &input.path,
+                Path::new(&target.display_path()),
                 ToolOutput::failure("edit: old and new text must differ"),
             ));
         }
 
-        #[cfg(unix)]
-        let result = edit_file_confined(
-            &self.project_root_dir,
-            &input.path,
-            &input.old,
-            &input.new,
-            context,
-        );
+        let result = match &target {
+            AuthorizedWritePath::Confined(relative) => {
+                #[cfg(unix)]
+                {
+                    edit_file_confined(
+                        &self.project_root_dir,
+                        relative,
+                        &input.old,
+                        &input.new,
+                        context,
+                    )
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = relative;
+                    Err(ToolOutput::failure(
+                        "edit: secure confined edits are unavailable on this platform",
+                    ))
+                }
+            }
+            AuthorizedWritePath::External(absolute) => {
+                edit_file_external(absolute, &input.old, &input.new, context)
+            }
+        };
 
-        #[cfg(not(unix))]
-        let result = Err(ToolOutput::failure(
-            "edit: secure confined edits are unavailable on this platform",
-        ));
-
-        Ok(result.unwrap_or_else(|output| Self::failed_edit_facts(&input.path, output)))
+        let display = Path::new(&target.display_path()).to_path_buf();
+        Ok(result.unwrap_or_else(|output| Self::failed_edit_facts(&display, output)))
     }
 
     /// Attaches `Edit` failure facts to an already-sanitized failure output,
@@ -5105,13 +5197,43 @@ impl NativeTools {
         Ok(())
     }
 
+    /// Resolves a path for a write/edit that has already cleared the permission
+    /// gate (when `context` is present).
+    ///
+    /// - Under the project root → confined openat path (relative).
+    /// - Outside the root after authorization → unrestricted absolute path.
+    /// - Outside the root without a context (unit tests / unauthenticated call
+    ///   sites) → still a hard confinement failure, same as before.
+    ///
+    /// Peers treat out-of-workspace paths as permission decisions; bypass/Allow
+    /// must not die at openat. Explicit policy Deny never reaches execute.
+    fn resolve_authorized_write_path(
+        &self,
+        path: &Path,
+        context: Option<&ToolExecutionContext>,
+    ) -> Result<AuthorizedWritePath, ToolOutput> {
+        match self.resolve_confined_path(path) {
+            Ok(relative) => Ok(AuthorizedWritePath::Confined(relative)),
+            Err(error) if context.is_some() && is_path_confinement_refusal(&error) => {
+                let absolute = if path.is_absolute() {
+                    path.to_path_buf()
+                } else {
+                    self.project_root.join(path)
+                };
+                let absolute = normalize_external_path(&absolute)?;
+                Ok(AuthorizedWritePath::External(absolute))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// Resolves a user/tool path into a project-relative path safe for confined openat.
     ///
     /// Absolute paths are accepted when they lie under the confinement root
     /// (future multi-workspace roots will extend the same rewrite). Outside the
-    /// root still fails as outside project root — that is confinement, not a
-    /// ban on absolute spelling. Explicit permission denies remain the policy
-    /// layer for blocking paths that would otherwise be in scope.
+    /// root still fails as outside project root for unauthenticated call sites.
+    /// After permission Allow (see [`Self::resolve_authorized_write_path`]),
+    /// outside paths may proceed unconfined.
     fn resolve_confined_path(&self, path: &Path) -> Result<PathBuf, ToolOutput> {
         if path.as_os_str().is_empty() {
             return Err(ToolOutput::failure("path: must be a non-empty path"));
@@ -5811,6 +5933,106 @@ fn read_range(content: &str, range: Option<(usize, usize)>) -> String {
         .skip(offset - 1)
         .take(limit)
         .collect()
+}
+
+/// Where an authorized write/edit should land.
+enum AuthorizedWritePath {
+    /// Project-relative path for confined openat.
+    Confined(PathBuf),
+    /// Absolute path outside the confinement root (permission already Allow'd).
+    External(PathBuf),
+}
+
+impl AuthorizedWritePath {
+    fn display_path(&self) -> String {
+        match self {
+            Self::Confined(path) | Self::External(path) => path.display().to_string(),
+        }
+    }
+}
+
+fn is_path_confinement_refusal(output: &ToolOutput) -> bool {
+    output.is_error
+        && (output.content.contains("outside project root")
+            || output.content.contains("traversal is not allowed"))
+}
+
+/// Collapses `.` / `..` without requiring the leaf to exist yet.
+fn normalize_external_path(path: &Path) -> Result<PathBuf, ToolOutput> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return Err(ToolOutput::failure("path: outside project root"));
+                }
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+    if normalized.as_os_str().is_empty() {
+        return Err(ToolOutput::failure("path: path must name a file"));
+    }
+    Ok(normalized)
+}
+
+/// Unconfined write used only after the permission gate Allow'd an external path.
+fn write_file_external(
+    path: &Path,
+    content: &[u8],
+    context: Option<&ToolExecutionContext>,
+) -> Result<bool, ToolOutput> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| ToolOutput::failure("path: path must name a file"))?;
+    fs::create_dir_all(parent)
+        .map_err(|error| ToolOutput::failure(format!("write: cannot create parent: {error}")))?;
+    let is_new_file = !path.exists();
+    let temp = parent.join(format!(
+        ".agens-write-{}-{}",
+        std::process::id(),
+        TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result = (|| {
+        fs::write(&temp, content).map_err(|error| ToolOutput::failure(format!("write: {error}")))?;
+        if context.is_some_and(ToolExecutionContext::is_cancelled) {
+            return Err(ToolOutput::failure("tool execution cancelled"));
+        }
+        fs::rename(&temp, path)
+            .map_err(|error| ToolOutput::failure(format!("write: cannot commit file: {error}")))?;
+        Ok(is_new_file)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
+}
+
+/// Unconfined edit used only after the permission gate Allow'd an external path.
+fn edit_file_external(
+    path: &Path,
+    old: &str,
+    new: &str,
+    context: Option<&ToolExecutionContext>,
+) -> Result<ToolOutput, ToolOutput> {
+    let content = fs::read_to_string(path)
+        .map_err(|error| ToolOutput::failure(format!("edit: {error}")))?;
+    let matches = content.matches(old).count();
+    if matches == 0 {
+        return Err(ToolOutput::failure("edit: old text not found"));
+    }
+    if matches > 1 {
+        return Err(ToolOutput::failure(
+            "edit: old text matches more than once; make it unique",
+        ));
+    }
+    let updated = content.replacen(old, new, 1);
+    write_file_external(path, updated.as_bytes(), context)?;
+    Ok(ToolOutput::success(format!("edited {}", path.display())))
 }
 
 #[cfg(unix)]

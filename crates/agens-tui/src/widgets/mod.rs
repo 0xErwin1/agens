@@ -13,7 +13,7 @@ mod role_palette;
 pub(crate) use blocks::{
     ACCENT_WIDTH, BlockContent, BlockLine, GUTTER_WIDTH, RowAccent, RowBullet, RowState,
     ThinkingBlock, ToolCallBlock, ToolResultBlock, VerbGroup, bounded_tool_preview,
-    format_ask_user_result_lines, is_ask_user_tool_name,
+    format_ask_user_result_lines, is_ask_user_tool_name, tool_argument_detail_text, tool_header,
 };
 pub use capability::{ColorLevel, UnicodeLevel};
 pub(crate) use capability::{Glyph, detect_color_level, detect_unicode_level, quantize_buffer};

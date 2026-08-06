@@ -88,18 +88,36 @@ const MAX_NATIVE_TOOL_FAILURE_CHARS: usize = 16_384;
 
 /// Rewrites a native-tool failure into something the model may see.
 ///
-/// A raw failure carries command output, filesystem paths and other host detail. Everything
-/// except the path-validation reasons below passes through, redacted and bounded, instead of
-/// collapsing to a generic message: real bash failures never carry a `"<tool>: "` prefix and
-/// used to lose all compiler and test output as a result.
+/// A raw failure carries command output, filesystem paths and other host detail. Path
+/// confinement refusals are rewritten to actionable guidance that never names a host path
+/// (no `/tmp`, no home directory). Everything else passes through redacted and bounded:
+/// real bash failures never carry a `"<tool>: "` prefix and used to lose all compiler and
+/// test output when they were collapsed.
 pub fn sanitized_native_tool_failure(content: &str) -> String {
     if let Some((tool, reason)) = content.split_once(": ")
         && !tool.contains('\n')
-        && (reason.contains("outside project root")
-            || reason.contains("traversal is not allowed")
-            || reason.contains("must be a non-empty relative path"))
+        && tool
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
     {
-        return format!("{tool}: path validation failed");
+        if reason.contains("outside project root") {
+            return format!(
+                "{tool}: path is outside the project workspace; use a relative path under \
+                 the project root (not /tmp or other absolute locations outside it)"
+            );
+        }
+        if reason.contains("traversal is not allowed") {
+            return format!(
+                "{tool}: path traversal is not allowed; use a path under the project root"
+            );
+        }
+        if reason.contains("must be a non-empty relative path")
+            || reason.contains("must be a non-empty path")
+        {
+            return format!(
+                "{tool}: path must be a non-empty path under the project root"
+            );
+        }
     }
 
     bounded_detail(
@@ -263,22 +281,30 @@ mod tests {
         );
     }
 
-    /// Path-validation reasons stay a closed, generic message with no host path — the one
-    /// evidenced threat this rewrite still guards against.
+    /// Path-confinement refusals stay free of host paths but must tell the model
+    /// *why* and *what to do* — a opaque "path validation failed" left agents
+    /// retrying `/tmp` forever after Allow, which never relaxes confinement.
     #[test]
-    fn path_validation_stays_generic() {
-        for content in [
-            "path: outside project root",
-            "read: outside project root",
-            "write: traversal is not allowed",
-            "edit: must be a non-empty relative path",
-        ] {
-            let converted = sanitized_native_tool_failure(content);
+    fn path_validation_is_actionable_without_host_paths() {
+        let outside = sanitized_native_tool_failure("path: outside project root");
+        assert!(
+            outside.contains("outside the project workspace"),
+            "{outside}"
+        );
+        assert!(outside.contains("project root"), "{outside}");
+        assert!(
+            !outside.contains("/home") && !outside.contains("/Users"),
+            "must not leak host home paths: {outside}"
+        );
 
-            let (tool, _) = content.split_once(": ").expect("fixture has a tool prefix");
-            assert_eq!(converted, format!("{tool}: path validation failed"));
-            assert!(!converted.contains('/'));
-        }
+        let traversal = sanitized_native_tool_failure("write: traversal is not allowed");
+        assert!(traversal.starts_with("write:"), "{traversal}");
+        assert!(traversal.contains("traversal"), "{traversal}");
+        assert!(!traversal.contains(".."), "{traversal}");
+
+        let empty = sanitized_native_tool_failure("edit: must be a non-empty relative path");
+        assert!(empty.starts_with("edit:"), "{empty}");
+        assert!(empty.contains("non-empty"), "{empty}");
     }
 
     /// The path-validation guard must anchor on a genuine `"<tool>: <reason>"` shape. Real bash

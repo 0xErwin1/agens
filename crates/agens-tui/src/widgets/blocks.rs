@@ -304,11 +304,14 @@ fn thought_duration(elapsed: Duration) -> String {
 pub(crate) struct ToolRow;
 
 impl ToolRow {
-    /// Arguments line (always visible for audit).
-    pub(crate) fn args(input: &str) -> Line<'static> {
+    /// Guttered detail line under a tool header (never a raw JSON dump label).
+    pub(crate) fn detail(text: impl Into<String>) -> Line<'static> {
         Line::from(vec![
-            Span::styled("│ input ", Style::default().fg(RolePalette::muted())),
-            Span::raw(input.to_owned()),
+            Span::styled("│ ", Style::default().fg(RolePalette::muted())),
+            Span::styled(
+                text.into(),
+                Style::default().fg(RolePalette::machine()),
+            ),
         ])
     }
 
@@ -513,8 +516,8 @@ fn header_parts(parsed: &ToolInput) -> HeaderParts {
 /// tool ran and nothing about what it was told to do. The values are what tell
 /// two calls apart, so scalars are shown — each redacted, collapsed and
 /// bounded — while nested objects and arrays stay shape-only, since those are
-/// the payloads worth dumping nowhere. Complete raw arguments remain reachable
-/// through [`DisplayMode::Expanded`].
+/// the payloads worth dumping nowhere. Expanded detail uses the same summary
+/// rather than dumping raw JSON.
 ///
 /// `ask_user` is special-cased: a nested `questions` array would otherwise
 /// collapse to `questions=[n]`, which tells the reader nothing about what was
@@ -742,6 +745,90 @@ fn truncate_operand(operand: &str, budget: usize) -> String {
     clipped
 }
 
+/// Plain-text argument detail for overlays and Expanded rows (no JSON dump).
+pub(crate) fn tool_argument_detail_text(parsed: &ToolInput, raw_input: &str) -> String {
+    expanded_argument_texts(parsed, raw_input, usize::MAX).join("\n")
+}
+
+/// Expanded argument body: human-readable fields only, never raw JSON.
+fn expanded_tool_argument_lines(
+    parsed: &ToolInput,
+    raw_input: &str,
+    content_width: usize,
+) -> Vec<Line<'static>> {
+    let width = content_width.saturating_sub(2).max(1);
+    expanded_argument_texts(parsed, raw_input, width)
+        .into_iter()
+        .map(ToolRow::detail)
+        .collect()
+}
+
+fn expanded_argument_texts(
+    parsed: &ToolInput,
+    raw_input: &str,
+    width: usize,
+) -> Vec<String> {
+    let texts = match parsed {
+        ToolInput::Bash { command } => {
+            let redacted = redact_credential_values(command);
+            // Keep script structure; wrap each source line on its own.
+            let mut lines = Vec::new();
+            for line in redacted.lines() {
+                if line.is_empty() {
+                    lines.push(String::new());
+                } else {
+                    lines.extend(wrap_command_lines(line, width));
+                }
+            }
+            if lines.is_empty() {
+                lines.push(String::new());
+            }
+            lines
+        }
+        ToolInput::Read { path }
+        | ToolInput::Write { path }
+        | ToolInput::Edit { path }
+        | ToolInput::List { path }
+        | ToolInput::Search { path } => wrap_command_lines(&format!("path {path}"), width),
+        ToolInput::Glob { pattern, path } => {
+            let mut lines = wrap_command_lines(&format!("pattern {pattern}"), width);
+            if let Some(path) = path {
+                lines.extend(wrap_command_lines(&format!("path {path}"), width));
+            }
+            lines
+        }
+        ToolInput::Grep { pattern, path } => {
+            let mut lines = wrap_command_lines(&format!("pattern {pattern}"), width);
+            if let Some(path) = path {
+                lines.extend(wrap_command_lines(&format!("path {path}"), width));
+            }
+            lines
+        }
+        ToolInput::WebFetch { url } => {
+            wrap_command_lines(&redact_credential_values(url), width)
+        }
+        ToolInput::Skill { skill } => wrap_command_lines(skill, width),
+        ToolInput::Other { name, raw } => {
+            let summary = summarize_args(name, raw);
+            if summary.is_empty() {
+                // Non-JSON free text only — still never echo a JSON object body.
+                let trimmed = raw_input.trim();
+                if trimmed.starts_with('{') {
+                    wrap_command_lines(&format_key_shape(&object_keys(trimmed)), width)
+                } else {
+                    wrap_command_lines(
+                        &redact_credential_values(&collapse_whitespace(trimmed)),
+                        width,
+                    )
+                }
+            } else {
+                wrap_command_lines(&summary, width)
+            }
+        }
+    };
+    texts
+}
+
 /// Greedy wrap of a shell command for transcript body rows (no mid-path ellipsis).
 fn wrap_command_lines(command: &str, width: usize) -> Vec<String> {
     if width == 0 {
@@ -800,9 +887,9 @@ fn wrap_command_lines(command: &str, width: usize) -> Vec<String> {
 
 /// Tool call header/args, wrapped as `BlockContent` with a typed per-tool header.
 ///
-/// The header never renders raw JSON; the complete raw `input` is exposed only
-/// in [`DisplayMode::Expanded`] so the audit view stays reachable without
-/// leaking a JSON payload into the always-visible header.
+/// Neither the header nor Expanded detail dumps raw JSON argument payloads.
+/// Typed tools show their authoritative fields; bash shows the command as a
+/// shell script; unknown tools show a value summary. Secrets are redacted.
 pub(crate) struct ToolCallBlock<'a> {
     pub(crate) input: &'a str,
     pub(crate) parsed: &'a ToolInput,
@@ -887,7 +974,13 @@ impl BlockContent for ToolCallBlock<'_> {
             .push(BlockLine::with_bullet(header, RowBullet::Activity(self.state)).accented(accent));
 
         if mode == DisplayMode::Expanded {
-            lines.push(BlockLine::new(ToolRow::args(self.input)).accented(accent));
+            for detail in expanded_tool_argument_lines(
+                self.parsed,
+                self.input,
+                self.content_width.max(1),
+            ) {
+                lines.push(BlockLine::new(detail).accented(accent));
+            }
         } else if mode == DisplayMode::Truncated {
             // When the bash header ellipsizes the command, keep the full
             // (secret-redacted) command on following rows so Truncated is still
@@ -1187,15 +1280,19 @@ mod tests {
     }
 
     #[test]
-    fn tool_row_args_and_lifecycle_suffix_are_stable() {
-        let args = ToolRow::args("src/lib.rs");
-        let args_text: String = args
+    fn tool_row_detail_and_lifecycle_suffix_are_stable() {
+        let detail = ToolRow::detail("src/lib.rs");
+        let detail_text: String = detail
             .spans
             .iter()
             .map(|span| span.content.as_ref())
             .collect();
-        assert!(args_text.contains("input"));
-        assert!(args_text.contains("src/lib.rs"));
+        assert!(detail_text.starts_with("│ "), "{detail_text:?}");
+        assert!(detail_text.contains("src/lib.rs"));
+        assert!(
+            !detail_text.contains("input"),
+            "detail lines must not be labeled as raw JSON input: {detail_text:?}"
+        );
 
         let success = ToolRow::lifecycle_suffix("Success · 12ms", false, Some("2 lines · 21 B"));
         let success_text = success
@@ -1645,7 +1742,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_call_block_defaults_truncated_and_reveals_raw_args_only_when_expanded() {
+    fn tool_call_block_defaults_truncated_and_shows_human_args_when_expanded() {
         let parsed = ToolInput::Read {
             path: "src/lib.rs".into(),
         };
@@ -1672,11 +1769,64 @@ mod tests {
         );
 
         let expanded = block.lines(DisplayMode::Expanded);
+        let expanded_text: String = expanded
+            .iter()
+            .map(|row| line_text(&row.line))
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(
             expanded
                 .iter()
-                .any(|row| line_text(&row.line).contains("{\"path\":\"src/lib.rs\"}")),
-            "expanded header must expose the full raw args for audit"
+                .any(|row| line_text(&row.line).contains("path src/lib.rs")),
+            "expanded detail must show the typed path, not JSON: {expanded_text:?}"
+        );
+        assert!(
+            !expanded_text.contains("{\""),
+            "expanded detail must not dump raw JSON: {expanded_text:?}"
+        );
+    }
+
+    #[test]
+    fn expanded_bash_shows_the_command_not_json() {
+        let command = "rm -f conformance/manifest/.gitkeep && python3 - <<'PY'\nprint(1)\nPY";
+        let parsed = ToolInput::Bash {
+            command: command.into(),
+        };
+        let raw = format!(r#"{{"command":{}}}"#, serde_json::to_string(command).unwrap());
+        let block = ToolCallBlock {
+            input: &raw,
+            parsed: &parsed,
+            batch: Some(1),
+            content_width: 80,
+            state: RowState::Failure,
+            result: Some(&ToolResultBlock {
+                status: "Failure · 2s".into(),
+                failed: true,
+                size: "1 lines · 132 B".into(),
+            }),
+        };
+
+        let expanded = block.lines(DisplayMode::Expanded);
+        let text: String = expanded
+            .iter()
+            .map(|row| line_text(&row.line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("rm -f conformance/manifest/.gitkeep"),
+            "bash expanded must show the shell command: {text:?}"
+        );
+        assert!(
+            text.contains("print(1)"),
+            "bash expanded must keep script lines: {text:?}"
+        );
+        assert!(
+            !text.contains(r#"{"command""#),
+            "bash expanded must not show JSON wrapper: {text:?}"
+        );
+        assert!(
+            !text.contains("│ input"),
+            "bash expanded must not label rows as raw input: {text:?}"
         );
     }
 
@@ -1714,7 +1864,16 @@ mod tests {
         assert_eq!(truncated.len(), 1);
 
         let expanded = block.lines(DisplayMode::Expanded);
-        assert!(line_text(&expanded[1].line).contains("input"));
+        assert!(
+            line_text(&expanded[1].line).contains("path src/lib.rs"),
+            "{:?}",
+            line_text(&expanded[1].line)
+        );
+        assert!(
+            !line_text(&expanded[1].line).contains('{'),
+            "expanded must not dump JSON: {:?}",
+            line_text(&expanded[1].line)
+        );
     }
 
     fn call_accents(

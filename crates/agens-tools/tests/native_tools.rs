@@ -651,7 +651,9 @@ fn absolute_paths_under_the_project_root_are_accepted_and_rewritten() {
     assert!(!read.is_error, "absolute read under the root: {read:?}");
     assert!(read.content.contains("absolute body"));
 
-    // Outside the root stays blocked (confinement), not a ban on absolute form.
+    // Outside the root stays blocked without a post-permission execution context
+    // (unit-test / unauthenticated call sites). Authorized execution is tested
+    // separately — peers treat out-of-workspace as Allow-after-ask, not hard fail.
     let outside = project_root().join("secret.txt");
     fs::write(&outside, "nope").unwrap();
     assert_eq!(
@@ -664,6 +666,46 @@ fn absolute_paths_under_the_project_root_are_accepted_and_rewritten() {
 
     fs::remove_dir_all(root).unwrap();
     fs::remove_dir_all(outside.parent().unwrap()).unwrap();
+}
+
+/// After the permission gate Allow's a call (execute path always has a
+/// ToolExecutionContext), writes outside the project root must succeed —
+/// same shape as OpenCode external_directory + Allow, Claude/Codex
+/// workspace-write with approval, and bypass meaning "everything not denied".
+#[test]
+fn authorized_writes_may_land_outside_the_project_root() {
+    let root = project_root();
+    let tools = NativeTools::open(&root).unwrap();
+    let outside_dir = project_root();
+    let outside = outside_dir.join("commit_msg.txt");
+    let context = ToolExecutionContext::with_timeout(Duration::from_secs(5));
+
+    let written = tools
+        .write_file_with_context(
+            WriteFileInput::new(&outside, "peer-style commit message\n"),
+            Some(&context),
+        )
+        .unwrap();
+    assert!(
+        !written.is_error,
+        "authorized external write must succeed: {written:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(&outside).unwrap(),
+        "peer-style commit message\n"
+    );
+
+    // Unauthenticated call sites still refuse the same path.
+    assert!(
+        tools
+            .write_file(WriteFileInput::new(&outside, "blocked"))
+            .unwrap()
+            .is_error,
+        "without execution context, outside write stays confined"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+    fs::remove_dir_all(outside_dir).unwrap();
 }
 
 #[test]

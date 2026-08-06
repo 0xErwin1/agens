@@ -165,6 +165,23 @@ impl OverlaySizing {
         }
     }
 
+    /// Large centered overlay for a single tool's full args and output.
+    ///
+    /// Tall on purpose: long bash scripts and tool results are why this
+    /// surface exists — the transcript only keeps a short preview.
+    pub(crate) const fn tool_detail() -> Self {
+        Self {
+            width_pct: 88,
+            min_width: 48,
+            max_width: 120,
+            max_height: 28,
+            v_margin: 0,
+            h_pad: 1,
+            v_pad: 0,
+            anchor: OverlayAnchor::Center,
+        }
+    }
+
     /// The content width [`OverlayLayout::solve`] resolves for `area`, or `None` when the area
     /// cannot host a frame at all.
     ///

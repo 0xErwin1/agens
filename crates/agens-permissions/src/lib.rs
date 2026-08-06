@@ -473,64 +473,28 @@ impl<P> ProductionPermissionResolver<P> {
     fn authorize_prompted_allow(
         &self,
         call: &HeadlessToolCall,
-        ephemeral_grant: Option<agens_core::ProjectPermissionGrant>,
+        // Kept for call-site clarity: AllowOnce/Always still build a grant for
+        // persistence paths, but this re-auth no longer re-matches policy.
+        _ephemeral_grant: Option<agens_core::ProjectPermissionGrant>,
     ) -> Result<PermissionDecision, HeadlessTurnPortError> {
-        let mut grants = self
-            .grants
-            .lock()
-            .map_err(|_| HeadlessTurnPortError::Permission)?
-            .clone();
-        if let Some(grant) = ephemeral_grant {
-            grants.push(grant);
-        }
-
         let arguments = parse_tool_input(call)?;
-        let make_request = || {
-            ToolDispatchRequest::new(
-                &self.authorization.project,
-                &call.name,
-                arguments.clone(),
-            )
-        };
+        let request = ToolDispatchRequest::new(
+            &self.authorization.project,
+            &call.name,
+            arguments,
+        );
 
+        // Human Allow is the decision. Re-running policy here used to leave a
+        // residual PromptRequired (configured floor ask, compound bash subjects,
+        // empty-project grant stripping) and refuse the call after the person
+        // already said yes. Hard safety still applies inside the force path.
         let outcome = self
             .authorization
             .dispatcher
             .lock()
             .map_err(|_| HeadlessTurnPortError::Permission)?
-            .evaluate(
-                &self.authorization.policy,
-                &grants,
-                &self.authorization.session,
-                make_request(),
-            )
+            .authorize_after_human_approval(&self.authorization.policy, request)
             .map_err(|_| HeadlessTurnPortError::Permission)?;
-
-        // The person already allowed this call. A residual PromptRequired is a
-        // grant-matching quirk (compound bash subjects, empty project stripping
-        // grants, etc.), not a fresh ask — force-authorize with an Any-target
-        // grant rather than killing the turn as "target could not be evaluated".
-        let outcome = match outcome {
-            ToolEvaluationOutcome::PromptRequired(context) => {
-                grants.push(agens_core::ProjectPermissionGrant::allow(
-                    context.project_id,
-                    PermissionPattern::Exact(context.tool_identity),
-                    PermissionPattern::Any,
-                ));
-                self.authorization
-                    .dispatcher
-                    .lock()
-                    .map_err(|_| HeadlessTurnPortError::Permission)?
-                    .evaluate(
-                        &self.authorization.policy,
-                        &grants,
-                        &agens_core::PermissionSession::with_temporary_bypass(),
-                        make_request(),
-                    )
-                    .map_err(|_| HeadlessTurnPortError::Permission)?
-            }
-            other => other,
-        };
 
         match outcome {
             ToolEvaluationOutcome::Authorized(handle) => self
@@ -1373,6 +1337,120 @@ mod tests {
             .unwrap();
 
         assert!(matches!(outcome, ToolEvaluationOutcome::Authorized(_)));
+    }
+
+    /// After the person says Allow, soft policy `ask` (including a configured
+    /// floor) must not re-refuse the call. That is how peers work: human Allow
+    /// is the authorization. Regression for "approval could not be completed"
+    /// after Allow on simple `rm` / compound bash while a floor still says ask.
+    #[test]
+    fn allow_once_authorizes_under_configured_floor_ask_including_bash() {
+        struct AllowOncePrompter;
+
+        impl PermissionPrompter for AllowOncePrompter {
+            fn prompt(
+                &mut self,
+                _: &PermissionPromptContext,
+                _: &HeadlessTurnCancellation,
+            ) -> Result<PermissionPromptAnswer, HeadlessTurnPortError> {
+                Ok(PermissionPromptAnswer::AllowOnce)
+            }
+        }
+
+        struct BashTool;
+
+        impl DispatchTool for BashTool {
+            fn permission_target(
+                &self,
+                arguments: &serde_json::Value,
+            ) -> Result<String, Error> {
+                Ok(arguments["command"].as_str().unwrap_or_default().to_owned())
+            }
+
+            fn execute(
+                &mut self,
+                _: &agens_tools::ToolExecutionContext,
+                _: serde_json::Value,
+            ) -> Result<agens_tools::ToolOutput, Error> {
+                Ok(agens_tools::ToolOutput::success("ok"))
+            }
+        }
+
+        let directory = std::env::temp_dir().join(format!(
+            "agens-permission-floor-allow-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+
+        let dispatcher = Arc::new(Mutex::new(ToolDispatcher::new()));
+        dispatcher
+            .lock()
+            .expect("dispatcher lock")
+            .register_native("native::bash", ToolAccess::Write, BashTool)
+            .expect("bash should register");
+
+        let grants = Arc::new(Mutex::new(Vec::new()));
+        let allowed = Arc::new(Mutex::new(BTreeMap::new()));
+        let prompts = Arc::new(Mutex::new(BTreeMap::new()));
+        // Configured floor `ask bash *` is more restrictive than any Allow grant.
+        // Re-evaluating policy after the prompt used to stay PromptRequired and
+        // refuse the call the person just allowed.
+        let policy = PermissionPolicy::new(PermissionMode::Edit, vec![]).with_configured_floor(
+            agens_core::ConfiguredFloor::governing(vec![PermissionRule::global(
+                PermissionDecision::Ask,
+                PermissionPattern::Exact("native::bash".into()),
+                PermissionPattern::Any,
+            )]),
+        );
+        let call = HeadlessToolCall {
+            id: "bash-rm".into(),
+            name: "native::bash".into(),
+            input: r#"{"command":"rm -f conformance/manifest/.gitkeep"}"#.into(),
+        };
+        let cancellation = HeadlessTurnCancellation::new();
+        let mut gate = ProductionPermissionGate::new(
+            policy.clone(),
+            Arc::clone(&grants),
+            PermissionSession::new(),
+            "project".into(),
+            Arc::clone(&dispatcher),
+            Arc::clone(&allowed),
+            Arc::clone(&prompts),
+        );
+        let store = PermissionGrantStore::open(&directory).expect("grant store should open");
+        let mut resolver = ProductionPermissionResolver::new(
+            AllowOncePrompter,
+            store,
+            Arc::clone(&grants),
+            Arc::clone(&prompts),
+            ProductionPromptAuthorization {
+                policy,
+                session: PermissionSession::new(),
+                project: "project".into(),
+                dispatcher: Arc::clone(&dispatcher),
+                allowed: Arc::clone(&allowed),
+            },
+        );
+
+        assert_eq!(
+            run_ready(gate.evaluate(&call, &cancellation)),
+            Ok(PermissionDecision::Ask)
+        );
+        assert_eq!(
+            run_ready(resolver.resolve(&call, &cancellation)),
+            Ok(PermissionDecision::Allow),
+            "human Allow must authorize even when the configured floor still says ask"
+        );
+        assert!(
+            allowed.lock().expect("allowed").contains_key("bash-rm"),
+            "the allowed map must hold the call so dispatch can run it"
+        );
+
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     /// A person taking longer than the turn deadline must still be able to allow

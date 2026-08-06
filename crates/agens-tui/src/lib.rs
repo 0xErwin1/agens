@@ -905,6 +905,11 @@ pub struct TranscriptRecord {
     focused_call: Option<String>,
     /// When true, auto-collapse on turn finish is skipped (user re-expanded via Ctrl+T).
     thinking_user_pinned: bool,
+    /// Full tool args + output opened as a scrollable overlay (Grok-style).
+    ///
+    /// The transcript keeps a short preview; long detail lives here so it does
+    /// not blow up the chat scroll.
+    tool_overlay: Option<ToolDetailOverlay>,
     focus: TranscriptFocus,
     selection: Option<TranscriptSelection>,
     selection_text: Option<String>,
@@ -912,6 +917,17 @@ pub struct TranscriptRecord {
     selecting: bool,
     last_admitted_ordinal: Option<u64>,
     terminal: bool,
+}
+
+/// Full detail for one tool call, shown in a modal overlay.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ToolDetailOverlay {
+    pub call_id: String,
+    pub title: String,
+    pub status: String,
+    pub args: String,
+    pub output: String,
+    pub scroll: u16,
 }
 
 impl TranscriptRecord {
@@ -930,6 +946,7 @@ impl TranscriptRecord {
             history_expanded: false,
             focused_call: None,
             thinking_user_pinned: false,
+            tool_overlay: None,
             focus: TranscriptFocus::Composer,
             selection: None,
             selection_text: None,
@@ -1057,6 +1074,8 @@ pub struct ViewState<'a> {
     pub history_expanded: bool,
     /// The block keyboard navigation is standing on, when there is one.
     pub focused_call: Option<&'a str>,
+    /// Open tool detail overlay, when full args/output are shown modally.
+    pub tool_overlay: Option<&'a ToolDetailOverlay>,
     /// Whether this terminal renders OSC 8 hyperlinks.
     pub hyperlinks: bool,
     /// How much colour this terminal can be sent.
@@ -1908,14 +1927,37 @@ fn render_frame_content(frame: &mut ratatui::Frame<'_>, state: &ViewState<'_>) {
     };
 
     let transcript = state.selectable.arc();
-    let _perf_select =
-        agens_perf::span!("tui.transcript.select", rows = transcript.rows.len() as u64);
+    let row_width = layout
+        .transcript
+        .width
+        .saturating_sub(TRANSCRIPT_ROW_INDENT)
+        .max(1);
+    // Live status is not in the selectable cache: rebuild only the few status
+    // rows from the current clock so spinner and elapsed keep moving.
+    let live_status = {
+        let separate = transcript
+            .rows
+            .last()
+            .is_some_and(|row| row.cells.iter().any(|cell| !cell.text.trim().is_empty()));
+        let lines = live_turn_status_lines(state, row_width, separate);
+        if lines.is_empty() {
+            None
+        } else {
+            Some(SelectableTranscript::from_lines(&lines, row_width))
+        }
+    };
+    let live_status_rows = live_status
+        .as_ref()
+        .map(|status| status.rows.len())
+        .unwrap_or(0);
+    let total_rows = transcript.rows.len().saturating_add(live_status_rows);
+    let _perf_select = agens_perf::span!("tui.transcript.select", rows = total_rows as u64);
     let visible_rows = layout
         .transcript
         .height
         .saturating_sub(transcript_chrome_rows(state.following_bottom))
         as usize;
-    let bottom_scroll = saturating_u16(transcript.rows.len().saturating_sub(visible_rows));
+    let bottom_scroll = saturating_u16(total_rows.saturating_sub(visible_rows));
     let scroll = if state.following_bottom {
         bottom_scroll
     } else {
@@ -1936,9 +1978,13 @@ fn render_frame_content(frame: &mut ratatui::Frame<'_>, state: &ViewState<'_>) {
         }
         {
             let _perf_paint =
-                agens_perf::span!("tui.transcript.paint", rows = transcript.rows.len() as u64,);
+                agens_perf::span!("tui.transcript.paint", rows = total_rows as u64,);
+            let mut lines = transcript.render_lines(state.selection);
+            if let Some(status) = live_status.as_ref() {
+                lines.extend(status.render_lines(None));
+            }
             frame.render_widget(
-                Paragraph::new(Text::from(transcript.render_lines(state.selection)))
+                Paragraph::new(Text::from(lines))
                     .block(transcript_block)
                     .scroll((scroll, 0)),
                 layout.transcript,
@@ -2087,6 +2133,91 @@ fn render_frame_content(frame: &mut ratatui::Frame<'_>, state: &ViewState<'_>) {
     if let Some(device_auth) = state.device_auth {
         render_device_auth(frame, area, device_auth);
     }
+
+    if let Some(overlay) = state.tool_overlay {
+        render_tool_detail_overlay(frame, area, overlay);
+    }
+}
+
+fn render_tool_detail_overlay(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    overlay: &ToolDetailOverlay,
+) {
+    let shortcuts = [
+        widgets::OverlayShortcut {
+            key: "Esc",
+            label: "close",
+        },
+        widgets::OverlayShortcut {
+            key: "↑↓",
+            label: "scroll",
+        },
+        widgets::OverlayShortcut {
+            key: "Ctrl+O",
+            label: "cycle",
+        },
+    ];
+    let title = if overlay.status.is_empty() {
+        overlay.title.clone()
+    } else {
+        format!("{} · {}", overlay.title, overlay.status)
+    };
+    let config = widgets::OverlayConfig {
+        title: &title,
+        tabs: None,
+        shortcuts: &shortcuts,
+        sizing: widgets::OverlaySizing::tool_detail(),
+        desired_content_rows: 24,
+    };
+    let Some(layout) = widgets::OverlayLayout::solve(area, &config) else {
+        return;
+    };
+    widgets::OverlayFrame::render(frame, &layout, &config);
+
+    let mut lines = Vec::new();
+    if !overlay.args.is_empty() {
+        lines.push(Line::styled(
+            "Arguments",
+            Style::default()
+                .fg(widgets::RolePalette::muted())
+                .add_modifier(Modifier::BOLD),
+        ));
+        for line in overlay.args.lines() {
+            lines.push(Line::styled(
+                line.to_owned(),
+                Style::default().fg(widgets::RolePalette::machine()),
+            ));
+        }
+        lines.push(Line::default());
+    }
+    lines.push(Line::styled(
+        "Output",
+        Style::default()
+            .fg(widgets::RolePalette::muted())
+            .add_modifier(Modifier::BOLD),
+    ));
+    if overlay.output.is_empty() {
+        lines.push(Line::styled(
+            "(no output)",
+            Style::default().fg(widgets::RolePalette::muted()),
+        ));
+    } else {
+        for line in overlay.output.lines() {
+            lines.push(Line::styled(
+                line.to_owned(),
+                Style::default().fg(widgets::RolePalette::assistant()),
+            ));
+        }
+    }
+
+    let visible = usize::from(layout.content.height);
+    let max_scroll = lines.len().saturating_sub(visible.max(1));
+    let scroll = usize::from(overlay.scroll).min(max_scroll);
+    frame.render_widget(
+        Paragraph::new(Text::from(lines)).scroll((saturating_u16(scroll), 0)),
+        layout.content,
+    );
 }
 
 /// Inner overlay width at which the context earns a column of its own.
@@ -4613,7 +4744,60 @@ fn elided_turn_count(state: &ViewState<'_>) -> usize {
 }
 
 fn rendered_transcript(state: &ViewState<'_>, row_width: u16) -> Vec<Line<'static>> {
+    let mut lines = rendered_transcript_content(state, row_width);
+    append_live_turn_status(&mut lines, state, row_width);
+    lines
+}
+
+/// Conversation content without the live turn-status chrome.
+///
+/// The selectable cache is keyed by content epoch only. Spinner and elapsed
+/// time must not be baked into that cache — otherwise a waiting turn freezes
+/// the counter until the next content invalidation (often tens of seconds).
+fn rendered_transcript_content(state: &ViewState<'_>, row_width: u16) -> Vec<Line<'static>> {
     assemble_transcript(state, row_width, false).0
+}
+
+/// Blank separator + live status row for an in-flight turn, or nothing when idle.
+fn live_turn_status_lines(
+    state: &ViewState<'_>,
+    row_width: u16,
+    separate_from_content: bool,
+) -> Vec<Line<'static>> {
+    if !state.running {
+        return Vec::new();
+    }
+
+    let mut lines = Vec::new();
+    // The status row reports the turn, it is not part of it: without a blank
+    // row it reads as another line of whatever the agent just said.
+    if separate_from_content {
+        lines.push(render::unaccented_row(Line::default()));
+    }
+    let label = state.turn_activity.status_label();
+    lines.push(render::unaccented_row(render::turn_status_line(
+        render::TurnStatus {
+            label: &label,
+            now: state.now,
+            elapsed: state
+                .turn_started_at
+                .map(|started| state.now.saturating_sub(started)),
+            tokens: state
+                .latest_usage
+                .and_then(|usage| usage.total_tokens.or(usage.output_tokens)),
+        },
+        usize::from(row_width.max(1)).saturating_sub(widgets::ACCENT_WIDTH),
+    )));
+    lines
+}
+
+fn append_live_turn_status(
+    lines: &mut Vec<Line<'static>>,
+    state: &ViewState<'_>,
+    row_width: u16,
+) {
+    let separate = lines.last().is_some_and(|line| line.width() > 0);
+    lines.extend(live_turn_status_lines(state, row_width, separate));
 }
 
 /// Which tool call owns each transcript row, for the rows any call owns.
@@ -4754,27 +4938,8 @@ fn assemble_transcript(
         state.runtime_events,
         conversation_is_authoritative,
     )));
-    if state.running {
-        // The status row reports the turn, it is not part of it: without a
-        // blank row it reads as another line of whatever the agent just said.
-        if transcript.last().is_some_and(|line| line.width() > 0) {
-            transcript.push(render::unaccented_row(Line::default()));
-        }
-        let label = state.turn_activity.status_label();
-        transcript.push(render::unaccented_row(render::turn_status_line(
-            render::TurnStatus {
-                label: &label,
-                now: state.now,
-                elapsed: state
-                    .turn_started_at
-                    .map(|started| state.now.saturating_sub(started)),
-                tokens: state
-                    .latest_usage
-                    .and_then(|usage| usage.total_tokens.or(usage.output_tokens)),
-            },
-            usize::from(row_width.max(1)).saturating_sub(widgets::ACCENT_WIDTH),
-        )));
-    }
+    // Live spinner / elapsed chrome is appended outside the selectable cache
+    // (see `append_live_turn_status`) so heartbeats do not freeze the clock.
     owners.resize(transcript.len(), None);
     (transcript, owners)
 }
@@ -6556,6 +6721,12 @@ where
         self.bump_selectable_epoch();
     }
 
+    fn active_record(&self) -> &TranscriptRecord {
+        self.transcripts
+            .get(&self.active_transcript)
+            .expect("active transcript always exists")
+    }
+
     fn active_record_mut(&mut self) -> &mut TranscriptRecord {
         self.transcripts
             .get_mut(&self.active_transcript)
@@ -6942,6 +7113,7 @@ where
                 history_expanded: false,
                 focused_call: None,
                 thinking_user_pinned: false,
+                tool_overlay: None,
                 focus: TranscriptFocus::Viewport,
                 selection: None,
                 selection_text: None,
@@ -7173,6 +7345,7 @@ where
             collapse_thinking: active.collapse_thinking,
             history_expanded: active.history_expanded,
             focused_call: active.focused_call.as_deref(),
+            tool_overlay: active.tool_overlay.as_ref(),
             hyperlinks: self.hyperlinks,
             color_level: self.color_level,
             unicode_level: self.unicode_level,
@@ -7244,8 +7417,9 @@ where
         }
 
         let _perf_select = agens_perf::span!("tui.transcript.select", row_width = row_width);
+        // Content only: live turn status is time-varying and painted separately.
         let transcript = Arc::new(SelectableTranscript::from_lines(
-            &rendered_transcript(state, row_width),
+            &rendered_transcript_content(state, row_width),
             row_width,
         ));
         *self.selectable_cache.borrow_mut() = Some(SelectableCache {
@@ -8064,6 +8238,41 @@ where
             .is_some_and(|dialog| dialog.interactive)
         {
             return self.handle_selection_dialog_key(key);
+        }
+
+        if key == Key::Escape && self.tool_overlay_is_open() {
+            self.close_tool_detail_overlay();
+            return Action::Render;
+        }
+
+        if self.tool_overlay_is_open() {
+            match key {
+                Key::Up | Key::CtrlK => {
+                    self.scroll_tool_overlay(-1);
+                    return Action::Render;
+                }
+                Key::Down | Key::CtrlJ => {
+                    self.scroll_tool_overlay(1);
+                    return Action::Render;
+                }
+                Key::PageUp => {
+                    self.scroll_tool_overlay(-10);
+                    return Action::Render;
+                }
+                Key::PageDown => {
+                    self.scroll_tool_overlay(10);
+                    return Action::Render;
+                }
+                Key::CtrlO => {
+                    self.cycle_tool_detail(true);
+                    return Action::Render;
+                }
+                Key::CtrlShiftO => {
+                    self.cycle_tool_detail(false);
+                    return Action::Render;
+                }
+                _ => {}
+            }
         }
 
         if key == Key::Escape && self.dialog.is_some() {
@@ -9910,16 +10119,37 @@ where
     /// "what is in this one", which is the question a reader has while looking
     /// at a specific row.
     fn cycle_focused_block_detail(&mut self) {
-        let record = self.active_record_mut();
-        let Some(call_id) = record.focused_call.clone() else {
-            return;
+        let call_id = {
+            let record = self.active_record_mut();
+            let Some(call_id) = record.focused_call.clone() else {
+                return;
+            };
+            call_id
         };
-        let current = record
-            .tool_display_modes
-            .get(&call_id)
-            .copied()
-            .unwrap_or(record.tool_detail);
+        let current = {
+            let record = self.active_record();
+            record
+                .tool_display_modes
+                .get(&call_id)
+                .copied()
+                .unwrap_or(record.tool_detail)
+        };
         let next = current.next();
+        if next == widgets::DisplayMode::Expanded {
+            if self.open_tool_detail_overlay(Some(&call_id)) {
+                let record = self.active_record_mut();
+                // Transcript keeps a short preview; full detail is the overlay.
+                record
+                    .tool_display_modes
+                    .insert(call_id, widgets::DisplayMode::Truncated);
+                self.bump_selectable_epoch();
+                self.report_detail_level("block", widgets::DisplayMode::Expanded);
+                return;
+            }
+        } else {
+            self.close_tool_detail_overlay();
+        }
+        let record = self.active_record_mut();
         record.tool_display_modes.insert(call_id, next);
         self.bump_selectable_epoch();
         self.report_detail_level("block", next);
@@ -9927,19 +10157,143 @@ where
 
     fn cycle_tool_detail(&mut self, forward: bool) {
         let completed_call_ids = self.settled_call_ids();
+        let next = {
+            let record = self.active_record();
+            if forward {
+                record.tool_detail.next()
+            } else {
+                record.tool_detail.previous()
+            }
+        };
+
+        if next == widgets::DisplayMode::Expanded {
+            let preferred = self
+                .active_record()
+                .focused_call
+                .clone()
+                .or_else(|| completed_call_ids.last().cloned());
+            if self.open_tool_detail_overlay(preferred.as_deref()) {
+                let record = self.active_record_mut();
+                record.tool_detail = widgets::DisplayMode::Expanded;
+                // Inline: preview only. Full body lives in the overlay.
+                for call_id in &completed_call_ids {
+                    record
+                        .tool_display_modes
+                        .insert(call_id.clone(), widgets::DisplayMode::Truncated);
+                }
+                self.bump_selectable_epoch();
+                self.report_detail_level("tools", widgets::DisplayMode::Expanded);
+                return;
+            }
+        } else {
+            self.close_tool_detail_overlay();
+        }
 
         let record = self.active_record_mut();
-        let next = if forward {
-            record.tool_detail.next()
-        } else {
-            record.tool_detail.previous()
-        };
         record.tool_detail = next;
         for call_id in completed_call_ids {
             record.tool_display_modes.insert(call_id, next);
         }
         self.bump_selectable_epoch();
         self.report_detail_level("tools", next);
+    }
+
+    fn close_tool_detail_overlay(&mut self) {
+        let record = self.active_record_mut();
+        if record.tool_overlay.take().is_some() {
+            self.bump_selectable_epoch();
+        }
+    }
+
+    /// Opens the scrollable overlay for one settled tool call.
+    ///
+    /// `preferred` is the focused call when the reader is standing on one;
+    /// otherwise the newest settled call. Returns false when nothing settled.
+    fn open_tool_detail_overlay(&mut self, preferred: Option<&str>) -> bool {
+        let call_id = preferred
+            .map(ToOwned::to_owned)
+            .or_else(|| self.settled_call_ids().last().cloned());
+        let Some(call_id) = call_id else {
+            return false;
+        };
+        let Some(call) = self.find_settled_tool_call(&call_id) else {
+            return false;
+        };
+
+        let title = {
+            let header = widgets::tool_header(&call.parsed, 80);
+            header
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        };
+        let args = widgets::tool_argument_detail_text(&call.parsed, &call.input);
+        let (status, output) = match &call.result {
+            Some(result) => {
+                let status = if result.is_error {
+                    "Failure".to_owned()
+                } else {
+                    "Success".to_owned()
+                };
+                (status, result.output.clone())
+            }
+            None => ("Running…".to_owned(), String::new()),
+        };
+
+        let record = self.active_record_mut();
+        record.tool_overlay = Some(ToolDetailOverlay {
+            call_id,
+            title,
+            status,
+            args,
+            output,
+            scroll: 0,
+        });
+        true
+    }
+
+    fn find_settled_tool_call(&self, call_id: &str) -> Option<conversation::ToolCall> {
+        let active = self
+            .transcripts
+            .get(&self.active_transcript)
+            .expect("active transcript always exists");
+        let (completed, conversation): (&[Conversation], Option<&Conversation>) =
+            if self.active_transcript == TranscriptId::Main {
+                (
+                    self.completed_conversations.as_slice(),
+                    self.conversation.as_ref(),
+                )
+            } else {
+                (
+                    active.completed_conversations.as_slice(),
+                    active.conversation.as_ref(),
+                )
+            };
+        completed
+            .iter()
+            .chain(conversation)
+            .flat_map(|conversation| &conversation.tool_batches)
+            .flat_map(|batch| &batch.calls)
+            .find(|call| call.call_id == call_id)
+            .cloned()
+    }
+
+    fn scroll_tool_overlay(&mut self, delta: i32) -> bool {
+        let record = self.active_record_mut();
+        let Some(overlay) = record.tool_overlay.as_mut() else {
+            return false;
+        };
+        if delta < 0 {
+            overlay.scroll = overlay.scroll.saturating_sub((-delta) as u16);
+        } else {
+            overlay.scroll = overlay.scroll.saturating_add(delta as u16);
+        }
+        true
+    }
+
+    fn tool_overlay_is_open(&self) -> bool {
+        self.active_record().tool_overlay.is_some()
     }
 
     /// Says where the detail cycle now rests, for as long as that is news.
@@ -13121,6 +13475,25 @@ mod runtime_tests {
         assert!(
             !first.rows.is_empty(),
             "cached selectable transcript must be non-empty after content exists"
+        );
+    }
+
+    #[test]
+    fn selectable_cache_survives_live_clock_ticks_while_waiting() {
+        // Content stays cached; paint rebuilds only the status chrome from `now`.
+        let mut tui = Tui::new(NoopEngine);
+        tui.handle(Event::Resize {
+            width: 80,
+            height: 12,
+        });
+        tui.begin_submission("wait");
+        tui.tick(Duration::from_secs(46));
+        let first = tui.view().selectable.arc();
+        tui.tick(Duration::from_secs(119));
+        let second = tui.view().selectable.arc();
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "clock ticks must not rebuild the selectable content index"
         );
     }
 

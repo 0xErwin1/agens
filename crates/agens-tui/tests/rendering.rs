@@ -827,6 +827,33 @@ fn active_status_glyph_advances_with_tick_and_idle_stays_static() {
 }
 
 #[test]
+fn live_elapsed_advances_across_heartbeats_without_content_changes() {
+    // Regression: the selectable transcript cache must not bake the status
+    // row's clock. A long wait with no deltas used to freeze e.g. "46s" until
+    // something else invalidated the cache, then jump to "1m 59s".
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(100, 14)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.begin_submission("wait probe");
+
+    tui.tick(Duration::from_secs(46));
+    renderer.render(tui.view()).unwrap();
+    let at_46s = rendered_text(&renderer);
+    assert!(at_46s.contains("46s"), "{at_46s:?}");
+    assert!(at_46s.contains("Waiting for the model…"), "{at_46s:?}");
+
+    // No progress, no runtime events — only the clock moves.
+    tui.tick(Duration::from_secs(119));
+    renderer.render(tui.view()).unwrap();
+    let at_119s = rendered_text(&renderer);
+    assert!(
+        at_119s.contains("1m 59s"),
+        "elapsed must advance from the live clock without content invalidation: {at_119s:?}"
+    );
+    assert!(!at_119s.contains("46s"), "{at_119s:?}");
+    assert!(at_119s.contains("Waiting for the model…"), "{at_119s:?}");
+}
+
+#[test]
 fn working_indicator_remains_visible_when_live_transcript_reaches_the_composer() {
     let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(80, 14)).unwrap());
     let mut tui = Tui::new(FakeEngine);
