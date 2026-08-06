@@ -308,10 +308,7 @@ impl ToolRow {
     pub(crate) fn detail(text: impl Into<String>) -> Line<'static> {
         Line::from(vec![
             Span::styled("│ ", Style::default().fg(RolePalette::muted())),
-            Span::styled(
-                text.into(),
-                Style::default().fg(RolePalette::machine()),
-            ),
+            Span::styled(text.into(), Style::default().fg(RolePalette::machine())),
         ])
     }
 
@@ -763,11 +760,7 @@ fn expanded_tool_argument_lines(
         .collect()
 }
 
-fn expanded_argument_texts(
-    parsed: &ToolInput,
-    raw_input: &str,
-    width: usize,
-) -> Vec<String> {
+fn expanded_argument_texts(parsed: &ToolInput, raw_input: &str, width: usize) -> Vec<String> {
     match parsed {
         ToolInput::Bash { command } => {
             let redacted = redact_credential_values(command);
@@ -804,9 +797,7 @@ fn expanded_argument_texts(
             }
             lines
         }
-        ToolInput::WebFetch { url } => {
-            wrap_command_lines(&redact_credential_values(url), width)
-        }
+        ToolInput::WebFetch { url } => wrap_command_lines(&redact_credential_values(url), width),
         ToolInput::Skill { skill } => wrap_command_lines(skill, width),
         ToolInput::Other { name, raw } => {
             let summary = summarize_args(name, raw);
@@ -973,11 +964,9 @@ impl BlockContent for ToolCallBlock<'_> {
             .push(BlockLine::with_bullet(header, RowBullet::Activity(self.state)).accented(accent));
 
         if mode == DisplayMode::Expanded {
-            for detail in expanded_tool_argument_lines(
-                self.parsed,
-                self.input,
-                self.content_width.max(1),
-            ) {
+            for detail in
+                expanded_tool_argument_lines(self.parsed, self.input, self.content_width.max(1))
+            {
                 lines.push(BlockLine::new(detail).accented(accent));
             }
         } else if mode == DisplayMode::Truncated {
@@ -1160,7 +1149,11 @@ fn parse_ask_user_input_questions(input: &str) -> Option<Vec<AskUserInputQuestio
     let mut parsed = Vec::with_capacity(questions.len());
     for question in questions {
         let object = question.as_object()?;
-        let id = object.get("id").and_then(Value::as_str).unwrap_or("").to_owned();
+        let id = object
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
         let prompt = object
             .get("prompt")
             .and_then(Value::as_str)
@@ -1187,24 +1180,20 @@ fn parse_ask_user_input_questions(input: &str) -> Option<Vec<AskUserInputQuestio
                 }
             }
         }
-        parsed.push(AskUserInputQuestion { id, prompt, options });
+        parsed.push(AskUserInputQuestion {
+            id,
+            prompt,
+            options,
+        });
     }
     Some(parsed)
 }
 
-fn ask_user_result_answer_text(
-    answer: &Value,
-    question: Option<&AskUserInputQuestion>,
-) -> String {
+fn ask_user_result_answer_text(answer: &Value, question: Option<&AskUserInputQuestion>) -> String {
     let selected_ids: Vec<&str> = answer
         .get("selected")
         .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(Value::as_str)
-                .collect::<Vec<_>>()
-        })
+        .map(|items| items.iter().filter_map(Value::as_str).collect::<Vec<_>>())
         .unwrap_or_default();
     let other = answer
         .get("other")
@@ -1413,7 +1402,8 @@ mod tests {
                 {"id":"q1","prompt":"One","mode":"single","options":[{"id":"a","label":"A"}]},
                 {"id":"q2","prompt":"Two","mode":"single","options":[{"id":"a","label":"A"}]},
                 {"id":"q3","prompt":"Three","mode":"single","options":[{"id":"a","label":"A"}]}
-            ]}"#.into(),
+            ]}"#
+            .into(),
         });
         assert!(three.contains("3 questions"), "{three:?}");
         assert!(three.contains("One"), "{three:?}");
@@ -1428,7 +1418,10 @@ mod tests {
         assert!(joined.contains("answered · 1/1"), "{joined:?}");
         assert!(joined.contains("Pick a path → Phased"), "{joined:?}");
         assert!(joined.contains("note: careful"), "{joined:?}");
-        assert!(!joined.contains(r#""status""#), "raw JSON must not be primary: {joined:?}");
+        assert!(
+            !joined.contains(r#""status""#),
+            "raw JSON must not be primary: {joined:?}"
+        );
 
         let cancelled = format_ask_user_result_lines(input, r#"{"status":"cancelled"}"#)
             .expect("cancelled envelope");
@@ -1791,7 +1784,10 @@ mod tests {
         let parsed = ToolInput::Bash {
             command: command.into(),
         };
-        let raw = format!(r#"{{"command":{}}}"#, serde_json::to_string(command).unwrap());
+        let raw = format!(
+            r#"{{"command":{}}}"#,
+            serde_json::to_string(command).unwrap()
+        );
         let block = ToolCallBlock {
             input: &raw,
             parsed: &parsed,

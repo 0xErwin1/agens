@@ -478,11 +478,7 @@ impl<P> ProductionPermissionResolver<P> {
         _ephemeral_grant: Option<agens_core::ProjectPermissionGrant>,
     ) -> Result<PermissionDecision, HeadlessTurnPortError> {
         let arguments = parse_tool_input(call)?;
-        let request = ToolDispatchRequest::new(
-            &self.authorization.project,
-            &call.name,
-            arguments,
-        );
+        let request = ToolDispatchRequest::new(&self.authorization.project, &call.name, arguments);
 
         // Human Allow is the decision. Re-running policy here used to leave a
         // residual PromptRequired (configured floor ask, compound bash subjects,
@@ -1360,10 +1356,7 @@ mod tests {
         struct BashTool;
 
         impl DispatchTool for BashTool {
-            fn permission_target(
-                &self,
-                arguments: &serde_json::Value,
-            ) -> Result<String, Error> {
+            fn permission_target(&self, arguments: &serde_json::Value) -> Result<String, Error> {
                 Ok(arguments["command"].as_str().unwrap_or_default().to_owned())
             }
 
@@ -1478,10 +1471,7 @@ mod tests {
         struct PathTool;
 
         impl DispatchTool for PathTool {
-            fn permission_target(
-                &self,
-                arguments: &serde_json::Value,
-            ) -> Result<String, Error> {
+            fn permission_target(&self, arguments: &serde_json::Value) -> Result<String, Error> {
                 Ok(arguments["path"].as_str().unwrap_or_default().to_owned())
             }
 
@@ -1527,7 +1517,8 @@ mod tests {
             name: "native::write".into(),
             input: r#"{"path":"notes.md","content":"body"}"#.into(),
         };
-        let cancellation = HeadlessTurnCancellation::with_deadline(std::time::Duration::from_millis(5));
+        let cancellation =
+            HeadlessTurnCancellation::with_deadline(std::time::Duration::from_millis(5));
         let mut gate = ProductionPermissionGate::new(
             policy.clone(),
             Arc::clone(&grants),

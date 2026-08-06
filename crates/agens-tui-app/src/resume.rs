@@ -180,12 +180,10 @@ pub fn prepare_loaded_tui_session_resume(
     let session_root =
         agens_bootstrap::session_root::SessionRoot::confined_to(confinement_root.clone());
     // Config resolve is preferred for bypass defaults, but must not block entry.
-    let configured_bypass = agens_bootstrap::session_config::SessionConfig::resolve(
-        &session_root,
-        bootstrap,
-    )
-    .ok()
-    .map(|config| config.bypass_permission_prompts());
+    let configured_bypass =
+        agens_bootstrap::session_config::SessionConfig::resolve(&session_root, bootstrap)
+            .ok()
+            .map(|config| config.bypass_permission_prompts());
     let mut context = SessionContext::restored(
         identifier,
         session.metadata,
@@ -1039,13 +1037,9 @@ mod tests {
             parts: vec![MessagePart::Text("orphan assistant still visible".into())],
         }];
         // Odd message order must still open with the saved text visible.
-        let restored = prepare_loaded_tui_session_resume(
-            &bootstrap,
-            metadata.id,
-            invalid,
-            &credentials,
-        )
-        .expect("malformed history must not block session entry");
+        let restored =
+            prepare_loaded_tui_session_resume(&bootstrap, metadata.id, invalid, &credentials)
+                .expect("malformed history must not block session entry");
         assert_eq!(restored.history.len(), 1);
         assert!(
             restored.history[0]

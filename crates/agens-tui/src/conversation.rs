@@ -389,8 +389,8 @@ impl Conversation {
                                 &parse_tool_input,
                             );
                         } else if let MessagePart::Text(text) = part {
-                            let _ = conversation
-                                .apply(ConversationEvent::MarkdownDelta(text.clone()));
+                            let _ =
+                                conversation.apply(ConversationEvent::MarkdownDelta(text.clone()));
                         }
                     }
                 }
@@ -802,14 +802,8 @@ impl Conversation {
         let mut insert_at = call_pos + 1;
         while insert_at < self.items.len() {
             let same_call = match &self.items[insert_at] {
-                ConversationItem::ToolResult {
-                    call_id: id,
-                    ..
-                }
-                | ConversationItem::Diff {
-                    call_id: id,
-                    ..
-                } => id == call_id,
+                ConversationItem::ToolResult { call_id: id, .. }
+                | ConversationItem::Diff { call_id: id, .. } => id == call_id,
                 _ => false,
             };
             if !same_call {
@@ -942,12 +936,13 @@ mod tests {
             restored[0].live_markdown
         );
         assert!(
-            restored[0].tool_batches.iter().any(|batch| batch
-                .calls
+            restored[0]
+                .tool_batches
                 .iter()
-                .any(|call| call.result.as_ref().is_some_and(|result| {
-                    result.output.contains("still visible output")
-                }))),
+                .any(|batch| batch.calls.iter().any(|call| call
+                    .result
+                    .as_ref()
+                    .is_some_and(|result| { result.output.contains("still visible output") }))),
             "orphan tool result kept under a synthetic call"
         );
     }

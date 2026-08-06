@@ -1977,8 +1977,7 @@ fn render_frame_content(frame: &mut ratatui::Frame<'_>, state: &ViewState<'_>) {
                 .title_alignment(Alignment::Right);
         }
         {
-            let _perf_paint =
-                agens_perf::span!("tui.transcript.paint", rows = total_rows as u64,);
+            let _perf_paint = agens_perf::span!("tui.transcript.paint", rows = total_rows as u64,);
             let mut lines = transcript.render_lines(state.selection);
             if let Some(status) = live_status.as_ref() {
                 lines.extend(status.render_lines(None));
@@ -2660,9 +2659,7 @@ fn ask_user_rows<'a>(
 }
 
 /// Review-mode list: every question with its chosen answer, then Submit/Cancel.
-fn ask_user_review_rows<'a>(
-    render: &AskUserRender<'a>,
-) -> (Vec<widgets::OverlayRow<'a>>, usize) {
+fn ask_user_review_rows<'a>(render: &AskUserRender<'a>) -> (Vec<widgets::OverlayRow<'a>>, usize) {
     let mut rows: Vec<widgets::OverlayRow<'a>> = Vec::new();
     let mut selected_row = 0;
 
@@ -4787,11 +4784,7 @@ fn live_turn_status_lines(
     lines
 }
 
-fn append_live_turn_status(
-    lines: &mut Vec<Line<'static>>,
-    state: &ViewState<'_>,
-    row_width: u16,
-) {
+fn append_live_turn_status(lines: &mut Vec<Line<'static>>, state: &ViewState<'_>, row_width: u16) {
     let separate = lines.last().is_some_and(|line| line.width() > 0);
     lines.extend(live_turn_status_lines(state, row_width, separate));
 }
@@ -14562,7 +14555,10 @@ mod runtime_tests {
     fn permission_dialog_body_keeps_the_full_target_and_access() {
         assert_eq!(permission_dialog_title("bash"), "Bash command");
         assert_eq!(permission_dialog_title("write"), "Write file");
-        assert_eq!(permission_dialog_title("probe::tool"), "Permission required");
+        assert_eq!(
+            permission_dialog_title("probe::tool"),
+            "Permission required"
+        );
 
         let body = permission_dialog_body(
             "cd /tmp && git commit -m long-message",

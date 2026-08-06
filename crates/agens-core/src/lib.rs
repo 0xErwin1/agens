@@ -2023,12 +2023,10 @@ async fn run_headless_turn_with_iteration_limit(
                         None => output,
                     }
                 }
-                PreflightAuthorization::PermissionResolutionFailed => {
-                    HeadlessToolOutput::failure(
-                        "tool call refused: the permission approval for this call could not be \
+                PreflightAuthorization::PermissionResolutionFailed => HeadlessToolOutput::failure(
+                    "tool call refused: the permission approval for this call could not be \
                          completed; try the call again, or use a simpler single command",
-                    )
-                }
+                ),
                 PreflightAuthorization::UnknownTool => HeadlessToolOutput::failure(
                     "tool call refused: this session has no tool by that name; it was not denied \
                      and its arguments are not at fault, so no rewriting of this call can reach a \

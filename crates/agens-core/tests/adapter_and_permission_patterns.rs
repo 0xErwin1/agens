@@ -752,8 +752,7 @@ fn safety_predicates_precede_rules_and_bypass() {
 #[test]
 fn allow_exact_full_compound_bash_command_matches_the_request() {
     let command = "cd /tmp && git commit -m msg";
-    let request =
-        PermissionRequest::new("project", "native::bash", command, ToolAccess::Write);
+    let request = PermissionRequest::new("project", "native::bash", command, ToolAccess::Write);
     let grant = ProjectPermissionGrant::allow(
         "project",
         PermissionPattern::Exact("native::bash".into()),
@@ -773,8 +772,7 @@ fn allow_exact_full_compound_bash_command_matches_the_request() {
 #[test]
 fn allow_glob_git_star_does_not_match_compound_with_non_git_invocation() {
     let command = "cd /tmp && rm -rf victim";
-    let request =
-        PermissionRequest::new("project", "native::bash", command, ToolAccess::Write);
+    let request = PermissionRequest::new("project", "native::bash", command, ToolAccess::Write);
     let grant = ProjectPermissionGrant::allow(
         "project",
         PermissionPattern::Exact("native::bash".into()),
@@ -794,8 +792,7 @@ fn allow_glob_git_star_does_not_match_compound_with_non_git_invocation() {
 #[test]
 fn allow_glob_git_star_matches_compound_of_only_git_invocations() {
     let command = "git status && git log";
-    let request =
-        PermissionRequest::new("project", "native::bash", command, ToolAccess::Write);
+    let request = PermissionRequest::new("project", "native::bash", command, ToolAccess::Write);
     let grant = ProjectPermissionGrant::allow(
         "project",
         PermissionPattern::Exact("native::bash".into()),

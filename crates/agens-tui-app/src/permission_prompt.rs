@@ -57,19 +57,14 @@ impl PermissionPrompter for TuiPermissionPrompter {
         cancellation: &HeadlessTurnCancellation,
     ) -> Result<PermissionPromptAnswer, HeadlessTurnPortError> {
         let tool = agens_core::bare_tool_name(&context.tool_identity).into_owned();
-        let target =
-            sanitize_permission_target(&context.tool_identity, &context.target_identifier);
+        let target = sanitize_permission_target(&context.tool_identity, &context.target_identifier);
         let access = format!("{:?}", context.access);
         let reason = (!context.reason.is_empty()).then(|| context.reason.clone());
 
-        match self.0.wait_for_reply(
-            tool,
-            target,
-            access,
-            reason,
-            self.1.clone(),
-            cancellation,
-        ) {
+        match self
+            .0
+            .wait_for_reply(tool, target, access, reason, self.1.clone(), cancellation)
+        {
             TuiPermissionReply::AllowOnce => Ok(PermissionPromptAnswer::AllowOnce),
             TuiPermissionReply::AllowAlways => Ok(PermissionPromptAnswer::AllowAlways),
             TuiPermissionReply::DenyOnce => Ok(PermissionPromptAnswer::DenyOnce),

@@ -114,9 +114,7 @@ pub fn sanitized_native_tool_failure(content: &str) -> String {
         if reason.contains("must be a non-empty relative path")
             || reason.contains("must be a non-empty path")
         {
-            return format!(
-                "{tool}: path must be a non-empty path under the project root"
-            );
+            return format!("{tool}: path must be a non-empty path under the project root");
         }
     }
 

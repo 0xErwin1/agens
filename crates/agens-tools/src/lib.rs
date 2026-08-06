@@ -5998,7 +5998,8 @@ fn write_file_external(
         TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
     ));
     let result = (|| {
-        fs::write(&temp, content).map_err(|error| ToolOutput::failure(format!("write: {error}")))?;
+        fs::write(&temp, content)
+            .map_err(|error| ToolOutput::failure(format!("write: {error}")))?;
         if context.is_some_and(ToolExecutionContext::is_cancelled) {
             return Err(ToolOutput::failure("tool execution cancelled"));
         }
@@ -6019,8 +6020,8 @@ fn edit_file_external(
     new: &str,
     context: Option<&ToolExecutionContext>,
 ) -> Result<ToolOutput, ToolOutput> {
-    let content = fs::read_to_string(path)
-        .map_err(|error| ToolOutput::failure(format!("edit: {error}")))?;
+    let content =
+        fs::read_to_string(path).map_err(|error| ToolOutput::failure(format!("edit: {error}")))?;
     let matches = content.matches(old).count();
     if matches == 0 {
         return Err(ToolOutput::failure("edit: old text not found"));

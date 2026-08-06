@@ -852,7 +852,8 @@ fn gate_permission_errors_still_end_the_turn() {
             &mut self,
             _call: &HeadlessToolCall,
             _cancellation: &HeadlessTurnCancellation,
-        ) -> impl Future<Output = Result<PermissionDecision, HeadlessTurnPortError>> + Send {
+        ) -> impl Future<Output = Result<PermissionDecision, HeadlessTurnPortError>> + Send
+        {
             ready(Err(HeadlessTurnPortError::Permission))
         }
     }
@@ -890,7 +891,8 @@ fn resolver_permission_errors_refuse_the_call_and_let_the_agent_continue() {
             &mut self,
             _call: &HeadlessToolCall,
             _cancellation: &HeadlessTurnCancellation,
-        ) -> impl Future<Output = Result<PermissionDecision, HeadlessTurnPortError>> + Send {
+        ) -> impl Future<Output = Result<PermissionDecision, HeadlessTurnPortError>> + Send
+        {
             ready(Err(HeadlessTurnPortError::Permission))
         }
     }
@@ -902,7 +904,9 @@ fn resolver_permission_errors_refuse_the_call_and_let_the_agent_continue() {
                 name: "read".into(),
                 input: "credential=do-not-expose".into(),
             }]),
-            Ok(vec![MessagePart::Text("recovered after tool refusal".into())]),
+            Ok(vec![MessagePart::Text(
+                "recovered after tool refusal".into(),
+            )]),
         ],
     };
     let mut repository = Repository::default();
