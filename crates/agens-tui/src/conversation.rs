@@ -832,6 +832,64 @@ pub(crate) fn subagent_activity(name: &str) -> Option<&'static str> {
         _ => None,
     }
 }
+
+/// Applies a restored tool result, synthesizing a placeholder call when the
+/// matching call is missing so failed/partial sessions still show their output.
+fn apply_restored_tool_result(
+    conversation: &mut Conversation,
+    tool_call_id: &str,
+    content: &str,
+    is_error: bool,
+    parse_tool_input: &impl Fn(&str, &str) -> ToolInput,
+) {
+    if !conversation.has_call(tool_call_id) {
+        let name = "restored";
+        let input = "{}";
+        let _ = conversation.apply(ConversationEvent::ToolCall {
+            call_id: tool_call_id.to_owned(),
+            name: name.to_owned(),
+            input: input.to_owned(),
+            parsed: parse_tool_input(name, input),
+        });
+    }
+    if conversation
+        .find_call(tool_call_id)
+        .is_some_and(|call| call.result.is_some())
+    {
+        return;
+    }
+    let _ = conversation.apply(ConversationEvent::ToolResult {
+        call_id: tool_call_id.to_owned(),
+        output: content.to_owned(),
+        is_error,
+    });
+}
+
+fn push_text_item(items: &mut Vec<ConversationItem>, text: String, reasoning: bool) {
+    match (items.last_mut(), reasoning) {
+        (Some(ConversationItem::Reasoning(current)), true)
+        | (Some(ConversationItem::Assistant(current)), false) => current.push_str(&text),
+        (_, true) => items.push(ConversationItem::Reasoning(text)),
+        (_, false) => items.push(ConversationItem::Assistant(text)),
+    }
+}
+
+/// Path-free resume marker for a durable media part (`[Image #N]` / `[File #N]`).
+fn media_resume_chip(ordinal: usize, mime: &str) -> String {
+    if mime.starts_with("image/") {
+        format!("[Image #{ordinal}]")
+    } else {
+        format!("[File #{ordinal}]")
+    }
+}
+
+/// Withholds credential-shaped values from a runtime error message before it reaches the TUI
+/// card. This sink is user-visible-only, so unlike a model-visible sink it keeps host paths —
+/// only [`redact_credential_values`] runs here, never [`agens_core::redaction::redact_absolute_paths`].
+fn sanitize_error_message(message: String) -> String {
+    redact_credential_values(&message)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -930,61 +988,4 @@ mod tests {
             "out-of-order results still pair under their calls: {kinds:?}"
         );
     }
-}
-
-/// Applies a restored tool result, synthesizing a placeholder call when the
-/// matching call is missing so failed/partial sessions still show their output.
-fn apply_restored_tool_result(
-    conversation: &mut Conversation,
-    tool_call_id: &str,
-    content: &str,
-    is_error: bool,
-    parse_tool_input: &impl Fn(&str, &str) -> ToolInput,
-) {
-    if !conversation.has_call(tool_call_id) {
-        let name = "restored";
-        let input = "{}";
-        let _ = conversation.apply(ConversationEvent::ToolCall {
-            call_id: tool_call_id.to_owned(),
-            name: name.to_owned(),
-            input: input.to_owned(),
-            parsed: parse_tool_input(name, input),
-        });
-    }
-    if conversation
-        .find_call(tool_call_id)
-        .is_some_and(|call| call.result.is_some())
-    {
-        return;
-    }
-    let _ = conversation.apply(ConversationEvent::ToolResult {
-        call_id: tool_call_id.to_owned(),
-        output: content.to_owned(),
-        is_error,
-    });
-}
-
-fn push_text_item(items: &mut Vec<ConversationItem>, text: String, reasoning: bool) {
-    match (items.last_mut(), reasoning) {
-        (Some(ConversationItem::Reasoning(current)), true)
-        | (Some(ConversationItem::Assistant(current)), false) => current.push_str(&text),
-        (_, true) => items.push(ConversationItem::Reasoning(text)),
-        (_, false) => items.push(ConversationItem::Assistant(text)),
-    }
-}
-
-/// Path-free resume marker for a durable media part (`[Image #N]` / `[File #N]`).
-fn media_resume_chip(ordinal: usize, mime: &str) -> String {
-    if mime.starts_with("image/") {
-        format!("[Image #{ordinal}]")
-    } else {
-        format!("[File #{ordinal}]")
-    }
-}
-
-/// Withholds credential-shaped values from a runtime error message before it reaches the TUI
-/// card. This sink is user-visible-only, so unlike a model-visible sink it keeps host paths —
-/// only [`redact_credential_values`] runs here, never [`agens_core::redaction::redact_absolute_paths`].
-fn sanitize_error_message(message: String) -> String {
-    redact_credential_values(&message)
 }

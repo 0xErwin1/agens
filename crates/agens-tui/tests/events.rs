@@ -979,10 +979,10 @@ fn the_tool_detail_cycle_walks_both_ways_through_its_three_levels() {
     );
 }
 
-/// Full tool detail opens a modal overlay (Grok-style) instead of expanding the
-/// transcript. Preview stays inline; Esc dismisses the overlay.
+/// Ctrl+O only expands inline; the modal opens with Enter on a focused tool
+/// (or a click on a tool row).
 #[test]
-fn full_tool_detail_opens_a_scrollable_overlay_with_args_and_output() {
+fn tool_modal_opens_with_enter_on_focused_tool_not_ctrl_o() {
     let mut tui = turn_with_reasoning_and_a_settled_call();
     tui.handle(Event::Resize {
         width: 100,
@@ -991,22 +991,31 @@ fn full_tool_detail_opens_a_scrollable_overlay_with_args_and_output() {
 
     assert!(tui.view().tool_overlay.is_none());
     tui.handle(Event::Key(Key::CtrlO)); // Truncated
-    tui.handle(Event::Key(Key::CtrlO)); // Expanded → overlay
+    tui.handle(Event::Key(Key::CtrlO)); // Expanded inline
     assert_eq!(tui.view().tool_detail, DisplayMode::Expanded);
+    assert!(
+        tui.view().tool_overlay.is_none(),
+        "Ctrl+O must not open the modal"
+    );
+    assert_eq!(
+        tui.view().tool_display_modes.get("read-1"),
+        Some(&DisplayMode::Expanded),
+        "Ctrl+O expands the tool inline"
+    );
+
+    focus_viewport(&mut tui);
+    tui.handle(Event::Key(Key::Char('K'))); // focus newest settled tool
+    assert_eq!(tui.view().focused_call, Some("read-1"));
+    tui.handle(Event::Key(Key::Enter));
     let overlay = tui
         .view()
         .tool_overlay
-        .expect("full detail must open the tool overlay");
+        .expect("Enter on a focused tool opens the modal");
     assert_eq!(overlay.call_id, "read-1");
     assert!(
         overlay.output.contains("TOOL_BODY"),
         "overlay carries the tool output: {:?}",
         overlay.output
-    );
-    // Transcript keeps a short preview, not the full expanded dump.
-    assert_eq!(
-        tui.view().tool_display_modes.get("read-1"),
-        Some(&DisplayMode::Truncated)
     );
 
     tui.handle(Event::Key(Key::Escape));

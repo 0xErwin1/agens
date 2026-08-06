@@ -768,7 +768,7 @@ fn expanded_argument_texts(
     raw_input: &str,
     width: usize,
 ) -> Vec<String> {
-    let texts = match parsed {
+    match parsed {
         ToolInput::Bash { command } => {
             let redacted = redact_credential_values(command);
             // Keep script structure; wrap each source line on its own.
@@ -825,8 +825,7 @@ fn expanded_argument_texts(
                 wrap_command_lines(&summary, width)
             }
         }
-    };
-    texts
+    }
 }
 
 /// Greedy wrap of a shell command for transcript body rows (no mid-path ellipsis).

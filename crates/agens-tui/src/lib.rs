@@ -2153,10 +2153,6 @@ fn render_tool_detail_overlay(
             key: "↑↓",
             label: "scroll",
         },
-        widgets::OverlayShortcut {
-            key: "Ctrl+O",
-            label: "cycle",
-        },
     ];
     let title = if overlay.status.is_empty() {
         overlay.title.clone()
@@ -5794,7 +5790,35 @@ where
                 .handle_subagent_tree_click(column, row)
                 .unwrap_or_else(|| self.begin_mouse_selection(column, row)),
             Event::MouseDrag { column, row } => self.update_mouse_selection(column, row, true),
-            Event::MouseUp { column, row } => self.update_mouse_selection(column, row, false),
+            Event::MouseUp { column, row } => {
+                // A plain click (no selection text) on a tool row opens the
+                // detail modal. Drag-select still only selects text.
+                let had_text = self
+                    .transcripts
+                    .get(&self.active_transcript)
+                    .expect("active transcript always exists")
+                    .selection_text
+                    .as_ref()
+                    .is_some_and(|text| !text.is_empty());
+                let call_under_pointer = self.tool_call_id_at(column, row);
+                let action = self.update_mouse_selection(column, row, false);
+                let still_no_text = self
+                    .transcripts
+                    .get(&self.active_transcript)
+                    .expect("active transcript always exists")
+                    .selection_text
+                    .as_ref()
+                    .is_none_or(|text| text.is_empty());
+                if !had_text
+                    && still_no_text
+                    && let Some(call_id) = call_under_pointer
+                    && self.open_tool_detail_overlay(Some(&call_id))
+                {
+                    Action::Render
+                } else {
+                    action
+                }
+            }
             Event::MouseMove { column, row } => {
                 if self
                     .transcripts
@@ -9237,9 +9261,18 @@ where
                 Some(Action::Render)
             }
             Key::Char('o') => {
+                // Inline expand of the focused tool only — modal is Enter/click.
                 self.cycle_focused_block_detail();
                 self.scroll_to_focused_block();
                 Some(Action::Render)
+            }
+            Key::Enter => {
+                let call_id = self.active_record().focused_call.clone();
+                if self.open_tool_detail_overlay(call_id.as_deref()) {
+                    Some(Action::Render)
+                } else {
+                    Some(Action::Unchanged)
+                }
             }
             Key::Char('[') => {
                 self.select_sibling(-1);
@@ -10113,83 +10146,40 @@ where
         self.bump_selectable_epoch();
     }
 
-    /// Cycles the detail of the focused block alone.
+    /// Cycles the detail of the focused block alone (inline expand, not modal).
     ///
     /// The transcript-wide cycle answers "how much of everything"; this answers
-    /// "what is in this one", which is the question a reader has while looking
-    /// at a specific row.
+    /// "what is in this one". The modal is opened by Enter or a click, not by
+    /// this path.
     fn cycle_focused_block_detail(&mut self) {
-        let call_id = {
-            let record = self.active_record_mut();
-            let Some(call_id) = record.focused_call.clone() else {
-                return;
-            };
-            call_id
-        };
-        let current = {
-            let record = self.active_record();
-            record
-                .tool_display_modes
-                .get(&call_id)
-                .copied()
-                .unwrap_or(record.tool_detail)
-        };
-        let next = current.next();
-        if next == widgets::DisplayMode::Expanded {
-            if self.open_tool_detail_overlay(Some(&call_id)) {
-                let record = self.active_record_mut();
-                // Transcript keeps a short preview; full detail is the overlay.
-                record
-                    .tool_display_modes
-                    .insert(call_id, widgets::DisplayMode::Truncated);
-                self.bump_selectable_epoch();
-                self.report_detail_level("block", widgets::DisplayMode::Expanded);
-                return;
-            }
-        } else {
-            self.close_tool_detail_overlay();
-        }
         let record = self.active_record_mut();
+        let Some(call_id) = record.focused_call.clone() else {
+            return;
+        };
+        let current = record
+            .tool_display_modes
+            .get(&call_id)
+            .copied()
+            .unwrap_or(record.tool_detail);
+        let next = current.next();
         record.tool_display_modes.insert(call_id, next);
         self.bump_selectable_epoch();
         self.report_detail_level("block", next);
     }
 
+    /// Advances or walks back the transcript-wide tool output cycle (Ctrl+O).
+    ///
+    /// Inline only: Collapsed → Truncated → Expanded in the transcript. The
+    /// detail modal is not on this key — open it with Enter on a focused tool
+    /// or by clicking a tool row.
     fn cycle_tool_detail(&mut self, forward: bool) {
         let completed_call_ids = self.settled_call_ids();
-        let next = {
-            let record = self.active_record();
-            if forward {
-                record.tool_detail.next()
-            } else {
-                record.tool_detail.previous()
-            }
-        };
-
-        if next == widgets::DisplayMode::Expanded {
-            let preferred = self
-                .active_record()
-                .focused_call
-                .clone()
-                .or_else(|| completed_call_ids.last().cloned());
-            if self.open_tool_detail_overlay(preferred.as_deref()) {
-                let record = self.active_record_mut();
-                record.tool_detail = widgets::DisplayMode::Expanded;
-                // Inline: preview only. Full body lives in the overlay.
-                for call_id in &completed_call_ids {
-                    record
-                        .tool_display_modes
-                        .insert(call_id.clone(), widgets::DisplayMode::Truncated);
-                }
-                self.bump_selectable_epoch();
-                self.report_detail_level("tools", widgets::DisplayMode::Expanded);
-                return;
-            }
-        } else {
-            self.close_tool_detail_overlay();
-        }
-
         let record = self.active_record_mut();
+        let next = if forward {
+            record.tool_detail.next()
+        } else {
+            record.tool_detail.previous()
+        };
         record.tool_detail = next;
         for call_id in completed_call_ids {
             record.tool_display_modes.insert(call_id, next);
@@ -10205,18 +10195,16 @@ where
         }
     }
 
-    /// Opens the scrollable overlay for one settled tool call.
+    /// Opens the scrollable overlay for one tool call (click / Enter, not Ctrl+O).
     ///
-    /// `preferred` is the focused call when the reader is standing on one;
-    /// otherwise the newest settled call. Returns false when nothing settled.
+    /// `preferred` is the focused or clicked call; falls back to the newest
+    /// settled call only when callers pass `None` intentionally.
     fn open_tool_detail_overlay(&mut self, preferred: Option<&str>) -> bool {
-        let call_id = preferred
-            .map(ToOwned::to_owned)
-            .or_else(|| self.settled_call_ids().last().cloned());
-        let Some(call_id) = call_id else {
-            return false;
+        let call_id = match preferred {
+            Some(id) => id.to_owned(),
+            None => return false,
         };
-        let Some(call) = self.find_settled_tool_call(&call_id) else {
+        let Some(call) = self.find_tool_call(&call_id) else {
             return false;
         };
 
@@ -10242,6 +10230,7 @@ where
         };
 
         let record = self.active_record_mut();
+        record.focused_call = Some(call_id.clone());
         record.tool_overlay = Some(ToolDetailOverlay {
             call_id,
             title,
@@ -10253,7 +10242,7 @@ where
         true
     }
 
-    fn find_settled_tool_call(&self, call_id: &str) -> Option<conversation::ToolCall> {
+    fn find_tool_call(&self, call_id: &str) -> Option<conversation::ToolCall> {
         let active = self
             .transcripts
             .get(&self.active_transcript)
@@ -10277,6 +10266,39 @@ where
             .flat_map(|batch| &batch.calls)
             .find(|call| call.call_id == call_id)
             .cloned()
+    }
+
+    /// Call id owning the transcript row under the pointer, if any.
+    fn tool_call_id_at(&self, column: u16, row: u16) -> Option<String> {
+        let layout = self.screen_layout();
+        if layout.transcript.height == 0
+            || row < layout.transcript.y
+            || row >= layout.transcript.bottom()
+            || column < layout.transcript.x
+            || column >= layout.transcript.right()
+        {
+            return None;
+        }
+
+        let row_width = layout
+            .transcript
+            .width
+            .saturating_sub(TRANSCRIPT_ROW_INDENT)
+            .max(1);
+        let view = self.view_without_selectable();
+        let scroll = usize::from(if view.following_bottom {
+            self.detached_scroll_bottom()
+        } else {
+            view.scroll_offset
+        });
+        let inside = row
+            .checked_sub(layout.transcript.y)
+            .and_then(|offset| offset.checked_sub(1))?;
+        let target = scroll.saturating_add(usize::from(inside));
+        transcript_call_owners(&view, row_width)
+            .into_iter()
+            .nth(target)
+            .flatten()
     }
 
     fn scroll_tool_overlay(&mut self, delta: i32) -> bool {
@@ -10377,46 +10399,10 @@ where
     /// Moves block focus to whatever the pointer is resting on.
     ///
     /// Hover is an accelerator over the keyboard path, never a second one: it
-    /// sets the same focus `j`/`k` set and opens nothing by itself, so the
-    /// detail still costs a deliberate press and a session with mouse capture
-    /// off loses no capability at all.
+    /// sets the same focus `J`/`K` set and opens nothing by itself. Opening the
+    /// modal still costs a deliberate click or Enter.
     fn hover_block(&mut self, column: u16, row: u16) -> Action {
-        let layout = self.screen_layout();
-        if layout.transcript.height == 0
-            || row < layout.transcript.y
-            || row >= layout.transcript.bottom()
-            || column < layout.transcript.x
-            || column >= layout.transcript.right()
-        {
-            return Action::Unchanged;
-        }
-
-        let row_width = layout
-            .transcript
-            .width
-            .saturating_sub(TRANSCRIPT_ROW_INDENT)
-            .max(1);
-        let view = self.view_without_selectable();
-        let scroll = usize::from(if view.following_bottom {
-            self.detached_scroll_bottom()
-        } else {
-            view.scroll_offset
-        });
-        // The transcript block draws a top border, so its first content row sits
-        // one below the rect. A pointer on the border itself owns nothing.
-        let Some(inside) = row
-            .checked_sub(layout.transcript.y)
-            .and_then(|offset| offset.checked_sub(1))
-        else {
-            return Action::Unchanged;
-        };
-        let target = scroll.saturating_add(usize::from(inside));
-
-        let hovered = transcript_call_owners(&view, row_width)
-            .into_iter()
-            .nth(target)
-            .flatten();
-
+        let hovered = self.tool_call_id_at(column, row);
         let record = self.active_record_mut();
         if record.focused_call == hovered {
             return Action::Unchanged;
@@ -14543,9 +14529,10 @@ mod runtime_tests {
             "session help is fully covered by the derived footer"
         );
 
-        // A constructor strips the newline, and the result still fits one wrapped row.
+        // Informational bodies keep newlines so "message\nAction: …" does not glue
+        // together; two help lines + the empty-list placeholder row.
         let informational = DialogView::informational("Details", "first line\nsecond line");
-        assert_eq!(dialog_desired_rows(&informational, 30), 2);
+        assert_eq!(dialog_desired_rows(&informational, 30), 3);
 
         let empty = DialogView::selection("Choose", None::<String>, Vec::new());
         assert_eq!(dialog_desired_rows(&empty, 30), 1);
