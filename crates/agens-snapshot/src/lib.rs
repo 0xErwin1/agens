@@ -11,13 +11,21 @@
 //! so a caller that only wants back the files one turn touched cannot
 //! accidentally roll the rest of the tree with them.
 //!
-//! Every degraded path here has to fail rather than proceed. A snapshot that
-//! does not describe the working tree is worse than no snapshot at all: undoing
-//! against it deletes files instead of restoring them. So the index seed is a
-//! precondition rather than an optimisation, a capture that would produce the
-//! empty tree for a non-empty project is an error, and a path the snapshot
-//! could not cover is recorded so a restore never mistakes it for a file the
-//! turn created.
+//! No degraded path here may proceed: each is either repaired or reported. A
+//! snapshot that does not describe the working tree is worse than no snapshot at
+//! all, because undoing against it deletes files instead of restoring them. So
+//! the index seed is a precondition rather than an optimisation and is
+//! re-established before every capture that finds it gone, a capture that would
+//! produce the empty tree for a non-empty project is an error, and a path the
+//! snapshot could not cover is recorded so a restore never mistakes it for a
+//! file the turn created.
+//!
+//! The same asymmetry decides what this crate is willing to delete. Removing a
+//! project's snapshots throws away the last copy of content it may no longer
+//! have, so absence is never inferred from a question the filesystem failed to
+//! answer, and a finished record of what a capture could not cover is never
+//! removed at all, because nothing visible from here proves the snapshot it
+//! belongs to will not be restored to.
 //!
 //! git reaches write and execution behaviour through configuration as well as
 //! through subcommand names, so every invocation here fixes its own argv, runs
@@ -61,6 +69,10 @@ const PENDING_RECORD_PREFIX: &str = "tmp-";
 /// recognised without guessing from its name.
 const WORKTREE_MARKER: &str = "agens-worktree";
 
+/// Where the first moment a project was found missing is recorded. The file's
+/// modification time is the whole of its content.
+const MISSING_MARKER: &str = "agens-missing-since";
+
 /// What a session's private index file is called, before the part that makes it
 /// this session's.
 const INDEX_PREFIX: &str = "index-";
@@ -74,6 +86,21 @@ const INDEX_PREFIX: &str = "index-";
 /// every capture. The threshold is set far past any plausible gap between two
 /// turns of one session.
 const STALE_INDEX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// How long a record still carrying the pending name must have gone untouched
+/// before it is treated as the debris of an interrupted capture. A capture
+/// renames its record into place immediately, so the only reason to wait at all
+/// is that another session may be inside those few instructions right now.
+const STALE_RECORD_AGE: Duration = Duration::from_secs(60 * 60);
+
+/// How long a project must have been missing before its snapshots are removed.
+///
+/// At any single moment a path that cannot be reached — an unmounted share, a
+/// drive that is not plugged in, an automount that has not come up — is
+/// indistinguishable from one that was deleted. Time is the only thing that
+/// separates them, and the snapshots are the last copy of files the project may
+/// still have, so the wait is long.
+const MISSING_PROJECT_GRACE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 /// A git tree hash naming one captured state of the working tree.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -179,6 +206,7 @@ impl WorkspaceSnapshots {
         create_private_directory(&root)?;
         create_private_directory(&git_dir)?;
         sweep_abandoned_indexes(&git_dir);
+        sweep_pending_records(&git_dir);
 
         let index_file = git_dir.join(format!("{INDEX_PREFIX}{}", unique_suffix()));
         let repository = Self {
@@ -317,12 +345,21 @@ impl WorkspaceSnapshots {
         Ok(report)
     }
 
-    /// Removes snapshot repositories whose project directory is gone.
+    /// Removes snapshot repositories whose project directory has been gone long
+    /// enough to be believed gone.
     ///
     /// Snapshot objects outlive the session that wrote them, so without this
     /// the data directory keeps copies of files from projects that no longer
     /// exist. A directory this crate did not write, or did not finish writing,
     /// carries no project marker and is left alone.
+    ///
+    /// Removal is the one irreversible thing this crate does, and what it
+    /// removes is the only remaining copy of content the project may not have
+    /// any more. So an absence is not enough on its own: a path that cannot
+    /// currently be reached is left alone entirely, and one that is genuinely
+    /// missing has to stay missing across [`MISSING_PROJECT_GRACE`] before its
+    /// snapshots go. A project that comes back clears the record of its absence,
+    /// so intermittent storage never accumulates towards a deletion.
     pub fn prune_orphans(data_directory: &Path) -> Result<Vec<PathBuf>, SnapshotError> {
         let root = data_directory.join("snapshots");
         let entries = match std::fs::read_dir(&root) {
@@ -339,13 +376,17 @@ impl WorkspaceSnapshots {
             let Some(worktree) = recorded_worktree(&directory)? else {
                 continue;
             };
-            if worktree.exists() {
-                continue;
-            }
 
-            std::fs::remove_dir_all(&directory)
-                .map_err(|error| SnapshotError::Storage(error.to_string()))?;
-            removed.push(directory);
+            match project_presence(&worktree) {
+                ProjectPresence::Present => forget_absence(&directory)?,
+                ProjectPresence::Unreachable => continue,
+                ProjectPresence::Absent if !absent_beyond_the_grace_period(&directory)? => continue,
+                ProjectPresence::Absent => {
+                    std::fs::remove_dir_all(&directory)
+                        .map_err(|error| SnapshotError::Storage(error.to_string()))?;
+                    removed.push(directory);
+                }
+            }
         }
         Ok(removed)
     }
@@ -450,13 +491,26 @@ impl WorkspaceSnapshots {
     /// others and [`Self::uncovered`] answers with their union, which is the
     /// only direction that is safe to be wrong in: an entry that does not apply
     /// costs a file left alone, while a missing one costs a file deleted.
-    /// Naming a record for its content is what keeps that from growing, since
-    /// the repeated captures are exactly the ones that agree.
+    /// Naming a record for its content keeps one tree's repeats from
+    /// multiplying, since the captures that agree write the same name.
+    ///
+    /// Across trees the set still grows, roughly one record per turn, and
+    /// nothing removes a finished one. That is deliberate: the caller holds
+    /// snapshot ids for as long as it offers an undo, and it may offer one taken
+    /// far earlier, so no age or count this crate can see distinguishes a record
+    /// nobody will ask for from a record whose loss would let a restore delete a
+    /// file it was never allowed to touch. Only a capture with nothing outside
+    /// it is skipped, which says the same as the empty record it would write.
     ///
     /// The record is written under a name no reader looks at and moved into
     /// place, so a union taken while a capture is running sees whole records or
-    /// nothing, never a truncated one.
+    /// nothing, never a truncated one. A write that dies between the two leaves
+    /// the pending name behind, which [`sweep_pending_records`] collects.
     fn record_uncovered(&self, hash: &str, entries: &[String]) -> Result<(), SnapshotError> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+
         let directory = self.git_dir.join(UNCOVERED_DIRECTORY);
         create_private_directory(&directory)?;
 
@@ -562,6 +616,29 @@ impl WorkspaceSnapshots {
         Ok(())
     }
 
+    /// Re-establishes the seeded index before anything stages through it.
+    ///
+    /// [`Self::seed_index`] runs once at open, but the file it produces can be
+    /// gone by the next capture: another session's sweep, a temporary-directory
+    /// reaper or a reader clearing the data directory all remove it, and none of
+    /// them announce it. Staging into a fresh empty index is the one degraded
+    /// path that stays silent — git refuses an index it cannot parse, but an
+    /// absent one it simply creates — and the tree that comes out names only the
+    /// handful of paths a listing of the working tree offered. Every file it
+    /// leaves out reads as a file that did not exist, which a restore to that
+    /// tree acts on by deleting them.
+    ///
+    /// Seeding is defined by the project's own state rather than by the
+    /// session's history, so running it again produces exactly what the first
+    /// capture staged through: this restores the precondition rather than
+    /// papering over its loss.
+    fn ensure_index(&self) -> Result<(), SnapshotError> {
+        if self.index_file.is_file() {
+            return Ok(());
+        }
+        self.seed_index()
+    }
+
     /// Gives this session an index that already knows every tracked file, by
     /// copying the project's own or, failing that, reading its history.
     ///
@@ -624,6 +701,8 @@ impl WorkspaceSnapshots {
     /// entry in place would make a restore write stale content over a file the
     /// snapshot never looked at.
     fn stage(&self) -> Result<Vec<String>, SnapshotError> {
+        self.ensure_index()?;
+
         let candidates = self.candidate_paths()?;
         let (staged, over_cap): (Vec<String>, Vec<String>) = candidates
             .into_iter()
@@ -911,6 +990,65 @@ fn recorded_worktree(directory: &Path) -> Result<Option<PathBuf>, SnapshotError>
     }
 }
 
+/// What is known about a project directory, kept apart because only one of the
+/// three answers means the project was deleted.
+enum ProjectPresence {
+    Present,
+    /// Nothing is at the path, and the filesystem holding it answered.
+    Absent,
+    /// The filesystem could not answer. Unmounted, disconnected, or closed to
+    /// this process.
+    Unreachable,
+}
+
+/// Asks about `worktree` in a way that keeps "there is nothing here" apart from
+/// "this could not be looked up", which `Path::exists` folds into one answer.
+///
+/// The link itself is what is asked about: a dangling symlink is a project path
+/// that still exists and points somewhere the reader chose.
+fn project_presence(worktree: &Path) -> ProjectPresence {
+    match std::fs::symlink_metadata(worktree) {
+        Ok(_) => ProjectPresence::Present,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => ProjectPresence::Absent,
+        Err(_) => ProjectPresence::Unreachable,
+    }
+}
+
+/// Whether the project belonging to `directory` has been missing for longer than
+/// the grace period, starting the clock on the first prune that finds it gone.
+fn absent_beyond_the_grace_period(directory: &Path) -> Result<bool, SnapshotError> {
+    let marker = directory.join(MISSING_MARKER);
+    let first_missed = match std::fs::metadata(&marker) {
+        Ok(metadata) => metadata
+            .modified()
+            .map_err(|error| SnapshotError::Storage(error.to_string()))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::write(&marker, [])
+                .map_err(|error| SnapshotError::Storage(error.to_string()))?;
+            return Ok(false);
+        }
+        Err(error) => return Err(SnapshotError::Storage(error.to_string())),
+    };
+
+    Ok(SystemTime::now()
+        .duration_since(first_missed)
+        .is_ok_and(|absence| absence >= MISSING_PROJECT_GRACE))
+}
+
+/// Restarts the clock for a project that is there again.
+///
+/// A failure here is reported rather than passed over. A marker left behind
+/// carries an absence that has already ended, and the next prune to find the
+/// project missing would read it as an absence stretching back to then and
+/// remove the snapshots on the strength of it.
+fn forget_absence(directory: &Path) -> Result<(), SnapshotError> {
+    match std::fs::remove_file(directory.join(MISSING_MARKER)) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(SnapshotError::Storage(error.to_string())),
+    }
+}
+
 fn create_private_directory(path: &Path) -> Result<(), SnapshotError> {
     std::fs::create_dir_all(path).map_err(|error| SnapshotError::Storage(error.to_string()))?;
     restrict_permissions(path)
@@ -938,10 +1076,10 @@ fn restrict_permissions(_path: &Path) -> Result<(), SnapshotError> {
 /// [`WorkspaceSnapshots`] alive in this process may be between two of its own
 /// git calls. Everything else is judged by [`STALE_INDEX_AGE`].
 ///
-/// Getting that judgement wrong cannot cost a file. A session whose index is
-/// taken from underneath it stages into an empty one, and a capture built from
-/// an empty index is refused rather than returned, because the empty tree names
-/// a state in which nothing exists.
+/// Getting that judgement wrong costs a seed, not a file: a session whose index
+/// is taken from underneath it rebuilds it from the project before its next
+/// capture stages through it. See [`WorkspaceSnapshots::ensure_index`], which is
+/// what makes this sweep a matter of housekeeping rather than of correctness.
 ///
 /// Best effort throughout: a directory that cannot be read or a file that
 /// cannot be removed is left for the next session rather than failing an open
@@ -963,16 +1101,50 @@ fn sweep_abandoned_indexes(git_dir: &Path) {
             continue;
         }
 
-        let abandoned = entry
-            .metadata()
-            .and_then(|metadata| metadata.modified())
-            .ok()
-            .and_then(|modified| now.duration_since(modified).ok())
-            .is_some_and(|age| age >= STALE_INDEX_AGE);
-        if abandoned {
+        if untouched_for(&entry, now, STALE_INDEX_AGE) {
             let _ = std::fs::remove_file(entry.path());
         }
     }
+}
+
+/// Removes the records of captures that died between writing one and moving it
+/// into place, so an interrupted session does not leave a file nothing will ever
+/// read or replace.
+///
+/// Only the pending name is swept. A finished record is what stops a restore
+/// from deleting a file the capture could not hold, and the caller may still
+/// hold the snapshot id it belongs to, so nothing here decides that one has
+/// outlived its use.
+///
+/// Best effort, and by age: a capture running right now is between the write and
+/// the rename of a file with exactly this name.
+fn sweep_pending_records(git_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(git_dir.join(UNCOVERED_DIRECTORY)) else {
+        return;
+    };
+
+    let now = SystemTime::now();
+    for entry in entries.flatten() {
+        let is_pending = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with(PENDING_RECORD_PREFIX));
+        if is_pending && untouched_for(&entry, now, STALE_RECORD_AGE) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Whether `entry` was last written at least `age` ago. An entry whose age
+/// cannot be established counts as recent, so an unreadable modification time
+/// leaves the file where it is.
+fn untouched_for(entry: &std::fs::DirEntry, now: SystemTime, age: Duration) -> bool {
+    entry
+        .metadata()
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| now.duration_since(modified).ok())
+        .is_some_and(|elapsed| elapsed >= age)
 }
 
 fn unique_suffix() -> String {

@@ -364,33 +364,79 @@ fn a_project_whose_index_is_missing_is_still_described_by_its_history() {
     );
 }
 
-/// The empty tree is a snapshot in which nothing exists. Handing one back for a
-/// project full of files would make the next undo delete them, so a capture
-/// that arrives at it says so instead.
+/// A session's index can go missing underneath it, whether swept by another
+/// session or removed by something outside this crate. What must never follow is
+/// a capture that describes a fraction of the project: the files it failed to
+/// mention read as files that did not exist, and restoring to it deletes them.
 #[test]
-fn a_capture_that_would_describe_an_empty_project_is_refused() {
+fn a_capture_taken_after_the_session_index_vanished_still_describes_the_project() {
+    let project = Project::new().into_repository();
+    project.write("second.txt", "the reader's other file\n");
+    project.commit("track a second file");
+
+    let snapshots = project.snapshots();
+    let before = snapshots.capture().expect("capture succeeds");
+
+    for index in session_indexes(&project) {
+        std::fs::remove_file(&index).expect("the session index is removable");
+    }
+
+    project.write("tracked.txt", "agent output\n");
+    let after = snapshots.capture().expect("capture succeeds");
+
+    let undoing = snapshots.changed_since(&before).expect("diff succeeds");
+    snapshots.restore(&before, &undoing).expect("undo succeeds");
+    assert_eq!(
+        project.read("second.txt").as_deref(),
+        Some("the reader's other file\n")
+    );
+
+    let redoing = snapshots.changed_since(&after).expect("diff succeeds");
+    let report = snapshots.restore(&after, &redoing).expect("redo succeeds");
+    assert!(
+        report.removed.is_empty(),
+        "a redo deleted a file no turn ever created: {report:?}"
+    );
+    assert_eq!(
+        project.read("second.txt").as_deref(),
+        Some("the reader's other file\n"),
+        "a file the capture failed to describe is not a file the turn created"
+    );
+    assert_eq!(
+        project.read("tracked.txt").as_deref(),
+        Some("agent output\n")
+    );
+}
+
+/// An index git cannot read is a capture that cannot be trusted. Refusing is the
+/// only safe answer: any tree written past it describes fewer files than the
+/// project has.
+#[test]
+fn a_capture_built_on_an_unusable_index_is_refused() {
     let project = Project::new().into_repository();
     let snapshots = project.snapshots();
+    snapshots.capture().expect("capture succeeds");
 
-    for repository in std::fs::read_dir(project.data.join("snapshots")).expect("snapshot storage") {
-        let repository = repository.expect("snapshot repository entry").path();
-        for entry in std::fs::read_dir(&repository).expect("snapshot repository") {
-            let entry = entry.expect("repository entry").path();
-            let is_index = entry
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("index"));
-            if is_index {
-                std::fs::remove_file(&entry).expect("the session index is removable");
-            }
-        }
+    for index in session_indexes(&project) {
+        std::fs::write(&index, b"not an index").expect("the session index is writable");
     }
 
     assert!(
         snapshots.capture().is_err(),
-        "a snapshot that knows about no file is not a snapshot of this project"
+        "a capture staged through an unreadable index is not a snapshot of this project"
     );
     assert_eq!(project.read("tracked.txt").as_deref(), Some("original\n"));
+}
+
+fn session_indexes(project: &Project) -> Vec<PathBuf> {
+    std::fs::read_dir(project.data.join("snapshots"))
+        .expect("snapshot storage")
+        .filter_map(|repository| repository.ok())
+        .flat_map(|repository| std::fs::read_dir(repository.path()).expect("snapshot repository"))
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("index"))
+        .map(|entry| entry.path())
+        .collect()
 }
 
 /// A linked worktree has its own index and its own checkout. Seeding from the
@@ -778,6 +824,33 @@ fn an_index_abandoned_by_a_crashed_session_is_swept_by_a_later_one() {
     snapshots.capture().expect("capture succeeds");
 }
 
+/// Age alone cannot tell an abandoned index from one this process is staging
+/// through, because a session that captures rarely leaves its own index looking
+/// exactly as old as a crashed one's. Ownership is what separates them.
+#[test]
+fn an_index_this_process_owns_is_never_swept_however_old_it_looks() {
+    let project = Project::new().into_repository();
+    drop(project.snapshots());
+
+    let repository = std::fs::read_dir(project.data.join("snapshots"))
+        .expect("snapshot storage")
+        .next()
+        .expect("the repository was created")
+        .expect("snapshot repository entry")
+        .path();
+
+    let own = repository.join(format!("index-{}-999999", std::process::id()));
+    std::fs::write(&own, b"in use").expect("plant an index of this process");
+    backdate(&own);
+
+    let snapshots = project.snapshots();
+    assert!(
+        own.exists(),
+        "a session alive in this process may be between two of its own git calls"
+    );
+    snapshots.capture().expect("capture succeeds");
+}
+
 fn backdate(path: &Path) {
     let file = std::fs::File::options()
         .write(true)
@@ -787,8 +860,68 @@ fn backdate(path: &Path) {
         .expect("the fixture modification time is settable");
 }
 
+/// A capture that died between writing its record of what it could not hold and
+/// moving that record into place leaves a file nothing reads and nothing
+/// replaces. A capture running right now is inside exactly those two steps, so
+/// age is what separates them.
+#[test]
+fn a_record_left_unfinished_by_an_interrupted_capture_is_swept() {
+    let project = Project::new().into_repository();
+    project.write(".gitignore", "ignored/\n");
+    project.write("ignored/artifact.bin", "build output\n");
+    project.commit("ignore the build output");
+
+    let snapshots = project.snapshots();
+    let before = snapshots.capture().expect("capture succeeds");
+    drop(snapshots);
+
+    let records = repository_of(&project.data, &project.worktree).join("agens-uncovered");
+    let abandoned = records.join("tmp-999999-0");
+    std::fs::write(&abandoned, b"").expect("plant an unfinished record");
+    backdate(&abandoned);
+    let being_written = records.join("tmp-999999-1");
+    std::fs::write(&being_written, b"").expect("plant a record being written");
+
+    let snapshots = project.snapshots();
+    assert!(!abandoned.exists(), "nothing will ever finish this record");
+    assert!(
+        being_written.exists(),
+        "a capture may be between writing its record and moving it into place"
+    );
+    assert!(
+        snapshots
+            .uncovered(&before)
+            .expect("the uncovered set is readable")
+            .contains(&"ignored/".to_owned()),
+        "sweeping unfinished records must not reach a finished one"
+    );
+}
+
+/// A record of nothing says exactly what no record says, and the set of records
+/// only ever grows, so a capture with nothing outside it writes none.
+#[test]
+fn a_capture_with_nothing_outside_it_writes_no_record() {
+    let project = Project::new().into_repository();
+    let snapshots = project.snapshots();
+    let before = snapshots.capture().expect("capture succeeds");
+
+    let records = repository_of(&project.data, &project.worktree).join("agens-uncovered");
+    let written = std::fs::read_dir(&records)
+        .map(|entries| entries.count())
+        .unwrap_or_default();
+    assert_eq!(written, 0);
+    assert!(
+        snapshots
+            .uncovered(&before)
+            .expect("the uncovered set is readable")
+            .is_empty()
+    );
+}
+
 /// Snapshot repositories hold copies of project files, so one whose project is
-/// gone is content nobody can reach and nobody asked to keep.
+/// gone is content nobody can reach and nobody asked to keep. Gone has to mean
+/// gone for a while: a project is missing for a moment every time a share is
+/// remounted, and the snapshots are the last copy of what it held.
 #[test]
 fn a_snapshot_repository_outliving_its_project_is_pruned() {
     let live = Project::new().into_repository();
@@ -803,13 +936,123 @@ fn a_snapshot_repository_outliving_its_project_is_pruned() {
         .expect("is a worktree");
     kept.capture().expect("capture succeeds");
     orphan.capture().expect("capture succeeds");
+    let orphan_directory = repository_of(&data, &doomed.worktree);
     drop(orphan);
     std::fs::remove_dir_all(&doomed.worktree).expect("the fixture project is removable");
 
     let removed = WorkspaceSnapshots::prune_orphans(&data).expect("pruning succeeds");
-    assert_eq!(removed.len(), 1, "{removed:?}");
+    assert!(
+        removed.is_empty(),
+        "one moment of absence is not evidence a project was deleted: {removed:?}"
+    );
+    assert!(orphan_directory.is_dir());
+
+    backdate_files_in(&orphan_directory);
+    let removed = WorkspaceSnapshots::prune_orphans(&data).expect("pruning succeeds");
+    assert_eq!(removed, vec![orphan_directory]);
     assert!(
         kept.capture().is_ok(),
         "pruning must not disturb a project that is still there"
     );
+}
+
+/// A project that has come back is a project that was never deleted, so the
+/// clock a later prune reads has to start again from nothing.
+#[test]
+fn a_project_that_reappears_is_not_pruned_on_the_strength_of_its_absence() {
+    let project = Project::new().into_repository();
+    let data = project.data.clone();
+    let snapshots = project.snapshots();
+    snapshots.capture().expect("capture succeeds");
+    let directory = repository_of(&data, &project.worktree);
+
+    let moved = project.root.join("moved-away");
+    std::fs::rename(&project.worktree, &moved).expect("the fixture project is movable");
+    assert!(
+        WorkspaceSnapshots::prune_orphans(&data)
+            .expect("pruning succeeds")
+            .is_empty()
+    );
+    backdate_files_in(&directory);
+
+    std::fs::rename(&moved, &project.worktree).expect("the fixture project is movable back");
+    WorkspaceSnapshots::prune_orphans(&data).expect("pruning succeeds");
+
+    std::fs::rename(&project.worktree, &moved).expect("the fixture project is movable");
+    let removed = WorkspaceSnapshots::prune_orphans(&data).expect("pruning succeeds");
+    std::fs::rename(&moved, &project.worktree).expect("the fixture project is movable back");
+    assert!(
+        removed.is_empty(),
+        "an absence that ended cannot go on ageing into a deletion: {removed:?}"
+    );
+    assert!(directory.is_dir());
+}
+
+/// An unmounted share, a detached drive and a directory whose permissions
+/// changed all answer "not there" to the cheapest question. None of them means
+/// the project was deleted, and the snapshots are the only other copy of it.
+#[cfg(unix)]
+#[test]
+fn a_project_that_cannot_be_reached_is_not_treated_as_a_deleted_one() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let project = Project::new().into_repository();
+    let data = project.data.clone();
+
+    let enclosure = project.root.join("enclosure");
+    let enclosed = enclosure.join("linked");
+    git(
+        &project.worktree,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            enclosed.to_str().expect("a printable fixture path"),
+            "-b",
+            "enclosed",
+        ],
+    );
+    let snapshots = WorkspaceSnapshots::open(&data, &enclosed)
+        .expect("opens")
+        .expect("is a worktree");
+    snapshots.capture().expect("capture succeeds");
+    let directory = repository_of(&data, &enclosed);
+
+    let sealed = std::fs::Permissions::from_mode(0o000);
+    std::fs::set_permissions(&enclosure, sealed).expect("the fixture enclosure is sealable");
+
+    let outcome = WorkspaceSnapshots::prune_orphans(&data);
+
+    let opened = std::fs::Permissions::from_mode(0o700);
+    std::fs::set_permissions(&enclosure, opened).expect("the fixture enclosure is openable");
+
+    assert!(
+        outcome.expect("pruning succeeds").is_empty(),
+        "a path that cannot be read is not a path that is gone"
+    );
+    assert!(directory.is_dir());
+}
+
+/// The pruning clock lives in the repository's own files, so ageing them is what
+/// makes a fixture's absence old enough to believe.
+fn backdate_files_in(directory: &Path) {
+    for entry in std::fs::read_dir(directory).expect("the snapshot repository is readable") {
+        let entry = entry.expect("repository entry").path();
+        if entry.is_file() {
+            backdate(&entry);
+        }
+    }
+}
+
+fn repository_of(data: &Path, worktree: &Path) -> PathBuf {
+    let resolved = std::fs::canonicalize(worktree).expect("the fixture project resolves");
+    std::fs::read_dir(data.join("snapshots"))
+        .expect("snapshot storage")
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .find(|directory| {
+            std::fs::read_to_string(directory.join("agens-worktree"))
+                .is_ok_and(|recorded| Path::new(recorded.trim()) == resolved)
+        })
+        .expect("the project has a snapshot repository")
 }

@@ -117,13 +117,26 @@ fn rewind(
     context: &mut SessionContext,
     direction: Rewind,
 ) -> Result<UndoOutcome, UndoUnavailable> {
+    rewind_while(snapshots, context, direction, |_| {}).map(|(outcome, _)| outcome)
+}
+
+/// The same command with `meanwhile` standing in for whatever reaches the
+/// session while the tree is moving: the command holds no lock over that stretch,
+/// so a completing turn or a second rewind lands in exactly this gap.
+///
+/// Reports whether the marker was moved alongside the outcome.
+fn rewind_while(
+    snapshots: Option<&WorkspaceSnapshots>,
+    context: &mut SessionContext,
+    direction: Rewind,
+    meanwhile: impl FnOnce(&mut SessionContext),
+) -> Result<(UndoOutcome, bool), UndoUnavailable> {
     let step = pending_turn(context, direction)?;
     let outcome = rewind_tree(snapshots, &step, direction)?;
-    if outcome.is_complete() {
-        commit_rewind(context, direction);
-    }
+    meanwhile(context);
 
-    Ok(outcome)
+    let committed = outcome.is_complete() && commit_rewind(context, direction, &step);
+    Ok((outcome, committed))
 }
 
 /// The whole feature in one pass: the turn's file goes back, and the prompt
@@ -362,6 +375,77 @@ fn a_comparison_that_cannot_run_restores_nothing_and_keeps_the_turn() {
     assert!(
         pending_turn(&context, Rewind::Back).is_ok(),
         "the turn is still there to take back once the tree can be read again"
+    );
+    assert_eq!(context.live_messages().len(), 2);
+}
+
+/// The tree moves with the session released, so a turn can complete while it is
+/// moving. Moving the marker afterwards would take back a turn whose files were
+/// never restored, so the marker stays where it is and the undo history is left
+/// whole for the reader to try again.
+#[test]
+fn a_turn_that_completes_while_the_tree_moves_leaves_the_marker_where_it_was() {
+    let project = Project::new("turn-during-undo");
+    let snapshots = project.snapshots();
+    let mut context = SessionContext::fresh();
+
+    turn(&snapshots, &mut context, "first", || {
+        project.write("kept.txt", "after the first turn\n");
+    });
+
+    let (outcome, committed) =
+        rewind_while(Some(&snapshots), &mut context, Rewind::Back, |context| {
+            turn(&snapshots, context, "second", || {
+                project.write("kept.txt", "after a turn that landed mid-undo\n");
+            });
+        })
+        .expect("a turn to undo");
+
+    assert!(outcome.is_complete(), "{outcome:?}");
+    assert!(
+        !committed,
+        "the marker must not move over a turn it did not restore"
+    );
+    assert_eq!(
+        pending_turn(&context, Rewind::Back)
+            .expect("the turn that landed is still there")
+            .prompt(),
+        "second"
+    );
+    assert_eq!(
+        pending_turn(&context, Rewind::Forward),
+        Err(UndoUnavailable::NothingToRedo),
+        "nothing was taken back, so nothing is waiting to be put back"
+    );
+    assert_eq!(context.live_messages().len(), 4);
+}
+
+/// A turn claiming the session while the tree moves is the same disagreement
+/// from the other side: the marker would move under a turn that is still
+/// writing, so it does not move at all.
+#[test]
+fn a_session_that_starts_running_while_the_tree_moves_keeps_its_undo() {
+    let project = Project::new("running-during-undo");
+    let snapshots = project.snapshots();
+    let mut context = SessionContext::fresh();
+
+    turn(&snapshots, &mut context, "first", || {
+        project.write("kept.txt", "after the first turn\n");
+    });
+
+    let (_, committed) = rewind_while(Some(&snapshots), &mut context, Rewind::Back, |context| {
+        context.running = true;
+    })
+    .expect("a turn to undo");
+
+    assert!(
+        !committed,
+        "a running session does not get its marker moved"
+    );
+    assert!(pending_turn(&context, Rewind::Back).is_ok());
+    assert_eq!(
+        pending_turn(&context, Rewind::Forward),
+        Err(UndoUnavailable::NothingToRedo)
     );
     assert_eq!(context.live_messages().len(), 2);
 }

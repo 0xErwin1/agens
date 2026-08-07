@@ -15,6 +15,7 @@ use agens_models::ModelSelection;
 use agens_session::context::SessionContext;
 use agens_session::provider::ProviderKind;
 use agens_session::turns::SUBAGENT_CALL_ID_PREFIX;
+use agens_session::undo::turn_boundary;
 use agens_tui::TuiPresentation;
 
 pub fn complete_tui_turn(
@@ -49,10 +50,22 @@ pub fn complete_tui_turn(
 /// A background subagent turn can be persisted after the foreground turn reloaded the session, so
 /// adopting the turn's history alone would drop that turn from the in-process request history for
 /// the rest of the process even though the store keeps it.
+///
+/// Such a turn goes back where the store holds it — at the point the reloaded history stops
+/// agreeing with the one in hand, which is after everything both already agree on and before the
+/// turn being adopted — rather than at the tail. Undo derives its bound by comparing these two
+/// histories, so a turn kept anywhere but its persisted position makes them disagree earlier than
+/// the turn did, and a later commit then drops every message past that earlier point from this
+/// history and deletes the matching range from the store, taking turns nobody took back.
+///
+/// The insertion point is the boundary [`turn_boundary`] derives, so it can never fall between a
+/// tool call and its result.
 pub fn adopt_turn_history(session: &mut SessionContext, history: Vec<Message>) {
     let preserved = missing_subagent_turns(&session.messages, &history);
+    let divergence = turn_boundary(&session.messages, &history);
+
     session.messages = history;
-    session.messages.extend(preserved);
+    session.messages.splice(divergence..divergence, preserved);
 }
 
 pub fn missing_subagent_turns(previous: &[Message], history: &[Message]) -> Vec<Message> {
@@ -313,9 +326,84 @@ mod tests {
             "summary"
         );
 
-        let mut expected = foreground_turn;
-        expected.extend(subagent_turn);
+        let mut expected = subagent_turn;
+        expected.extend(foreground_turn);
         assert_eq!(session.messages, expected);
+    }
+
+    #[test]
+    fn a_subagent_turn_persisted_mid_flight_is_kept_where_the_store_holds_it() {
+        let settled = vec![
+            Message {
+                role: Role::User,
+                parts: vec![MessagePart::Text("open the file".into())],
+            },
+            Message {
+                role: Role::Assistant,
+                parts: vec![MessagePart::Text("opened".into())],
+            },
+        ];
+        let subagent_turns = ["subagent:1", "subagent:2"]
+            .into_iter()
+            .flat_map(|call_id| {
+                [
+                    Message {
+                        role: Role::User,
+                        parts: vec![MessagePart::Text(format!("task for {call_id}"))],
+                    },
+                    Message {
+                        role: Role::Assistant,
+                        parts: vec![
+                            MessagePart::ToolCall {
+                                id: call_id.into(),
+                                name: "native::task".into(),
+                                input: r#"{"agent":"reviewer","description":"review"}"#.into(),
+                            },
+                            MessagePart::Reasoning("2 tool uses".into()),
+                        ],
+                    },
+                    Message {
+                        role: Role::Tool,
+                        parts: vec![MessagePart::ToolResult {
+                            tool_call_id: call_id.into(),
+                            content: "approved".into(),
+                            is_error: false,
+                        }],
+                    },
+                ]
+            })
+            .collect::<Vec<_>>();
+        let foreground_turn = vec![
+            Message {
+                role: Role::User,
+                parts: vec![MessagePart::Text("summarize the patch".into())],
+            },
+            Message {
+                role: Role::Assistant,
+                parts: vec![MessagePart::Text("summary".into())],
+            },
+        ];
+        let mut previous = settled.clone();
+        previous.extend(subagent_turns.clone());
+        let mut reloaded = settled.clone();
+        reloaded.extend(foreground_turn.clone());
+        let mut session = SessionContext {
+            identifier: Some(9),
+            messages: previous.clone(),
+            ..SessionContext::fresh()
+        };
+
+        adopt_turn_history(&mut session, reloaded);
+
+        let mut expected = settled;
+        expected.extend(subagent_turns);
+        expected.extend(foreground_turn);
+        assert_eq!(session.messages, expected);
+        assert_eq!(
+            agens_session::undo::turn_boundary(&previous, &session.messages),
+            previous.len(),
+            "the turn adopted here is the only one a later undo may take back"
+        );
     }
 
     #[test]

@@ -292,13 +292,12 @@ impl TuiRuntimeRouter {
                 .session
                 .lock()
                 .map_err(|_| CliError::storage("TUI session is unavailable"))?;
-            if session.running || pending_turn(&session, direction).as_ref() != Ok(&step) {
+            if !commit_rewind(&mut session, direction, &step) {
                 return Ok(TuiSubmissionOutcome::LocalActionableError {
                     message: rewind_uncommitted(direction),
                     action: "check the working tree and run the command again".into(),
                 });
             }
-            commit_rewind(&mut session, direction);
         }
 
         let history = self.live_history()?;

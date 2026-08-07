@@ -284,6 +284,14 @@ impl SessionContext {
     /// last loaded — a sub-agent turn completing in the background — sits past
     /// that length in the store and was never part of what the reader took back,
     /// so it stays; the next completed turn reloads it into this history.
+    ///
+    /// That bound is a length, not an identity, and it covers only what the store
+    /// holds beyond this history. Everything this history holds past the
+    /// surviving prefix is dropped, and the matching range is deleted from the
+    /// store. Matching one against the other is therefore only sound while this
+    /// history holds its messages in the order the store recorded them, which is
+    /// what a caller re-adopting a turn's history has to preserve: a sub-agent
+    /// turn persisted mid-turn belongs where it was persisted, not at the tail.
     pub fn commit_undo(&mut self, store: Option<&mut SessionStore>) -> Result<(), UndoCommitError> {
         if !self.undo.has_undone_turns() {
             return Ok(());
@@ -442,10 +450,7 @@ mod tests {
     }
 
     fn store_directory(label: &str) -> StoreDirectory {
-        let directory =
-            std::env::temp_dir().join(format!("agens-session-undo-{}-{label}", std::process::id()));
-        std::fs::create_dir_all(&directory).unwrap();
-        StoreDirectory(directory)
+        StoreDirectory(agens_fixtures::session_directory(&format!("undo-{label}")))
     }
 
     fn text(role: Role, body: &str) -> Message {
@@ -553,6 +558,72 @@ mod tests {
             "the background turn stays, and the next completed turn reloads it"
         );
         assert_eq!(stored.metadata.completed_turn_count, 2);
+    }
+
+    /// A sub-agent turn persisted while an earlier foreground turn was running sits before the turn
+    /// the reader takes back, in the store and in the history in hand alike. The bound derived from
+    /// that history then falls after it, so the commit takes back one turn and leaves the turn
+    /// nobody undid in place on both sides.
+    #[test]
+    fn a_turn_persisted_before_the_taken_back_turn_survives_the_commit() {
+        let directory = store_directory("store-order");
+        let mut store = SessionStore::open(directory.path()).unwrap();
+        let mut metadata = SessionMetadata {
+            id: 0,
+            project: "project".into(),
+            title: "title".into(),
+            active_agent: "primary".into(),
+            provider_id: None,
+            model_id: None,
+            reasoning_effort: None,
+            created_at: 1,
+            updated_at: 1,
+            completed_turn_count: 0,
+            resumable: false,
+        };
+        for turn in [
+            completed_turn("first", "kept"),
+            completed_turn("a sub-agent task", "a sub-agent turn"),
+            completed_turn("second", "taken back"),
+        ] {
+            metadata = store
+                .persist_completed_session_turn(&metadata, &turn)
+                .unwrap();
+        }
+
+        let stored = store.load_session_for_resume(metadata.id).unwrap();
+        let before_the_taken_back_turn = stored.messages[..4].to_vec();
+        let mut context = SessionContext::restored(
+            metadata.id,
+            stored.metadata,
+            stored.messages.clone(),
+            std::path::PathBuf::from("project"),
+        );
+        let boundary = crate::undo::turn_boundary(&before_the_taken_back_turn, &context.messages);
+        assert_eq!(boundary, 4, "the taken-back turn is the only one held back");
+        context.undo.record(crate::undo::UndoStep::new(
+            "second".into(),
+            boundary,
+            "before".into(),
+            "after".into(),
+        ));
+        context.undo.undo().expect("a turn to take back");
+
+        context.commit_undo(Some(&mut store)).unwrap();
+
+        assert_eq!(context.messages, before_the_taken_back_turn);
+        let remaining = store.load_session_for_resume(metadata.id).unwrap();
+        assert_eq!(
+            remaining.messages, before_the_taken_back_turn,
+            "the sub-agent turn was never taken back, so it stays in the store"
+        );
+        assert_eq!(
+            remaining.messages[2..],
+            [
+                text(Role::User, "a sub-agent task"),
+                text(Role::Assistant, "a sub-agent turn"),
+            ]
+        );
     }
 
     /// Memory and the store must never part company quietly: a commit that cannot reach the store

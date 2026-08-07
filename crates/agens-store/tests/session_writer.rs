@@ -13,14 +13,45 @@ use rusqlite::Connection;
 
 static NEXT_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
 
-fn directory() -> std::path::PathBuf {
+/// A temporary store directory that removes itself when the test ends, whether
+/// it ends by returning or by panicking on a failed assertion.
+struct TestDirectory(std::path::PathBuf);
+
+impl Drop for TestDirectory {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+impl std::ops::Deref for TestDirectory {
+    type Target = std::path::Path;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl AsRef<std::path::Path> for TestDirectory {
+    fn as_ref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+/// A directory no other run can be holding: the process id alone repeats once
+/// the operating system reuses it, and a leftover database under the same name
+/// would be opened instead of a fresh one.
+fn directory() -> TestDirectory {
     let suffix = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+    let started = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("the fixture clock is after the epoch")
+        .as_nanos();
     let directory = std::env::temp_dir().join(format!(
-        "agens-store-writer-{}-{suffix}",
+        "agens-store-writer-{}-{started}-{suffix}",
         std::process::id()
     ));
     fs::create_dir_all(&directory).unwrap();
-    directory
+    TestDirectory(directory)
 }
 
 fn turn(messages: Vec<Message>) -> CompletedSessionTurn {
@@ -115,8 +146,6 @@ fn attempt_begin_and_finish_are_targeted_cas_transactions() {
             .unwrap(),
         ("failed".into(), "failed".into())
     );
-
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
@@ -199,8 +228,6 @@ fn successful_attempt_finish_is_atomic_exact_and_private() {
     );
     assert!(!format!("{attempt:?}").contains("private-prompt-token"));
     assert!(!format!("{:?}", BeginSessionAttemptError::Store).contains("private-prompt-token"));
-
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
@@ -311,8 +338,6 @@ fn partial_attempt_persistence_appends_history_and_drops_the_retry_prompt() {
     let stored = store.load_session_for_resume(metadata.id).unwrap();
     assert_eq!(stored.metadata.completed_turn_count, 1);
     assert_eq!(stored.messages, partial.messages());
-
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
@@ -381,8 +406,6 @@ fn attempt_begin_bounds_prompts_allocates_zero_ids_and_preserves_other_sessions(
             .unwrap(),
         1
     );
-
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
@@ -457,8 +480,6 @@ fn terminal_attempt_cas_shapes_never_append_history() {
             ((index + 1) as i64, 0, 0, 0)
         );
     }
-
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
@@ -606,8 +627,6 @@ fn session_pages_use_stable_keyset_search_scope_and_bounded_sizes() {
     let running = loaded.latest_attempt.unwrap();
     assert!(loaded.messages.is_empty());
     assert_eq!(running.key().session_id(), 501);
-
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
@@ -645,8 +664,6 @@ fn zero_turn_session_without_retained_retry_prompt_is_not_resumable() {
 
     assert!(page.sessions.is_empty());
     assert!(store.load_session_for_resume(metadata.id).is_err());
-
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
@@ -876,8 +893,6 @@ fn explicit_attempt_recovery_is_exact_stale_safe_and_history_preserving() {
     let preserved = store.load_session_for_resume(metadata.id).unwrap();
     assert_eq!(preserved.metadata.completed_turn_count, 2);
     assert_eq!(preserved.messages.len(), 5);
-
-    fs::remove_dir_all(directory).unwrap();
 }
 
 fn attempt_status(status: SessionAttemptStatus) -> &'static str {
@@ -990,8 +1005,6 @@ fn persists_text_completed_turn_and_reopens_in_order() {
         ("project".into(), "title".into(), "primary".into(), 10, 20, 2, true),
     );
     assert_eq!(connection.prepare("SELECT turn_sequence, role, text FROM messages JOIN message_parts ON messages.session_id = message_parts.session_id AND messages.sequence = message_parts.message_sequence ORDER BY messages.sequence, message_parts.sequence").unwrap().query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap(), vec![(1, "system".into(), "system".into()), (1, "user".into(), "first user".into()), (1, "assistant".into(), "first assistant".into()), (2, "user".into(), "second user".into()), (2, "assistant".into(), "second assistant".into())]);
-
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
@@ -1114,8 +1127,6 @@ fn persists_all_typed_parts_with_canonical_tool_json() {
             ),
         ]
     );
-
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
@@ -1226,8 +1237,6 @@ fn atomically_rolls_back_failed_writes_and_appends_from_stale_metadata() {
         (2, true)
     );
     assert_eq!(normalized_counts(&connection), (1, 2, 6, 6));
-
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
@@ -1314,8 +1323,6 @@ fn appends_completed_turn_when_a_concurrent_subagent_turn_advanced_the_count() {
             "parent",
         ]
     );
-
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
@@ -1389,8 +1396,6 @@ fn media_parts_round_trip_without_source_path() {
     assert_eq!(media_id, Some(media.id));
     assert_eq!(mime.as_deref(), Some("image/png"));
     assert_eq!(text, None);
-
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
@@ -1441,8 +1446,6 @@ fn begin_session_attempt_allows_empty_prompt_when_media_ids_present() {
             .is_err(),
         "empty prompt without media must still fail"
     );
-
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
@@ -1518,8 +1521,6 @@ fn retry_boundary_round_trips_media_ids_without_source_paths() {
         )
         .unwrap();
     assert_eq!(empty_json, None);
-
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
@@ -1599,7 +1600,6 @@ fn session_store_crud_round_trips_normalized_context() {
 
     let reopened = SessionStore::open(&directory).unwrap();
     assert_eq!(reopened.list_sessions().unwrap(), vec![updated]);
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
@@ -1647,7 +1647,6 @@ fn session_store_rejects_legacy_resume_and_delete_is_idempotent() {
     store.delete_session(12).unwrap();
     store.delete_session(12).unwrap();
     assert!(store.list_sessions().unwrap().is_empty());
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
@@ -1736,7 +1735,6 @@ fn selection_metadata_round_trips_updates_atomically_and_preserves_crud_boundari
             .iter()
             .all(|session| session.project != "/project/a")
     );
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
@@ -1764,8 +1762,6 @@ fn a_freshly_created_session_records_its_own_confinement_root() {
         store.confinement_root(attempt.key().session_id()).unwrap(),
         std::path::PathBuf::from("/original/root")
     );
-
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
@@ -1802,8 +1798,6 @@ fn confinement_root_falls_back_to_project_for_rows_recorded_before_the_column_ex
         store.confinement_root(session_id).unwrap(),
         std::path::PathBuf::from("/legacy/root")
     );
-
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
@@ -1833,8 +1827,6 @@ fn a_freshly_created_session_has_no_recorded_bypass_permission_prompts_value() {
             .unwrap(),
         None
     );
-
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
@@ -1874,8 +1866,6 @@ fn setting_bypass_permission_prompts_round_trips_true_and_false() {
         store.bypass_permission_prompts(session_id).unwrap(),
         Some(false)
     );
-
-    fs::remove_dir_all(directory).unwrap();
 }
 
 /// A session with three completed turns, each recorded through its own attempt, so a truncation
@@ -2031,8 +2021,6 @@ fn truncating_a_session_drops_the_later_turns_and_leaves_the_prefix_unchanged() 
         vec![Some(1), Some(2)],
         "the attempt that completed the dropped turn goes with it"
     );
-
-    fs::remove_dir_all(directory).unwrap();
 }
 
 /// The surviving prefix is a message boundary, not a turn boundary: one that lands inside a turn
@@ -2057,8 +2045,6 @@ fn a_surviving_prefix_inside_a_turn_keeps_the_turn_it_lands_in() {
 
     let connection = Connection::open(store.database_path()).unwrap();
     assert_eq!(normalized_counts(&connection), (1, 2, 3, 4));
-
-    fs::remove_dir_all(directory).unwrap();
 }
 
 /// Truncating everything leaves a session that exists and can be written to again, with counters
@@ -2087,8 +2073,6 @@ fn truncating_a_session_to_nothing_clears_its_history_and_counters() {
         attempt_turn_sequences(&store, session_id).is_empty(),
         "no attempt survives a turn it completed"
     );
-
-    fs::remove_dir_all(directory).unwrap();
 }
 
 /// A truncation that cannot finish must leave the session exactly as it was: a session missing
@@ -2128,8 +2112,6 @@ fn a_truncation_that_cannot_finish_leaves_every_row_in_place() {
         .unwrap();
     store.truncate_session_history(session_id, 6, 8).unwrap();
     assert_eq!(normalized_counts(&connection), (1, 2, 6, 7));
-
-    fs::remove_dir_all(directory).unwrap();
 }
 
 /// A session that already holds no more than the surviving prefix has nothing to truncate, and a
@@ -2144,8 +2126,6 @@ fn truncating_past_the_stored_history_changes_nothing() {
     store.truncate_session_history(session_id, 12, 12).unwrap();
 
     assert_eq!(store.load_session_for_resume(session_id).unwrap(), before);
-
-    fs::remove_dir_all(directory).unwrap();
 }
 
 /// A turn persisted after the measured history — a sub-agent turn recorded out of band, or one
@@ -2188,6 +2168,4 @@ fn a_turn_persisted_after_the_measured_history_survives_the_truncation() {
         after.metadata.completed_turn_count, 3,
         "the surviving out-of-band turn is still counted"
     );
-
-    fs::remove_dir_all(directory).unwrap();
 }

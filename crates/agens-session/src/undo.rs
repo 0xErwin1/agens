@@ -358,12 +358,27 @@ pub fn rewind_tree(
     )
 }
 
-/// Moves the marker over the messages after the tree has been moved.
-pub fn commit_rewind(context: &mut SessionContext, direction: Rewind) {
+/// Moves the marker over the messages after the tree has been moved, and
+/// reports whether it moved.
+///
+/// The tree moves with the session released, so the turn a rewind would move can
+/// change while git is running: another turn can complete, or the reader can
+/// undo again. The marker therefore moves only while `moved` is still the turn
+/// this direction would take and nothing is running; otherwise it would be moved
+/// over a turn whose tree was never restored. A refusal leaves the undo history
+/// exactly as it was, so the caller can report the disagreement and the command
+/// can be run again.
+#[must_use]
+pub fn commit_rewind(context: &mut SessionContext, direction: Rewind, moved: &UndoStep) -> bool {
+    if context.running || pending_turn(context, direction).as_ref() != Ok(moved) {
+        return false;
+    }
+
     match direction {
         Rewind::Back => context.undo.undo(),
         Rewind::Forward => context.undo.redo(),
     };
+    true
 }
 
 /// Moves the working tree from `from` to `target`, restoring only the paths the
