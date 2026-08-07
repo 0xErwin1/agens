@@ -496,6 +496,8 @@ mod tests {
             updated_at: 1,
             completed_turn_count: 0,
             resumable: false,
+            parent_session_id: None,
+            fork_message_count: None,
         };
         metadata = store
             .persist_completed_session_turn(&metadata, &completed_turn("first", "kept"))
@@ -589,6 +591,8 @@ mod tests {
             updated_at: 1,
             completed_turn_count: 0,
             resumable: false,
+            parent_session_id: None,
+            fork_message_count: None,
         };
         for turn in [
             completed_turn("first", "kept"),
@@ -694,6 +698,8 @@ mod tests {
             updated_at: 1,
             completed_turn_count: 0,
             resumable: true,
+            parent_session_id: None,
+            fork_message_count: None,
         };
         let restored =
             SessionContext::restored(1, metadata, Vec::new(), std::path::PathBuf::from("project"));

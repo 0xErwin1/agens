@@ -188,6 +188,8 @@ mod tests {
             updated_at: 2,
             completed_turn_count: 2,
             resumable: true,
+            parent_session_id: None,
+            fork_message_count: None,
         };
         let mut context = SessionContext::fresh();
         context.pending_system_reminder = Some("reminder".into());
@@ -229,6 +231,8 @@ mod tests {
             updated_at: 2,
             completed_turn_count: 1,
             resumable: true,
+            parent_session_id: None,
+            fork_message_count: None,
         };
         let messages = vec![
             Message {
@@ -317,6 +321,8 @@ mod tests {
                 updated_at: 1,
                 completed_turn_count: 1,
                 resumable: true,
+                parent_session_id: None,
+                fork_message_count: None,
             },
             messages: foreground_turn.clone(),
         };

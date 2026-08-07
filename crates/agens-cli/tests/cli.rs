@@ -997,6 +997,8 @@ fn sessions_crud_uses_normalized_metadata_and_idempotent_removal() {
         updated_at: 20,
         completed_turn_count: 0,
         resumable: false,
+        parent_session_id: None,
+        fork_message_count: None,
     };
     let turn = CompletedSessionTurn::new(
         vec![
@@ -1093,6 +1095,8 @@ fn sessions_rm_after_a_double_dash_deletes_a_positive_identifier_and_no_ops_on_a
         updated_at: 20,
         completed_turn_count: 0,
         resumable: false,
+        parent_session_id: None,
+        fork_message_count: None,
     };
     let turn = CompletedSessionTurn::new(
         vec![
@@ -1549,6 +1553,8 @@ fn headless_chat_bootstraps_config_runs_local_turn_and_supports_session_resume()
             updated_at: 20,
             completed_turn_count: 0,
             resumable: false,
+            parent_session_id: None,
+            fork_message_count: None,
         };
         let turn = CompletedSessionTurn::new(
             [

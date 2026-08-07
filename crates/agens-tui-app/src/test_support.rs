@@ -591,6 +591,8 @@ pub fn persist_tui_session(
                 updated_at: 1,
                 completed_turn_count: 0,
                 resumable: false,
+                parent_session_id: None,
+                fork_message_count: None,
             },
             &turn,
         )
@@ -676,6 +678,8 @@ pub fn submit_tui_command(
                         updated_at: 1,
                         completed_turn_count: 1,
                         resumable: true,
+                        parent_session_id: None,
+                        fork_message_count: None,
                     },
                     messages: Vec::new(),
                 })

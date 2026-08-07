@@ -28,6 +28,42 @@ pub struct StoredSession {
     pub latest_attempt: Option<SessionAttemptSummary>,
 }
 
+/// Why a fork was refused. The two rejections are kept apart from a storage failure because a
+/// surface answers them differently: an unknown source and a cut point outside the source's
+/// history are both things the caller asked for and can correct, not something that went wrong
+/// underneath. Neither is clamped into a fork of whatever happened to be there.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ForkSessionError {
+    UnknownSession(i64),
+    PrefixOutOfRange { requested: i64, available: i64 },
+    Store(SessionStoreError),
+}
+
+impl std::fmt::Display for ForkSessionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownSession(id) => write!(formatter, "unknown session {id}"),
+            Self::PrefixOutOfRange {
+                requested,
+                available,
+            } => write!(
+                formatter,
+                "message prefix {requested} is outside the {available} messages the session holds"
+            ),
+            Self::Store(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for ForkSessionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Store(error) => Some(error),
+            Self::UnknownSession(_) | Self::PrefixOutOfRange { .. } => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionPage {
     pub sessions: Vec<StoredSession>,
@@ -35,6 +71,27 @@ pub struct SessionPage {
 }
 
 const MAX_TRANSCRIPT_PAGE_SIZE: usize = 200;
+
+/// The session columns [`session_metadata`] reads by position, followed by the six attempt columns
+/// [`attempt_summary_from_row`] reads at offset [`LATEST_ATTEMPT_COLUMN_OFFSET`]. Shared by every
+/// listing that returns a [`StoredSession`] so the two readers can keep indexing one column order.
+const SESSION_WITH_LATEST_ATTEMPT_SELECT: &str =
+    "SELECT sessions.id, sessions.project, sessions.title, sessions.active_agent,
+                    sessions.created_at, sessions.updated_at, sessions.completed_turn_count,
+                    sessions.resumable, sessions.provider_id, sessions.model_id,
+                    sessions.reasoning_effort, sessions.parent_session_id,
+                    sessions.fork_message_count, latest.id, latest.sequence, latest.status,
+                    latest.failure_kind, latest.started_at, latest.finished_at
+             FROM sessions
+             LEFT JOIN session_attempts AS latest
+               ON latest.session_id = sessions.id
+              AND latest.sequence = (
+                  SELECT MAX(candidate.sequence)
+                  FROM session_attempts AS candidate
+                  WHERE candidate.session_id = sessions.id
+              )";
+
+const LATEST_ATTEMPT_COLUMN_OFFSET: usize = 13;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TranscriptPage {
@@ -432,7 +489,7 @@ impl SessionStore {
             .connection
             .prepare(
                 "SELECT id, project, title, active_agent, created_at, updated_at, completed_turn_count, resumable,
-                        provider_id, model_id, reasoning_effort
+                        provider_id, model_id, reasoning_effort, parent_session_id, fork_message_count
                  FROM sessions WHERE resumable = 1 ORDER BY updated_at DESC, id DESC",
             )
             .map_err(|error| SessionStoreError::operation("prepare session list", &self.database_path, error))?;
@@ -472,20 +529,8 @@ impl SessionStore {
         let cursor_id = cursor.map(SessionCursor::id);
         let mut statement = self
             .connection
-            .prepare(
-                "SELECT sessions.id, sessions.project, sessions.title, sessions.active_agent,
-                    sessions.created_at, sessions.updated_at, sessions.completed_turn_count,
-                    sessions.resumable, sessions.provider_id, sessions.model_id,
-                    sessions.reasoning_effort, latest.id, latest.sequence, latest.status,
-                    latest.failure_kind, latest.started_at, latest.finished_at
-             FROM sessions
-             LEFT JOIN session_attempts AS latest
-               ON latest.session_id = sessions.id
-              AND latest.sequence = (
-                  SELECT MAX(candidate.sequence)
-                  FROM session_attempts AS candidate
-                  WHERE candidate.session_id = sessions.id
-              )
+            .prepare(&format!(
+                "{SESSION_WITH_LATEST_ATTEMPT_SELECT}
              WHERE (sessions.completed_turn_count > 0 OR EXISTS (
                   SELECT 1 FROM session_attempts
                   WHERE session_attempts.session_id = sessions.id
@@ -500,27 +545,15 @@ impl SessionStore {
                      OR sessions.updated_at < ?3
                      OR (sessions.updated_at = ?3 AND sessions.id < ?4))
              ORDER BY sessions.updated_at DESC, sessions.id DESC
-             LIMIT ?5",
-            )
+             LIMIT ?5"
+            ))
             .map_err(|error| {
                 SessionStoreError::operation("prepare session page", &self.database_path, error)
             })?;
         let mut sessions = statement
             .query_map(
                 params![project, query, cursor_updated_at, cursor_id, fetch_limit],
-                |row| {
-                    let metadata = session_metadata(row)?;
-                    let latest_attempt = row
-                        .get::<_, Option<i64>>(11)?
-                        .map(|_| attempt_summary_from_row(row, metadata.id, 11))
-                        .transpose()?;
-
-                    Ok(StoredSession {
-                        metadata,
-                        messages: Vec::new(),
-                        latest_attempt,
-                    })
-                },
+                stored_session_from_row,
             )
             .map_err(|error| {
                 SessionStoreError::operation("query session page", &self.database_path, error)
@@ -539,6 +572,39 @@ impl SessionStore {
             sessions,
             next_cursor,
         })
+    }
+
+    /// Reads the sessions forked directly from `parent_id`, oldest fork first.
+    ///
+    /// One level only: assembling a forest is repeated calls down the lineage, which keeps the
+    /// depth a caller's concern rather than a recursive query's. Unlike
+    /// [`SessionStore::list_session_page`] this applies no content filter — a fork always carries
+    /// the history it copied — and it returns an empty list for a session with no forks and for
+    /// an unknown id alike, since a parent that is gone has no children left to list.
+    pub fn list_session_children(
+        &self,
+        parent_id: i64,
+    ) -> Result<Vec<StoredSession>, SessionStoreError> {
+        let mut statement = self
+            .connection
+            .prepare(&format!(
+                "{SESSION_WITH_LATEST_ATTEMPT_SELECT}
+             WHERE sessions.parent_session_id = ?1
+             ORDER BY sessions.created_at, sessions.id"
+            ))
+            .map_err(|error| {
+                SessionStoreError::operation("prepare session children", &self.database_path, error)
+            })?;
+
+        statement
+            .query_map([parent_id], stored_session_from_row)
+            .map_err(|error| {
+                SessionStoreError::operation("query session children", &self.database_path, error)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|error| {
+                SessionStoreError::operation("read session children", &self.database_path, error)
+            })
     }
 
     /// Reads a page of a session's thread, oldest message first.
@@ -900,7 +966,7 @@ impl SessionStore {
             .connection
             .query_row(
                 "SELECT id, project, title, active_agent, created_at, updated_at, completed_turn_count, resumable,
-                        provider_id, model_id, reasoning_effort
+                        provider_id, model_id, reasoning_effort, parent_session_id, fork_message_count
                  FROM sessions WHERE id = ?1 AND (resumable = 1 OR EXISTS (
                      SELECT 1 FROM session_attempts
                      WHERE session_attempts.session_id = sessions.id
@@ -1128,6 +1194,188 @@ impl SessionStore {
         })
     }
 
+    /// Copies a prefix of `source_id`'s conversation into a new session and returns its id,
+    /// leaving the source untouched.
+    ///
+    /// `message_prefix` is a message sequence, not an offset: every message at or below it is
+    /// copied, together with the turns those messages belong to and every part they hold.
+    /// Sequences are per-session, so they are copied verbatim rather than renumbered and the fork
+    /// reads back with the same numbering the source has. A prefix landing inside a turn copies
+    /// that turn with only the messages under the cut, the same way a truncation keeps the turn
+    /// it lands in, and the fork's `completed_turn_count`/`resumable` are set from the turns that
+    /// were actually copied.
+    ///
+    /// The fork starts with no attempt history: nothing has ever run in it, so it has no attempt
+    /// to recover, retry or report. `media` rows are shared between sessions by content hash, so
+    /// the copied parts reference the same rows and no blob is copied, rewritten or reference
+    /// counted.
+    ///
+    /// One immediate transaction covers the whole copy: a half-copied fork would be a session
+    /// whose history stops mid-turn for no reason a reader could see.
+    pub fn fork_session(
+        &mut self,
+        source_id: i64,
+        message_prefix: i64,
+    ) -> Result<i64, ForkSessionError> {
+        let database_path = self.database_path.clone();
+        let store_error = |operation: &'static str| {
+            let database_path = database_path.clone();
+            move |error: rusqlite::Error| {
+                ForkSessionError::Store(SessionStoreError::operation(
+                    operation,
+                    &database_path,
+                    error,
+                ))
+            }
+        };
+
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(store_error("start session fork"))?;
+
+        let source_exists = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)",
+                [source_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(store_error("check fork source"))?;
+        if !source_exists {
+            return Err(ForkSessionError::UnknownSession(source_id));
+        }
+
+        let available = transaction
+            .query_row(
+                "SELECT COALESCE(MAX(sequence), 0) FROM messages WHERE session_id = ?1",
+                [source_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(store_error("read fork source history"))?;
+        let copied_messages = transaction
+            .query_row(
+                "SELECT count(*) FROM messages WHERE session_id = ?1 AND sequence <= ?2",
+                params![source_id, message_prefix],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(store_error("read fork source history"))?;
+        if message_prefix < 1 || message_prefix > available || copied_messages == 0 {
+            return Err(ForkSessionError::PrefixOutOfRange {
+                requested: message_prefix,
+                available,
+            });
+        }
+
+        transaction
+            .execute(
+                "INSERT INTO sessions (project, title, active_agent, provider_id, model_id,
+                                       reasoning_effort, created_at, updated_at, confinement_root,
+                                       bypass_permission_prompts, parent_session_id,
+                                       fork_message_count, completed_turn_count, resumable)
+                 SELECT project, title, active_agent, provider_id, model_id,
+                        reasoning_effort, CAST(strftime('%s','now') AS INTEGER),
+                        CAST(strftime('%s','now') AS INTEGER), confinement_root,
+                        bypass_permission_prompts, id,
+                        ?2, 0, 0
+                 FROM sessions WHERE id = ?1",
+                params![source_id, message_prefix],
+            )
+            .map_err(store_error("create forked session"))?;
+        let fork_id = transaction.last_insert_rowid();
+
+        copy_session_prefix(&transaction, source_id, fork_id, message_prefix)
+            .map_err(store_error("copy forked session history"))?;
+
+        transaction
+            .commit()
+            .map_err(store_error("commit session fork"))?;
+        Ok(fork_id)
+    }
+
+    /// Reads one session by id, without its messages, or `None` when it is gone.
+    ///
+    /// Unlike [`SessionStore::load_session_for_resume`] this applies no resumability filter and
+    /// treats a missing session as an absence rather than a failure. It exists for the lineage
+    /// views, which show a session because something was forked from it — a reason that holds
+    /// whether or not the session itself could be entered.
+    pub fn read_session(&self, id: i64) -> Result<Option<StoredSession>, SessionStoreError> {
+        self.connection
+            .query_row(
+                &format!("{SESSION_WITH_LATEST_ATTEMPT_SELECT} WHERE sessions.id = ?1"),
+                [id],
+                stored_session_from_row,
+            )
+            .optional()
+            .map_err(|error| {
+                SessionStoreError::operation("read session", &self.database_path, error)
+            })
+    }
+
+    /// The session `session_id` was forked from, if it was forked at all.
+    ///
+    /// The counterpart of [`SessionStore::list_session_children`], and the step a caller repeats
+    /// to climb to the session a lineage is rooted at. A parent id that names a session which no
+    /// longer exists still reads as `Some`: the row records where the fork came from, not whether
+    /// that session is still around, and a caller climbing past it simply finds nothing there.
+    ///
+    /// An unknown session reads as `None`, the same as a session that was started rather than
+    /// forked — neither has a parent to climb to.
+    pub fn session_parent(&self, session_id: i64) -> Result<Option<i64>, SessionStoreError> {
+        self.connection
+            .query_row(
+                "SELECT parent_session_id FROM sessions WHERE id = ?1",
+                [session_id],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .optional()
+            .map(Option::flatten)
+            .map_err(|error| {
+                SessionStoreError::operation("read session parent", &self.database_path, error)
+            })
+    }
+
+    /// The sequence of the `count`th message of a session, counting from its oldest.
+    ///
+    /// [`SessionStore::fork_session`] cuts at a sequence, but a caller measuring an in-memory
+    /// history only ever holds a count: sequences are not dense, because a truncation leaves the
+    /// surviving messages with the numbering they already had. This is the one translation
+    /// between the two, so a caller never has to assume the nth message is numbered n.
+    ///
+    /// Returns `None` when the session holds fewer than `count` messages, which is a caller
+    /// asking about a cut that does not exist rather than a storage failure.
+    pub fn message_sequence_at(
+        &self,
+        session_id: i64,
+        count: usize,
+    ) -> Result<Option<i64>, SessionStoreError> {
+        let Some(offset) = count.checked_sub(1) else {
+            return Ok(None);
+        };
+        let offset = i64::try_from(offset).map_err(|error| {
+            SessionStoreError::operation(
+                "read session message sequence",
+                &self.database_path,
+                error,
+            )
+        })?;
+
+        self.connection
+            .query_row(
+                "SELECT sequence FROM messages WHERE session_id = ?1
+                 ORDER BY sequence LIMIT 1 OFFSET ?2",
+                params![session_id, offset],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|error| {
+                SessionStoreError::operation(
+                    "read session message sequence",
+                    &self.database_path,
+                    error,
+                )
+            })
+    }
+
     /// Drops what a session persisted between its first `surviving_messages` messages and the
     /// `measured_messages` the caller's own history covers.
     ///
@@ -1276,6 +1524,52 @@ impl SessionStore {
     }
 }
 
+/// Copies the forked prefix in foreign-key order — turns, then the messages that reference them,
+/// then those messages' parts — and sets the fork's turn counters from what the copy produced.
+///
+/// A turn is copied when any message under the cut belongs to it, so a cut inside a turn carries
+/// that turn with fewer messages. Media ids are copied as references; the `media` rows they point
+/// at are shared by content hash and belong to no single session.
+fn copy_session_prefix(
+    transaction: &Transaction<'_>,
+    source_id: i64,
+    fork_id: i64,
+    message_prefix: i64,
+) -> rusqlite::Result<()> {
+    transaction.execute(
+        "INSERT INTO turns (session_id, sequence, completed_at)
+         SELECT ?2, sequence, completed_at FROM turns
+         WHERE session_id = ?1 AND sequence IN (
+             SELECT turn_sequence FROM messages WHERE session_id = ?1 AND sequence <= ?3
+         )",
+        params![source_id, fork_id, message_prefix],
+    )?;
+    transaction.execute(
+        "INSERT INTO messages (session_id, sequence, turn_sequence, role)
+         SELECT ?2, sequence, turn_sequence, role FROM messages
+         WHERE session_id = ?1 AND sequence <= ?3",
+        params![source_id, fork_id, message_prefix],
+    )?;
+    transaction.execute(
+        "INSERT INTO message_parts (session_id, message_sequence, sequence, kind, text, call_id,
+                                    name, input_json, content, is_error, media_id, mime)
+         SELECT ?2, message_sequence, sequence, kind, text, call_id,
+                name, input_json, content, is_error, media_id, mime
+         FROM message_parts
+         WHERE session_id = ?1 AND message_sequence <= ?3",
+        params![source_id, fork_id, message_prefix],
+    )?;
+    transaction.execute(
+        "UPDATE sessions
+         SET completed_turn_count = (SELECT count(*) FROM turns WHERE session_id = ?1),
+             resumable = (SELECT count(*) FROM turns WHERE session_id = ?1) > 0
+         WHERE id = ?1",
+        params![fork_id],
+    )?;
+
+    Ok(())
+}
+
 fn validate_attempt_metadata(
     metadata: &SessionMetadata,
 ) -> Result<(), agens_core::SessionMetadataError> {
@@ -1304,6 +1598,20 @@ fn latest_attempt_summary(
         )
         .optional()
         .map_err(|error| SessionStoreError::operation("load session attempt", database_path, error))
+}
+
+fn stored_session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredSession> {
+    let metadata = session_metadata(row)?;
+    let latest_attempt = row
+        .get::<_, Option<i64>>(LATEST_ATTEMPT_COLUMN_OFFSET)?
+        .map(|_| attempt_summary_from_row(row, metadata.id, LATEST_ATTEMPT_COLUMN_OFFSET))
+        .transpose()?;
+
+    Ok(StoredSession {
+        metadata,
+        messages: Vec::new(),
+        latest_attempt,
+    })
 }
 
 fn attempt_summary_from_row(
@@ -1650,6 +1958,8 @@ fn session_metadata(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionMetadata
         completed_turn_count: u64::try_from(completed_turn_count)
             .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(6, completed_turn_count))?,
         resumable: row.get(7)?,
+        parent_session_id: row.get(11)?,
+        fork_message_count: row.get(12)?,
     };
     metadata.validate().map_err(|_| {
         rusqlite::Error::FromSqlConversionFailure(
@@ -1787,6 +2097,8 @@ mod session_page_statement_tests {
                 updated_at: id / 2,
                 completed_turn_count: 0,
                 resumable: false,
+                parent_session_id: None,
+                fork_message_count: None,
             };
             store
                 .begin_session_attempt(&metadata, format!("private-{id}"))

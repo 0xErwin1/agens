@@ -1358,6 +1358,8 @@ fn dangerous_mode_is_visible_press_once_and_next_turn_only() {
                     updated_at: 1,
                     completed_turn_count: 1,
                     resumable: true,
+                    parent_session_id: None,
+                    fork_message_count: None,
                 },
                 messages: Vec::new(),
             })
@@ -2366,6 +2368,8 @@ fn dialog_recovery_is_confirmed_private_local_safe_and_retryable() {
         updated_at: 7,
         completed_turn_count: 0,
         resumable: false,
+        parent_session_id: None,
+        fork_message_count: None,
     };
     let mut store = SessionStore::open(bootstrap.data_directory()).unwrap();
     let attempt = store
@@ -4059,6 +4063,212 @@ fn clipboard_image_route_ingests_bytes() {
     assert_eq!(staged_media.len(), 1);
     assert_eq!(staged_media[0].mime, "image/png");
     assert_eq!(session.lock().unwrap().pending_media_ids.len(), 1);
+
+    std::fs::remove_dir_all(temporary).unwrap();
+}
+
+/// Two turns, so a fork can cut between them.
+fn persist_two_turn_tui_session(
+    store: &mut SessionStore,
+    project: &str,
+    title: &str,
+) -> SessionMetadata {
+    let first = persist_tui_session(store, project, title);
+    let second = CompletedSessionTurn::new(
+        vec![
+            Message {
+                role: Role::User,
+                parts: vec![MessagePart::Text("second request".into())],
+            },
+            Message {
+                role: Role::Assistant,
+                parts: vec![MessagePart::Text("second answer".into())],
+            },
+        ]
+        .into_iter()
+        .map(SessionMessage::try_from)
+        .collect::<Result<_, _>>()
+        .unwrap(),
+    )
+    .unwrap();
+
+    store
+        .persist_completed_session_turn(&first, &second)
+        .unwrap()
+}
+
+/// The whole feature end to end: the reader stands on the first turn, forks, and lands in a new
+/// session holding only that turn — with the session they forked from left exactly as it was.
+#[test]
+fn forking_the_active_session_enters_a_copy_of_the_prefix_and_leaves_the_source_alone() {
+    let temporary = tui_session_directory("fork-enters-the-copy");
+    let bootstrap = tui_session_bootstrap(&temporary, &[]);
+    let project = tui_project(&temporary);
+    let mut store = SessionStore::open(bootstrap.data_directory()).unwrap();
+    let metadata = persist_two_turn_tui_session(&mut store, &project, "Forked");
+    let source_before = store.load_session_for_resume(metadata.id).unwrap();
+    assert_eq!(source_before.messages.len(), 5);
+    drop(store);
+
+    let session = Arc::new(Mutex::new(SessionContext {
+        identifier: Some(metadata.id),
+        messages: source_before.messages.clone(),
+        ..SessionContext::fresh()
+    }));
+    let router = TuiRuntimeRouter::with_clock(
+        bootstrap.clone(),
+        Arc::clone(&session),
+        Arc::new(Mutex::new(None)),
+        Arc::new(CommandCatalog::default()),
+        Arc::new(SkillCatalog::default()),
+        || 10_000,
+    );
+
+    let outcome = router.route_request(
+        TuiRouteRequest::ForkSession(agens_tui::SessionForkRequest::from_active_transcript(1)),
+        std::sync::mpsc::channel().0,
+    );
+
+    assert!(
+        matches!(outcome, TuiSubmissionOutcome::SessionResumed { .. }),
+        "a fork ends attached to the fork: {outcome:?}"
+    );
+    let fork_id = session.lock().unwrap().identifier.unwrap();
+    assert_ne!(fork_id, metadata.id);
+
+    let store = SessionStore::open(bootstrap.data_directory()).unwrap();
+    let fork = store.load_session_for_resume(fork_id).unwrap();
+    assert_eq!(
+        fork.messages,
+        source_before.messages[..3].to_vec(),
+        "the fork holds the first turn and nothing of the second"
+    );
+    assert_eq!(fork.metadata.parent_session_id, Some(metadata.id));
+    assert_eq!(fork.metadata.fork_message_count, Some(3));
+    assert_eq!(
+        store.load_session_for_resume(metadata.id).unwrap(),
+        source_before,
+        "the session that was forked from is untouched"
+    );
+    assert_eq!(session.lock().unwrap().messages, fork.messages);
+
+    std::fs::remove_dir_all(temporary).unwrap();
+}
+
+/// A fork point the reader never chose is refused rather than guessed at.
+#[test]
+fn forking_without_a_turn_to_cut_at_is_refused() {
+    let temporary = tui_session_directory("fork-without-a-turn");
+    let bootstrap = tui_session_bootstrap(&temporary, &[]);
+    let mut store = SessionStore::open(bootstrap.data_directory()).unwrap();
+    let metadata = persist_two_turn_tui_session(&mut store, &tui_project(&temporary), "Forked");
+    drop(store);
+
+    let session = Arc::new(Mutex::new(SessionContext {
+        identifier: Some(metadata.id),
+        ..SessionContext::fresh()
+    }));
+    let router = TuiRuntimeRouter::with_clock(
+        bootstrap.clone(),
+        Arc::clone(&session),
+        Arc::new(Mutex::new(None)),
+        Arc::new(CommandCatalog::default()),
+        Arc::new(SkillCatalog::default()),
+        || 10_000,
+    );
+
+    let refused = router.route_request(
+        TuiRouteRequest::ForkSession(agens_tui::SessionForkRequest::from_active_transcript(0)),
+        std::sync::mpsc::channel().0,
+    );
+    assert!(
+        matches!(refused, TuiSubmissionOutcome::LocalActionableError { .. }),
+        "{refused:?}"
+    );
+
+    let unsaved = Arc::new(Mutex::new(SessionContext::fresh()));
+    let unsaved_router = TuiRuntimeRouter::with_clock(
+        bootstrap.clone(),
+        unsaved,
+        Arc::new(Mutex::new(None)),
+        Arc::new(CommandCatalog::default()),
+        Arc::new(SkillCatalog::default()),
+        || 10_000,
+    );
+    let unsaved_refusal = unsaved_router.route_request(
+        TuiRouteRequest::ForkSession(agens_tui::SessionForkRequest::from_active_transcript(1)),
+        std::sync::mpsc::channel().0,
+    );
+    assert!(
+        matches!(
+            unsaved_refusal,
+            TuiSubmissionOutcome::LocalActionableError { .. }
+        ),
+        "{unsaved_refusal:?}"
+    );
+
+    let store = SessionStore::open(bootstrap.data_directory()).unwrap();
+    assert_eq!(
+        store.list_session_children(metadata.id).unwrap(),
+        Vec::new(),
+        "a refused fork writes no session"
+    );
+
+    std::fs::remove_dir_all(temporary).unwrap();
+}
+
+/// The overlay is opened from anywhere in a lineage and always shows the whole of it, rooted at
+/// the session nothing was forked from and indented by how deep each fork sits.
+#[test]
+fn the_session_tree_lists_the_whole_lineage_from_whichever_fork_it_is_opened_in() {
+    let temporary = tui_session_directory("session-tree-lineage");
+    let bootstrap = tui_session_bootstrap(&temporary, &[]);
+    let mut store = SessionStore::open(bootstrap.data_directory()).unwrap();
+    let root = persist_two_turn_tui_session(&mut store, &tui_project(&temporary), "Root");
+    let fork = store.fork_session(root.id, 3).unwrap();
+    let sibling = store.fork_session(root.id, 5).unwrap();
+    let grandchild = store.fork_session(fork, 3).unwrap();
+    drop(store);
+
+    let session = Arc::new(Mutex::new(SessionContext {
+        identifier: Some(grandchild),
+        ..SessionContext::fresh()
+    }));
+    let router = TuiRuntimeRouter::with_clock(
+        bootstrap.clone(),
+        Arc::clone(&session),
+        Arc::new(Mutex::new(None)),
+        Arc::new(CommandCatalog::default()),
+        Arc::new(SkillCatalog::default()),
+        || 10_000,
+    );
+
+    let outcome = router.route_request(
+        TuiRouteRequest::SessionTree(agens_tui::SessionTreeRequest::active()),
+        std::sync::mpsc::channel().0,
+    );
+
+    let TuiSubmissionOutcome::Dialog(dialog) = outcome else {
+        panic!("the lineage browser answers with a dialog");
+    };
+    let mut tui = Tui::new(ProductionTuiEngine {
+        cancellation: Arc::new(Mutex::new(None)),
+    });
+    tui.show_selection_dialog(dialog);
+    let rendered = render_tui_test_backend(&tui, 100, 26);
+
+    assert!(rendered.contains("Session tree"), "{rendered:?}");
+    for id in [root.id, fork, sibling, grandchild] {
+        assert!(rendered.contains(&format!("#{id}")), "{id} in {rendered:?}");
+    }
+    assert!(
+        rendered.contains(&format!("└ #{fork}")),
+        "a fork is indented under the session it came from: {rendered:?}"
+    );
+    assert!(
+        rendered.contains(&format!("└ #{grandchild}")),
+        "a fork of a fork is indented deeper: {rendered:?}"
+    );
 
     std::fs::remove_dir_all(temporary).unwrap();
 }

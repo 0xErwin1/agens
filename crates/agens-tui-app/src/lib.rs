@@ -12,6 +12,7 @@ pub mod dialogs;
 pub mod engine;
 pub mod extensions;
 pub mod files;
+pub mod fork;
 pub mod metrics;
 pub mod models;
 pub mod permission_prompt;

@@ -415,6 +415,11 @@ pub struct SessionMetadata {
     pub updated_at: i64,
     pub completed_turn_count: u64,
     pub resumable: bool,
+    /// The session this one was forked from, or `None` for a session that was started rather
+    /// than forked.
+    pub parent_session_id: Option<i64>,
+    /// The message-sequence cut point the fork copied up to, carried only by a forked session.
+    pub fork_message_count: Option<i64>,
 }
 
 impl SessionMetadata {
@@ -447,9 +452,30 @@ impl SessionMetadata {
             return Err(SessionMetadataError::InvalidModelId);
         }
 
+        self.validate_lineage()?;
+
         (self.resumable == (self.completed_turn_count > 0))
             .then_some(())
             .ok_or(SessionMetadataError::InvalidResumability)
+    }
+
+    /// Fork lineage is both-or-neither: a fork knows both the session it came from and the cut
+    /// point it copied up to, and a session that was started rather than forked knows neither.
+    /// Half a lineage would leave a fork whose origin or cut point can never be recovered.
+    fn validate_lineage(&self) -> Result<(), SessionMetadataError> {
+        match (self.parent_session_id, self.fork_message_count) {
+            (None, None) => Ok(()),
+            (Some(parent_session_id), Some(fork_message_count)) => {
+                if parent_session_id <= 0 || parent_session_id == self.id {
+                    return Err(SessionMetadataError::IncoherentFork);
+                }
+
+                (fork_message_count > 0)
+                    .then_some(())
+                    .ok_or(SessionMetadataError::InvalidForkMessageCount)
+            }
+            _ => Err(SessionMetadataError::IncoherentFork),
+        }
     }
 }
 
@@ -461,6 +487,8 @@ pub enum SessionMetadataError {
     InvalidProviderId,
     InvalidModelId,
     InvalidResumability,
+    IncoherentFork,
+    InvalidForkMessageCount,
 }
 
 /// Why a subagent turn failed. A classification the runtime makes and any

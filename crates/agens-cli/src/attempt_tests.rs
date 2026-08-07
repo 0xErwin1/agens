@@ -58,6 +58,8 @@ mod tests {
             updated_at: 1,
             completed_turn_count: 0,
             resumable: false,
+            parent_session_id: None,
+            fork_message_count: None,
         };
         let registry = AttemptActivityRegistry::default();
 
@@ -107,6 +109,8 @@ mod tests {
             updated_at: 1,
             completed_turn_count: 0,
             resumable: false,
+            parent_session_id: None,
+            fork_message_count: None,
         };
         let mut store = SessionStore::open(&directory).unwrap();
         let registry = AttemptActivityRegistry::default();
@@ -250,6 +254,8 @@ mod tests {
             updated_at: 1,
             completed_turn_count: 0,
             resumable: false,
+            parent_session_id: None,
+            fork_message_count: None,
         };
 
         let cancelled = run_session_attempt_lifecycle(
@@ -355,6 +361,8 @@ mod tests {
             updated_at: 1,
             completed_turn_count: 0,
             resumable: false,
+            parent_session_id: None,
+            fork_message_count: None,
         };
         let events = vec![
             TurnEvent::ProviderPart(MessagePart::Reasoning("checking".into())),
@@ -469,6 +477,8 @@ mod tests {
             updated_at: 1,
             completed_turn_count: 0,
             resumable: false,
+            parent_session_id: None,
+            fork_message_count: None,
         };
         let requested = Mutex::new(Vec::new());
         record_requested_subagent(
@@ -580,6 +590,8 @@ mod tests {
             updated_at: 1,
             completed_turn_count: 0,
             resumable: false,
+            parent_session_id: None,
+            fork_message_count: None,
         };
         let mut store = SessionStore::open(&directory).unwrap();
         let registry = AttemptActivityRegistry::default();
@@ -919,6 +931,8 @@ mod tests {
             updated_at,
             completed_turn_count: 0,
             resumable: false,
+            parent_session_id: None,
+            fork_message_count: None,
         }
     }
 

@@ -36,6 +36,8 @@ fn metadata(id: i64) -> SessionMetadata {
         updated_at: 20,
         completed_turn_count: 0,
         resumable: false,
+        parent_session_id: None,
+        fork_message_count: None,
     }
 }
 

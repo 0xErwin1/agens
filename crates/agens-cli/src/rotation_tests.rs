@@ -425,6 +425,8 @@ fn a_resumed_session_keeps_its_persisted_agent_over_the_configured_default() {
         updated_at: 1,
         completed_turn_count: 0,
         resumable: true,
+        parent_session_id: None,
+        fork_message_count: None,
     };
     let resumed =
         SessionContext::restored(7, metadata, Vec::new(), std::path::PathBuf::from("project"));

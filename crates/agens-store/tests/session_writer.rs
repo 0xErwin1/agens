@@ -8,7 +8,9 @@ use agens_core::{
     MAX_RETRY_PROMPT_BYTES, Message, MessagePart, ReasoningEffort, RecoveryOutcome, Role,
     SessionAttemptFailureKind, SessionAttemptStatus, SessionMessage, SessionMetadata,
 };
-use agens_store::{SessionCursor, SessionStore, StoredSession, ingest_media_bytes};
+use agens_store::{
+    ForkSessionError, SessionCursor, SessionStore, StoredSession, ingest_media_bytes,
+};
 use rusqlite::Connection;
 
 static NEXT_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
@@ -112,6 +114,8 @@ fn attempt_begin_and_finish_are_targeted_cas_transactions() {
         updated_at: 20,
         completed_turn_count: 0,
         resumable: false,
+        parent_session_id: None,
+        fork_message_count: None,
     };
     let mut store = SessionStore::open(&directory).unwrap();
 
@@ -163,6 +167,8 @@ fn successful_attempt_finish_is_atomic_exact_and_private() {
         updated_at: 20,
         completed_turn_count: 0,
         resumable: false,
+        parent_session_id: None,
+        fork_message_count: None,
     };
     let completed = turn(vec![
         Message {
@@ -245,6 +251,8 @@ fn partial_attempt_persistence_appends_history_and_drops_the_retry_prompt() {
         updated_at: 20,
         completed_turn_count: 0,
         resumable: false,
+        parent_session_id: None,
+        fork_message_count: None,
     };
     let partial = turn(vec![
         Message {
@@ -356,6 +364,8 @@ fn attempt_begin_bounds_prompts_allocates_zero_ids_and_preserves_other_sessions(
         updated_at: 20,
         completed_turn_count: 0,
         resumable: false,
+        parent_session_id: None,
+        fork_message_count: None,
     };
     let existing_attempt = store
         .begin_session_attempt(&existing, "existing-secret".into())
@@ -372,6 +382,8 @@ fn attempt_begin_bounds_prompts_allocates_zero_ids_and_preserves_other_sessions(
         updated_at: 40,
         completed_turn_count: 0,
         resumable: false,
+        parent_session_id: None,
+        fork_message_count: None,
     };
     let exact_limit = format!(
         "{}abcd",
@@ -446,6 +458,8 @@ fn terminal_attempt_cas_shapes_never_append_history() {
             updated_at: 20,
             completed_turn_count: 0,
             resumable: false,
+            parent_session_id: None,
+            fork_message_count: None,
         };
         let attempt = store
             .begin_session_attempt(&metadata, format!("private-{index}"))
@@ -504,6 +518,8 @@ fn session_pages_use_stable_keyset_search_scope_and_bounded_sizes() {
             updated_at: id / 2,
             completed_turn_count: 0,
             resumable: false,
+            parent_session_id: None,
+            fork_message_count: None,
         };
         store
             .begin_session_attempt(&metadata, format!("private-{id}"))
@@ -529,6 +545,8 @@ fn session_pages_use_stable_keyset_search_scope_and_bounded_sizes() {
         updated_at: 301,
         completed_turn_count: 0,
         resumable: false,
+        parent_session_id: None,
+        fork_message_count: None,
     };
     store
         .begin_session_attempt(&replacement, "replacement-private".into())
@@ -568,6 +586,8 @@ fn session_pages_use_stable_keyset_search_scope_and_bounded_sizes() {
         updated_at: 1_000,
         completed_turn_count: 0,
         resumable: false,
+        parent_session_id: None,
+        fork_message_count: None,
     };
     store
         .begin_session_attempt(&inserted, "inserted-private".into())
@@ -645,6 +665,8 @@ fn zero_turn_session_without_retained_retry_prompt_is_not_resumable() {
         updated_at: 20,
         completed_turn_count: 0,
         resumable: false,
+        parent_session_id: None,
+        fork_message_count: None,
     };
     let attempt = store
         .begin_session_attempt(&metadata, "discarded draft".into())
@@ -681,6 +703,8 @@ fn explicit_attempt_recovery_is_exact_stale_safe_and_history_preserving() {
         updated_at: 20,
         completed_turn_count: 0,
         resumable: false,
+        parent_session_id: None,
+        fork_message_count: None,
     };
     let mut store = SessionStore::open(&directory).unwrap();
     let attempt = store
@@ -733,6 +757,8 @@ fn explicit_attempt_recovery_is_exact_stale_safe_and_history_preserving() {
         updated_at: 20,
         completed_turn_count: 0,
         resumable: false,
+        parent_session_id: None,
+        fork_message_count: None,
     };
     let unrelated = store
         .begin_session_attempt(&unrelated_metadata, "unrelated-private".into())
@@ -930,6 +956,8 @@ fn persists_text_completed_turn_and_reopens_in_order() {
         updated_at: 20,
         completed_turn_count: 0,
         resumable: false,
+        parent_session_id: None,
+        fork_message_count: None,
     };
     let first = turn(vec![
         Message {
@@ -1022,6 +1050,8 @@ fn persists_all_typed_parts_with_canonical_tool_json() {
         updated_at: 20,
         completed_turn_count: 0,
         resumable: false,
+        parent_session_id: None,
+        fork_message_count: None,
     };
     let turn = turn(vec![
         Message {
@@ -1144,6 +1174,8 @@ fn atomically_rolls_back_failed_writes_and_appends_from_stale_metadata() {
         updated_at: 20,
         completed_turn_count: 0,
         resumable: false,
+        parent_session_id: None,
+        fork_message_count: None,
     };
     let invalid_json = turn(vec![
         Message {
@@ -1254,6 +1286,8 @@ fn appends_completed_turn_when_a_concurrent_subagent_turn_advanced_the_count() {
         updated_at: 20,
         completed_turn_count: 0,
         resumable: false,
+        parent_session_id: None,
+        fork_message_count: None,
     };
     let completed = |text: &str| {
         turn(vec![
@@ -1341,6 +1375,8 @@ fn media_parts_round_trip_without_source_path() {
         updated_at: 20,
         completed_turn_count: 0,
         resumable: false,
+        parent_session_id: None,
+        fork_message_count: None,
     };
     let completed = turn(vec![
         Message {
@@ -1414,6 +1450,8 @@ fn begin_session_attempt_allows_empty_prompt_when_media_ids_present() {
         updated_at: 20,
         completed_turn_count: 0,
         resumable: false,
+        parent_session_id: None,
+        fork_message_count: None,
     };
     let mut store = SessionStore::open(&directory).unwrap();
 
@@ -1439,6 +1477,8 @@ fn begin_session_attempt_allows_empty_prompt_when_media_ids_present() {
                     updated_at: 20,
                     completed_turn_count: 0,
                     resumable: false,
+                    parent_session_id: None,
+                    fork_message_count: None,
                 },
                 String::new(),
                 Vec::new(),
@@ -1465,6 +1505,8 @@ fn retry_boundary_round_trips_media_ids_without_source_paths() {
         updated_at: 20,
         completed_turn_count: 0,
         resumable: false,
+        parent_session_id: None,
+        fork_message_count: None,
     };
     let mut store = SessionStore::open(&directory).unwrap();
     let attempt = store
@@ -1506,6 +1548,8 @@ fn retry_boundary_round_trips_media_ids_without_source_paths() {
                 updated_at: 20,
                 completed_turn_count: 0,
                 resumable: false,
+                parent_session_id: None,
+                fork_message_count: None,
             },
             "text only".into(),
             Vec::new(),
@@ -1538,6 +1582,8 @@ fn session_store_crud_round_trips_normalized_context() {
         updated_at: 20,
         completed_turn_count: 0,
         resumable: false,
+        parent_session_id: None,
+        fork_message_count: None,
     };
     let messages = vec![
         Message {
@@ -1627,6 +1673,8 @@ fn session_store_rejects_legacy_resume_and_delete_is_idempotent() {
         updated_at: 20,
         completed_turn_count: 0,
         resumable: false,
+        parent_session_id: None,
+        fork_message_count: None,
     };
     store
         .persist_completed_session_turn(
@@ -1674,6 +1722,8 @@ fn selection_metadata_round_trips_updates_atomically_and_preserves_crud_boundari
         updated_at: 20,
         completed_turn_count: 0,
         resumable: false,
+        parent_session_id: None,
+        fork_message_count: None,
     };
     let mut store = SessionStore::open(&directory).unwrap();
     metadata = store
@@ -1714,7 +1764,7 @@ fn selection_metadata_round_trips_updates_atomically_and_preserves_crud_boundari
         )
         .unwrap();
     assert!(schema.ends_with(
-        "provider_id,model_id,reasoning_effort,confinement_root,bypass_permission_prompts"
+        "provider_id,model_id,reasoning_effort,confinement_root,bypass_permission_prompts,parent_session_id,fork_message_count"
     ));
     for forbidden in [
         "credential",
@@ -1752,6 +1802,8 @@ fn a_freshly_created_session_records_its_own_confinement_root() {
         updated_at: 20,
         completed_turn_count: 0,
         resumable: false,
+        parent_session_id: None,
+        fork_message_count: None,
     };
     let mut store = SessionStore::open(&directory).unwrap();
     let attempt = store
@@ -1779,6 +1831,8 @@ fn confinement_root_falls_back_to_project_for_rows_recorded_before_the_column_ex
         updated_at: 20,
         completed_turn_count: 0,
         resumable: false,
+        parent_session_id: None,
+        fork_message_count: None,
     };
     let mut store = SessionStore::open(&directory).unwrap();
     let attempt = store
@@ -1815,6 +1869,8 @@ fn a_freshly_created_session_has_no_recorded_bypass_permission_prompts_value() {
         updated_at: 20,
         completed_turn_count: 0,
         resumable: false,
+        parent_session_id: None,
+        fork_message_count: None,
     };
     let mut store = SessionStore::open(&directory).unwrap();
     let attempt = store
@@ -1844,6 +1900,8 @@ fn setting_bypass_permission_prompts_round_trips_true_and_false() {
         updated_at: 20,
         completed_turn_count: 0,
         resumable: false,
+        parent_session_id: None,
+        fork_message_count: None,
     };
     let mut store = SessionStore::open(&directory).unwrap();
     let attempt = store
@@ -1883,6 +1941,8 @@ fn session_with_three_turns(directory: &std::path::Path, media_id: i64) -> (Sess
         updated_at: 20,
         completed_turn_count: 0,
         resumable: false,
+        parent_session_id: None,
+        fork_message_count: None,
     };
     let turns = [
         turn(vec![
@@ -2167,5 +2227,371 @@ fn a_turn_persisted_after_the_measured_history_survives_the_truncation() {
     assert_eq!(
         after.metadata.completed_turn_count, 3,
         "the surviving out-of-band turn is still counted"
+    );
+}
+
+/// Everything the parent must still hold after a fork, read back through the paths a resume and
+/// the session browser use rather than by inspecting rows one at a time.
+fn parent_evidence(store: &SessionStore, session_id: i64) -> (StoredSession, Vec<Option<i64>>) {
+    (
+        store.load_session_for_resume(session_id).unwrap(),
+        attempt_turn_sequences(store, session_id),
+    )
+}
+
+fn session_attempt_count(store: &SessionStore, session_id: i64) -> i64 {
+    let connection = Connection::open(store.database_path()).unwrap();
+    connection
+        .query_row(
+            "SELECT count(*) FROM session_attempts WHERE session_id = ?1",
+            [session_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+/// The claim the feature rests on: a fork is a second session holding a copy of the prefix, and
+/// the session it was forked from is left exactly as it was.
+#[test]
+fn forking_copies_the_prefix_and_leaves_the_parent_untouched() {
+    let directory = directory();
+    let media = ingest_media_bytes(&directory, b"session-media", "image/png").unwrap();
+    let (mut store, session_id) = session_with_three_turns(&directory, media.id);
+    let before = parent_evidence(&store, session_id);
+    assert_eq!(before.0.messages.len(), 8);
+
+    let fork_id = store.fork_session(session_id, 6).unwrap();
+
+    assert_ne!(fork_id, session_id);
+    assert_eq!(
+        parent_evidence(&store, session_id),
+        before,
+        "the parent keeps its messages, turns, counters and attempt history"
+    );
+
+    let fork = store.load_session_for_resume(fork_id).unwrap();
+    assert_eq!(fork.messages, before.0.messages[..6].to_vec());
+    assert_eq!(fork.metadata.parent_session_id, Some(session_id));
+    assert_eq!(fork.metadata.fork_message_count, Some(6));
+    assert_eq!(fork.metadata.project, before.0.metadata.project);
+    assert_eq!(fork.metadata.title, before.0.metadata.title);
+    assert_eq!(fork.metadata.active_agent, before.0.metadata.active_agent);
+    assert_eq!(fork.metadata.completed_turn_count, 2);
+    assert!(fork.metadata.resumable);
+    assert_eq!(fork.latest_attempt, None, "a fork has run nothing yet");
+    assert_eq!(session_attempt_count(&store, fork_id), 0);
+
+    let connection = Connection::open(store.database_path()).unwrap();
+    assert_eq!(normalized_counts(&connection), (2, 5, 14, 16));
+    assert_eq!(
+        connection
+            .query_row("SELECT count(*) FROM media", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        1,
+        "media rows are shared by content hash and a fork references rather than copies them"
+    );
+    assert_eq!(
+        fork.messages[0].parts[1],
+        MessagePart::Media {
+            media_id: media.id,
+            mime: "image/png".into(),
+        },
+        "the copied media part resolves to the same shared blob"
+    );
+    assert_eq!(
+        fork.messages[3].parts[0],
+        MessagePart::ToolCall {
+            id: "call-1".into(),
+            name: "search".into(),
+            input: r#"{"query":"answer"}"#.into(),
+        },
+    );
+    assert_eq!(
+        fork.messages[4].parts[0],
+        MessagePart::ToolResult {
+            tool_call_id: "call-1".into(),
+            content: "found".into(),
+            is_error: false,
+        },
+    );
+}
+
+/// The cut point is a message boundary, not a turn boundary: one that lands inside a turn copies
+/// that turn with only the messages under the cut, exactly as a truncation keeps the turn it
+/// lands in.
+#[test]
+fn forking_inside_a_turn_copies_the_turn_it_lands_in() {
+    let directory = directory();
+    let media = ingest_media_bytes(&directory, b"session-media", "image/png").unwrap();
+    let (mut store, session_id) = session_with_three_turns(&directory, media.id);
+    let before = parent_evidence(&store, session_id);
+
+    let fork_id = store.fork_session(session_id, 3).unwrap();
+
+    let fork = store.load_session_for_resume(fork_id).unwrap();
+    assert_eq!(fork.messages, before.0.messages[..3].to_vec());
+    assert_eq!(
+        fork.metadata.completed_turn_count, 2,
+        "the turn the cut lands in is copied with the messages under the cut"
+    );
+    assert!(fork.metadata.resumable);
+    assert_eq!(fork.metadata.fork_message_count, Some(3));
+    assert_eq!(
+        parent_evidence(&store, session_id),
+        before,
+        "a mid-turn fork still leaves the parent whole"
+    );
+}
+
+/// Message sequences are per-session, so a fork keeps the parent's numbering rather than
+/// renumbering from one; the turn a message belongs to has to be copied under the same sequence
+/// for the foreign key to hold at all.
+#[test]
+fn a_fork_keeps_the_message_and_turn_sequences_it_copied() {
+    let directory = directory();
+    let media = ingest_media_bytes(&directory, b"session-media", "image/png").unwrap();
+    let (mut store, session_id) = session_with_three_turns(&directory, media.id);
+
+    let fork_id = store.fork_session(session_id, 6).unwrap();
+
+    let connection = Connection::open(store.database_path()).unwrap();
+    let sequences = |table: &str, id: i64| {
+        let mut statement = connection
+            .prepare(&format!(
+                "SELECT sequence FROM {table} WHERE session_id = ?1 ORDER BY sequence"
+            ))
+            .unwrap();
+        statement
+            .query_map([id], |row| row.get::<_, i64>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+
+    assert_eq!(sequences("messages", fork_id), vec![1, 2, 3, 4, 5, 6]);
+    assert_eq!(sequences("turns", fork_id), vec![1, 2]);
+    assert_eq!(sequences("turns", session_id), vec![1, 2, 3]);
+}
+
+/// Neither rejection is clamped into a fork of whatever happened to be stored.
+#[test]
+fn forking_refuses_an_unknown_source_and_a_prefix_outside_the_history() {
+    let directory = directory();
+    let media = ingest_media_bytes(&directory, b"session-media", "image/png").unwrap();
+    let (mut store, session_id) = session_with_three_turns(&directory, media.id);
+
+    assert_eq!(
+        store.fork_session(session_id + 500, 1).unwrap_err(),
+        ForkSessionError::UnknownSession(session_id + 500)
+    );
+    assert_eq!(
+        store.fork_session(session_id, 9).unwrap_err(),
+        ForkSessionError::PrefixOutOfRange {
+            requested: 9,
+            available: 8,
+        }
+    );
+    assert_eq!(
+        store.fork_session(session_id, 0).unwrap_err(),
+        ForkSessionError::PrefixOutOfRange {
+            requested: 0,
+            available: 8,
+        }
+    );
+
+    let connection = Connection::open(store.database_path()).unwrap();
+    assert_eq!(
+        normalized_counts(&connection),
+        (1, 3, 8, 9),
+        "a refused fork writes nothing"
+    );
+}
+
+/// The lineage a browser needs: the parent lists its forks, a fork lists none of its own, and the
+/// ordinary session page carries the lineage columns for every row it already returned.
+#[test]
+fn session_children_and_pages_carry_the_fork_lineage() {
+    let directory = directory();
+    let media = ingest_media_bytes(&directory, b"session-media", "image/png").unwrap();
+    let (mut store, session_id) = session_with_three_turns(&directory, media.id);
+
+    let first_fork = store.fork_session(session_id, 2).unwrap();
+    let second_fork = store.fork_session(session_id, 6).unwrap();
+    let grandchild = store.fork_session(first_fork, 1).unwrap();
+
+    let children = store.list_session_children(session_id).unwrap();
+    assert_eq!(
+        children
+            .iter()
+            .map(|child| child.metadata.id)
+            .collect::<Vec<_>>(),
+        vec![first_fork, second_fork]
+    );
+    assert_eq!(children[0].metadata.fork_message_count, Some(2));
+    assert_eq!(children[1].metadata.fork_message_count, Some(6));
+    assert_eq!(children[0].latest_attempt, None);
+    assert_eq!(
+        store
+            .list_session_children(first_fork)
+            .unwrap()
+            .iter()
+            .map(|child| child.metadata.id)
+            .collect::<Vec<_>>(),
+        vec![grandchild]
+    );
+    assert_eq!(
+        store.list_session_children(second_fork).unwrap(),
+        Vec::new()
+    );
+
+    let listed = collect_session_pages(&store, Some("project"), "");
+    let lineage = listed
+        .iter()
+        .map(|session| {
+            (
+                session.metadata.id,
+                session.metadata.parent_session_id,
+                session.metadata.fork_message_count,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(lineage.contains(&(session_id, None, None)));
+    assert!(lineage.contains(&(first_fork, Some(session_id), Some(2))));
+    assert!(lineage.contains(&(second_fork, Some(session_id), Some(6))));
+    assert!(lineage.contains(&(grandchild, Some(first_fork), Some(1))));
+}
+
+/// The step a lineage browser climbs with, and its answer for the two sessions that have nowhere
+/// to climb to: one that was started rather than forked, and one that is not there at all.
+#[test]
+fn a_session_parent_is_readable_and_absent_for_a_root_and_an_unknown_session() {
+    let directory = directory();
+    let media = ingest_media_bytes(&directory, b"session-media", "image/png").unwrap();
+    let (mut store, session_id) = session_with_three_turns(&directory, media.id);
+
+    let fork_id = store.fork_session(session_id, 4).unwrap();
+
+    assert_eq!(store.session_parent(fork_id).unwrap(), Some(session_id));
+    assert_eq!(store.session_parent(session_id).unwrap(), None);
+    assert_eq!(store.session_parent(session_id + 500).unwrap(), None);
+}
+
+/// A lineage lists a session because something was forked from it, so reading one applies no
+/// resumability filter — and a session that is gone reads as an absence, not a failure.
+#[test]
+fn reading_one_session_ignores_resumability_and_reports_a_missing_one_as_absent() {
+    let directory = directory();
+    let media = ingest_media_bytes(&directory, b"session-media", "image/png").unwrap();
+    let (mut store, session_id) = session_with_three_turns(&directory, media.id);
+    let fork_id = store.fork_session(session_id, 4).unwrap();
+
+    let read = store.read_session(session_id).unwrap().unwrap();
+    assert_eq!(read.metadata.id, session_id);
+    assert_eq!(read.metadata.parent_session_id, None);
+    assert!(
+        read.messages.is_empty(),
+        "a lineage row carries metadata, not a transcript"
+    );
+    assert_eq!(
+        store
+            .read_session(fork_id)
+            .unwrap()
+            .unwrap()
+            .metadata
+            .fork_message_count,
+        Some(4)
+    );
+
+    assert_eq!(store.read_session(session_id + 500).unwrap(), None);
+}
+
+/// The translation a caller needs because it holds a count and the fork needs a sequence. A
+/// truncation leaves the surviving messages with the numbering they already had, so the two stop
+/// agreeing exactly when a caller would most likely assume they still do.
+#[test]
+fn a_message_count_resolves_to_its_sequence_across_a_gap_left_by_a_truncation() {
+    let directory = directory();
+    let media = ingest_media_bytes(&directory, b"session-media", "image/png").unwrap();
+    let (mut store, session_id) = session_with_three_turns(&directory, media.id);
+
+    assert_eq!(store.message_sequence_at(session_id, 1).unwrap(), Some(1));
+    assert_eq!(store.message_sequence_at(session_id, 8).unwrap(), Some(8));
+    assert_eq!(store.message_sequence_at(session_id, 0).unwrap(), None);
+    assert_eq!(store.message_sequence_at(session_id, 9).unwrap(), None);
+
+    // Drop the third turn's messages, then re-append: the survivors keep 1..=6 and the new
+    // messages continue past the numbers the deleted ones held.
+    store.truncate_session_history(session_id, 6, 8).unwrap();
+    let sequences: Vec<i64> = Connection::open(store.database_path())
+        .unwrap()
+        .prepare("SELECT sequence FROM messages WHERE session_id = ?1 ORDER BY sequence")
+        .unwrap()
+        .query_map([session_id], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(sequences, vec![1, 2, 3, 4, 5, 6]);
+    assert_eq!(store.message_sequence_at(session_id, 6).unwrap(), Some(6));
+    assert_eq!(store.message_sequence_at(session_id, 7).unwrap(), None);
+
+    // The sequence a count resolves to is the one the fork must be given.
+    let fork_id = store
+        .fork_session(
+            session_id,
+            store.message_sequence_at(session_id, 4).unwrap().unwrap(),
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .load_session_for_resume(fork_id)
+            .unwrap()
+            .messages
+            .len(),
+        4
+    );
+}
+
+/// Reopening an already-migrated database applies nothing a second time: the ledger keeps one row
+/// for the fork migration and the columns and forest index it added stay single.
+#[test]
+fn the_fork_lineage_migration_is_idempotent_on_an_already_migrated_database() {
+    let directory = directory();
+    let store = SessionStore::open(&directory).unwrap();
+    drop(store);
+
+    let store = SessionStore::open(&directory).unwrap();
+    let connection = Connection::open(store.database_path()).unwrap();
+
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT count(*) FROM schema_migrations WHERE id = '0011_session_fork_lineage'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('sessions')
+                 WHERE name IN ('parent_session_id', 'fork_message_count')",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema
+                 WHERE type = 'index' AND name = 'sessions_forest'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1
     );
 }

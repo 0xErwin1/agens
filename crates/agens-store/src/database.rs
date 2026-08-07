@@ -57,7 +57,7 @@ struct Migration {
     preserved_tables: &'static [&'static str],
 }
 
-const MIGRATIONS: [Migration; 10] = [
+const MIGRATIONS: [Migration; 11] = [
     Migration {
         id: "0001_permission_grants",
         ddl: permission_grants_ddl,
@@ -107,6 +107,11 @@ const MIGRATIONS: [Migration; 10] = [
         id: "0010_prompt_memory_media",
         ddl: prompt_memory_media_ddl,
         preserved_tables: &["prompt_history", "prompt_stash"],
+    },
+    Migration {
+        id: "0011_session_fork_lineage",
+        ddl: session_fork_lineage_ddl,
+        preserved_tables: &[],
     },
 ];
 
@@ -664,6 +669,29 @@ fn prompt_memory_media_ddl() -> String {
     .to_owned()
 }
 
+/// The lineage a forked session carries: the session its history was copied from, and the
+/// message-sequence cut point it was copied up to. Both are NULL on a session that was started
+/// rather than forked, and the pair is written together so a fork can never lose its origin or
+/// its cut point.
+///
+/// The column carries no `REFERENCES sessions(id)` clause on purpose. A real foreign key would
+/// force one of three answers to "what happens to a fork when its parent is deleted", and all
+/// three change behavior this migration has no mandate to change: `NO ACTION` makes deleting a
+/// forked-from session fail, `CASCADE` silently deletes the forks with it, and `SET NULL` clears
+/// the parent while leaving `fork_message_count` behind, breaking the both-or-neither invariant
+/// the read path validates. A dangling parent id simply reads as a fork whose parent is gone.
+///
+/// `sessions_list` is `(resumable, updated_at DESC, id DESC)`, which no lineage query can use;
+/// the forest index makes reading a session's children an index lookup instead of a table scan.
+fn session_fork_lineage_ddl() -> String {
+    "
+    ALTER TABLE sessions ADD COLUMN parent_session_id INTEGER;
+    ALTER TABLE sessions ADD COLUMN fork_message_count INTEGER;
+    CREATE INDEX sessions_forest ON sessions(parent_session_id, id);
+    "
+    .to_owned()
+}
+
 #[cfg(unix)]
 fn restrict_permissions(path: &Path, maximum_mode: u32) -> Result<(), DatabaseError> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -987,6 +1015,8 @@ mod tests {
                 "reasoning_effort",
                 "confinement_root",
                 "bypass_permission_prompts",
+                "parent_session_id",
+                "fork_message_count",
             ]
         );
 
@@ -1072,8 +1102,9 @@ mod tests {
             );
         }
 
-        // `sessions` keeps every pre-existing column, unchanged and in the same order, with
-        // exactly one new column appended.
+        // `sessions` keeps every pre-existing column, unchanged and in the same order. This test
+        // opens a freshly created database, so every later migration has already applied too — it
+        // asserts bypass_permission_prompts's own position, not the full column set.
         assert_eq!(
             ordered_table_columns(&connection, "sessions"),
             vec![
@@ -1090,6 +1121,8 @@ mod tests {
                 "reasoning_effort",
                 "confinement_root",
                 "bypass_permission_prompts",
+                "parent_session_id",
+                "fork_message_count",
             ]
         );
 
@@ -1130,6 +1163,55 @@ mod tests {
                      VALUES ('chatgpt-subscription', 'gpt-5.5', NULL);",
             )
             .expect("distinct sources must coexist");
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn migration_0011_is_purely_additive_and_adds_a_nullable_fork_lineage_pair() {
+        let directory = data_directory();
+        let (_, connection) = open_unified_database(&directory).unwrap();
+
+        for column in ["parent_session_id", "fork_message_count"] {
+            let (declared_type, not_null, default_value): (String, i64, Option<String>) =
+                connection
+                    .query_row(
+                        "SELECT type, \"notnull\", dflt_value FROM pragma_table_info('sessions')
+                     WHERE name = ?1",
+                        params![column],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .unwrap();
+            assert_eq!(declared_type, "INTEGER");
+            assert_eq!(not_null, 0, "{column} must be nullable");
+            assert_eq!(default_value, None);
+        }
+
+        let forest_index: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE type = 'index' AND name = 'sessions_forest'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(forest_index.contains("sessions(parent_session_id, id)"));
+
+        // A session that was started rather than forked carries neither half of the lineage, so
+        // no pre-existing row needs a backfill.
+        connection
+            .execute_batch(
+                "INSERT INTO sessions (project, title, active_agent, created_at, updated_at)
+                 VALUES ('project', 'title', 'primary', 1, 1);",
+            )
+            .unwrap();
+        let lineage: (Option<i64>, Option<i64>) = connection
+            .query_row(
+                "SELECT parent_session_id, fork_message_count FROM sessions",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(lineage, (None, None));
 
         fs::remove_dir_all(directory).unwrap();
     }
