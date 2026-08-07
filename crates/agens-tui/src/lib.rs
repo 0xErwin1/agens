@@ -848,12 +848,14 @@ pub enum TranscriptFocus {
     Viewport,
 }
 
-/// The discoverable main-surface destination selected with Tab.
+/// Which surface above the prompt holds the keyboard.
+///
+/// The subagent tree is deliberately absent: it hangs below the composer and is
+/// walked into with the down arrow, so Tab has exactly one destination.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SurfaceFocus {
     Composer,
     Queue,
-    Activity,
 }
 
 const DEFAULT_PROMPT_QUEUE_CAPACITY: usize = 8;
@@ -4290,10 +4292,10 @@ fn hint_spans(state: &ViewState<'_>) -> Vec<Span<'static>> {
                 ("Enter", "edit"),
                 ("Del", "remove"),
                 ("Alt↑↓", "reorder"),
-                ("Tab", "activity"),
+                ("Tab", "composer"),
             ]);
         }
-    } else if state.surface_focus == SurfaceFocus::Activity {
+    } else if state.execution_selection.is_some() {
         if state.size.0 < 52 {
             hints.push(("ACTIVITY", "x cancel X all"));
         } else {
@@ -4303,7 +4305,6 @@ fn hint_spans(state: &ViewState<'_>) -> Vec<Span<'static>> {
                 ("x", "cancel selected"),
                 ("X", "cancel all"),
                 ("Enter", "inspect"),
-                ("Tab", "composer"),
             ]);
         }
     } else if state.focus == TranscriptFocus::Viewport {
@@ -8311,7 +8312,7 @@ where
         }
 
         if !self.palette_open && !self.file_picker_open() && key == Key::Tab {
-            self.cycle_surface_focus();
+            self.toggle_queue_focus();
             return Action::Render;
         }
 
@@ -8331,14 +8332,6 @@ where
 
         if !self.palette_open && !self.file_picker_open() && !self.executions.is_empty() {
             match key {
-                Key::Tab => {
-                    if self.execution_selection.is_some() {
-                        self.execution_selection = None;
-                    } else {
-                        self.focus_execution_strip();
-                    }
-                    return Action::Render;
-                }
                 // The tree hangs below the composer, so walking down out of the
                 // prompt walks into it. Only from an empty prompt: with text in
                 // it, Down belongs to the text.
@@ -8375,6 +8368,16 @@ where
                 }
                 Key::CtrlB if self.execution_selection.is_some() => {
                     return self.handle_background_key();
+                }
+                // Cancellation belongs to the tree only while the reader is
+                // standing in it; with no row selected these are just letters.
+                Key::Char('x') if self.execution_selection.is_some() => {
+                    if let Some(action) = self.selected_execution_cancellation() {
+                        return action;
+                    }
+                }
+                Key::Char('X') if self.execution_selection.is_some() => {
+                    return Action::CancelAllExecutions;
                 }
                 _ => {}
             }
@@ -8620,47 +8623,21 @@ where
         }
     }
 
-    fn cycle_surface_focus(&mut self) {
+    /// Tab toggles between the prompt and the queue sitting above it.
+    ///
+    /// The subagent tree used to be the third stop on this ring; it is reached
+    /// with the down arrow instead, which is the direction it actually lies in.
+    fn toggle_queue_focus(&mut self) {
         self.surface_focus = match self.surface_focus {
             SurfaceFocus::Composer => {
                 self.queue_selected = (!self.scheduler.queued_entries().is_empty()).then_some(0);
                 SurfaceFocus::Queue
             }
-            SurfaceFocus::Queue => {
-                if !self.executions.is_empty() {
-                    self.focus_execution_strip();
-                }
-                SurfaceFocus::Activity
-            }
-            SurfaceFocus::Activity => SurfaceFocus::Composer,
+            SurfaceFocus::Queue => SurfaceFocus::Composer,
         };
     }
 
     fn handle_surface_focus_key(&mut self, key: Key) -> Option<Action> {
-        if self.surface_focus == SurfaceFocus::Activity {
-            return match key {
-                Key::Up => {
-                    self.move_execution_selection(-1);
-                    Some(Action::Render)
-                }
-                Key::Down => {
-                    self.move_execution_selection(1);
-                    Some(Action::Render)
-                }
-                Key::Enter if self.execution_selection.is_some() => {
-                    self.inspect_execution_selection();
-                    Some(Action::Render)
-                }
-                Key::Char('x') => self.selected_execution_cancellation(),
-                Key::Char('X') => Some(Action::CancelAllExecutions),
-                // Typing returns to the composer so `/` commands still work mid-turn.
-                key if key.edits_composer() => {
-                    self.surface_focus = SurfaceFocus::Composer;
-                    None
-                }
-                _ => Some(Action::Render),
-            };
-        }
         if self.surface_focus != SurfaceFocus::Queue {
             return None;
         }

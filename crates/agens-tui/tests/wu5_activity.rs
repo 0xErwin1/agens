@@ -1,6 +1,6 @@
 use agens_tui::{
-    Action, Engine, Event, Key, SurfaceFocus, Tui, TuiExecutionEvent, TuiExecutionState,
-    TuiRuntimeEvent,
+    Action, Engine, Event, Key, SurfaceFocus, TranscriptId, Tui, TuiExecutionEvent,
+    TuiExecutionState, TuiRuntimeEvent,
 };
 
 #[derive(Default)]
@@ -28,9 +28,17 @@ fn activity_focus_lists_hidden_work_and_requests_selected_or_all_cancellation() 
     start_execution(&mut tui, 8, true);
 
     assert_eq!(tui.executions().len(), 2);
-    assert_eq!(tui.handle(Event::Key(Key::Tab)), Action::Render);
-    assert_eq!(tui.handle(Event::Key(Key::Tab)), Action::Render);
-    assert_eq!(tui.view().surface_focus, SurfaceFocus::Activity);
+    assert_eq!(tui.handle(Event::Key(Key::Down)), Action::Render);
+    assert_eq!(
+        tui.view().execution_selection,
+        Some(TranscriptId::Main),
+        "the down arrow is the only door into the tree"
+    );
+    assert_eq!(
+        tui.view().surface_focus,
+        SurfaceFocus::Composer,
+        "the tree is not a Tab surface"
+    );
 
     assert_eq!(tui.handle(Event::Key(Key::Down)), Action::Render);
     assert_eq!(tui.handle(Event::Key(Key::Down)), Action::Render);

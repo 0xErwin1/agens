@@ -665,9 +665,12 @@ fn execution_strip_navigation_enters_children_and_backgrounds_the_focused_execut
     assert_eq!(tui.handle(Event::Key(Key::Tab)), Action::Render);
     assert_eq!(tui.view().surface_focus, agens_tui::SurfaceFocus::Queue);
     assert_eq!(tui.handle(Event::Key(Key::Tab)), Action::Render);
-    assert_eq!(tui.view().surface_focus, agens_tui::SurfaceFocus::Activity);
-    assert_eq!(tui.handle(Event::Key(Key::Tab)), Action::Render);
     assert_eq!(tui.view().surface_focus, agens_tui::SurfaceFocus::Composer);
+    assert_eq!(
+        tui.view().execution_selection,
+        None,
+        "Tab never reaches the subagent tree"
+    );
     assert_eq!(tui.input(), "next task");
     assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Render);
     assert_eq!(tui.view().active_transcript, TranscriptId::Main);
@@ -4066,9 +4069,12 @@ fn the_file_picker_takes_navigation_keys_before_the_subagent_strip() {
     assert_eq!(tui.handle(Event::Key(Key::Tab)), Action::Render);
     assert_eq!(tui.view().surface_focus, agens_tui::SurfaceFocus::Queue);
     assert_eq!(tui.handle(Event::Key(Key::Tab)), Action::Render);
-    assert_eq!(tui.view().surface_focus, agens_tui::SurfaceFocus::Activity);
-    assert_eq!(tui.handle(Event::Key(Key::Tab)), Action::Render);
     assert_eq!(tui.view().surface_focus, agens_tui::SurfaceFocus::Composer);
+    assert_eq!(
+        tui.view().execution_selection,
+        None,
+        "Tab never reaches the subagent tree"
+    );
 
     typed(&mut tui, "@src/lib");
     tui.handle(Event::Key(Key::Down));

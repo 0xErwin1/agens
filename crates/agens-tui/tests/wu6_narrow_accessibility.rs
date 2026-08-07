@@ -66,7 +66,17 @@ fn narrow_surface_keeps_composer_queue_and_activity_controls_reachable() {
     );
 
     tui.handle(Event::Key(Key::Tab));
-    assert_eq!(tui.view().surface_focus, SurfaceFocus::Activity);
+    assert_eq!(
+        tui.view().surface_focus,
+        SurfaceFocus::Composer,
+        "Tab toggles the queue; it does not ring on into the tree"
+    );
+
+    // The tree lies below the prompt, so an empty prompt walks down into it.
+    tui.handle(Event::Key(Key::LineEnd));
+    tui.handle(Event::Key(Key::DeleteToLineStart));
+    tui.handle(Event::Key(Key::Down));
+    assert!(tui.view().execution_selection.is_some());
     renderer.render(tui.view()).unwrap();
     let activity = rendered_text(&renderer);
     assert!(activity.contains("ACTIVITY"), "{activity:?}");

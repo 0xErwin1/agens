@@ -32,7 +32,7 @@ pub const SHORTCUTS: &[ShortcutGroup] = &[
             shortcut("Enter", "Send the prompt"),
             shortcut("Shift+Enter", "Newline without sending"),
             shortcut("Esc", "Focus the transcript (never cancels)"),
-            shortcut("Esc Esc", "Cancel the running turn"),
+            shortcut("Tab", "Focus the queued prompts"),
             shortcut("Ctrl+C Ctrl+C", "Quit"),
             shortcut("Ctrl+?", "This list"),
             shortcut("/", "Command palette"),
@@ -92,7 +92,7 @@ pub const SHORTCUTS: &[ShortcutGroup] = &[
             shortcut("Up", "Leave the tree from its first row"),
             shortcut("Enter", "Open the selected subagent"),
             shortcut("Enter on Main", "Back to the prompt"),
-            shortcut("Tab", "Enter or leave the tree"),
+            shortcut("x / X", "Cancel the selected subagent / all"),
         ],
     },
     ShortcutGroup {

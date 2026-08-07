@@ -2430,8 +2430,7 @@ fn the_tree_offers_cancel_only_over_a_running_branch_and_the_key_cancels_it() {
         "nothing is selected yet, so the key would act on nothing"
     );
 
-    tui.handle(Event::Key(Key::Tab));
-    tui.handle(Event::Key(Key::Tab));
+    tui.handle(Event::Key(Key::Down));
     tui.handle(Event::Key(Key::Down));
     tui.handle(Event::Key(Key::Enter));
     assert_eq!(tui.view().active_transcript, TranscriptId::Subagent(9));

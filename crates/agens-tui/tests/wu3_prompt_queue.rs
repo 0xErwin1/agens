@@ -33,9 +33,11 @@ fn running_composer_keeps_editing_cursor_and_tab_focus_without_escape_mode_switc
     assert_eq!(tui.handle(Event::Key(Key::Tab)), Action::Render);
     assert_eq!(tui.view().surface_focus, SurfaceFocus::Queue);
     assert_eq!(tui.handle(Event::Key(Key::Tab)), Action::Render);
-    assert_eq!(tui.view().surface_focus, SurfaceFocus::Activity);
-    assert_eq!(tui.handle(Event::Key(Key::Tab)), Action::Render);
-    assert_eq!(tui.view().surface_focus, SurfaceFocus::Composer);
+    assert_eq!(
+        tui.view().surface_focus,
+        SurfaceFocus::Composer,
+        "Tab is a toggle between the prompt and its queue, not a ring"
+    );
 
     assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Render);
     assert_eq!(tui.view().surface_focus, SurfaceFocus::Composer);
