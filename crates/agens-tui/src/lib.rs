@@ -8393,7 +8393,14 @@ where
             return Action::Render;
         }
 
+        // With nothing left to dismiss, Esc is how the reader leaves the prompt
+        // for Normal mode. It stays inert on the turn itself: focusing the
+        // transcript mid-stream is a way to read, never a way to cancel.
         if key == Key::Escape {
+            let record = self.active_record_mut();
+            if record.focus == TranscriptFocus::Composer {
+                record.focus = TranscriptFocus::Viewport;
+            }
             return Action::Render;
         }
 
@@ -13861,14 +13868,32 @@ mod runtime_tests {
         tui
     }
 
+    /// Esc moves the reader, not the turn: it hands focus to the transcript so
+    /// a running answer can be read from the top, and leaves the turn running.
     #[test]
-    fn escape_is_inert_on_the_main_surface_while_a_turn_is_running() {
+    fn escape_focuses_the_transcript_without_cancelling_a_running_turn() {
         let mut tui = scrollable_tui();
         tui.set_running(true);
 
         assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Render);
-        assert_eq!(tui.view().focus, TranscriptFocus::Composer);
+        assert_eq!(tui.view().focus, TranscriptFocus::Viewport);
         assert!(tui.view().running);
+    }
+
+    /// The prompt is one keystroke away again, and the transcript keymap that
+    /// Esc turned on is what makes `i` mean "back to typing" instead of text.
+    #[test]
+    fn escape_then_i_returns_to_the_composer() {
+        let mut tui = scrollable_tui();
+
+        tui.handle(Event::Key(Key::Escape));
+        assert_eq!(tui.view().focus, TranscriptFocus::Viewport);
+
+        tui.handle(Event::Key(Key::Char('i')));
+        assert_eq!(tui.view().focus, TranscriptFocus::Composer);
+
+        tui.handle(Event::Key(Key::Char('x')));
+        assert_eq!(tui.input(), "x");
     }
 
     #[test]
@@ -14004,9 +14029,14 @@ mod runtime_tests {
 
         tui.set_running(false);
         tui.handle(Event::Key(Key::Escape));
-        let composer = text(&tui);
-        assert_eq!(tui.view().focus, TranscriptFocus::Composer);
-        assert!(composer.contains("Esc:normal"), "{composer:?}");
+        let normal = text(&tui);
+        assert_eq!(tui.view().focus, TranscriptFocus::Viewport);
+        assert!(normal.contains("j/k:scroll"), "{normal:?}");
+        assert!(normal.contains("i:insert"), "{normal:?}");
+        assert!(
+            !normal.contains("Esc:normal"),
+            "the door it already went through is not a hint: {normal:?}"
+        );
     }
 
     /// The tree hangs below the composer, so the arrows walk between them as

@@ -2932,12 +2932,16 @@ fn double_control_c_exits_without_clearing_composer_input() {
 }
 
 #[test]
-fn escape_is_inert_while_running_and_control_c_requests_cancellation() {
+fn escape_never_cancels_a_running_turn_and_control_c_requests_cancellation() {
     let mut tui = Tui::new(FakeEngine::default());
     tui.begin_submission("running");
 
     assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Render);
-    assert_eq!(tui.view().focus, TranscriptFocus::Composer);
+    assert_eq!(
+        tui.view().focus,
+        TranscriptFocus::Viewport,
+        "Esc moves the reader into the transcript"
+    );
     assert_eq!(tui.engine().cancellations, 0);
     assert!(!tui.view().quit_armed);
 
@@ -4089,7 +4093,11 @@ fn a_background_submission_leaves_no_file_picker_behind_for_escape() {
     assert!(tui.view().file_picker.is_none());
 
     assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Render);
-    assert_eq!(tui.view().focus, TranscriptFocus::Composer);
+    assert_eq!(
+        tui.view().focus,
+        TranscriptFocus::Viewport,
+        "Esc reached the transcript instead of a stale picker"
+    );
 }
 
 #[test]

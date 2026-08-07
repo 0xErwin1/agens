@@ -4140,10 +4140,11 @@ fn physical_cursor_follows_main_composer_focus_and_overlay_ownership() {
     renderer.render(tui.view()).unwrap();
     assert!(renderer.terminal().backend().cursor_visible());
 
-    // Escape is inert on the main surface; it must not hide the composer cursor.
+    // Escape hands the surface to Normal mode, where nothing is being typed:
+    // a cursor left blinking in the prompt would deny the mode it is in.
     tui.handle(Event::Key(Key::Escape));
     renderer.render(tui.view()).unwrap();
-    assert!(renderer.terminal().backend().cursor_visible());
+    assert!(!renderer.terminal().backend().cursor_visible());
 
     tui.handle(Event::Key(Key::Char('i')));
     renderer.render(tui.view()).unwrap();
