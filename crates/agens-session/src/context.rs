@@ -44,6 +44,13 @@ pub struct SessionContext {
     pub pending_media_ids: Vec<i64>,
     pub pending_media_mimes: Vec<String>,
     pub selected_subagent: Option<String>,
+    /// Why a turn of this session could not be bracketed by snapshots, when
+    /// one could not. Set when opening the snapshot repository or capturing
+    /// fails, cleared once a turn is bracketed successfully again, and never
+    /// set for a project that simply is not a git worktree. Lets `/undo`
+    /// explain that turns went unrecorded instead of claiming there is
+    /// nothing to undo.
+    pub snapshot_degraded: Option<String>,
     pub dangerous_mode: bool,
     /// Whether `Ask` permission prompts are bypassed for this session. Seeded from
     /// `agent.bypass_permission_prompts` (global configuration only) for a brand-new session, but
@@ -340,6 +347,7 @@ impl SessionContext {
             pending_media_ids: Vec::new(),
             pending_media_mimes: Vec::new(),
             selected_subagent: None,
+            snapshot_degraded: None,
             dangerous_mode: false,
             bypass_permissions: false,
             running: false,
@@ -377,6 +385,7 @@ impl SessionContext {
             pending_media_ids: Vec::new(),
             pending_media_mimes: Vec::new(),
             selected_subagent: None,
+            snapshot_degraded: None,
             dangerous_mode: false,
             bypass_permissions: false,
             running: false,
