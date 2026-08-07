@@ -22,6 +22,10 @@ pub struct SessionContext {
     /// [`crate::session::root::resolve_tui_session_root`] for the fallback that applies then.
     pub confinement_root: Option<std::path::PathBuf>,
     pub messages: Vec<Message>,
+    /// The turns this session can take back. Undone turns leave their messages
+    /// in `messages` and are excluded by [`SessionContext::live_messages`]
+    /// until the next prompt commits the undo.
+    pub undo: crate::undo::UndoHistory,
     pub active_agent: Option<ActiveAgentRuntime>,
     pub pending_system_reminder: Option<String>,
     pub selection: Option<ModelSelection>,
@@ -202,6 +206,29 @@ impl SessionContext {
         Self::default()
     }
 
+    /// The messages that are still part of the conversation.
+    ///
+    /// An undone turn's messages stay in `messages` so a redo can be exact, but
+    /// they are not what the model is asked to continue from — this is the
+    /// history every request is built against.
+    pub fn live_messages(&self) -> &[Message] {
+        let live = self.undo.visible_message_count(self.messages.len());
+        &self.messages[..live]
+    }
+
+    /// Drops the messages an undo held back and ends the undo.
+    ///
+    /// Called when the next prompt arrives: that submission is the reader
+    /// choosing the new direction, and the turns they took back stop being
+    /// recoverable at that moment.
+    pub fn commit_undo(&mut self) {
+        if !self.undo.has_undone_turns() {
+            return;
+        }
+        let surviving = self.undo.commit(self.messages.len());
+        self.messages.truncate(surviving);
+    }
+
     /// A resumed context assembled directly. Not test-gated: its callers are
     /// tests in another crate, which `cfg(test)` cannot reach.
     pub fn resumed(
@@ -216,6 +243,7 @@ impl SessionContext {
             metadata: Some(metadata),
             confinement_root: Some(confinement_root),
             messages,
+            undo: crate::undo::UndoHistory::default(),
             active_agent: Some(active_agent),
             pending_system_reminder: None,
             selection: None,
@@ -251,6 +279,7 @@ impl SessionContext {
             metadata: Some(metadata),
             confinement_root: Some(confinement_root),
             messages,
+            undo: crate::undo::UndoHistory::default(),
             active_agent: None,
             pending_system_reminder: None,
             selection: None,

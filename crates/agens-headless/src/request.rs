@@ -254,7 +254,9 @@ pub fn apply_session_to_request(
     request.dangerous_mode = context.dangerous_mode;
     request.dangerously_allow_all |= context.bypass_permissions;
     if context.identifier.is_some() {
-        request.history = context.messages.clone();
+        // An undone turn's messages are still on the context so a redo can be
+        // exact. They are not what the model continues from.
+        request.history = context.live_messages().to_vec();
         request.session = context.metadata.clone();
     }
 
