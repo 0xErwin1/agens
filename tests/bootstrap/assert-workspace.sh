@@ -126,6 +126,7 @@ jq -e '
       "agens-store",
       "agens-tools"
     ],
+    "agens-snapshot": [],
     "agens-store": [
       "agens-core"
     ],
@@ -174,6 +175,7 @@ jq -e '
       "agens-permissions",
       "agens-providers",
       "agens-session",
+      "agens-snapshot",
       "agens-store",
       "agens-tool-runtime",
       "agens-tools",
