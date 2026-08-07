@@ -134,23 +134,7 @@ pub fn prepare_loaded_tui_session_resume(
         bypass_permission_prompts,
     } = loaded;
     agens_callcount::note_session_resume_projection();
-    // Always project history. The conversation restorer is best-effort and
-    // never discards a saved turn — resume must show what was persisted,
-    // including failed and incomplete tool rows.
-    let restored_history = Conversation::from_messages_with_parser(
-        &history_without_subagent_turns(&session.messages),
-        |name, input| {
-            let bare = name
-                .strip_prefix("native::")
-                .or_else(|| name.strip_prefix("mcp::"))
-                .unwrap_or(name);
-            agens_core::ToolInput::parse(bare, input)
-        },
-    )
-    .unwrap_or_else(|_| {
-        // API keeps Result for callers; production parser always returns Ok.
-        Vec::new()
-    });
+    let restored_history = project_tui_history(&session.messages);
     let saved_provider = session.metadata.provider_id.as_deref();
     let provider = saved_provider.and_then(ProviderKind::parse);
     let selection_provider =
@@ -292,6 +276,29 @@ const MAX_RESTORED_SUBAGENT_TOOL_USES: usize = 256;
 /// and [`resumed_subagent_cards`] already restores it as a card. Left in the
 /// history as well, its task text opens a turn of its own and reads as though
 /// the user had typed the instructions the runtime wrote for the subagent.
+/// Projects persisted messages into the transcript a surface renders.
+///
+/// Best-effort and never lossy: a saved turn is shown as it was persisted,
+/// including failed and incomplete tool rows. Shared by resume and by the undo
+/// commands, which both have to redraw a transcript from a history they did not
+/// stream.
+pub fn project_tui_history(messages: &[Message]) -> Vec<Conversation> {
+    Conversation::from_messages_with_parser(
+        &history_without_subagent_turns(messages),
+        |name, input| {
+            let bare = name
+                .strip_prefix("native::")
+                .or_else(|| name.strip_prefix("mcp::"))
+                .unwrap_or(name);
+            agens_core::ToolInput::parse(bare, input)
+        },
+    )
+    .unwrap_or_else(|_| {
+        // API keeps Result for callers; production parser always returns Ok.
+        Vec::new()
+    })
+}
+
 fn history_without_subagent_turns(messages: &[Message]) -> Vec<Message> {
     let mut kept = Vec::with_capacity(messages.len());
     let mut index = 0;

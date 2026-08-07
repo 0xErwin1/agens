@@ -482,6 +482,15 @@ pub enum TuiSubmissionOutcome {
         message: String,
         presentation: TuiPresentation,
     },
+    /// A turn was taken back or put back: the transcript is replaced with the
+    /// history that is live again and the prompt that started the turn goes
+    /// back to the composer, so undoing costs no retyping.
+    HistoryRewritten {
+        message: String,
+        presentation: TuiPresentation,
+        history: Vec<Conversation>,
+        draft: Option<String>,
+    },
     SessionResumed {
         message: String,
         presentation: TuiPresentation,
@@ -6443,6 +6452,22 @@ where
                         format!("Saved provider is unavailable.\nAction: {error}."),
                     );
                 }
+                None
+            }
+            TuiSubmissionOutcome::HistoryRewritten {
+                message,
+                presentation,
+                history,
+                draft,
+            } => {
+                self.replace_projected_history(history);
+                self.apply_presentation(presentation);
+                self.input.clear();
+                self.input_cursor = 0;
+                if let Some(draft) = draft {
+                    self.restore_resume_draft(draft);
+                }
+                self.status = Some(message);
                 None
             }
             TuiSubmissionOutcome::Dialog(dialog) => {

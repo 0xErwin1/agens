@@ -10,6 +10,7 @@ use crate::files::{ingest_tui_media_path, resolve_attach_path};
 use crate::models::{select_tui_effort, select_tui_model};
 use crate::resume::{commit_tui_session_resume, resume_tui_session};
 use crate::turn::tui_session_presentation;
+use crate::undo::{redo_turn, session_snapshots, undo_turn};
 use agens_agents::select_subagent;
 use agens_bootstrap::Bootstrap;
 use agens_error::{CliError, ExitStatus};
@@ -75,6 +76,8 @@ impl TuiRuntimeRouter {
         let bootstrap = self.bootstrap()?;
         let outcome = match command {
             "/dangerous" => return self.toggle_dangerous_mode(),
+            "/undo" => return self.rewind_turn(true),
+            "/redo" => return self.rewind_turn(false),
             "/bypass" => return self.toggle_bypass_permissions(),
             "/help" => self.open_dialog("help")?,
             "/history" => self.open_dialog("history")?,
@@ -204,6 +207,54 @@ impl TuiRuntimeRouter {
             .lock()
             .map_err(|_| CliError::storage("TUI session is unavailable"))?;
         Ok(tui_session_presentation(&bootstrap, &session))
+    }
+
+    /// Takes the last turn back, or puts it back.
+    ///
+    /// Both directions are the same operation: move the working tree to the
+    /// other snapshot, move the marker over the messages, and hand the prompt
+    /// that started the turn back to the composer.
+    fn rewind_turn(&self, backwards: bool) -> Result<TuiSubmissionOutcome, CliError> {
+        let bootstrap = self.bootstrap()?;
+        let outcome = {
+            let mut session = self
+                .session
+                .lock()
+                .map_err(|_| CliError::storage("TUI session is unavailable"))?;
+            if session.running {
+                return Err(CliError::runtime(HeadlessTurnError::State));
+            }
+
+            let snapshots = session_snapshots(&bootstrap, &session);
+            let moved = if backwards {
+                undo_turn(snapshots.as_ref(), &mut session)
+            } else {
+                redo_turn(snapshots.as_ref(), &mut session)
+            };
+            match moved {
+                Ok(outcome) => outcome,
+                Err(unavailable) => {
+                    return Ok(TuiSubmissionOutcome::LocalInfo(unavailable.to_string()));
+                }
+            }
+        };
+
+        let history = self.live_history()?;
+        Ok(TuiSubmissionOutcome::HistoryRewritten {
+            message: outcome.message(if backwards { "Undid" } else { "Redid" }),
+            presentation: self.presentation()?,
+            history,
+            draft: backwards.then(|| outcome.prompt.clone()),
+        })
+    }
+
+    /// The transcript for the messages that are still part of the conversation.
+    fn live_history(&self) -> Result<Vec<agens_tui::Conversation>, CliError> {
+        let session = self
+            .session
+            .lock()
+            .map_err(|_| CliError::storage("TUI session is unavailable"))?;
+        Ok(crate::resume::project_tui_history(session.live_messages()))
     }
 
     pub(super) fn toggle_dangerous_mode(&self) -> Result<TuiSubmissionOutcome, CliError> {

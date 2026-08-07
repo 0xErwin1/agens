@@ -35,6 +35,12 @@ const MAX_SNAPSHOT_FILE_BYTES: u64 = 2 * 1024 * 1024;
 pub struct SnapshotId(String);
 
 impl SnapshotId {
+    /// Rebuilds an id a caller stored earlier. The hash names an object in the
+    /// snapshot repository, so an id from elsewhere simply resolves to nothing.
+    pub fn from_hash(hash: String) -> Self {
+        Self(hash)
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }

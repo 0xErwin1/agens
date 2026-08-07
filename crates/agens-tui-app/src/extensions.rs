@@ -177,6 +177,15 @@ const TUI_BUILT_INS: &[TuiBuiltinCommand] = &[
         4,
     ),
     TuiBuiltinCommand::new(
+        "redo",
+        "Put back the turn /undo took",
+        "",
+        None,
+        CommandBusyPolicy::IdleOnly,
+        false,
+        25,
+    ),
+    TuiBuiltinCommand::new(
         "provider",
         "Select runtime provider",
         "[name]",
@@ -239,6 +248,15 @@ const TUI_BUILT_INS: &[TuiBuiltinCommand] = &[
         CommandBusyPolicy::Local,
         true,
         19,
+    ),
+    TuiBuiltinCommand::new(
+        "undo",
+        "Take back the last turn and its file changes",
+        "",
+        None,
+        CommandBusyPolicy::IdleOnly,
+        false,
+        24,
     ),
     TuiBuiltinCommand::new(
         "subagent-profiles",

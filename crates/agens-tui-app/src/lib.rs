@@ -21,6 +21,7 @@ pub mod resume;
 pub mod router;
 pub mod session;
 pub mod turn;
+pub mod undo;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;

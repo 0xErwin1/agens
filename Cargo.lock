@@ -340,6 +340,7 @@ dependencies = [
  "agens-permissions",
  "agens-providers",
  "agens-session",
+ "agens-snapshot",
  "agens-store",
  "agens-tool-runtime",
  "agens-tools",

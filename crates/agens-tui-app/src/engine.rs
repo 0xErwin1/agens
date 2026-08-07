@@ -27,6 +27,7 @@ use crate::repository::start_repository_probe;
 use crate::resume::{ResumedTuiSession, resume_tui_session, resumed_subagent_cards};
 use crate::router::{TuiRuntimeRouter, tui_provider_outcome};
 use crate::turn::{complete_tui_turn, tui_session_presentation};
+use crate::undo::{record_turn, session_snapshots};
 use agens_agents::{
     ensure_active_agent_runtime, persist_pending_agent_correction, reconcile_persisted_active_agent,
 };
@@ -461,7 +462,8 @@ pub fn run_tui_prompt(
                 | TuiSubmissionOutcome::SelectionInfo(message)
                 | TuiSubmissionOutcome::ResetSucceeded { message, .. }
                 | TuiSubmissionOutcome::ContextChanged { message, .. }
-                | TuiSubmissionOutcome::SessionResumed { message, .. } => Ok(message),
+                | TuiSubmissionOutcome::SessionResumed { message, .. }
+                | TuiSubmissionOutcome::HistoryRewritten { message, .. } => Ok(message),
                 TuiSubmissionOutcome::ProviderTurn { .. }
                 | TuiSubmissionOutcome::BusyProviderTurn { .. }
                 | TuiSubmissionOutcome::BusyRefusal(_)
@@ -507,7 +509,7 @@ pub fn run_tui_prompt_with(
             .map_err(|_| CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable"))?;
         expand_tui_prompt_with_media(&context, bootstrap, prompt)?
     };
-    let request = {
+    let (request, snapshots, before, message_count) = {
         let mut session = session
             .lock()
             .map_err(|_| CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable"))?;
@@ -515,6 +517,18 @@ pub fn run_tui_prompt_with(
             return Err(CliError::runtime(HeadlessTurnError::State));
         }
         session.running = true;
+        // Sending a prompt is the reader choosing the direction they undid
+        // their way back to, so the turns they took back stop being recoverable
+        // here rather than lingering into a history they did not ask for.
+        session.commit_undo();
+
+        // Bracketing the turn is what makes it undoable at all; a project that
+        // cannot be snapshotted simply records no step.
+        let snapshots = session_snapshots(bootstrap, &session);
+        let before = snapshots
+            .as_ref()
+            .and_then(|repository| repository.capture().ok());
+        let message_count = session.messages.len();
         // Snapshot staged media into the request without clearing yet. Preflight and other
         // early failures must leave chips staged; clear only after success or after the
         // attempt has produced partial history (media then lives on the session/retry path).
@@ -554,7 +568,7 @@ pub fn run_tui_prompt_with(
             request.system_prompt = Some(parent_skill_system_prompt(&base, &skills));
         }
         seed_configured_reasoning_effort(&mut request, bootstrap);
-        request
+        (request, snapshots, before, message_count)
     };
     let consumed_reminder = request.pending_system_reminder.is_some();
     let completion = run(request);
@@ -572,6 +586,10 @@ pub fn run_tui_prompt_with(
         session.pending_media_mimes.clear();
     }
     let result = complete_tui_turn(&mut session, completion, consumed_reminder);
+    let after = snapshots
+        .as_ref()
+        .and_then(|repository| repository.capture().ok());
+    record_turn(&mut session, prompt, message_count, before, after);
     if let Some(identifier) = session.identifier {
         // Best-effort, like the write above: this call gets another attempt on every subsequent
         // completed turn, and the toggle command (the moment the user actually asked for a

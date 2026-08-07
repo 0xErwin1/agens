@@ -32,6 +32,7 @@ agens-models = { path = "../agens-models" }
 agens-permissions = { path = "../agens-permissions" }
 agens-providers = { path = "../agens-providers" }
 agens-session = { path = "../agens-session" }
+agens-snapshot = { path = "../agens-snapshot" }
 agens-store = { path = "../agens-store" }
 agens-tool-runtime = { path = "../agens-tool-runtime", features = ["probe"] }
 agens-tools = { path = "../agens-tools" }
