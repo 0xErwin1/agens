@@ -887,6 +887,8 @@ mod tests {
                 "history",
                 "stash",
                 "attach",
+                "undo",
+                "redo",
                 "review",
                 "shared",
                 "inspect",
