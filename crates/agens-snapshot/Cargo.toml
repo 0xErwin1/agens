@@ -1,0 +1,12 @@
+[package]
+name = "agens-snapshot"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+sha2 = "0.10"
