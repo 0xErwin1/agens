@@ -10,7 +10,9 @@ use crate::files::{ingest_tui_media_path, resolve_attach_path};
 use crate::models::{select_tui_effort, select_tui_model};
 use crate::resume::{commit_tui_session_resume, resume_tui_session};
 use crate::turn::tui_session_presentation;
-use crate::undo::{rewind_detail, rewind_failure, rewind_summary, unavailable_message};
+use crate::undo::{
+    rewind_detail, rewind_failure, rewind_summary, rewind_uncommitted, unavailable_message,
+};
 use agens_agents::select_subagent;
 use agens_bootstrap::Bootstrap;
 use agens_error::{CliError, ExitStatus};
@@ -240,6 +242,11 @@ impl TuiRuntimeRouter {
     /// spawns git, and the marker moves only afterwards: a restore that could
     /// not finish leaves both the transcript and the files as they were, so the
     /// same command can be run again once the reader has dealt with it.
+    ///
+    /// Because the lock is released for the move, the turn the session would
+    /// take back can change while the tree is moving. The marker is committed
+    /// only after the step is confirmed to still be that turn, so it can never
+    /// be moved over a turn whose tree was not the one restored.
     fn rewind_turn(&self, direction: Rewind) -> Result<TuiSubmissionOutcome, CliError> {
         let bootstrap = self.bootstrap()?;
         let (root, step) = {
@@ -285,6 +292,12 @@ impl TuiRuntimeRouter {
                 .session
                 .lock()
                 .map_err(|_| CliError::storage("TUI session is unavailable"))?;
+            if session.running || pending_turn(&session, direction).as_ref() != Ok(&step) {
+                return Ok(TuiSubmissionOutcome::LocalActionableError {
+                    message: rewind_uncommitted(direction),
+                    action: "check the working tree and run the command again".into(),
+                });
+            }
             commit_rewind(&mut session, direction);
         }
 

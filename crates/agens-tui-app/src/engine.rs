@@ -42,7 +42,8 @@ use agens_headless::{
 use agens_session::context::{ResumeDraft, SessionContext};
 use agens_session::provider::CredentialResolver;
 use agens_session::undo::{
-    open_session_snapshots, record_turn, session_snapshot_root, turn_boundary,
+    open_session_snapshots, prune_orphan_snapshots, record_turn, session_snapshot_root,
+    turn_boundary,
 };
 use agens_store::{PromptMemoryStore, SessionStore};
 use agens_tool_runtime::runner::{ProductionTaskRunner, TuiTaskControls, TuiTaskLifecycleBridge};
@@ -181,6 +182,7 @@ pub fn run_production_tui_with_profile_store(
             .map_err(|_| CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable"))?;
         agens_session::root::resolve_tui_session_root(&context, bootstrap)?
     };
+    prune_orphan_snapshots(bootstrap);
     let skills = start_tui_skills(&mut tui, bootstrap, &session_root_for_startup)?;
     let commands = start_tui_commands(&mut tui, bootstrap, &session_root_for_startup)?;
     report_tui_extension_collisions(&mut tui, &commands, &skills);

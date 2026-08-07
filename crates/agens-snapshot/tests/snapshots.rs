@@ -61,6 +61,14 @@ impl Project {
         std::fs::write(target, content).expect("write fixture file");
     }
 
+    /// Sets what the repository ignores without touching a tracked file, so a
+    /// change of view does not also become a change of tree.
+    fn exclude(&self, patterns: &str) {
+        let info = self.worktree.join(".git").join("info");
+        std::fs::create_dir_all(&info).expect("the repository info directory");
+        std::fs::write(info.join("exclude"), patterns).expect("write the exclude file");
+    }
+
     fn read(&self, path: &str) -> Option<String> {
         std::fs::read_to_string(self.worktree.join(path)).ok()
     }
@@ -617,6 +625,7 @@ fn snapshot_storage_is_private_to_its_owner() {
 
 /// Two routes to one working tree are one working tree, and must not become two
 /// separately seeded repositories.
+#[cfg(unix)]
 #[test]
 fn a_symlinked_route_to_a_project_finds_the_same_repository() {
     let project = Project::new().into_repository();
@@ -674,6 +683,108 @@ fn a_listing_too_large_for_a_pipe_does_not_stall() {
         .expect("restore succeeds");
     assert_eq!(report.removed.len(), 300, "{:?}", report.failed);
     assert_eq!(project.read("generated/created-0000.txt"), None);
+}
+
+/// Two captures reach the same tree all the time: one turn's end is the next
+/// turn's start, and a turn that changes nothing repeats the tree it began
+/// with. They can still disagree about what lies outside that tree, because what
+/// a project ignores is decided elsewhere and changes underneath it. The later
+/// view must not be applied to the earlier snapshot — a path that dropped out of
+/// it would be deleted by an undo that was never allowed to touch it.
+#[test]
+fn a_later_capture_of_the_same_tree_does_not_narrow_an_earlier_uncovered_set() {
+    let project = Project::new().into_repository();
+    project.exclude("local.env\n");
+    project.write("local.env", "the reader's secret\n");
+
+    let snapshots = project.snapshots();
+    let before = snapshots.capture().expect("capture succeeds");
+    assert!(
+        snapshots
+            .uncovered(&before)
+            .expect("the uncovered set is readable")
+            .contains(&"local.env".to_owned()),
+        "the capture could not hold the ignored file and has to say so"
+    );
+
+    std::fs::remove_file(project.worktree.join("local.env"))
+        .expect("the fixture file is removable");
+    let after = snapshots.capture().expect("capture succeeds");
+    assert_eq!(
+        after, before,
+        "a file the tree never held cannot change the tree by leaving"
+    );
+    assert!(
+        snapshots
+            .uncovered(&before)
+            .expect("the uncovered set is readable")
+            .contains(&"local.env".to_owned()),
+        "a second capture describes itself, not what the first one could not hold"
+    );
+
+    project.write("local.env", "the reader's secret\n");
+    project.exclude("\n");
+
+    let changed = snapshots.changed_since(&before).expect("diff succeeds");
+    assert!(changed.contains(&"local.env".to_owned()));
+
+    let report = snapshots
+        .restore(&before, &changed)
+        .expect("restore succeeds");
+    assert_eq!(
+        project.read("local.env").as_deref(),
+        Some("the reader's secret\n"),
+        "the snapshot never held this file, so an undo has nothing to say about it"
+    );
+    assert!(
+        report.uncovered.contains(&"local.env".to_owned()),
+        "{report:?}"
+    );
+    assert!(report.removed.is_empty(), "{report:?}");
+}
+
+/// A session that ends without running its cleanup leaves its private index
+/// behind, and nothing else ever looks at it. A session still between two of its
+/// own turns is not that, and keeps what it is using.
+#[test]
+fn an_index_abandoned_by_a_crashed_session_is_swept_by_a_later_one() {
+    let project = Project::new().into_repository();
+    drop(project.snapshots());
+
+    let repository = std::fs::read_dir(project.data.join("snapshots"))
+        .expect("snapshot storage")
+        .next()
+        .expect("the repository was created")
+        .expect("snapshot repository entry")
+        .path();
+
+    let foreign = std::process::id() + 1;
+    let abandoned = repository.join(format!("index-{foreign}-0"));
+    std::fs::write(&abandoned, b"abandoned").expect("plant an abandoned index");
+    backdate(&abandoned);
+
+    let in_use = repository.join(format!("index-{foreign}-1"));
+    std::fs::write(&in_use, b"in use").expect("plant a live index");
+
+    let snapshots = project.snapshots();
+    assert!(
+        !abandoned.exists(),
+        "an index untouched for longer than any session could go belongs to nobody"
+    );
+    assert!(
+        in_use.exists(),
+        "a session between two of its turns still owns the index it stages through"
+    );
+    snapshots.capture().expect("capture succeeds");
+}
+
+fn backdate(path: &Path) {
+    let file = std::fs::File::options()
+        .write(true)
+        .open(path)
+        .expect("the fixture index is writable");
+    file.set_times(std::fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH))
+        .expect("the fixture modification time is settable");
 }
 
 /// Snapshot repositories hold copies of project files, so one whose project is

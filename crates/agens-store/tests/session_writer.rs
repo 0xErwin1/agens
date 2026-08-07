@@ -2002,7 +2002,7 @@ fn truncating_a_session_drops_the_later_turns_and_leaves_the_prefix_unchanged() 
     let before = store.load_session_for_resume(session_id).unwrap();
     assert_eq!(before.messages.len(), 8);
 
-    store.truncate_session_history(session_id, 6).unwrap();
+    store.truncate_session_history(session_id, 6, 8).unwrap();
 
     let after = store.load_session_for_resume(session_id).unwrap();
     assert_eq!(after.messages, before.messages[..6].to_vec());
@@ -2044,7 +2044,7 @@ fn a_surviving_prefix_inside_a_turn_keeps_the_turn_it_lands_in() {
     let (mut store, session_id) = session_with_three_turns(&directory, media.id);
     let before = store.load_session_for_resume(session_id).unwrap();
 
-    store.truncate_session_history(session_id, 3).unwrap();
+    store.truncate_session_history(session_id, 3, 8).unwrap();
 
     let after = store.load_session_for_resume(session_id).unwrap();
     assert_eq!(after.messages, before.messages[..3].to_vec());
@@ -2069,7 +2069,7 @@ fn truncating_a_session_to_nothing_clears_its_history_and_counters() {
     let media = ingest_media_bytes(&directory, b"session-media", "image/png").unwrap();
     let (mut store, session_id) = session_with_three_turns(&directory, media.id);
 
-    store.truncate_session_history(session_id, 0).unwrap();
+    store.truncate_session_history(session_id, 0, 8).unwrap();
 
     let connection = Connection::open(store.database_path()).unwrap();
     assert_eq!(normalized_counts(&connection), (1, 0, 0, 0));
@@ -2109,7 +2109,7 @@ fn a_truncation_that_cannot_finish_leaves_every_row_in_place() {
         .unwrap();
 
     assert!(
-        store.truncate_session_history(session_id, 6).is_err(),
+        store.truncate_session_history(session_id, 6, 8).is_err(),
         "a refused delete must be reported, not swallowed"
     );
     assert_eq!(
@@ -2126,7 +2126,7 @@ fn a_truncation_that_cannot_finish_leaves_every_row_in_place() {
     connection
         .execute_batch("DROP TRIGGER refuse_turn_delete;")
         .unwrap();
-    store.truncate_session_history(session_id, 6).unwrap();
+    store.truncate_session_history(session_id, 6, 8).unwrap();
     assert_eq!(normalized_counts(&connection), (1, 2, 6, 7));
 
     fs::remove_dir_all(directory).unwrap();
@@ -2141,46 +2141,52 @@ fn truncating_past_the_stored_history_changes_nothing() {
     let (mut store, session_id) = session_with_three_turns(&directory, media.id);
     let before = store.load_session_for_resume(session_id).unwrap();
 
-    store.truncate_session_history(session_id, 12).unwrap();
+    store.truncate_session_history(session_id, 12, 12).unwrap();
 
     assert_eq!(store.load_session_for_resume(session_id).unwrap(), before);
 
     fs::remove_dir_all(directory).unwrap();
 }
 
-/// A turn persisted after the prefix was measured — a sub-agent turn recorded out of band, or one
-/// that raced the truncation — is appended past it, so the prefix still names the same rows.
+/// A turn persisted after the measured history — a sub-agent turn recorded out of band, or one
+/// that raced the truncation — belongs to no undone range, so the truncation must leave it alone
+/// while still dropping everything the caller did measure past the prefix.
 #[test]
-fn a_turn_persisted_after_the_prefix_was_measured_does_not_move_it() {
+fn a_turn_persisted_after_the_measured_history_survives_the_truncation() {
     let directory = directory();
     let media = ingest_media_bytes(&directory, b"session-media", "image/png").unwrap();
     let (mut store, session_id) = session_with_three_turns(&directory, media.id);
     let before = store.load_session_for_resume(session_id).unwrap();
     let mut metadata = before.metadata.clone();
     metadata.updated_at = 40;
+    let out_of_band = vec![
+        Message {
+            role: Role::User,
+            parts: vec![MessagePart::Text("a sub-agent task".into())],
+        },
+        Message {
+            role: Role::Assistant,
+            parts: vec![MessagePart::Text("a sub-agent turn".into())],
+        },
+    ];
     store
-        .persist_completed_session_turn(
-            &metadata,
-            &turn(vec![
-                Message {
-                    role: Role::User,
-                    parts: vec![MessagePart::Text("a sub-agent task".into())],
-                },
-                Message {
-                    role: Role::Assistant,
-                    parts: vec![MessagePart::Text("a sub-agent turn".into())],
-                },
-            ]),
-        )
+        .persist_completed_session_turn(&metadata, &turn(out_of_band.clone()))
         .unwrap();
 
-    store.truncate_session_history(session_id, 6).unwrap();
+    store
+        .truncate_session_history(session_id, 6, before.messages.len())
+        .unwrap();
 
     let after = store.load_session_for_resume(session_id).unwrap();
+    let mut expected = before.messages[..6].to_vec();
+    expected.extend(out_of_band);
     assert_eq!(
-        after.messages,
-        before.messages[..6].to_vec(),
-        "the prefix keeps naming the same six messages"
+        after.messages, expected,
+        "the undone turn goes and the turn nobody undid stays"
+    );
+    assert_eq!(
+        after.metadata.completed_turn_count, 3,
+        "the surviving out-of-band turn is still counted"
     );
 
     fs::remove_dir_all(directory).unwrap();

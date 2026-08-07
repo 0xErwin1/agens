@@ -78,16 +78,46 @@ pub fn rewind_detail(outcome: &UndoOutcome) -> Option<String> {
 }
 
 /// What to tell the reader when part of the turn could not be moved.
+///
+/// A restore falls back to writing one path at a time, so a run can both move
+/// files and fail on others. The reader is told which of the two happened,
+/// because "nothing changed" and "some of it changed" call for different next
+/// steps.
 pub fn rewind_failure(outcome: &UndoOutcome, direction: Rewind) -> String {
+    let command = command(direction);
+    let moved = outcome.restored.len() + outcome.removed.len();
+    let state = if moved > 0 {
+        format!("{moved} other file(s) were already moved and the rest were left in place")
+    } else {
+        "the turn was left in place".to_owned()
+    };
+
     format!(
-        "{} could not restore {} file(s), so the turn was left in place:\n{}",
-        match direction {
-            Rewind::Back => "Undo",
-            Rewind::Forward => "Redo",
-        },
+        "{command} could not restore {} file(s), so {state}:\n{}",
         outcome.failed.len(),
         path_list(&outcome.failed)
     )
+}
+
+/// What to tell the reader when the tree moved but the transcript could not
+/// follow it.
+///
+/// The tree is moved with the session unlocked, so the turn it belongs to can
+/// stop being the one the session would take back before the marker is moved.
+/// Moving the marker anyway would point it at a different turn, so it stays and
+/// the reader is told the two now disagree.
+pub fn rewind_uncommitted(direction: Rewind) -> String {
+    format!(
+        "{} moved the working tree, but the session changed while it was moving, so the transcript was left as it was.",
+        command(direction)
+    )
+}
+
+fn command(direction: Rewind) -> &'static str {
+    match direction {
+        Rewind::Back => "Undo",
+        Rewind::Forward => "Redo",
+    }
 }
 
 fn verb(direction: Rewind) -> &'static str {

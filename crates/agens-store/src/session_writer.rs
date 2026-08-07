@@ -1128,13 +1128,19 @@ impl SessionStore {
         })
     }
 
-    /// Drops everything a session persisted past its first `surviving_messages` messages.
+    /// Drops what a session persisted between its first `surviving_messages` messages and the
+    /// `measured_messages` the caller's own history covers.
     ///
-    /// The count is a prefix of the session's messages in `sequence` order, which is the order
+    /// Both counts are prefixes of the session's messages in `sequence` order, which is the order
     /// [`SessionStore::load_session_for_resume`] reads them back in and the order the in-memory
     /// history holds them in. Message sequences are only ever appended, so the nth message names
-    /// the same row before and after another turn — a sub-agent turn persisted out of band, for
-    /// instance — extends the session past it.
+    /// the same row before and after another turn extends the session past it.
+    ///
+    /// The upper bound is what keeps a caller from deleting rows it never saw. A sub-agent turn
+    /// persisted out of band after the caller measured its history sits past `measured_messages`
+    /// and belongs to no undone range, so it is kept even though it lies after the surviving
+    /// prefix; deleting it would drop a turn nobody took back. A session that holds fewer than
+    /// `measured_messages` messages is truncated to its end.
     ///
     /// A turn keeps its row while any of its messages survive, so a prefix landing inside a turn
     /// keeps that turn with fewer messages. A turn left with none is deleted together with the
@@ -1152,10 +1158,15 @@ impl SessionStore {
         &mut self,
         session_id: i64,
         surviving_messages: usize,
+        measured_messages: usize,
     ) -> Result<(), SessionStoreError> {
         let surviving = i64::try_from(surviving_messages).map_err(|error| {
             SessionStoreError::operation("truncate session history", &self.database_path, error)
         })?;
+        let measured =
+            i64::try_from(measured_messages.max(surviving_messages)).map_err(|error| {
+                SessionStoreError::operation("truncate session history", &self.database_path, error)
+            })?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1172,6 +1183,9 @@ impl SessionStore {
         else {
             return Ok(());
         };
+        let last_measured_sequence =
+            surviving_message_sequence(&transaction, &self.database_path, session_id, measured)?
+                .unwrap_or(i64::MAX);
 
         transaction
             .execute(
@@ -1179,14 +1193,15 @@ impl SessionStore {
                  WHERE session_id = ?1 AND completed_turn_sequence IS NOT NULL
                    AND completed_turn_sequence NOT IN (
                        SELECT turn_sequence FROM messages
-                       WHERE session_id = ?1 AND sequence <= ?2
+                       WHERE session_id = ?1 AND (sequence <= ?2 OR sequence > ?3)
                    )",
-                params![session_id, last_surviving_sequence],
+                params![session_id, last_surviving_sequence, last_measured_sequence],
             )
             .and_then(|_| {
                 transaction.execute(
-                    "DELETE FROM messages WHERE session_id = ?1 AND sequence > ?2",
-                    params![session_id, last_surviving_sequence],
+                    "DELETE FROM messages
+                     WHERE session_id = ?1 AND sequence > ?2 AND sequence <= ?3",
+                    params![session_id, last_surviving_sequence, last_measured_sequence],
                 )
             })
             .and_then(|_| {

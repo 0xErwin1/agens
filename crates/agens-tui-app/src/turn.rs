@@ -141,6 +141,26 @@ mod tests {
     };
     use agens_tui::Tui;
 
+    /// A fixture directory that removes itself when the test ends, whether it ends by returning or
+    /// by panicking on a failed assertion.
+    struct FixtureDirectory(std::path::PathBuf);
+
+    impl FixtureDirectory {
+        fn new(label: &str) -> Self {
+            Self(tui_session_directory(label))
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for FixtureDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     #[test]
     fn completed_tui_turn_clears_reminders_only_after_successful_persistence() {
         let metadata = SessionMetadata {
@@ -300,9 +320,9 @@ mod tests {
 
     #[test]
     fn fresh_tui_presentation_projects_resolved_model_effort_and_context() {
-        let known_root = tui_session_directory("fresh-presentation-known");
+        let known_root = FixtureDirectory::new("fresh-presentation-known");
         let known_bootstrap =
-            tui_session_bootstrap_for_provider(&known_root, &[], "openai-api", "gpt-5.6-sol");
+            tui_session_bootstrap_for_provider(known_root.path(), &[], "openai-api", "gpt-5.6-sol");
         let mut known_tui = Tui::new(ProductionTuiEngine {
             cancellation: Arc::new(Mutex::new(None)),
         });
@@ -316,9 +336,13 @@ mod tests {
         assert!(known.contains("gpt-5.6-sol (medium) ·   0%"), "{known:?}");
         assert!(!known.contains("model · default · ctx —"), "{known:?}");
 
-        let unknown_root = tui_session_directory("fresh-presentation-unknown");
-        let unknown_bootstrap =
-            tui_session_bootstrap_for_provider(&unknown_root, &[], "openai-api", "gpt-future-1");
+        let unknown_root = FixtureDirectory::new("fresh-presentation-unknown");
+        let unknown_bootstrap = tui_session_bootstrap_for_provider(
+            unknown_root.path(),
+            &[],
+            "openai-api",
+            "gpt-future-1",
+        );
         let mut unknown_tui = Tui::new(ProductionTuiEngine {
             cancellation: Arc::new(Mutex::new(None)),
         });
@@ -330,15 +354,13 @@ mod tests {
 
         assert!(unknown.contains("gpt-future-1 · ctx —"), "{unknown:?}");
         assert!(!unknown.contains("gpt-future-1 · 0/"), "{unknown:?}");
-
-        std::fs::remove_dir_all(known_root).unwrap();
-        std::fs::remove_dir_all(unknown_root).unwrap();
     }
 
     #[test]
     fn tui_presentation_carries_the_session_bypass_state_into_the_footer() {
-        let root = tui_session_directory("presentation-bypass");
-        let bootstrap = tui_session_bootstrap_for_provider(&root, &[], "openai-api", "gpt-5.6-sol");
+        let root = FixtureDirectory::new("presentation-bypass");
+        let bootstrap =
+            tui_session_bootstrap_for_provider(root.path(), &[], "openai-api", "gpt-5.6-sol");
         let mut tui = Tui::new(ProductionTuiEngine {
             cancellation: Arc::new(Mutex::new(None)),
         });
@@ -347,7 +369,5 @@ mod tests {
         tui.apply_presentation(tui_session_presentation(&bootstrap, &session));
         let rendered = render_tui_test_backend(&tui, 140, 14);
         assert!(rendered.contains("bypass"), "{rendered:?}");
-
-        std::fs::remove_dir_all(root).unwrap();
     }
 }

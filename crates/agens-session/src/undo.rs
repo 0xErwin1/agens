@@ -264,6 +264,20 @@ pub fn open_session_snapshots(bootstrap: &Bootstrap, root: &Path) -> Option<Work
         .flatten()
 }
 
+/// Discards the snapshot repositories of projects that no longer exist.
+///
+/// Snapshot objects outlive the session that wrote them, so without this the
+/// data directory keeps a copy of every file of every project ever opened. It
+/// reads one marker file per snapshot repository and spawns nothing, but it is
+/// still a directory walk, so it belongs to starting a session rather than to
+/// taking a turn.
+///
+/// The result is deliberately dropped: reclaiming space is housekeeping, and a
+/// data directory that cannot be read is reported by every path that needs it.
+pub fn prune_orphan_snapshots(bootstrap: &Bootstrap) {
+    let _ = WorkspaceSnapshots::prune_orphans(bootstrap.data_directory());
+}
+
 /// Records a completed turn as undoable.
 ///
 /// Both snapshots are required: without the one taken before the turn there is

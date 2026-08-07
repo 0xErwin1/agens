@@ -31,7 +31,7 @@ use std::{
     process::{Child, Command, ExitStatus, Stdio},
     sync::atomic::{AtomicU64, Ordering},
     thread::ScopedJoinHandle,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -48,12 +48,32 @@ const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 /// well under the smallest argument limit any supported platform imposes.
 const MAX_ARGUMENT_BATCH_BYTES: usize = 96 * 1024;
 
-/// Where the paths a capture could not represent are recorded, keyed by tree.
+/// Where the paths a capture could not represent are recorded, one file per
+/// capture named for the tree it describes and for its own content.
 const UNCOVERED_DIRECTORY: &str = "agens-uncovered";
+
+/// The name a record carries while it is still being written, chosen so that it
+/// cannot be mistaken for a finished one: a tree hash is hexadecimal and can
+/// never begin with this.
+const PENDING_RECORD_PREFIX: &str = "tmp-";
 
 /// Which project a snapshot repository belongs to, so an abandoned one can be
 /// recognised without guessing from its name.
 const WORKTREE_MARKER: &str = "agens-worktree";
+
+/// What a session's private index file is called, before the part that makes it
+/// this session's.
+const INDEX_PREFIX: &str = "index-";
+
+/// How long a session index must have gone untouched before another session
+/// treats it as abandoned and removes it.
+///
+/// Age is the only usable evidence. A pid proves nothing, because the operating
+/// system reuses it, so a name that looks live may belong to something else
+/// entirely; whereas a session that is still running rewrites its index at
+/// every capture. The threshold is set far past any plausible gap between two
+/// turns of one session.
+const STALE_INDEX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 /// A git tree hash naming one captured state of the working tree.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -158,8 +178,9 @@ impl WorkspaceSnapshots {
         let git_dir = root.join(worktree_key(&worktree));
         create_private_directory(&root)?;
         create_private_directory(&git_dir)?;
+        sweep_abandoned_indexes(&git_dir);
 
-        let index_file = git_dir.join(format!("index-{}", unique_suffix()));
+        let index_file = git_dir.join(format!("{INDEX_PREFIX}{}", unique_suffix()));
         let repository = Self {
             git_dir,
             worktree,
@@ -196,9 +217,10 @@ impl WorkspaceSnapshots {
             });
         }
 
-        let mut uncovered = over_cap;
-        extend_unique(&mut uncovered, self.ignored_entries()?);
-        self.record_uncovered(hash, &uncovered)?;
+        let mut uncovered = UniquePaths::default();
+        uncovered.extend(over_cap);
+        uncovered.extend(self.ignored_entries()?);
+        self.record_uncovered(hash, &uncovered.into_vec())?;
         Ok(snapshot)
     }
 
@@ -228,13 +250,36 @@ impl WorkspaceSnapshots {
     /// project. A caller reporting an undo cannot claim to have covered them.
     ///
     /// Directory entries end in `/` and stand for everything beneath them.
+    ///
+    /// The answer is the union of every record written for this tree, which is
+    /// what makes it safe for more than one capture to describe the same tree:
+    /// see [`Self::record_uncovered`].
     pub fn uncovered(&self, snapshot: &SnapshotId) -> Result<Vec<String>, SnapshotError> {
         let hash = snapshot.validated()?;
-        match std::fs::read(self.git_dir.join(UNCOVERED_DIRECTORY).join(hash)) {
-            Ok(bytes) => Ok(split_nul(&String::from_utf8_lossy(&bytes))),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-            Err(error) => Err(SnapshotError::Storage(error.to_string())),
+        let directory = self.git_dir.join(UNCOVERED_DIRECTORY);
+        let records = match std::fs::read_dir(&directory) {
+            Ok(records) => records,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(SnapshotError::Storage(error.to_string())),
+        };
+
+        let prefix = format!("{hash}-");
+        let mut entries = UniquePaths::default();
+        for record in records {
+            let record = record.map_err(|error| SnapshotError::Storage(error.to_string()))?;
+            let name = record.file_name();
+            let describes_this_tree = name
+                .to_str()
+                .is_some_and(|name| name == hash || name.starts_with(&prefix));
+            if !describes_this_tree {
+                continue;
+            }
+
+            let bytes = std::fs::read(record.path())
+                .map_err(|error| SnapshotError::Storage(error.to_string()))?;
+            entries.extend(split_nul(&String::from_utf8_lossy(&bytes)));
         }
+        Ok(entries.into_vec())
     }
 
     /// Puts `paths` back to their content in `snapshot`.
@@ -389,20 +434,44 @@ impl WorkspaceSnapshots {
         Ok(present)
     }
 
+    /// Writes down what this capture could not represent, under a name carrying
+    /// both the tree and the content of the record.
+    ///
+    /// A tree hash alone does not identify a capture. Two captures reach the
+    /// same tree constantly — one turn's `after` is the next turn's `before`,
+    /// and a turn that changes nothing repeats the tree it started from — while
+    /// disagreeing about what lies outside it, because what a project ignores is
+    /// decided by configuration that differs between sessions and changes
+    /// between captures. Keyed by tree alone, the later record would replace the
+    /// earlier one; a record that lost an entry that way would leave the earlier
+    /// snapshot free to delete a file it was never allowed to touch.
+    ///
+    /// So a record is never replaced. Each distinct one is kept beside the
+    /// others and [`Self::uncovered`] answers with their union, which is the
+    /// only direction that is safe to be wrong in: an entry that does not apply
+    /// costs a file left alone, while a missing one costs a file deleted.
+    /// Naming a record for its content is what keeps that from growing, since
+    /// the repeated captures are exactly the ones that agree.
+    ///
+    /// The record is written under a name no reader looks at and moved into
+    /// place, so a union taken while a capture is running sees whole records or
+    /// nothing, never a truncated one.
     fn record_uncovered(&self, hash: &str, entries: &[String]) -> Result<(), SnapshotError> {
         let directory = self.git_dir.join(UNCOVERED_DIRECTORY);
         create_private_directory(&directory)?;
 
-        let temporary = directory.join(format!("{hash}.{}", unique_suffix()));
         let mut encoded = Vec::new();
         for entry in entries {
             encoded.extend_from_slice(entry.as_bytes());
             encoded.push(0);
         }
 
+        let name = format!("{hash}-{}", content_key(&encoded));
+        let temporary = directory.join(format!("{PENDING_RECORD_PREFIX}{}", unique_suffix()));
+
         std::fs::write(&temporary, encoded)
             .map_err(|error| SnapshotError::Storage(error.to_string()))?;
-        std::fs::rename(&temporary, directory.join(hash))
+        std::fs::rename(&temporary, directory.join(name))
             .map_err(|error| SnapshotError::Storage(error.to_string()))
     }
 
@@ -586,11 +655,11 @@ impl WorkspaceSnapshots {
     /// to be asked about itself as well, or the stale entry it keeps would be
     /// restored over content nobody asked to roll back.
     fn candidate_paths(&self) -> Result<Vec<String>, SnapshotError> {
-        let mut paths = Vec::new();
+        let mut paths = UniquePaths::default();
 
         if self.project_head_tree()?.is_some() {
             let tracked = self.project_git("diff", &["diff", "--name-only", "-z", "HEAD"])?;
-            extend_unique(&mut paths, split_nul(&tracked));
+            paths.extend(split_nul(&tracked));
         }
 
         let untracked = self.project_git(
@@ -603,12 +672,12 @@ impl WorkspaceSnapshots {
                 "-z",
             ],
         )?;
-        extend_unique(&mut paths, split_nul(&untracked));
+        paths.extend(split_nul(&untracked));
 
         let against_snapshot = self.git("diff", &["diff", "--name-only", "-z"], None)?;
-        extend_unique(&mut paths, split_nul(&against_snapshot));
+        paths.extend(split_nul(&against_snapshot));
 
-        Ok(paths)
+        Ok(paths.into_vec())
     }
 
     /// What the project ignores and therefore keeps out of every snapshot.
@@ -794,10 +863,14 @@ fn is_git_worktree(worktree: &Path) -> Result<bool, SnapshotError> {
 /// resolves the path first, so a symlinked or unnormalised route to the same
 /// tree keys to the same repository.
 fn worktree_key(worktree: &Path) -> String {
+    content_key(worktree.display().to_string().as_bytes())
+}
+
+/// A short, stable, file-name-safe name for a run of bytes.
+fn content_key(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
 
-    let digest = Sha256::digest(worktree.display().to_string().as_bytes());
-    digest
+    Sha256::digest(bytes)
         .iter()
         .take(16)
         .map(|byte| format!("{byte:02x}"))
@@ -858,6 +931,50 @@ fn restrict_permissions(_path: &Path) -> Result<(), SnapshotError> {
     Ok(())
 }
 
+/// Removes the index files of sessions that ended without running their
+/// cleanup, so a repository does not collect one per crash forever.
+///
+/// A file this process owns is kept whatever its age, since another
+/// [`WorkspaceSnapshots`] alive in this process may be between two of its own
+/// git calls. Everything else is judged by [`STALE_INDEX_AGE`].
+///
+/// Getting that judgement wrong cannot cost a file. A session whose index is
+/// taken from underneath it stages into an empty one, and a capture built from
+/// an empty index is refused rather than returned, because the empty tree names
+/// a state in which nothing exists.
+///
+/// Best effort throughout: a directory that cannot be read or a file that
+/// cannot be removed is left for the next session rather than failing an open
+/// that has nothing else wrong with it.
+fn sweep_abandoned_indexes(git_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(git_dir) else {
+        return;
+    };
+
+    let own = format!("{INDEX_PREFIX}{}-", std::process::id());
+    let now = SystemTime::now();
+
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let is_other_session = name
+            .to_str()
+            .is_some_and(|name| name.starts_with(INDEX_PREFIX) && !name.starts_with(&own));
+        if !is_other_session {
+            continue;
+        }
+
+        let abandoned = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age >= STALE_INDEX_AGE);
+        if abandoned {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 fn unique_suffix() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -894,11 +1011,28 @@ fn batches(paths: &[String]) -> Vec<&[String]> {
     groups
 }
 
-fn extend_unique(paths: &mut Vec<String>, additions: Vec<String>) {
-    for path in additions {
-        if !paths.contains(&path) {
-            paths.push(path);
+/// Paths in the order they were first seen, with repeats dropped.
+///
+/// Membership is answered by a set rather than by scanning what has been kept,
+/// because a capture runs at every turn boundary and a large tree offers it
+/// thousands of candidates.
+#[derive(Default)]
+struct UniquePaths {
+    order: Vec<String>,
+    seen: HashSet<String>,
+}
+
+impl UniquePaths {
+    fn extend(&mut self, additions: Vec<String>) {
+        for path in additions {
+            if self.seen.insert(path.clone()) {
+                self.order.push(path);
+            }
         }
+    }
+
+    fn into_vec(self) -> Vec<String> {
+        self.order
     }
 }
 

@@ -278,6 +278,12 @@ impl SessionContext {
     /// still holds would be reloaded into this history by the next completed
     /// turn and sent to the model. A session with no identifier has persisted
     /// nothing yet and needs no store.
+    ///
+    /// The truncation is bounded by the length of this history as well as by the
+    /// surviving prefix. A turn persisted out of band since this history was
+    /// last loaded — a sub-agent turn completing in the background — sits past
+    /// that length in the store and was never part of what the reader took back,
+    /// so it stays; the next completed turn reloads it into this history.
     pub fn commit_undo(&mut self, store: Option<&mut SessionStore>) -> Result<(), UndoCommitError> {
         if !self.undo.has_undone_turns() {
             return Ok(());
@@ -288,7 +294,7 @@ impl SessionContext {
         if let Some(identifier) = self.identifier {
             let store = store.ok_or(UndoCommitError::StoreUnavailable)?;
             store
-                .truncate_session_history(identifier, surviving)
+                .truncate_session_history(identifier, surviving, self.messages.len())
                 .map_err(UndoCommitError::Storage)?;
         }
 
@@ -419,11 +425,27 @@ mod tests {
 
     use super::*;
 
-    fn store_directory(label: &str) -> std::path::PathBuf {
+    /// A temporary store directory that removes itself when the test ends,
+    /// whether it ends by returning or by panicking on a failed assertion.
+    struct StoreDirectory(std::path::PathBuf);
+
+    impl StoreDirectory {
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for StoreDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn store_directory(label: &str) -> StoreDirectory {
         let directory =
             std::env::temp_dir().join(format!("agens-session-undo-{}-{label}", std::process::id()));
         std::fs::create_dir_all(&directory).unwrap();
-        directory
+        StoreDirectory(directory)
     }
 
     fn text(role: Role, body: &str) -> Message {
@@ -445,11 +467,9 @@ mod tests {
     }
 
     /// A session with two persisted turns, held in a context that has taken the second one back.
-    fn session_with_an_undone_turn(
-        label: &str,
-    ) -> (std::path::PathBuf, SessionStore, SessionContext) {
+    fn session_with_an_undone_turn(label: &str) -> (StoreDirectory, SessionStore, SessionContext) {
         let directory = store_directory(label);
-        let mut store = SessionStore::open(&directory).unwrap();
+        let mut store = SessionStore::open(directory.path()).unwrap();
         let mut metadata = SessionMetadata {
             id: 0,
             project: "project".into(),
@@ -492,7 +512,7 @@ mod tests {
     /// into the history by the next completed turn and sent to the model again.
     #[test]
     fn committing_an_undo_drops_the_taken_back_turn_from_the_store() {
-        let (directory, mut store, mut context) = session_with_an_undone_turn("commits");
+        let (_directory, mut store, mut context) = session_with_an_undone_turn("commits");
         let identifier = context.identifier.expect("a persisted session");
 
         context.commit_undo(Some(&mut store)).unwrap();
@@ -501,8 +521,38 @@ mod tests {
         let stored = store.load_session_for_resume(identifier).unwrap();
         assert_eq!(stored.messages, context.messages);
         assert_eq!(stored.metadata.completed_turn_count, 1);
+    }
 
-        std::fs::remove_dir_all(directory).unwrap();
+    /// A turn persisted while the reader was deciding — a sub-agent turn finishing in the
+    /// background — was never taken back, so committing the undo must not take it with the turn
+    /// that was.
+    #[test]
+    fn committing_an_undo_keeps_a_turn_persisted_after_this_history_was_loaded() {
+        let (_directory, mut store, mut context) = session_with_an_undone_turn("out-of-band");
+        let identifier = context.identifier.expect("a persisted session");
+        let metadata = context.metadata.clone().expect("persisted metadata");
+        store
+            .persist_completed_session_turn(
+                &metadata,
+                &completed_turn("a sub-agent task", "a sub-agent turn"),
+            )
+            .unwrap();
+
+        context.commit_undo(Some(&mut store)).unwrap();
+
+        assert_eq!(context.messages.len(), 2);
+        let stored = store.load_session_for_resume(identifier).unwrap();
+        assert_eq!(stored.messages.len(), 4);
+        assert_eq!(stored.messages[..2], context.messages[..]);
+        assert_eq!(
+            stored.messages[2..],
+            [
+                text(Role::User, "a sub-agent task"),
+                text(Role::Assistant, "a sub-agent turn"),
+            ],
+            "the background turn stays, and the next completed turn reloads it"
+        );
+        assert_eq!(stored.metadata.completed_turn_count, 2);
     }
 
     /// Memory and the store must never part company quietly: a commit that cannot reach the store
@@ -510,7 +560,7 @@ mod tests {
     /// the store will contradict.
     #[test]
     fn a_commit_that_cannot_reach_the_store_changes_nothing() {
-        let (directory, _store, mut context) = session_with_an_undone_turn("unreachable");
+        let (_directory, _store, mut context) = session_with_an_undone_turn("unreachable");
         let messages = context.messages.clone();
 
         assert_eq!(
@@ -520,8 +570,6 @@ mod tests {
         assert_eq!(context.messages, messages);
         assert!(context.undo.has_undone_turns());
         assert_eq!(context.live_messages().len(), 2);
-
-        std::fs::remove_dir_all(directory).unwrap();
     }
 
     /// A session that never reached the store has nothing to truncate, which is not a failure.
