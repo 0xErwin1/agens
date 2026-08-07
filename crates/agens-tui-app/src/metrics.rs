@@ -55,6 +55,20 @@ impl TuiMetricsPublisher {
         self
     }
 
+    /// Publishes one already-composed failure line through the same channel
+    /// the MCP notices use, for a fault discovered outside a turn event —
+    /// for example a snapshot capture that failed while bracketing a turn.
+    pub fn publish_failure_notice(&self, text: String) {
+        let _ = self.bridge.publish(
+            TuiRuntimeEvent::Notice {
+                text,
+                severity: NoticeSeverity::Failure,
+            },
+            &self.cancellation,
+            None,
+        );
+    }
+
     /// Publishes one `Notice` per enabled server currently `Failed` or
     /// `Degraded` that has not already been noticed, and clears any server
     /// that has recovered to `Ready` from the noticed set so a later

@@ -19,7 +19,8 @@ use agens_error::{CliError, ExitStatus};
 use agens_session::context::reset_session;
 use agens_session::provider::ProviderKind;
 use agens_session::undo::{
-    Rewind, commit_rewind, open_session_snapshots, pending_turn, rewind_tree, session_snapshot_root,
+    Rewind, UndoUnavailable, commit_rewind, open_session_snapshots, pending_turn, rewind_tree,
+    session_snapshot_root,
 };
 use agens_tool_runtime::rotation::rotate_agent;
 
@@ -269,9 +270,18 @@ impl TuiRuntimeRouter {
             }
         };
 
-        let snapshots = root
+        let snapshots = match root
             .as_deref()
-            .and_then(|root| open_session_snapshots(&bootstrap, root));
+            .map(|root| open_session_snapshots(&bootstrap, root))
+        {
+            Some(Ok(snapshots)) => snapshots,
+            Some(Err(error)) => {
+                return Ok(TuiSubmissionOutcome::LocalInfo(unavailable_message(
+                    &UndoUnavailable::Uninspectable(error.to_string()),
+                )));
+            }
+            None => None,
+        };
         let outcome = match rewind_tree(snapshots.as_ref(), &step, direction) {
             Ok(outcome) => outcome,
             Err(unavailable) => {

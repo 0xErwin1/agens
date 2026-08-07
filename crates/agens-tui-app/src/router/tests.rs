@@ -1331,31 +1331,38 @@ fn dangerous_mode_is_visible_press_once_and_next_turn_only() {
     assert!(!render_tui_test_backend(&tui, 120, 24).contains("agens safe"));
 
     tui.apply_submission_outcome(router.route("/dangerous".into()));
-    let result = run_tui_prompt_with(&bootstrap, "next request", &session, None, |request| {
-        assert!(request.dangerous_mode);
-        assert!(matches!(
-            router.route("/dangerous".into()),
-            TuiSubmissionOutcome::ContextChanged { .. }
-        ));
-        assert!(request.dangerous_mode);
-        Ok(HeadlessChatCompletion {
-            text: "captured".into(),
-            metadata: SessionMetadata {
-                id: 1,
-                project: "project".into(),
-                title: "captured".into(),
-                active_agent: "primary".into(),
-                provider_id: None,
-                model_id: None,
-                reasoning_effort: None,
-                created_at: 1,
-                updated_at: 1,
-                completed_turn_count: 1,
-                resumable: true,
-            },
-            messages: Vec::new(),
-        })
-    });
+    let result = run_tui_prompt_with(
+        &bootstrap,
+        "next request",
+        &session,
+        None,
+        None,
+        |request| {
+            assert!(request.dangerous_mode);
+            assert!(matches!(
+                router.route("/dangerous".into()),
+                TuiSubmissionOutcome::ContextChanged { .. }
+            ));
+            assert!(request.dangerous_mode);
+            Ok(HeadlessChatCompletion {
+                text: "captured".into(),
+                metadata: SessionMetadata {
+                    id: 1,
+                    project: "project".into(),
+                    title: "captured".into(),
+                    active_agent: "primary".into(),
+                    provider_id: None,
+                    model_id: None,
+                    reasoning_effort: None,
+                    created_at: 1,
+                    updated_at: 1,
+                    completed_turn_count: 1,
+                    resumable: true,
+                },
+                messages: Vec::new(),
+            })
+        },
+    );
     assert!(result.is_ok());
     assert!(!session.lock().unwrap().dangerous_mode);
 
@@ -2787,6 +2794,7 @@ fn tui_resume_overlay_restores_appends_reopens_and_resets_complete_history() {
         &prompt,
         &router.session,
         Some(router.skills().unwrap()),
+        None,
         |request| {
             assert_eq!(request.history, restored_messages);
             let mut store = SessionStore::open(bootstrap.data_directory()).unwrap();

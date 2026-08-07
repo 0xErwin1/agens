@@ -319,6 +319,11 @@ impl WorkspaceSnapshots {
     /// agent did. Every path is addressed as a literal top-level pathspec, so a
     /// file whose name looks like a pattern or a flag is still only ever
     /// itself.
+    ///
+    /// Every question about which paths may be touched is answered before the
+    /// first file is written. A caller that receives an error from the
+    /// partitioning can therefore truthfully report that nothing moved; once
+    /// writing starts, what happened to each path is carried in the report.
     pub fn restore(
         &self,
         snapshot: &SnapshotId,
@@ -328,18 +333,18 @@ impl WorkspaceSnapshots {
         let mut report = RestoreReport::default();
 
         let present = self.paths_in_snapshot(hash, paths)?;
+        let uncovered = self.uncovered(snapshot)?;
+
         let (in_snapshot, absent): (Vec<String>, Vec<String>) = paths
             .iter()
             .cloned()
             .partition(|path| present.contains(path));
-
-        self.checkout_paths(hash, &in_snapshot, &mut report);
-
-        let uncovered = self.uncovered(snapshot)?;
         let (hidden, removable): (Vec<String>, Vec<String>) = absent
             .into_iter()
             .partition(|path| is_uncovered(&uncovered, path));
         report.uncovered = hidden;
+
+        self.checkout_paths(hash, &in_snapshot, &mut report);
         self.remove_paths(&removable, &mut report)?;
 
         Ok(report)

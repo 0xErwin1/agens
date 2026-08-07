@@ -17,6 +17,9 @@ pub fn unavailable_message(unavailable: &UndoUnavailable) -> String {
                 .to_owned()
         }
         UndoUnavailable::NothingToUndo => "There is no turn to undo.".to_owned(),
+        UndoUnavailable::SnapshotsUnavailable(detail) => format!(
+            "Snapshots were unavailable this session ({detail}), so no turn was recorded to undo."
+        ),
         UndoUnavailable::NothingToRedo => "There is no undone turn to redo.".to_owned(),
         UndoUnavailable::Uninspectable(detail) => format!(
             "The working tree could not be compared against the snapshot ({detail}), so nothing was changed."

@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 
 use agens_bootstrap::Bootstrap;
 use agens_core::{Message, MessagePart};
-use agens_snapshot::{SnapshotId, WorkspaceSnapshots};
+use agens_snapshot::{SnapshotError, SnapshotId, WorkspaceSnapshots};
 
 use crate::context::SessionContext;
 use crate::root::resolve_tui_session_root;
@@ -209,6 +209,10 @@ pub enum UndoUnavailable {
     NotSnapshotted,
     /// Nothing has been recorded yet, or every recorded turn is already undone.
     NothingToUndo,
+    /// Nothing has been recorded because snapshots failed this session, so
+    /// "nothing to undo" would blame the reader for a fault of the machinery.
+    /// Carries the failure that stopped the recording.
+    SnapshotsUnavailable(String),
     /// Nothing has been undone, so there is nothing to put back.
     NothingToRedo,
     /// The working tree could not be compared against the snapshot. Nothing was
@@ -256,12 +260,15 @@ pub fn session_snapshot_root(bootstrap: &Bootstrap, context: &SessionContext) ->
 
 /// Opens the snapshot repository for a session root.
 ///
-/// `None` means this project cannot be snapshotted, which is an answer rather
-/// than a failure: the commands say so and stay out of the way.
-pub fn open_session_snapshots(bootstrap: &Bootstrap, root: &Path) -> Option<WorkspaceSnapshots> {
+/// `Ok(None)` means this project cannot be snapshotted, which is an answer
+/// rather than a failure: the commands say so and stay out of the way. `Err`
+/// means the project should be snapshottable but the repository could not be
+/// opened — a caller that swallowed it would silently stop recording turns.
+pub fn open_session_snapshots(
+    bootstrap: &Bootstrap,
+    root: &Path,
+) -> Result<Option<WorkspaceSnapshots>, SnapshotError> {
     WorkspaceSnapshots::open(bootstrap.data_directory(), root)
-        .ok()
-        .flatten()
 }
 
 /// Discards the snapshot repositories of projects that no longer exist.
@@ -318,11 +325,12 @@ pub fn pending_turn(
     direction: Rewind,
 ) -> Result<UndoStep, UndoUnavailable> {
     match direction {
-        Rewind::Back => context
-            .undo
-            .undoable()
-            .cloned()
-            .ok_or(UndoUnavailable::NothingToUndo),
+        Rewind::Back => context.undo.undoable().cloned().ok_or_else(|| {
+            context.snapshot_degraded.clone().map_or(
+                UndoUnavailable::NothingToUndo,
+                UndoUnavailable::SnapshotsUnavailable,
+            )
+        }),
         Rewind::Forward => context
             .undo
             .redoable()

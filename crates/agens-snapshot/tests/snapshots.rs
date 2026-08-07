@@ -301,6 +301,39 @@ fn a_file_that_only_became_visible_is_not_deleted_by_an_undo() {
     assert!(report.removed.is_empty(), "{report:?}");
 }
 
+/// An uncovered set that cannot be read refuses the restore before the first
+/// file is written. Were a file already checked out by then, a caller seeing
+/// the error would report that nothing moved — and be wrong.
+#[test]
+fn an_unreadable_uncovered_set_refuses_the_restore_before_any_file_is_written() {
+    let project = Project::new().into_repository();
+    let snapshots = project.snapshots();
+
+    let before = snapshots.capture().expect("capture succeeds");
+    project.write("tracked.txt", "rewritten by the agent\n");
+
+    let repository = std::fs::read_dir(project.data.join("snapshots"))
+        .expect("the snapshot root is listable")
+        .next()
+        .expect("the capture created a snapshot repository")
+        .expect("the repository entry is readable")
+        .path();
+    let records = repository.join("agens-uncovered");
+    if records.is_dir() {
+        std::fs::remove_dir_all(&records).expect("the record directory is removable");
+    }
+    std::fs::write(&records, "not a directory").expect("the record path is writable");
+
+    snapshots
+        .restore(&before, &["tracked.txt".to_owned()])
+        .expect_err("an unreadable uncovered set refuses the restore");
+    assert_eq!(
+        project.read("tracked.txt").as_deref(),
+        Some("rewritten by the agent\n"),
+        "the refusal has to land before the first file is written"
+    );
+}
+
 /// A file too large to snapshot is outside the feature in both directions. It
 /// must not come back from the snapshot at all, because the only content the
 /// snapshot could offer for it is content it never captured.

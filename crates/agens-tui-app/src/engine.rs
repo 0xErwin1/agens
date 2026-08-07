@@ -331,11 +331,18 @@ pub fn run_production_tui_with_profile_store(
                 Ok(false) => {}
                 Err(error) => return tui_provider_outcome(Err(error)),
             }
+            let notice_metrics = Arc::clone(&metrics);
+            let snapshot_notice = move |text: String| {
+                if let Ok(metrics) = notice_metrics.lock() {
+                    metrics.publish_failure_notice(text);
+                }
+            };
             let result = run_tui_prompt_with(
                 &runtime_bootstrap,
                 &prompt,
                 &router.session,
                 Some(Arc::clone(&skills)),
+                Some(&snapshot_notice),
                 |request| {
                     let task_runtime = production_tui_task_runtime_with_runner_and_parent_config(
                         &runtime_bootstrap,
@@ -486,7 +493,7 @@ pub fn run_tui_prompt(
                 TuiSubmissionOutcome::Quit => Ok(String::new()),
             }
         }
-        prompt => run_tui_prompt_with(bootstrap, prompt, session, None, |request| {
+        prompt => run_tui_prompt_with(bootstrap, prompt, session, None, None, |request| {
             run_production_headless_chat_with_progress(
                 request,
                 bootstrap,
@@ -505,6 +512,7 @@ pub fn run_tui_prompt_with(
     prompt: &str,
     session: &Arc<Mutex<SessionContext>>,
     skills: Option<Arc<SkillCatalog>>,
+    notice: Option<&dyn Fn(String)>,
     run: impl FnOnce(HeadlessChatRequest) -> Result<HeadlessChatCompletion, HeadlessChatFailure>,
 ) -> Result<String, CliError> {
     let expanded = {
@@ -577,18 +585,46 @@ pub fn run_tui_prompt_with(
     // Bracketing the turn is what makes it undoable at all; a project that
     // cannot be snapshotted simply records no step. Opening the repository and
     // capturing both spawn git, so neither runs while the session is locked.
-    let snapshots = snapshot_root
+    // A failure never breaks the turn, but it is not silent either: the first
+    // reason is said out loud once below and remembered on the session, so a
+    // later `/undo` can explain why the turn went unrecorded.
+    let mut snapshot_failure: Option<String> = None;
+    let snapshots = match snapshot_root
         .as_deref()
-        .and_then(|root| open_session_snapshots(bootstrap, root));
-    let before = snapshots
-        .as_ref()
-        .and_then(|repository| repository.capture().ok());
+        .map(|root| open_session_snapshots(bootstrap, root))
+    {
+        Some(Ok(snapshots)) => snapshots,
+        Some(Err(error)) => {
+            snapshot_failure = Some(error.to_string());
+            None
+        }
+        None => None,
+    };
+    let before = snapshots.as_ref().and_then(|repository| {
+        repository
+            .capture()
+            .map_err(|error| {
+                snapshot_failure.get_or_insert(error.to_string());
+            })
+            .ok()
+    });
 
     let consumed_reminder = request.pending_system_reminder.is_some();
     let completion = run(request);
-    let after = snapshots
-        .as_ref()
-        .and_then(|repository| repository.capture().ok());
+    let after = snapshots.as_ref().and_then(|repository| {
+        repository
+            .capture()
+            .map_err(|error| {
+                snapshot_failure.get_or_insert(error.to_string());
+            })
+            .ok()
+    });
+
+    if let (Some(reason), Some(notice)) = (&snapshot_failure, notice) {
+        notice(format!(
+            "Snapshots are unavailable, so this turn cannot be undone ({reason})."
+        ));
+    }
 
     let mut session = session
         .lock()
@@ -604,6 +640,11 @@ pub fn run_tui_prompt_with(
         session.pending_media_mimes.clear();
     }
     let result = complete_tui_turn(&mut session, completion, consumed_reminder);
+    match snapshot_failure {
+        Some(reason) => session.snapshot_degraded = Some(reason),
+        None if before.is_some() && after.is_some() => session.snapshot_degraded = None,
+        None => {}
+    }
     let boundary = turn_boundary(&previous_messages, &session.messages);
     record_turn(&mut session, prompt, boundary, before, after);
     if let Some(identifier) = session.identifier {
@@ -897,7 +938,7 @@ mod tests {
             locked.push_pending_media(42, "image/png".into());
         }
 
-        let result = run_tui_prompt_with(&bootstrap, "describe", &session, None, |_| {
+        let result = run_tui_prompt_with(&bootstrap, "describe", &session, None, None, |_| {
             Err(HeadlessChatFailure::from(CliError::configuration(
                 "model gpt-4.1-nano does not accept attachment mime application/pdf",
             )))
@@ -910,6 +951,96 @@ mod tests {
             "staged media must remain after early failure"
         );
         assert_eq!(locked.pending_media_mimes, vec!["image/png".to_owned()]);
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    /// A snapshot failure must not break the turn, but it must not be silent
+    /// either: the reader is warned once, and a later `/undo` explains that
+    /// the turn went unrecorded instead of claiming there is nothing to undo.
+    #[test]
+    fn a_failed_snapshot_capture_warns_and_does_not_abort_the_turn() {
+        fn git(directory: &std::path::Path, arguments: &[&str]) {
+            let status = std::process::Command::new("git")
+                .args(arguments)
+                .current_dir(directory)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .status()
+                .expect("git runs");
+            assert!(status.success(), "git {arguments:?} failed");
+        }
+
+        let temporary = tui_session_directory("snapshot-capture-failure");
+        let bootstrap = tui_session_bootstrap(&temporary, &[]);
+        let project = temporary.join("project");
+
+        // The project's only tracked file grew past the snapshot size cap, so
+        // staging it empties the capture's index while the project still
+        // tracks a file — the capture failure that can be arranged from
+        // outside the snapshot crate, and one it refuses rather than
+        // describing the project as empty.
+        std::fs::remove_dir_all(project.join(".git")).unwrap();
+        git(&project, &["init", "--quiet"]);
+        git(&project, &["config", "user.name", "test"]);
+        git(&project, &["config", "user.email", "test@localhost"]);
+        std::fs::write(project.join("big.txt"), "small at first\n").unwrap();
+        git(&project, &["add", "."]);
+        git(&project, &["commit", "--quiet", "-m", "initial"]);
+        std::fs::write(project.join("big.txt"), "x".repeat(3 * 1024 * 1024)).unwrap();
+
+        let session = Arc::new(Mutex::new(SessionContext::fresh()));
+        let notices = std::cell::RefCell::new(Vec::new());
+        let notice = |text: String| notices.borrow_mut().push(text);
+
+        let result =
+            run_tui_prompt_with(&bootstrap, "prompt", &session, None, Some(&notice), |_| {
+                Ok(HeadlessChatCompletion {
+                    text: "answered".into(),
+                    metadata: SessionMetadata {
+                        id: 1,
+                        project: tui_project(&temporary),
+                        title: "conversation".into(),
+                        active_agent: "primary".into(),
+                        provider_id: None,
+                        model_id: None,
+                        reasoning_effort: None,
+                        created_at: 1,
+                        updated_at: 1,
+                        completed_turn_count: 1,
+                        resumable: true,
+                    },
+                    messages: Vec::new(),
+                })
+            });
+
+        assert!(
+            result.is_ok(),
+            "a snapshot failure must not break the turn: {result:?}"
+        );
+        let notices = notices.into_inner();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(
+            notices[0].contains("cannot be undone"),
+            "the warning names the consequence: {notices:?}"
+        );
+        assert!(
+            session.lock().unwrap().snapshot_degraded.is_some(),
+            "the failure is remembered for /undo"
+        );
+
+        let answer = run_tui_prompt(
+            &bootstrap,
+            "/undo",
+            &HeadlessTurnCancellation::new(),
+            &session,
+            None,
+        )
+        .unwrap();
+        assert!(
+            answer.starts_with("Snapshots were unavailable this session"),
+            "{answer}"
+        );
 
         std::fs::remove_dir_all(temporary).unwrap();
     }
@@ -1195,7 +1326,7 @@ mod tests {
 
         let mut next_turn = metadata.clone();
         next_turn.completed_turn_count += 1;
-        let result = run_tui_prompt_with(&bootstrap, "next request", &session, None, |_| {
+        let result = run_tui_prompt_with(&bootstrap, "next request", &session, None, None, |_| {
             Ok(HeadlessChatCompletion {
                 text: "captured".into(),
                 metadata: next_turn,
@@ -1282,8 +1413,13 @@ mod tests {
         let session = Arc::new(Mutex::new(context));
 
         let identifier = metadata.id;
-        let result =
-            run_tui_prompt_with(&bootstrap, "a new direction", &session, None, |request| {
+        let result = run_tui_prompt_with(
+            &bootstrap,
+            "a new direction",
+            &session,
+            None,
+            None,
+            |request| {
                 assert_eq!(
                     request.history.len(),
                     2,
@@ -1304,7 +1440,8 @@ mod tests {
                     metadata: stored.metadata,
                     messages: stored.messages,
                 })
-            });
+            },
+        );
         assert!(result.is_ok(), "{result:?}");
 
         let context = session.lock().unwrap();
@@ -1444,7 +1581,7 @@ mod tests {
         let skills = Some(Arc::new(SkillCatalog::default()));
         let captured_system_prompt = std::cell::RefCell::new(None);
 
-        let result = run_tui_prompt_with(&bootstrap, "prompt", &session, skills, |request| {
+        let result = run_tui_prompt_with(&bootstrap, "prompt", &session, skills, None, |request| {
             *captured_system_prompt.borrow_mut() = request.system_prompt.clone();
             Ok(HeadlessChatCompletion {
                 text: "captured".into(),
