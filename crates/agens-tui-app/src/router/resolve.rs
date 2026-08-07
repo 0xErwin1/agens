@@ -10,7 +10,9 @@ use crate::files::{ingest_tui_media_path, resolve_attach_path};
 use crate::models::{select_tui_effort, select_tui_model};
 use crate::resume::{commit_tui_session_resume, resume_tui_session};
 use crate::turn::tui_session_presentation;
-use crate::undo::{redo_turn, session_snapshots, undo_turn};
+use crate::undo::{
+    Rewind, commit_rewind, open_session_snapshots, pending_turn, rewind_tree, session_snapshot_root,
+};
 use agens_agents::select_subagent;
 use agens_bootstrap::Bootstrap;
 use agens_error::{CliError, ExitStatus};
@@ -76,8 +78,8 @@ impl TuiRuntimeRouter {
         let bootstrap = self.bootstrap()?;
         let outcome = match command {
             "/dangerous" => return self.toggle_dangerous_mode(),
-            "/undo" => return self.rewind_turn(true),
-            "/redo" => return self.rewind_turn(false),
+            "/undo" => return self.rewind_turn(Rewind::Back),
+            "/redo" => return self.rewind_turn(Rewind::Forward),
             "/bypass" => return self.toggle_bypass_permissions(),
             "/help" => self.open_dialog("help")?,
             "/history" => self.open_dialog("history")?,
@@ -175,14 +177,11 @@ impl TuiRuntimeRouter {
                 return Err(CliError::usage(format!("unknown TUI command: {command}")));
             }
             _ => match self.commands()?.command(name) {
-                Some(command) => TuiSubmissionOutcome::ProviderTurn {
-                    display: input.clone(),
-                    prompt: command.expand(arguments),
-                },
+                Some(command) => self.expanded_turn(&input, command.expand(arguments))?,
                 None => match self.skills()?.skill(name) {
-                    Some(skill) => TuiSubmissionOutcome::ProviderTurn {
-                        display: input.clone(),
-                        prompt: format!(
+                    Some(skill) => self.expanded_turn(
+                        &input,
+                        format!(
                             "## Skill: {}\n{}\n\n## User arguments\n{}",
                             skill.name(),
                             skill.load_instructions().map_err(|_| {
@@ -190,7 +189,7 @@ impl TuiRuntimeRouter {
                             })?,
                             arguments
                         ),
-                    },
+                    )?,
                     None => {
                         return Err(CliError::usage(format!("unknown TUI command: {command}")));
                     }
@@ -198,6 +197,27 @@ impl TuiRuntimeRouter {
             },
         };
         Ok(outcome)
+    }
+
+    /// A turn whose prompt is an expansion of what the reader typed.
+    ///
+    /// The session keeps the invocation alongside the expansion so that taking
+    /// the turn back hands `/name arguments` to the composer rather than the
+    /// command template or the whole inlined body of a skill.
+    fn expanded_turn(
+        &self,
+        typed: &str,
+        expanded: String,
+    ) -> Result<TuiSubmissionOutcome, CliError> {
+        self.session
+            .lock()
+            .map_err(|_| CliError::storage("TUI session is unavailable"))?
+            .remember_expanded_prompt(typed.to_owned(), expanded.clone());
+
+        Ok(TuiSubmissionOutcome::ProviderTurn {
+            display: typed.to_owned(),
+            prompt: expanded,
+        })
     }
 
     pub fn presentation(&self) -> Result<TuiPresentation, CliError> {
@@ -214,10 +234,15 @@ impl TuiRuntimeRouter {
     /// Both directions are the same operation: move the working tree to the
     /// other snapshot, move the marker over the messages, and hand the prompt
     /// that started the turn back to the composer.
-    fn rewind_turn(&self, backwards: bool) -> Result<TuiSubmissionOutcome, CliError> {
+    ///
+    /// The tree moves with the session lock released, because every step of it
+    /// spawns git, and the marker moves only afterwards: a restore that could
+    /// not finish leaves both the transcript and the files as they were, so the
+    /// same command can be run again once the reader has dealt with it.
+    fn rewind_turn(&self, direction: Rewind) -> Result<TuiSubmissionOutcome, CliError> {
         let bootstrap = self.bootstrap()?;
-        let outcome = {
-            let mut session = self
+        let (root, step) = {
+            let session = self
                 .session
                 .lock()
                 .map_err(|_| CliError::storage("TUI session is unavailable"))?;
@@ -225,26 +250,46 @@ impl TuiRuntimeRouter {
                 return Err(CliError::runtime(HeadlessTurnError::State));
             }
 
-            let snapshots = session_snapshots(&bootstrap, &session);
-            let moved = if backwards {
-                undo_turn(snapshots.as_ref(), &mut session)
-            } else {
-                redo_turn(snapshots.as_ref(), &mut session)
-            };
-            match moved {
-                Ok(outcome) => outcome,
+            let root = session_snapshot_root(&bootstrap, &session);
+            match pending_turn(&session, direction) {
+                Ok(step) => (root, step),
                 Err(unavailable) => {
                     return Ok(TuiSubmissionOutcome::LocalInfo(unavailable.to_string()));
                 }
             }
         };
 
+        let snapshots = root
+            .as_deref()
+            .and_then(|root| open_session_snapshots(&bootstrap, root));
+        let outcome = match rewind_tree(snapshots.as_ref(), &step, direction) {
+            Ok(outcome) => outcome,
+            Err(unavailable) => {
+                return Ok(TuiSubmissionOutcome::LocalInfo(unavailable.to_string()));
+            }
+        };
+        if !outcome.is_complete() {
+            return Ok(TuiSubmissionOutcome::LocalActionableError {
+                message: outcome.failure(direction),
+                action: "resolve the listed files and run the command again".into(),
+            });
+        }
+
+        {
+            let mut session = self
+                .session
+                .lock()
+                .map_err(|_| CliError::storage("TUI session is unavailable"))?;
+            commit_rewind(&mut session, direction);
+        }
+
         let history = self.live_history()?;
         Ok(TuiSubmissionOutcome::HistoryRewritten {
-            message: outcome.message(if backwards { "Undid" } else { "Redid" }),
+            message: outcome.summary(direction),
+            detail: outcome.detail(),
             presentation: self.presentation()?,
             history,
-            draft: backwards.then(|| outcome.prompt.clone()),
+            draft: matches!(direction, Rewind::Back).then(|| outcome.prompt.clone()),
         })
     }
 

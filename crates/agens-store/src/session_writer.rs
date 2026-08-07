@@ -1128,6 +1128,98 @@ impl SessionStore {
         })
     }
 
+    /// Drops everything a session persisted past its first `surviving_messages` messages.
+    ///
+    /// The count is a prefix of the session's messages in `sequence` order, which is the order
+    /// [`SessionStore::load_session_for_resume`] reads them back in and the order the in-memory
+    /// history holds them in. Message sequences are only ever appended, so the nth message names
+    /// the same row before and after another turn — a sub-agent turn persisted out of band, for
+    /// instance — extends the session past it.
+    ///
+    /// A turn keeps its row while any of its messages survive, so a prefix landing inside a turn
+    /// keeps that turn with fewer messages. A turn left with none is deleted together with the
+    /// attempt that completed it, and `completed_turn_count`/`resumable` are recomputed from the
+    /// turns that remain rather than adjusted by a delta. Attempts are deleted before their turn
+    /// so the `ON DELETE SET NULL` back-reference cannot clear a completed attempt's turn and
+    /// break its own `CHECK`.
+    ///
+    /// `media` rows are shared between sessions by content hash and are left alone; only the
+    /// message parts that referenced them go.
+    ///
+    /// Everything happens in one immediate transaction: a partial delete would leave a session
+    /// that cannot be resumed.
+    pub fn truncate_session_history(
+        &mut self,
+        session_id: i64,
+        surviving_messages: usize,
+    ) -> Result<(), SessionStoreError> {
+        let surviving = i64::try_from(surviving_messages).map_err(|error| {
+            SessionStoreError::operation("truncate session history", &self.database_path, error)
+        })?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| {
+                SessionStoreError::operation(
+                    "start session history truncation",
+                    &self.database_path,
+                    error,
+                )
+            })?;
+
+        let Some(last_surviving_sequence) =
+            surviving_message_sequence(&transaction, &self.database_path, session_id, surviving)?
+        else {
+            return Ok(());
+        };
+
+        transaction
+            .execute(
+                "DELETE FROM session_attempts
+                 WHERE session_id = ?1 AND completed_turn_sequence IS NOT NULL
+                   AND completed_turn_sequence NOT IN (
+                       SELECT turn_sequence FROM messages
+                       WHERE session_id = ?1 AND sequence <= ?2
+                   )",
+                params![session_id, last_surviving_sequence],
+            )
+            .and_then(|_| {
+                transaction.execute(
+                    "DELETE FROM messages WHERE session_id = ?1 AND sequence > ?2",
+                    params![session_id, last_surviving_sequence],
+                )
+            })
+            .and_then(|_| {
+                transaction.execute(
+                    "DELETE FROM turns
+                     WHERE session_id = ?1 AND sequence NOT IN (
+                         SELECT turn_sequence FROM messages WHERE session_id = ?1
+                     )",
+                    params![session_id],
+                )
+            })
+            .and_then(|_| {
+                transaction.execute(
+                    "UPDATE sessions
+                     SET completed_turn_count = (SELECT count(*) FROM turns WHERE session_id = ?1),
+                         resumable = (SELECT count(*) FROM turns WHERE session_id = ?1) > 0
+                     WHERE id = ?1",
+                    params![session_id],
+                )
+            })
+            .map_err(|error| {
+                SessionStoreError::operation("truncate session history", &self.database_path, error)
+            })?;
+
+        transaction.commit().map_err(|error| {
+            SessionStoreError::operation(
+                "commit session history truncation",
+                &self.database_path,
+                error,
+            )
+        })
+    }
+
     pub fn persist_completed_session_turn(
         &mut self,
         metadata: &SessionMetadata,
@@ -1454,6 +1546,34 @@ fn canonicalize_value(value: &mut serde_json::Value) {
         }
         _ => {}
     }
+}
+
+/// The `sequence` of the last message a `surviving`-message prefix keeps, or `None` when the
+/// session holds fewer messages than that and there is nothing to truncate.
+///
+/// Zero surviving messages answers with a sequence below every stored one rather than with an
+/// absent bound, since message sequences start at one.
+fn surviving_message_sequence(
+    transaction: &Transaction<'_>,
+    database_path: &std::path::Path,
+    session_id: i64,
+    surviving: i64,
+) -> Result<Option<i64>, SessionStoreError> {
+    if surviving == 0 {
+        return Ok(Some(0));
+    }
+
+    transaction
+        .query_row(
+            "SELECT sequence FROM messages WHERE session_id = ?1
+             ORDER BY sequence LIMIT 1 OFFSET ?2",
+            params![session_id, surviving - 1],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|error| {
+            SessionStoreError::operation("read session history boundary", database_path, error)
+        })
 }
 
 fn next_sequence(

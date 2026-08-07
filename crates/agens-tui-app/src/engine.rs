@@ -27,7 +27,7 @@ use crate::repository::start_repository_probe;
 use crate::resume::{ResumedTuiSession, resume_tui_session, resumed_subagent_cards};
 use crate::router::{TuiRuntimeRouter, tui_provider_outcome};
 use crate::turn::{complete_tui_turn, tui_session_presentation};
-use crate::undo::{record_turn, session_snapshots};
+use crate::undo::{open_session_snapshots, record_turn, session_snapshot_root};
 use agens_agents::{
     ensure_active_agent_runtime, persist_pending_agent_correction, reconcile_persisted_active_agent,
 };
@@ -42,6 +42,7 @@ use agens_headless::{
 };
 use agens_session::context::{ResumeDraft, SessionContext};
 use agens_session::provider::CredentialResolver;
+use agens_session::undo::turn_boundary;
 use agens_store::{PromptMemoryStore, SessionStore};
 use agens_tool_runtime::runner::{ProductionTaskRunner, TuiTaskControls, TuiTaskLifecycleBridge};
 use agens_tool_runtime::runtime::task_execution_limits;
@@ -463,12 +464,12 @@ pub fn run_tui_prompt(
                 | TuiSubmissionOutcome::ResetSucceeded { message, .. }
                 | TuiSubmissionOutcome::ContextChanged { message, .. }
                 | TuiSubmissionOutcome::SessionResumed { message, .. }
-                | TuiSubmissionOutcome::HistoryRewritten { message, .. } => Ok(message),
+                | TuiSubmissionOutcome::HistoryRewritten { message, .. }
+                | TuiSubmissionOutcome::LocalActionableError { message, .. } => Ok(message),
                 TuiSubmissionOutcome::ProviderTurn { .. }
                 | TuiSubmissionOutcome::BusyProviderTurn { .. }
                 | TuiSubmissionOutcome::BusyRefusal(_)
                 | TuiSubmissionOutcome::SecretEntry(_)
-                | TuiSubmissionOutcome::LocalActionableError { .. }
                 | TuiSubmissionOutcome::Dialog(_)
                 | TuiSubmissionOutcome::SafeDialog(_)
                 | TuiSubmissionOutcome::TranscriptDialog
@@ -509,26 +510,13 @@ pub fn run_tui_prompt_with(
             .map_err(|_| CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable"))?;
         expand_tui_prompt_with_media(&context, bootstrap, prompt)?
     };
-    let (request, snapshots, before, message_count) = {
+    let (request, snapshot_root, previous_messages) = {
         let mut session = session
             .lock()
             .map_err(|_| CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable"))?;
         if session.running {
             return Err(CliError::runtime(HeadlessTurnError::State));
         }
-        session.running = true;
-        // Sending a prompt is the reader choosing the direction they undid
-        // their way back to, so the turns they took back stop being recoverable
-        // here rather than lingering into a history they did not ask for.
-        session.commit_undo();
-
-        // Bracketing the turn is what makes it undoable at all; a project that
-        // cannot be snapshotted simply records no step.
-        let snapshots = session_snapshots(bootstrap, &session);
-        let before = snapshots
-            .as_ref()
-            .and_then(|repository| repository.capture().ok());
-        let message_count = session.messages.len();
         // Snapshot staged media into the request without clearing yet. Preflight and other
         // early failures must leave chips staged; clear only after success or after the
         // attempt has produced partial history (media then lives on the session/retry path).
@@ -568,10 +556,37 @@ pub fn run_tui_prompt_with(
             request.system_prompt = Some(parent_skill_system_prompt(&base, &skills));
         }
         seed_configured_reasoning_effort(&mut request, bootstrap);
-        (request, snapshots, before, message_count)
+        let snapshot_root = session_snapshot_root(bootstrap, &session);
+
+        // Sending a prompt is the reader choosing the direction they undid
+        // their way back to, so the turns they took back stop being recoverable
+        // here — in the store as well as in memory — rather than lingering into
+        // a history they did not ask for.
+        commit_tui_undo(bootstrap, &mut session)?;
+
+        // The session is claimed only once nothing above can still fail: a turn
+        // that never starts must not leave the session marked running.
+        session.running = true;
+
+        (request, snapshot_root, session.messages.clone())
     };
+
+    // Bracketing the turn is what makes it undoable at all; a project that
+    // cannot be snapshotted simply records no step. Opening the repository and
+    // capturing both spawn git, so neither runs while the session is locked.
+    let snapshots = snapshot_root
+        .as_deref()
+        .and_then(|root| open_session_snapshots(bootstrap, root));
+    let before = snapshots
+        .as_ref()
+        .and_then(|repository| repository.capture().ok());
+
     let consumed_reminder = request.pending_system_reminder.is_some();
     let completion = run(request);
+    let after = snapshots
+        .as_ref()
+        .and_then(|repository| repository.capture().ok());
+
     let mut session = session
         .lock()
         .map_err(|_| CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable"))?;
@@ -586,10 +601,8 @@ pub fn run_tui_prompt_with(
         session.pending_media_mimes.clear();
     }
     let result = complete_tui_turn(&mut session, completion, consumed_reminder);
-    let after = snapshots
-        .as_ref()
-        .and_then(|repository| repository.capture().ok());
-    record_turn(&mut session, prompt, message_count, before, after);
+    let boundary = turn_boundary(&previous_messages, &session.messages);
+    record_turn(&mut session, prompt, boundary, before, after);
     if let Some(identifier) = session.identifier {
         // Best-effort, like the write above: this call gets another attempt on every subsequent
         // completed turn, and the toggle command (the moment the user actually asked for a
@@ -601,6 +614,24 @@ pub fn run_tui_prompt_with(
         );
     }
     result
+}
+
+/// Drops the turns an undo held back, from the session in hand and from what it persisted.
+///
+/// The store is opened only when an undo is actually waiting, so a prompt on a session that undid
+/// nothing cannot fail on a store it never needed. Unlike the bypass write-through below, a
+/// failure here is fatal to the submission: the reader's next prompt would otherwise be answered
+/// with the turn they took back still in the history the model is given.
+fn commit_tui_undo(bootstrap: &Bootstrap, session: &mut SessionContext) -> Result<(), CliError> {
+    if !session.undo.has_undone_turns() {
+        return Ok(());
+    }
+
+    let mut store = SessionStore::open(bootstrap.data_directory())
+        .map_err(|_| CliError::storage("undone turns could not be dropped from the session"))?;
+    session
+        .commit_undo(Some(&mut store))
+        .map_err(|_| CliError::storage("undone turns could not be dropped from the session"))
 }
 
 pub(crate) fn seed_fresh_tui_context(
@@ -1176,6 +1207,129 @@ mod tests {
             Some(true)
         );
 
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    /// The sequence the feature is judged by: a turn is taken back, the reader sends the next
+    /// prompt, that turn completes — and the turn they took back is gone from what the model was
+    /// given, from the history in hand, and from the store the next turn reloads from.
+    #[test]
+    fn a_turn_taken_back_stays_gone_once_the_next_turn_completes() {
+        use agens_core::{CompletedSessionTurn, Message, Role, SessionMessage};
+
+        fn completed(prompt: &str, answer: &str) -> CompletedSessionTurn {
+            CompletedSessionTurn::new(
+                [
+                    Message {
+                        role: Role::User,
+                        parts: vec![MessagePart::Text(prompt.into())],
+                    },
+                    Message {
+                        role: Role::Assistant,
+                        parts: vec![MessagePart::Text(answer.into())],
+                    },
+                ]
+                .into_iter()
+                .map(SessionMessage::try_from)
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            )
+            .unwrap()
+        }
+
+        let temporary = tui_session_directory("undo-commit");
+        let bootstrap = tui_session_bootstrap(&temporary, &[]);
+        let project = tui_project(&temporary);
+        let mut store = SessionStore::open(bootstrap.data_directory()).unwrap();
+        let mut metadata = SessionMetadata {
+            id: 0,
+            project: project.clone(),
+            title: "conversation".into(),
+            active_agent: "primary".into(),
+            provider_id: None,
+            model_id: None,
+            reasoning_effort: None,
+            created_at: 1,
+            updated_at: 1,
+            completed_turn_count: 0,
+            resumable: false,
+        };
+        metadata = store
+            .persist_completed_session_turn(&metadata, &completed("first", "kept"))
+            .unwrap();
+        metadata = store
+            .persist_completed_session_turn(&metadata, &completed("second", "taken back"))
+            .unwrap();
+        let stored = store.load_session_for_resume(metadata.id).unwrap();
+        drop(store);
+
+        let mut context = SessionContext::restored(
+            metadata.id,
+            stored.metadata,
+            stored.messages,
+            std::path::PathBuf::from(&project),
+        );
+        context.undo.record(agens_session::undo::UndoStep::new(
+            "second".into(),
+            2,
+            "before".into(),
+            "after".into(),
+        ));
+        context.undo.undo().expect("a turn to take back");
+        let session = Arc::new(Mutex::new(context));
+
+        let identifier = metadata.id;
+        let result =
+            run_tui_prompt_with(&bootstrap, "a new direction", &session, None, |request| {
+                assert_eq!(
+                    request.history.len(),
+                    2,
+                    "the model is asked to continue from the history the reader undid back to"
+                );
+
+                let mut store = SessionStore::open(bootstrap.data_directory()).unwrap();
+                let metadata = store
+                    .persist_completed_session_turn(
+                        &store.load_session_for_resume(identifier).unwrap().metadata,
+                        &completed("a new direction", "answered"),
+                    )
+                    .unwrap();
+                let stored = store.load_session_for_resume(metadata.id).unwrap();
+
+                Ok(HeadlessChatCompletion {
+                    text: "answered".into(),
+                    metadata: stored.metadata,
+                    messages: stored.messages,
+                })
+            });
+        assert!(result.is_ok(), "{result:?}");
+
+        let context = session.lock().unwrap();
+        let texts = context
+            .messages
+            .iter()
+            .flat_map(|message| message.parts.iter())
+            .filter_map(|part| match part {
+                MessagePart::Text(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            texts,
+            vec!["first", "kept", "a new direction", "answered"],
+            "the taken-back turn does not come back with the next completed turn"
+        );
+
+        let store = SessionStore::open(bootstrap.data_directory()).unwrap();
+        let reloaded = store.load_session_for_resume(identifier).unwrap();
+        assert_eq!(
+            reloaded.messages, context.messages,
+            "the store holds exactly the history the session does"
+        );
+        assert_eq!(reloaded.metadata.completed_turn_count, 2);
+
+        drop(context);
+        drop(store);
         std::fs::remove_dir_all(temporary).unwrap();
     }
 

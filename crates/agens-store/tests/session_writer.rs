@@ -1877,3 +1877,311 @@ fn setting_bypass_permission_prompts_round_trips_true_and_false() {
 
     fs::remove_dir_all(directory).unwrap();
 }
+
+/// A session with three completed turns, each recorded through its own attempt, so a truncation
+/// can be checked against real turn, message, part and attempt rows rather than a hand-built one.
+fn session_with_three_turns(directory: &std::path::Path, media_id: i64) -> (SessionStore, i64) {
+    let metadata = SessionMetadata {
+        id: 0,
+        project: "project".into(),
+        title: "history".into(),
+        active_agent: "primary".into(),
+        provider_id: None,
+        model_id: None,
+        reasoning_effort: None,
+        created_at: 10,
+        updated_at: 20,
+        completed_turn_count: 0,
+        resumable: false,
+    };
+    let turns = [
+        turn(vec![
+            Message {
+                role: Role::User,
+                parts: vec![
+                    MessagePart::Text("look at this".into()),
+                    MessagePart::Media {
+                        media_id,
+                        mime: "image/png".into(),
+                    },
+                ],
+            },
+            Message {
+                role: Role::Assistant,
+                parts: vec![MessagePart::Text("a diagram".into())],
+            },
+        ]),
+        turn(vec![
+            Message {
+                role: Role::User,
+                parts: vec![MessagePart::Text("search it".into())],
+            },
+            Message {
+                role: Role::Assistant,
+                parts: vec![MessagePart::ToolCall {
+                    id: "call-1".into(),
+                    name: "search".into(),
+                    input: r#"{"query":"answer"}"#.into(),
+                }],
+            },
+            Message {
+                role: Role::Tool,
+                parts: vec![MessagePart::ToolResult {
+                    tool_call_id: "call-1".into(),
+                    content: "found".into(),
+                    is_error: false,
+                }],
+            },
+            Message {
+                role: Role::Assistant,
+                parts: vec![MessagePart::Text("here it is".into())],
+            },
+        ]),
+        turn(vec![
+            Message {
+                role: Role::User,
+                parts: vec![MessagePart::Text("the turn the reader takes back".into())],
+            },
+            Message {
+                role: Role::Assistant,
+                parts: vec![MessagePart::Text("undone".into())],
+            },
+        ]),
+    ];
+
+    let mut store = SessionStore::open(directory).unwrap();
+    let mut session_id = 0;
+    for (index, completed) in turns.iter().enumerate() {
+        let started_at = 20 + index as i64;
+        let metadata = SessionMetadata {
+            id: session_id,
+            updated_at: started_at,
+            ..metadata.clone()
+        };
+        let attempt = store
+            .begin_session_attempt(&metadata, format!("prompt-{index}"))
+            .unwrap();
+        session_id = attempt.key().session_id();
+        let metadata = SessionMetadata {
+            id: session_id,
+            ..metadata
+        };
+        assert_eq!(
+            store
+                .persist_completed_session_attempt(attempt.key(), &metadata, completed, started_at)
+                .unwrap(),
+            AttemptFinishOutcome::Finished
+        );
+    }
+
+    (store, session_id)
+}
+
+fn attempt_turn_sequences(store: &SessionStore, session_id: i64) -> Vec<Option<i64>> {
+    let connection = Connection::open(store.database_path()).unwrap();
+    let mut statement = connection
+        .prepare(
+            "SELECT completed_turn_sequence FROM session_attempts
+             WHERE session_id = ?1 ORDER BY sequence",
+        )
+        .unwrap();
+    statement
+        .query_map([session_id], |row| row.get::<_, Option<i64>>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+}
+
+/// The claim the whole feature rests on: after a truncation the session reloads through the same
+/// path a resume uses, the taken-back turn is gone, and everything before it comes back unchanged.
+#[test]
+fn truncating_a_session_drops_the_later_turns_and_leaves_the_prefix_unchanged() {
+    let directory = directory();
+    let media = ingest_media_bytes(&directory, b"session-media", "image/png").unwrap();
+    let (mut store, session_id) = session_with_three_turns(&directory, media.id);
+    let before = store.load_session_for_resume(session_id).unwrap();
+    assert_eq!(before.messages.len(), 8);
+
+    store.truncate_session_history(session_id, 6).unwrap();
+
+    let after = store.load_session_for_resume(session_id).unwrap();
+    assert_eq!(after.messages, before.messages[..6].to_vec());
+    assert_eq!(after.metadata.completed_turn_count, 2);
+    assert!(after.metadata.resumable);
+    assert_eq!(
+        after.messages[0].parts[1],
+        MessagePart::Media {
+            media_id: media.id,
+            mime: "image/png".into(),
+        },
+        "a surviving media part still resolves to its blob"
+    );
+
+    let connection = Connection::open(store.database_path()).unwrap();
+    assert_eq!(normalized_counts(&connection), (1, 2, 6, 7));
+    assert_eq!(
+        connection
+            .query_row("SELECT count(*) FROM media", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        1,
+        "media rows are shared by content hash and are not a session's to delete"
+    );
+    assert_eq!(
+        attempt_turn_sequences(&store, session_id),
+        vec![Some(1), Some(2)],
+        "the attempt that completed the dropped turn goes with it"
+    );
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+/// The surviving prefix is a message boundary, not a turn boundary: one that lands inside a turn
+/// keeps that turn, with only the messages past the boundary removed.
+#[test]
+fn a_surviving_prefix_inside_a_turn_keeps_the_turn_it_lands_in() {
+    let directory = directory();
+    let media = ingest_media_bytes(&directory, b"session-media", "image/png").unwrap();
+    let (mut store, session_id) = session_with_three_turns(&directory, media.id);
+    let before = store.load_session_for_resume(session_id).unwrap();
+
+    store.truncate_session_history(session_id, 3).unwrap();
+
+    let after = store.load_session_for_resume(session_id).unwrap();
+    assert_eq!(after.messages, before.messages[..3].to_vec());
+    assert_eq!(after.metadata.completed_turn_count, 2);
+    assert_eq!(
+        attempt_turn_sequences(&store, session_id),
+        vec![Some(1), Some(2)],
+        "the partially truncated turn still has its attempt"
+    );
+
+    let connection = Connection::open(store.database_path()).unwrap();
+    assert_eq!(normalized_counts(&connection), (1, 2, 3, 4));
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+/// Truncating everything leaves a session that exists and can be written to again, with counters
+/// that agree with the nothing it now holds.
+#[test]
+fn truncating_a_session_to_nothing_clears_its_history_and_counters() {
+    let directory = directory();
+    let media = ingest_media_bytes(&directory, b"session-media", "image/png").unwrap();
+    let (mut store, session_id) = session_with_three_turns(&directory, media.id);
+
+    store.truncate_session_history(session_id, 0).unwrap();
+
+    let connection = Connection::open(store.database_path()).unwrap();
+    assert_eq!(normalized_counts(&connection), (1, 0, 0, 0));
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT completed_turn_count, resumable FROM sessions WHERE id = ?1",
+                [session_id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .unwrap(),
+        (0, 0)
+    );
+    assert!(
+        attempt_turn_sequences(&store, session_id).is_empty(),
+        "no attempt survives a turn it completed"
+    );
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+/// A truncation that cannot finish must leave the session exactly as it was: a session missing
+/// half of a turn is one that cannot be resumed at all.
+#[test]
+fn a_truncation_that_cannot_finish_leaves_every_row_in_place() {
+    let directory = directory();
+    let media = ingest_media_bytes(&directory, b"session-media", "image/png").unwrap();
+    let (mut store, session_id) = session_with_three_turns(&directory, media.id);
+    let before = store.load_session_for_resume(session_id).unwrap();
+
+    let connection = Connection::open(store.database_path()).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER refuse_turn_delete BEFORE DELETE ON turns
+             BEGIN SELECT RAISE(ABORT, 'turn delete refused'); END;",
+        )
+        .unwrap();
+
+    assert!(
+        store.truncate_session_history(session_id, 6).is_err(),
+        "a refused delete must be reported, not swallowed"
+    );
+    assert_eq!(
+        store.load_session_for_resume(session_id).unwrap(),
+        before,
+        "the messages deleted before the failure are rolled back with it"
+    );
+    assert_eq!(normalized_counts(&connection), (1, 3, 8, 9));
+    assert_eq!(
+        attempt_turn_sequences(&store, session_id),
+        vec![Some(1), Some(2), Some(3)]
+    );
+
+    connection
+        .execute_batch("DROP TRIGGER refuse_turn_delete;")
+        .unwrap();
+    store.truncate_session_history(session_id, 6).unwrap();
+    assert_eq!(normalized_counts(&connection), (1, 2, 6, 7));
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+/// A session that already holds no more than the surviving prefix has nothing to truncate, and a
+/// truncation asked for anyway must not touch it.
+#[test]
+fn truncating_past_the_stored_history_changes_nothing() {
+    let directory = directory();
+    let media = ingest_media_bytes(&directory, b"session-media", "image/png").unwrap();
+    let (mut store, session_id) = session_with_three_turns(&directory, media.id);
+    let before = store.load_session_for_resume(session_id).unwrap();
+
+    store.truncate_session_history(session_id, 12).unwrap();
+
+    assert_eq!(store.load_session_for_resume(session_id).unwrap(), before);
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+/// A turn persisted after the prefix was measured — a sub-agent turn recorded out of band, or one
+/// that raced the truncation — is appended past it, so the prefix still names the same rows.
+#[test]
+fn a_turn_persisted_after_the_prefix_was_measured_does_not_move_it() {
+    let directory = directory();
+    let media = ingest_media_bytes(&directory, b"session-media", "image/png").unwrap();
+    let (mut store, session_id) = session_with_three_turns(&directory, media.id);
+    let before = store.load_session_for_resume(session_id).unwrap();
+    let mut metadata = before.metadata.clone();
+    metadata.updated_at = 40;
+    store
+        .persist_completed_session_turn(
+            &metadata,
+            &turn(vec![
+                Message {
+                    role: Role::User,
+                    parts: vec![MessagePart::Text("a sub-agent task".into())],
+                },
+                Message {
+                    role: Role::Assistant,
+                    parts: vec![MessagePart::Text("a sub-agent turn".into())],
+                },
+            ]),
+        )
+        .unwrap();
+
+    store.truncate_session_history(session_id, 6).unwrap();
+
+    let after = store.load_session_for_resume(session_id).unwrap();
+    assert_eq!(
+        after.messages,
+        before.messages[..6].to_vec(),
+        "the prefix keeps naming the same six messages"
+    );
+
+    fs::remove_dir_all(directory).unwrap();
+}

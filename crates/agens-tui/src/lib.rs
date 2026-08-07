@@ -487,6 +487,10 @@ pub enum TuiSubmissionOutcome {
     /// back to the composer, so undoing costs no retyping.
     HistoryRewritten {
         message: String,
+        /// What the one-line message left out — the files a rewind deliberately
+        /// did not touch. Shown where the reader can read all of it, rather
+        /// than truncated into the status line.
+        detail: Option<String>,
         presentation: TuiPresentation,
         history: Vec<Conversation>,
         draft: Option<String>,
@@ -6456,6 +6460,7 @@ where
             }
             TuiSubmissionOutcome::HistoryRewritten {
                 message,
+                detail,
                 presentation,
                 history,
                 draft,
@@ -6468,6 +6473,9 @@ where
                     self.restore_resume_draft(draft);
                 }
                 self.status = Some(message);
+                if let Some(detail) = detail {
+                    self.show_dialog("Files left alone", detail);
+                }
                 None
             }
             TuiSubmissionOutcome::Dialog(dialog) => {

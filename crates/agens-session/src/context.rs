@@ -26,6 +26,10 @@ pub struct SessionContext {
     /// in `messages` and are excluded by [`SessionContext::live_messages`]
     /// until the next prompt commits the undo.
     pub undo: crate::undo::UndoHistory,
+    /// The last prompt that was expanded before being sent, kept only until the
+    /// turn it belongs to records itself. See
+    /// [`SessionContext::remember_expanded_prompt`].
+    pub expanded_prompt: Option<ExpandedPrompt>,
     pub active_agent: Option<ActiveAgentRuntime>,
     pub pending_system_reminder: Option<String>,
     pub selection: Option<ModelSelection>,
@@ -49,6 +53,23 @@ pub struct SessionContext {
     /// persisted value a resume reads back.
     pub bypass_permissions: bool,
     pub running: bool,
+}
+
+/// A prompt as the reader typed it, next to the text that was sent for it.
+///
+/// A slash command or a skill reaches the provider as its expanded body, which
+/// can run to kilobytes and is not what the reader would recognise as their
+/// prompt. Keeping both lets an undo hand back the invocation instead.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ExpandedPrompt {
+    typed: String,
+    expanded: String,
+}
+
+impl std::fmt::Debug for ExpandedPrompt {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ExpandedPrompt([REDACTED])")
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -125,6 +146,16 @@ pub struct CompletedSubagentTurn {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SessionMutationError {
     Busy,
+}
+
+/// Why the turns a reader took back could not be dropped for good.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UndoCommitError {
+    /// The session has persisted history but no store was handed in to truncate
+    /// it. Committing memory alone would let the store hand the undone turn
+    /// back on the next completed turn.
+    StoreUnavailable,
+    Storage(agens_store::SessionStoreError),
 }
 
 pub fn reset_session(context: &mut SessionContext) -> Result<(), SessionMutationError> {
@@ -216,17 +247,55 @@ impl SessionContext {
         &self.messages[..live]
     }
 
-    /// Drops the messages an undo held back and ends the undo.
+    /// Remembers what the reader typed for a prompt that was expanded before it
+    /// was sent, so the turn recording itself can prefer the invocation over the
+    /// expansion.
+    pub fn remember_expanded_prompt(&mut self, typed: String, expanded: String) {
+        self.expanded_prompt = Some(ExpandedPrompt { typed, expanded });
+    }
+
+    /// The text the reader typed for `expanded`, if `expanded` is the expansion
+    /// that was last remembered.
+    ///
+    /// Takes either way: a remembered prompt belongs to one submission, and a
+    /// submission that never reached a turn must not be handed to a later one.
+    pub fn take_typed_prompt_for(&mut self, expanded: &str) -> Option<String> {
+        self.expanded_prompt
+            .take()
+            .filter(|prompt| prompt.expanded == expanded)
+            .map(|prompt| prompt.typed)
+    }
+
+    /// Drops the messages an undo held back, from this history and from the
+    /// session's persisted one, and ends the undo.
     ///
     /// Called when the next prompt arrives: that submission is the reader
     /// choosing the new direction, and the turns they took back stop being
     /// recoverable at that moment.
-    pub fn commit_undo(&mut self) {
+    ///
+    /// The store is truncated first and a failure is propagated before anything
+    /// in memory moves, so the two cannot end up disagreeing: a turn the store
+    /// still holds would be reloaded into this history by the next completed
+    /// turn and sent to the model. A session with no identifier has persisted
+    /// nothing yet and needs no store.
+    pub fn commit_undo(&mut self, store: Option<&mut SessionStore>) -> Result<(), UndoCommitError> {
         if !self.undo.has_undone_turns() {
-            return;
+            return Ok(());
         }
-        let surviving = self.undo.commit(self.messages.len());
+
+        let surviving = self.undo.visible_message_count(self.messages.len());
+
+        if let Some(identifier) = self.identifier {
+            let store = store.ok_or(UndoCommitError::StoreUnavailable)?;
+            store
+                .truncate_session_history(identifier, surviving)
+                .map_err(UndoCommitError::Storage)?;
+        }
+
+        self.undo.commit(self.messages.len());
         self.messages.truncate(surviving);
+
+        Ok(())
     }
 
     /// A resumed context assembled directly. Not test-gated: its callers are
@@ -244,6 +313,7 @@ impl SessionContext {
             confinement_root: Some(confinement_root),
             messages,
             undo: crate::undo::UndoHistory::default(),
+            expanded_prompt: None,
             active_agent: Some(active_agent),
             pending_system_reminder: None,
             selection: None,
@@ -280,6 +350,7 @@ impl SessionContext {
             confinement_root: Some(confinement_root),
             messages,
             undo: crate::undo::UndoHistory::default(),
+            expanded_prompt: None,
             active_agent: None,
             pending_system_reminder: None,
             selection: None,
@@ -344,7 +415,137 @@ impl SessionContext {
 
 #[cfg(test)]
 mod tests {
+    use agens_core::{CompletedSessionTurn, MessagePart, Role, SessionMessage};
+
     use super::*;
+
+    fn store_directory(label: &str) -> std::path::PathBuf {
+        let directory =
+            std::env::temp_dir().join(format!("agens-session-undo-{}-{label}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        directory
+    }
+
+    fn text(role: Role, body: &str) -> Message {
+        Message {
+            role,
+            parts: vec![MessagePart::Text(body.into())],
+        }
+    }
+
+    fn completed_turn(prompt: &str, answer: &str) -> CompletedSessionTurn {
+        CompletedSessionTurn::new(
+            [text(Role::User, prompt), text(Role::Assistant, answer)]
+                .into_iter()
+                .map(SessionMessage::try_from)
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    /// A session with two persisted turns, held in a context that has taken the second one back.
+    fn session_with_an_undone_turn(
+        label: &str,
+    ) -> (std::path::PathBuf, SessionStore, SessionContext) {
+        let directory = store_directory(label);
+        let mut store = SessionStore::open(&directory).unwrap();
+        let mut metadata = SessionMetadata {
+            id: 0,
+            project: "project".into(),
+            title: "title".into(),
+            active_agent: "primary".into(),
+            provider_id: None,
+            model_id: None,
+            reasoning_effort: None,
+            created_at: 1,
+            updated_at: 1,
+            completed_turn_count: 0,
+            resumable: false,
+        };
+        metadata = store
+            .persist_completed_session_turn(&metadata, &completed_turn("first", "kept"))
+            .unwrap();
+        metadata = store
+            .persist_completed_session_turn(&metadata, &completed_turn("second", "taken back"))
+            .unwrap();
+
+        let stored = store.load_session_for_resume(metadata.id).unwrap();
+        let mut context = SessionContext::restored(
+            metadata.id,
+            stored.metadata,
+            stored.messages,
+            std::path::PathBuf::from("project"),
+        );
+        context.undo.record(crate::undo::UndoStep::new(
+            "second".into(),
+            2,
+            "before".into(),
+            "after".into(),
+        ));
+        context.undo.undo().expect("a turn to take back");
+
+        (directory, store, context)
+    }
+
+    /// The defect this exists for: without the store truncation the taken-back turn is reloaded
+    /// into the history by the next completed turn and sent to the model again.
+    #[test]
+    fn committing_an_undo_drops_the_taken_back_turn_from_the_store() {
+        let (directory, mut store, mut context) = session_with_an_undone_turn("commits");
+        let identifier = context.identifier.expect("a persisted session");
+
+        context.commit_undo(Some(&mut store)).unwrap();
+
+        assert_eq!(context.messages.len(), 2);
+        let stored = store.load_session_for_resume(identifier).unwrap();
+        assert_eq!(stored.messages, context.messages);
+        assert_eq!(stored.metadata.completed_turn_count, 1);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Memory and the store must never part company quietly: a commit that cannot reach the store
+    /// leaves the undo exactly where it was, so the reader is told rather than served a history
+    /// the store will contradict.
+    #[test]
+    fn a_commit_that_cannot_reach_the_store_changes_nothing() {
+        let (directory, _store, mut context) = session_with_an_undone_turn("unreachable");
+        let messages = context.messages.clone();
+
+        assert_eq!(
+            context.commit_undo(None),
+            Err(UndoCommitError::StoreUnavailable)
+        );
+        assert_eq!(context.messages, messages);
+        assert!(context.undo.has_undone_turns());
+        assert_eq!(context.live_messages().len(), 2);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A session that never reached the store has nothing to truncate, which is not a failure.
+    #[test]
+    fn committing_an_undo_on_an_unpersisted_session_needs_no_store() {
+        let mut context = SessionContext::fresh();
+        context.messages = vec![
+            text(Role::User, "first"),
+            text(Role::Assistant, "kept"),
+            text(Role::User, "second"),
+            text(Role::Assistant, "taken back"),
+        ];
+        context.undo.record(crate::undo::UndoStep::new(
+            "second".into(),
+            2,
+            "before".into(),
+            "after".into(),
+        ));
+        context.undo.undo().expect("a turn to take back");
+
+        assert_eq!(context.commit_undo(None), Ok(()));
+        assert_eq!(context.messages.len(), 2);
+        assert!(!context.undo.has_undone_turns());
+    }
 
     #[test]
     fn bypass_permissions_defaults_to_false_for_a_fresh_session() {
