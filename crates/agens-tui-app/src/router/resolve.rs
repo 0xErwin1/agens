@@ -10,14 +10,15 @@ use crate::files::{ingest_tui_media_path, resolve_attach_path};
 use crate::models::{select_tui_effort, select_tui_model};
 use crate::resume::{commit_tui_session_resume, resume_tui_session};
 use crate::turn::tui_session_presentation;
-use crate::undo::{
-    Rewind, commit_rewind, open_session_snapshots, pending_turn, rewind_tree, session_snapshot_root,
-};
+use crate::undo::{rewind_detail, rewind_failure, rewind_summary, unavailable_message};
 use agens_agents::select_subagent;
 use agens_bootstrap::Bootstrap;
 use agens_error::{CliError, ExitStatus};
 use agens_session::context::reset_session;
 use agens_session::provider::ProviderKind;
+use agens_session::undo::{
+    Rewind, commit_rewind, open_session_snapshots, pending_turn, rewind_tree, session_snapshot_root,
+};
 use agens_tool_runtime::rotation::rotate_agent;
 
 use super::{BusyPolicy, TuiRuntimeRouter};
@@ -254,7 +255,9 @@ impl TuiRuntimeRouter {
             match pending_turn(&session, direction) {
                 Ok(step) => (root, step),
                 Err(unavailable) => {
-                    return Ok(TuiSubmissionOutcome::LocalInfo(unavailable.to_string()));
+                    return Ok(TuiSubmissionOutcome::LocalInfo(unavailable_message(
+                        &unavailable,
+                    )));
                 }
             }
         };
@@ -265,12 +268,14 @@ impl TuiRuntimeRouter {
         let outcome = match rewind_tree(snapshots.as_ref(), &step, direction) {
             Ok(outcome) => outcome,
             Err(unavailable) => {
-                return Ok(TuiSubmissionOutcome::LocalInfo(unavailable.to_string()));
+                return Ok(TuiSubmissionOutcome::LocalInfo(unavailable_message(
+                    &unavailable,
+                )));
             }
         };
         if !outcome.is_complete() {
             return Ok(TuiSubmissionOutcome::LocalActionableError {
-                message: outcome.failure(direction),
+                message: rewind_failure(&outcome, direction),
                 action: "resolve the listed files and run the command again".into(),
             });
         }
@@ -285,8 +290,8 @@ impl TuiRuntimeRouter {
 
         let history = self.live_history()?;
         Ok(TuiSubmissionOutcome::HistoryRewritten {
-            message: outcome.summary(direction),
-            detail: outcome.detail(),
+            message: rewind_summary(&outcome, direction),
+            detail: rewind_detail(&outcome),
             presentation: self.presentation()?,
             history,
             draft: matches!(direction, Rewind::Back).then(|| outcome.prompt.clone()),

@@ -27,7 +27,6 @@ use crate::repository::start_repository_probe;
 use crate::resume::{ResumedTuiSession, resume_tui_session, resumed_subagent_cards};
 use crate::router::{TuiRuntimeRouter, tui_provider_outcome};
 use crate::turn::{complete_tui_turn, tui_session_presentation};
-use crate::undo::{open_session_snapshots, record_turn, session_snapshot_root};
 use agens_agents::{
     ensure_active_agent_runtime, persist_pending_agent_correction, reconcile_persisted_active_agent,
 };
@@ -42,7 +41,9 @@ use agens_headless::{
 };
 use agens_session::context::{ResumeDraft, SessionContext};
 use agens_session::provider::CredentialResolver;
-use agens_session::undo::turn_boundary;
+use agens_session::undo::{
+    open_session_snapshots, record_turn, session_snapshot_root, turn_boundary,
+};
 use agens_store::{PromptMemoryStore, SessionStore};
 use agens_tool_runtime::runner::{ProductionTaskRunner, TuiTaskControls, TuiTaskLifecycleBridge};
 use agens_tool_runtime::runtime::task_execution_limits;

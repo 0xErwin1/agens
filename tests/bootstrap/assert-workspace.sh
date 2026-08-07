@@ -121,8 +121,10 @@ jq -e '
       "agens-bootstrap",
       "agens-core",
       "agens-error",
+      "agens-fixtures",
       "agens-models",
       "agens-providers",
+      "agens-snapshot",
       "agens-store",
       "agens-tools"
     ],
@@ -175,7 +177,6 @@ jq -e '
       "agens-permissions",
       "agens-providers",
       "agens-session",
-      "agens-snapshot",
       "agens-store",
       "agens-tool-runtime",
       "agens-tools",
