@@ -250,11 +250,4 @@ pub fn guess_mime_from_bytes(bytes: &[u8]) -> Option<String> {
     None
 }
 
-/// Path-free composer chip label, 1-based ordinal (Grok-style `[Image #N]`).
-pub fn media_chip_label(ordinal: usize, mime: &str) -> String {
-    if mime.starts_with("image/") {
-        format!("[Image #{ordinal}]")
-    } else {
-        format!("[File #{ordinal}]")
-    }
-}
+pub use agens_core::media_chip_label;

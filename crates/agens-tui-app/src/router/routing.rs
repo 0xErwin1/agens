@@ -79,6 +79,9 @@ impl TuiRuntimeRouter {
             TuiRouteRequest::AttachClipboardImage { bytes, mime } => {
                 return self.attach_clipboard_image(bytes, mime);
             }
+            TuiRouteRequest::ReplaceStagedMedia { attachments } => {
+                return self.replace_staged_media(attachments);
+            }
             TuiRouteRequest::SubmitSecret { action_id, secret } => {
                 return self.submit_secret(action_id, secret);
             }
@@ -110,14 +113,49 @@ impl TuiRuntimeRouter {
             let (media_id, mime) =
                 crate::files::ingest_tui_media_bytes(&bootstrap, &bytes, mime.as_deref())?;
             session.push_pending_media(media_id, mime);
-            let media_chips = session.pending_media_chip_labels();
-            let chip = media_chips
+            let chip = session
+                .pending_media_chip_labels()
                 .last()
                 .cloned()
                 .unwrap_or_else(|| "[Image #?]".into());
             Ok(TuiSubmissionOutcome::MediaAttached {
                 message: format!("Attached {chip} from clipboard."),
-                media_chips,
+                staged_media: crate::files::session_staged_media(&session),
+            })
+        })();
+        result.unwrap_or_else(
+            |error: CliError| TuiSubmissionOutcome::LocalActionableError {
+                message: error.to_string(),
+                action: TUI_ERROR_ACTION.into(),
+            },
+        )
+    }
+
+    /// Replaces the session's staged media with a restored attachment set.
+    ///
+    /// Driven by stash pop, overlay paste, and history browse: the composer
+    /// chips changed on the surface, and what the next submit sends must match.
+    fn replace_staged_media(
+        &self,
+        attachments: Vec<agens_core::PromptAttachment>,
+    ) -> TuiSubmissionOutcome {
+        let result = (|| {
+            let mut session = self
+                .session
+                .lock()
+                .map_err(|_| CliError::storage("TUI session is unavailable"))?;
+
+            session.pending_media_ids = attachments
+                .iter()
+                .map(|attachment| attachment.media_id)
+                .collect();
+            session.pending_media_mimes = attachments
+                .iter()
+                .map(|attachment| attachment.mime.clone())
+                .collect();
+
+            Ok(TuiSubmissionOutcome::StagedMediaReplaced {
+                staged_media: attachments,
             })
         })();
         result.unwrap_or_else(

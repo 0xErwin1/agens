@@ -52,7 +52,7 @@ struct Migration {
     ddl: fn() -> String,
 }
 
-const MIGRATIONS: [Migration; 9] = [
+const MIGRATIONS: [Migration; 10] = [
     Migration {
         id: "0001_permission_grants",
         ddl: permission_grants_ddl,
@@ -88,6 +88,10 @@ const MIGRATIONS: [Migration; 9] = [
     Migration {
         id: "0009_media",
         ddl: media_ddl,
+    },
+    Migration {
+        id: "0010_prompt_memory_media",
+        ddl: prompt_memory_media_ddl,
     },
 ];
 
@@ -540,6 +544,62 @@ fn media_ddl() -> String {
     CREATE UNIQUE INDEX session_attempts_session_sequence ON session_attempts(session_id, sequence);
     CREATE UNIQUE INDEX session_attempts_one_running ON session_attempts(session_id) WHERE status = 'running';
     CREATE INDEX session_attempts_latest ON session_attempts(session_id, sequence DESC, id DESC);
+    "
+    .to_owned()
+}
+
+/// Staged attachments for prompt history and stash rows.
+///
+/// `attachments` is JSON text of `[media_id, mime]` pairs (durable ids only, never source paths),
+/// `NULL` for text-only entries — every pre-existing row copies through as `NULL`. The old
+/// `text <> ''` CHECK is relaxed so an attachments-only entry (empty text) can be stashed;
+/// application code still rejects an entry that is empty on both sides. The rebuild uses the same
+/// double shuffle as `media_ddl` so `sqlite_schema` keeps unquoted table names.
+fn prompt_memory_media_ddl() -> String {
+    "
+    CREATE TABLE prompt_history_media (
+        id INTEGER PRIMARY KEY,
+        text TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        attachments TEXT CHECK(attachments IS NULL OR (json_valid(attachments) AND json_type(attachments) = 'array')),
+        CHECK(text <> '' OR attachments IS NOT NULL)
+    );
+    INSERT INTO prompt_history_media (id, text, created_at, attachments)
+    SELECT id, text, created_at, NULL FROM prompt_history;
+    DROP TABLE prompt_history;
+    CREATE TABLE prompt_history (
+        id INTEGER PRIMARY KEY,
+        text TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        attachments TEXT CHECK(attachments IS NULL OR (json_valid(attachments) AND json_type(attachments) = 'array')),
+        CHECK(text <> '' OR attachments IS NOT NULL)
+    );
+    INSERT INTO prompt_history (id, text, created_at, attachments)
+    SELECT id, text, created_at, attachments FROM prompt_history_media;
+    DROP TABLE prompt_history_media;
+    CREATE INDEX prompt_history_id ON prompt_history(id);
+
+    CREATE TABLE prompt_stash_media (
+        id INTEGER PRIMARY KEY,
+        text TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        attachments TEXT CHECK(attachments IS NULL OR (json_valid(attachments) AND json_type(attachments) = 'array')),
+        CHECK(text <> '' OR attachments IS NOT NULL)
+    );
+    INSERT INTO prompt_stash_media (id, text, created_at, attachments)
+    SELECT id, text, created_at, NULL FROM prompt_stash;
+    DROP TABLE prompt_stash;
+    CREATE TABLE prompt_stash (
+        id INTEGER PRIMARY KEY,
+        text TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        attachments TEXT CHECK(attachments IS NULL OR (json_valid(attachments) AND json_type(attachments) = 'array')),
+        CHECK(text <> '' OR attachments IS NOT NULL)
+    );
+    INSERT INTO prompt_stash (id, text, created_at, attachments)
+    SELECT id, text, created_at, attachments FROM prompt_stash_media;
+    DROP TABLE prompt_stash_media;
+    CREATE INDEX prompt_stash_id ON prompt_stash(id);
     "
     .to_owned()
 }

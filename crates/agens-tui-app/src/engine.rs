@@ -5,7 +5,10 @@
 use std::sync::{Arc, Mutex};
 
 use agens_core::SubmitOrigin;
-use agens_core::{HeadlessTurnCancellation, HeadlessTurnError, PermissionMode, TurnProgressSink};
+use agens_core::{
+    EphemeralPromptMemory, HeadlessTurnCancellation, HeadlessTurnError, PermissionMode,
+    TurnProgressSink,
+};
 use agens_tools::{
     CommandCatalog, SkillCatalog, TaskExecutionRegistry, TaskMessageSource, TaskMessageTarget,
 };
@@ -74,15 +77,27 @@ fn interactive_turn_cancellation() -> HeadlessTurnCancellation {
     HeadlessTurnCancellation::new()
 }
 
-/// Best-effort open of SQLite prompt memory and install it on the surface port.
+/// Opens SQLite prompt memory and installs it on the surface port.
+///
+/// When the store cannot open, history and stash still work for this session
+/// through [`EphemeralPromptMemory`], and the degradation is said out loud as
+/// a one-line failure notice instead of silently losing persistence.
 fn install_prompt_memory_from_store<E: TuiEngine>(
     tui: &mut Tui<E>,
     data_directory: &std::path::Path,
 ) {
-    let Ok(store) = PromptMemoryStore::open(data_directory) else {
-        return;
-    };
-    tui.set_prompt_memory(Box::new(store));
+    match PromptMemoryStore::open(data_directory) {
+        Ok(store) => tui.set_prompt_memory(Box::new(store)),
+        Err(error) => {
+            tui.set_prompt_memory(Box::new(EphemeralPromptMemory::new()));
+            tui.apply_runtime_event(agens_tui::TuiRuntimeEvent::Notice {
+                text: format!(
+                    "Prompt history and stash will not persist beyond this session ({error})."
+                ),
+                severity: agens_tui::NoticeSeverity::Failure,
+            });
+        }
+    }
 }
 
 /// Installs the trace recorder when `AGENS_PERF_TRACE` names a directory.
@@ -143,7 +158,7 @@ pub fn run_production_tui_with_profile_store(
         let presentation = tui_session_presentation(bootstrap, &resumed);
         let message = resumed.note();
         let draft = resumed.resume_draft.take().map(ResumeDraft::into_inner);
-        let media_chips = resumed.pending_media_chip_labels();
+        let staged_media = crate::files::session_staged_media(&resumed);
         let resume_error = resumed.resume_error.clone();
         resumed.resume_notice = None;
         tui.apply_submission_outcome(TuiSubmissionOutcome::SessionResumed {
@@ -151,7 +166,7 @@ pub fn run_production_tui_with_profile_store(
             presentation,
             history,
             draft,
-            media_chips,
+            staged_media,
             resume_error,
             // The real picker candidates and palette are set below, once the session's own root
             // is resolved and `start_tui_skills`/`start_tui_commands` have run against it.
@@ -479,6 +494,7 @@ pub fn run_tui_prompt(
                 TuiSubmissionOutcome::ProviderTurn { .. }
                 | TuiSubmissionOutcome::BusyProviderTurn { .. }
                 | TuiSubmissionOutcome::BusyRefusal(_)
+                | TuiSubmissionOutcome::StagedMediaReplaced { .. }
                 | TuiSubmissionOutcome::SecretEntry(_)
                 | TuiSubmissionOutcome::Dialog(_)
                 | TuiSubmissionOutcome::SafeDialog(_)
@@ -1041,6 +1057,43 @@ mod tests {
             answer.starts_with("Snapshots were unavailable this session"),
             "{answer}"
         );
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    /// A prompt-memory store that cannot open must not silently disable
+    /// history and stash: the session falls back to ephemeral memory and the
+    /// degradation is announced as a visible one-line failure notice.
+    #[test]
+    fn prompt_memory_store_failure_falls_back_to_ephemeral_with_a_failure_notice() {
+        let temporary = tui_session_directory("prompt-memory-fallback");
+        let blocked = temporary.join("blocked");
+        std::fs::write(&blocked, b"not a directory").unwrap();
+
+        let mut tui = Tui::new(ProductionTuiEngine {
+            cancellation: Arc::new(Mutex::new(None)),
+        });
+        install_prompt_memory_from_store(&mut tui, &blocked);
+
+        assert!(
+            tui.runtime_events().iter().any(|event| matches!(
+                event,
+                agens_tui::TuiRuntimeEvent::Notice {
+                    text,
+                    severity: agens_tui::NoticeSeverity::Failure,
+                } if text.contains("will not persist beyond this session")
+            )),
+            "the degradation must be said out loud"
+        );
+
+        // History and stash still work for this session through the fallback.
+        for character in "parked".chars() {
+            tui.handle(Event::Key(Key::Char(character)));
+        }
+        tui.handle(Event::Key(Key::CtrlS));
+        assert_eq!(tui.input(), "");
+        tui.handle(Event::Key(Key::CtrlS));
+        assert_eq!(tui.input(), "parked");
 
         std::fs::remove_dir_all(temporary).unwrap();
     }

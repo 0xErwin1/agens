@@ -15,8 +15,8 @@ mod widgets;
 pub use activity::{RetryActivity, TurnActivity};
 pub use agens_bus::{BridgeCancel, BridgeTx, PublishOutcome, UiEnvelope};
 pub use agens_core::{
-    DiffLine, DiffLineKind, NoticeSeverity, ToolResultState, TuiExecution, TuiExecutionEvent,
-    TuiExecutionState, TuiRuntimeEvent, TuiSubagentEvent,
+    DiffLine, DiffLineKind, NoticeSeverity, PromptAttachment, ToolResultState, TuiExecution,
+    TuiExecutionEvent, TuiExecutionState, TuiRuntimeEvent, TuiSubagentEvent,
 };
 pub use app::{
     ActiveRoute, AppEvent, AppState, Command, Dialog, Effect, PromptObservability,
@@ -54,7 +54,7 @@ use std::{
 use agens_core::SubagentStatus;
 use agens_core::SubmitOrigin;
 use agens_core::ask_user::{AskUserMode, AskUserQuestion, AskUserReply, AskUserRequest};
-use agens_core::{HistoryBrowseResult, PromptMemory};
+use agens_core::{HistoryBrowseResult, PromptMemory, PromptRecall, media_chip_label};
 use agens_core::{MessagePart, TurnEvent, TurnState, Usage};
 use ask_user::{AskUserEntry, AskUserOutcome, AskUserRow, AskUserState};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
@@ -352,6 +352,12 @@ pub enum Action {
     Submit(String),
     /// Request OS clipboard image ingest (Ctrl+V when image data is available).
     AttachClipboardImage,
+    /// Replace the app-side staged media with a restored attachment set.
+    ///
+    /// Emitted when a stash pop, overlay paste, or history browse changes the
+    /// composer's chips: the session context owns what a submit actually
+    /// sends, so it must follow the restored set (possibly empty).
+    SyncStagedMedia(Vec<PromptAttachment>),
     /// Classify this busy composer draft before mutating the prompt queue.
     SubmitBusy(String),
     /// Submit a redacted credential through the dedicated route only.
@@ -465,10 +471,14 @@ pub enum TuiSubmissionOutcome {
     /// Opens an isolated credential-entry overlay.
     SecretEntry(SecretEntryView),
     LocalInfo(String),
-    /// Local attach succeeded: update path-free composer chips and status.
+    /// Local attach succeeded: update staged attachments (chips derive from them) and status.
     MediaAttached {
         message: String,
-        media_chips: Vec<String>,
+        staged_media: Vec<PromptAttachment>,
+    },
+    /// App-side staged media now matches a restored attachment set; applied silently.
+    StagedMediaReplaced {
+        staged_media: Vec<PromptAttachment>,
     },
     LocalActionableError {
         message: String,
@@ -500,8 +510,8 @@ pub enum TuiSubmissionOutcome {
         presentation: TuiPresentation,
         history: Vec<Conversation>,
         draft: Option<String>,
-        /// Path-free media chips restored from the retry boundary (ids only; no paths).
-        media_chips: Vec<String>,
+        /// Staged attachments restored from the retry boundary (durable ids only; no paths).
+        staged_media: Vec<PromptAttachment>,
         resume_error: Option<String>,
         /// The `@` picker candidates for the resumed session's OWN root. Without this, a
         /// post-startup resume would leave whatever candidates were set at TUI startup (or by an
@@ -542,6 +552,10 @@ pub enum TuiRouteRequest {
     AttachClipboardImage {
         bytes: Vec<u8>,
         mime: Option<String>,
+    },
+    /// Replace the session's staged media with a restored attachment set.
+    ReplaceStagedMedia {
+        attachments: Vec<PromptAttachment>,
     },
     SubmitSecret {
         action_id: String,
@@ -690,6 +704,10 @@ impl std::fmt::Debug for Action {
             Self::Unchanged => formatter.write_str("Unchanged"),
             Self::Submit(value) => formatter.debug_tuple("Submit").field(value).finish(),
             Self::AttachClipboardImage => formatter.write_str("AttachClipboardImage"),
+            Self::SyncStagedMedia(value) => formatter
+                .debug_tuple("SyncStagedMedia")
+                .field(value)
+                .finish(),
             Self::SubmitBusy(value) => formatter.debug_tuple("SubmitBusy").field(value).finish(),
             Self::SubmitBackground(value) => formatter
                 .debug_tuple("SubmitBackground")
@@ -766,6 +784,10 @@ impl std::fmt::Debug for TuiRouteRequest {
                 .debug_struct("AttachClipboardImage")
                 .field("bytes", &bytes.len())
                 .field("mime", mime)
+                .finish(),
+            Self::ReplaceStagedMedia { attachments } => formatter
+                .debug_struct("ReplaceStagedMedia")
+                .field("attachments", attachments)
                 .finish(),
             Self::OpenDialog(value) => formatter.debug_tuple("OpenDialog").field(value).finish(),
             Self::DialogAction(value) => {
@@ -1275,8 +1297,11 @@ enum DialogEntryAction {
     Dispatch(String),
     SafeDispatch(String),
     SelectTranscript(TranscriptId),
-    /// Paste text into the composer and dismiss; never submits.
-    FillComposer(String),
+    /// Paste text and attachments into the composer and dismiss; never submits.
+    FillComposer {
+        text: String,
+        attachments: Vec<PromptAttachment>,
+    },
     Cancel,
     ToggleDetails,
 }
@@ -1436,11 +1461,12 @@ impl DialogEntry {
         }
     }
 
-    /// Overlay row that pastes `text` into the composer without submitting.
+    /// Overlay row that pastes `text` and `attachments` into the composer without submitting.
     fn fill_composer(
         label: impl AsRef<str>,
         detail: Option<&str>,
         text: impl Into<String>,
+        attachments: Vec<PromptAttachment>,
         id: Option<String>,
     ) -> Self {
         let text = text.into();
@@ -1449,7 +1475,7 @@ impl DialogEntry {
             detail: detail.map(|detail| bounded_dialog_text(detail, 256)),
             search_text: Some(bounded_dialog_text(&text, 512)),
             selected_detail: None,
-            action: Some(DialogEntryAction::FillComposer(text)),
+            action: Some(DialogEntryAction::FillComposer { text, attachments }),
             id: id.map(|id| bounded_dialog_text(&id, 128)),
         }
     }
@@ -1837,8 +1863,14 @@ fn history_overlay_entries(memory: &dyn PromptMemory, query: &str) -> Vec<Dialog
         .history_overlay(query, PROMPT_OVERLAY_LIMIT)
         .into_iter()
         .map(|entry| {
-            let date = prompt_entry_date_label(entry.created_at);
-            DialogEntry::fill_composer(&entry.text, Some(&date), entry.text.clone(), None)
+            let detail = prompt_entry_detail_label(entry.created_at, entry.attachments.len());
+            DialogEntry::fill_composer(
+                prompt_overlay_row_label(&entry.text, entry.attachments.len()),
+                Some(&detail),
+                entry.text.clone(),
+                entry.attachments,
+                None,
+            )
         })
         .collect()
 }
@@ -1848,15 +1880,44 @@ fn stash_overlay_entries(memory: &dyn PromptMemory, query: &str) -> Vec<DialogEn
         .stash_overlay(query, PROMPT_OVERLAY_LIMIT)
         .into_iter()
         .map(|entry| {
-            let date = prompt_entry_date_label(entry.created_at);
+            let detail = prompt_entry_detail_label(entry.created_at, entry.attachments.len());
             DialogEntry::fill_composer(
-                &entry.text,
-                Some(&date),
+                prompt_overlay_row_label(&entry.text, entry.attachments.len()),
+                Some(&detail),
                 entry.text.clone(),
+                entry.attachments,
                 Some(entry.store_index.to_string()),
             )
         })
         .collect()
+}
+
+/// Overlay row label; attachment-only entries would otherwise render blank.
+fn prompt_overlay_row_label(text: &str, attachment_count: usize) -> String {
+    if text.is_empty() && attachment_count > 0 {
+        "(attachments only)".to_owned()
+    } else {
+        text.to_owned()
+    }
+}
+
+/// Path-free chip labels (`[Image #N]` / `[File #N]`) for a staged attachment set.
+fn attachment_chip_labels(attachments: &[PromptAttachment]) -> Vec<String> {
+    attachments
+        .iter()
+        .enumerate()
+        .map(|(index, attachment)| media_chip_label(index + 1, &attachment.mime))
+        .collect()
+}
+
+/// Right label for an overlay row: attachment count marker plus the date.
+fn prompt_entry_detail_label(created_at: i64, attachment_count: usize) -> String {
+    let date = prompt_entry_date_label(created_at);
+    if attachment_count > 0 {
+        format!("{attachment_count} att · {date}")
+    } else {
+        date
+    }
 }
 
 /// Date portion (`YYYY-MM-DD`) of a unix-seconds timestamp for overlay right labels.
@@ -5600,6 +5661,11 @@ pub struct Tui<E> {
     input_cursor: usize,
     /// Path-free media chips staged for the next turn (`[Image #N]`, …).
     media_chips: Vec<String>,
+    /// The staged attachments behind `media_chips` (durable ids + mimes, no paths).
+    ///
+    /// Mirrors the app-side session staging so prompt history/stash can record
+    /// what the chips stand for and restores can hand the exact set back.
+    staged_media: Vec<PromptAttachment>,
     recovered_failed_prompt: bool,
     size: (u16, u16),
     local_route_active: bool,
@@ -5713,6 +5779,7 @@ where
             input: String::new(),
             input_cursor: 0,
             media_chips: Vec::new(),
+            staged_media: Vec::new(),
             recovered_failed_prompt: false,
             size: (80, 24),
             local_route_active: false,
@@ -6397,10 +6464,14 @@ where
             }
             TuiSubmissionOutcome::MediaAttached {
                 message,
-                media_chips,
+                staged_media,
             } => {
-                self.set_media_chips(media_chips);
+                self.set_staged_media(staged_media);
                 self.add_info(message);
+                None
+            }
+            TuiSubmissionOutcome::StagedMediaReplaced { staged_media } => {
+                self.set_staged_media(staged_media);
                 None
             }
             TuiSubmissionOutcome::LocalActionableError { message, action } => {
@@ -6429,7 +6500,7 @@ where
                 presentation,
                 history,
                 draft,
-                media_chips,
+                staged_media,
                 resume_error,
                 file_candidates,
                 palette_entries,
@@ -6442,7 +6513,7 @@ where
                 self.input.clear();
                 self.input_cursor = 0;
                 self.recovered_failed_prompt = false;
-                self.set_media_chips(media_chips);
+                self.set_staged_media(staged_media);
                 if let Some(draft) = draft {
                     self.restore_resume_draft(draft);
                 }
@@ -6581,9 +6652,10 @@ where
         record.scroll_offset = scroll_offset;
     }
 
-    /// Replaces composer media chips with path-free labels (e.g. `[Image #1]`).
-    pub fn set_media_chips(&mut self, chips: Vec<String>) {
-        self.media_chips = chips;
+    /// Replaces the staged attachments; chip labels derive from the mimes.
+    pub fn set_staged_media(&mut self, attachments: Vec<PromptAttachment>) {
+        self.media_chips = attachment_chip_labels(&attachments);
+        self.staged_media = attachments;
     }
 
     /// Current path-free media chips shown above the composer.
@@ -6591,9 +6663,15 @@ where
         &self.media_chips
     }
 
+    /// The staged attachments behind the chips (durable ids + mimes).
+    pub fn staged_media(&self) -> &[PromptAttachment] {
+        &self.staged_media
+    }
+
     /// Clears staged media chips (after a successful submit or discard).
     pub fn clear_media_chips(&mut self) {
         self.media_chips.clear();
+        self.staged_media.clear();
     }
 
     pub fn finish_provider_turn(&mut self, outcome: TuiProviderOutcome) -> Option<String> {
@@ -6664,7 +6742,7 @@ where
                 } else {
                     self.transcript.push(TranscriptEntry::Assistant(body));
                 }
-                self.media_chips.clear();
+                self.clear_media_chips();
                 self.set_foreground_presentation(false);
             }
             TuiProviderOutcome::Failed { message, action } => {
@@ -8809,7 +8887,7 @@ where
         self.input.clear();
         self.input_cursor = 0;
         self.recovered_failed_prompt = false;
-        self.media_chips.clear();
+        self.clear_media_chips();
     }
 
     fn enqueue_resolved_composer(&mut self, display: String, prompt: String) {
@@ -8826,11 +8904,33 @@ where
         self.surface_focus = SurfaceFocus::Composer;
     }
 
+    /// Records a submitted prompt with the attachments staged when it was sent.
     fn record_prompt_history(&mut self, text: &str) {
         let Some(memory) = self.prompt_memory.as_mut() else {
             return;
         };
-        let _ = memory.record_submission(text);
+        let _ = memory.record_submission(text, &self.staged_media);
+    }
+
+    /// Applies restored composer content (text plus attachments) after a stash
+    /// pop, overlay paste, or history browse step.
+    fn apply_prompt_recall(&mut self, recall: PromptRecall) -> Action {
+        self.apply_composer_text(recall.text);
+        self.apply_restored_attachments(recall.attachments)
+    }
+
+    /// Replaces the staged chips with a restored attachment set.
+    ///
+    /// Returns [`Action::SyncStagedMedia`] when the set changed, so the app
+    /// side replaces its session staging to match; the composer alone deciding
+    /// what a submit sends would leave the two views divergent.
+    fn apply_restored_attachments(&mut self, attachments: Vec<PromptAttachment>) -> Action {
+        if self.staged_media == attachments {
+            return Action::Render;
+        }
+
+        self.set_staged_media(attachments.clone());
+        Action::SyncStagedMedia(attachments)
     }
 
     fn apply_composer_text(&mut self, text: String) {
@@ -8846,10 +8946,12 @@ where
     fn handle_prompt_history_key(&mut self, key: Key) -> Option<Action> {
         match key {
             Key::Up => {
-                let shown = self.prompt_memory.as_mut()?.browse_up(&self.input)?;
+                let recall = self
+                    .prompt_memory
+                    .as_mut()?
+                    .browse_up(&self.input, &self.staged_media)?;
                 self.execution_selection = None;
-                self.apply_composer_text(shown);
-                Some(Action::Render)
+                Some(self.apply_prompt_recall(recall))
             }
             Key::Down
                 if self
@@ -8859,13 +8961,9 @@ where
             {
                 let result = self.prompt_memory.as_mut()?.browse_down();
                 match result {
-                    HistoryBrowseResult::Entry(text) => {
-                        self.apply_composer_text(text);
-                        Some(Action::Render)
-                    }
-                    HistoryBrowseResult::RestoreDraft(draft) => {
-                        self.apply_composer_text(draft);
-                        Some(Action::Render)
+                    HistoryBrowseResult::Entry(recall)
+                    | HistoryBrowseResult::RestoreDraft(recall) => {
+                        Some(self.apply_prompt_recall(recall))
                     }
                     HistoryBrowseResult::Idle => None,
                 }
@@ -8874,53 +8972,67 @@ where
         }
     }
 
-    /// Ctrl+S: push non-empty draft, or pop LIFO when empty. Never submits.
+    /// Ctrl+S: push a non-empty draft (text and/or staged attachments), or pop
+    /// the LIFO top when the composer is fully empty. Never submits.
+    ///
+    /// Staged attachments with empty text still push — popping a stashed
+    /// prompt on top of visible chips would silently merge two drafts.
     fn handle_prompt_stash_key(&mut self) -> Action {
         if self.prompt_memory.is_none() {
             return Action::Render;
         }
 
-        if !self.input.is_empty() {
+        if !self.input.is_empty() || !self.staged_media.is_empty() {
             let text = std::mem::take(&mut self.input);
+            let chips = std::mem::take(&mut self.media_chips);
+            let attachments = std::mem::take(&mut self.staged_media);
             self.input_cursor = 0;
             self.recovered_failed_prompt = false;
 
             let push_failed = {
                 let memory = self.prompt_memory.as_mut().expect("checked above");
                 memory.clear_browse();
-                memory.stash_push(&text).is_err()
+                memory.stash_push(&text, &attachments).is_err()
             };
 
             if push_failed {
-                // Restore the draft when durable push fails so the user does not lose input.
+                // Restore draft text and chips when durable push fails so the
+                // user does not lose input.
                 self.input = text;
                 self.input_cursor = self.input.chars().count();
+                self.media_chips = chips;
+                self.staged_media = attachments;
                 self.add_info("Could not save to stash.");
-            } else {
-                self.add_info("Saved to stash.");
+                self.clamp_palette_selection();
+                self.refresh_file_picker();
+                return Action::Render;
             }
 
+            self.add_info("Saved to stash.");
             self.clamp_palette_selection();
             self.refresh_file_picker();
-            return Action::Render;
+            if attachments.is_empty() {
+                return Action::Render;
+            }
+            // The chips moved into the stash; the app-side staging must follow.
+            return Action::SyncStagedMedia(Vec::new());
         }
 
         let popped = {
             let memory = self.prompt_memory.as_mut().expect("checked above");
             match memory.stash_pop() {
-                Ok(Some(text)) => {
+                Ok(Some(recall)) => {
                     memory.clear_browse();
-                    Some(text)
+                    Some(recall)
                 }
                 _ => None,
             }
         };
 
-        if let Some(text) = popped {
-            self.apply_composer_text(text);
+        match popped {
+            Some(recall) => self.apply_prompt_recall(recall),
+            None => Action::Render,
         }
-
-        Action::Render
     }
 
     fn handle_composer_key(&mut self, key: Key) -> Option<Action> {
@@ -9579,10 +9691,10 @@ where
                         self.dialog = None;
                         Action::Render
                     }
-                    Some(DialogEntryAction::FillComposer(text)) => {
+                    Some(DialogEntryAction::FillComposer { text, attachments }) => {
                         self.dialog = None;
                         self.apply_composer_text(text);
-                        Action::Render
+                        self.apply_restored_attachments(attachments)
                     }
                     Some(DialogEntryAction::ToggleDetails) => {
                         if let Some(dialog) = self.dialog.as_mut() {
@@ -10999,6 +11111,7 @@ where
                 renderer.render(tui.view())?;
             }
             Action::AttachClipboardImage
+            | Action::SyncStagedMedia(_)
             | Action::Unchanged
             | Action::Render
             | Action::Submit(_)
@@ -11086,6 +11199,7 @@ where
                 renderer.render(tui.view())?;
             }
             Action::AttachClipboardImage
+            | Action::SyncStagedMedia(_)
             | Action::Unchanged
             | Action::Render
             | Action::SubmitSecret { .. }
@@ -11710,6 +11824,14 @@ where
                     let _ = tui.apply_submission_outcome(outcome);
                 }
             }
+            Action::SyncStagedMedia(attachments) => {
+                let outcome = route(
+                    TuiRouteRequest::ReplaceStagedMedia { attachments },
+                    route_progress_sender.clone(),
+                    TuiRouteCancellation::new(),
+                );
+                let _ = tui.apply_submission_outcome(outcome);
+            }
             Action::SubmitBusy(input) => {
                 let outcome = route(
                     TuiRouteRequest::BusyInput(input),
@@ -12044,6 +12166,7 @@ fn is_session_resume_request(request: &TuiRouteRequest) -> bool {
         TuiRouteRequest::DialogAction(action_id) => is_session_resume_action(action_id),
         TuiRouteRequest::DeviceAuthOpenUrl(_)
         | TuiRouteRequest::AttachClipboardImage { .. }
+        | TuiRouteRequest::ReplaceStagedMedia { .. }
         | TuiRouteRequest::SubmitSecret { .. }
         | TuiRouteRequest::OpenDialog(_)
         | TuiRouteRequest::SessionPage(_) => false,
@@ -12056,6 +12179,7 @@ fn is_session_browser_request(request: &TuiRouteRequest) -> bool {
         TuiRouteRequest::BusyInput(_) => false,
         TuiRouteRequest::DeviceAuthOpenUrl(_)
         | TuiRouteRequest::AttachClipboardImage { .. }
+        | TuiRouteRequest::ReplaceStagedMedia { .. }
         | TuiRouteRequest::SubmitSecret { .. } => false,
         TuiRouteRequest::OpenDialog(route_id) => route_id == "sessions",
         TuiRouteRequest::SessionPage(_) => true,
@@ -12843,7 +12967,7 @@ mod runtime_tests {
             presentation: TuiPresentation::new("provider", "model", "session #2"),
             history,
             draft: None,
-            media_chips: Vec::new(),
+            staged_media: Vec::new(),
             resume_error: None,
             file_candidates: Vec::new(),
             palette_entries: Vec::new(),

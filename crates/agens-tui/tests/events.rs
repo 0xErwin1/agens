@@ -4,7 +4,7 @@ use agens_core::ask_user::{
 use agens_core::{
     HeadlessTurnCancellation, Message, MessagePart, Role, ToolInput, TurnEvent, TurnState,
 };
-use agens_core::{NoticeSeverity, SubagentErrorKind, SubagentStatus};
+use agens_core::{NoticeSeverity, PromptAttachment, SubagentErrorKind, SubagentStatus};
 use agens_tui::{
     Action, AppEvent, AppState, AskUserEditing, AskUserRowSnapshot, BridgeCancel, BridgeTx,
     Command, Conversation, ConversationError, ConversationEvent, Dialog, DialogEntry, DialogView,
@@ -249,7 +249,7 @@ fn transcript_admission_retention_session_resume_keeps_restored_history_summary_
         ])
         .unwrap(),
         draft: None,
-        media_chips: Vec::new(),
+        staged_media: Vec::new(),
         resume_error: None,
         file_candidates: Vec::new(),
         palette_entries: Vec::new(),
@@ -338,7 +338,7 @@ fn session_resume_success_replaces_prepared_state_in_one_outcome() {
         presentation: TuiPresentation::new("new-provider", "new-model", "session #2"),
         history,
         draft: None,
-        media_chips: Vec::new(),
+        staged_media: Vec::new(),
         resume_error: None,
         file_candidates: Vec::new(),
         palette_entries: Vec::new(),
@@ -373,7 +373,7 @@ fn failed_session_resume_restores_exact_draft_with_history_at_composer_bottom() 
         presentation: TuiPresentation::new("openai-chatgpt", "gpt-5.5", "session #327"),
         history: vec![Conversation::new("completed prompt")],
         draft: Some("retry exact café 🙂".into()),
-        media_chips: Vec::new(),
+        staged_media: Vec::new(),
         resume_error: None,
         file_candidates: Vec::new(),
         palette_entries: Vec::new(),
@@ -419,7 +419,7 @@ fn recovered_failed_prompt_escape_discards_and_successful_resume_replaces_atomic
         presentation: TuiPresentation::new("provider", "model", "session #1"),
         history: Vec::new(),
         draft: Some("failed prompt".into()),
-        media_chips: Vec::new(),
+        staged_media: Vec::new(),
         resume_error: None,
         file_candidates: Vec::new(),
         palette_entries: Vec::new(),
@@ -434,7 +434,7 @@ fn recovered_failed_prompt_escape_discards_and_successful_resume_replaces_atomic
         presentation: TuiPresentation::new("provider", "model", "session #2"),
         history: Vec::new(),
         draft: Some("older failed prompt".into()),
-        media_chips: Vec::new(),
+        staged_media: Vec::new(),
         resume_error: None,
         file_candidates: Vec::new(),
         palette_entries: Vec::new(),
@@ -444,7 +444,7 @@ fn recovered_failed_prompt_escape_discards_and_successful_resume_replaces_atomic
         presentation: TuiPresentation::new("provider", "model", "session #3"),
         history: Vec::new(),
         draft: None,
-        media_chips: Vec::new(),
+        staged_media: Vec::new(),
         resume_error: None,
         file_candidates: Vec::new(),
         palette_entries: Vec::new(),
@@ -3783,7 +3783,7 @@ fn resume_projects_user_media_parts_as_path_free_chips() {
 #[test]
 fn media_only_composer_submit_with_empty_text() {
     let mut tui = Tui::new(FakeEngine::default());
-    tui.set_media_chips(vec!["[Image #1]".into()]);
+    tui.set_staged_media(vec![PromptAttachment::new(1, "image/png")]);
     assert!(tui.input().is_empty());
 
     let action = tui.handle(Event::Key(Key::Enter));
@@ -5703,17 +5703,213 @@ fn history_append_leaves_stash_unchanged_across_submit_and_enqueue() {
 }
 
 #[test]
+fn prompt_stash_push_and_pop_round_trip_restores_text_and_chips() {
+    let mut tui = tui_with_prompt_memory();
+    let chips = vec![
+        PromptAttachment::new(3, "image/png"),
+        PromptAttachment::new(4, "application/pdf"),
+    ];
+
+    tui.set_staged_media(chips.clone());
+    type_chars(&mut tui, "draft with media");
+
+    // Push takes text and chips together; the app-side staging must be cleared.
+    assert_eq!(
+        tui.handle(Event::Key(Key::CtrlS)),
+        Action::SyncStagedMedia(Vec::new())
+    );
+    assert!(tui.input().is_empty());
+    assert!(tui.media_chips().is_empty());
+    assert!(tui.staged_media().is_empty());
+    assert_eq!(tui.status(), Some("Saved to stash."));
+
+    // Pop restores both, and asks the app side to stage the same set again.
+    assert_eq!(
+        tui.handle(Event::Key(Key::CtrlS)),
+        Action::SyncStagedMedia(chips.clone())
+    );
+    assert_eq!(tui.input(), "draft with media");
+    assert_eq!(tui.staged_media(), &chips[..]);
+    assert_eq!(
+        tui.media_chips(),
+        &["[Image #1]".to_owned(), "[File #2]".to_owned()][..]
+    );
+}
+
+#[test]
+fn prompt_stash_ctrl_s_with_only_staged_attachments_pushes_instead_of_popping() {
+    let mut tui = tui_with_prompt_memory();
+
+    // Seed one stashed prompt that a pop would otherwise restore.
+    type_chars(&mut tui, "already parked");
+    assert_eq!(tui.handle(Event::Key(Key::CtrlS)), Action::Render);
+
+    let chip = vec![PromptAttachment::new(7, "image/png")];
+    tui.set_staged_media(chip.clone());
+    assert!(tui.input().is_empty());
+
+    // Chips-only Ctrl+S pushes the attachments; it must NOT pop "already parked"
+    // on top of the visible chips.
+    assert_eq!(
+        tui.handle(Event::Key(Key::CtrlS)),
+        Action::SyncStagedMedia(Vec::new())
+    );
+    assert!(tui.input().is_empty());
+    assert!(tui.media_chips().is_empty());
+    assert_eq!(tui.status(), Some("Saved to stash."));
+
+    // LIFO: the attachments-only entry pops first, chips reappear.
+    assert_eq!(
+        tui.handle(Event::Key(Key::CtrlS)),
+        Action::SyncStagedMedia(chip.clone())
+    );
+    assert!(tui.input().is_empty());
+    assert_eq!(tui.staged_media(), &chip[..]);
+    assert_eq!(tui.media_chips(), &["[Image #1]".to_owned()][..]);
+}
+
+#[test]
+fn history_browse_restores_attachments_and_returns_staged_chips_with_draft() {
+    let mut tui = tui_with_prompt_memory();
+    let sent = vec![PromptAttachment::new(1, "image/png")];
+    let draft_chip = vec![PromptAttachment::new(9, "application/pdf")];
+
+    tui.set_staged_media(sent.clone());
+    assert_eq!(
+        submit_text(&mut tui, "with media"),
+        Action::Submit("with media".into())
+    );
+    // Chips stay staged until the turn completes; clear as a completed turn would.
+    tui.clear_media_chips();
+    assert_eq!(
+        submit_text(&mut tui, "text only"),
+        Action::Submit("text only".into())
+    );
+
+    // Stage a fresh chip as the current draft, then browse.
+    tui.set_staged_media(draft_chip.clone());
+    assert_eq!(
+        tui.handle(Event::Key(Key::Up)),
+        Action::SyncStagedMedia(Vec::new())
+    );
+    assert_eq!(tui.input(), "text only");
+    assert!(tui.media_chips().is_empty());
+
+    assert_eq!(
+        tui.handle(Event::Key(Key::Up)),
+        Action::SyncStagedMedia(sent.clone())
+    );
+    assert_eq!(tui.input(), "with media");
+    assert_eq!(tui.media_chips(), &["[Image #1]".to_owned()][..]);
+
+    assert_eq!(
+        tui.handle(Event::Key(Key::Down)),
+        Action::SyncStagedMedia(Vec::new())
+    );
+    assert_eq!(tui.input(), "text only");
+
+    // Past the newest entry: the draft returns with its own staged chip.
+    assert_eq!(
+        tui.handle(Event::Key(Key::Down)),
+        Action::SyncStagedMedia(draft_chip.clone())
+    );
+    assert_eq!(tui.input(), "");
+    assert_eq!(tui.staged_media(), &draft_chip[..]);
+    assert_eq!(tui.media_chips(), &["[File #1]".to_owned()][..]);
+}
+
+#[test]
+fn history_dedupe_treats_same_text_with_different_attachments_as_distinct() {
+    let mut tui = tui_with_prompt_memory();
+
+    assert_eq!(
+        submit_text(&mut tui, "hello"),
+        Action::Submit("hello".into())
+    );
+    tui.set_staged_media(vec![PromptAttachment::new(2, "image/png")]);
+    assert_eq!(
+        submit_text(&mut tui, "hello"),
+        Action::Submit("hello".into())
+    );
+    tui.clear_media_chips();
+
+    // Two entries: Up shows the media one, Up again the text-only one.
+    assert_eq!(
+        tui.handle(Event::Key(Key::Up)),
+        Action::SyncStagedMedia(vec![PromptAttachment::new(2, "image/png")])
+    );
+    assert_eq!(tui.input(), "hello");
+    let action = tui.handle(Event::Key(Key::Up));
+    assert_eq!(action, Action::SyncStagedMedia(Vec::new()));
+    assert_eq!(tui.input(), "hello");
+    assert!(tui.media_chips().is_empty());
+}
+
+#[test]
+fn prompt_overlay_paste_restores_chips_and_rows_mark_attachments() {
+    let mut tui = tui_with_prompt_memory();
+    let chips = vec![PromptAttachment::new(5, "image/png")];
+
+    tui.set_staged_media(chips.clone());
+    type_chars(&mut tui, "stash with media");
+    assert_eq!(
+        tui.handle(Event::Key(Key::CtrlS)),
+        Action::SyncStagedMedia(Vec::new())
+    );
+
+    tui.show_stash_overlay();
+    assert_eq!(tui.view().dialog.unwrap().entry_count(), 1);
+
+    let backend = TestBackend::new(80, 24);
+    let terminal = Terminal::new(backend).unwrap();
+    let mut renderer = RatatuiRenderer::new(terminal);
+    renderer.render(tui.view()).unwrap();
+    let rendered = renderer
+        .terminal()
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(
+        rendered.contains("1 att"),
+        "stash row must mark its attachment count: {rendered}"
+    );
+
+    // Enter pastes text AND chips.
+    assert_eq!(
+        tui.handle(Event::Key(Key::Enter)),
+        Action::SyncStagedMedia(chips.clone())
+    );
+    assert_eq!(tui.input(), "stash with media");
+    assert_eq!(tui.staged_media(), &chips[..]);
+    assert_eq!(tui.media_chips(), &["[Image #1]".to_owned()][..]);
+    assert!(tui.view().dialog.is_none());
+}
+
+#[test]
 fn prompt_memory_write_failure_does_not_panic_and_restores_stash_draft() {
-    use agens_core::{HistoryBrowseResult, PromptMemory, PromptMemoryError, PromptOverlayItem};
+    use agens_core::{
+        HistoryBrowseResult, PromptMemory, PromptMemoryError, PromptOverlayItem, PromptRecall,
+    };
 
     struct FailingPromptMemory;
 
     impl PromptMemory for FailingPromptMemory {
-        fn record_submission(&mut self, _text: &str) -> Result<bool, PromptMemoryError> {
+        fn record_submission(
+            &mut self,
+            _text: &str,
+            _attachments: &[PromptAttachment],
+        ) -> Result<bool, PromptMemoryError> {
             Err(PromptMemoryError::new("history write failed"))
         }
 
-        fn browse_up(&mut self, _composer_input: &str) -> Option<String> {
+        fn browse_up(
+            &mut self,
+            _composer_input: &str,
+            _staged_attachments: &[PromptAttachment],
+        ) -> Option<PromptRecall> {
             None
         }
 
@@ -5727,11 +5923,15 @@ fn prompt_memory_write_failure_does_not_panic_and_restores_stash_draft() {
             false
         }
 
-        fn stash_push(&mut self, _text: &str) -> Result<bool, PromptMemoryError> {
+        fn stash_push(
+            &mut self,
+            _text: &str,
+            _attachments: &[PromptAttachment],
+        ) -> Result<bool, PromptMemoryError> {
             Err(PromptMemoryError::new("stash write failed"))
         }
 
-        fn stash_pop(&mut self) -> Result<Option<String>, PromptMemoryError> {
+        fn stash_pop(&mut self) -> Result<Option<PromptRecall>, PromptMemoryError> {
             Err(PromptMemoryError::new("stash pop failed"))
         }
 
@@ -5759,10 +5959,16 @@ fn prompt_memory_write_failure_does_not_panic_and_restores_stash_draft() {
     assert_eq!(tui.handle(Event::Key(Key::Up)), Action::Render);
     assert_eq!(tui.input(), "");
 
-    // Stash push failure restores the draft so the user does not lose input.
+    // Stash push failure restores the draft AND its chips so nothing is lost.
     type_chars(&mut tui, "stash-io-a");
+    tui.set_staged_media(vec![PromptAttachment::new(6, "image/png")]);
     assert_eq!(tui.handle(Event::Key(Key::CtrlS)), Action::Render);
     assert_eq!(tui.input(), "stash-io-a");
+    assert_eq!(
+        tui.staged_media(),
+        &[PromptAttachment::new(6, "image/png")][..]
+    );
+    assert_eq!(tui.media_chips(), &["[Image #1]".to_owned()][..]);
 
     // Overlay remove failure is best-effort and must not panic.
     tui.show_stash_overlay();

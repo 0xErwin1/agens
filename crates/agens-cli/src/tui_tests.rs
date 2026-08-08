@@ -263,7 +263,7 @@ fn production_tui_project_identity_uses_the_canonical_current_project_for_new_an
         presentation: TuiPresentation::new("openai-api", "gpt-4.1", "session #7"),
         history: Vec::new(),
         draft: None,
-        media_chips: Vec::new(),
+        staged_media: Vec::new(),
         resume_error: None,
         file_candidates: Vec::new(),
         palette_entries: Vec::new(),

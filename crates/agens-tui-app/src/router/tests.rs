@@ -3792,21 +3792,26 @@ fn attach_command_ingests_media_and_returns_path_free_chips() {
 
     let TuiSubmissionOutcome::MediaAttached {
         message,
-        media_chips,
+        staged_media,
     } = outcome
     else {
         panic!("expected MediaAttached, got {outcome:?}");
     };
     assert!(message.contains("[Image #1]"), "{message}");
-    assert_eq!(media_chips, vec!["[Image #1]".to_owned()]);
+    assert_eq!(staged_media.len(), 1);
+    assert_eq!(staged_media[0].mime, "image/png");
     assert_eq!(session.lock().unwrap().pending_media_ids.len(), 1);
     assert_eq!(
         session.lock().unwrap().pending_media_mimes,
         vec!["image/png".to_owned()]
     );
-    // Path-free: chips and message must not echo the source path.
+    // Path-free: attachments and message must not echo the source path.
     assert!(!message.contains("photo.png"));
-    assert!(!media_chips.iter().any(|chip| chip.contains("photo")));
+    assert!(
+        !staged_media
+            .iter()
+            .any(|media| media.mime.contains("photo"))
+    );
 
     std::fs::remove_dir_all(temporary).unwrap();
 }
@@ -3833,10 +3838,11 @@ fn clipboard_image_route_ingests_bytes() {
         },
         progress,
     );
-    let TuiSubmissionOutcome::MediaAttached { media_chips, .. } = outcome else {
+    let TuiSubmissionOutcome::MediaAttached { staged_media, .. } = outcome else {
         panic!("expected MediaAttached, got {outcome:?}");
     };
-    assert_eq!(media_chips, vec!["[Image #1]".to_owned()]);
+    assert_eq!(staged_media.len(), 1);
+    assert_eq!(staged_media[0].mime, "image/png");
     assert_eq!(session.lock().unwrap().pending_media_ids.len(), 1);
 
     std::fs::remove_dir_all(temporary).unwrap();

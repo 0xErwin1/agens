@@ -3,6 +3,7 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
+use agens_core::{PromptAttachment, PromptMemoryEntry};
 use agens_store::PromptMemoryStore;
 use rusqlite::Connection;
 
@@ -27,12 +28,18 @@ fn history_append_survives_reopen_in_agens_db() {
         assert_eq!(store.database_path(), directory.join("agens.db"));
         assert!(store.list_history().unwrap().is_empty());
 
-        let first = store.append_history("alpha").unwrap().expect("inserted");
+        let first = store
+            .append_history("alpha", &[])
+            .unwrap()
+            .expect("inserted");
         assert_eq!(first.text, "alpha");
         assert!(first.id > 0);
         assert!(first.created_at > 0);
 
-        let second = store.append_history("beta").unwrap().expect("inserted");
+        let second = store
+            .append_history("beta", &[])
+            .unwrap()
+            .expect("inserted");
         assert_eq!(second.text, "beta");
         assert!(second.id > first.id);
     }
@@ -78,12 +85,12 @@ fn history_skips_consecutive_duplicate_of_last_row() {
     let directory = data_directory();
     let mut store = PromptMemoryStore::open(&directory).unwrap();
 
-    assert!(store.append_history("same").unwrap().is_some());
-    assert!(store.append_history("same").unwrap().is_none());
+    assert!(store.append_history("same", &[]).unwrap().is_some());
+    assert!(store.append_history("same", &[]).unwrap().is_none());
     assert_eq!(store.list_history().unwrap().len(), 1);
 
-    assert!(store.append_history("other").unwrap().is_some());
-    assert!(store.append_history("same").unwrap().is_some());
+    assert!(store.append_history("other", &[]).unwrap().is_some());
+    assert!(store.append_history("same", &[]).unwrap().is_some());
     assert_eq!(
         store
             .list_history()
@@ -105,9 +112,9 @@ fn stash_push_pop_remove_survive_reopen() {
         let mut store = PromptMemoryStore::open(&directory).unwrap();
         assert!(store.list_stash().unwrap().is_empty());
 
-        store.push_stash("oldest").unwrap();
-        store.push_stash("middle").unwrap();
-        store.push_stash("newest").unwrap();
+        store.push_stash("oldest", &[]).unwrap();
+        store.push_stash("middle", &[]).unwrap();
+        store.push_stash("newest", &[]).unwrap();
 
         let popped = store.pop_stash().unwrap().expect("newest");
         assert_eq!(popped.text, "newest");
@@ -133,11 +140,11 @@ fn replace_stash_rewrites_full_stack_in_order() {
     let directory = data_directory();
     let mut store = PromptMemoryStore::open(&directory).unwrap();
 
-    store.push_stash("drop-me").unwrap();
+    store.push_stash("drop-me", &[]).unwrap();
     store
         .replace_stash(&[
-            ("keep-a".to_owned(), 1_700_000_000),
-            ("keep-b".to_owned(), 1_700_000_100),
+            PromptMemoryEntry::with_created_at("keep-a", 1_700_000_000),
+            PromptMemoryEntry::with_created_at("keep-b", 1_700_000_100),
         ])
         .unwrap();
 
@@ -163,10 +170,10 @@ fn history_and_stash_have_no_hard_product_cap() {
 
     for index in 0..120 {
         store
-            .append_history(&format!("h-{index}"))
+            .append_history(&format!("h-{index}"), &[])
             .unwrap()
             .expect("insert");
-        store.push_stash(&format!("s-{index}")).unwrap();
+        store.push_stash(&format!("s-{index}"), &[]).unwrap();
     }
 
     assert_eq!(store.list_history().unwrap().len(), 120);
@@ -180,15 +187,112 @@ fn history_and_stash_have_no_hard_product_cap() {
 }
 
 #[test]
-fn empty_text_is_rejected_for_history_and_stash() {
+fn fully_empty_entries_are_rejected_but_attachment_only_entries_are_not() {
     let directory = data_directory();
     let mut store = PromptMemoryStore::open(&directory).unwrap();
 
-    assert!(store.append_history("").is_err());
-    assert!(store.push_stash("").is_err());
-    assert!(store.replace_stash(&[("".to_owned(), 1)]).is_err());
+    assert!(store.append_history("", &[]).is_err());
+    assert!(store.push_stash("", &[]).is_err());
+    assert!(
+        store
+            .replace_stash(&[PromptMemoryEntry::with_created_at("", 1)])
+            .is_err()
+    );
     assert!(store.list_history().unwrap().is_empty());
     assert!(store.list_stash().unwrap().is_empty());
+
+    let chips = vec![PromptAttachment::new(11, "image/png")];
+    let pushed = store.push_stash("", &chips).unwrap();
+    assert_eq!(pushed.text, "");
+    assert_eq!(pushed.attachments, chips);
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn stash_round_trip_preserves_attachments_across_reopen() {
+    let directory = data_directory();
+    let chips = vec![
+        PromptAttachment::new(3, "image/png"),
+        PromptAttachment::new(9, "application/pdf"),
+    ];
+
+    {
+        let mut store = PromptMemoryStore::open(&directory).unwrap();
+        store.push_stash("with media", &chips).unwrap();
+        store.push_stash("text only", &[]).unwrap();
+    }
+
+    let mut reopened = PromptMemoryStore::open(&directory).unwrap();
+    let stash = reopened.list_stash().unwrap();
+    assert_eq!(stash[0].attachments, chips);
+    assert!(stash[1].attachments.is_empty());
+
+    let top = reopened.pop_stash().unwrap().expect("text only");
+    assert!(top.attachments.is_empty());
+    let with_media = reopened.pop_stash().unwrap().expect("with media");
+    assert_eq!(with_media.text, "with media");
+    assert_eq!(with_media.attachments, chips);
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn history_dedupe_considers_attachments_and_persists_them() {
+    let directory = data_directory();
+    let chips = vec![PromptAttachment::new(5, "image/jpeg")];
+
+    {
+        let mut store = PromptMemoryStore::open(&directory).unwrap();
+        assert!(store.append_history("look", &chips).unwrap().is_some());
+        assert!(
+            store.append_history("look", &[]).unwrap().is_some(),
+            "same text without the media is a distinct prompt"
+        );
+        assert!(
+            store.append_history("look", &[]).unwrap().is_none(),
+            "identical text and attachments dedupe"
+        );
+    }
+
+    let reopened = PromptMemoryStore::open(&directory).unwrap();
+    let history = reopened.list_history().unwrap();
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[0].attachments, chips);
+    assert!(history[1].attachments.is_empty());
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+/// Rows written before migration 0010 have no attachments column value; they
+/// must load as text-only entries after the rebuild.
+#[test]
+fn pre_media_rows_survive_the_attachments_migration_as_text_only() {
+    let directory = data_directory();
+
+    {
+        let mut store = PromptMemoryStore::open(&directory).unwrap();
+        store.append_history("legacy", &[]).unwrap();
+        store.push_stash("parked", &[]).unwrap();
+    }
+
+    {
+        let connection = Connection::open(directory.join("agens.db")).unwrap();
+        connection
+            .execute("UPDATE prompt_history SET attachments = NULL", [])
+            .unwrap();
+        connection
+            .execute("UPDATE prompt_stash SET attachments = NULL", [])
+            .unwrap();
+    }
+
+    let reopened = PromptMemoryStore::open(&directory).unwrap();
+    let history = reopened.list_history().unwrap();
+    assert_eq!(history[0].text, "legacy");
+    assert!(history[0].attachments.is_empty());
+    let stash = reopened.list_stash().unwrap();
+    assert_eq!(stash[0].text, "parked");
+    assert!(stash[0].attachments.is_empty());
 
     fs::remove_dir_all(directory).unwrap();
 }
@@ -198,8 +302,8 @@ fn history_and_stash_are_independent_tables() {
     let directory = data_directory();
     let mut store = PromptMemoryStore::open(&directory).unwrap();
 
-    store.append_history("only-history").unwrap();
-    store.push_stash("only-stash").unwrap();
+    store.append_history("only-history", &[]).unwrap();
+    store.push_stash("only-stash", &[]).unwrap();
 
     assert_eq!(
         store

@@ -54,7 +54,8 @@ fn a_remembered_model_and_effort_survive_a_reopen_as_one_selection() {
             "0006_session_bypass_permission_prompts",
             "0007_model_preference_by_source",
             "0008_prompt_memory",
-            "0009_media"
+            "0009_media",
+            "0010_prompt_memory_media"
         ]
     );
     drop(connection);

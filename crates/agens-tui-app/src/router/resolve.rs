@@ -360,14 +360,14 @@ impl TuiRuntimeRouter {
         let path = resolve_attach_path(&session, &bootstrap, raw)?;
         let (media_id, mime) = ingest_tui_media_path(&bootstrap, &path)?;
         session.push_pending_media(media_id, mime);
-        let media_chips = session.pending_media_chip_labels();
-        let chip = media_chips
+        let chip = session
+            .pending_media_chip_labels()
             .last()
             .cloned()
             .unwrap_or_else(|| "[Image #?]".into());
         Ok(TuiSubmissionOutcome::MediaAttached {
             message: format!("Attached {chip}."),
-            media_chips,
+            staged_media: crate::files::session_staged_media(&session),
         })
     }
 
