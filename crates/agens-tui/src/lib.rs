@@ -476,9 +476,13 @@ pub enum TuiSubmissionOutcome {
         message: String,
         staged_media: Vec<PromptAttachment>,
     },
-    /// App-side staged media now matches a restored attachment set; applied silently.
+    /// App-side staged media now matches a restored attachment set.
+    ///
+    /// Applied silently unless the restore had to drop attachments whose blob is gone,
+    /// which `notice` then reports.
     StagedMediaReplaced {
         staged_media: Vec<PromptAttachment>,
+        notice: Option<String>,
     },
     LocalActionableError {
         message: String,
@@ -5666,6 +5670,13 @@ pub struct Tui<E> {
     /// Mirrors the app-side session staging so prompt history/stash can record
     /// what the chips stand for and restores can hand the exact set back.
     staged_media: Vec<PromptAttachment>,
+    /// The attachments the running turn carried, snapshotted when it started.
+    ///
+    /// Completion clears only this set, never whatever is staged at that moment:
+    /// media attached mid-turn belongs to the next prompt.
+    submitted_media: Vec<PromptAttachment>,
+    /// Whether a durable prompt-history write failure was already reported.
+    prompt_history_write_reported: bool,
     recovered_failed_prompt: bool,
     size: (u16, u16),
     local_route_active: bool,
@@ -5780,6 +5791,8 @@ where
             input_cursor: 0,
             media_chips: Vec::new(),
             staged_media: Vec::new(),
+            submitted_media: Vec::new(),
+            prompt_history_write_reported: false,
             recovered_failed_prompt: false,
             size: (80, 24),
             local_route_active: false,
@@ -6251,6 +6264,7 @@ where
         }
         self.runtime_events.clear();
         self.turn_duration = None;
+        self.submitted_media = self.staged_media.clone();
         self.transcript.push(TranscriptEntry::User(prompt.clone()));
         self.conversation = Some(Conversation::new(prompt));
         {
@@ -6310,6 +6324,7 @@ where
         self.runtime_events.clear();
         self.turn_duration = None;
         self.latest_usage = None;
+        self.submitted_media = self.staged_media.clone();
         self.transcript.push(TranscriptEntry::Info(notice.clone()));
         self.conversation = Some(Conversation::new(String::new()));
         self.project_conversation(ConversationEvent::Info(notice));
@@ -6470,8 +6485,14 @@ where
                 self.add_info(message);
                 None
             }
-            TuiSubmissionOutcome::StagedMediaReplaced { staged_media } => {
+            TuiSubmissionOutcome::StagedMediaReplaced {
+                staged_media,
+                notice,
+            } => {
                 self.set_staged_media(staged_media);
+                if let Some(notice) = notice {
+                    self.add_info(notice);
+                }
                 None
             }
             TuiSubmissionOutcome::LocalActionableError { message, action } => {
@@ -6668,10 +6689,34 @@ where
         &self.staged_media
     }
 
-    /// Clears staged media chips (after a successful submit or discard).
+    /// Clears staged media chips (after a discard).
     pub fn clear_media_chips(&mut self) {
         self.media_chips.clear();
         self.staged_media.clear();
+        self.submitted_media.clear();
+    }
+
+    /// Drops only the chips the finished turn carried, keeping anything staged since.
+    ///
+    /// A stash pop or clipboard attach mid-turn stages media for the NEXT prompt and,
+    /// in the stash case, has already deleted the durable row it came from; clearing
+    /// every chip on completion would destroy it with nothing left to restore from.
+    /// The app side removes the same consumed set from its session staging, so the two
+    /// views stay in step without a further sync round-trip.
+    fn clear_submitted_media(&mut self) {
+        let consumed = std::mem::take(&mut self.submitted_media);
+        if consumed.is_empty() {
+            return;
+        }
+
+        let mut remaining = std::mem::take(&mut self.staged_media);
+        for attachment in &consumed {
+            if let Some(index) = remaining.iter().position(|staged| staged == attachment) {
+                remaining.remove(index);
+            }
+        }
+
+        self.set_staged_media(remaining);
     }
 
     pub fn finish_provider_turn(&mut self, outcome: TuiProviderOutcome) -> Option<String> {
@@ -6742,7 +6787,7 @@ where
                 } else {
                     self.transcript.push(TranscriptEntry::Assistant(body));
                 }
-                self.clear_media_chips();
+                self.clear_submitted_media();
                 self.set_foreground_presentation(false);
             }
             TuiProviderOutcome::Failed { message, action } => {
@@ -8883,11 +8928,16 @@ where
         Action::Render
     }
 
+    /// Clears the composer TEXT only.
+    ///
+    /// Staged chips survive: this runs from paths that emit no [`Action`], so dropping
+    /// them here would take the chips off the surface while the session still holds the
+    /// same media, and the next submit would ship attachments the user can no longer see.
+    /// Chips are released when the turn that carried them completes.
     fn clear_composer(&mut self) {
         self.input.clear();
         self.input_cursor = 0;
         self.recovered_failed_prompt = false;
-        self.clear_media_chips();
     }
 
     fn enqueue_resolved_composer(&mut self, display: String, prompt: String) {
@@ -8905,11 +8955,21 @@ where
     }
 
     /// Records a submitted prompt with the attachments staged when it was sent.
+    ///
+    /// A failed durable write is reported once per session: the prompt itself still went
+    /// through, so repeating the notice on every submit would bury the turn's own output,
+    /// but staying silent would let history quietly stop recording after a loud open.
     fn record_prompt_history(&mut self, text: &str) {
         let Some(memory) = self.prompt_memory.as_mut() else {
             return;
         };
-        let _ = memory.record_submission(text, &self.staged_media);
+
+        if memory.record_submission(text, &self.staged_media).is_err()
+            && !self.prompt_history_write_reported
+        {
+            self.prompt_history_write_reported = true;
+            self.add_info("Could not save this prompt to history.");
+        }
     }
 
     /// Applies restored composer content (text plus attachments) after a stash
@@ -9023,15 +9083,21 @@ where
             match memory.stash_pop() {
                 Ok(Some(recall)) => {
                     memory.clear_browse();
-                    Some(recall)
+                    Ok(Some(recall))
                 }
-                _ => None,
+                Ok(None) => Ok(None),
+                Err(_) => Err(()),
             }
         };
 
         match popped {
-            Some(recall) => self.apply_prompt_recall(recall),
-            None => Action::Render,
+            Ok(Some(recall)) => self.apply_prompt_recall(recall),
+            Ok(None) => Action::Render,
+            // A read that failed is not an empty stash, and the push path says so out loud.
+            Err(()) => {
+                self.add_info("Could not read the stash.");
+                Action::Render
+            }
         }
     }
 

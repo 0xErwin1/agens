@@ -5768,6 +5768,91 @@ fn prompt_stash_ctrl_s_with_only_staged_attachments_pushes_instead_of_popping() 
     assert_eq!(tui.media_chips(), &["[Image #1]".to_owned()][..]);
 }
 
+/// A stash pop while a turn is running has already deleted the durable row it restored, so
+/// completing that turn must clear only what the turn itself carried.
+#[test]
+fn a_turn_completing_keeps_media_staged_after_it_started() {
+    let mut tui = tui_with_prompt_memory();
+    let popped = vec![PromptAttachment::new(2, "application/pdf")];
+
+    // Park a draft with attachments, then send a text-only prompt.
+    tui.set_staged_media(popped.clone());
+    type_chars(&mut tui, "parked draft");
+    assert_eq!(
+        tui.handle(Event::Key(Key::CtrlS)),
+        Action::SyncStagedMedia(Vec::new())
+    );
+
+    assert_eq!(
+        submit_text(&mut tui, "text only"),
+        Action::Submit("text only".into())
+    );
+    tui.begin_submission("text only");
+
+    // Mid-turn pop: the stash row is gone, the composer now holds the only copy.
+    assert_eq!(
+        tui.handle(Event::Key(Key::CtrlS)),
+        Action::SyncStagedMedia(popped.clone())
+    );
+
+    tui.finish_provider_turn(TuiProviderOutcome::Completed("answer".into()));
+
+    assert_eq!(
+        tui.staged_media(),
+        &popped[..],
+        "the popped attachments must survive the turn that never carried them"
+    );
+    assert_eq!(tui.media_chips(), &["[File #1]".to_owned()][..]);
+    assert_eq!(tui.input(), "parked draft");
+}
+
+#[test]
+fn a_turn_completing_clears_exactly_the_media_it_carried() {
+    let mut tui = tui_with_prompt_memory();
+    let sent = PromptAttachment::new(1, "image/png");
+    let attached_mid_turn = PromptAttachment::new(4, "application/pdf");
+
+    tui.set_staged_media(vec![sent.clone()]);
+    assert_eq!(
+        submit_text(&mut tui, "with media"),
+        Action::Submit("with media".into())
+    );
+    tui.begin_submission("with media");
+    assert_eq!(tui.media_chips(), &["[Image #1]".to_owned()][..]);
+
+    tui.apply_submission_outcome(TuiSubmissionOutcome::MediaAttached {
+        message: "Attached [File #2] from clipboard.".into(),
+        staged_media: vec![sent, attached_mid_turn.clone()],
+    });
+
+    tui.finish_provider_turn(TuiProviderOutcome::Completed("answer".into()));
+
+    assert_eq!(
+        tui.staged_media(),
+        &[attached_mid_turn][..],
+        "only the attachment the turn carried is released"
+    );
+    assert_eq!(tui.media_chips(), &["[File #1]".to_owned()][..]);
+}
+
+/// A busy dialog or overlay clears the composer text; the chips belong to the session's
+/// staging and must not vanish from the surface behind its back.
+#[test]
+fn a_busy_overlay_leaves_staged_chips_alone() {
+    let mut tui = tui_with_prompt_memory();
+    let staged = vec![PromptAttachment::new(3, "image/png")];
+
+    tui.set_staged_media(staged.clone());
+    tui.begin_submission("running");
+    type_chars(&mut tui, "/stash");
+
+    tui.apply_busy_submission_outcome(TuiSubmissionOutcome::PromptStashOverlay);
+
+    assert!(tui.input().is_empty());
+    assert_eq!(tui.staged_media(), &staged[..]);
+    assert_eq!(tui.media_chips(), &["[Image #1]".to_owned()][..]);
+}
+
 #[test]
 fn history_browse_restores_attachments_and_returns_staged_chips_with_draft() {
     let mut tui = tui_with_prompt_memory();
@@ -5951,13 +6036,29 @@ fn prompt_memory_write_failure_does_not_panic_and_restores_stash_draft() {
     let mut tui = Tui::new(FakeEngine::default());
     tui.set_prompt_memory(Box::new(FailingPromptMemory));
 
-    // Submit still routes; failed record does not panic or invent history.
+    // Submit still routes; failed record does not panic or invent history, and says so once.
     assert_eq!(
         submit_text(&mut tui, "survives-history-io"),
         Action::Submit("survives-history-io".into())
     );
+    assert_eq!(tui.status(), Some("Could not save this prompt to history."));
     assert_eq!(tui.handle(Event::Key(Key::Up)), Action::Render);
     assert_eq!(tui.input(), "");
+
+    // A stash read that failed is not an empty stash and must not pass in silence.
+    assert!(tui.input().is_empty());
+    assert_eq!(tui.handle(Event::Key(Key::CtrlS)), Action::Render);
+    assert_eq!(tui.status(), Some("Could not read the stash."));
+
+    assert_eq!(
+        submit_text(&mut tui, "second-history-io"),
+        Action::Submit("second-history-io".into())
+    );
+    assert_eq!(
+        tui.status(),
+        None,
+        "the history write failure is reported once per session, not on every submit"
+    );
 
     // Stash push failure restores the draft AND its chips so nothing is lost.
     type_chars(&mut tui, "stash-io-a");
