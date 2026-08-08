@@ -24,7 +24,7 @@ Enter the development shell and build:
 
 ```sh
 nix develop --no-pure-eval
-just build
+build
 ```
 
 For ChatGPT subscription authentication:
@@ -249,25 +249,25 @@ The workspace contains seven crates:
 
 ## Development
 
-Use the root `justfile` inside `nix develop --no-pure-eval`:
+Repository tasks are devenv scripts declared in `devenv.nix`. Entering the development shell, through direnv or manually, puts each one on `PATH`:
 
 ```sh
-just fmt-check    # check rustfmt without modifying files
-just lint         # Clippy for all workspace targets with warnings denied
-just test         # workspace tests
-just build        # build the workspace
-just contracts    # repository bootstrap and standards contracts
-just deny         # dependency advisories, licenses, bans, and sources
-just verify       # canonical complete gate
-just clean        # manual build-output cleanup
+fmt-check    # check rustfmt without modifying files
+lint         # Clippy for all workspace targets with warnings denied
+check         # workspace tests
+build        # build the workspace
+contracts    # repository bootstrap and standards contracts
+deny         # dependency advisories, licenses, bans, and sources
+verify       # canonical complete gate
+clean        # manual build-output cleanup
 ```
 
-Build outputs are `target/{debug,release}/agens`. The directory has a 50 GiB budget. Verification checks the budget and never cleans automatically; cleanup is manual only with `just clean`.
+Build outputs are `target/{debug,release}/agens`. The directory has a 50 GiB budget. Verification checks the budget and never cleans automatically; cleanup is manual only with `clean`.
 
 Before considering a change complete, run:
 
 ```sh
-nix develop --no-pure-eval -c just verify
+nix develop --no-pure-eval -c verify
 ```
 
 ## Known limitations

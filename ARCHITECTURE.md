@@ -81,7 +81,7 @@ A **surface** is anything a user interacts with: argument parsing, terminal rend
 - **Logic must not be written against surface types.** A function that takes a rendering type, a prompt reply, or a "which surface submitted this" enum is coupled even when the crate graph looks clean. When logic needs something from a surface, it declares a trait it owns and the surface implements it.
 - **A surface holds only what disappears with it.** If deleting the TUI would delete the ability to run a turn, evaluate a permission, or dispatch a tool, that logic is in the wrong place.
 
-`tests/bootstrap/assert-workspace.sh` pins every crate's exact dependency list, so a logic crate that grows a surface dependency fails `just contracts`. **That check cannot see inside a crate.** Logic that lives in the binary crate alongside the surfaces is therefore unenforced by construction, which is the reason engine code moves out of `agens-cli` rather than staying there behind naming discipline.
+`tests/bootstrap/assert-workspace.sh` pins every crate's exact dependency list, so a logic crate that grows a surface dependency fails `contracts`. **That check cannot see inside a crate.** Logic that lives in the binary crate alongside the surfaces is therefore unenforced by construction, which is the reason engine code moves out of `agens-cli` rather than staying there behind naming discipline.
 
 ## Runtime boundary
 
@@ -120,7 +120,7 @@ Every `task` subagent inherits its prompt from the catalog agent it was dispatch
 
 ## Repository contracts
 
-- `justfile` is the canonical Rust developer command surface.
+- The devenv scripts declared in `devenv.nix` are the canonical Rust developer command surface.
 - `flake.nix` owns the reproducible Rust development environment.
 - `CODE_STYLE.md` owns formatting, linting, and testing expectations.
 - `AGENTS.md` owns agent-specific workflow rules.

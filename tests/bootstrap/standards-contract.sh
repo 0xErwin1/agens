@@ -6,6 +6,8 @@ cd "$repo_root"
 
 for file in \
     CLAUDE.md \
+    .envrc \
+    devenv.nix \
     rustfmt.toml \
     deny.toml \
     .gitattributes \
@@ -32,13 +34,13 @@ for manifest in crates/*/Cargo.toml; do
     grep -F 'publish.workspace = true' "$manifest" >/dev/null
 done
 
-grep -F 'pkgs.cargo-deny' flake.nix >/dev/null
-grep -F 'cargo deny check' justfile >/dev/null
-grep -F 'just contracts' justfile >/dev/null
-grep -F 'tests/bootstrap/standards-contract.sh' justfile >/dev/null
+grep -F 'pkgs.cargo-deny' devenv.nix >/dev/null
+grep -F 'cargo deny check' devenv.nix >/dev/null
+grep -F 'tests/bootstrap/verify-contracts.sh' devenv.nix >/dev/null
+grep -F 'tests/bootstrap/standards-contract.sh' devenv.nix >/dev/null
 
 grep -F '* text=auto eol=lf' .gitattributes >/dev/null
-grep -F 'nix develop --no-pure-eval -c just verify' .github/workflows/verify.yml >/dev/null
+grep -F 'nix develop --no-pure-eval -c verify' .github/workflows/verify.yml >/dev/null
 if grep -Eq 'uses: [^@[:space:]]+@v[0-9]' .github/workflows/verify.yml; then
     echo "GitHub Actions must be pinned to exact commits" >&2
     exit 1

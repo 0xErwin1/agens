@@ -4,18 +4,24 @@ Agens is a Rust workspace with a Nix-first development environment. Keep contrib
 
 ## Setup
 
-Enter the development shell:
+The development shell is entered by direnv:
+
+```sh
+direnv allow
+```
+
+Without direnv, enter the same shell manually:
 
 ```sh
 nix develop --no-pure-eval
 ```
 
-With direnv installed, `direnv allow` may enter the same shell automatically. Rust 1.97.1, `just`, `cargo-deny`, Clippy, rustfmt, and rust-analyzer are provided by the shell.
+Rust 1.97.1, `cargo-deny`, Clippy, rustfmt, and rust-analyzer are provided by the shell. Repository tasks are devenv scripts declared in `devenv.nix`, so entering the shell puts each one on `PATH` under its own name and prints the list. Tests are `check` rather than `test`, because a command named `test` would be shadowed by the shell builtin.
 
 Build and inspect the CLI:
 
 ```sh
-just build
+build
 ./target/debug/agens --help
 ```
 
@@ -42,13 +48,13 @@ For non-trivial production or contract changes:
 Use the verification matrix in `CODE_STYLE.md` to select focused commands. Repository contracts run with:
 
 ```sh
-just contracts
+contracts
 ```
 
 The canonical final gate is:
 
 ```sh
-nix develop --no-pure-eval -c just verify
+nix develop --no-pure-eval -c verify
 ```
 
 It checks the target budget, bootstrap contracts, formatting, Clippy, tests, build, supply-chain policy, and the target budget again.
@@ -58,7 +64,7 @@ It checks the target budget, bootstrap contracts, formatting, Clippy, tests, bui
 The Rust `target/` directory has a 50 GiB budget. Verification reports an overage and never removes artifacts automatically. Cleanup is a deliberate manual action:
 
 ```sh
-just clean
+clean
 ```
 
 ## Commits and review units
@@ -107,7 +113,7 @@ Dependency changes must be intentional and minimal:
 - Explain why the standard library or an existing dependency is insufficient.
 - Review default features, transitive size, maintenance status, license, advisory history, and platform impact.
 - Keep `Cargo.lock` synchronized and use `--locked` in verification.
-- Run focused tests, `just lint`, and `just deny`.
+- Run focused tests, `lint`, and `deny`.
 - Do not introduce build profiles, linkers, installers, containers, or release tooling without a measured project need.
 
 Dependabot groups routine monthly minor and patch updates. Major upgrades remain deliberate review work.

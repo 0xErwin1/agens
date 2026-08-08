@@ -15,7 +15,7 @@ Resolves #
 | Check | Result |
 |-------|--------|
 | Focused test or contract | Not run |
-| `nix develop --no-pure-eval -c just verify` | Not run |
+| `nix develop --no-pure-eval -c verify` | Not run |
 
 ## Risks and limitations
 

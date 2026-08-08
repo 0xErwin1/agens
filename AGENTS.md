@@ -14,30 +14,30 @@ Agens is a Rust coding-agent CLI. This file is the canonical execution guide for
 
 ## Environment and commands
 
-Rust is the only implementation. Use the Nix development shell and the root `justfile` command surface:
+Rust is the only implementation. Repository tasks are devenv scripts declared in `devenv.nix`; entering the development shell puts each on `PATH`:
 
 ```sh
-nix develop --no-pure-eval
+direnv allow          # or: nix develop --no-pure-eval
 ```
 
 | Task | Command |
 |------|---------|
-| Format check | `just fmt-check` |
-| Lint | `just lint` |
-| Test | `just test` |
-| Build | `just build` |
-| Bootstrap contracts | `just contracts` |
-| Supply-chain policy | `just deny` |
-| Full gate | `just verify` |
-| Manual cleanup | `just clean` |
+| Format check | `fmt-check` |
+| Lint | `lint` |
+| Test | `check` |
+| Build | `build` |
+| Bootstrap contracts | `contracts` |
+| Supply-chain policy | `deny` |
+| Full gate | `verify` |
+| Manual cleanup | `clean` |
 
 The canonical completion gate is:
 
 ```sh
-nix develop --no-pure-eval -c just verify
+nix develop --no-pure-eval -c verify
 ```
 
-Build outputs are `target/{debug,release}/agens`. The `target/` budget is 50 GiB. Verification checks the budget before and after the gate and never cleans automatically; cleanup is manual only with `just clean`.
+Build outputs are `target/{debug,release}/agens`. The `target/` budget is 50 GiB. Verification checks the budget before and after the gate and never cleans automatically; cleanup is manual only with `clean`.
 
 ## Strict TDD
 

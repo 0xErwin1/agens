@@ -12,7 +12,7 @@ else
 fi
 
 if ((actual > limit)); then
-    printf 'Rust target budget exceeded\nactual size: %s bytes\nlimit: %s bytes\nCleanup is manual only; run just target-clean when appropriate.\n' "$actual" "$limit" >&2
+    printf 'Rust target budget exceeded\nactual size: %s bytes\nlimit: %s bytes\nCleanup is manual only; run target-clean when appropriate.\n' "$actual" "$limit" >&2
     exit 1
 fi
 
