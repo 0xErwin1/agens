@@ -61,6 +61,8 @@ pub fn next_session_metadata(
         updated_at: timestamp,
         completed_turn_count: 0,
         resumable: false,
+        parent_session_id: None,
+        fork_message_count: None,
     })
 }
 

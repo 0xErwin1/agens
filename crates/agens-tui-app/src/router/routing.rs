@@ -89,6 +89,12 @@ impl TuiRuntimeRouter {
             TuiRouteRequest::SessionPage(request) => {
                 return self.session_dialog_outcome(request);
             }
+            TuiRouteRequest::SessionTree(request) => {
+                return self.session_tree_outcome(request);
+            }
+            TuiRouteRequest::ForkSession(request) => {
+                return self.fork_session_outcome(request, &cancellation);
+            }
             TuiRouteRequest::DialogAction(action_id) => {
                 return self.route_dialog_action_with_cancellation(
                     &action_id,

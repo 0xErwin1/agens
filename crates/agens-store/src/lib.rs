@@ -22,7 +22,7 @@ pub use media::{
 };
 pub use prompt_memory::{PromptMemoryStore, PromptMemoryStoreError, StoredPrompt};
 pub use session_writer::{
-    SessionCursor, SessionPage, StoredSession, TranscriptCursor, TranscriptPage,
+    ForkSessionError, SessionCursor, SessionPage, StoredSession, TranscriptCursor, TranscriptPage,
 };
 
 const PERMISSION_GRANTS_COLUMNS: [ExpectedColumnSignature; 7] = [
@@ -1184,12 +1184,27 @@ fn validate_legacy_archive(
     }
 }
 
+/// Expected normalized session tables after migration `0011_session_fork_lineage`: the two fork
+/// lineage columns spliced before the trailing `CHECK` in the order `ALTER TABLE … ADD COLUMN`
+/// rewrites them, plus the forest index the children query reads through.
+fn normalized_session_schema_v9() -> String {
+    let with_lineage_columns = normalized_session_schema_v8().replacen(
+        "CHECK(resumable = (completed_turn_count > 0))",
+        "parent_session_id INTEGER,\n        fork_message_count INTEGER,\n        CHECK(resumable = (completed_turn_count > 0))",
+        1,
+    );
+
+    format!(
+        "{with_lineage_columns}CREATE INDEX sessions_forest ON sessions(parent_session_id, id);"
+    )
+}
+
 fn validate_v5_schema(
     connection: &Connection,
     database_path: &Path,
 ) -> Result<(), SessionStoreError> {
     validate_legacy_archive(connection, database_path)?;
-    validate_normalized_session_schema(connection, database_path, &normalized_session_schema_v8())
+    validate_normalized_session_schema(connection, database_path, &normalized_session_schema_v9())
 }
 
 fn validate_normalized_session_schema(
@@ -1199,7 +1214,7 @@ fn validate_normalized_session_schema(
 ) -> Result<(), SessionStoreError> {
     let names = if expected_schema.contains("CREATE TABLE session_attempts") {
         "'sessions', 'turns', 'messages', 'message_parts',
-         'sessions_list', 'messages_turn_order', 'parts_message_order',
+         'sessions_list', 'sessions_forest', 'messages_turn_order', 'parts_message_order',
          'session_attempts', 'session_attempts_session_sequence',
          'session_attempts_one_running', 'session_attempts_latest'"
     } else {

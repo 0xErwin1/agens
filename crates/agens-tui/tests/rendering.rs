@@ -6,9 +6,9 @@ use agens_core::{Message, MessagePart, Role, TurnEvent, TurnRetryReason, Usage};
 use agens_tui::{
     Action, ColorLevel, ConversationEvent, DialogEntry, DialogView, DiffLine, DiffLineKind,
     DisplayMode, Engine, Event, Key, PaletteEntry, PaletteEntryKind, RatatuiRenderer, Renderer,
-    RepositoryStatus, SessionDialogCursor, SessionDialogRequest, ToolResultState, TranscriptId,
-    Tui, TuiExecutionEvent, TuiExecutionState, TuiPresentation, TuiRuntimeEvent, TuiSubagentEvent,
-    TuiSubmissionOutcome, UnicodeLevel,
+    RepositoryStatus, SessionDialogCursor, SessionDialogRequest, SessionTreeRequest,
+    ToolResultState, TranscriptId, Tui, TuiExecutionEvent, TuiExecutionState, TuiPresentation,
+    TuiRuntimeEvent, TuiSubagentEvent, TuiSubmissionOutcome, UnicodeLevel,
 };
 use ratatui::{
     Terminal,
@@ -6965,4 +6965,60 @@ fn ask_user_overlay_never_panics_or_corrupts_its_frame_at_degenerate_sizes() {
         let (_tui, renderer) = open_ask_user(width, height, single_context_request(&long));
         assert_ask_user_frame_is_not_corrupted(&renderer, &format!("{width}x{height} long"));
     }
+}
+
+/// Lineage is drawn as indentation on a flat list, so a search that hides a
+/// parent still leaves rows the reader can read, and the loading and failed
+/// states say which of the two they are.
+#[test]
+fn session_tree_renders_depth_indented_rows_and_its_own_loading_and_error_states() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(78, 16)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    let entries = vec![
+        DialogEntry::action("#1 root", "session:1"),
+        DialogEntry::action("#2 fork of root", "session:2").with_depth(1),
+        DialogEntry::action("#3 fork of fork", "session:3").with_depth(2),
+    ];
+    tui.show_selection_dialog(DialogView::session_tree_page(
+        entries,
+        SessionTreeRequest::active(),
+    ));
+
+    renderer.render(tui.view()).unwrap();
+    let tree = rendered_text(&renderer);
+    assert!(tree.contains("Session tree"), "{tree:?}");
+    assert!(tree.contains("#1 root"), "{tree:?}");
+    assert!(tree.contains("└ #2 fork of root"), "{tree:?}");
+    assert!(tree.contains("  └ #3 fork of fork"), "{tree:?}");
+
+    tui.show_selection_dialog(DialogView::session_tree_page(
+        Vec::new(),
+        SessionTreeRequest::active(),
+    ));
+    renderer.render(tui.view()).unwrap();
+    let empty = rendered_text(&renderer);
+    assert!(empty.contains("No forks of this session."), "{empty:?}");
+
+    tui.show_selection_dialog(DialogView::session_tree_loading(
+        SessionTreeRequest::for_root("41"),
+    ));
+    renderer.render(tui.view()).unwrap();
+    let loading = rendered_text(&renderer);
+    assert!(loading.contains("Loading session tree…"), "{loading:?}");
+    assert!(
+        !loading.contains("No forks of this session."),
+        "{loading:?}"
+    );
+
+    tui.show_selection_dialog(DialogView::session_tree_error(
+        SessionTreeRequest::for_root("41"),
+        "The session tree could not be loaded.",
+    ));
+    renderer.render(tui.view()).unwrap();
+    let error = rendered_text(&renderer);
+    assert!(
+        error.contains("The session tree could not be loaded."),
+        "{error:?}"
+    );
+    assert!(!error.contains("Loading session tree…"), "{error:?}");
 }

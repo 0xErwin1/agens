@@ -1049,6 +1049,8 @@ mod tests {
                     updated_at: 1,
                     completed_turn_count: 1,
                     resumable: true,
+                    parent_session_id: None,
+                    fork_message_count: None,
                 },
                 messages: Vec::new(),
             })
@@ -1124,6 +1126,8 @@ mod tests {
                         updated_at: 1,
                         completed_turn_count: 1,
                         resumable: true,
+                        parent_session_id: None,
+                        fork_message_count: None,
                     },
                     messages: Vec::new(),
                 })
@@ -1539,6 +1543,8 @@ mod tests {
             updated_at: 1,
             completed_turn_count: 0,
             resumable: false,
+            parent_session_id: None,
+            fork_message_count: None,
         };
         metadata = store
             .persist_completed_session_turn(&metadata, &completed("first", "kept"))
@@ -1652,6 +1658,8 @@ mod tests {
                 updated_at: 1,
                 completed_turn_count: 1,
                 resumable: true,
+                parent_session_id: None,
+                fork_message_count: None,
             }),
             messages: tui_session_messages(),
             active_agent: Some(active_agent),
@@ -1749,6 +1757,8 @@ mod tests {
                     updated_at: 1,
                     completed_turn_count: 1,
                     resumable: true,
+                    parent_session_id: None,
+                    fork_message_count: None,
                 },
                 messages: Vec::new(),
             })

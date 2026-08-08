@@ -229,6 +229,8 @@ pub enum Key {
     CtrlB,
     /// Pushes non-empty composer text onto the LIFO stash, or pops when empty.
     CtrlS,
+    /// Opens the session lineage browser the reader can fork from.
+    CtrlR,
     ShiftEnter,
     Left,
     Right,
@@ -377,6 +379,10 @@ pub enum Action {
     OpenDialog(String),
     /// Load a bounded session-browser page through the composition layer.
     LoadSessionPage(SessionDialogRequest),
+    /// Load the lineage a session belongs to, for the session-tree overlay.
+    LoadSessionTree(SessionTreeRequest),
+    /// Fork a session at the point the reader pointed at.
+    ForkSession(SessionForkRequest),
     /// Dispatch the selected dialog action through the composition layer.
     DialogAction(String),
     SafeDialogAction(String),
@@ -568,6 +574,8 @@ pub enum TuiRouteRequest {
     OpenDialog(String),
     DialogAction(String),
     SessionPage(SessionDialogRequest),
+    SessionTree(SessionTreeRequest),
+    ForkSession(SessionForkRequest),
 }
 
 const MAX_SECRET_INPUT_BYTES: usize = 8192;
@@ -735,6 +743,11 @@ impl std::fmt::Debug for Action {
                 .debug_tuple("LoadSessionPage")
                 .field(value)
                 .finish(),
+            Self::LoadSessionTree(value) => formatter
+                .debug_tuple("LoadSessionTree")
+                .field(value)
+                .finish(),
+            Self::ForkSession(value) => formatter.debug_tuple("ForkSession").field(value).finish(),
             Self::DialogAction(value) => {
                 formatter.debug_tuple("DialogAction").field(value).finish()
             }
@@ -798,6 +811,8 @@ impl std::fmt::Debug for TuiRouteRequest {
                 formatter.debug_tuple("DialogAction").field(value).finish()
             }
             Self::SessionPage(value) => formatter.debug_tuple("SessionPage").field(value).finish(),
+            Self::SessionTree(value) => formatter.debug_tuple("SessionTree").field(value).finish(),
+            Self::ForkSession(value) => formatter.debug_tuple("ForkSession").field(value).finish(),
         }
     }
 }
@@ -1317,6 +1332,22 @@ enum PromptOverlayKind {
     Stash,
 }
 
+/// Deepest lineage row that still moves right; deeper rows share this indent.
+///
+/// A lineage can be arbitrarily deep, but the dialog is not arbitrarily wide:
+/// past this point another level of indent would cost more label than it buys
+/// in structure.
+const MAX_DIALOG_ENTRY_DEPTH: usize = 8;
+/// Columns [`lineage_indent`] can claim at [`MAX_DIALOG_ENTRY_DEPTH`].
+const MAX_LINEAGE_INDENT_CHARS: usize = 2 * MAX_DIALOG_ENTRY_DEPTH;
+/// Label bound for an indented row, so the indent cannot eat the label's tail.
+const LINEAGE_LABEL_LIMIT: usize = 128 + MAX_LINEAGE_INDENT_CHARS;
+
+/// The lineage marker a row at `depth` is prefixed with.
+fn lineage_indent(depth: usize) -> String {
+    format!("{}└ ", "  ".repeat(depth.saturating_sub(1)))
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DialogEntry {
     label: String,
@@ -1325,6 +1356,8 @@ pub struct DialogEntry {
     selected_detail: Option<String>,
     action: Option<DialogEntryAction>,
     id: Option<String>,
+    /// How deep this row sits in a lineage, for depth-prefixed flat lists.
+    depth: usize,
 }
 
 impl DialogEntry {
@@ -1366,6 +1399,7 @@ impl DialogEntry {
                 128,
             ))),
             id: None,
+            depth: 0,
         }
     }
 
@@ -1380,6 +1414,7 @@ impl DialogEntry {
                 128,
             ))),
             id: None,
+            depth: 0,
         }
     }
 
@@ -1400,6 +1435,7 @@ impl DialogEntry {
                 128,
             ))),
             id: None,
+            depth: 0,
         }
     }
 
@@ -1407,6 +1443,33 @@ impl DialogEntry {
     pub fn with_id(mut self, id: impl AsRef<str>) -> Self {
         self.id = Some(bounded_dialog_text(id.as_ref(), 128));
         self
+    }
+
+    /// Places the row at `depth` in a lineage and indents its label to match.
+    ///
+    /// A tree is drawn as a flat list of indented rows rather than a nested
+    /// widget, for the reason the shortcut catalogue states: the dialog already
+    /// filters rows, and a filtered tree would answer a search with rows whose
+    /// parents are no longer on screen. The indent is baked into the label so
+    /// filtering, measuring, and painting all keep seeing one row of text.
+    pub fn with_depth(mut self, depth: usize) -> Self {
+        let depth = depth.min(MAX_DIALOG_ENTRY_DEPTH);
+        if depth == 0 {
+            self.depth = 0;
+            return self;
+        }
+
+        self.label = bounded_dialog_text(
+            &format!("{}{}", lineage_indent(depth), self.label),
+            LINEAGE_LABEL_LIMIT,
+        );
+        self.depth = depth;
+        self
+    }
+
+    /// How deep this row sits in the lineage it was built for.
+    pub const fn depth(&self) -> usize {
+        self.depth
     }
 
     /// A row that states a fact and dispatches nothing.
@@ -1425,6 +1488,7 @@ impl DialogEntry {
             selected_detail: None,
             action: Some(DialogEntryAction::ToggleDetails),
             id: None,
+            depth: 0,
         }
     }
 
@@ -1436,6 +1500,7 @@ impl DialogEntry {
             selected_detail: None,
             action: Some(DialogEntryAction::Cancel),
             id: None,
+            depth: 0,
         }
     }
 
@@ -1447,6 +1512,7 @@ impl DialogEntry {
             selected_detail: None,
             action: None,
             id: None,
+            depth: 0,
         }
     }
 
@@ -1462,6 +1528,7 @@ impl DialogEntry {
             selected_detail: Some(bounded_dialog_multiline(selected_detail.as_ref(), 2_048)),
             action: Some(DialogEntryAction::ToggleDetails),
             id: None,
+            depth: 0,
         }
     }
 
@@ -1481,6 +1548,7 @@ impl DialogEntry {
             selected_detail: None,
             action: Some(DialogEntryAction::FillComposer { text, attachments }),
             id: id.map(|id| bounded_dialog_text(&id, 128)),
+            depth: 0,
         }
     }
 }
@@ -1562,6 +1630,96 @@ struct SessionDialogEntries {
     error: Option<String>,
 }
 
+/// A request for the lineage a session belongs to, as a forest of sessions.
+///
+/// The terminal cannot name a session: it is shown a label, not an identity.
+/// `root` is therefore `None` when the request is about the session the reader
+/// is in, and the composition layer resolves which one that is.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionTreeRequest {
+    root: Option<String>,
+    generation: u64,
+}
+
+impl SessionTreeRequest {
+    /// The lineage of the session the terminal is currently attached to.
+    pub const fn active() -> Self {
+        Self {
+            root: None,
+            generation: 0,
+        }
+    }
+
+    /// The lineage rooted at a session the caller can already name.
+    pub fn for_root(root: impl AsRef<str>) -> Self {
+        Self {
+            root: Some(bounded_dialog_text(root.as_ref(), 128)),
+            generation: 0,
+        }
+    }
+
+    pub fn root(&self) -> Option<&str> {
+        self.root.as_deref()
+    }
+
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+/// A request to fork a session at a point the reader pointed at.
+///
+/// `turn_prefix` is a hint, not an authority: it counts the transcript turns
+/// the terminal has drawn up to and including the fork point, which is the only
+/// measure this crate can take. It is not a message count — the terminal never
+/// sees the persisted messages a turn expands into — so the composition layer
+/// re-derives and validates the real cut and may land on a different one.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionForkRequest {
+    session: Option<String>,
+    turn_prefix: u64,
+    generation: u64,
+}
+
+impl SessionForkRequest {
+    /// Forks the session the terminal is currently attached to.
+    pub const fn from_active_transcript(turn_prefix: u64) -> Self {
+        Self {
+            session: None,
+            turn_prefix,
+            generation: 0,
+        }
+    }
+
+    /// Forks a session the caller can already name, such as a browsed row.
+    pub fn for_session(session: impl AsRef<str>, turn_prefix: u64) -> Self {
+        Self {
+            session: Some(bounded_dialog_text(session.as_ref(), 128)),
+            turn_prefix,
+            generation: 0,
+        }
+    }
+
+    pub fn session(&self) -> Option<&str> {
+        self.session.as_deref()
+    }
+
+    pub const fn turn_prefix(&self) -> u64 {
+        self.turn_prefix
+    }
+
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SessionTreeEntries {
+    request: SessionTreeRequest,
+    loading: bool,
+    error: Option<String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct DialogQueryAction {
     label_prefix: String,
@@ -1588,6 +1746,8 @@ pub struct DialogView {
     offset: usize,
     interactive: bool,
     session_entries: Option<SessionDialogEntries>,
+    /// Lineage-browser state, when this dialog is a session tree page.
+    tree_entries: Option<SessionTreeEntries>,
     query_action: Option<DialogQueryAction>,
     refresh_id: Option<String>,
     details_open: bool,
@@ -1624,6 +1784,7 @@ impl DialogView {
             offset: 0,
             interactive: true,
             session_entries: None,
+            tree_entries: None,
             query_action: None,
             refresh_id: None,
             details_open: false,
@@ -1729,10 +1890,51 @@ impl DialogView {
         dialog
     }
 
+    /// One page of a session lineage, as a depth-prefixed flat list.
+    ///
+    /// The caller indents each row with [`DialogEntry::with_depth`]; this keeps
+    /// the same bound every other dialog page keeps, so a forest wider than the
+    /// cap loses its tail here rather than growing an unbounded overlay. Paging
+    /// past the cap is the composition layer's job.
+    pub fn session_tree_page(entries: Vec<DialogEntry>, request: SessionTreeRequest) -> Self {
+        let entries = entries.into_iter().take(64).collect::<Vec<_>>();
+        let mut dialog = Self::selection(
+            SESSION_TREE_TITLE,
+            Some("Enter resume · / search · Esc close"),
+            entries,
+        );
+        dialog.tree_entries = Some(SessionTreeEntries {
+            request,
+            loading: false,
+            error: None,
+        });
+        dialog
+    }
+
+    pub fn session_tree_loading(request: SessionTreeRequest) -> Self {
+        let mut dialog = Self::session_tree_page(Vec::new(), request);
+        if let Some(tree_entries) = dialog.tree_entries.as_mut() {
+            tree_entries.loading = true;
+        }
+        dialog
+    }
+
+    pub fn session_tree_error(request: SessionTreeRequest, message: impl AsRef<str>) -> Self {
+        let mut dialog = Self::session_tree_page(Vec::new(), request);
+        if let Some(tree_entries) = dialog.tree_entries.as_mut() {
+            tree_entries.error = Some(bounded_dialog_text(message.as_ref(), 256));
+        }
+        dialog
+    }
+
     pub fn is_loading(&self) -> bool {
         self.session_entries
             .as_ref()
             .is_some_and(|entries| entries.loading)
+            || self
+                .tree_entries
+                .as_ref()
+                .is_some_and(|entries| entries.loading)
     }
 
     pub fn with_selected(mut self, selected: usize) -> Self {
@@ -1777,6 +1979,7 @@ impl DialogView {
             offset: 0,
             interactive: false,
             session_entries: None,
+            tree_entries: None,
             query_action: None,
             refresh_id: None,
             details_open: false,
@@ -1815,6 +2018,8 @@ fn refresh_dialog_query_action(dialog: &mut DialogView) {
         format!("{}{}", action.action_prefix, dialog.query),
     ));
 }
+
+const SESSION_TREE_TITLE: &str = "Session tree";
 
 fn session_dialog_title(scope: SessionDialogScope) -> &'static str {
     match scope {
@@ -3738,13 +3943,23 @@ fn dialog_row_offset(
 /// The single non-entry line: loading, error, or the empty-state message.
 fn dialog_status_line(dialog: &DialogView) -> Option<Line<'static>> {
     let sessions = dialog.session_entries.as_ref();
+    let tree = dialog.tree_entries.as_ref();
     if sessions.is_some_and(|entries| entries.loading) {
         return Some(Line::styled(
             "Loading sessions…",
             Style::default().fg(widgets::RolePalette::muted()),
         ));
     }
-    if let Some(error) = sessions.and_then(|entries| entries.error.as_deref()) {
+    if tree.is_some_and(|entries| entries.loading) {
+        return Some(Line::styled(
+            "Loading session tree…",
+            Style::default().fg(widgets::RolePalette::muted()),
+        ));
+    }
+    if let Some(error) = sessions
+        .and_then(|entries| entries.error.as_deref())
+        .or_else(|| tree.and_then(|entries| entries.error.as_deref()))
+    {
         return Some(Line::styled(
             error.to_owned(),
             Style::default().fg(widgets::RolePalette::warning()),
@@ -3753,6 +3968,7 @@ fn dialog_status_line(dialog: &DialogView) -> Option<Line<'static>> {
 
     let empty = dialog_matches(dialog).is_empty()
         && (sessions.is_some()
+            || tree.is_some()
             || dialog.empty_message.is_some()
             || !dialog_shows_help_body(dialog));
     empty.then(|| {
@@ -4052,6 +4268,13 @@ fn dialog_empty_message(dialog: &DialogView) -> &str {
         return message;
     }
     let Some(session_entries) = dialog.session_entries.as_ref() else {
+        if dialog.tree_entries.is_some() {
+            return if dialog.query.is_empty() {
+                "No forks of this session."
+            } else {
+                "No sessions match search."
+            };
+        }
         return "No options available.";
     };
     if !dialog.query.is_empty() {
@@ -5753,6 +5976,8 @@ pub struct Tui<E> {
     pending_viewport_key: Option<char>,
     /// Optional prompt history/stash port installed by the composition root.
     prompt_memory: Option<Box<dyn PromptMemory>>,
+    /// Generation stamped on the last fork request this terminal emitted.
+    fork_generation: u64,
 }
 
 impl<E> Tui<E>
@@ -5852,6 +6077,7 @@ where
             selectable_cache: RefCell::new(None),
             pending_viewport_key: None,
             prompt_memory: None,
+            fork_generation: 0,
         }
     }
 
@@ -7420,6 +7646,18 @@ where
         {
             return;
         }
+        // Same guard for the lineage browser: a tree page that answers a request
+        // the reader has already replaced must not paint over the newer one.
+        if let (Some(current), Some(incoming)) = (
+            self.dialog
+                .as_ref()
+                .and_then(|dialog| dialog.tree_entries.as_ref()),
+            dialog.tree_entries.as_ref(),
+        ) && current.loading
+            && current.request.generation != incoming.request.generation
+        {
+            return;
+        }
         if dialog.refresh_id.is_some()
             && dialog.refresh_id
                 == self
@@ -8645,6 +8883,16 @@ where
             return Action::OpenDialog("bypass".into());
         }
 
+        // The lineage browser opens over the transcript, never over a palette or
+        // picker: those are being typed into, and an overlay that stole the next
+        // keystroke would abandon a half-written command with no way back to it.
+        if key == Key::CtrlR {
+            if self.palette_open || self.file_picker_open() {
+                return Action::Render;
+            }
+            return self.start_session_tree_request(SessionTreeRequest::active());
+        }
+
         if matches!(
             key,
             Key::Char(_)
@@ -9467,6 +9715,17 @@ where
                 self.scroll_to_focused_block();
                 Some(Action::Render)
             }
+            // Forking cuts at the block the reader is standing on. With no block
+            // focused there is no such point, and forking at a guessed one would
+            // cut a turn nobody chose, so the key does nothing instead.
+            Key::Char('f') => {
+                match self.focused_block_turn_prefix() {
+                    Some(turn_prefix) => Some(self.start_fork_request(
+                        SessionForkRequest::from_active_transcript(turn_prefix),
+                    )),
+                    None => Some(Action::Unchanged),
+                }
+            }
             Key::Enter => {
                 let call_id = self.active_record().focused_call.clone();
                 if self.open_tool_detail_overlay(call_id.as_deref()) {
@@ -10014,6 +10273,73 @@ where
         dialog.searching = self.dialog_is_searching();
         self.dialog = Some(dialog);
         Action::LoadSessionPage(request)
+    }
+
+    fn session_tree_request(&self) -> Option<&SessionTreeRequest> {
+        self.dialog
+            .as_ref()?
+            .tree_entries
+            .as_ref()
+            .map(|entries| &entries.request)
+    }
+
+    /// Opens the lineage browser on a loading page and asks for its content.
+    ///
+    /// The generation is what lets the answer be matched to the question: a page
+    /// that arrives for a request the reader has already replaced is dropped by
+    /// [`Self::show_selection_dialog`] rather than painted.
+    fn start_session_tree_request(&mut self, mut request: SessionTreeRequest) -> Action {
+        let generation = self
+            .session_tree_request()
+            .map_or(1, |current| current.generation.wrapping_add(1).max(1));
+        request.generation = generation;
+
+        self.dialog = Some(DialogView::session_tree_loading(request.clone()));
+        Action::LoadSessionTree(request)
+    }
+
+    /// Stamps a fork request with the generation that makes it the current one.
+    fn start_fork_request(&mut self, mut request: SessionForkRequest) -> Action {
+        self.fork_generation = self.fork_generation.wrapping_add(1).max(1);
+        request.generation = self.fork_generation;
+        Action::ForkSession(request)
+    }
+
+    /// Whether `request` is still the fork this terminal is waiting on.
+    ///
+    /// A fork answered after the reader asked for another one must not be
+    /// applied: the composition layer asks this before acting on a result.
+    pub const fn is_current_fork(&self, request: &SessionForkRequest) -> bool {
+        request.generation == self.fork_generation && self.fork_generation != 0
+    }
+
+    /// The fork point the focused transcript block stands on, as a turn count.
+    ///
+    /// Only the main transcript can be forked: a subagent transcript is not a
+    /// session. Returns `None` when no block is focused or the focused block
+    /// belongs to no turn this terminal can place, so the key does nothing
+    /// rather than forking at a point the reader did not choose.
+    fn focused_block_turn_prefix(&self) -> Option<u64> {
+        if self.active_transcript != TranscriptId::Main {
+            return None;
+        }
+        let focused = self
+            .transcripts
+            .get(&TranscriptId::Main)?
+            .focused_call
+            .as_deref()?;
+
+        self.completed_conversations
+            .iter()
+            .chain(self.conversation.as_ref())
+            .position(|conversation| {
+                conversation
+                    .tool_batches
+                    .iter()
+                    .flat_map(|batch| &batch.calls)
+                    .any(|call| call.call_id == focused)
+            })
+            .map(|index| u64::try_from(index.saturating_add(1)).unwrap_or(u64::MAX))
     }
 
     fn toggle_session_dialog_scope(&mut self) -> Action {
@@ -11190,6 +11516,8 @@ where
             | Action::SendTaskMessage { .. }
             | Action::OpenDialog(_)
             | Action::LoadSessionPage(_)
+            | Action::LoadSessionTree(_)
+            | Action::ForkSession(_)
             | Action::DialogAction(_)
             | Action::SafeDialogAction(_)
             | Action::OpenDeviceAuthUrl
@@ -11276,6 +11604,8 @@ where
             | Action::SendTaskMessage { .. }
             | Action::OpenDialog(_)
             | Action::LoadSessionPage(_)
+            | Action::LoadSessionTree(_)
+            | Action::ForkSession(_)
             | Action::DialogAction(_)
             | Action::SafeDialogAction(_)
             | Action::OpenDeviceAuthUrl
@@ -12008,6 +12338,57 @@ where
                     let _ = route_sender.send((active_id, outcome));
                 });
             }
+            // The lineage load is one keystroke, not a typed query, so it goes
+            // out without the search debounce the session pages need.
+            Action::LoadSessionTree(request) => {
+                if let Some((_, cancellation, _)) = active_route.take() {
+                    cancellation.cancel();
+                }
+                next_route_id = next_route_id.wrapping_add(1).max(1);
+                let active_id = next_route_id;
+                let cancellation = TuiRouteCancellation::new();
+                active_route = Some((active_id, cancellation.clone(), false));
+                let route = Arc::clone(&route);
+                let route_sender = route_sender.clone();
+                let progress = route_progress_sender.clone();
+                thread::spawn(move || {
+                    let outcome = if cancellation.is_cancelled() {
+                        TuiSubmissionOutcome::RouteCancelled
+                    } else {
+                        route(
+                            TuiRouteRequest::SessionTree(request),
+                            progress,
+                            cancellation,
+                        )
+                    };
+                    let _ = route_sender.send((active_id, outcome));
+                });
+            }
+            // A fork ends attached to the fork, so it is a session load: the
+            // transcript is about to be replaced and the keymap has to say so.
+            Action::ForkSession(request) => {
+                if !tui.begin_session_load() {
+                    continue;
+                }
+                if let Some((_, cancellation, _)) = active_route.take() {
+                    cancellation.cancel();
+                }
+                next_route_id = next_route_id.wrapping_add(1).max(1);
+                let active_id = next_route_id;
+                let cancellation = TuiRouteCancellation::new();
+                active_route = Some((active_id, cancellation.clone(), true));
+                let route = Arc::clone(&route);
+                let route_sender = route_sender.clone();
+                let progress = route_progress_sender.clone();
+                thread::spawn(move || {
+                    let outcome = route(
+                        TuiRouteRequest::ForkSession(request),
+                        progress,
+                        cancellation,
+                    );
+                    let _ = route_sender.send((active_id, outcome));
+                });
+            }
             Action::DialogAction(action_id) => {
                 if let Some((id, reply)) = parse_permission_reply(&action_id) {
                     if let Some(permission_bridge) = permission_bridge.as_ref() {
@@ -12235,7 +12616,11 @@ fn is_session_resume_request(request: &TuiRouteRequest) -> bool {
         | TuiRouteRequest::ReplaceStagedMedia { .. }
         | TuiRouteRequest::SubmitSecret { .. }
         | TuiRouteRequest::OpenDialog(_)
-        | TuiRouteRequest::SessionPage(_) => false,
+        | TuiRouteRequest::SessionPage(_)
+        // A fork already begins its own session load where it is dispatched, so
+        // it must not be classified into a second one here.
+        | TuiRouteRequest::ForkSession(_)
+        | TuiRouteRequest::SessionTree(_) => false,
     }
 }
 
@@ -12249,7 +12634,10 @@ fn is_session_browser_request(request: &TuiRouteRequest) -> bool {
         | TuiRouteRequest::SubmitSecret { .. } => false,
         TuiRouteRequest::OpenDialog(route_id) => route_id == "sessions",
         TuiRouteRequest::SessionPage(_) => true,
-        TuiRouteRequest::DialogAction(_) => false,
+        // The lineage browser installs its own loading page, not this one.
+        TuiRouteRequest::SessionTree(_)
+        | TuiRouteRequest::ForkSession(_)
+        | TuiRouteRequest::DialogAction(_) => false,
     }
 }
 
@@ -12419,6 +12807,9 @@ fn map_key(event: KeyEvent) -> Option<Event> {
         }
         (KeyCode::Char('s' | 'S'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
             Key::CtrlS
+        }
+        (KeyCode::Char('r' | 'R'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+            Key::CtrlR
         }
         (KeyCode::Char('v' | 'V'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
             Key::CtrlV
@@ -13283,6 +13674,16 @@ mod runtime_tests {
             map_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
             Some(Event::Key(Key::CtrlC))
         );
+    }
+
+    #[test]
+    fn maps_control_r_to_the_session_tree_in_both_reported_cases() {
+        for code in [KeyCode::Char('r'), KeyCode::Char('R')] {
+            assert_eq!(
+                map_key(KeyEvent::new(code, KeyModifiers::CONTROL)),
+                Some(Event::Key(Key::CtrlR))
+            );
+        }
     }
 
     #[test]

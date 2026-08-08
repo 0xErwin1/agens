@@ -12,6 +12,7 @@ use agens_tui::{
 use crate::dialogs::{diagnostics_dialog, mcp_status_dialog};
 use crate::extensions::render_tui_help;
 use crate::files::{selected_tui_file, tui_select_candidates};
+use crate::fork::{fork_cut_message_count, lineage_entries, lineage_root};
 use crate::models::{
     apply_tui_effort, apply_tui_model, apply_tui_unverified_model, format_model_metadata,
 };
@@ -473,6 +474,141 @@ impl TuiRuntimeRouter {
                 fallback_request,
                 "Saved sessions could not be loaded.",
             )),
+        }
+    }
+
+    /// Answers the lineage browser, reporting a failure inside the overlay.
+    ///
+    /// A lineage that could not be read is shown as an error row rather than as
+    /// a local error toast: the reader opened an overlay and the answer belongs
+    /// where they are looking.
+    pub(super) fn session_tree_outcome(
+        &self,
+        request: agens_tui::SessionTreeRequest,
+    ) -> TuiSubmissionOutcome {
+        match self.load_session_tree(&request) {
+            Ok(entries) => {
+                TuiSubmissionOutcome::Dialog(DialogView::session_tree_page(entries, request))
+            }
+            Err(error) => {
+                TuiSubmissionOutcome::Dialog(DialogView::session_tree_error(request, error.message))
+            }
+        }
+    }
+
+    fn load_session_tree(
+        &self,
+        request: &agens_tui::SessionTreeRequest,
+    ) -> Result<Vec<DialogEntry>, CliError> {
+        let bootstrap = self.bootstrap()?;
+        let current_session = self
+            .session
+            .lock()
+            .map_err(|_| CliError::storage("TUI session is unavailable"))?
+            .identifier;
+        let session_id = self.requested_session(request.root(), current_session)?;
+        let store = SessionStore::open(bootstrap.data_directory())
+            .map_err(|_| CliError::storage("sessions database is unavailable"))?;
+
+        let root = lineage_root(&store, session_id)
+            .map_err(|_| CliError::storage("this session's lineage could not be read"))?;
+        lineage_entries(&store, root, current_session, (self.clock)())
+            .map_err(|_| CliError::storage("this session's lineage could not be read"))
+    }
+
+    /// Copies the session up to the reader's fork point and enters the copy.
+    ///
+    /// The fork is a session like any other, so entering it is the ordinary
+    /// resume path rather than a second way in. The source is left untouched:
+    /// forking is the non-destructive counterpart of `/undo`, which is why a
+    /// failure here can always leave the reader where they already were.
+    pub(super) fn fork_session_outcome(
+        &self,
+        request: agens_tui::SessionForkRequest,
+        cancellation: &TuiRouteCancellation,
+    ) -> TuiSubmissionOutcome {
+        match self.fork_and_enter(&request, cancellation) {
+            Ok(outcome) => outcome,
+            Err(error) => TuiSubmissionOutcome::LocalActionableError {
+                message: error.to_string(),
+                action: TUI_ERROR_ACTION.into(),
+            },
+        }
+    }
+
+    fn fork_and_enter(
+        &self,
+        request: &agens_tui::SessionForkRequest,
+        cancellation: &TuiRouteCancellation,
+    ) -> Result<TuiSubmissionOutcome, CliError> {
+        let bootstrap = self.bootstrap()?;
+        let expected = self
+            .session
+            .lock()
+            .map_err(|_| CliError::storage("TUI session is unavailable"))?
+            .clone();
+        let source_id = self.requested_session(request.session(), expected.identifier)?;
+
+        // The live history is the one the terminal counted its turns against, so
+        // it is what the cut is derived from whenever the fork is of the session
+        // the reader is actually in.
+        let history = if request.session().is_some() || expected.identifier != Some(source_id) {
+            SessionStore::open(bootstrap.data_directory())
+                .map_err(|_| CliError::storage("sessions database is unavailable"))?
+                .load_session_for_resume(source_id)
+                .map_err(|_| CliError::storage("the session to fork is unavailable"))?
+                .messages
+        } else {
+            expected.messages.clone()
+        };
+
+        let cut = fork_cut_message_count(&history, request.turn_prefix())
+            .ok_or_else(|| CliError::usage("there is no turn to fork at"))?;
+
+        let mut store = SessionStore::open(bootstrap.data_directory())
+            .map_err(|_| CliError::storage("sessions database is unavailable"))?;
+        let sequence = store
+            .message_sequence_at(source_id, cut)
+            .map_err(|_| CliError::storage("the fork point could not be read"))?
+            .ok_or_else(|| CliError::usage("this session has nothing saved to fork"))?;
+        let fork_id = store
+            .fork_session(source_id, sequence)
+            .map_err(|error| CliError::storage(error.to_string()))?;
+        drop(store);
+
+        let resumed = prepare_loaded_tui_session_resume(
+            &bootstrap,
+            fork_id,
+            load_tui_session_for_resume(&bootstrap, fork_id)?,
+            &self.credentials,
+        )?;
+
+        commit_tui_session_resume(
+            &bootstrap,
+            &self.session,
+            &expected,
+            resumed,
+            cancellation,
+            |context| self.on_session_resume_committed(&bootstrap, context),
+        )
+    }
+
+    /// The session a lineage or fork request names, or the one the reader is in.
+    ///
+    /// The terminal cannot name a session — it is shown labels, not identities —
+    /// so a request without one is about the active session, and a session that
+    /// has never been saved has no identity to resolve to yet.
+    fn requested_session(
+        &self,
+        requested: Option<&str>,
+        current_session: Option<i64>,
+    ) -> Result<i64, CliError> {
+        match requested {
+            Some(identifier) => identifier
+                .parse()
+                .map_err(|_| CliError::usage("session action is invalid")),
+            None => current_session
+                .ok_or_else(|| CliError::usage("this session has not been saved yet")),
         }
     }
 

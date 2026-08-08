@@ -263,6 +263,8 @@ mod tests {
             updated_at: 1,
             completed_turn_count: 0,
             resumable: false,
+            parent_session_id: None,
+            fork_message_count: None,
         };
         let turn = CompletedSessionTurn::new(vec![
             SessionMessage::try_from(Message {
@@ -524,6 +526,8 @@ mod tests {
             updated_at: 1,
             completed_turn_count: 1,
             resumable: true,
+            parent_session_id: None,
+            fork_message_count: None,
         });
         context.messages = vec![Message {
             role: Role::User,
@@ -565,6 +569,8 @@ mod tests {
             updated_at: 20,
             completed_turn_count: 1,
             resumable: true,
+            parent_session_id: None,
+            fork_message_count: None,
         };
         let messages = vec![
             Message {

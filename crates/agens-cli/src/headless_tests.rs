@@ -936,6 +936,8 @@ fn production_resumed_headless_turn_replays_typed_history_and_appends_to_the_sam
         updated_at: 10,
         completed_turn_count: 0,
         resumable: false,
+        parent_session_id: None,
+        fork_message_count: None,
     };
     SessionStore::open(&data_directory)
         .expect("session store should open")

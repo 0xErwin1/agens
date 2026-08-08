@@ -238,6 +238,8 @@ fn session_metadata_enforces_identity_and_completion_boundaries() {
         updated_at: 11,
         completed_turn_count: 1,
         resumable: true,
+        parent_session_id: None,
+        fork_message_count: None,
     };
     assert_eq!(resumable.validate(), Ok(()));
     assert_eq!(
@@ -305,6 +307,61 @@ fn session_metadata_enforces_identity_and_completion_boundaries() {
         }
         .validate(),
         Ok(())
+    );
+}
+
+/// Fork lineage is both-or-neither: a fork carries the session it came from and the cut point it
+/// copied up to, and a session that was started rather than forked carries neither.
+#[test]
+fn session_metadata_enforces_fork_lineage_coherence() {
+    let fork = SessionMetadata {
+        id: 7,
+        project: "agens".into(),
+        title: "Core contracts".into(),
+        active_agent: "review-agent".into(),
+        provider_id: None,
+        model_id: None,
+        reasoning_effort: None,
+        created_at: 10,
+        updated_at: 11,
+        completed_turn_count: 1,
+        resumable: true,
+        parent_session_id: Some(3),
+        fork_message_count: Some(4),
+    };
+    assert_eq!(fork.validate(), Ok(()));
+
+    for half_lineage in [
+        SessionMetadata {
+            fork_message_count: None,
+            ..fork.clone()
+        },
+        SessionMetadata {
+            parent_session_id: None,
+            ..fork.clone()
+        },
+        SessionMetadata {
+            parent_session_id: Some(0),
+            ..fork.clone()
+        },
+        SessionMetadata {
+            parent_session_id: Some(fork.id),
+            ..fork.clone()
+        },
+    ] {
+        assert_eq!(
+            half_lineage.validate(),
+            Err(SessionMetadataError::IncoherentFork)
+        );
+    }
+
+    assert_eq!(
+        SessionMetadata {
+            fork_message_count: Some(0),
+            ..fork
+        }
+        .validate(),
+        Err(SessionMetadataError::InvalidForkMessageCount)
     );
 }
 

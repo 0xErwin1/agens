@@ -373,7 +373,7 @@ fn history_without_subagent_turns(messages: &[Message]) -> Vec<Message> {
 }
 
 /// Whether `window` is the three-message shape a completed subagent is stored as.
-fn is_persisted_subagent_turn(window: &[Message]) -> bool {
+pub(crate) fn is_persisted_subagent_turn(window: &[Message]) -> bool {
     let [user, assistant, tool] = window else {
         return false;
     };
@@ -677,6 +677,8 @@ mod tests {
             updated_at: 1,
             completed_turn_count: 0,
             resumable: false,
+            parent_session_id: None,
+            fork_message_count: None,
         };
         let active = store
             .begin_session_attempt(&metadata, "inspect".into())
@@ -773,6 +775,8 @@ mod tests {
             updated_at: 20,
             completed_turn_count: 0,
             resumable: false,
+            parent_session_id: None,
+            fork_message_count: None,
         };
         let retry_prompt = "retry exact café 🙂";
         let media = agens_store::ingest_media_bytes(
@@ -893,6 +897,8 @@ mod tests {
             updated_at: 20,
             completed_turn_count: 0,
             resumable: false,
+            parent_session_id: None,
+            fork_message_count: None,
         };
         let attempt = store
             .begin_session_attempt_with_media(&metadata, "retry with media".into(), vec![media_id])

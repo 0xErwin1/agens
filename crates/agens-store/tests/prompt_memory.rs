@@ -266,6 +266,11 @@ fn history_dedupe_considers_attachments_and_persists_them() {
 
 /// Writes `agens.db` at the schema migration 0010 inherits: the pre-media prompt tables
 /// (with the old `text <> ''` CHECK, no `attachments` column) and a ledger stopping at 0009.
+///
+/// The ledger claims the session migrations already ran, so every migration after 0009 is free to
+/// touch `sessions` — this fixture has to leave behind the table it says exists, or a later
+/// migration fails here for a reason that has nothing to do with prompt attachments. Only the
+/// identity column is needed: nothing under test reads the rest.
 fn seed_pre_media_prompt_tables(directory: &std::path::Path, rows: &[(i64, &str, i64)]) {
     let connection = Connection::open(directory.join("agens.db")).unwrap();
     connection
@@ -282,7 +287,8 @@ fn seed_pre_media_prompt_tables(directory: &std::path::Path, rows: &[(i64, &str,
                  text TEXT NOT NULL CHECK(text <> ''),
                  created_at INTEGER NOT NULL
              );
-             CREATE INDEX prompt_stash_id ON prompt_stash(id);",
+             CREATE INDEX prompt_stash_id ON prompt_stash(id);
+             CREATE TABLE sessions (id INTEGER PRIMARY KEY);",
         )
         .unwrap();
 

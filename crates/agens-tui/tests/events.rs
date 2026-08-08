@@ -10,10 +10,10 @@ use agens_tui::{
     Command, Conversation, ConversationError, ConversationEvent, Dialog, DialogEntry, DialogView,
     DiffLine, DiffLineKind, DisplayMode, Effect, Engine, Event, Key, PaletteEntry,
     PaletteEntryKind, PublishOutcome, RatatuiRenderer, Renderer, Runtime, SessionDialogCursor,
-    SessionDialogRequest, SessionDialogScope, TranscriptEntry, TranscriptFocus, TranscriptId, Tui,
-    TuiExecutionEvent, TuiExecutionState, TuiPermissionBridge, TuiPermissionReply, TuiPresentation,
-    TuiProviderOutcome, TuiRouteProgress, TuiRuntimeEvent, TuiSubagentEvent, TuiSubmissionOutcome,
-    TurnLifecycle,
+    SessionDialogRequest, SessionDialogScope, SessionTreeRequest, TranscriptEntry, TranscriptFocus,
+    TranscriptId, Tui, TuiExecutionEvent, TuiExecutionState, TuiPermissionBridge,
+    TuiPermissionReply, TuiPresentation, TuiProviderOutcome, TuiRouteProgress, TuiRuntimeEvent,
+    TuiSubagentEvent, TuiSubmissionOutcome, TurnLifecycle,
 };
 use ratatui::{Terminal, backend::TestBackend};
 use std::{
@@ -6078,4 +6078,172 @@ fn prompt_memory_write_failure_does_not_panic_and_restores_stash_draft() {
     assert!(tui.view().dialog.is_some());
     assert_eq!(tui.handle(Event::Key(Key::Char('x'))), Action::Render);
     assert!(tui.view().dialog.is_some());
+}
+
+/// The lineage browser answers "where did this session come from", so it opens
+/// from the running surface — but never on top of something being typed into.
+#[test]
+fn ctrl_r_opens_the_session_tree_unless_the_palette_owns_the_keystrokes() {
+    let mut tui = Tui::new(FakeEngine::default());
+
+    let Action::LoadSessionTree(request) = tui.handle(Event::Key(Key::CtrlR)) else {
+        panic!("Ctrl+R should request the session tree");
+    };
+    assert_eq!(
+        request.root(),
+        None,
+        "the terminal cannot name a session; the composition layer resolves it"
+    );
+    assert!(request.generation() > 0);
+    assert!(
+        tui.view().dialog.unwrap().is_loading(),
+        "the overlay opens on a loading page while the lineage is fetched"
+    );
+
+    let mut tui = Tui::new(FakeEngine::default());
+    type_chars(&mut tui, "/");
+    assert!(tui.view().palette.is_some());
+    assert_eq!(
+        tui.handle(Event::Key(Key::CtrlR)),
+        Action::Render,
+        "an open palette keeps the keystroke it is being typed into"
+    );
+    assert!(tui.view().palette.is_some());
+    assert!(tui.view().dialog.is_none());
+}
+
+/// A fork cuts the transcript, so it cuts where the reader is standing. With
+/// nothing focused there is no such place and the key must not invent one.
+#[test]
+fn normal_mode_fork_cuts_at_the_focused_block_and_stays_still_without_one() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.handle(Event::Resize {
+        width: 80,
+        height: 24,
+    });
+    for (prompt, call) in [("first", "read-1"), ("second", "read-2")] {
+        tui.begin_submission(prompt);
+        tui.apply_progress(TurnEvent::ToolCallRequested {
+            id: call.into(),
+            name: "native::read".into(),
+            input: format!("{call}.log"),
+        });
+        tui.apply_progress(TurnEvent::ToolResult(MessagePart::ToolResult {
+            tool_call_id: call.into(),
+            content: format!("body of {call}"),
+            is_error: false,
+        }));
+        tui.finish_provider_turn(TuiProviderOutcome::Completed("answer".into()));
+    }
+
+    focus_viewport(&mut tui);
+    assert_eq!(
+        tui.handle(Event::Key(Key::Char('f'))),
+        Action::Unchanged,
+        "no focused block is no fork point"
+    );
+
+    tui.handle(Event::Key(Key::Char('K')));
+    tui.handle(Event::Key(Key::Char('K')));
+    assert_eq!(tui.view().focused_call, Some("read-1"));
+    let Action::ForkSession(first) = tui.handle(Event::Key(Key::Char('f'))) else {
+        panic!("f should fork at the focused block");
+    };
+    assert_eq!(first.session(), None);
+    assert_eq!(first.turn_prefix(), 1, "the first turn is the whole prefix");
+    assert!(tui.is_current_fork(&first));
+
+    tui.handle(Event::Key(Key::Char('J')));
+    assert_eq!(tui.view().focused_call, Some("read-2"));
+    let Action::ForkSession(second) = tui.handle(Event::Key(Key::Char('f'))) else {
+        panic!("f should fork at the focused block");
+    };
+    assert_eq!(second.turn_prefix(), 2);
+    assert!(
+        second.generation() > first.generation(),
+        "each fork supersedes the one before it"
+    );
+    assert!(!tui.is_current_fork(&first), "the older fork is stale");
+    assert!(tui.is_current_fork(&second));
+}
+
+/// The regression that matters: `f` is a letter everywhere the prompt is being
+/// written, and a fork triggered by typing would be unrecoverable.
+#[test]
+fn f_in_the_composer_types_a_letter_and_never_forks() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.begin_submission("first");
+    tui.apply_progress(TurnEvent::ToolCallRequested {
+        id: "read-1".into(),
+        name: "native::read".into(),
+        input: "read-1.log".into(),
+    });
+    tui.apply_progress(TurnEvent::ToolResult(MessagePart::ToolResult {
+        tool_call_id: "read-1".into(),
+        content: "body".into(),
+        is_error: false,
+    }));
+    tui.finish_provider_turn(TuiProviderOutcome::Completed("answer".into()));
+
+    // Focus a block first, so the only thing standing between the letter and a
+    // fork is the mode the reader is in.
+    focus_viewport(&mut tui);
+    tui.handle(Event::Key(Key::Char('K')));
+    assert_eq!(tui.view().focused_call, Some("read-1"));
+    tui.handle(Event::Key(Key::Char('i')));
+    assert_eq!(tui.view().focus, TranscriptFocus::Composer);
+
+    assert_eq!(tui.handle(Event::Key(Key::Char('f'))), Action::Render);
+    assert_eq!(tui.input(), "f");
+    type_chars(&mut tui, "ork");
+    assert_eq!(tui.input(), "fork");
+}
+
+/// A page that answers a request the reader already replaced must not paint
+/// over the newer one, exactly as the session browser guards its pages.
+#[test]
+fn a_stale_session_tree_page_is_discarded() {
+    let mut tui = Tui::new(FakeEngine::default());
+    let stale = SessionTreeRequest::active();
+
+    let Action::LoadSessionTree(current) = tui.handle(Event::Key(Key::CtrlR)) else {
+        panic!("Ctrl+R should request the session tree");
+    };
+    assert!(current.generation() > stale.generation());
+
+    tui.apply_submission_outcome(TuiSubmissionOutcome::Dialog(DialogView::session_tree_page(
+        vec![DialogEntry::action("stale root", "session:1")],
+        stale,
+    )));
+    assert!(
+        tui.view().dialog.unwrap().is_loading(),
+        "the stale page never replaced the pending one"
+    );
+
+    tui.apply_submission_outcome(TuiSubmissionOutcome::Dialog(DialogView::session_tree_page(
+        vec![DialogEntry::action("root", "session:9")],
+        current,
+    )));
+    assert!(!tui.view().dialog.unwrap().is_loading());
+}
+
+/// The tree is a flat list of indented rows, and it keeps the same bound every
+/// other dialog page keeps rather than growing an unbounded overlay.
+#[test]
+fn the_session_tree_indents_by_depth_and_keeps_the_dialog_entry_cap() {
+    let root = DialogEntry::action("#1 root", "session:1").with_depth(0);
+    let child = DialogEntry::action("#2 child", "session:2").with_depth(1);
+    let grandchild = DialogEntry::action("#3 grandchild", "session:3").with_depth(2);
+    assert_eq!(root.depth(), 0);
+    assert_eq!(child.depth(), 1);
+    assert_eq!(grandchild.depth(), 2);
+
+    let deeper = DialogEntry::action("#4 deep", "session:4").with_depth(99);
+    assert_eq!(deeper.depth(), 8, "indentation stops before the label does");
+
+    let overflowing = (0..80)
+        .map(|id| DialogEntry::action(format!("#{id}"), format!("session:{id}")).with_depth(1))
+        .collect::<Vec<_>>();
+    let dialog = DialogView::session_tree_page(overflowing, SessionTreeRequest::active());
+    assert_eq!(dialog.entry_count(), 64);
 }
