@@ -39,7 +39,7 @@ max_search_entries = 10000
 max_search_results = 100
 max_search_depth = 32
 operation_timeout_ms = 5000
-bash_timeout_ms = 1800000
+bash_timeout_ms = 120000
 
 [subagents]
 check_interval = 32

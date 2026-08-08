@@ -307,7 +307,7 @@ mod tests {
             assert!(!tool_result_is_error);
             assert_eq!(
                 tool_result_content,
-                "{\"status\":\"answered\",\"answers\":[{\"question_id\":\"q\",\"selected\":[\"a\"],\"other\":null,\"note\":null}]}"
+                "{\"status\":\"answered\",\"answers\":[{\"question_id\":\"q\",\"answered\":true,\"selected\":[\"a\"],\"other\":null,\"note\":null}]}"
             );
 
             let turn_continued = snapshot.events().iter().any(|event| {

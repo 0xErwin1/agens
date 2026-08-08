@@ -47,7 +47,7 @@ mod resolution {
         assert_eq!(tools.max_search_results, 100);
         assert_eq!(tools.max_search_depth, 32);
         assert_eq!(tools.operation_timeout_ms, 5_000);
-        assert_eq!(tools.bash_timeout_ms, 1_800_000);
+        assert_eq!(tools.bash_timeout_ms, 120_000);
 
         let subagents = bootstrap.subagent_limits();
         assert_eq!(subagents.check_interval, 32);

@@ -521,7 +521,7 @@ pub const SETTINGS: &[SettingSpec] = &[
             minimum: 1_000,
             maximum: 86_400_000,
         },
-        default: SettingValue::Integer(1_800_000),
+        default: SettingValue::Integer(120_000),
         doc: "Timeout for a bash tool invocation.",
     },
     SettingSpec {

@@ -1312,13 +1312,15 @@ fn child_ordered_stream_preserves_visible_child_rows_and_isolates_parent_summari
         .iter()
         .map(|cell| cell.symbol())
         .collect::<String>();
+    // Results are laid out under the call they answer rather than in arrival
+    // order, so `result-a` follows `read` even though `result-b` arrived first.
     let expected_child_rows = [
         "child-reasoning",
         "child-partial",
         "read",
+        "result-a",
         "glob",
         "result-b",
-        "result-a",
         "Subagent tool execution failed.",
         "ref: abc12345",
         "child-final",
@@ -1330,7 +1332,7 @@ fn child_ordered_stream_preserves_visible_child_rows_and_isolates_parent_summari
 
     assert!(
         row_positions.windows(2).all(|rows| rows[0] < rows[1]),
-        "child rows did not preserve source order: {expected_child_rows:?}",
+        "child rows did not lay each result out under its own call: {expected_child_rows:?}",
     );
     assert!(!child.contains("call-a"), "{child:?}");
     assert!(!child.contains("call-b"), "{child:?}");
