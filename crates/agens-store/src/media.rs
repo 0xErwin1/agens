@@ -244,6 +244,29 @@ pub fn open_media(
     }
 }
 
+/// The MIME recorded for a media id, read from the index alone.
+///
+/// Answers a narrower question than [`open_media`]: what the media was recorded as, with no claim
+/// about whether its blob is reachable. A caller that keeps an attachment whose reachability could
+/// not be determined still needs the recorded MIME to render and re-send it.
+pub fn media_mime(data_directory: &Path, media_id: i64) -> Result<String, MediaStoreError> {
+    let (_, connection) =
+        database::open_unified_database(data_directory).map_err(MediaStoreError::from_database)?;
+
+    connection
+        .query_row(
+            "SELECT mime FROM media WHERE id = ?1",
+            params![media_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| MediaStoreError::Database {
+            operation: "read media mime".into(),
+            detail: error.to_string(),
+        })?
+        .ok_or(MediaStoreError::NotFound { media_id })
+}
+
 /// Returns true when `mime` is a durable media attachment type (image or PDF).
 pub fn is_media_mime(mime: &str) -> bool {
     mime.starts_with("image/") || mime == "application/pdf"

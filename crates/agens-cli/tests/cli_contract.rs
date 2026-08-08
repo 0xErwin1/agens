@@ -142,7 +142,7 @@ const CONFIG_DOCTOR_DEFAULT_SETTINGS: &str = concat!(
     "  tools.max_search_results         100           default\n",
     "  tools.max_search_depth           32            default\n",
     "  tools.operation_timeout_ms       5000          default\n",
-    "  tools.bash_timeout_ms            1800000       default\n",
+    "  tools.bash_timeout_ms            120000        default\n",
     "  subagents.check_interval         32            default\n",
     "  subagents.max_concurrency        4             default\n",
     "  subagents.max_output_chars       65536         default\n",
