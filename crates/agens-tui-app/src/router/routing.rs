@@ -162,13 +162,13 @@ impl TuiRuntimeRouter {
             let mut unverified = 0usize;
 
             for attachment in attachments {
-                match agens_store::open_media(bootstrap.data_directory(), attachment.media_id) {
-                    Ok(_) => staged.push(attachment),
-                    Err(
-                        agens_store::MediaStoreError::NotFound { .. }
-                        | agens_store::MediaStoreError::Io { .. },
-                    ) => dropped += 1,
-                    Err(_) => {
+                match crate::files::check_restored_media(
+                    bootstrap.data_directory(),
+                    attachment.media_id,
+                ) {
+                    crate::files::RestoredMediaCheck::Reachable { .. } => staged.push(attachment),
+                    crate::files::RestoredMediaCheck::ProvenGone => dropped += 1,
+                    crate::files::RestoredMediaCheck::Unverified => {
                         unverified += 1;
                         staged.push(attachment);
                     }
@@ -186,7 +186,7 @@ impl TuiRuntimeRouter {
 
             Ok(TuiSubmissionOutcome::StagedMediaReplaced {
                 staged_media: staged,
-                notice: restored_attachments_notice(dropped, unverified),
+                notice: crate::files::restored_attachments_notice(dropped, unverified),
             })
         })();
         result.unwrap_or_else(
@@ -257,38 +257,5 @@ impl TuiRuntimeRouter {
                     action: TUI_ERROR_ACTION.into(),
                 }),
         }
-    }
-}
-
-/// Reports what a restore did to attachments it could not stage as recorded.
-///
-/// `dropped` counts the ones proven unreachable, `unverified` the ones whose lookup failed
-/// without proving anything — the latter stay staged, so the two claims must not be merged.
-fn restored_attachments_notice(dropped: usize, unverified: usize) -> Option<String> {
-    let mut parts = Vec::new();
-
-    if dropped > 0 {
-        parts.push(dropped_attachments_notice(dropped));
-    }
-    if unverified > 0 {
-        parts.push(unverified_attachments_notice(unverified));
-    }
-
-    (!parts.is_empty()).then(|| parts.join(" "))
-}
-
-fn unverified_attachments_notice(unverified: usize) -> String {
-    if unverified == 1 {
-        "1 restored attachment could not be checked and was kept staged.".to_owned()
-    } else {
-        format!("{unverified} restored attachments could not be checked and were kept staged.")
-    }
-}
-
-fn dropped_attachments_notice(dropped: usize) -> String {
-    if dropped == 1 {
-        "1 restored attachment is no longer available and was dropped.".to_owned()
-    } else {
-        format!("{dropped} restored attachments are no longer available and were dropped.")
     }
 }

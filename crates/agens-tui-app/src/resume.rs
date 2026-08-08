@@ -4,7 +4,7 @@
 //! completed-subagent cards shown for its history.
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use agens_core::{HeadlessTurnError, Message, MessagePart, RetryBoundary};
@@ -194,15 +194,15 @@ pub fn prepare_loaded_tui_session_resume(
         // never handed back to the composer.
         if !agens_tui::is_runtime_scheduled_prompt(boundary.prompt()) {
             context.resume_draft = Some(ResumeDraft::new(boundary.prompt().to_owned()));
-            // Restore durable media ids only (no source path) so retry re-encodes from the store.
-            // A missing blob must not block entry.
-            for media_id in boundary.media_ids() {
-                if let Ok((mime, _path)) =
-                    agens_store::open_media(bootstrap.data_directory(), *media_id)
-                {
-                    context.push_pending_media(*media_id, mime);
-                }
+            let (restored_media, media_notice) =
+                restored_pending_media(bootstrap.data_directory(), boundary.media_ids());
+            for (media_id, mime) in restored_media {
+                context.push_pending_media(media_id, mime);
             }
+            context.resume_notice = match (context.resume_notice.take(), media_notice) {
+                (Some(notice), Some(media)) => Some(format!("{notice} · {media}")),
+                (notice, media) => notice.or(media),
+            };
         }
     }
     reconcile_persisted_active_agent(bootstrap, &mut context)?;
@@ -210,6 +210,60 @@ pub fn prepare_loaded_tui_session_resume(
         context,
         history: restored_history,
     })
+}
+
+/// A retry boundary's durable media restored as staged attachments, paired with what the resume
+/// must tell the user about the ones it could not restore as recorded.
+///
+/// Durable ids only (no source path): a retry re-encodes from the store. An id proven unreachable
+/// is dropped, exactly as a staged-media replacement drops one. An id whose reachability could not
+/// be determined is kept instead, because dropping it would claim a permanence the store never
+/// confirmed. Keeping one needs its recorded MIME — the next submit gates and sends on it — so an
+/// unchecked id whose MIME is unreadable too is reported rather than silently omitted.
+fn restored_pending_media(
+    data_directory: &Path,
+    media_ids: &[i64],
+) -> (Vec<(i64, String)>, Option<String>) {
+    let mut restored = Vec::with_capacity(media_ids.len());
+    let mut dropped = 0usize;
+    let mut unverified = 0usize;
+    let mut unrestorable = 0usize;
+
+    for media_id in media_ids {
+        match crate::files::check_restored_media(data_directory, *media_id) {
+            crate::files::RestoredMediaCheck::Reachable { mime } => {
+                restored.push((*media_id, mime))
+            }
+            crate::files::RestoredMediaCheck::ProvenGone => dropped += 1,
+            crate::files::RestoredMediaCheck::Unverified => {
+                match agens_store::media_mime(data_directory, *media_id) {
+                    Ok(mime) => {
+                        unverified += 1;
+                        restored.push((*media_id, mime));
+                    }
+                    Err(_) => unrestorable += 1,
+                }
+            }
+        }
+    }
+
+    let mut notices = Vec::new();
+    if let Some(notice) = crate::files::restored_attachments_notice(dropped, unverified) {
+        notices.push(notice);
+    }
+    if unrestorable > 0 {
+        notices.push(unrestorable_attachments_notice(unrestorable));
+    }
+
+    (restored, (!notices.is_empty()).then(|| notices.join(" ")))
+}
+
+fn unrestorable_attachments_notice(unrestorable: usize) -> String {
+    if unrestorable == 1 {
+        "1 recorded attachment could not be checked or restored.".to_owned()
+    } else {
+        format!("{unrestorable} recorded attachments could not be checked or restored.")
+    }
 }
 
 /// Commits a prepared resume into the live session slot under the race guard described on
@@ -819,6 +873,112 @@ mod tests {
                 .unwrap()
                 .status(),
             SessionAttemptStatus::Failed
+        );
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    /// Persists a failed attempt carrying `media_id` and returns its session id.
+    fn failed_attempt_with_media(bootstrap: &Bootstrap, project: &str, media_id: i64) -> i64 {
+        let mut store = SessionStore::open(bootstrap.data_directory()).unwrap();
+        let metadata = SessionMetadata {
+            id: 0,
+            project: project.to_owned(),
+            title: "media".into(),
+            active_agent: "primary".into(),
+            provider_id: None,
+            model_id: None,
+            reasoning_effort: None,
+            created_at: 10,
+            updated_at: 20,
+            completed_turn_count: 0,
+            resumable: false,
+        };
+        let attempt = store
+            .begin_session_attempt_with_media(&metadata, "retry with media".into(), vec![media_id])
+            .unwrap();
+        store
+            .finish_session_attempt(attempt.key(), SessionAttemptStatus::Failed, 30)
+            .unwrap();
+
+        attempt.key().session_id()
+    }
+
+    #[test]
+    fn resume_drops_a_media_id_proven_gone_and_says_so() {
+        let temporary = tui_session_directory("resume-media-proven-gone");
+        let bootstrap = tui_session_bootstrap(&temporary, &[]);
+        let media =
+            agens_store::ingest_media_bytes(bootstrap.data_directory(), b"gone-media", "image/png")
+                .unwrap();
+        let session_id = failed_attempt_with_media(&bootstrap, &tui_project(&temporary), media.id);
+        std::fs::remove_file(bootstrap.data_directory().join("media").join(&media.sha256)).unwrap();
+
+        let prepared = resume_tui_session(
+            &bootstrap,
+            session_id,
+            &SkillCatalog::default(),
+            &CredentialResolver::production(),
+        )
+        .unwrap();
+
+        assert!(prepared.context.pending_media_ids.is_empty());
+        assert_eq!(
+            prepared.context.note(),
+            "Recovered failed prompt · Enter retry · Esc discard · 1 restored attachment is no \
+             longer available and was dropped."
+        );
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    /// A blob whose reachability could not even be checked proves nothing, so the resumed draft
+    /// must keep its chip and say the attachment went unchecked.
+    #[test]
+    #[cfg(unix)]
+    fn resume_keeps_a_media_id_it_could_not_check_and_reports_it() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary = tui_session_directory("resume-media-unverifiable");
+        let bootstrap = tui_session_bootstrap(&temporary, &[]);
+        let media = agens_store::ingest_media_bytes(
+            bootstrap.data_directory(),
+            b"unreadable-media",
+            "image/png",
+        )
+        .unwrap();
+        let session_id = failed_attempt_with_media(&bootstrap, &tui_project(&temporary), media.id);
+
+        let media_directory = bootstrap.data_directory().join("media");
+        let original_mode = std::fs::metadata(&media_directory)
+            .unwrap()
+            .permissions()
+            .mode();
+        std::fs::set_permissions(&media_directory, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let prepared = resume_tui_session(
+            &bootstrap,
+            session_id,
+            &SkillCatalog::default(),
+            &CredentialResolver::production(),
+        );
+
+        std::fs::set_permissions(
+            &media_directory,
+            std::fs::Permissions::from_mode(original_mode),
+        )
+        .unwrap();
+
+        let prepared = prepared.unwrap();
+        assert_eq!(prepared.context.pending_media_ids, vec![media.id]);
+        assert_eq!(
+            prepared.context.pending_media_mimes,
+            vec!["image/png".to_owned()]
+        );
+        assert_eq!(
+            prepared.context.note(),
+            "Recovered failed prompt · Enter retry · Esc discard · 1 restored attachment could \
+             not be checked and was kept staged."
         );
 
         std::fs::remove_dir_all(temporary).unwrap();

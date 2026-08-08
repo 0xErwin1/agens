@@ -21,6 +21,62 @@ pub(crate) fn session_staged_media(context: &SessionContext) -> Vec<agens_core::
         .collect()
 }
 
+/// What a lookup actually proved about a recorded media id.
+///
+/// Reachability and permanence are different claims. Only a missing index row or a blob that is
+/// provably gone proves an attachment unreachable; every other failure proves nothing, so the
+/// attachment must be kept and reported as unchecked instead of being dropped as gone.
+pub(crate) enum RestoredMediaCheck {
+    Reachable { mime: String },
+    ProvenGone,
+    Unverified,
+}
+
+/// Classifies a recorded media id for the restore paths (resume and staged-media replacement),
+/// which must agree on what counts as proof that an attachment is gone.
+pub(crate) fn check_restored_media(data_directory: &Path, media_id: i64) -> RestoredMediaCheck {
+    match agens_store::open_media(data_directory, media_id) {
+        Ok((mime, _path)) => RestoredMediaCheck::Reachable { mime },
+        Err(
+            agens_store::MediaStoreError::NotFound { .. } | agens_store::MediaStoreError::Io { .. },
+        ) => RestoredMediaCheck::ProvenGone,
+        Err(_) => RestoredMediaCheck::Unverified,
+    }
+}
+
+/// Reports what a restore did to attachments it could not stage as recorded.
+///
+/// `dropped` counts the ones proven unreachable, `unverified` the ones whose lookup failed
+/// without proving anything — the latter stay staged, so the two claims must not be merged.
+pub(crate) fn restored_attachments_notice(dropped: usize, unverified: usize) -> Option<String> {
+    let mut parts = Vec::new();
+
+    if dropped > 0 {
+        parts.push(dropped_attachments_notice(dropped));
+    }
+    if unverified > 0 {
+        parts.push(unverified_attachments_notice(unverified));
+    }
+
+    (!parts.is_empty()).then(|| parts.join(" "))
+}
+
+fn unverified_attachments_notice(unverified: usize) -> String {
+    if unverified == 1 {
+        "1 restored attachment could not be checked and was kept staged.".to_owned()
+    } else {
+        format!("{unverified} restored attachments could not be checked and were kept staged.")
+    }
+}
+
+fn dropped_attachments_notice(dropped: usize) -> String {
+    if dropped == 1 {
+        "1 restored attachment is no longer available and was dropped.".to_owned()
+    } else {
+        format!("{dropped} restored attachments are no longer available and were dropped.")
+    }
+}
+
 const TUI_SELECT_FILE_LIMIT: usize = 100;
 /// Hard cap on `@` picker entries: enumeration is one bounded walk of the
 /// project root, kept in memory for the whole session so no keystroke and no
