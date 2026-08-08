@@ -48,7 +48,7 @@ if [[ $status -eq 0 ]]; then
 fi
 grep -F "actual size: $((limit + 1)) bytes" <<<"$output" >/dev/null
 grep -F "limit: $limit bytes" <<<"$output" >/dev/null
-grep -F "just target-clean" <<<"$output" >/dev/null
+grep -F "target-clean" <<<"$output" >/dev/null
 test -f "$fixture/budget-fixture"
 
 rm -rf "$sandbox"

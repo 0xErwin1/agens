@@ -31,22 +31,7 @@
       imports = [ inputs.devenv.flakeModule ];
 
       perSystem = { pkgs, ... }: {
-        devenv.shells.default = {
-          packages = [
-            pkgs.cargo-deny
-            pkgs.jq
-            pkgs.just
-          ];
-
-          languages.rust = {
-            enable = true;
-            toolchainFile = ./rust-toolchain.toml;
-          };
-
-          enterShell = ''
-            echo "Agens dev shell (Rust, just, cargo-deny)"
-          '';
-        };
+        devenv.shells.default = import ./devenv.nix { inherit pkgs; };
 
         formatter = pkgs.nixpkgs-fmt;
       };

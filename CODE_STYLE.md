@@ -9,12 +9,12 @@ Every crate inherits Rust edition 2024 and Rust 1.97.1 from the workspace manife
 `rustfmt.toml` is the formatting contract: 100-column width, four-space indentation, and Unix newlines. Run formatting checks with:
 
 ```sh
-nix develop --no-pure-eval -c just fmt-check
+nix develop --no-pure-eval -c fmt-check
 ```
 
-`just fmt` is intentionally mutating. Do not run it when unrelated or excluded Rust files are dirty. Use `just fmt-check` for verification.
+`fmt` is intentionally mutating. Do not run it when unrelated or excluded Rust files are dirty. Use `fmt-check` for verification.
 
-Build outputs remain at `target/{debug,release}/agens`. The target budget is 50 GiB. Verification never cleans automatically; cleanup is manual only through `just clean`.
+Build outputs remain at `target/{debug,release}/agens`. The target budget is 50 GiB. Verification never cleans automatically; cleanup is manual only through `clean`.
 
 ## Naming, imports, and modules
 
@@ -122,7 +122,7 @@ For non-trivial behavior or repository contracts:
 2. Implement the smallest complete behavior.
 3. Re-run the focused test to green.
 4. Run the affected crate or contract checks.
-5. Finish with `nix develop --no-pure-eval -c just verify`.
+5. Finish with `nix develop --no-pure-eval -c verify`.
 
 - Keep unit tests near implementation and integration tests under the owning crate's `tests/` directory.
 - Prefer table-driven cases for a stable set of input/output branches.
@@ -143,5 +143,5 @@ Run commands inside `nix develop --no-pure-eval` unless the full invocation is s
 | Sessions or persisted permission grants | `cargo test -p agens-store --all-targets --locked` |
 | TUI rendering or event behavior | `cargo test -p agens-tui --all-targets --locked` |
 | CLI parsing, composition, or runtime wiring | `cargo test -p agens --all-targets --locked` |
-| Root docs, manifests, scripts, CI, or tooling | `just contracts && just fmt-check && just lint && just deny` |
-| Any completed change | `nix develop --no-pure-eval -c just verify` |
+| Root docs, manifests, scripts, CI, or tooling | `contracts && fmt-check && lint && deny` |
+| Any completed change | `nix develop --no-pure-eval -c verify` |

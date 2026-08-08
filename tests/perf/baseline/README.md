@@ -5,8 +5,8 @@
 ## Quick path
 
 ```bash
-just perf-audit                                             # writes target/perf/<run-id>/run.jsonl
-just perf-diff tests/perf/baseline/run.jsonl target/perf/<run-id>/run.jsonl
+perf-audit                                             # writes target/perf/<run-id>/run.jsonl
+perf-diff tests/perf/baseline/run.jsonl target/perf/<run-id>/run.jsonl
 ```
 
 Read the deterministic section first. If it is empty, the render pipeline did the same work in the same shape as the baseline, and nothing further is owed.
@@ -29,7 +29,7 @@ The diff enforces this split: durations only ever appear in a section labelled a
 ## Regenerating
 
 ```bash
-just perf-baseline
+perf-baseline
 ```
 
 It refuses to run on a dirty worktree: a trace records the commit it ran at, and one captured from uncommitted changes would name a commit that does not describe the code it measured.

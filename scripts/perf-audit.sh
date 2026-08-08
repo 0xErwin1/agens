@@ -7,7 +7,7 @@ set -euo pipefail
 # library must never spawn a process, so commit, dirty flag and host arrive as
 # environment variables it treats as opaque.
 #
-# The audit builds with a feature that `just verify` never enables, so this
+# The audit builds with a feature that `verify` never enables, so this
 # script lints and tests that code itself. Nothing else does.
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -34,4 +34,4 @@ cargo run -p agens-tui --features perf-audit --bin agens-perf-audit --locked -- 
     run "$trace_dir" "$run_id"
 
 printf '\nCompare against the committed baseline with:\n'
-printf '  just perf-diff tests/perf/baseline/run.jsonl %s/run.jsonl\n' "$trace_dir"
+printf '  perf-diff tests/perf/baseline/run.jsonl %s/run.jsonl\n' "$trace_dir"
