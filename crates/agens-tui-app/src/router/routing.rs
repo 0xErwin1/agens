@@ -79,6 +79,9 @@ impl TuiRuntimeRouter {
             TuiRouteRequest::AttachClipboardImage { bytes, mime } => {
                 return self.attach_clipboard_image(bytes, mime);
             }
+            TuiRouteRequest::ReplaceStagedMedia { attachments } => {
+                return self.replace_staged_media(attachments);
+            }
             TuiRouteRequest::SubmitSecret { action_id, secret } => {
                 return self.submit_secret(action_id, secret);
             }
@@ -110,14 +113,80 @@ impl TuiRuntimeRouter {
             let (media_id, mime) =
                 crate::files::ingest_tui_media_bytes(&bootstrap, &bytes, mime.as_deref())?;
             session.push_pending_media(media_id, mime);
-            let media_chips = session.pending_media_chip_labels();
-            let chip = media_chips
+            let chip = session
+                .pending_media_chip_labels()
                 .last()
                 .cloned()
                 .unwrap_or_else(|| "[Image #?]".into());
             Ok(TuiSubmissionOutcome::MediaAttached {
                 message: format!("Attached {chip} from clipboard."),
-                media_chips,
+                staged_media: crate::files::session_staged_media(&session),
+            })
+        })();
+        result.unwrap_or_else(
+            |error: CliError| TuiSubmissionOutcome::LocalActionableError {
+                message: error.to_string(),
+                action: TUI_ERROR_ACTION.into(),
+            },
+        )
+    }
+
+    /// Replaces the session's staged media with a restored attachment set.
+    ///
+    /// Driven by stash pop, overlay paste, and history browse: the composer
+    /// chips changed on the surface, and what the next submit sends must match.
+    ///
+    /// A recorded id proven unreachable is dropped rather than staged, the same way a
+    /// resume drops one: staging it would fail the preflight of every later submit, with
+    /// no way to take a chip back off the composer.
+    ///
+    /// A lookup that merely fails — a database that will not open, a busy writer, a blob whose
+    /// existence could not even be checked — proves nothing, so the attachment stays staged and
+    /// the failure is reported as such. The
+    /// stash pop that feeds this path has already deleted the durable row, so dropping on
+    /// an unproven failure would destroy the attachment for good.
+    fn replace_staged_media(
+        &self,
+        attachments: Vec<agens_core::PromptAttachment>,
+    ) -> TuiSubmissionOutcome {
+        let result = (|| {
+            let bootstrap = self.bootstrap()?;
+            let mut session = self
+                .session
+                .lock()
+                .map_err(|_| CliError::storage("TUI session is unavailable"))?;
+
+            let mut staged: Vec<agens_core::PromptAttachment> =
+                Vec::with_capacity(attachments.len());
+            let mut dropped = 0usize;
+            let mut unverified = 0usize;
+
+            for attachment in attachments {
+                match agens_store::open_media(bootstrap.data_directory(), attachment.media_id) {
+                    Ok(_) => staged.push(attachment),
+                    Err(
+                        agens_store::MediaStoreError::NotFound { .. }
+                        | agens_store::MediaStoreError::Io { .. },
+                    ) => dropped += 1,
+                    Err(_) => {
+                        unverified += 1;
+                        staged.push(attachment);
+                    }
+                }
+            }
+
+            session.pending_media_ids = staged
+                .iter()
+                .map(|attachment| attachment.media_id)
+                .collect();
+            session.pending_media_mimes = staged
+                .iter()
+                .map(|attachment| attachment.mime.clone())
+                .collect();
+
+            Ok(TuiSubmissionOutcome::StagedMediaReplaced {
+                staged_media: staged,
+                notice: restored_attachments_notice(dropped, unverified),
             })
         })();
         result.unwrap_or_else(
@@ -188,5 +257,38 @@ impl TuiRuntimeRouter {
                     action: TUI_ERROR_ACTION.into(),
                 }),
         }
+    }
+}
+
+/// Reports what a restore did to attachments it could not stage as recorded.
+///
+/// `dropped` counts the ones proven unreachable, `unverified` the ones whose lookup failed
+/// without proving anything — the latter stay staged, so the two claims must not be merged.
+fn restored_attachments_notice(dropped: usize, unverified: usize) -> Option<String> {
+    let mut parts = Vec::new();
+
+    if dropped > 0 {
+        parts.push(dropped_attachments_notice(dropped));
+    }
+    if unverified > 0 {
+        parts.push(unverified_attachments_notice(unverified));
+    }
+
+    (!parts.is_empty()).then(|| parts.join(" "))
+}
+
+fn unverified_attachments_notice(unverified: usize) -> String {
+    if unverified == 1 {
+        "1 restored attachment could not be checked and was kept staged.".to_owned()
+    } else {
+        format!("{unverified} restored attachments could not be checked and were kept staged.")
+    }
+}
+
+fn dropped_attachments_notice(dropped: usize) -> String {
+    if dropped == 1 {
+        "1 restored attachment is no longer available and was dropped.".to_owned()
+    } else {
+        format!("{dropped} restored attachments are no longer available and were dropped.")
     }
 }

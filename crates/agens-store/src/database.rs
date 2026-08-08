@@ -50,44 +50,63 @@ impl DatabaseError {
 struct Migration {
     id: &'static str,
     ddl: fn() -> String,
+    /// Tables whose row count the migration must carry across unchanged.
+    ///
+    /// Empty for an additive `CREATE`; a migration that rebuilds a populated table lists it
+    /// here so a copy that loses rows aborts the transaction instead of committing the loss.
+    preserved_tables: &'static [&'static str],
 }
 
-const MIGRATIONS: [Migration; 9] = [
+const MIGRATIONS: [Migration; 10] = [
     Migration {
         id: "0001_permission_grants",
         ddl: permission_grants_ddl,
+        preserved_tables: &[],
     },
     Migration {
         id: "0002_model_preference",
         ddl: model_preference_ddl,
+        preserved_tables: &[],
     },
     Migration {
         id: "0003_sessions_v5",
         ddl: sessions_v5_ddl,
+        preserved_tables: &[],
     },
     Migration {
         id: "0004_tool_result_facts",
         ddl: tool_result_facts_ddl,
+        preserved_tables: &[],
     },
     Migration {
         id: "0005_session_confinement_root",
         ddl: session_confinement_root_ddl,
+        preserved_tables: &[],
     },
     Migration {
         id: "0006_session_bypass_permission_prompts",
         ddl: session_bypass_permission_prompts_ddl,
+        preserved_tables: &[],
     },
     Migration {
         id: "0007_model_preference_by_source",
         ddl: model_preference_by_source_ddl,
+        preserved_tables: &[],
     },
     Migration {
         id: "0008_prompt_memory",
         ddl: prompt_memory_ddl,
+        preserved_tables: &[],
     },
     Migration {
         id: "0009_media",
         ddl: media_ddl,
+        preserved_tables: &["message_parts", "session_attempts"],
+    },
+    Migration {
+        id: "0010_prompt_memory_media",
+        ddl: prompt_memory_media_ddl,
+        preserved_tables: &["prompt_history", "prompt_stash"],
     },
 ];
 
@@ -135,9 +154,22 @@ pub(crate) fn open_unified_database(
 /// `schema_migrations` ledger, each DDL and its ledger row inside one transaction.
 ///
 /// Migrations are append-only: once released, neither a migration's id nor its DDL may change.
-/// Every migration shipped so far is additive `CREATE`, which is why no backup, verification, or
-/// fault-injection machinery exists here; the first destructive migration must reintroduce one.
+///
+/// Most migrations are additive `CREATE`, but some rebuild a populated table by copying it into a
+/// replacement and dropping the original. Those declare the tables they must carry across in
+/// [`Migration::preserved_tables`], and the row count of each is compared before and after the DDL
+/// inside the same transaction: a copy that lost rows fails the migration and rolls back, so a
+/// broken rebuild leaves the old schema and the user's rows in place rather than committing the
+/// loss. No backup or fault-injection machinery exists beyond that.
 fn run_pending_migrations(connection: &mut Connection, path: &Path) -> Result<(), DatabaseError> {
+    apply_migrations(connection, path, &MIGRATIONS)
+}
+
+fn apply_migrations(
+    connection: &mut Connection,
+    path: &Path,
+    migrations: &[Migration],
+) -> Result<(), DatabaseError> {
     connection
         .execute_batch(
             "CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -149,7 +181,7 @@ fn run_pending_migrations(connection: &mut Connection, path: &Path) -> Result<()
 
     let applied = read_applied_migration_ids(connection, path)?;
 
-    for migration in MIGRATIONS {
+    for migration in migrations {
         if applied.contains(migration.id) {
             continue;
         }
@@ -158,9 +190,27 @@ fn run_pending_migrations(connection: &mut Connection, path: &Path) -> Result<()
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| DatabaseError::new(operation.clone(), path, error))?;
+
+        let mut counts_before = Vec::with_capacity(migration.preserved_tables.len());
+        for table in migration.preserved_tables {
+            counts_before.push(count_rows(&transaction, table, &operation, path)?);
+        }
+
         transaction
             .execute_batch(&(migration.ddl)())
             .map_err(|error| DatabaseError::new(operation.clone(), path, error))?;
+
+        for (table, before) in migration.preserved_tables.iter().zip(counts_before) {
+            let after = count_rows(&transaction, table, &operation, path)?;
+            if after != before {
+                return Err(DatabaseError::new(
+                    operation,
+                    path,
+                    format!("{table} kept {after} of {before} rows across the rebuild"),
+                ));
+            }
+        }
+
         transaction
             .execute(
                 "INSERT INTO schema_migrations (id, applied_at)
@@ -174,6 +224,20 @@ fn run_pending_migrations(connection: &mut Connection, path: &Path) -> Result<()
     }
 
     Ok(())
+}
+
+fn count_rows(
+    connection: &Connection,
+    table: &str,
+    operation: &str,
+    path: &Path,
+) -> Result<i64, DatabaseError> {
+    // Table names come from the crate-private MIGRATIONS table only.
+    connection
+        .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+            row.get(0)
+        })
+        .map_err(|error| DatabaseError::new(operation.to_owned(), path, error))
 }
 
 fn read_applied_migration_ids(
@@ -544,6 +608,62 @@ fn media_ddl() -> String {
     .to_owned()
 }
 
+/// Staged attachments for prompt history and stash rows.
+///
+/// `attachments` is JSON text of `[media_id, mime]` pairs (durable ids only, never source paths),
+/// `NULL` for text-only entries — every pre-existing row copies through as `NULL`. The old
+/// `text <> ''` CHECK is relaxed so an attachments-only entry (empty text) can be stashed;
+/// application code still rejects an entry that is empty on both sides. The rebuild uses the same
+/// double shuffle as `media_ddl` so `sqlite_schema` keeps unquoted table names.
+fn prompt_memory_media_ddl() -> String {
+    "
+    CREATE TABLE prompt_history_media (
+        id INTEGER PRIMARY KEY,
+        text TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        attachments TEXT CHECK(attachments IS NULL OR (json_valid(attachments) AND json_type(attachments) = 'array')),
+        CHECK(text <> '' OR attachments IS NOT NULL)
+    );
+    INSERT INTO prompt_history_media (id, text, created_at, attachments)
+    SELECT id, text, created_at, NULL FROM prompt_history;
+    DROP TABLE prompt_history;
+    CREATE TABLE prompt_history (
+        id INTEGER PRIMARY KEY,
+        text TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        attachments TEXT CHECK(attachments IS NULL OR (json_valid(attachments) AND json_type(attachments) = 'array')),
+        CHECK(text <> '' OR attachments IS NOT NULL)
+    );
+    INSERT INTO prompt_history (id, text, created_at, attachments)
+    SELECT id, text, created_at, attachments FROM prompt_history_media;
+    DROP TABLE prompt_history_media;
+    CREATE INDEX prompt_history_id ON prompt_history(id);
+
+    CREATE TABLE prompt_stash_media (
+        id INTEGER PRIMARY KEY,
+        text TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        attachments TEXT CHECK(attachments IS NULL OR (json_valid(attachments) AND json_type(attachments) = 'array')),
+        CHECK(text <> '' OR attachments IS NOT NULL)
+    );
+    INSERT INTO prompt_stash_media (id, text, created_at, attachments)
+    SELECT id, text, created_at, NULL FROM prompt_stash;
+    DROP TABLE prompt_stash;
+    CREATE TABLE prompt_stash (
+        id INTEGER PRIMARY KEY,
+        text TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        attachments TEXT CHECK(attachments IS NULL OR (json_valid(attachments) AND json_type(attachments) = 'array')),
+        CHECK(text <> '' OR attachments IS NOT NULL)
+    );
+    INSERT INTO prompt_stash (id, text, created_at, attachments)
+    SELECT id, text, created_at, attachments FROM prompt_stash_media;
+    DROP TABLE prompt_stash_media;
+    CREATE INDEX prompt_stash_id ON prompt_stash(id);
+    "
+    .to_owned()
+}
+
 #[cfg(unix)]
 fn restrict_permissions(path: &Path, maximum_mode: u32) -> Result<(), DatabaseError> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -607,6 +727,55 @@ mod tests {
                 "migration id {id} must start with a numeric prefix"
             );
         }
+    }
+
+    /// A rebuild that drops rows must abort instead of committing the loss: the ledger stays
+    /// clean and the table the user already had is still there, untouched, on the next open.
+    #[test]
+    fn a_rebuild_that_loses_rows_fails_the_migration_and_rolls_back() {
+        let directory = data_directory();
+        let path = directory.join("guard.db");
+        let mut connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE parked (id INTEGER PRIMARY KEY, text TEXT NOT NULL);
+                 INSERT INTO parked (text) VALUES ('kept'), ('lost');",
+            )
+            .unwrap();
+
+        let lossy = [Migration {
+            id: "9999_lossy_rebuild",
+            ddl: || {
+                "
+                CREATE TABLE parked_rebuilt (id INTEGER PRIMARY KEY, text TEXT NOT NULL);
+                INSERT INTO parked_rebuilt (id, text) SELECT id, text FROM parked WHERE id = 1;
+                DROP TABLE parked;
+                ALTER TABLE parked_rebuilt RENAME TO parked;
+                "
+                .to_owned()
+            },
+            preserved_tables: &["parked"],
+        }];
+
+        let error = apply_migrations(&mut connection, &path, &lossy).expect_err("must refuse");
+        assert!(
+            error.detail().contains("parked kept 1 of 2 rows"),
+            "the failure must name what was lost: {}",
+            error.detail()
+        );
+
+        let rows: i64 = connection
+            .query_row("SELECT count(*) FROM parked", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 2, "the original table must survive the rollback");
+        assert!(
+            read_applied_migration_ids(&connection, &path)
+                .unwrap()
+                .is_empty()
+        );
+
+        drop(connection);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

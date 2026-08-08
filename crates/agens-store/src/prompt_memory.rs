@@ -4,6 +4,10 @@
 //! adapter loads tables on open and keeps SQLite consistent with in-memory
 //! state: durable mutators write SQLite first, then update state; on SQLite
 //! failure state is left unchanged. Browse ops are memory-only.
+//!
+//! Attachments persist as JSON text of `[media_id, mime]` pairs (durable media
+//! ids only, never source paths); `NULL` marks a text-only row, so entries
+//! recorded before the media migration keep loading with no attachments.
 
 use std::{
     fmt,
@@ -12,8 +16,8 @@ use std::{
 };
 
 use agens_core::{
-    HistoryBrowseResult, PromptMemory, PromptMemoryEntry, PromptMemoryError, PromptMemoryState,
-    PromptOverlayItem,
+    HistoryBrowseResult, PromptAttachment, PromptMemory, PromptMemoryEntry, PromptMemoryError,
+    PromptMemoryState, PromptOverlayItem, PromptRecall,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -24,6 +28,7 @@ use crate::database;
 pub struct StoredPrompt {
     pub id: i64,
     pub text: String,
+    pub attachments: Vec<PromptAttachment>,
     pub created_at: i64,
 }
 
@@ -72,6 +77,7 @@ pub struct PromptMemoryStore {
     database_path: PathBuf,
     connection: Connection,
     state: PromptMemoryState,
+    undecodable_attachment_rows: usize,
 }
 
 impl PromptMemoryStore {
@@ -83,9 +89,18 @@ impl PromptMemoryStore {
             database_path,
             connection,
             state: PromptMemoryState::new(),
+            undecodable_attachment_rows: 0,
         };
         store.reload_state_from_db()?;
         Ok(store)
+    }
+
+    /// How many loaded rows carried an `attachments` column that could not be decoded.
+    ///
+    /// Those rows are usable as text-only prompts; the count is what a surface reports so the
+    /// silent loss of their attachments is visible.
+    pub fn undecodable_attachment_rows(&self) -> usize {
+        self.undecodable_attachment_rows
     }
 
     pub fn database_path(&self) -> PathBuf {
@@ -101,20 +116,23 @@ impl PromptMemoryStore {
         self.list_table("prompt_history")
     }
 
-    /// Append `text` unless it equals the newest history row's text.
+    /// Append an entry unless it duplicates the newest history row.
     ///
+    /// A duplicate means the same text AND the same attachments; the same text
+    /// with different media is a distinct prompt and is recorded.
     /// Returns `Ok(None)` when skipped as a consecutive duplicate.
     pub fn append_history(
         &mut self,
         text: &str,
+        attachments: &[PromptAttachment],
     ) -> Result<Option<StoredPrompt>, PromptMemoryStoreError> {
-        validate_prompt_text(text)?;
+        validate_prompt_entry(text, attachments)?;
 
         if self
             .state
             .history()
             .last()
-            .is_some_and(|entry| entry.text == text)
+            .is_some_and(|entry| entry.text == text && entry.attachments == attachments)
         {
             self.state.clear_browse();
             return Ok(None);
@@ -123,15 +141,17 @@ impl PromptMemoryStore {
         let created_at = unix_now_secs();
         self.connection
             .execute(
-                "INSERT INTO prompt_history (text, created_at) VALUES (?1, ?2)",
-                params![text, created_at],
+                "INSERT INTO prompt_history (text, created_at, attachments) VALUES (?1, ?2, ?3)",
+                params![text, created_at, encode_attachments(attachments)?],
             )
             .map_err(|error| {
                 PromptMemoryStoreError::operation("append history", &self.database_path, error)
             })?;
 
         let id = self.connection.last_insert_rowid();
-        let recorded = self.state.record_submission_at(text, created_at);
+        let recorded = self
+            .state
+            .record_submission_at(text, attachments, created_at);
         debug_assert!(recorded);
 
         self.load_row("prompt_history", id).map(Some)
@@ -143,21 +163,25 @@ impl PromptMemoryStore {
     }
 
     /// Push onto the LIFO top (append row).
-    pub fn push_stash(&mut self, text: &str) -> Result<StoredPrompt, PromptMemoryStoreError> {
-        validate_prompt_text(text)?;
+    pub fn push_stash(
+        &mut self,
+        text: &str,
+        attachments: &[PromptAttachment],
+    ) -> Result<StoredPrompt, PromptMemoryStoreError> {
+        validate_prompt_entry(text, attachments)?;
 
         let created_at = unix_now_secs();
         self.connection
             .execute(
-                "INSERT INTO prompt_stash (text, created_at) VALUES (?1, ?2)",
-                params![text, created_at],
+                "INSERT INTO prompt_stash (text, created_at, attachments) VALUES (?1, ?2, ?3)",
+                params![text, created_at, encode_attachments(attachments)?],
             )
             .map_err(|error| {
                 PromptMemoryStoreError::operation("push stash", &self.database_path, error)
             })?;
 
         let id = self.connection.last_insert_rowid();
-        self.state.stash_push_at(text, created_at);
+        self.state.stash_push_at(text, attachments, created_at);
         self.load_row("prompt_stash", id)
     }
 
@@ -166,15 +190,9 @@ impl PromptMemoryStore {
         let top = self
             .connection
             .query_row(
-                "SELECT id, text, created_at FROM prompt_stash ORDER BY id DESC LIMIT 1",
+                "SELECT id, text, created_at, attachments FROM prompt_stash ORDER BY id DESC LIMIT 1",
                 [],
-                |row| {
-                    Ok(StoredPrompt {
-                        id: row.get(0)?,
-                        text: row.get(1)?,
-                        created_at: row.get(2)?,
-                    })
-                },
+                stored_prompt_from_row,
             )
             .optional()
             .map_err(|error| {
@@ -218,10 +236,10 @@ impl PromptMemoryStore {
     /// Replace the entire stash stack in one transaction (order = oldest first).
     pub fn replace_stash(
         &mut self,
-        entries: &[(String, i64)],
+        entries: &[PromptMemoryEntry],
     ) -> Result<(), PromptMemoryStoreError> {
-        for (text, _) in entries {
-            validate_prompt_text(text)?;
+        for entry in entries {
+            validate_prompt_entry(&entry.text, &entry.attachments)?;
         }
 
         let transaction = self.connection.transaction().map_err(|error| {
@@ -234,11 +252,15 @@ impl PromptMemoryStore {
                 PromptMemoryStoreError::operation("clear stash", &self.database_path, error)
             })?;
 
-        for (text, created_at) in entries {
+        for entry in entries {
             transaction
                 .execute(
-                    "INSERT INTO prompt_stash (text, created_at) VALUES (?1, ?2)",
-                    params![text, created_at],
+                    "INSERT INTO prompt_stash (text, created_at, attachments) VALUES (?1, ?2, ?3)",
+                    params![
+                        entry.text,
+                        entry.created_at,
+                        encode_attachments(&entry.attachments)?
+                    ],
                 )
                 .map_err(|error| {
                     PromptMemoryStoreError::operation("rewrite stash", &self.database_path, error)
@@ -249,34 +271,35 @@ impl PromptMemoryStore {
             PromptMemoryStoreError::operation("commit stash rewrite", &self.database_path, error)
         })?;
 
-        self.state.seed_stash(
-            entries
-                .iter()
-                .map(|(text, created_at)| PromptMemoryEntry::with_created_at(text, *created_at)),
-        );
+        self.state.seed_stash(entries.iter().cloned());
         Ok(())
     }
 
     fn reload_state_from_db(&mut self) -> Result<(), PromptMemoryStoreError> {
-        let history = self.list_history()?;
-        let stash = self.list_stash()?;
+        let (history, undecodable_history) =
+            self.list_table_with_decode_status("prompt_history")?;
+        let (stash, undecodable_stash) = self.list_table_with_decode_status("prompt_stash")?;
 
-        self.state.seed_history(
-            history
-                .into_iter()
-                .map(|row| PromptMemoryEntry::with_created_at(row.text, row.created_at)),
-        );
-        self.state.seed_stash(
-            stash
-                .into_iter()
-                .map(|row| PromptMemoryEntry::with_created_at(row.text, row.created_at)),
-        );
+        self.undecodable_attachment_rows = undecodable_history + undecodable_stash;
+        self.state
+            .seed_history(history.into_iter().map(stored_prompt_into_entry));
+        self.state
+            .seed_stash(stash.into_iter().map(stored_prompt_into_entry));
         Ok(())
     }
 
     fn list_table(&self, table: &str) -> Result<Vec<StoredPrompt>, PromptMemoryStoreError> {
+        self.list_table_with_decode_status(table)
+            .map(|(entries, _)| entries)
+    }
+
+    /// Lists a table and counts the rows whose attachments column could not be decoded.
+    fn list_table_with_decode_status(
+        &self,
+        table: &str,
+    ) -> Result<(Vec<StoredPrompt>, usize), PromptMemoryStoreError> {
         // Table names are crate-private literals only.
-        let sql = format!("SELECT id, text, created_at FROM {table} ORDER BY id ASC");
+        let sql = format!("SELECT id, text, created_at, attachments FROM {table} ORDER BY id ASC");
         let mut statement = self.connection.prepare(&sql).map_err(|error| {
             PromptMemoryStoreError::operation(
                 &format!("prepare {table} list"),
@@ -286,13 +309,7 @@ impl PromptMemoryStore {
         })?;
 
         let rows = statement
-            .query_map([], |row| {
-                Ok(StoredPrompt {
-                    id: row.get(0)?,
-                    text: row.get(1)?,
-                    created_at: row.get(2)?,
-                })
-            })
+            .query_map([], stored_prompt_with_decode_status)
             .map_err(|error| {
                 PromptMemoryStoreError::operation(
                     &format!("query {table} list"),
@@ -301,25 +318,27 @@ impl PromptMemoryStore {
                 )
             })?;
 
-        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(|error| {
-            PromptMemoryStoreError::operation(
-                &format!("read {table} list"),
-                &self.database_path,
-                error,
-            )
-        })
+        let rows = rows
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|error| {
+                PromptMemoryStoreError::operation(
+                    &format!("read {table} list"),
+                    &self.database_path,
+                    error,
+                )
+            })?;
+
+        let undecodable = rows.iter().filter(|(_, undecodable)| *undecodable).count();
+        Ok((
+            rows.into_iter().map(|(entry, _)| entry).collect(),
+            undecodable,
+        ))
     }
 
     fn load_row(&self, table: &str, id: i64) -> Result<StoredPrompt, PromptMemoryStoreError> {
-        let sql = format!("SELECT id, text, created_at FROM {table} WHERE id = ?1");
+        let sql = format!("SELECT id, text, created_at, attachments FROM {table} WHERE id = ?1");
         self.connection
-            .query_row(&sql, params![id], |row| {
-                Ok(StoredPrompt {
-                    id: row.get(0)?,
-                    text: row.get(1)?,
-                    created_at: row.get(2)?,
-                })
-            })
+            .query_row(&sql, params![id], stored_prompt_from_row)
             .map_err(|error| {
                 PromptMemoryStoreError::operation(
                     &format!("load {table} row"),
@@ -331,14 +350,22 @@ impl PromptMemoryStore {
 }
 
 impl PromptMemory for PromptMemoryStore {
-    fn record_submission(&mut self, text: &str) -> Result<bool, PromptMemoryError> {
-        self.append_history(text)
+    fn record_submission(
+        &mut self,
+        text: &str,
+        attachments: &[PromptAttachment],
+    ) -> Result<bool, PromptMemoryError> {
+        self.append_history(text, attachments)
             .map(|row| row.is_some())
             .map_err(PromptMemoryError::from)
     }
 
-    fn browse_up(&mut self, composer_input: &str) -> Option<String> {
-        self.state.browse_up(composer_input)
+    fn browse_up(
+        &mut self,
+        composer_input: &str,
+        staged_attachments: &[PromptAttachment],
+    ) -> Option<PromptRecall> {
+        self.state.browse_up(composer_input, staged_attachments)
     }
 
     fn browse_down(&mut self) -> HistoryBrowseResult {
@@ -353,15 +380,24 @@ impl PromptMemory for PromptMemoryStore {
         self.state.is_browsing()
     }
 
-    fn stash_push(&mut self, text: &str) -> Result<bool, PromptMemoryError> {
-        self.push_stash(text)
+    fn stash_push(
+        &mut self,
+        text: &str,
+        attachments: &[PromptAttachment],
+    ) -> Result<bool, PromptMemoryError> {
+        self.push_stash(text, attachments)
             .map(|_| true)
             .map_err(PromptMemoryError::from)
     }
 
-    fn stash_pop(&mut self) -> Result<Option<String>, PromptMemoryError> {
+    fn stash_pop(&mut self) -> Result<Option<PromptRecall>, PromptMemoryError> {
         self.pop_stash()
-            .map(|row| row.map(|entry| entry.text))
+            .map(|row| {
+                row.map(|entry| PromptRecall {
+                    text: entry.text,
+                    attachments: entry.attachments,
+                })
+            })
             .map_err(PromptMemoryError::from)
     }
 
@@ -380,11 +416,80 @@ impl PromptMemory for PromptMemoryStore {
     }
 }
 
-fn validate_prompt_text(text: &str) -> Result<(), PromptMemoryStoreError> {
-    if text.is_empty() {
-        return Err(PromptMemoryStoreError::detail("prompt text is required"));
+fn stored_prompt_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredPrompt> {
+    stored_prompt_with_decode_status(row).map(|(entry, _)| entry)
+}
+
+/// Reads a row, reporting whether its `attachments` column had to be given up on.
+fn stored_prompt_with_decode_status(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<(StoredPrompt, bool)> {
+    let raw: Option<String> = row.get(3)?;
+    let decoded = decode_attachments(raw.as_deref());
+    let undecodable = decoded.is_none();
+
+    Ok((
+        StoredPrompt {
+            id: row.get(0)?,
+            text: row.get(1)?,
+            created_at: row.get(2)?,
+            attachments: decoded.unwrap_or_default(),
+        },
+        undecodable,
+    ))
+}
+
+fn stored_prompt_into_entry(row: StoredPrompt) -> PromptMemoryEntry {
+    PromptMemoryEntry::with_created_at(row.text, row.created_at).with_attachments(row.attachments)
+}
+
+fn validate_prompt_entry(
+    text: &str,
+    attachments: &[PromptAttachment],
+) -> Result<(), PromptMemoryStoreError> {
+    if text.is_empty() && attachments.is_empty() {
+        return Err(PromptMemoryStoreError::detail(
+            "prompt text or attachments are required",
+        ));
     }
     Ok(())
+}
+
+fn encode_attachments(
+    attachments: &[PromptAttachment],
+) -> Result<Option<String>, PromptMemoryStoreError> {
+    if attachments.is_empty() {
+        return Ok(None);
+    }
+
+    let pairs: Vec<(i64, &str)> = attachments
+        .iter()
+        .map(|attachment| (attachment.media_id, attachment.mime.as_str()))
+        .collect();
+    serde_json::to_string(&pairs)
+        .map(Some)
+        .map_err(|error| PromptMemoryStoreError::detail(format!("encode attachments: {error}")))
+}
+
+/// Decodes stored `[media_id, mime]` pairs, or `None` when the column holds another shape.
+///
+/// The column CHECK admits any JSON array, so shapes this store never writes reach here: `[]`
+/// decodes to no attachments, while `[1, 2]` or `[{}]` decode to nothing at all. A row of that
+/// second kind must not be fatal: the load runs at open, and failing it would cost the reader
+/// every prompt they ever recorded, permanently, on every launch. The row loads as text-only
+/// and the caller counts it instead.
+fn decode_attachments(value: Option<&str>) -> Option<Vec<PromptAttachment>> {
+    let Some(value) = value else {
+        return Some(Vec::new());
+    };
+
+    let pairs: Vec<(i64, String)> = serde_json::from_str(value).ok()?;
+    Some(
+        pairs
+            .into_iter()
+            .map(|(media_id, mime)| PromptAttachment::new(media_id, mime))
+            .collect(),
+    )
 }
 
 fn unix_now_secs() -> i64 {

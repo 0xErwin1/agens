@@ -11,6 +11,16 @@ use agens_store::{
 };
 use agens_tool_runtime::runtime::open_native_tools;
 
+/// The session's staged media as prompt attachments (durable id + mime pairs).
+pub(crate) fn session_staged_media(context: &SessionContext) -> Vec<agens_core::PromptAttachment> {
+    context
+        .pending_media_ids
+        .iter()
+        .zip(context.pending_media_mimes.iter())
+        .map(|(media_id, mime)| agens_core::PromptAttachment::new(*media_id, mime.clone()))
+        .collect()
+}
+
 const TUI_SELECT_FILE_LIMIT: usize = 100;
 /// Hard cap on `@` picker entries: enumeration is one bounded walk of the
 /// project root, kept in memory for the whole session so no keystroke and no

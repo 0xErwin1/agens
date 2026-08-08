@@ -5,7 +5,10 @@
 use std::sync::{Arc, Mutex};
 
 use agens_core::SubmitOrigin;
-use agens_core::{HeadlessTurnCancellation, HeadlessTurnError, PermissionMode, TurnProgressSink};
+use agens_core::{
+    EphemeralPromptMemory, HeadlessTurnCancellation, HeadlessTurnError, PermissionMode,
+    TurnProgressSink,
+};
 use agens_tools::{
     CommandCatalog, SkillCatalog, TaskExecutionRegistry, TaskMessageSource, TaskMessageTarget,
 };
@@ -74,15 +77,42 @@ fn interactive_turn_cancellation() -> HeadlessTurnCancellation {
     HeadlessTurnCancellation::new()
 }
 
-/// Best-effort open of SQLite prompt memory and install it on the surface port.
+/// Opens SQLite prompt memory and installs it on the surface port.
+///
+/// When the store cannot open, history and stash still work for this session
+/// through [`EphemeralPromptMemory`], and the degradation is said out loud as
+/// a one-line failure notice instead of silently losing persistence.
+///
+/// A store that opened but had to give up on some rows' attachments reports that too: those
+/// prompts load as text, and a restore that quietly comes back without its media would
+/// otherwise look like the attachments were never recorded.
 fn install_prompt_memory_from_store<E: TuiEngine>(
     tui: &mut Tui<E>,
     data_directory: &std::path::Path,
 ) {
-    let Ok(store) = PromptMemoryStore::open(data_directory) else {
-        return;
-    };
-    tui.set_prompt_memory(Box::new(store));
+    match PromptMemoryStore::open(data_directory) {
+        Ok(store) => {
+            let undecodable = store.undecodable_attachment_rows();
+            tui.set_prompt_memory(Box::new(store));
+            if undecodable > 0 {
+                tui.apply_runtime_event(agens_tui::TuiRuntimeEvent::Notice {
+                    text: format!(
+                        "{undecodable} prompt(s) loaded without their attachments (unreadable record)."
+                    ),
+                    severity: agens_tui::NoticeSeverity::Failure,
+                });
+            }
+        }
+        Err(error) => {
+            tui.set_prompt_memory(Box::new(EphemeralPromptMemory::new()));
+            tui.apply_runtime_event(agens_tui::TuiRuntimeEvent::Notice {
+                text: format!(
+                    "Prompt history and stash will not persist beyond this session ({error})."
+                ),
+                severity: agens_tui::NoticeSeverity::Failure,
+            });
+        }
+    }
 }
 
 /// Installs the trace recorder when `AGENS_PERF_TRACE` names a directory.
@@ -143,7 +173,7 @@ pub fn run_production_tui_with_profile_store(
         let presentation = tui_session_presentation(bootstrap, &resumed);
         let message = resumed.note();
         let draft = resumed.resume_draft.take().map(ResumeDraft::into_inner);
-        let media_chips = resumed.pending_media_chip_labels();
+        let staged_media = crate::files::session_staged_media(&resumed);
         let resume_error = resumed.resume_error.clone();
         resumed.resume_notice = None;
         tui.apply_submission_outcome(TuiSubmissionOutcome::SessionResumed {
@@ -151,7 +181,7 @@ pub fn run_production_tui_with_profile_store(
             presentation,
             history,
             draft,
-            media_chips,
+            staged_media,
             resume_error,
             // The real picker candidates and palette are set below, once the session's own root
             // is resolved and `start_tui_skills`/`start_tui_commands` have run against it.
@@ -479,6 +509,7 @@ pub fn run_tui_prompt(
                 TuiSubmissionOutcome::ProviderTurn { .. }
                 | TuiSubmissionOutcome::BusyProviderTurn { .. }
                 | TuiSubmissionOutcome::BusyRefusal(_)
+                | TuiSubmissionOutcome::StagedMediaReplaced { .. }
                 | TuiSubmissionOutcome::SecretEntry(_)
                 | TuiSubmissionOutcome::Dialog(_)
                 | TuiSubmissionOutcome::SafeDialog(_)
@@ -521,7 +552,7 @@ pub fn run_tui_prompt_with(
             .map_err(|_| CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable"))?;
         expand_tui_prompt_with_media(&context, bootstrap, prompt)?
     };
-    let (request, snapshot_root, previous_messages) = {
+    let (request, snapshot_root, previous_messages, consumed_media_ids) = {
         let mut session = session
             .lock()
             .map_err(|_| CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable"))?;
@@ -531,6 +562,7 @@ pub fn run_tui_prompt_with(
         // Snapshot staged media into the request without clearing yet. Preflight and other
         // early failures must leave chips staged; clear only after success or after the
         // attempt has produced partial history (media then lives on the session/retry path).
+        let consumed_media_ids = session.pending_media_ids.clone();
         let mut media_ids = session.pending_media_ids.clone();
         let mut media_mimes = session.pending_media_mimes.clone();
         media_ids.extend(expanded.media_ids);
@@ -579,7 +611,12 @@ pub fn run_tui_prompt_with(
         // that never starts must not leave the session marked running.
         session.running = true;
 
-        (request, snapshot_root, session.messages.clone())
+        (
+            request,
+            snapshot_root,
+            session.messages.clone(),
+            consumed_media_ids,
+        )
     };
 
     // Bracketing the turn is what makes it undoable at all; a project that
@@ -636,8 +673,7 @@ pub fn run_tui_prompt_with(
         // Preflight / begin failures keep staged media so chips remain for retry.
     };
     if clear_pending_media {
-        session.pending_media_ids.clear();
-        session.pending_media_mimes.clear();
+        drop_consumed_pending_media(&mut session, &consumed_media_ids);
     }
     let result = complete_tui_turn(&mut session, completion, consumed_reminder);
     match snapshot_failure {
@@ -658,6 +694,29 @@ pub fn run_tui_prompt_with(
         );
     }
     result
+}
+
+/// Removes exactly the attachments the finished turn carried from the session staging.
+///
+/// Anything staged after the turn started — a stash pop, a history restore, a clipboard attach
+/// while the model was answering — belongs to the next prompt, so a blanket clear here would
+/// destroy media the finished turn never sent and whose stash row is already gone. Matching is
+/// positional per id so a set that stages the same media twice loses only what it consumed.
+fn drop_consumed_pending_media(session: &mut SessionContext, consumed: &[i64]) {
+    for media_id in consumed {
+        let Some(index) = session
+            .pending_media_ids
+            .iter()
+            .position(|staged| staged == media_id)
+        else {
+            continue;
+        };
+
+        session.pending_media_ids.remove(index);
+        if index < session.pending_media_mimes.len() {
+            session.pending_media_mimes.remove(index);
+        }
+    }
 }
 
 /// Drops the turns an undo held back, from the session in hand and from what it persisted.
@@ -955,6 +1014,62 @@ mod tests {
         std::fs::remove_dir_all(temporary).unwrap();
     }
 
+    /// Media staged while the model was answering belongs to the next prompt. A stash pop is
+    /// the destructive case: its durable row is already deleted, so clearing it on completion
+    /// would leave nothing anywhere.
+    #[test]
+    fn a_completed_turn_clears_only_the_media_it_carried() {
+        let temporary = tui_session_directory("pending-media-mid-turn");
+        let bootstrap = tui_session_bootstrap(&temporary, &[]);
+        let store = SessionStore::open(bootstrap.data_directory()).unwrap();
+        let project = tui_project(&temporary);
+        drop(store);
+        let session = Arc::new(Mutex::new(SessionContext::fresh()));
+        {
+            let mut locked = session.lock().unwrap();
+            locked.push_pending_media(42, "image/png".into());
+        }
+
+        let staged_mid_turn = Arc::clone(&session);
+        let result = run_tui_prompt_with(&bootstrap, "describe", &session, None, None, move |_| {
+            let mut locked = staged_mid_turn.lock().unwrap();
+            locked.pending_media_ids = vec![77];
+            locked.pending_media_mimes = vec!["application/pdf".to_owned()];
+            Ok(HeadlessChatCompletion {
+                text: "answered".into(),
+                metadata: SessionMetadata {
+                    id: 1,
+                    project,
+                    title: "conversation".into(),
+                    active_agent: "primary".into(),
+                    provider_id: None,
+                    model_id: None,
+                    reasoning_effort: None,
+                    created_at: 1,
+                    updated_at: 1,
+                    completed_turn_count: 1,
+                    resumable: true,
+                },
+                messages: Vec::new(),
+            })
+        });
+        assert!(result.is_ok(), "turn must complete: {result:?}");
+
+        let locked = session.lock().unwrap();
+        assert_eq!(
+            locked.pending_media_ids,
+            vec![77],
+            "media staged mid-turn must survive completion"
+        );
+        assert_eq!(
+            locked.pending_media_mimes,
+            vec!["application/pdf".to_owned()]
+        );
+
+        drop(locked);
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
     /// A snapshot failure must not break the turn, but it must not be silent
     /// either: the reader is warned once, and a later `/undo` explains that
     /// the turn went unrecorded instead of claiming there is nothing to undo.
@@ -1041,6 +1156,43 @@ mod tests {
             answer.starts_with("Snapshots were unavailable this session"),
             "{answer}"
         );
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    /// A prompt-memory store that cannot open must not silently disable
+    /// history and stash: the session falls back to ephemeral memory and the
+    /// degradation is announced as a visible one-line failure notice.
+    #[test]
+    fn prompt_memory_store_failure_falls_back_to_ephemeral_with_a_failure_notice() {
+        let temporary = tui_session_directory("prompt-memory-fallback");
+        let blocked = temporary.join("blocked");
+        std::fs::write(&blocked, b"not a directory").unwrap();
+
+        let mut tui = Tui::new(ProductionTuiEngine {
+            cancellation: Arc::new(Mutex::new(None)),
+        });
+        install_prompt_memory_from_store(&mut tui, &blocked);
+
+        assert!(
+            tui.runtime_events().iter().any(|event| matches!(
+                event,
+                agens_tui::TuiRuntimeEvent::Notice {
+                    text,
+                    severity: agens_tui::NoticeSeverity::Failure,
+                } if text.contains("will not persist beyond this session")
+            )),
+            "the degradation must be said out loud"
+        );
+
+        // History and stash still work for this session through the fallback.
+        for character in "parked".chars() {
+            tui.handle(Event::Key(Key::Char(character)));
+        }
+        tui.handle(Event::Key(Key::CtrlS));
+        assert_eq!(tui.input(), "");
+        tui.handle(Event::Key(Key::CtrlS));
+        assert_eq!(tui.input(), "parked");
 
         std::fs::remove_dir_all(temporary).unwrap();
     }

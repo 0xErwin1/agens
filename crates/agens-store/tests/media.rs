@@ -115,6 +115,51 @@ fn open_media_returns_mime_and_content_addressed_path() {
 }
 
 #[test]
+fn open_media_whose_blob_was_deleted_reports_a_missing_blob() {
+    let directory = data_directory();
+    let _store = SessionStore::open(&directory).unwrap();
+    let record = ingest_media_bytes(&directory, b"delete-me", "image/png").unwrap();
+    fs::remove_file(directory.join("media").join(&record.sha256)).unwrap();
+
+    let error = open_media(&directory, record.id).unwrap_err();
+
+    let MediaStoreError::Io { operation, detail } = &error else {
+        panic!("expected a missing-blob Io error, got {error:?}");
+    };
+    assert_eq!(operation, "open media blob");
+    assert!(detail.contains(&format!("missing blob for media {}", record.id)));
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+/// A blob whose existence cannot even be checked must not be reported as missing: the caller
+/// would take that as proof the media is gone and discard it.
+#[test]
+#[cfg(unix)]
+fn open_media_whose_blob_cannot_be_stated_is_unverifiable_rather_than_missing() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = data_directory();
+    let _store = SessionStore::open(&directory).unwrap();
+    let record = ingest_media_bytes(&directory, b"unreadable", "image/png").unwrap();
+
+    let media_directory = directory.join("media");
+    let original_mode = fs::metadata(&media_directory).unwrap().permissions().mode();
+    fs::set_permissions(&media_directory, fs::Permissions::from_mode(0o000)).unwrap();
+
+    let result = open_media(&directory, record.id);
+
+    fs::set_permissions(&media_directory, fs::Permissions::from_mode(original_mode)).unwrap();
+
+    let Err(MediaStoreError::Unverifiable { operation, .. }) = &result else {
+        panic!("expected an Unverifiable error, got {result:?}");
+    };
+    assert_eq!(operation, "stat media blob");
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn open_unknown_media_id_fails() {
     let directory = data_directory();
     let _store = SessionStore::open(&directory).unwrap();

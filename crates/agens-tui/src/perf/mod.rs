@@ -158,7 +158,7 @@ impl ScenarioContext {
             presentation: TuiPresentation::new("provider", "model", "session"),
             history,
             draft: None,
-            media_chips: Vec::new(),
+            staged_media: Vec::new(),
             resume_error: None,
             file_candidates: Vec::new(),
             palette_entries: Vec::new(),

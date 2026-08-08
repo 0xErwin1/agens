@@ -236,7 +236,7 @@ pub fn commit_tui_session_resume(
     let presentation = tui_session_presentation(bootstrap, &resumed);
     let message = resumed.note();
     let draft = resumed.resume_draft.take().map(ResumeDraft::into_inner);
-    let media_chips = resumed.pending_media_chip_labels();
+    let staged_media = crate::files::session_staged_media(&resumed);
     let resume_error = resumed.resume_error.clone();
     resumed.resume_notice = None;
     if cancellation.is_cancelled() {
@@ -261,7 +261,7 @@ pub fn commit_tui_session_resume(
         presentation,
         history,
         draft,
-        media_chips,
+        staged_media,
         resume_error,
         file_candidates,
         palette_entries,
@@ -790,7 +790,7 @@ mod tests {
             message,
             history,
             draft,
-            media_chips,
+            staged_media,
             ..
         } = outcome
         else {
@@ -802,7 +802,10 @@ mod tests {
         );
         assert!(history.is_empty());
         assert_eq!(draft.as_deref(), Some(retry_prompt));
-        assert_eq!(media_chips, vec!["[Image #1]".to_owned()]);
+        assert_eq!(
+            staged_media,
+            vec![agens_core::PromptAttachment::new(media.id, "image/png")]
+        );
         assert_eq!(call_counts(), Counts(1, 1, 0, 0));
 
         let reopened = SessionStore::open(bootstrap.data_directory()).unwrap();

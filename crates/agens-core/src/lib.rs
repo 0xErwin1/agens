@@ -24,8 +24,8 @@ pub use permission_precedence::{
     declarations_deny_every_target, prevailing_decision, prevailing_rule_decision,
 };
 pub use prompt_memory::{
-    EphemeralPromptMemory, HistoryBrowseResult, PromptMemory, PromptMemoryEntry, PromptMemoryError,
-    PromptMemoryState, PromptOverlayItem,
+    EphemeralPromptMemory, HistoryBrowseResult, PromptAttachment, PromptMemory, PromptMemoryEntry,
+    PromptMemoryError, PromptMemoryState, PromptOverlayItem, PromptRecall,
 };
 pub use request_config::{ReasoningEffort, RequestConfig, RequestConfigError};
 
@@ -130,6 +130,15 @@ fn validate_session_message_part(
     };
 
     nonempty.then_some(()).ok_or(SessionMessageError::EmptyPart)
+}
+
+/// Path-free composer chip label, 1-based ordinal (Grok-style `[Image #N]`).
+pub fn media_chip_label(ordinal: usize, mime: &str) -> String {
+    if mime.starts_with("image/") {
+        format!("[Image #{ordinal}]")
+    } else {
+        format!("[File #{ordinal}]")
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

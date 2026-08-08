@@ -3792,21 +3792,241 @@ fn attach_command_ingests_media_and_returns_path_free_chips() {
 
     let TuiSubmissionOutcome::MediaAttached {
         message,
-        media_chips,
+        staged_media,
     } = outcome
     else {
         panic!("expected MediaAttached, got {outcome:?}");
     };
     assert!(message.contains("[Image #1]"), "{message}");
-    assert_eq!(media_chips, vec!["[Image #1]".to_owned()]);
+    assert_eq!(staged_media.len(), 1);
+    assert_eq!(staged_media[0].mime, "image/png");
     assert_eq!(session.lock().unwrap().pending_media_ids.len(), 1);
     assert_eq!(
         session.lock().unwrap().pending_media_mimes,
         vec!["image/png".to_owned()]
     );
-    // Path-free: chips and message must not echo the source path.
+    // Path-free: attachments and message must not echo the source path.
     assert!(!message.contains("photo.png"));
-    assert!(!media_chips.iter().any(|chip| chip.contains("photo")));
+    assert!(
+        !staged_media
+            .iter()
+            .any(|media| media.mime.contains("photo"))
+    );
+
+    std::fs::remove_dir_all(temporary).unwrap();
+}
+
+/// A restored id proven unreachable — its blob deleted from the store, or no row at all — must be
+/// dropped, not staged: staging it would fail the preflight of every later submit with no way to
+/// take the chip back off the composer.
+#[test]
+fn restoring_staged_media_drops_ids_with_a_deleted_blob_and_ids_with_no_row() {
+    let temporary = tui_session_directory("restore-missing-blob");
+    let bootstrap = tui_session_bootstrap(&temporary, &[]);
+    let _store = SessionStore::open(bootstrap.data_directory()).unwrap();
+    let project = temporary.join("project");
+    std::fs::write(project.join("photo.png"), b"photo-bytes").unwrap();
+    std::fs::write(project.join("scan.png"), b"scan-bytes").unwrap();
+
+    let session = Arc::new(Mutex::new(SessionContext::fresh()));
+    let router = TuiRuntimeRouter::new(
+        bootstrap.clone(),
+        Arc::clone(&session),
+        Arc::new(Mutex::new(None)),
+        Arc::new(CommandCatalog::default()),
+        Arc::new(SkillCatalog::default()),
+    );
+
+    let (progress, _) = std::sync::mpsc::channel();
+    let attached =
+        router.route_request(TuiRouteRequest::Input("/attach photo.png".into()), progress);
+    let TuiSubmissionOutcome::MediaAttached { staged_media, .. } = attached else {
+        panic!("expected MediaAttached, got {attached:?}");
+    };
+    let reachable = staged_media[0].clone();
+
+    let (progress, _) = std::sync::mpsc::channel();
+    let attached =
+        router.route_request(TuiRouteRequest::Input("/attach scan.png".into()), progress);
+    let TuiSubmissionOutcome::MediaAttached { staged_media, .. } = attached else {
+        panic!("expected MediaAttached, got {attached:?}");
+    };
+    let blob_deleted = staged_media
+        .iter()
+        .find(|attachment| attachment.media_id != reachable.media_id)
+        .expect("the second attach must record its own media id")
+        .clone();
+
+    let (_mime, blob_path) =
+        agens_store::open_media(bootstrap.data_directory(), blob_deleted.media_id).unwrap();
+    std::fs::remove_file(&blob_path).unwrap();
+
+    let (progress, _) = std::sync::mpsc::channel();
+    let outcome = router.route_request(
+        TuiRouteRequest::ReplaceStagedMedia {
+            attachments: vec![
+                reachable.clone(),
+                blob_deleted,
+                agens_core::PromptAttachment::new(987_654, "application/pdf"),
+            ],
+        },
+        progress,
+    );
+
+    let TuiSubmissionOutcome::StagedMediaReplaced {
+        staged_media,
+        notice,
+    } = outcome
+    else {
+        panic!("expected StagedMediaReplaced, got {outcome:?}");
+    };
+    assert_eq!(staged_media, vec![reachable.clone()]);
+    assert_eq!(
+        notice.as_deref(),
+        Some("2 restored attachments are no longer available and were dropped.")
+    );
+    assert_eq!(
+        session.lock().unwrap().pending_media_ids,
+        vec![reachable.media_id],
+        "an unreachable id must never reach the session staging"
+    );
+
+    std::fs::remove_dir_all(temporary).unwrap();
+}
+
+/// A blob the store could not even stat proves nothing, so the attachment must survive the
+/// restore: the stash pop feeding this path has already deleted the durable row.
+#[test]
+#[cfg(unix)]
+fn restoring_staged_media_keeps_ids_whose_blob_could_not_be_stated() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temporary = tui_session_directory("restore-unstatable-blob");
+    let bootstrap = tui_session_bootstrap(&temporary, &[]);
+    let _store = SessionStore::open(bootstrap.data_directory()).unwrap();
+    let project = temporary.join("project");
+    std::fs::write(project.join("photo.png"), b"photo-bytes").unwrap();
+
+    let session = Arc::new(Mutex::new(SessionContext::fresh()));
+    let router = TuiRuntimeRouter::new(
+        bootstrap.clone(),
+        Arc::clone(&session),
+        Arc::new(Mutex::new(None)),
+        Arc::new(CommandCatalog::default()),
+        Arc::new(SkillCatalog::default()),
+    );
+
+    let (progress, _) = std::sync::mpsc::channel();
+    let attached =
+        router.route_request(TuiRouteRequest::Input("/attach photo.png".into()), progress);
+    let TuiSubmissionOutcome::MediaAttached { staged_media, .. } = attached else {
+        panic!("expected MediaAttached, got {attached:?}");
+    };
+    let recorded = staged_media[0].clone();
+
+    let media_directory = bootstrap.data_directory().join("media");
+    let original_mode = std::fs::metadata(&media_directory)
+        .unwrap()
+        .permissions()
+        .mode();
+    std::fs::set_permissions(&media_directory, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let (progress, _) = std::sync::mpsc::channel();
+    let outcome = router.route_request(
+        TuiRouteRequest::ReplaceStagedMedia {
+            attachments: vec![recorded.clone()],
+        },
+        progress,
+    );
+
+    std::fs::set_permissions(
+        &media_directory,
+        std::fs::Permissions::from_mode(original_mode),
+    )
+    .unwrap();
+
+    let TuiSubmissionOutcome::StagedMediaReplaced {
+        staged_media,
+        notice,
+    } = outcome
+    else {
+        panic!("expected StagedMediaReplaced, got {outcome:?}");
+    };
+    assert_eq!(
+        staged_media,
+        vec![recorded.clone()],
+        "a blob that could not be stated proves nothing, so the attachment must stay staged"
+    );
+    assert_eq!(
+        notice.as_deref(),
+        Some("1 restored attachment could not be checked and was kept staged.")
+    );
+    assert_eq!(
+        session.lock().unwrap().pending_media_ids,
+        vec![recorded.media_id]
+    );
+
+    std::fs::remove_dir_all(temporary).unwrap();
+}
+
+#[test]
+fn restoring_staged_media_keeps_ids_whose_lookup_failed() {
+    let temporary = tui_session_directory("restore-unverifiable");
+    let bootstrap = tui_session_bootstrap(&temporary, &[]);
+    let store = SessionStore::open(bootstrap.data_directory()).unwrap();
+    let project = temporary.join("project");
+    std::fs::write(project.join("photo.png"), b"photo-bytes").unwrap();
+
+    let session = Arc::new(Mutex::new(SessionContext::fresh()));
+    let router = TuiRuntimeRouter::new(
+        bootstrap.clone(),
+        Arc::clone(&session),
+        Arc::new(Mutex::new(None)),
+        Arc::new(CommandCatalog::default()),
+        Arc::new(SkillCatalog::default()),
+    );
+
+    let (progress, _) = std::sync::mpsc::channel();
+    let attached =
+        router.route_request(TuiRouteRequest::Input("/attach photo.png".into()), progress);
+    let TuiSubmissionOutcome::MediaAttached { staged_media, .. } = attached else {
+        panic!("expected MediaAttached, got {attached:?}");
+    };
+    let recorded = staged_media[0].clone();
+
+    drop(store);
+    let database_path = bootstrap.data_directory().join("agens.db");
+    std::fs::remove_file(&database_path).unwrap();
+    std::fs::create_dir(&database_path).unwrap();
+
+    let (progress, _) = std::sync::mpsc::channel();
+    let outcome = router.route_request(
+        TuiRouteRequest::ReplaceStagedMedia {
+            attachments: vec![recorded.clone()],
+        },
+        progress,
+    );
+
+    let TuiSubmissionOutcome::StagedMediaReplaced {
+        staged_media,
+        notice,
+    } = outcome
+    else {
+        panic!("expected StagedMediaReplaced, got {outcome:?}");
+    };
+    assert_eq!(
+        staged_media,
+        vec![recorded.clone()],
+        "a lookup failure proves nothing, so the attachment must stay staged"
+    );
+    assert_eq!(
+        notice.as_deref(),
+        Some("1 restored attachment could not be checked and was kept staged.")
+    );
+    assert_eq!(
+        session.lock().unwrap().pending_media_ids,
+        vec![recorded.media_id]
+    );
 
     std::fs::remove_dir_all(temporary).unwrap();
 }
@@ -3833,10 +4053,11 @@ fn clipboard_image_route_ingests_bytes() {
         },
         progress,
     );
-    let TuiSubmissionOutcome::MediaAttached { media_chips, .. } = outcome else {
+    let TuiSubmissionOutcome::MediaAttached { staged_media, .. } = outcome else {
         panic!("expected MediaAttached, got {outcome:?}");
     };
-    assert_eq!(media_chips, vec!["[Image #1]".to_owned()]);
+    assert_eq!(staged_media.len(), 1);
+    assert_eq!(staged_media[0].mime, "image/png");
     assert_eq!(session.lock().unwrap().pending_media_ids.len(), 1);
 
     std::fs::remove_dir_all(temporary).unwrap();
