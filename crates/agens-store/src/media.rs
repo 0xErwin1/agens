@@ -2,7 +2,7 @@
 
 use std::{
     fmt, fs,
-    io::Write,
+    io::{self, Write},
     path::{Path, PathBuf},
 };
 
@@ -23,11 +23,28 @@ pub struct MediaRecord {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MediaStoreError {
-    Oversize { byte_len: usize },
-    NotFound { media_id: i64 },
+    Oversize {
+        byte_len: usize,
+    },
+    NotFound {
+        media_id: i64,
+    },
     EmptyMime,
-    Io { operation: String, detail: String },
-    Database { operation: String, detail: String },
+    Io {
+        operation: String,
+        detail: String,
+    },
+    Database {
+        operation: String,
+        detail: String,
+    },
+    /// The store could not determine whether the media is reachable — a permission denial, an
+    /// I/O error, a stale mount. It proves nothing about the media, so callers must not treat it
+    /// as evidence that the media is gone.
+    Unverifiable {
+        operation: String,
+        detail: String,
+    },
 }
 
 impl MediaStoreError {
@@ -60,6 +77,12 @@ impl fmt::Display for MediaStoreError {
             Self::Io { operation, detail } => write!(formatter, "media {operation}: {detail}"),
             Self::Database { operation, detail } => {
                 write!(formatter, "media database {operation}: {detail}")
+            }
+            Self::Unverifiable { operation, detail } => {
+                write!(
+                    formatter,
+                    "media {operation} could not be checked: {detail}"
+                )
             }
         }
     }
@@ -176,6 +199,11 @@ pub fn ingest_media_path(
 }
 
 /// Resolves a durable media id to its mime type and content-addressed blob path.
+///
+/// Only an absent row ([`MediaStoreError::NotFound`]) and a blob that is provably gone or not a
+/// regular file ([`MediaStoreError::Io`]) report the media as unreachable. A blob whose state
+/// could not be read at all — a denied directory, an I/O failure, a stale mount — reports
+/// [`MediaStoreError::Unverifiable`], because callers discard media they are told is unreachable.
 pub fn open_media(
     data_directory: &Path,
     media_id: i64,
@@ -200,14 +228,20 @@ pub fn open_media(
     };
 
     let path = data_directory.join("media").join(sha256);
-    if !path.is_file() {
-        return Err(MediaStoreError::Io {
-            operation: "open media blob".into(),
-            detail: format!("missing blob for media {media_id}"),
-        });
-    }
+    let missing_blob = || MediaStoreError::Io {
+        operation: "open media blob".into(),
+        detail: format!("missing blob for media {media_id}"),
+    };
 
-    Ok((mime, path))
+    match fs::metadata(&path) {
+        Ok(metadata) if metadata.is_file() => Ok((mime, path)),
+        Ok(_) => Err(missing_blob()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Err(missing_blob()),
+        Err(error) => Err(MediaStoreError::Unverifiable {
+            operation: "stat media blob".into(),
+            detail: error.to_string(),
+        }),
+    }
 }
 
 /// Returns true when `mime` is a durable media attachment type (image or PDF).

@@ -358,14 +358,12 @@ fn overlay_items(
     query: &str,
     limit: usize,
 ) -> Vec<PromptOverlayItem> {
-    let query_lower = query.to_ascii_lowercase();
+    let query_lower = query.to_lowercase();
     entries
         .iter()
         .enumerate()
         .rev()
-        .filter(|(_, entry)| {
-            query_lower.is_empty() || entry.text.to_ascii_lowercase().contains(&query_lower)
-        })
+        .filter(|(_, entry)| entry_matches_query(entry, &query_lower))
         .take(limit)
         .map(|(store_index, entry)| PromptOverlayItem {
             text: entry.text.clone(),
@@ -374,6 +372,28 @@ fn overlay_items(
             attachments: entry.attachments.clone(),
         })
         .collect()
+}
+
+/// Matches an entry against an already-lowercased query.
+///
+/// Attachments are searchable by the chip label and mime they are shown as: an entry with no
+/// text is displayed by its attachments alone, so matching text only would put every
+/// attachments-only prompt out of reach of any query the reader can type.
+fn entry_matches_query(entry: &PromptMemoryEntry, query_lower: &str) -> bool {
+    if query_lower.is_empty() || entry.text.to_lowercase().contains(query_lower) {
+        return true;
+    }
+
+    entry
+        .attachments
+        .iter()
+        .enumerate()
+        .any(|(index, attachment)| {
+            crate::media_chip_label(index + 1, &attachment.mime)
+                .to_lowercase()
+                .contains(query_lower)
+                || attachment.mime.to_lowercase().contains(query_lower)
+        })
 }
 
 fn unix_now_secs() -> i64 {
@@ -766,6 +786,33 @@ mod tests {
 
         let stash = state.stash_overlay("", 64);
         assert_eq!(stash[0].attachments, vec![attachment(8)]);
+    }
+
+    #[test]
+    fn overlay_search_reaches_attachment_only_entries_and_folds_non_ascii_case() {
+        let mut state = PromptMemoryState::new();
+        state.record_submission("", &[attachment(5)]);
+        state.record_submission("ÉCRIRE un test", &[]);
+        state.record_submission("plain text", &[]);
+
+        let by_chip = state.history_overlay("image", 64);
+        assert_eq!(
+            by_chip.len(),
+            1,
+            "an attachments-only entry must be findable"
+        );
+        assert_eq!(by_chip[0].attachments, vec![attachment(5)]);
+
+        let by_mime = state.history_overlay("image/png", 64);
+        assert_eq!(by_mime.len(), 1);
+
+        let non_ascii = state.history_overlay("écrire", 64);
+        assert_eq!(
+            non_ascii.len(),
+            1,
+            "case folding must not stop at ASCII: {non_ascii:?}"
+        );
+        assert_eq!(non_ascii[0].text, "ÉCRIRE un test");
     }
 
     #[test]

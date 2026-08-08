@@ -77,6 +77,7 @@ pub struct PromptMemoryStore {
     database_path: PathBuf,
     connection: Connection,
     state: PromptMemoryState,
+    undecodable_attachment_rows: usize,
 }
 
 impl PromptMemoryStore {
@@ -88,9 +89,18 @@ impl PromptMemoryStore {
             database_path,
             connection,
             state: PromptMemoryState::new(),
+            undecodable_attachment_rows: 0,
         };
         store.reload_state_from_db()?;
         Ok(store)
+    }
+
+    /// How many loaded rows carried an `attachments` column that could not be decoded.
+    ///
+    /// Those rows are usable as text-only prompts; the count is what a surface reports so the
+    /// silent loss of their attachments is visible.
+    pub fn undecodable_attachment_rows(&self) -> usize {
+        self.undecodable_attachment_rows
     }
 
     pub fn database_path(&self) -> PathBuf {
@@ -266,9 +276,11 @@ impl PromptMemoryStore {
     }
 
     fn reload_state_from_db(&mut self) -> Result<(), PromptMemoryStoreError> {
-        let history = self.list_history()?;
-        let stash = self.list_stash()?;
+        let (history, undecodable_history) =
+            self.list_table_with_decode_status("prompt_history")?;
+        let (stash, undecodable_stash) = self.list_table_with_decode_status("prompt_stash")?;
 
+        self.undecodable_attachment_rows = undecodable_history + undecodable_stash;
         self.state
             .seed_history(history.into_iter().map(stored_prompt_into_entry));
         self.state
@@ -277,6 +289,15 @@ impl PromptMemoryStore {
     }
 
     fn list_table(&self, table: &str) -> Result<Vec<StoredPrompt>, PromptMemoryStoreError> {
+        self.list_table_with_decode_status(table)
+            .map(|(entries, _)| entries)
+    }
+
+    /// Lists a table and counts the rows whose attachments column could not be decoded.
+    fn list_table_with_decode_status(
+        &self,
+        table: &str,
+    ) -> Result<(Vec<StoredPrompt>, usize), PromptMemoryStoreError> {
         // Table names are crate-private literals only.
         let sql = format!("SELECT id, text, created_at, attachments FROM {table} ORDER BY id ASC");
         let mut statement = self.connection.prepare(&sql).map_err(|error| {
@@ -288,7 +309,7 @@ impl PromptMemoryStore {
         })?;
 
         let rows = statement
-            .query_map([], stored_prompt_from_row)
+            .query_map([], stored_prompt_with_decode_status)
             .map_err(|error| {
                 PromptMemoryStoreError::operation(
                     &format!("query {table} list"),
@@ -297,13 +318,21 @@ impl PromptMemoryStore {
                 )
             })?;
 
-        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(|error| {
-            PromptMemoryStoreError::operation(
-                &format!("read {table} list"),
-                &self.database_path,
-                error,
-            )
-        })
+        let rows = rows
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|error| {
+                PromptMemoryStoreError::operation(
+                    &format!("read {table} list"),
+                    &self.database_path,
+                    error,
+                )
+            })?;
+
+        let undecodable = rows.iter().filter(|(_, undecodable)| *undecodable).count();
+        Ok((
+            rows.into_iter().map(|(entry, _)| entry).collect(),
+            undecodable,
+        ))
     }
 
     fn load_row(&self, table: &str, id: i64) -> Result<StoredPrompt, PromptMemoryStoreError> {
@@ -388,12 +417,26 @@ impl PromptMemory for PromptMemoryStore {
 }
 
 fn stored_prompt_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredPrompt> {
-    Ok(StoredPrompt {
-        id: row.get(0)?,
-        text: row.get(1)?,
-        created_at: row.get(2)?,
-        attachments: decode_attachments(row.get::<_, Option<String>>(3)?.as_deref())?,
-    })
+    stored_prompt_with_decode_status(row).map(|(entry, _)| entry)
+}
+
+/// Reads a row, reporting whether its `attachments` column had to be given up on.
+fn stored_prompt_with_decode_status(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<(StoredPrompt, bool)> {
+    let raw: Option<String> = row.get(3)?;
+    let decoded = decode_attachments(raw.as_deref());
+    let undecodable = decoded.is_none();
+
+    Ok((
+        StoredPrompt {
+            id: row.get(0)?,
+            text: row.get(1)?,
+            created_at: row.get(2)?,
+            attachments: decoded.unwrap_or_default(),
+        },
+        undecodable,
+    ))
 }
 
 fn stored_prompt_into_entry(row: StoredPrompt) -> PromptMemoryEntry {
@@ -428,18 +471,25 @@ fn encode_attachments(
         .map_err(|error| PromptMemoryStoreError::detail(format!("encode attachments: {error}")))
 }
 
-fn decode_attachments(value: Option<&str>) -> rusqlite::Result<Vec<PromptAttachment>> {
+/// Decodes stored `[media_id, mime]` pairs, or `None` when the column holds another shape.
+///
+/// The column CHECK admits any JSON array, so shapes this store never writes reach here: `[]`
+/// decodes to no attachments, while `[1, 2]` or `[{}]` decode to nothing at all. A row of that
+/// second kind must not be fatal: the load runs at open, and failing it would cost the reader
+/// every prompt they ever recorded, permanently, on every launch. The row loads as text-only
+/// and the caller counts it instead.
+fn decode_attachments(value: Option<&str>) -> Option<Vec<PromptAttachment>> {
     let Some(value) = value else {
-        return Ok(Vec::new());
+        return Some(Vec::new());
     };
 
-    let pairs: Vec<(i64, String)> = serde_json::from_str(value).map_err(|error| {
-        rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(error))
-    })?;
-    Ok(pairs
-        .into_iter()
-        .map(|(media_id, mime)| PromptAttachment::new(media_id, mime))
-        .collect())
+    let pairs: Vec<(i64, String)> = serde_json::from_str(value).ok()?;
+    Some(
+        pairs
+            .into_iter()
+            .map(|(media_id, mime)| PromptAttachment::new(media_id, mime))
+            .collect(),
+    )
 }
 
 fn unix_now_secs() -> i64 {
