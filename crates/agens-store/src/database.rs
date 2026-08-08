@@ -101,7 +101,9 @@ const MIGRATIONS: [Migration; 10] = [
     Migration {
         id: "0009_media",
         ddl: media_ddl,
-        preserved_tables: &["message_parts", "session_attempts"],
+        // `tool_result_facts` is not rebuilt, but its rows hang off `session_attempts` by an
+        // `ON DELETE CASCADE` the rebuild's `DROP TABLE` would fire, so the count must hold too.
+        preserved_tables: &["message_parts", "session_attempts", "tool_result_facts"],
     },
     Migration {
         id: "0010_prompt_memory_media",
@@ -161,6 +163,14 @@ pub(crate) fn open_unified_database(
 /// inside the same transaction: a copy that lost rows fails the migration and rolls back, so a
 /// broken rebuild leaves the old schema and the user's rows in place rather than committing the
 /// loss. No backup or fault-injection machinery exists beyond that.
+///
+/// That row guard only sees the tables a migration declares, so it cannot see a table emptied
+/// behind the migration's back: with foreign keys enforced, `DROP TABLE` performs an implicit
+/// `DELETE FROM` that fires `ON DELETE CASCADE` into children the rebuild never mentions —
+/// dropping `session_attempts` mid-rebuild takes `tool_result_facts` with it. Enforcement is a
+/// per-connection setting that cannot be changed inside a transaction, so each migration runs
+/// with it suspended and its result is validated by `PRAGMA foreign_key_check` before the
+/// transaction commits.
 fn run_pending_migrations(connection: &mut Connection, path: &Path) -> Result<(), DatabaseError> {
     apply_migrations(connection, path, &MIGRATIONS)
 }
@@ -186,41 +196,94 @@ fn apply_migrations(
             continue;
         }
 
-        let operation = format!("apply migration {}", migration.id);
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|error| DatabaseError::new(operation.clone(), path, error))?;
+        set_foreign_keys(connection, path, false)?;
+        let outcome = apply_migration(connection, path, migration);
+        let restored = set_foreign_keys(connection, path, true);
 
-        let mut counts_before = Vec::with_capacity(migration.preserved_tables.len());
-        for table in migration.preserved_tables {
-            counts_before.push(count_rows(&transaction, table, &operation, path)?);
+        outcome?;
+        restored?;
+    }
+
+    Ok(())
+}
+
+fn apply_migration(
+    connection: &mut Connection,
+    path: &Path,
+    migration: &Migration,
+) -> Result<(), DatabaseError> {
+    let operation = format!("apply migration {}", migration.id);
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| DatabaseError::new(operation.clone(), path, error))?;
+
+    let mut counts_before = Vec::with_capacity(migration.preserved_tables.len());
+    for table in migration.preserved_tables {
+        counts_before.push(count_rows(&transaction, table, &operation, path)?);
+    }
+
+    transaction
+        .execute_batch(&(migration.ddl)())
+        .map_err(|error| DatabaseError::new(operation.clone(), path, error))?;
+
+    for (table, before) in migration.preserved_tables.iter().zip(counts_before) {
+        let after = count_rows(&transaction, table, &operation, path)?;
+        if after != before {
+            return Err(DatabaseError::new(
+                operation,
+                path,
+                format!("{table} kept {after} of {before} rows across the rebuild"),
+            ));
         }
+    }
 
-        transaction
-            .execute_batch(&(migration.ddl)())
-            .map_err(|error| DatabaseError::new(operation.clone(), path, error))?;
+    let violations: i64 = transaction
+        .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })
+        .map_err(|error| DatabaseError::new(operation.clone(), path, error))?;
+    if violations > 0 {
+        return Err(DatabaseError::new(
+            operation,
+            path,
+            format!("the migrated schema holds {violations} foreign key violation(s)"),
+        ));
+    }
 
-        for (table, before) in migration.preserved_tables.iter().zip(counts_before) {
-            let after = count_rows(&transaction, table, &operation, path)?;
-            if after != before {
-                return Err(DatabaseError::new(
-                    operation,
-                    path,
-                    format!("{table} kept {after} of {before} rows across the rebuild"),
-                ));
-            }
-        }
+    transaction
+        .execute(
+            "INSERT INTO schema_migrations (id, applied_at)
+             VALUES (?1, CAST(strftime('%s','now') AS INTEGER))",
+            params![migration.id],
+        )
+        .map_err(|error| DatabaseError::new(operation.clone(), path, error))?;
+    transaction
+        .commit()
+        .map_err(|error| DatabaseError::new(operation, path, error))
+}
 
-        transaction
-            .execute(
-                "INSERT INTO schema_migrations (id, applied_at)
-                 VALUES (?1, CAST(strftime('%s','now') AS INTEGER))",
-                params![migration.id],
-            )
-            .map_err(|error| DatabaseError::new(operation.clone(), path, error))?;
-        transaction
-            .commit()
-            .map_err(|error| DatabaseError::new(operation, path, error))?;
+/// Sets foreign key enforcement on this connection and verifies it took effect.
+///
+/// The pragma is silently ignored inside a transaction, so reading it back is the only way to
+/// know a migration is not about to run under the enforcement it asked to suspend.
+fn set_foreign_keys(
+    connection: &Connection,
+    path: &Path,
+    enabled: bool,
+) -> Result<(), DatabaseError> {
+    connection
+        .pragma_update(None, "foreign_keys", if enabled { "ON" } else { "OFF" })
+        .map_err(|error| DatabaseError::new("configure foreign keys", path, error))?;
+
+    let effective: i64 = connection
+        .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+        .map_err(|error| DatabaseError::new("configure foreign keys", path, error))?;
+    if (effective == 1) != enabled {
+        return Err(DatabaseError::new(
+            "configure foreign keys",
+            path,
+            format!("foreign_keys is {effective}"),
+        ));
     }
 
     Ok(())
@@ -773,6 +836,141 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+
+        drop(connection);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A connection in the shape [`open_unified_database`] leaves behind — foreign keys on —
+    /// holding a database migrated up to, but not including, `pending`.
+    fn database_before(directory: &Path, pending: &[Migration]) -> (PathBuf, Connection) {
+        let path = directory.join("upgrade.db");
+        let mut connection = Connection::open(&path).unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .unwrap();
+
+        let applied = MIGRATIONS
+            .iter()
+            .position(|migration| migration.id == pending[0].id)
+            .expect("the pending migrations must belong to MIGRATIONS");
+        apply_migrations(&mut connection, &path, &MIGRATIONS[..applied]).unwrap();
+
+        (path, connection)
+    }
+
+    fn populate_session_with_a_fact(connection: &Connection) {
+        connection
+            .execute_batch(
+                "INSERT INTO sessions (id, project, title, active_agent, created_at, updated_at,
+                                       completed_turn_count, resumable)
+                     VALUES (1, '/project', 'titled', 'primary', 1, 1, 1, 1);
+                 INSERT INTO turns (session_id, sequence, completed_at) VALUES (1, 1, 1);
+                 INSERT INTO messages (session_id, sequence, turn_sequence, role)
+                     VALUES (1, 1, 1, 'user');
+                 INSERT INTO message_parts (session_id, message_sequence, sequence, kind, text)
+                     VALUES (1, 1, 0, 'text', 'hello');
+                 INSERT INTO session_attempts (id, session_id, sequence, status, retry_prompt,
+                                               started_at)
+                     VALUES (1, 1, 1, 'running', 'retry me', 1);
+                 INSERT INTO tool_result_facts (id, session_id, attempt_id, sequence, tool_call_id,
+                                                tool, outcome, path_status, recorded_at)
+                     VALUES (1, 1, 1, 1, 'call-1', 'read', 'succeeded', 'not_applicable', 1);",
+            )
+            .unwrap();
+    }
+
+    /// Suspending enforcement for the rebuild must not let a migration commit a dangling child:
+    /// what the pragma stops policing before the DDL, `PRAGMA foreign_key_check` polices after it,
+    /// and enforcement is restored even though the migration failed.
+    #[test]
+    fn a_migration_that_orphans_a_child_row_fails_the_foreign_key_check_and_rolls_back() {
+        let directory = data_directory();
+        let path = directory.join("orphan.db");
+        let mut connection = Connection::open(&path).unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE parent (id INTEGER PRIMARY KEY);
+                 CREATE TABLE child (
+                     id INTEGER PRIMARY KEY,
+                     parent_id INTEGER NOT NULL,
+                     FOREIGN KEY(parent_id) REFERENCES parent(id) ON DELETE CASCADE
+                 );
+                 INSERT INTO parent (id) VALUES (1);
+                 INSERT INTO child (id, parent_id) VALUES (1, 1);",
+            )
+            .unwrap();
+
+        let orphaning = [Migration {
+            id: "9999_orphaning_rebuild",
+            ddl: || {
+                "DROP TABLE parent;
+                 CREATE TABLE parent (id INTEGER PRIMARY KEY);"
+                    .to_owned()
+            },
+            preserved_tables: &[],
+        }];
+
+        let error = apply_migrations(&mut connection, &path, &orphaning).expect_err("must refuse");
+        assert!(
+            error.detail().contains("1 foreign key violation"),
+            "the failure must name what the check found: {}",
+            error.detail()
+        );
+
+        assert_eq!(foreign_keys(&connection), 1);
+        let parents: i64 = connection
+            .query_row("SELECT count(*) FROM parent", [], |row| row.get(0))
+            .unwrap();
+        let children: i64 = connection
+            .query_row("SELECT count(*) FROM child", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            (parents, children),
+            (1, 1),
+            "the rollback must restore both"
+        );
+        assert!(
+            read_applied_migration_ids(&connection, &path)
+                .unwrap()
+                .is_empty()
+        );
+
+        drop(connection);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `DROP TABLE` performs an implicit `DELETE FROM` with foreign keys on, so dropping the
+    /// `session_attempts` original mid-rebuild cascades into `tool_result_facts`. The evidence
+    /// ledger belongs to attempts that the rebuild puts straight back, so it must survive.
+    #[test]
+    fn migration_0009_keeps_the_facts_cascade_reachable_from_the_attempts_it_rebuilds() {
+        let directory = data_directory();
+        let media_migration = &MIGRATIONS[8..9];
+        assert_eq!(media_migration[0].id, "0009_media");
+        let (path, mut connection) = database_before(&directory, media_migration);
+        populate_session_with_a_fact(&connection);
+
+        apply_migrations(&mut connection, &path, media_migration).unwrap();
+
+        let facts: i64 = connection
+            .query_row("SELECT count(*) FROM tool_result_facts", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            facts, 1,
+            "the session_attempts rebuild must not cascade the evidence ledger away"
+        );
+        let attempts: i64 = connection
+            .query_row("SELECT count(*) FROM session_attempts", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(attempts, 1);
 
         drop(connection);
         fs::remove_dir_all(directory).unwrap();
