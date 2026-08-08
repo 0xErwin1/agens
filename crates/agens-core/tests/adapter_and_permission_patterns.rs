@@ -788,6 +788,36 @@ fn allow_glob_git_star_does_not_match_compound_with_non_git_invocation() {
     );
 }
 
+/// A glob that happens to match the whole command line as one string is still
+/// not a grant for what was chained onto its first invocation: `git*` matches
+/// `git status && rm -rf victim` end to end while naming only the `git status`.
+#[test]
+fn allow_glob_git_star_does_not_match_a_compound_it_matches_as_one_string() {
+    let command = "git status && rm -rf victim";
+    let request = PermissionRequest::new("project", "native::bash", command, ToolAccess::Write);
+    let pattern =
+        PermissionPattern::glob_for_target_kind("git*", PermissionTargetKind::FreeFormText)
+            .expect("git* is a valid free-form glob");
+
+    assert!(
+        pattern.matches(command),
+        "the case only bites while git* selects the whole command line as one string"
+    );
+
+    let grant = ProjectPermissionGrant::allow(
+        "project",
+        PermissionPattern::Exact("native::bash".into()),
+        pattern,
+    );
+    let policy = PermissionPolicy::new(PermissionMode::Edit, vec![]);
+
+    assert_eq!(
+        policy.evaluate(&request, &[grant], &PermissionSession::new()),
+        PermissionDecision::Ask,
+        "Allow Glob git* must not authorize the rm chained onto a git command"
+    );
+}
+
 /// When every invocation matches the allow glob, the compound command is covered.
 #[test]
 fn allow_glob_git_star_matches_compound_of_only_git_invocations() {
