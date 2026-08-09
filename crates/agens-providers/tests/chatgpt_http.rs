@@ -25,6 +25,21 @@ const REFRESH_WORKER_ENV: &str = "AGENS_CHATGPT_REFRESH_WORKER";
 const REFRESH_LOCK_WORKER_ENV: &str = "AGENS_CHATGPT_REFRESH_LOCK_WORKER";
 const LOCK_TEST_REPETITIONS: usize = 20;
 const LOCK_TEST_WAIT: Duration = Duration::from_secs(1);
+/// How long a step may take when it is waiting on another process rather than on the
+/// behavior under test.
+///
+/// Spawning a debug test binary, letting it build a provider and letting it complete an
+/// HTTP round trip is startup cost, not the promptness `LOCK_TEST_WAIT` measures, and on
+/// a loaded machine it is worth seconds. Sizing those waits as if they were promptness
+/// budgets makes them report a slow machine as a broken lock.
+const LOCK_TEST_PROCESS_WAIT: Duration = Duration::from_secs(30);
+/// How long the lock holder waits to be released.
+///
+/// This is not a promptness budget like `LOCK_TEST_WAIT`: the parent releases the holder
+/// only after it has spawned a second process, cancelled it and checked the credentials
+/// it left behind, so the holder's patience has to span that whole sequence rather than
+/// the single signal the other waits cover.
+const HOLDER_RELEASE_WAIT: Duration = Duration::from_secs(60);
 
 #[test]
 fn subscription_transport_posts_the_codex_request_and_returns_text() {
@@ -1067,7 +1082,11 @@ fn refresh_lock_subprocess_worker() {
             );
             let canceller = cancellation.clone();
             let watcher = thread::spawn(move || {
-                wait_for_file(&release, "holder release marker should arrive");
+                wait_for_file(
+                    &release,
+                    HOLDER_RELEASE_WAIT,
+                    "holder release marker should arrive",
+                );
                 canceller.cancel();
             });
 
@@ -1099,7 +1118,11 @@ fn refresh_lock_subprocess_worker() {
             fs::write(&started, b"started").expect("caller start marker should be written");
             let canceller = cancellation.clone();
             let watcher = thread::spawn(move || {
-                wait_for_file(&cancel, "caller cancellation marker should arrive");
+                wait_for_file(
+                    &cancel,
+                    LOCK_TEST_PROCESS_WAIT,
+                    "caller cancellation marker should arrive",
+                );
                 canceller.cancel();
             });
 
@@ -1185,7 +1208,10 @@ fn subscription_transport_times_out_while_waiting_for_refresh() {
         Duration::from_secs(1),
     )
     .expect("provider should be configured");
-    let cancellation = HeadlessTurnCancellation::with_deadline(Duration::from_millis(25));
+    // The deadline is scaffolding for "stopped while the refresh is outstanding": it has
+    // to outlast the request reaching the server, which the assertion below requires,
+    // while staying under the fixture's half-second hold on the connection.
+    let cancellation = HeadlessTurnCancellation::with_deadline(Duration::from_millis(250));
 
     assert_eq!(
         run(&mut provider, cancellation),
@@ -1306,7 +1332,7 @@ fn subscription_refresh_lock_wait_cancellation_preserves_holder_and_credentials(
         );
         let first_request = oauth
             .requests()
-            .recv_timeout(LOCK_TEST_WAIT)
+            .recv_timeout(LOCK_TEST_PROCESS_WAIT)
             .expect("holder should signal that it acquired the refresh lock");
         assert_eq!(first_request.path, "/oauth/token");
         let credentials_before =
@@ -1328,6 +1354,7 @@ fn subscription_refresh_lock_wait_cancellation_preserves_holder_and_credentials(
         );
         wait_for_file(
             &caller_started,
+            LOCK_TEST_PROCESS_WAIT,
             "caller should start after the holder signal",
         );
         thread::sleep(Duration::from_millis(25));
@@ -1349,8 +1376,9 @@ fn subscription_refresh_lock_wait_cancellation_preserves_holder_and_credentials(
         );
 
         fs::write(&holder_release, b"release").expect("holder release marker should be written");
-        wait_for_success(
+        wait_for_success_within(
             &mut holder,
+            LOCK_TEST_PROCESS_WAIT,
             "holder should release normally after cancellation test",
         );
         oauth.join();
@@ -1378,7 +1406,7 @@ fn subscription_refresh_recovers_after_lock_holder_crash_without_stale_sidecar_d
 
         oauth
             .requests()
-            .recv_timeout(LOCK_TEST_WAIT)
+            .recv_timeout(LOCK_TEST_PROCESS_WAIT)
             .expect("holder should acquire the refresh lock before it crashes");
         assert!(directory.join(".auth.json.refresh.lock").exists());
         holder.kill().expect("holder should be force-killed");
@@ -1391,14 +1419,15 @@ fn subscription_refresh_recovers_after_lock_holder_crash_without_stale_sidecar_d
             &oauth.url(),
             &[],
         );
-        wait_for_success(
+        wait_for_success_within(
             &mut recovery,
+            LOCK_TEST_PROCESS_WAIT,
             "subsequent process should reacquire the OS lock",
         );
         assert_eq!(oauth.request_count(), 2);
         assert_eq!(
             response_request
-                .recv_timeout(LOCK_TEST_WAIT)
+                .recv_timeout(LOCK_TEST_PROCESS_WAIT)
                 .expect("recovery should issue one Responses request")
                 .header("authorization"),
             Some("Bearer header.eyJleHAiOjE4OTM0NTYwMDB9.signature")
@@ -2164,15 +2193,21 @@ fn subscription_tool_replay_cancellation_and_timeout_stop_second_and_third_round
             events.push(tool_result("call_2", "second", false));
         }
 
+        // The stop has to reach a round that is already in flight, or the provider is
+        // stopped before it ever issues the request this asserts it issued. Cancellation
+        // can wait for the server to say so; a deadline is fixed at construction, so it
+        // is instead widened far enough to span the request it is meant to interrupt
+        // while staying under both the fixture's hold and the provider's own timeout.
         let cancellation = if cancellation_mode {
             HeadlessTurnCancellation::new()
         } else {
-            HeadlessTurnCancellation::with_deadline(Duration::from_millis(25))
+            HeadlessTurnCancellation::with_deadline(Duration::from_millis(250))
         };
         let canceller = cancellation_mode.then(|| {
             let cancellation = cancellation.clone();
+            let observed_requests = server.observed_requests();
             thread::spawn(move || {
-                thread::sleep(Duration::from_millis(25));
+                wait_for_observed_requests(&observed_requests, round);
                 cancellation.cancel();
             })
         });
@@ -2342,8 +2377,19 @@ fn spawn_refresh_lock_worker(
     command.spawn().expect("refresh lock worker should start")
 }
 
-fn wait_for_file(path: &Path, description: &str) {
-    let deadline = Instant::now() + LOCK_TEST_WAIT;
+fn wait_for_observed_requests(observed_requests: &AtomicUsize, expected: usize) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while observed_requests.load(Ordering::Acquire) < expected {
+        assert!(
+            Instant::now() < deadline,
+            "the scripted server should observe round {expected} before it is stopped"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+fn wait_for_file(path: &Path, budget: Duration, description: &str) {
+    let deadline = Instant::now() + budget;
     while !path.exists() {
         assert!(Instant::now() < deadline, "{description}");
         thread::sleep(Duration::from_millis(5));
@@ -2351,7 +2397,11 @@ fn wait_for_file(path: &Path, description: &str) {
 }
 
 fn wait_for_success(child: &mut std::process::Child, description: &str) {
-    let deadline = Instant::now() + LOCK_TEST_WAIT;
+    wait_for_success_within(child, LOCK_TEST_WAIT, description);
+}
+
+fn wait_for_success_within(child: &mut std::process::Child, budget: Duration, description: &str) {
+    let deadline = Instant::now() + budget;
     loop {
         if let Some(status) = child.try_wait().expect("child status should be readable") {
             assert!(status.success(), "{description}");
@@ -2478,12 +2528,14 @@ impl ObservedRequest {
 struct LocalServer {
     address: std::net::SocketAddr,
     observed_request: Option<mpsc::Receiver<ObservedRequest>>,
+    stop: Arc<AtomicBool>,
     worker: thread::JoinHandle<()>,
 }
 
 struct OAuthServer {
     address: std::net::SocketAddr,
-    worker: thread::JoinHandle<ObservedRequest>,
+    stop: Arc<AtomicBool>,
+    worker: thread::JoinHandle<Option<ObservedRequest>>,
 }
 
 struct ControlledOAuthServer {
@@ -2496,28 +2548,36 @@ struct ControlledOAuthServer {
 
 impl OAuthServer {
     fn start(status: u16, body: &'static str) -> Self {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("OAuth server should bind");
-        let address = listener
-            .local_addr()
-            .expect("OAuth server address should be available");
+        let (listener, address) = bind_pollable_listener();
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
         let worker = thread::spawn(move || {
-            let (mut stream, _) = listener
-                .accept()
-                .expect("OAuth server should accept a request");
-            let request = read_request(&stream);
-            stream
-                .write_all(
-                    format!(
-                        "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
+            let stream = accept_until_stopped(&listener, &worker_stop);
+            let request = stream.as_ref().and_then(|stream| {
+                let mut stream = stream.try_clone().expect("stream should clone");
+                let request = read_request(&stream)?;
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
                     )
-                    .as_bytes(),
-                )
-                .expect("OAuth response should be written");
+                    .expect("OAuth response should be written");
+
+                Some(request)
+            });
+            hold_address_until_stopped(&listener, &worker_stop);
+
             request
         });
 
-        Self { address, worker }
+        Self {
+            address,
+            stop,
+            worker,
+        }
     }
 
     fn url(&self) -> String {
@@ -2525,7 +2585,11 @@ impl OAuthServer {
     }
 
     fn join(self) -> ObservedRequest {
-        self.worker.join().expect("OAuth server should finish")
+        self.stop.store(true, Ordering::Release);
+        self.worker
+            .join()
+            .expect("OAuth server should finish")
+            .expect("OAuth server should observe a complete refresh request")
     }
 }
 
@@ -2550,15 +2614,21 @@ impl ControlledOAuthServer {
                     Ok((stream, _)) => {
                         let sender = sender.clone();
                         let request_number = worker_request_count.fetch_add(1, Ordering::AcqRel);
+                        let handler_stop = Arc::clone(&worker_stop);
                         thread::spawn(move || {
                             let mut stream = stream;
-                            let request = read_request(&stream);
-                            sender
-                                .send(request)
-                                .expect("test should receive the OAuth request");
+                            let Some(request) = read_request(&stream) else {
+                                return;
+                            };
+                            let _ = sender.send(request);
 
                             if request_number == 0 {
-                                wait_for_client_close(&stream);
+                                // The first refresh is the one the test holds the lock
+                                // with, so it stays outstanding until the test is done
+                                // with it. Releasing it on a timer instead let the holder
+                                // observe the close, retry, and turn the request count
+                                // this fixture reports into a second refresh.
+                                hold_connection_until_stopped(&handler_stop);
                             } else {
                                 write_json(
                                     &mut stream,
@@ -2617,22 +2687,32 @@ enum ScriptedResponse {
 
 struct ScriptedServer {
     address: std::net::SocketAddr,
+    observed_requests: Arc<AtomicUsize>,
+    stop: Arc<AtomicBool>,
     worker: thread::JoinHandle<Vec<ObservedRequest>>,
 }
 
 impl ScriptedServer {
     fn start(responses: Vec<ScriptedResponse>) -> Self {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("scripted server should bind");
-        let address = listener
-            .local_addr()
-            .expect("scripted server address should be available");
+        let (listener, address) = bind_pollable_listener();
+        let observed_requests = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_observed = Arc::clone(&observed_requests);
+        let worker_stop = Arc::clone(&stop);
         let worker = thread::spawn(move || {
             let mut requests = Vec::with_capacity(responses.len());
             for response in responses {
-                let (mut stream, _) = listener
-                    .accept()
-                    .expect("scripted server should accept a request");
-                requests.push(read_request(&stream));
+                let Some(mut stream) = accept_until_stopped(&listener, &worker_stop) else {
+                    break;
+                };
+                // Every scripted round answers a request the provider is expected to
+                // complete, so a connection without one is a failure of the round, not
+                // an accepted outcome: the request counts these tests assert on would
+                // otherwise quietly drop it.
+                requests.push(read_request(&stream).expect(
+                    "scripted server should receive a complete request for every scripted round",
+                ));
+                worker_observed.store(requests.len(), Ordering::Release);
                 match response {
                     ScriptedResponse::Disconnect => {}
                     ScriptedResponse::Status(status) => write_status(&mut stream, status),
@@ -2642,10 +2722,17 @@ impl ScriptedServer {
                     ScriptedResponse::WaitForClientClose => wait_for_client_close(&stream),
                 }
             }
+            hold_address_until_stopped(&listener, &worker_stop);
+
             requests
         });
 
-        Self { address, worker }
+        Self {
+            address,
+            observed_requests,
+            stop,
+            worker,
+        }
     }
 
     fn responses_base_url(&self) -> String {
@@ -2656,23 +2743,36 @@ impl ScriptedServer {
         format!("http://{}/oauth/token", self.address)
     }
 
+    /// Counts the scripted rounds whose request the server has already read, so a test
+    /// can stop the provider once the round it means to stop is actually in flight.
+    fn observed_requests(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.observed_requests)
+    }
+
     fn join(self) -> Vec<ObservedRequest> {
+        self.stop.store(true, Ordering::Release);
         self.worker.join().expect("scripted server should finish")
     }
 }
 
 impl LocalServer {
     fn start(behavior: ServerBehavior) -> Self {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("server should bind");
-        let address = listener
-            .local_addr()
-            .expect("server address should be available");
+        let (listener, address) = bind_pollable_listener();
         let (sender, observed_request) = mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
         let worker = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("server should accept a request");
-            sender
-                .send(read_request(&stream))
-                .expect("test should receive the request");
+            let Some(mut stream) = accept_until_stopped(&listener, &worker_stop) else {
+                return;
+            };
+            // A test that asserts on the request reports its absence itself, from its
+            // own receiver, rather than as an opaque worker panic here.
+            if let Some(request) = read_request(&stream) {
+                let _ = sender.send(request);
+            } else {
+                hold_address_until_stopped(&listener, &worker_stop);
+                return;
+            }
 
             match behavior {
                 ServerBehavior::Status(status) => write_status(&mut stream, status),
@@ -2694,11 +2794,14 @@ impl LocalServer {
                 }
                 ServerBehavior::WaitForClientClose => wait_for_client_close(&stream),
             }
+
+            hold_address_until_stopped(&listener, &worker_stop);
         });
 
         Self {
             address,
             observed_request: Some(observed_request),
+            stop,
             worker,
         }
     }
@@ -2714,16 +2817,106 @@ impl LocalServer {
     }
 
     fn join(self) {
+        self.stop.store(true, Ordering::Release);
         self.worker.join().expect("server worker should finish");
     }
 }
 
-fn read_request(stream: &TcpStream) -> ObservedRequest {
+/// Binds a listener whose accept loop can be polled, so a worker never parks in a
+/// blocking `accept` a client under test may never reach.
+fn bind_pollable_listener() -> (TcpListener, std::net::SocketAddr) {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("server should bind");
+    listener
+        .set_nonblocking(true)
+        .expect("listener should be nonblocking");
+    let address = listener
+        .local_addr()
+        .expect("server address should be available");
+
+    (listener, address)
+}
+
+/// Waits for one connection while honoring the stop flag, so `join` terminates even
+/// when the client was cancelled or timed out before it opened a socket at all.
+fn accept_until_stopped(listener: &TcpListener, stop: &AtomicBool) -> Option<TcpStream> {
+    while !stop.load(Ordering::Acquire) {
+        match listener.accept() {
+            Ok((stream, _)) => return Some(stream),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return None,
+        }
+    }
+
+    None
+}
+
+/// Keeps the fixture's port bound until the test releases it, closing anything that
+/// arrives once the scripted exchanges are done.
+///
+/// A worker that returned as soon as it had served its script dropped the listener while
+/// the provider under test could still be retrying against that address, so the kernel
+/// handed the port to whatever bound next — including another fixture in another test,
+/// whose canned status then answered this test's retry. Closing late arrivals rather
+/// than leaving them outstanding keeps those retries as fast as the refused connections
+/// they used to be.
+fn hold_address_until_stopped(listener: &TcpListener, stop: &AtomicBool) {
+    while let Some(stream) = accept_until_stopped(listener, stop) {
+        drop(stream);
+    }
+}
+
+/// Leaves one connection outstanding until the test releases it, for a fixture whose
+/// scenario is a request that never gets an answer.
+fn hold_connection_until_stopped(stop: &AtomicBool) {
+    while !stop.load(Ordering::Acquire) {
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RequestArrival {
+    Complete,
+    ClientCut,
+}
+
+/// A line the client never terminated — an empty read, a partial line, or a reset —
+/// means the connection was cut; anything that arrived whole is the client's own
+/// output and stays subject to the assertions on it.
+fn read_line_or_cut(reader: &mut BufReader<TcpStream>, line: &mut String) -> RequestArrival {
+    match reader.read_line(line) {
+        Ok(_) if line.ends_with('\n') => RequestArrival::Complete,
+        Ok(_) => RequestArrival::ClientCut,
+        Err(error) if is_client_cut(&error) => RequestArrival::ClientCut,
+        Err(error) => panic!("request should be readable: {error}"),
+    }
+}
+
+fn is_client_cut(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::UnexpectedEof
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::BrokenPipe
+    )
+}
+
+/// Reads a request, reporting `None` when the client cut the connection before it was
+/// complete.
+///
+/// `accept` returns as soon as the kernel completes the handshake, so a client that is
+/// cancelled or times out before writing leaves a connection with nothing on it. A
+/// request that does arrive stays fully asserted; each caller decides whether a missing
+/// one is an expected outcome of its scenario or a failure it must report.
+fn read_request(stream: &TcpStream) -> Option<ObservedRequest> {
     let mut reader = BufReader::new(stream.try_clone().expect("stream should clone"));
     let mut request_line = String::new();
-    reader
-        .read_line(&mut request_line)
-        .expect("request line should be readable");
+    if read_line_or_cut(&mut reader, &mut request_line) == RequestArrival::ClientCut {
+        return None;
+    }
     let path = request_line
         .split_whitespace()
         .nth(1)
@@ -2734,9 +2927,9 @@ fn read_request(stream: &TcpStream) -> ObservedRequest {
     let mut content_length = None;
     loop {
         let mut header = String::new();
-        reader
-            .read_line(&mut header)
-            .expect("header should be readable");
+        if read_line_or_cut(&mut reader, &mut header) == RequestArrival::ClientCut {
+            return None;
+        }
         if header == "\r\n" {
             break;
         }
@@ -2755,15 +2948,18 @@ fn read_request(stream: &TcpStream) -> ObservedRequest {
     }
 
     let mut body = vec![0; content_length.expect("request should have a content length")];
-    reader
-        .read_exact(&mut body)
-        .expect("body should be readable");
-    ObservedRequest {
+    match reader.read_exact(&mut body) {
+        Ok(()) => {}
+        Err(error) if is_client_cut(&error) => return None,
+        Err(error) => panic!("body should be readable: {error}"),
+    }
+
+    Some(ObservedRequest {
         path,
         headers,
         body: serde_json::from_slice(&body).unwrap_or(Value::Null),
         raw_body: String::from_utf8(body).expect("body should be UTF-8"),
-    }
+    })
 }
 
 fn write_status(stream: &mut TcpStream, status: u16) {
