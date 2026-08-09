@@ -28,6 +28,16 @@ pub const DEVICE_USER_CODE_ENDPOINT: &str =
     "https://auth.openai.com/api/accounts/deviceauth/usercode";
 pub const DEVICE_TOKEN_ENDPOINT: &str = "https://auth.openai.com/api/accounts/deviceauth/token";
 pub const CALLBACK_PORTS: [u16; 2] = [1455, 1457];
+/// Short summary of a busy-callback-port failure, for surfaces that render a
+/// message and a follow-up action separately.
+pub const CALLBACK_PORTS_BUSY_SUMMARY: &str =
+    "ChatGPT login could not start: loopback callback ports 1455 and 1457 are both in use.";
+pub const CALLBACK_PORTS_BUSY_GUIDANCE: &str = "Another agens or Codex login is probably running. Close it and retry, or run `agens auth login --device-auth`, which needs no local port.";
+pub const CALLBACK_PORTS_DENIED_SUMMARY: &str =
+    "ChatGPT login could not start: binding loopback callback ports 1455 and 1457 was denied.";
+pub const CALLBACK_PORTS_DENIED_GUIDANCE: &str = "A sandbox or local policy is blocking loopback binds. Fix that and retry, or run `agens auth login --device-auth`, which needs no local port.";
+const CALLBACK_PORTS_BUSY_MESSAGE: &str = "ChatGPT login could not start: loopback callback ports 1455 and 1457 are both in use.\nAnother agens or Codex login is probably running. Close it and retry, or run\n`agens auth login --device-auth`, which needs no local port.";
+const CALLBACK_PORTS_DENIED_MESSAGE: &str = "ChatGPT login could not start: binding loopback callback ports 1455 and 1457 was denied.\nA sandbox or local policy is blocking loopback binds. Fix that and retry, or run\n`agens auth login --device-auth`, which needs no local port.";
 pub const SCOPES: &str =
     "openid profile email offline_access api.connectors.read api.connectors.invoke";
 pub const ORIGINATOR: &str = "codex_cli_rs";
@@ -96,6 +106,8 @@ impl std::fmt::Debug for ChatGptCredentials {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LoginError {
     Authentication(&'static str),
+    CallbackPortsBusy,
+    CallbackPortsDenied,
     TokenTransport,
     TokenStatus,
     TokenFormat,
@@ -111,6 +123,8 @@ impl std::fmt::Display for LoginError {
             Self::Authentication(message) => {
                 return write!(formatter, "ChatGPT authentication required: {message}");
             }
+            Self::CallbackPortsBusy => CALLBACK_PORTS_BUSY_MESSAGE,
+            Self::CallbackPortsDenied => CALLBACK_PORTS_DENIED_MESSAGE,
             Self::TokenTransport => "ChatGPT token request failed; check the network and retry",
             Self::TokenStatus => "ChatGPT token request was rejected; retry authentication",
             Self::TokenFormat => "ChatGPT token response was invalid; retry authentication",
@@ -138,6 +152,8 @@ impl LoginError {
                 | "loopback callback failed",
             ) => "ChatGPT login callback failed; retry authentication",
             Self::Authentication(_) => "ChatGPT login setup failed; retry authentication",
+            Self::CallbackPortsBusy => CALLBACK_PORTS_BUSY_MESSAGE,
+            Self::CallbackPortsDenied => CALLBACK_PORTS_DENIED_MESSAGE,
             Self::TokenTransport => "ChatGPT token request failed; check the network and retry",
             Self::TokenStatus => "ChatGPT token request was rejected; retry authentication",
             Self::TokenFormat => "ChatGPT token response was invalid; retry authentication",
@@ -555,17 +571,39 @@ fn bind_loopback_port(port: u16) -> std::io::Result<TcpListener> {
     TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port))
 }
 
+/// Binds the first available callback port, keeping the most diagnostic bind
+/// failure so an exhausted candidate list reports why it failed. A failure that
+/// is not "address in use" always wins over one that is, because it points at a
+/// different fix (sandbox or permission) than a competing login.
 fn bind_candidate_port(
     ports: &[u16],
     bind: &dyn Fn(u16) -> std::io::Result<TcpListener>,
 ) -> Result<TcpListener, LoginError> {
-    ports
-        .iter()
-        .copied()
-        .find_map(|port| bind(port).ok())
-        .ok_or(LoginError::Authentication(
-            "loopback callback is unavailable",
-        ))
+    let mut failure: Option<std::io::Error> = None;
+
+    for port in ports.iter().copied() {
+        match bind(port) {
+            Ok(listener) => return Ok(listener),
+            Err(error) => {
+                let keeps_previous = failure
+                    .as_ref()
+                    .is_some_and(|previous| previous.kind() != std::io::ErrorKind::AddrInUse);
+                if !keeps_previous {
+                    failure = Some(error);
+                }
+            }
+        }
+    }
+
+    Err(bind_failure_error(failure.as_ref()))
+}
+
+fn bind_failure_error(failure: Option<&std::io::Error>) -> LoginError {
+    match failure.map(std::io::Error::kind) {
+        Some(std::io::ErrorKind::AddrInUse) => LoginError::CallbackPortsBusy,
+        Some(std::io::ErrorKind::PermissionDenied) => LoginError::CallbackPortsDenied,
+        _ => LoginError::Authentication("loopback callback is unavailable"),
+    }
 }
 
 fn wait_for_callback(

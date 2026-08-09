@@ -10,9 +10,10 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use agens_providers::chatgpt_login::{
-    ChatGptCredentials, ChatGptDeviceCodeLoginOptions, ChatGptLoginOptions, LoginCancellation,
-    LoginError, device_code_login_with_progress, login, remove_provider_entry,
-    upsert_chatgpt_credentials,
+    CALLBACK_PORTS_BUSY_GUIDANCE, CALLBACK_PORTS_BUSY_SUMMARY, CALLBACK_PORTS_DENIED_GUIDANCE,
+    CALLBACK_PORTS_DENIED_SUMMARY, ChatGptCredentials, ChatGptDeviceCodeLoginOptions,
+    ChatGptLoginOptions, LoginCancellation, LoginError, device_code_login_with_progress, login,
+    remove_provider_entry, upsert_chatgpt_credentials,
 };
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChatGptAuthFlow {
@@ -42,23 +43,39 @@ impl ChatGptAuthError {
         self.action
     }
 
+    /// Callback-port failures already carry their guidance inside the stage
+    /// message, so this surface splits them into the summary plus the action it
+    /// renders separately instead of repeating the same advice twice.
     fn login(error: LoginError) -> Self {
-        let action = match error {
-            LoginError::Cancelled => "Run authentication again when ready.",
-            LoginError::TimedOut => "Retry authentication.",
-            LoginError::Authentication("authorization was denied") => {
-                "Retry and approve access, or use device authentication."
+        let (message, action) = match error {
+            LoginError::CallbackPortsBusy => {
+                (CALLBACK_PORTS_BUSY_SUMMARY, CALLBACK_PORTS_BUSY_GUIDANCE)
             }
-            LoginError::Authentication(_) => "Retry authentication or use device authentication.",
-            LoginError::TokenTransport | LoginError::TokenStatus => "Retry authentication.",
+            LoginError::CallbackPortsDenied => (
+                CALLBACK_PORTS_DENIED_SUMMARY,
+                CALLBACK_PORTS_DENIED_GUIDANCE,
+            ),
+            LoginError::Cancelled => (
+                error.stage_message(),
+                "Run authentication again when ready.",
+            ),
+            LoginError::TimedOut => (error.stage_message(), "Retry authentication."),
+            LoginError::Authentication("authorization was denied") => (
+                error.stage_message(),
+                "Retry and approve access, or use device authentication.",
+            ),
+            LoginError::Authentication(_) => (
+                error.stage_message(),
+                "Retry authentication or use device authentication.",
+            ),
+            LoginError::TokenTransport | LoginError::TokenStatus => {
+                (error.stage_message(), "Retry authentication.")
+            }
             LoginError::TokenFormat | LoginError::Account | LoginError::Expiry => {
-                "Run authentication again."
+                (error.stage_message(), "Run authentication again.")
             }
         };
-        Self {
-            message: error.stage_message(),
-            action,
-        }
+        Self { message, action }
     }
 
     fn persistence() -> Self {
@@ -300,6 +317,28 @@ mod tests {
         );
         assert_eq!(error.action(), "Retry authentication.");
         assert!(!format!("{} {}", error.message(), error.action()).contains("must-not-persist"));
+    }
+
+    #[test]
+    fn busy_or_denied_callback_ports_point_at_device_authentication() {
+        let busy = ChatGptAuthError::login(LoginError::CallbackPortsBusy);
+
+        assert_eq!(
+            busy.message(),
+            "ChatGPT login could not start: loopback callback ports 1455 and 1457 are both in use."
+        );
+        assert_eq!(
+            busy.action(),
+            "Another agens or Codex login is probably running. Close it and retry, or run `agens auth login --device-auth`, which needs no local port."
+        );
+
+        let denied = ChatGptAuthError::login(LoginError::CallbackPortsDenied);
+
+        assert_eq!(
+            denied.message(),
+            "ChatGPT login could not start: binding loopback callback ports 1455 and 1457 was denied."
+        );
+        assert!(denied.action().contains("agens auth login --device-auth"));
     }
 
     fn test_credentials(access_token: &str) -> ChatGptCredentials {
