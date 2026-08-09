@@ -201,19 +201,137 @@ fn page(tools: Vec<McpToolDefinition>, next_cursor: Option<&str>) -> McpResponse
     McpResponse::ToolsListed(McpToolsPage::new(tools, next_cursor.map(str::to_owned)))
 }
 
+/// Deadline for transport calls whose assertions are about framing, limits or retry
+/// accounting rather than about time.
+///
+/// None of those tests observe the deadline, so it only has to be large enough never to
+/// fire and small enough that a genuine hang still fails loudly. A one-second budget is
+/// not large enough: moving a megabyte over loopback and parsing it routinely exceeds it
+/// on a contended core, and every such assertion then reports `TimedOut` instead of the
+/// framing error it was written for. Do not tighten this back toward the observed
+/// latency.
+const UNOBSERVED_DEADLINE: Duration = Duration::from_secs(30);
+
+/// Deadline shared by both attempts of a retried request whose retry is never answered.
+///
+/// It has to comfortably exceed one loopback round trip, because the first attempt must
+/// complete inside it for the retry under test to happen at all; the fifty milliseconds
+/// this replaces are routinely spent before the first response arrives on a contended
+/// core, and the retry then never leaves the client.
+const SHARED_RETRY_DEADLINE: Duration = Duration::from_secs(1);
+
+/// Ceiling on a retried call bounded by [`SHARED_RETRY_DEADLINE`].
+///
+/// The server holding the retry open never answers it, so what this bound proves is that
+/// the call ended on its own deadline rather than on anything the server did. Keep it
+/// close to the deadline — the margin is only there to absorb the cost of noticing the
+/// deadline and unwinding on a loaded machine.
+const SHARED_RETRY_CEILING: Duration = Duration::from_millis(1_800);
+
+/// Authority of an endpoint that can never complete a connection.
+///
+/// The obvious alternative — bind an ephemeral port, drop the listener, then connect —
+/// only holds while nothing else claims the released port, and under a high process-fork
+/// rate the kernel hands it to another socket between the drop and the connect, so the
+/// refusal these tests depend on silently becomes a successful connection. Port zero is
+/// never assigned to a listening socket, so connecting to it always fails to establish
+/// without depending on the state of the rest of the machine.
+const UNREACHABLE_AUTHORITY: &str = "127.0.0.1:0";
+
+/// Binds a listener whose accept loop can be polled, so a fixture never parks in a
+/// blocking `accept` for a client that was cancelled or timed out before connecting.
+fn bind_pollable_listener() -> (TcpListener, std::net::SocketAddr) {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+
+    (listener, address)
+}
+
+/// Waits for one connection while honoring the stop flag, so joining the fixture
+/// terminates even when no client ever arrives.
+fn accept_until_stopped(listener: &TcpListener, stop: &AtomicBool) -> Option<TcpStream> {
+    while !stop.load(Ordering::Acquire) {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                stream.set_nonblocking(false).unwrap();
+                return Some(stream);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return None,
+        }
+    }
+
+    None
+}
+
 fn accept_http_request(listener: &TcpListener) -> (TcpStream, String) {
     let (stream, _) = listener.accept().unwrap();
+    let headers = read_http_request(&stream);
+
+    (stream, headers)
+}
+
+/// Reads a request head from an already accepted connection.
+///
+/// A client that goes away mid-request ends the read instead of leaving the fixture
+/// spinning on an endless stream of empty reads; the truncated head it returns then
+/// fails whatever assertion was written against it.
+fn read_http_request(stream: &TcpStream) -> String {
     let mut reader = BufReader::new(stream.try_clone().unwrap());
     let mut headers = String::new();
 
     loop {
         let mut line = String::new();
-        reader.read_line(&mut line).unwrap();
+        if reader.read_line(&mut line).unwrap() == 0 {
+            return headers;
+        }
         headers.push_str(&line);
         if line == "\r\n" {
-            return (stream, headers);
+            return headers;
         }
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum HttpAttempt {
+    Failed,
+    Stalled,
+}
+
+/// Answers the first request with a retryable failure and then holds the retry open
+/// until the caller stops it, reporting each attempt it observed.
+///
+/// Stalling by holding rather than by sleeping is what lets the caller's deadline be the
+/// only thing that ends the retried call: a fixture that stops on its own clock races
+/// the client, and one that parks in a blocking `accept` never returns at all when the
+/// client gives up before retrying.
+fn stall_the_retry_of_a_failed_attempt(
+    listener: TcpListener,
+    attempts: mpsc::SyncSender<HttpAttempt>,
+    stop: Arc<AtomicBool>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let Some(mut failed) = accept_until_stopped(&listener, &stop) else {
+            return;
+        };
+        read_http_request(&failed);
+        respond(&mut failed, "500 Internal Server Error", b"", "");
+        attempts.send(HttpAttempt::Failed).unwrap();
+
+        let Some(stalled) = accept_until_stopped(&listener, &stop) else {
+            return;
+        };
+        read_http_request(&stalled);
+        attempts.send(HttpAttempt::Stalled).unwrap();
+
+        while !stop.load(Ordering::Acquire) {
+            thread::sleep(Duration::from_millis(1));
+        }
+    })
 }
 
 fn respond(stream: &mut TcpStream, status: &str, body: &[u8], extra_headers: &str) {
@@ -1261,7 +1379,7 @@ fn legacy_sse_transport_retries_transient_failures_with_one_deadline() {
         assert_eq!(
             transport.execute(
                 McpRequest::Initialize(initialize()),
-                &McpOperationContext::new(Arc::new(AtomicBool::new(false)), Duration::from_secs(1))
+                &McpOperationContext::new(Arc::new(AtomicBool::new(false)), UNOBSERVED_DEADLINE)
             ),
             Ok(initialized()),
             "{status} must retry once then accept the SSE response"
@@ -1269,38 +1387,50 @@ fn legacy_sse_transport_retries_transient_failures_with_one_deadline() {
         server.join().unwrap();
     }
 
-    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-    let address = listener.local_addr().unwrap();
-    drop(listener);
-    let mut transport =
-        McpSseTransport::new(format!("http://{address}/events"), Default::default(), 1).unwrap();
+    let mut transport = McpSseTransport::new(
+        format!("http://{UNREACHABLE_AUTHORITY}/events"),
+        Default::default(),
+        1,
+    )
+    .unwrap();
     assert_eq!(
         transport.execute(
             McpRequest::Initialize(initialize()),
-            &McpOperationContext::new(Arc::new(AtomicBool::new(false)), Duration::from_secs(1))
+            &McpOperationContext::new(Arc::new(AtomicBool::new(false)), UNOBSERVED_DEADLINE)
         ),
         Err(McpTransportError::RetriesExhausted)
     );
 
-    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-    let address = listener.local_addr().unwrap();
-    let server = thread::spawn(move || {
-        let (mut failed, _) = accept_http_request(&listener);
-        respond(&mut failed, "500 Internal Server Error", b"", "");
-        let (_events, _) = accept_http_request(&listener);
-        thread::sleep(Duration::from_secs(1));
-    });
+    let (listener, address) = bind_pollable_listener();
+    let (stalled, attempts) = mpsc::sync_channel(2);
+    let stop = Arc::new(AtomicBool::new(false));
+    let server = stall_the_retry_of_a_failed_attempt(listener, stalled, Arc::clone(&stop));
     let mut transport =
         McpSseTransport::new(format!("http://{address}/events"), Default::default(), 1).unwrap();
     let start = Instant::now();
+
     assert_eq!(
         transport.execute(
             McpRequest::Initialize(initialize()),
-            &McpOperationContext::new(Arc::new(AtomicBool::new(false)), Duration::from_millis(50))
+            &McpOperationContext::new(Arc::new(AtomicBool::new(false)), SHARED_RETRY_DEADLINE)
         ),
         Err(McpTransportError::TimedOut)
     );
-    assert!(start.elapsed() < Duration::from_millis(250));
+    assert!(
+        start.elapsed() < SHARED_RETRY_CEILING,
+        "{:?}",
+        start.elapsed()
+    );
+    assert_eq!(
+        attempts.recv_timeout(UNOBSERVED_DEADLINE),
+        Ok(HttpAttempt::Failed)
+    );
+    assert_eq!(
+        attempts.recv_timeout(UNOBSERVED_DEADLINE),
+        Ok(HttpAttempt::Stalled)
+    );
+
+    stop.store(true, Ordering::Release);
     server.join().unwrap();
 }
 
@@ -1435,7 +1565,7 @@ fn legacy_sse_transport_bounds_framing_and_waits_interruptibly() {
     assert_eq!(
         transport.execute(
             McpRequest::Initialize(initialize()),
-            &McpOperationContext::new(Arc::new(AtomicBool::new(false)), Duration::from_secs(1))
+            &McpOperationContext::new(Arc::new(AtomicBool::new(false)), UNOBSERVED_DEADLINE)
         ),
         Err(McpTransportError::Protocol(
             "MCP SSE event exceeds limit".into()
@@ -1443,21 +1573,35 @@ fn legacy_sse_transport_bounds_framing_and_waits_interruptibly() {
     );
     server.join().unwrap();
 
-    for (cancel, expected) in [
-        (true, McpTransportError::Cancelled),
-        (false, McpTransportError::TimedOut),
+    // Each half stalls the server for as long as the client is willing to wait, so a
+    // result arriving at all is what proves the wait was interrupted. Only one bound may
+    // end the call: the cancelled half gets a deadline it cannot reach, and the timed-out
+    // half is never cancelled and gets a deadline long enough that connecting to loopback
+    // cannot consume it, because a deadline that expires before the client connects would
+    // leave the accept below unmatched.
+    for (cancel, deadline, expected) in [
+        (true, UNOBSERVED_DEADLINE, McpTransportError::Cancelled),
+        (
+            false,
+            Duration::from_millis(500),
+            McpTransportError::TimedOut,
+        ),
     ] {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let address = listener.local_addr().unwrap();
+        let (listener, address) = bind_pollable_listener();
         let (started, ready) = mpsc::sync_channel(1);
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_stop = Arc::clone(&stop);
         let server = thread::spawn(move || {
-            let (_stream, _) = accept_http_request(&listener);
+            let Some(_stream) = accept_until_stopped(&listener, &server_stop) else {
+                return;
+            };
             started.send(()).unwrap();
-            thread::sleep(Duration::from_secs(1));
+            while !server_stop.load(Ordering::Acquire) {
+                thread::sleep(Duration::from_millis(1));
+            }
         });
         let cancellation = Arc::new(AtomicBool::new(false));
-        let context =
-            McpOperationContext::new(Arc::clone(&cancellation), Duration::from_millis(50));
+        let context = McpOperationContext::new(Arc::clone(&cancellation), deadline);
         let mut transport =
             McpSseTransport::new(format!("http://{address}/events"), Default::default(), 0)
                 .unwrap();
@@ -1467,16 +1611,16 @@ fn legacy_sse_transport_bounds_framing_and_waits_interruptibly() {
                 .send(transport.execute(McpRequest::Initialize(initialize()), &context))
                 .unwrap();
         });
-        ready.recv_timeout(Duration::from_secs(1)).unwrap();
+        ready.recv_timeout(UNOBSERVED_DEADLINE).unwrap();
         if cancel {
             cancellation.store(true, Ordering::Release);
         }
         assert_eq!(
-            result_receiver
-                .recv_timeout(Duration::from_millis(250))
-                .unwrap(),
+            result_receiver.recv_timeout(UNOBSERVED_DEADLINE).unwrap(),
             Err(expected)
         );
+
+        stop.store(true, Ordering::Release);
         server.join().unwrap();
     }
 }
@@ -1512,7 +1656,7 @@ fn legacy_sse_transport_accepts_exact_limit_exhausts_retries_and_closes_on_curre
         runtime.block_on(async {
             transport.execute(
                 McpRequest::Initialize(initialize()),
-                &McpOperationContext::new(Arc::new(AtomicBool::new(false)), Duration::from_secs(1)),
+                &McpOperationContext::new(Arc::new(AtomicBool::new(false)), UNOBSERVED_DEADLINE),
             )
         }),
         Ok(initialized())
@@ -1520,7 +1664,7 @@ fn legacy_sse_transport_accepts_exact_limit_exhausts_retries_and_closes_on_curre
     transport
         .close(&McpOperationContext::new(
             Arc::new(AtomicBool::new(false)),
-            Duration::from_secs(1),
+            UNOBSERVED_DEADLINE,
         ))
         .unwrap();
     drop(transport);
@@ -1545,7 +1689,7 @@ fn legacy_sse_transport_accepts_exact_limit_exhausts_retries_and_closes_on_curre
         assert_eq!(
             transport.execute(
                 McpRequest::Initialize(initialize()),
-                &McpOperationContext::new(Arc::new(AtomicBool::new(false)), Duration::from_secs(1))
+                &McpOperationContext::new(Arc::new(AtomicBool::new(false)), UNOBSERVED_DEADLINE)
             ),
             Err(McpTransportError::RetriesExhausted)
         );
@@ -1634,7 +1778,7 @@ fn http_transport_rejects_responses_larger_than_one_mib() {
 
     let result = transport.execute(
         McpRequest::Initialize(initialize()),
-        &McpOperationContext::new(cancellation, Duration::from_secs(1)),
+        &McpOperationContext::new(cancellation, UNOBSERVED_DEADLINE),
     );
 
     assert_eq!(
@@ -1687,14 +1831,10 @@ fn http_transport_cancels_a_live_headless_turn_after_request_admission() {
 
 #[test]
 fn http_transport_shares_one_deadline_across_retries_and_retries_network_failures() {
-    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-    let address = listener.local_addr().unwrap();
-    let server = thread::spawn(move || {
-        let (mut first, _) = accept_http_request(&listener);
-        respond(&mut first, "500 Internal Server Error", b"", "");
-        let (_second, _) = accept_http_request(&listener);
-        thread::sleep(Duration::from_secs(1));
-    });
+    let (listener, address) = bind_pollable_listener();
+    let (stalled, attempts) = mpsc::sync_channel(2);
+    let stop = Arc::new(AtomicBool::new(false));
+    let server = stall_the_retry_of_a_failed_attempt(listener, stalled, Arc::clone(&stop));
     let cancellation = Arc::new(AtomicBool::new(false));
     let mut transport =
         McpHttpTransport::new(format!("http://{address}/mcp"), Default::default(), 1).unwrap();
@@ -1703,22 +1843,37 @@ fn http_transport_shares_one_deadline_across_retries_and_retries_network_failure
     assert_eq!(
         transport.execute(
             McpRequest::Initialize(initialize()),
-            &McpOperationContext::new(cancellation, Duration::from_millis(50)),
+            &McpOperationContext::new(cancellation, SHARED_RETRY_DEADLINE),
         ),
         Err(McpTransportError::TimedOut)
     );
-    assert!(start.elapsed() < Duration::from_millis(250));
+    assert!(
+        start.elapsed() < SHARED_RETRY_CEILING,
+        "{:?}",
+        start.elapsed()
+    );
+    assert_eq!(
+        attempts.recv_timeout(UNOBSERVED_DEADLINE),
+        Ok(HttpAttempt::Failed)
+    );
+    assert_eq!(
+        attempts.recv_timeout(UNOBSERVED_DEADLINE),
+        Ok(HttpAttempt::Stalled)
+    );
+
+    stop.store(true, Ordering::Release);
     server.join().unwrap();
 
-    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-    let address = listener.local_addr().unwrap();
-    drop(listener);
-    let mut transport =
-        McpHttpTransport::new(format!("http://{address}/mcp"), Default::default(), 1).unwrap();
+    let mut transport = McpHttpTransport::new(
+        format!("http://{UNREACHABLE_AUTHORITY}/mcp"),
+        Default::default(),
+        1,
+    )
+    .unwrap();
     assert_eq!(
         transport.execute(
             McpRequest::Initialize(initialize()),
-            &McpOperationContext::new(Arc::new(AtomicBool::new(false)), Duration::from_secs(1)),
+            &McpOperationContext::new(Arc::new(AtomicBool::new(false)), UNOBSERVED_DEADLINE),
         ),
         Err(McpTransportError::RetriesExhausted)
     );
@@ -1742,7 +1897,7 @@ fn http_transport_never_retries_protocol_errors_and_accepts_exactly_one_mib() {
     assert!(matches!(
         transport.execute(
             McpRequest::Initialize(initialize()),
-            &McpOperationContext::new(Arc::new(AtomicBool::new(false)), Duration::from_secs(1)),
+            &McpOperationContext::new(Arc::new(AtomicBool::new(false)), UNOBSERVED_DEADLINE),
         ),
         Err(McpTransportError::Protocol(_))
     ));
@@ -1766,7 +1921,7 @@ fn http_transport_never_retries_protocol_errors_and_accepts_exactly_one_mib() {
     assert_eq!(
         transport.execute(
             McpRequest::Initialize(initialize()),
-            &McpOperationContext::new(Arc::new(AtomicBool::new(false)), Duration::from_secs(1)),
+            &McpOperationContext::new(Arc::new(AtomicBool::new(false)), UNOBSERVED_DEADLINE),
         ),
         Ok(initialized())
     );

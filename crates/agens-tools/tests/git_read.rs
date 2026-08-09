@@ -1,8 +1,10 @@
 use std::{
     fs,
+    ops::Deref,
+    path::{Path, PathBuf},
     process::Command,
     sync::atomic::{AtomicUsize, Ordering},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use agens_core::ToolAccess;
@@ -13,17 +15,74 @@ use serde_json::json;
 
 static NEXT_ROOT: AtomicUsize = AtomicUsize::new(0);
 
-fn project_root() -> std::path::PathBuf {
-    let suffix = NEXT_ROOT.fetch_add(1, Ordering::Relaxed);
-    let root = std::env::temp_dir().join(format!("agens-git-read-{}-{suffix}", std::process::id()));
-    fs::create_dir_all(&root).unwrap();
-    root
+/// A temporary project directory that removes itself when the test ends.
+///
+/// The name deliberately does not rest on the process id alone: pids are a
+/// finite, recycled key, so a leaked root from an earlier run can be handed
+/// straight back to a later one. A root that already holds a repository makes
+/// `repository()` replay `git init` on it and fail on an empty commit, which is
+/// why a leak of this kind poisons every future run until `/tmp` is cleared.
+struct ProjectRoot {
+    path: PathBuf,
 }
 
-fn git(root: &std::path::Path, arguments: &[&str]) {
+impl ProjectRoot {
+    fn new() -> Self {
+        let sequence = NEXT_ROOT.fetch_add(1, Ordering::Relaxed);
+        let nanoseconds = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock after Unix epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "agens-git-read-{}-{nanoseconds}-{sequence}",
+            std::process::id()
+        ));
+
+        fs::create_dir_all(&path).expect("temporary project root");
+        assert!(
+            fs::read_dir(&path)
+                .expect("read the temporary project root")
+                .next()
+                .is_none(),
+            "the project root {} already exists and is not empty; \
+             a leaked root from an earlier run would silently poison this test",
+            path.display()
+        );
+
+        Self { path }
+    }
+}
+
+impl Deref for ProjectRoot {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl AsRef<Path> for ProjectRoot {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for ProjectRoot {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+fn project_root() -> ProjectRoot {
+    ProjectRoot::new()
+}
+
+fn git(root: &Path, arguments: &[&str]) {
     let status = Command::new("git")
         .args(arguments)
         .current_dir(root)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
         .env("GIT_AUTHOR_NAME", "agens")
         .env("GIT_AUTHOR_EMAIL", "agens@example.invalid")
         .env("GIT_COMMITTER_NAME", "agens")
@@ -38,7 +97,7 @@ fn git(root: &std::path::Path, arguments: &[&str]) {
 }
 
 /// A repository with one commit on `main` containing `tracked.txt`.
-fn repository() -> std::path::PathBuf {
+fn repository() -> ProjectRoot {
     let root = project_root();
     git(&root, &["init", "--initial-branch=main", "--quiet"]);
     fs::write(root.join("tracked.txt"), "base\n").unwrap();

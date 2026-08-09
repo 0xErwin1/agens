@@ -1519,14 +1519,22 @@ fn live_tool_call_collapses_when_it_ends_and_hides_its_raw_input() {
     tui.handle(Event::Key(Key::CtrlO));
     tui.handle(Event::Key(Key::CtrlO));
     renderer.render(tui.view()).unwrap();
-    let audited = collapse_fixture_rows(&renderer).join("\n");
+    let expanded = collapse_fixture_rows(&renderer).join("\n");
     assert!(
-        audited.contains("timeout_ms"),
-        "the raw input stays reachable through the audit mode: {audited:?}"
+        expanded.contains("cargo test --workspace"),
+        "the expanded row still names the work: {expanded:?}"
     );
     assert!(
-        audited.contains("body-sentinel-line"),
-        "the body stays reachable through the audit mode: {audited:?}"
+        expanded.contains("body-sentinel-line"),
+        "the body comes back with the expanded row: {expanded:?}"
+    );
+    assert!(
+        !expanded.contains("timeout_ms"),
+        "the inline row stays scannable and leaves the rest to the overlay: {expanded:?}"
+    );
+    assert!(
+        !expanded.contains(COLLAPSE_FIXTURE_INPUT),
+        "and never dumps the raw JSON input: {expanded:?}"
     );
 }
 
@@ -3367,7 +3375,7 @@ fn restored_messages_render_every_turn_and_typed_part_in_persisted_order() {
     renderer.render(tui.view()).unwrap();
     let text = rendered_text(&renderer);
 
-    let order = "first user|first reasoning|read|first answer|first result|persisted reminder|second user|second answer";
+    let order = "first user|first reasoning|read|first result|first answer|persisted reminder|second user|second answer";
     let mut offset = 0;
     for expected in order.split('|') {
         let position = text[offset..].find(expected).expect(expected);

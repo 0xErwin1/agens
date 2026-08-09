@@ -2211,12 +2211,24 @@ fn render_frame_content(frame: &mut ratatui::Frame<'_>, state: &ViewState<'_>) {
         screen_layout(area, state.input, state.queue.len())
     };
 
-    let transcript = state.selectable.arc();
     let row_width = layout
         .transcript
         .width
         .saturating_sub(TRANSCRIPT_ROW_INDENT)
         .max(1);
+    // The frame this renderer was handed is the only authority on width. The
+    // cached index is laid out from the width the state last knew about, and
+    // painting rows wrapped for a wider frame would let the buffer clip prose
+    // away with no ellipsis to say anything was lost.
+    let cached = state.selectable.arc();
+    let transcript = if cached.row_width == row_width {
+        cached
+    } else {
+        Arc::new(SelectableTranscript::from_lines(
+            &rendered_transcript_content(state, row_width),
+            row_width,
+        ))
+    };
     // Live status is not in the selectable cache: rebuild only the few status
     // rows from the current clock so spinner and elapsed keep moving.
     let live_status = {
@@ -5263,6 +5275,11 @@ struct SelectableCache {
     epoch: u64,
     transcript_id: TranscriptId,
     row_width: u16,
+    /// Wave frame the cached rows were painted in, when any of them animates.
+    ///
+    /// Only rows carrying a running accent bar change with the clock, so an
+    /// otherwise settled transcript stays cached across every tick.
+    animated_at: Option<u128>,
     transcript: Arc<SelectableTranscript>,
 }
 
@@ -5317,6 +5334,9 @@ struct SelectableRow {
 #[derive(Clone, Debug, Default)]
 struct SelectableTranscript {
     rows: Vec<SelectableRow>,
+    /// Content width these rows were wrapped at, so paint can detect a frame
+    /// whose width the index does not describe.
+    row_width: u16,
 }
 
 impl SelectableTranscript {
@@ -5381,7 +5401,10 @@ impl SelectableTranscript {
             }));
         }
 
-        Self { rows }
+        Self {
+            rows,
+            row_width: width,
+        }
     }
 
     /// How many rows these lines wrap into, without materializing any of them.
@@ -7586,6 +7609,7 @@ where
             let detail = record.tool_detail;
             record.tool_display_modes.insert(call_id, detail);
         }
+        self.bump_selectable_epoch();
         Ok(())
     }
 
@@ -7826,25 +7850,31 @@ where
         let row_width = row_width.max(1);
         let epoch = self.selectable_epoch;
         let transcript_id = state.active_transcript;
+        let wave_frame = widgets::RowAccent::wave_frame(state.now);
 
         if let Some(cache) = self.selectable_cache.borrow().as_ref()
             && cache.epoch == epoch
             && cache.transcript_id == transcript_id
             && cache.row_width == row_width
+            && cache.animated_at.is_none_or(|frame| frame == wave_frame)
         {
             return Arc::clone(&cache.transcript);
         }
 
         let _perf_select = agens_perf::span!("tui.transcript.select", row_width = row_width);
         // Content only: live turn status is time-varying and painted separately.
-        let transcript = Arc::new(SelectableTranscript::from_lines(
-            &rendered_transcript_content(state, row_width),
-            row_width,
-        ));
+        let lines = rendered_transcript_content(state, row_width);
+        let animated_at = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .any(|span| widgets::RowAccent::is_wave_span(span, state.unicode_level))
+            .then_some(wave_frame);
+        let transcript = Arc::new(SelectableTranscript::from_lines(&lines, row_width));
         *self.selectable_cache.borrow_mut() = Some(SelectableCache {
             epoch,
             transcript_id,
             row_width,
+            animated_at,
             transcript: Arc::clone(&transcript),
         });
         transcript
@@ -10929,6 +10959,21 @@ where
     /// sets the same focus `J`/`K` set and opens nothing by itself. Opening the
     /// modal still costs a deliberate click or Enter.
     fn hover_block(&mut self, column: u16, row: u16) -> Action {
+        let layout = self.screen_layout();
+        if layout.transcript.height == 0
+            || row < layout.transcript.y
+            || row >= layout.transcript.bottom()
+            || column < layout.transcript.x
+            || column >= layout.transcript.right()
+        {
+            return Action::Unchanged;
+        }
+        // The transcript block draws a top border, so its first content row sits
+        // one below the rect. A pointer on the border itself owns nothing.
+        if row == layout.transcript.y {
+            return Action::Unchanged;
+        }
+
         let hovered = self.tool_call_id_at(column, row);
         let record = self.active_record_mut();
         if record.focused_call == hovered {

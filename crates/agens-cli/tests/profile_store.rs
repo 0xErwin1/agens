@@ -1,5 +1,6 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -42,12 +43,25 @@ impl TaskRunner for CapturingRunner {
     }
 }
 
+/// A fresh root for one test.
+///
+/// The key carries a timestamp and a per-process sequence on top of the PID
+/// because PIDs wrap: two concurrent runs can share one, and a root that only a
+/// PID distinguishes would then be the same directory. Cleaning on entry is not
+/// a substitute — on a reused PID it deletes the other run's live state.
 fn temporary_directory(label: &str) -> std::path::PathBuf {
+    static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
     let path = std::env::temp_dir().join(format!(
-        "agens-profile-store-{label}-{}",
-        std::process::id()
+        "agens-profile-store-{label}-{}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the system clock must be after the Unix epoch")
+            .as_nanos(),
+        NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
     ));
-    let _ = fs::remove_dir_all(&path);
+
     fs::create_dir_all(&path).expect("temporary directory must be created");
     path
 }

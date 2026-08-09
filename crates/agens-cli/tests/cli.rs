@@ -3497,7 +3497,7 @@ fn production_binary_cancellation_kills_native_bash_descendants_without_continui
         .stderr(Stdio::piped())
         .spawn()
         .expect("production binary should start");
-    wait_for_path(&ready_marker, Duration::from_secs(2));
+    wait_for_path(&ready_marker);
 
     let signal_status = Command::new("kill")
         .args(["-INT", &child.id().to_string()])
@@ -3912,7 +3912,7 @@ fn production_binary_cancels_configured_mcp_call_without_continuing_or_persistin
         .stderr(Stdio::piped())
         .spawn()
         .expect("production binary should start");
-    wait_for_path(&call_ready, Duration::from_secs(2));
+    wait_for_path(&call_ready);
 
     assert!(
         Command::new("kill")
@@ -4290,8 +4290,14 @@ fn production_binary_records_each_sessions_own_identity_in_the_evidence_ledger()
 
 #[test]
 fn production_binary_recovers_from_mcp_infrastructure_failures_and_persists_completed_history() {
+    // `timeout_ms` budgets the connect and the list as well as the call, so the
+    // timeout case is bounded on both sides. Below, it must clear spawning the
+    // child and completing the MCP handshake on a loaded machine: 200ms already
+    // fails there, so do not tighten this. Above, it must stay well under the
+    // five seconds `call-sleep` blocks for, or the call would answer in time and
+    // the case would stop proving that a timeout is what produced the error.
     for (name, mode, timeout_ms, expected_tool_error) in [
-        ("timeout", "call-sleep", 20, "tool operation timed out"),
+        ("timeout", "call-sleep", 1_000, "tool operation timed out"),
         ("crash", "call-crash", 1_000, "tool infrastructure failure"),
         (
             "malformed protocol",
@@ -5623,16 +5629,22 @@ fn sse_response(events: &[&str]) -> String {
     format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{body}")
 }
 
-fn wait_for_path(path: &std::path::Path, timeout: Duration) {
-    let deadline = std::time::Instant::now() + timeout;
-    while !path.exists() {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "timed out waiting for {}",
-            path.display()
-        );
-        thread::sleep(Duration::from_millis(5));
-    }
+/// Blocks until the run under test writes the marker saying it has reached the
+/// work the caller is about to interrupt.
+///
+/// The bound proves nothing by itself: the signal, the exit status, and the
+/// absence of a persisted turn are what prove cancellation. It is here so that a
+/// run which never reaches that work fails loudly instead of hanging, so it must
+/// stay far above spawning the binary, resolving configuration, and completing
+/// the provider round trip on a loaded machine — two seconds did not, and was
+/// the largest single source of failures in this file under load.
+///
+/// Widening it does not widen the window between the marker and the interrupt,
+/// which is what the cancellation cases are actually sensitive to: the caller
+/// signals as soon as the marker appears, and the shared helper polls more
+/// tightly than this one used to.
+fn wait_for_path(path: &std::path::Path) {
+    agens_fixtures::wait_for(&path.display().to_string(), || path.exists().then_some(()));
 }
 
 fn wait_for_child_output(

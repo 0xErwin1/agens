@@ -2234,6 +2234,24 @@ pub enum PermissionDecision {
     Deny,
 }
 
+/// Whether a permission answer was decided, or merely fell through to
+/// dangerous mode's unmatched-call fallback.
+///
+/// The hard safety floors a person may waive for themselves — writing outside
+/// the project root after an explicit Allow — must stay standing for a call
+/// nobody decided on. Dangerous mode answers what no rule, grant, configured
+/// floor or opted-in bypass ever named, so its `Allow` is not an authorization
+/// anyone gave and cannot buy a call more reach than confinement grants.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PermissionAuthority {
+    /// A static rule, a grant, the configured floor, an interactive Allow or an
+    /// opted-in session bypass named this call.
+    #[default]
+    Decided,
+    /// Nothing named this call; dangerous mode allowed it automatically.
+    DangerousFallback,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PermissionScope {
     Global,
@@ -3239,16 +3257,45 @@ impl PermissionPolicy {
         session: &PermissionSession,
         unmatched_allow: bool,
     ) -> PermissionDecision {
-        self.stated_decision(request, project_grants, session_grants)
-            .unwrap_or_else(|| {
-                let fallback = if unmatched_allow {
-                    PermissionDecision::Allow
-                } else {
-                    PermissionDecision::Ask
-                };
+        self.evaluate_with_unmatched_authority(
+            request,
+            project_grants,
+            session_grants,
+            session,
+            unmatched_allow,
+        )
+        .0
+    }
 
-                Self::resolve_ask(fallback, session)
-            })
+    /// Resolves `request` exactly like [`Self::evaluate_with_unmatched_override`]
+    /// and also reports whether the answer was decided or fell through to
+    /// dangerous mode's fallback. See [`PermissionAuthority`] for why the
+    /// difference outlives the decision itself.
+    pub fn evaluate_with_unmatched_authority(
+        &self,
+        request: &PermissionRequest,
+        project_grants: &[ProjectPermissionGrant],
+        session_grants: &[ProjectPermissionGrant],
+        session: &PermissionSession,
+        unmatched_allow: bool,
+    ) -> (PermissionDecision, PermissionAuthority) {
+        let Some(stated) = self.stated_decision(request, project_grants, session_grants) else {
+            let fallback = if unmatched_allow {
+                PermissionDecision::Allow
+            } else {
+                PermissionDecision::Ask
+            };
+
+            let authority = if unmatched_allow && !session.temporary_bypass {
+                PermissionAuthority::DangerousFallback
+            } else {
+                PermissionAuthority::Decided
+            };
+
+            return (Self::resolve_ask(fallback, session), authority);
+        };
+
+        (stated, PermissionAuthority::Decided)
     }
 
     /// What a rule, a grant or the operator's configured floor states about
