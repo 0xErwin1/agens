@@ -5,7 +5,7 @@ use std::{
     path::{Component, Path},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -1580,16 +1580,71 @@ pub trait HeadlessToolDispatcher {
     ) -> impl Future<Output = Result<HeadlessToolOutput, HeadlessTurnPortError>> + Send;
 }
 
+/// Source of "now" for a cancellation's deadline checks.
+///
+/// Production is always `System`: the manual variant is unreachable without a
+/// [`ManualDeadlineClock`], and the only way to obtain one is
+/// [`HeadlessTurnCancellation::with_manual_deadline_for_test`].
+#[derive(Clone, Debug, Default)]
+enum DeadlineClock {
+    #[default]
+    System,
+    Manual(Arc<ManualDeadlineClockState>),
+}
+
+impl DeadlineClock {
+    fn now(&self) -> Instant {
+        match self {
+            Self::System => Instant::now(),
+            Self::Manual(state) => state.now(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ManualDeadlineClockState {
+    origin: Instant,
+    advanced_nanos: AtomicU64,
+}
+
+impl ManualDeadlineClockState {
+    fn now(&self) -> Instant {
+        self.origin + Duration::from_nanos(self.advanced_nanos.load(Ordering::Acquire))
+    }
+}
+
+/// Moves the clock of a cancellation built by
+/// [`HeadlessTurnCancellation::with_manual_deadline_for_test`].
+///
+/// The clock it drives is shared with that cancellation, every cancellation
+/// derived from it through
+/// [`HeadlessTurnCancellation::derived_with_timeout`], and their adapter
+/// views. It does not reach deadlines that were copied out as bare `Instant`s.
+#[derive(Clone, Debug)]
+pub struct ManualDeadlineClock {
+    state: Arc<ManualDeadlineClockState>,
+}
+
+impl ManualDeadlineClock {
+    pub fn advance(&self, step: Duration) {
+        let step = u64::try_from(step.as_nanos()).unwrap_or(u64::MAX);
+
+        self.state.advanced_nanos.fetch_add(step, Ordering::AcqRel);
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct HeadlessTurnCancellation {
     cancelled: Arc<AtomicBool>,
     deadline: Option<Instant>,
+    clock: DeadlineClock,
 }
 
 #[derive(Clone, Debug)]
 pub struct HeadlessTurnCancellationAdapter {
     cancelled: Arc<AtomicBool>,
     deadline: Option<Instant>,
+    clock: DeadlineClock,
 }
 
 impl HeadlessTurnCancellationAdapter {
@@ -1600,7 +1655,7 @@ impl HeadlessTurnCancellationAdapter {
     pub fn remaining_duration(&self) -> Option<Duration> {
         self.deadline.map(|deadline| {
             deadline
-                .checked_duration_since(Instant::now())
+                .checked_duration_since(self.clock.now())
                 .unwrap_or(Duration::ZERO)
         })
     }
@@ -1623,7 +1678,31 @@ impl HeadlessTurnCancellation {
         Self {
             cancelled: Arc::new(AtomicBool::new(false)),
             deadline: Some(Instant::now() + timeout),
+            clock: DeadlineClock::System,
         }
+    }
+
+    /// Deadline that expires only when the returned clock is advanced.
+    ///
+    /// A deadline built with [`Self::with_deadline`] starts running at
+    /// construction, so a test can only ever bet that wall time crosses it
+    /// inside the intended window. This one stands still until the test moves
+    /// it, which lets the test fire the deadline at an exact point in the code
+    /// under test — typically from a callback that path already invokes.
+    pub fn with_manual_deadline_for_test(timeout: Duration) -> (Self, ManualDeadlineClock) {
+        let state = Arc::new(ManualDeadlineClockState {
+            origin: Instant::now(),
+            advanced_nanos: AtomicU64::new(0),
+        });
+        let deadline = state.origin + timeout;
+
+        let cancellation = Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            deadline: Some(deadline),
+            clock: DeadlineClock::Manual(Arc::clone(&state)),
+        };
+
+        (cancellation, ManualDeadlineClock { state })
     }
 
     pub fn with_cancellation_and_deadline(
@@ -1633,6 +1712,25 @@ impl HeadlessTurnCancellation {
         Self {
             cancelled,
             deadline,
+            clock: DeadlineClock::System,
+        }
+    }
+
+    /// Cancellation for a nested operation: the same cancellation flag and the
+    /// same clock, with the deadline tightened to `timeout` from now.
+    ///
+    /// Deriving through this instead of re-reading the wall clock is what keeps
+    /// a nested operation on the clock its parent was built with.
+    pub fn derived_with_timeout(&self, timeout: Duration) -> Self {
+        let operation_deadline = self.clock.now() + timeout;
+        let deadline = self.deadline.map_or(operation_deadline, |deadline| {
+            deadline.min(operation_deadline)
+        });
+
+        Self {
+            cancelled: Arc::clone(&self.cancelled),
+            deadline: Some(deadline),
+            clock: self.clock.clone(),
         }
     }
 
@@ -1646,13 +1744,14 @@ impl HeadlessTurnCancellation {
 
     pub fn is_expired(&self) -> bool {
         self.deadline
-            .is_some_and(|deadline| Instant::now() >= deadline)
+            .is_some_and(|deadline| self.clock.now() >= deadline)
     }
 
     pub fn adapter_view(&self) -> HeadlessTurnCancellationAdapter {
         HeadlessTurnCancellationAdapter {
             cancelled: Arc::clone(&self.cancelled),
             deadline: self.deadline,
+            clock: self.clock.clone(),
         }
     }
 }

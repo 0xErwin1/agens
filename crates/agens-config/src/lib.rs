@@ -49,7 +49,35 @@ pub struct ConfigPaths {
     pub project_config: PathBuf,
 }
 
+/// Budget for a single MCP tool call. This is what `mcp_defaults.timeout_ms`
+/// and a server's own `timeout_ms` mean.
 pub const DEFAULT_MCP_TIMEOUT_MS: u64 = 30_000;
+
+/// Floor for the MCP connect handshake, applied independently of the
+/// configured call timeout.
+///
+/// The child process is already spawned before this budget starts, so what it
+/// covers is the server's own cold start: an interpreter booting its runtime
+/// and loading the SDK before it can answer `initialize`. That cost is unrelated
+/// to how long a tool call is allowed to take, and on a loaded machine it is
+/// measured in seconds — tightening this floor turns a slow start into a server
+/// that never appears at all.
+///
+/// The resulting connect budget doubles as the shutdown budget: `McpTimeouts`
+/// has no separate close phase, so raising this floor also lengthens how long
+/// agens waits for a server to stop.
+pub const DEFAULT_MCP_CONNECT_TIMEOUT_MS: u64 = 10_000;
+
+/// Floor for `tools/list`, applied independently of the configured call
+/// timeout.
+///
+/// It shares its value with [`DEFAULT_MCP_CONNECT_TIMEOUT_MS`] and its failure
+/// mode: what it covers is a whole paginated catalog from a large server —
+/// several round trips, each carrying every tool's schema — and not the single
+/// call a user sizes `timeout_ms` for. Tightening it toward that call turns a
+/// large or distant server into one that connects and then exposes no tools at
+/// all, which reads as a broken server rather than as a budget that was cut.
+pub const DEFAULT_MCP_LIST_TIMEOUT_MS: u64 = 10_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum McpTransport {
@@ -558,7 +586,7 @@ pub const SETTINGS: &[SettingSpec] = &[
             maximum: 600_000,
         },
         default: SettingValue::Integer(DEFAULT_MCP_TIMEOUT_MS as i64),
-        doc: "Request timeout for servers that omit their own.",
+        doc: "Timeout for a single MCP tool call, for servers that omit their own. Connect and tool listing keep their own floors.",
     },
     SettingSpec {
         path: "mcp_defaults.max_retries",

@@ -12,8 +12,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::os::unix::fs::MetadataExt;
 
 use agens_providers::chatgpt_login::{
-    ChatGptCredentials, ChatGptDeviceCodeLoginOptions, ChatGptLoginOptions, LoginCancellation,
-    LoginError, account_id_from_id_token, authorization_url, device_code_login,
+    CALLBACK_PORTS, CALLBACK_PORTS_BUSY_GUIDANCE, CALLBACK_PORTS_BUSY_SUMMARY,
+    CALLBACK_PORTS_DENIED_GUIDANCE, CALLBACK_PORTS_DENIED_SUMMARY, ChatGptCredentials,
+    ChatGptDeviceCodeLoginOptions, ChatGptLoginOptions, LoginCancellation, LoginError,
+    account_id_from_id_token, authorization_url, device_code_login,
     device_code_login_with_progress, generate_pkce, generate_state, login,
     upsert_chatgpt_credentials, upsert_provider_entry, upsert_provider_entry_with_deadline,
 };
@@ -1390,7 +1392,118 @@ fn login_times_out_without_a_callback() {
 }
 
 #[test]
+fn login_reports_busy_callback_ports_with_device_authentication_guidance() {
+    let occupied = [
+        TcpListener::bind("127.0.0.1:0").expect("first candidate port should bind"),
+        TcpListener::bind("127.0.0.1:0").expect("second candidate port should bind"),
+    ];
+    let options = ChatGptLoginOptions {
+        callback_ports: occupied
+            .iter()
+            .map(|listener| {
+                listener
+                    .local_addr()
+                    .expect("candidate port should be bound")
+                    .port()
+            })
+            .collect(),
+        timeout: Duration::from_secs(30),
+        ..ChatGptLoginOptions::for_test("http://127.0.0.1:1/authorize", "http://127.0.0.1:1/token")
+    };
+
+    let error = login(options, LoginCancellation::new()).expect_err("busy ports must fail login");
+
+    assert_eq!(error, LoginError::CallbackPortsBusy);
+    assert_eq!(
+        error.stage_message(),
+        "ChatGPT login could not start: loopback callback ports 1455 and 1457 are both in use.\n\
+         Another agens or Codex login is probably running. Close it and retry, or run\n\
+         `agens auth login --device-auth`, which needs no local port."
+    );
+    assert_eq!(error.to_string(), error.stage_message());
+    drop(occupied);
+}
+
+#[test]
+fn busy_callback_port_message_names_the_default_ports() {
+    assert_eq!(CALLBACK_PORTS, [1455, 1457]);
+    assert!(CALLBACK_PORTS_BUSY_SUMMARY.contains("1455 and 1457"));
+    assert!(CALLBACK_PORTS_DENIED_SUMMARY.contains("1455 and 1457"));
+    assert_eq!(
+        LoginError::CallbackPortsBusy
+            .stage_message()
+            .replace('\n', " "),
+        format!("{CALLBACK_PORTS_BUSY_SUMMARY} {CALLBACK_PORTS_BUSY_GUIDANCE}")
+    );
+    assert_eq!(
+        LoginError::CallbackPortsDenied
+            .stage_message()
+            .replace('\n', " "),
+        format!("{CALLBACK_PORTS_DENIED_SUMMARY} {CALLBACK_PORTS_DENIED_GUIDANCE}")
+    );
+}
+
+#[test]
+fn login_separates_denied_binds_from_busy_callback_ports() {
+    for (kinds, expected) in [
+        (
+            vec![std::io::ErrorKind::AddrInUse, std::io::ErrorKind::AddrInUse],
+            LoginError::CallbackPortsBusy,
+        ),
+        (
+            vec![
+                std::io::ErrorKind::AddrInUse,
+                std::io::ErrorKind::PermissionDenied,
+            ],
+            LoginError::CallbackPortsDenied,
+        ),
+        (
+            vec![
+                std::io::ErrorKind::PermissionDenied,
+                std::io::ErrorKind::AddrInUse,
+            ],
+            LoginError::CallbackPortsDenied,
+        ),
+        (
+            vec![
+                std::io::ErrorKind::AddrNotAvailable,
+                std::io::ErrorKind::AddrInUse,
+            ],
+            LoginError::Authentication("loopback callback is unavailable"),
+        ),
+    ] {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let options = ChatGptLoginOptions {
+            callback_ports: vec![1455, 1457],
+            timeout: Duration::from_secs(30),
+            bind_port: Arc::new(move |_| {
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                Err(std::io::Error::from(kinds[attempt]))
+            }),
+            ..ChatGptLoginOptions::for_test(
+                "http://127.0.0.1:1/authorize",
+                "http://127.0.0.1:1/token",
+            )
+        };
+
+        let error =
+            login(options, LoginCancellation::new()).expect_err("failed binds must fail login");
+
+        assert_eq!(error, expected);
+        if expected != LoginError::CallbackPortsBusy {
+            assert!(!error.to_string().contains("are both in use"));
+        }
+    }
+}
+
+#[test]
 fn callback_rejects_duplicate_parameters_malformed_encoding_and_untrusted_hosts() {
+    // Scaffolding budgets, not the property under test: the login deadline must stay well
+    // above the response wait so a loaded machine surfaces the callback rejection instead of
+    // `TimedOut`, and both must stay under the suite's per-test wall clock.
+    const CALLBACK_LOGIN_TIMEOUT: Duration = Duration::from_secs(60);
+    const CALLBACK_RESPONSE_WAIT: Duration = Duration::from_secs(15);
+
     for query_and_host in [
         (
             "state={state}&state=duplicate&code=authorization-code",
@@ -1411,7 +1524,7 @@ fn callback_rejects_duplicate_parameters_malformed_encoding_and_untrusted_hosts(
         let (status_send, status_receive) = mpsc::channel();
         let options = ChatGptLoginOptions {
             callback_ports: vec![0],
-            timeout: Duration::from_secs(1),
+            timeout: CALLBACK_LOGIN_TIMEOUT,
             open_browser: Arc::new(move |url| {
                 let url = url::Url::parse(url).expect("authorization URL should parse");
                 let redirect = url
@@ -1440,7 +1553,7 @@ fn callback_rejects_duplicate_parameters_malformed_encoding_and_untrusted_hosts(
                 )?;
                 let status_send = status_send.clone();
                 thread::spawn(move || {
-                    let _ = callback.set_read_timeout(Some(Duration::from_secs(1)));
+                    let _ = callback.set_read_timeout(Some(CALLBACK_RESPONSE_WAIT));
                     let mut response = [0_u8; 128];
                     let mut status = String::new();
                     while !status.contains("\r\n") {
@@ -1467,7 +1580,7 @@ fn callback_rejects_duplicate_parameters_malformed_encoding_and_untrusted_hosts(
         assert!(matches!(error, LoginError::Authentication(_)));
         assert!(!error.to_string().contains("private-remote-text"));
         let status = status_receive
-            .recv_timeout(Duration::from_secs(1))
+            .recv_timeout(CALLBACK_RESPONSE_WAIT)
             .expect("callback response");
         assert!(status.starts_with("HTTP/1.1 400"), "response: {status:?}");
     }

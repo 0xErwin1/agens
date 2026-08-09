@@ -13,13 +13,15 @@
 //! distinguishable from other high-entropy text (a padded base64 blob, for example) on shape
 //! alone, so it is accepted as a residual risk rather than mangling unrelated content.
 
-const CREDENTIAL_KEYS: [&str; 11] = [
+const CREDENTIAL_KEYS: [&str; 13] = [
     "api_key",
     "apikey",
     "api-key",
     "x-api-key",
     "authorization",
+    "credential",
     "password",
+    "private_key",
     "secret",
     "token",
     "access_token",
@@ -278,32 +280,84 @@ fn is_credential_shaped_value(value: &str) -> bool {
         && value.chars().any(char::is_alphabetic)
 }
 
-/// Whether `name` carries a known credential key as a whole `_`/`-`-delimited segment.
+/// Whether `name` carries a known credential key as a whole segment.
 ///
 /// Real credentials are namespaced far more often than they are bare — `GITHUB_TOKEN`,
 /// `AWS_SECRET_ACCESS_KEY`, `DATABASE_PASSWORD` — so requiring the whole name to equal a known
 /// key would recognize only the rarest form. Matching at segment boundaries is what keeps a
 /// benign word that merely contains one (`tokenizer`, `passwordless`, `secretary`) from
 /// matching.
+///
+/// A segment boundary is not only a literal `_`, `-` or `.`: names reaching this predicate come
+/// from JSON tool payloads as often as from environment variables, and camelCase is the
+/// dominant convention there, so `accessToken` has to be recognized exactly as `access_token`
+/// is. A plural segment is the same secret as its singular (`tokens`, `api_keys`), and missing
+/// it is worse than missing a scalar, because the sinks that prune on this predicate prune at
+/// the parent path — a missed plural leaves every element of the array rendered.
 pub fn is_credential_key(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    if lower.is_empty() || !lower.chars().all(is_credential_key_char) {
+    if name.is_empty() || !name.chars().all(is_credential_key_char) {
         return false;
     }
 
+    let normalized = normalize_key_boundaries(name);
+
     CREDENTIAL_KEYS
         .iter()
-        .any(|key| contains_credential_key_segment(&lower, key))
+        .any(|key| contains_credential_key_segment(&normalized, key))
 }
 
 fn is_credential_key_char(character: char) -> bool {
-    character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
+    character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
+}
+
+/// Lowercases `name` after making every implicit word boundary explicit, so the segment scan
+/// below only ever has to look for a literal separator.
+fn normalize_key_boundaries(name: &str) -> String {
+    let characters: Vec<char> = name.chars().collect();
+    let mut normalized = String::with_capacity(characters.len());
+
+    for (index, character) in characters.iter().enumerate() {
+        if index > 0 && opens_camel_case_word(&characters, index) {
+            normalized.push('_');
+        }
+
+        normalized.push(character.to_ascii_lowercase());
+    }
+
+    normalized
+}
+
+/// Whether the character at `index` starts a new word without a separator in front of it: an
+/// uppercase letter after a lowercase or a digit (`accessToken`), or the last letter of an
+/// acronym run that runs into a lowercase word (`XApiKey`).
+fn opens_camel_case_word(characters: &[char], index: usize) -> bool {
+    if !characters[index].is_ascii_uppercase() {
+        return false;
+    }
+
+    let previous = characters[index - 1];
+
+    previous.is_ascii_lowercase()
+        || previous.is_ascii_digit()
+        || (previous.is_ascii_uppercase()
+            && characters
+                .get(index + 1)
+                .is_some_and(char::is_ascii_lowercase))
 }
 
 fn contains_credential_key_segment(name: &str, key: &str) -> bool {
     name.match_indices(key).any(|(start, matched)| {
-        is_key_segment_boundary(name, start) && is_key_segment_boundary(name, start + matched.len())
+        is_key_segment_boundary(name, start) && ends_key_segment(name, start + matched.len())
     })
+}
+
+/// A key segment ends either at a boundary or at a plural `s` that itself sits before one.
+fn ends_key_segment(name: &str, offset: usize) -> bool {
+    if is_key_segment_boundary(name, offset) {
+        return true;
+    }
+
+    name.as_bytes().get(offset) == Some(&b's') && is_key_segment_boundary(name, offset + 1)
 }
 
 /// `name` is validated as ASCII by [`is_credential_key`] before this is reached, so byte
@@ -313,8 +367,8 @@ fn is_key_segment_boundary(name: &str, offset: usize) -> bool {
         return true;
     }
 
-    matches!(name.as_bytes().get(offset - 1), Some(b'_' | b'-'))
-        || matches!(name.as_bytes().get(offset), Some(b'_' | b'-'))
+    matches!(name.as_bytes().get(offset - 1), Some(b'_' | b'-' | b'.'))
+        || matches!(name.as_bytes().get(offset), Some(b'_' | b'-' | b'.'))
 }
 
 fn is_bare_key_with_operator(word: &str) -> bool {
@@ -1026,6 +1080,98 @@ mod tests {
         for (name, input) in cases {
             assert_eq!(redact_credential_values(input), input, "case: {name}");
         }
+    }
+
+    /// The predicate is the single gate every key-based sink prunes on, so a name it misses is
+    /// a secret rendered verbatim somewhere. JSON tool payloads name their arguments in
+    /// camelCase and hold collections under plural names, and both were invisible to a scan
+    /// that only recognized `_`/`-` boundaries.
+    #[test]
+    fn is_credential_key_recognizes_camel_case_plural_and_dotted_names() {
+        let credential_names = [
+            "accessToken",
+            "authToken",
+            "refreshToken",
+            "clientSecret",
+            "bearerToken",
+            "privateKey",
+            "apiKey",
+            "xApiKey",
+            "XApiKey",
+            "sessionPassword",
+            "tokens",
+            "secrets",
+            "passwords",
+            "api_keys",
+            "credentials",
+            "accessTokens",
+            "token.value",
+            "auth.accessToken",
+            "GITHUB_TOKEN",
+            "AWS_SECRET_ACCESS_KEY",
+            "x-api-key",
+            "token",
+        ];
+
+        for name in credential_names {
+            assert!(is_credential_key(name), "must be credential-shaped: {name}");
+        }
+
+        let benign_names = [
+            "tokenizer",
+            "passwordless",
+            "secretary",
+            "tokenizers",
+            "path",
+            "command",
+            "content",
+            "timeout_ms",
+            "key",
+            "keys",
+            "publicId",
+            "",
+            "token value",
+            "secret/token",
+        ];
+
+        for name in benign_names {
+            assert!(
+                !is_credential_key(name),
+                "must not be credential-shaped: {name}"
+            );
+        }
+    }
+
+    /// Widening the predicate widens every value rule built on it, so the shapes that were
+    /// deliberately left alone have to stay alone: a benign value after a credential key, and a
+    /// sentence that merely counts tokens.
+    #[test]
+    fn widened_key_matching_does_not_redact_benign_values() {
+        let cases = [
+            "request exceeds 128000 tokens",
+            "maxTokens: 128000",
+            "max_tokens: 128000",
+            "tokens: none",
+            "accessToken: missing",
+            "credentials: invalid",
+        ];
+
+        for input in cases {
+            assert_eq!(redact_credential_values(input), input, "case: {input}");
+        }
+    }
+
+    /// The one shape plural matching costs: a `key=value` pair glued into a single token is
+    /// replaced on the key alone, with no test of the value, because a short or low-entropy
+    /// secret is still a secret. A token COUNT written in that shape is therefore withheld too.
+    /// This is a visibly marked loss of a diagnostic number, traded against rendering every
+    /// element of a `tokens` array verbatim, and the count survives in every spaced shape.
+    #[test]
+    fn plural_matching_withholds_a_glued_token_count_as_its_accepted_cost() {
+        assert_eq!(
+            redact_credential_values("max_tokens=128000 exceeded"),
+            "max_tokens=[redacted: 6 characters] exceeded"
+        );
     }
 
     #[test]

@@ -51,8 +51,8 @@ pub use git_read::{GitReadInput, GitReadOperation};
 pub use http_mcp::{McpHttpTransport, McpSseTransport};
 pub use mcp_status::{
     MAX_MCP_STATUS_TOOL_NAMES, McpEndpointSummary, McpErrorCategory, McpLifecycleState,
-    McpServerDescriptor, McpServerSource, McpServerStatus, McpServerTransport, McpStatusError,
-    McpStatusHandle, McpStatusSnapshot,
+    McpLoadPhase, McpServerDescriptor, McpServerSource, McpServerStatus, McpServerTransport,
+    McpStatusError, McpStatusHandle, McpStatusSnapshot,
 };
 pub use stdio_mcp::{McpStdioTransport, McpStdioTransportConfig};
 pub use task::{
@@ -2497,6 +2497,9 @@ impl McpRegistry {
     /// register and no later `discover_server` call will resolve them. Without
     /// this, such a server would never appear in the shared status handle and
     /// would silently vanish from `/mcp` instead of surfacing as failed.
+    ///
+    /// No transport exists yet, so the failure is recorded against the connect
+    /// phase.
     pub fn register_failed_server(
         &mut self,
         descriptor: McpServerDescriptor,
@@ -2516,7 +2519,7 @@ impl McpRegistry {
             server_name,
             message: message.to_owned(),
         };
-        self.record_report(&report, Some(category));
+        self.record_report(&report, Some((category, McpLoadPhase::Connect)));
         Ok(())
     }
 
@@ -2536,7 +2539,7 @@ impl McpRegistry {
                 McpServerSource::Global,
                 McpServerTransport::Stdio,
                 true,
-                timeouts.connect,
+                timeouts.call,
                 None,
             ),
             factory,
@@ -2642,7 +2645,7 @@ impl McpRegistry {
         limits: McpLimits,
         cancellation: Arc<AtomicBool>,
     ) -> McpServerReport {
-        let mut category = None;
+        let mut failure = None;
         let report = match load_server_client(
             server_name,
             transport,
@@ -2659,7 +2662,7 @@ impl McpRegistry {
                 });
                 if conflicts || has_duplicate_qualified_name(&metadata) {
                     client.close();
-                    category = Some(McpErrorCategory::Protocol);
+                    failure = Some((McpErrorCategory::Protocol, McpLoadPhase::ListTools));
                     McpServerReport::Failed {
                         server_name: server_name.into(),
                         message: MCP_DUPLICATE_TOOL_NAMES_REASON.into(),
@@ -2678,16 +2681,16 @@ impl McpRegistry {
                     McpServerReport::loaded(server_name, tool_count)
                 }
             }
-            Err(error) => {
+            Err(McpLoadFailure { phase, error }) => {
                 let resolved_category = McpErrorCategory::from(&error);
-                category = Some(resolved_category);
+                failure = Some((resolved_category, phase));
                 McpServerReport::Failed {
                     server_name: server_name.into(),
-                    message: sanitized_mcp_load_error(resolved_category, &error),
+                    message: sanitized_mcp_load_error(resolved_category, phase, &error),
                 }
             }
         };
-        self.record_report(&report, category);
+        self.record_report(&report, failure);
         report
     }
 
@@ -2773,9 +2776,9 @@ impl McpRegistry {
                 let category = McpErrorCategory::from(&error);
                 let report = McpServerReport::Failed {
                     server_name: server_name.into(),
-                    message: sanitized_mcp_load_error(category, &error),
+                    message: sanitized_mcp_load_error(category, McpLoadPhase::Connect, &error),
                 };
-                self.record_report(&report, Some(category));
+                self.record_report(&report, Some((category, McpLoadPhase::Connect)));
                 report
             }
         }
@@ -2786,11 +2789,18 @@ impl McpRegistry {
             server_name: server_name.into(),
             message: "mcp server is unavailable".into(),
         };
-        self.record_report(&report, Some(McpErrorCategory::Unavailable));
+        self.record_report(
+            &report,
+            Some((McpErrorCategory::Unavailable, McpLoadPhase::Connect)),
+        );
         report
     }
 
-    fn record_report(&mut self, report: &McpServerReport, category: Option<McpErrorCategory>) {
+    fn record_report(
+        &mut self,
+        report: &McpServerReport,
+        failure: Option<(McpErrorCategory, McpLoadPhase)>,
+    ) {
         match report {
             McpServerReport::Loaded {
                 server_name,
@@ -2823,7 +2833,8 @@ impl McpRegistry {
                     },
                 );
                 let degraded = self.clients.contains_key(server_name);
-                let category = category.unwrap_or(McpErrorCategory::Unavailable);
+                let (category, phase) =
+                    failure.unwrap_or((McpErrorCategory::Unavailable, McpLoadPhase::Connect));
                 self.status.update(server_name, |status| {
                     status.state = if degraded {
                         McpLifecycleState::Degraded
@@ -2832,6 +2843,7 @@ impl McpRegistry {
                     };
                     status.last_error = Some(McpStatusError {
                         category,
+                        phase,
                         message: message.clone(),
                     });
                 });
@@ -2913,21 +2925,45 @@ const MCP_DUPLICATE_TOOL_NAMES_REASON: &str = "protocol: duplicate tool names";
 /// Renders a load failure as a sanitized, agens-authored reason.
 ///
 /// The result never interpolates remote text (bodies, headers, or messages
-/// from the MCP server) — only the error category and, for HTTP status
-/// failures, the numeric status code agens itself observed on the wire.
-fn sanitized_mcp_load_error(category: McpErrorCategory, error: &McpTransportError) -> String {
-    match (category, error) {
-        (McpErrorCategory::Cancelled, _) => "cancelled: connect cancelled".into(),
-        (McpErrorCategory::Timeout, _) => "timeout: connect timed out".into(),
-        (McpErrorCategory::RetriesExhausted, _) => {
+/// from the MCP server) — only the error category, the phase agens itself
+/// observed the failure in, and, for HTTP status failures, the numeric status
+/// code seen on the wire.
+///
+/// Timeouts name their phase because connect and tool listing hold separate
+/// budgets: a `tools/list` timeout reported as a connect timeout would send an
+/// operator to verify a handshake that already succeeded.
+fn sanitized_mcp_load_error(
+    category: McpErrorCategory,
+    phase: McpLoadPhase,
+    error: &McpTransportError,
+) -> String {
+    match (category, phase, error) {
+        (McpErrorCategory::Cancelled, McpLoadPhase::Connect, _) => {
+            "cancelled: connect cancelled".into()
+        }
+        (McpErrorCategory::Cancelled, McpLoadPhase::ListTools, _) => {
+            "cancelled: tool listing cancelled".into()
+        }
+        (McpErrorCategory::Timeout, McpLoadPhase::Connect, _) => {
+            "timeout: connect timed out".into()
+        }
+        (McpErrorCategory::Timeout, McpLoadPhase::ListTools, _) => {
+            "timeout: tool listing timed out; raise timeout_ms".into()
+        }
+        (McpErrorCategory::RetriesExhausted, _, _) => {
             "retries_exhausted: server did not respond".into()
         }
-        (McpErrorCategory::Protocol, _) => "protocol: server response rejected".into(),
-        (McpErrorCategory::Transport, McpTransportError::HttpStatus(status)) => {
+        (McpErrorCategory::Protocol, _, _) => "protocol: server response rejected".into(),
+        (McpErrorCategory::Transport, _, McpTransportError::HttpStatus(status)) => {
             format!("transport: http status {status}")
         }
-        (McpErrorCategory::Transport, _) => "transport: connection failed".into(),
-        (McpErrorCategory::Unavailable, _) => "mcp server load failed; reload to retry".into(),
+        (McpErrorCategory::Transport, McpLoadPhase::Connect, _) => {
+            "transport: connection failed".into()
+        }
+        (McpErrorCategory::Transport, McpLoadPhase::ListTools, _) => {
+            "transport: tool listing failed".into()
+        }
+        (McpErrorCategory::Unavailable, _, _) => "mcp server load failed; reload to retry".into(),
     }
 }
 
@@ -2940,40 +2976,90 @@ mod mcp_sanitized_error_tests {
         let cases = [
             (
                 McpErrorCategory::Cancelled,
+                McpLoadPhase::Connect,
                 McpTransportError::Cancelled,
                 "cancelled: connect cancelled",
             ),
             (
+                McpErrorCategory::Cancelled,
+                McpLoadPhase::ListTools,
+                McpTransportError::Cancelled,
+                "cancelled: tool listing cancelled",
+            ),
+            (
                 McpErrorCategory::Timeout,
+                McpLoadPhase::Connect,
                 McpTransportError::TimedOut,
                 "timeout: connect timed out",
             ),
             (
+                McpErrorCategory::Timeout,
+                McpLoadPhase::ListTools,
+                McpTransportError::TimedOut,
+                "timeout: tool listing timed out; raise timeout_ms",
+            ),
+            (
                 McpErrorCategory::RetriesExhausted,
+                McpLoadPhase::Connect,
                 McpTransportError::RetriesExhausted,
                 "retries_exhausted: server did not respond",
             ),
             (
                 McpErrorCategory::Protocol,
+                McpLoadPhase::ListTools,
                 McpTransportError::Protocol("SENTINEL_SECRET body".into()),
                 "protocol: server response rejected",
             ),
             (
                 McpErrorCategory::Transport,
+                McpLoadPhase::Connect,
                 McpTransportError::Transport("SENTINEL_SECRET body".into()),
                 "transport: connection failed",
             ),
             (
                 McpErrorCategory::Transport,
+                McpLoadPhase::ListTools,
+                McpTransportError::Transport("SENTINEL_SECRET body".into()),
+                "transport: tool listing failed",
+            ),
+            (
+                McpErrorCategory::Transport,
+                McpLoadPhase::Connect,
                 McpTransportError::HttpStatus(406),
                 "transport: http status 406",
             ),
         ];
 
-        for (category, error, expected) in cases {
-            let message = sanitized_mcp_load_error(category, &error);
+        for (category, phase, error, expected) in cases {
+            let message = sanitized_mcp_load_error(category, phase, &error);
             assert_eq!(message, expected);
             assert!(!message.contains("SENTINEL_SECRET"));
+        }
+    }
+}
+
+/// A load failure together with the startup phase it happened in.
+///
+/// The two phases hold independent budgets, so collapsing them would report a
+/// `tools/list` failure as a connect failure and point the operator at the
+/// wrong knob.
+struct McpLoadFailure {
+    phase: McpLoadPhase,
+    error: McpTransportError,
+}
+
+impl McpLoadFailure {
+    fn connect(error: McpTransportError) -> Self {
+        Self {
+            phase: McpLoadPhase::Connect,
+            error,
+        }
+    }
+
+    fn list_tools(error: McpTransportError) -> Self {
+        Self {
+            phase: McpLoadPhase::ListTools,
+            error,
         }
     }
 }
@@ -2985,23 +3071,32 @@ fn load_server_client<T: McpTransport>(
     timeouts: McpTimeouts,
     limits: McpLimits,
     cancellation: Arc<AtomicBool>,
-) -> Result<(Vec<RemoteToolMetadata>, McpClient<T>), McpTransportError> {
-    validate_server_name(server_name)?;
+) -> Result<(Vec<RemoteToolMetadata>, McpClient<T>), McpLoadFailure> {
+    validate_server_name(server_name).map_err(McpLoadFailure::connect)?;
+
     let mut client = McpClient::new(transport, timeouts, limits);
+
     let result = client
         .connect(initialize, &cancellation)
-        .and_then(|_| client.list_tools(&cancellation))
+        .map_err(McpLoadFailure::connect)
+        .and_then(|_| {
+            client
+                .list_tools(&cancellation)
+                .map_err(McpLoadFailure::list_tools)
+        })
         .and_then(|tools| {
             tools
                 .into_iter()
                 .map(|tool| remote_tool_metadata(server_name, tool))
-                .collect()
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(McpLoadFailure::list_tools)
         });
+
     match result {
         Ok(metadata) => Ok((metadata, client)),
-        Err(error) => {
+        Err(failure) => {
             client.close();
-            Err(error)
+            Err(failure)
         }
     }
 }
@@ -3223,6 +3318,9 @@ impl<T: McpTransport> McpClient<T> {
         let _ = self.transport.close(context);
         Err(primary)
     }
+    /// Shuts the transport down, budgeting the shutdown with the connect
+    /// timeout: `McpTimeouts` carries no separate close budget, and a server
+    /// slow to start is the same server slow to stop.
     fn close(&mut self) {
         let context =
             McpOperationContext::new(Arc::new(AtomicBool::new(false)), self.timeouts.connect);

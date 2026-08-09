@@ -610,7 +610,12 @@ fn summarize_arguments_by_value(raw: &str) -> Option<String> {
     let mut parts = Vec::new();
     let mut width = 0usize;
     for (key, value) in arguments.iter().take(MAX_SUMMARIZED_KEYS) {
-        let key = truncate_operand(key, MAX_SUMMARIZED_KEY_WIDTH);
+        // The key is judged whole and shortened only for display: a name clipped
+        // to its budget, or carrying a newline, is no longer credential-shaped to
+        // the predicate even though the argument it names still holds a secret.
+        let is_credential = is_credential_key(key);
+        let key = truncate_operand(&collapse_whitespace(key), MAX_SUMMARIZED_KEY_WIDTH);
+
         let rendered = match value {
             Value::Object(_) => "{…}".to_owned(),
             Value::Array(items) => format!("[{}]", items.len()),
@@ -619,7 +624,7 @@ fn summarize_arguments_by_value(raw: &str) -> Option<String> {
             // alone. Judging it by its own shape asks the wrong question: a
             // short or low-entropy secret is still a secret, and the argument
             // called `token` announced what it holds.
-            _ if is_credential_key(&key) => "[redacted]".to_owned(),
+            _ if is_credential => "[redacted]".to_owned(),
             Value::String(text) => {
                 let text = redact_credential_values(&collapse_whitespace(text));
                 truncate_operand(&text, MAX_SUMMARIZED_VALUE_WIDTH)
@@ -850,7 +855,7 @@ fn raw_argument_fields(raw_input: &str, already_rendered: &[String]) -> Vec<(Str
 /// Appends `value` under `path`, descending into objects and arrays so a nested
 /// argument reaches the reader as text rather than as a JSON body.
 fn flatten_argument_value(path: &str, value: &Value, fields: &mut Vec<(String, String)>) {
-    if is_credential_key(last_path_segment(path)) {
+    if path_carries_credential_key(path) {
         fields.push((path.to_owned(), "[redacted]".to_owned()));
         return;
     }
@@ -875,12 +880,20 @@ fn flatten_argument_value(path: &str, value: &Value, fields: &mut Vec<(String, S
     }
 }
 
-fn last_path_segment(path: &str) -> &str {
-    path.rsplit('.').next().unwrap_or(path)
+/// Whether a flattened argument path names a credential anywhere along its length.
+///
+/// The index brackets are the flattener's own, but a JSON key may itself carry one, so the path
+/// is split on them and every part is offered to the predicate — which treats the dot the
+/// flattener inserts and a dot inside an original key alike. Testing only the text after the
+/// last dot let a key that contains one (`token.value`) escape pruning entirely.
+fn path_carries_credential_key(path: &str) -> bool {
+    path.split(['[', ']']).any(is_credential_key)
 }
 
 /// One `name: value` line, or a labelled block when the value spans lines.
 fn format_detail_field(name: &str, value: &str) -> String {
+    let name = detail_field_name(name);
+
     if !value.contains('\n') {
         return format!("{name}: {value}");
     }
@@ -891,6 +904,32 @@ fn format_detail_field(name: &str, value: &str) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     format!("{name}:\n{body}")
+}
+
+/// Renders an argument name so it cannot move a row boundary.
+///
+/// An argument name is a JSON key and can carry any character, while the body this function
+/// writes into encodes field boundaries positionally: [`argument_fields`] opens a field at every
+/// row starting in column zero and continues one at every indented row. A raw newline in a key
+/// would therefore split one argument into two rows an operator reads as two separate
+/// arguments, and a key opening with the continuation indent would fold into the argument above
+/// it — fabricating and hiding arguments respectively, in the view whose whole purpose is
+/// auditing what the model asked a tool to do. Escaping keeps the key legible without letting
+/// it reach the layout.
+fn detail_field_name(name: &str) -> String {
+    let mut rendered = String::with_capacity(name.len());
+
+    for character in name.chars() {
+        if character.is_control() {
+            rendered.extend(character.escape_debug());
+        } else if character == ' ' && rendered.is_empty() {
+            rendered.push_str("\\u{20}");
+        } else {
+            rendered.push(character);
+        }
+    }
+
+    rendered
 }
 
 /// Inline Expanded argument body: the primary field only, so the transcript
@@ -1184,6 +1223,20 @@ pub(crate) struct ToolResultBlock {
 const PREVIEW_HEAD_LINES: usize = 5;
 const PREVIEW_TAIL_LINES: usize = 3;
 
+/// Content rows the tool detail overlay asks its layout for.
+///
+/// [`ARGUMENT_PREVIEW_ROWS`] is derived from this, so the two cannot drift: a
+/// change here has to be a deliberate change to how much of the overlay the
+/// argument section is allowed to claim.
+pub(crate) const TOOL_DETAIL_CONTENT_ROWS: u16 = 24;
+
+/// Rows the overlay's argument section spends before it starts eliding.
+///
+/// Half of [`TOOL_DETAIL_CONTENT_ROWS`], so the Output heading lands on the
+/// same screen as the arguments: bounding the section would buy nothing if it
+/// only traded one long scroll for another.
+const ARGUMENT_PREVIEW_ROWS: usize = TOOL_DETAIL_CONTENT_ROWS as usize / 2;
+
 /// Head/tail preview window for a [`DisplayMode::Truncated`] body.
 ///
 /// Bodies short enough to fit the window are returned unchanged so the marker
@@ -1195,12 +1248,102 @@ pub(crate) fn bounded_tool_preview(body: &[Line<'static>]) -> Vec<Line<'static>>
 
     let hidden = body.len() - PREVIEW_HEAD_LINES - PREVIEW_TAIL_LINES;
     let mut preview = body[..PREVIEW_HEAD_LINES].to_vec();
-    preview.push(Line::from(Span::styled(
-        format!("… {hidden} more lines · Ctrl+O for full output"),
-        Style::default().fg(RolePalette::muted()),
+    preview.push(elision_marker(format!(
+        "… {hidden} more lines · Ctrl+O for full output"
     )));
     preview.extend_from_slice(&body[body.len() - PREVIEW_TAIL_LINES..]);
     preview
+}
+
+/// Bounded rendering of the overlay's argument section.
+///
+/// [`tool_argument_detail_text`] keeps every argument, which a `Write` content
+/// or a wide MCP array turns into hundreds of rows. Two budgets bound what the
+/// preview level draws without dropping anything: one field is previewed
+/// head/tail so it cannot crowd the others out of the section, and the section
+/// itself stops on a whole-field boundary so no value is ever shown without the
+/// name it belongs to. Each elision says what it hid and which key shows all of
+/// it; the overlay's own state still carries the full text.
+pub(crate) fn bounded_argument_preview(args: &str) -> Vec<Line<'static>> {
+    let fields = argument_fields(args);
+
+    let mut rows: Vec<Line<'static>> = Vec::new();
+    for (index, field) in fields.iter().enumerate() {
+        let bounded = bounded_argument_field(field);
+
+        if index > 0 && rows.len() + bounded.len() > ARGUMENT_PREVIEW_ROWS {
+            let hidden = fields.len() - index;
+            let noun = if hidden == 1 { "argument" } else { "arguments" };
+            rows.push(elision_marker(format!(
+                "… {hidden} more {noun} · Ctrl+O for all arguments"
+            )));
+            break;
+        }
+
+        rows.extend(bounded);
+    }
+
+    rows
+}
+
+/// Lines of an argument body grouped by the field they belong to.
+///
+/// [`format_detail_field`] indents every continuation line by two spaces and no
+/// argument name starts with one, so a line at column zero always opens a field.
+fn argument_fields(args: &str) -> Vec<Vec<&str>> {
+    let mut fields: Vec<Vec<&str>> = Vec::new();
+
+    for line in args.lines() {
+        match fields.last_mut() {
+            Some(field) if line.starts_with("  ") => field.push(line),
+            _ => fields.push(vec![line]),
+        }
+    }
+
+    fields
+}
+
+/// Head/tail preview window for the rows of a single argument.
+///
+/// A field is returned whole whenever eliding it would hide fewer rows than the
+/// marker announcing the elision costs — the `+ 1` — so the reader is never told
+/// that something was withheld in exchange for seeing less of it.
+fn bounded_argument_field(field: &[&str]) -> Vec<Line<'static>> {
+    if field.len() <= PREVIEW_HEAD_LINES + PREVIEW_TAIL_LINES + 1 {
+        return field.iter().copied().map(argument_line).collect();
+    }
+
+    let hidden = field.len() - PREVIEW_HEAD_LINES - PREVIEW_TAIL_LINES;
+    let mut preview: Vec<Line<'static>> = field[..PREVIEW_HEAD_LINES]
+        .iter()
+        .copied()
+        .map(argument_line)
+        .collect();
+    preview.push(elision_marker(format!(
+        "… {hidden} more lines · Ctrl+O for all arguments"
+    )));
+    preview.extend(
+        field[field.len() - PREVIEW_TAIL_LINES..]
+            .iter()
+            .copied()
+            .map(argument_line),
+    );
+    preview
+}
+
+/// One argument row of the detail overlay, styled as machine text.
+pub(crate) fn argument_line(text: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        text.to_owned(),
+        Style::default().fg(RolePalette::machine()),
+    ))
+}
+
+fn elision_marker(text: String) -> Line<'static> {
+    Line::from(Span::styled(
+        text,
+        Style::default().fg(RolePalette::muted()),
+    ))
 }
 
 fn short_tool_name(name: &str) -> String {
@@ -1843,6 +1986,206 @@ mod tests {
         );
 
         assert_eq!(full_body.len(), 40, "expanded still shows the whole body");
+    }
+
+    /// One oversized argument must not spend the whole section: the reader still
+    /// has to see that the call carried the arguments that came after it.
+    #[test]
+    fn a_long_argument_value_is_previewed_without_hiding_the_arguments_after_it() {
+        let content = (1..=200)
+            .map(|index| format!("line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let args = tool_argument_detail_text(
+            &ToolInput::Write {
+                path: "src/lib.rs".into(),
+            },
+            &serde_json::json!({
+                "path": "src/lib.rs",
+                "content": content,
+                "timeout_ms": 600_000,
+            })
+            .to_string(),
+        );
+
+        let preview: Vec<String> = bounded_argument_preview(&args)
+            .iter()
+            .map(line_text)
+            .collect();
+
+        assert!(preview.len() <= ARGUMENT_PREVIEW_ROWS, "{preview:?}");
+        assert!(preview.iter().any(|row| row == "path: src/lib.rs"));
+        assert!(preview.iter().any(|row| row == "  line 1"));
+        assert!(!preview.iter().any(|row| row == "  line 100"));
+        assert!(preview.iter().any(|row| row == "  line 200"));
+        assert!(
+            preview.iter().any(|row| row == "timeout_ms: 600000"),
+            "the argument after the long one stays visible, as its own field rather than folded \
+             into the value above it: {preview:?}"
+        );
+        assert!(
+            preview
+                .iter()
+                .any(|row| row.contains("193 more lines") && row.contains("Ctrl+O")),
+            "the elision names the hidden count and the way to all of it: {preview:?}"
+        );
+    }
+
+    /// The section budget cuts between arguments, never inside one: a value row
+    /// stranded from the name above it is unreadable, not merely shortened.
+    #[test]
+    fn the_argument_section_stops_on_a_whole_argument_and_counts_what_it_hid() {
+        let arguments: serde_json::Map<String, serde_json::Value> = (1..=30)
+            .map(|index| {
+                (
+                    format!("arg{index:02}"),
+                    serde_json::Value::String(format!("value {index}")),
+                )
+            })
+            .collect();
+        let raw = serde_json::Value::Object(arguments).to_string();
+        let args = tool_argument_detail_text(
+            &ToolInput::Other {
+                name: "mcp::wide".into(),
+                raw: raw.clone(),
+            },
+            &raw,
+        );
+
+        let preview: Vec<String> = bounded_argument_preview(&args)
+            .iter()
+            .map(line_text)
+            .collect();
+
+        assert!(preview.len() <= ARGUMENT_PREVIEW_ROWS + 1, "{preview:?}");
+        assert_eq!(preview[0], "arg01: value 1");
+        assert_eq!(
+            preview.last().map(String::as_str),
+            Some("… 18 more arguments · Ctrl+O for all arguments"),
+            "{preview:?}"
+        );
+    }
+
+    /// The overlay is the audit surface: a credential an MCP server names the way its own
+    /// ecosystem names them — camelCase, plural, or with a dot inside the key — must never reach
+    /// a rendered row, whatever shape its value happens to have.
+    ///
+    /// The long key is load-bearing: it exceeds [`MAX_SUMMARIZED_KEY_WIDTH`], so the summary can
+    /// only recognize it while the predicate still sees the whole name. Judging the display key
+    /// instead leaves a name ending in `…` that no longer looks credential-shaped, and the
+    /// deliberately low-entropy value under it has nothing else to be caught by.
+    #[test]
+    fn no_credential_reaches_the_overlay_under_a_camel_case_plural_or_dotted_key() {
+        let secret = "ghp_ABCDEFghijkl0123456789";
+        let low_entropy_secret = "deploy-me-please";
+        let raw = serde_json::json!({
+            "accessToken": secret,
+            "tokens": [secret],
+            "token.value": secret,
+            "nested": { "clientSecret": secret },
+            "items": [{ "authToken": secret }],
+            "deployment_configuration_token": low_entropy_secret,
+            "path": "src/lib.rs",
+        })
+        .to_string();
+
+        let args = tool_argument_detail_text(
+            &ToolInput::Other {
+                name: "mcp::deploy".into(),
+                raw: raw.clone(),
+            },
+            &raw,
+        );
+
+        assert!(
+            !args.contains(secret) && !args.contains(low_entropy_secret),
+            "the overlay body leaks it: {args:?}"
+        );
+        assert!(
+            args.lines()
+                .filter(|row| row.ends_with("[redacted]"))
+                .count()
+                == 6,
+            "every credential-shaped argument is withheld: {args:?}"
+        );
+        assert!(
+            args.lines().any(|row| row == "path: src/lib.rs"),
+            "an unrelated argument still arrives: {args:?}"
+        );
+
+        let summary = summarize_args("mcp::deploy", &raw);
+        assert!(!summary.contains(secret), "{summary:?}");
+        assert!(
+            !summary.contains(low_entropy_secret),
+            "a credential key too long to display whole is still a credential key: {summary:?}"
+        );
+    }
+
+    /// The overlay body carries field boundaries in its own layout, so a JSON key is a place an
+    /// attacker can try to write rows from. A forged row is a fabricated argument in the one
+    /// view an operator reads to decide whether a call is safe.
+    #[test]
+    fn a_newline_in_an_argument_name_cannot_forge_an_overlay_row() {
+        let raw = serde_json::json!({ "path\ncommand": "rm -rf /" }).to_string();
+
+        let args = tool_argument_detail_text(
+            &ToolInput::Other {
+                name: "mcp::deploy".into(),
+                raw: raw.clone(),
+            },
+            &raw,
+        );
+
+        assert_eq!(
+            args.lines().count(),
+            1,
+            "one argument stays one row: {args:?}"
+        );
+        assert_eq!(argument_fields(&args).len(), 1, "{args:?}");
+
+        let preview: Vec<String> = bounded_argument_preview(&args)
+            .iter()
+            .map(line_text)
+            .collect();
+
+        assert_eq!(preview.len(), 1, "{preview:?}");
+        assert!(preview[0].starts_with("path\\ncommand: "), "{preview:?}");
+    }
+
+    /// A name opening with the continuation indent is the same defect from the other side: the
+    /// argument folds into the one above it and disappears from the count.
+    #[test]
+    fn a_leading_indent_in_an_argument_name_cannot_hide_an_argument() {
+        let raw = serde_json::json!({ "command": "ls", "  hidden": "value" }).to_string();
+
+        let args = tool_argument_detail_text(
+            &ToolInput::Bash {
+                command: "ls".into(),
+            },
+            &raw,
+        );
+
+        assert_eq!(argument_fields(&args).len(), 2, "{args:?}");
+    }
+
+    /// Bounding is for bodies that overflow. A short argument list must arrive
+    /// whole and unmarked, or the marker becomes noise the reader learns to skip.
+    #[test]
+    fn a_short_argument_list_is_shown_whole_and_unmarked() {
+        let raw = r#"{"command":"cargo test","timeout_ms":600000}"#;
+        let args = tool_argument_detail_text(
+            &ToolInput::Bash {
+                command: "cargo test".into(),
+            },
+            raw,
+        );
+
+        let preview: Vec<String> = bounded_argument_preview(&args)
+            .iter()
+            .map(line_text)
+            .collect();
+
+        assert_eq!(preview, ["command: cargo test", "timeout_ms: 600000"]);
     }
 
     #[test]

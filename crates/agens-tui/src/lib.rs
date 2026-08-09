@@ -2431,14 +2431,26 @@ fn render_frame_content(frame: &mut ratatui::Frame<'_>, state: &ViewState<'_>) {
     }
 
     if let Some(overlay) = state.tool_overlay {
-        render_tool_detail_overlay(frame, area, overlay);
+        let arguments = state
+            .tool_display_modes
+            .get(&overlay.call_id)
+            .copied()
+            .unwrap_or(state.tool_detail);
+        render_tool_detail_overlay(frame, area, overlay, arguments);
     }
 }
 
+/// Draws the tool detail modal.
+///
+/// `arguments` is the detail level the reader last asked for on this call. Only
+/// [`widgets::DisplayMode::Expanded`] draws every argument row: the other levels hide
+/// a body in the transcript, which the overlay must never do — it exists to show
+/// what the call carried — so they draw the bounded, marked preview instead.
 fn render_tool_detail_overlay(
     frame: &mut ratatui::Frame<'_>,
     area: Rect,
     overlay: &ToolDetailOverlay,
+    arguments: widgets::DisplayMode,
 ) {
     let shortcuts = [
         widgets::OverlayShortcut {
@@ -2460,7 +2472,7 @@ fn render_tool_detail_overlay(
         tabs: None,
         shortcuts: &shortcuts,
         sizing: widgets::OverlaySizing::tool_detail(),
-        desired_content_rows: 24,
+        desired_content_rows: widgets::TOOL_DETAIL_CONTENT_ROWS,
     };
     let Some(layout) = widgets::OverlayLayout::solve(area, &config) else {
         return;
@@ -2475,11 +2487,10 @@ fn render_tool_detail_overlay(
                 .fg(widgets::RolePalette::muted())
                 .add_modifier(Modifier::BOLD),
         ));
-        for line in overlay.args.lines() {
-            lines.push(Line::styled(
-                line.to_owned(),
-                Style::default().fg(widgets::RolePalette::machine()),
-            ));
+        if arguments == widgets::DisplayMode::Expanded {
+            lines.extend(overlay.args.lines().map(widgets::argument_line));
+        } else {
+            lines.extend(widgets::bounded_argument_preview(&overlay.args));
         }
         lines.push(Line::default());
     }

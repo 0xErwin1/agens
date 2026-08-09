@@ -465,6 +465,8 @@ mod tests {
             LoginError::Authentication("setup detail"),
             LoginError::Authentication("callback request is invalid"),
             LoginError::Authentication("authorization was denied"),
+            LoginError::CallbackPortsBusy,
+            LoginError::CallbackPortsDenied,
             LoginError::TokenTransport,
             LoginError::TokenStatus,
             LoginError::TokenFormat,
