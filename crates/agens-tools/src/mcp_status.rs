@@ -33,6 +33,29 @@ pub enum McpLifecycleState {
     Closed,
 }
 
+/// The phase of server startup a failure happened in.
+///
+/// Connect and tool listing are budgeted separately, so a failure that names
+/// the wrong phase sends the operator after the wrong budget: a `tools/list`
+/// timeout reported as a connect timeout looks like an unreachable server even
+/// though the handshake succeeded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum McpLoadPhase {
+    Connect,
+    ListTools,
+}
+
+impl McpLoadPhase {
+    /// How a failure in this phase reads in a one-line operator notice,
+    /// completing "mcp: {server} ...".
+    pub const fn failure_summary(&self) -> &'static str {
+        match self {
+            Self::Connect => "failed to connect",
+            Self::ListTools => "failed to list tools",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum McpErrorCategory {
     Cancelled,
@@ -149,6 +172,8 @@ impl McpServerDescriptor {
         self.enabled
     }
 
+    /// The configured budget for a single tool call on this server. Connect and
+    /// tool listing are budgeted separately and are not described by this value.
     pub const fn timeout(&self) -> Duration {
         self.timeout
     }
@@ -161,12 +186,17 @@ impl McpServerDescriptor {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct McpStatusError {
     pub(crate) category: McpErrorCategory,
+    pub(crate) phase: McpLoadPhase,
     pub(crate) message: String,
 }
 
 impl McpStatusError {
     pub const fn category(&self) -> McpErrorCategory {
         self.category
+    }
+
+    pub const fn phase(&self) -> McpLoadPhase {
+        self.phase
     }
 
     pub fn message(&self) -> &str {

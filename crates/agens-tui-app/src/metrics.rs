@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use agens_core::{MessagePart, NoticeSeverity, TurnEvent, TurnState};
-use agens_tools::{McpErrorCategory, McpLifecycleState, McpStatusHandle};
+use agens_tools::{McpErrorCategory, McpLifecycleState, McpLoadPhase, McpStatusHandle};
 use agens_tui::{BridgeCancel, BridgeTx, DiffLine, DiffLineKind, ToolResultState, TuiRuntimeEvent};
 
 use agens_error::CliError;
@@ -75,10 +75,10 @@ impl TuiMetricsPublisher {
     /// failure notices again.
     ///
     /// The notice text is composed exclusively from the server name and the
-    /// error category's closed label — never from the server's raw error
-    /// message — so remote-controlled text can never reach it even if a
-    /// future caller of `register_failed_server` forgets to sanitize its
-    /// own message.
+    /// closed labels of the failing phase and error category — never from the
+    /// server's raw error message — so remote-controlled text can never reach
+    /// it even if a future caller of `register_failed_server` forgets to
+    /// sanitize its own message.
     fn publish_mcp_notices(&self) {
         let Some(mcp) = self.mcp.as_ref() else {
             return;
@@ -103,12 +103,14 @@ impl TuiMetricsPublisher {
             if !noticed.insert(descriptor.name().to_owned()) {
                 continue;
             }
-            let category = server
-                .last_error()
-                .map_or(McpErrorCategory::Unavailable, |error| error.category());
+            let (category, phase) = server.last_error().map_or(
+                (McpErrorCategory::Unavailable, McpLoadPhase::Connect),
+                |error| (error.category(), error.phase()),
+            );
             let text = format!(
-                "mcp: {} failed to connect ({})",
+                "mcp: {} {} ({})",
                 descriptor.name(),
+                phase.failure_summary(),
                 category.label()
             );
             let _ = self.bridge.publish(

@@ -20,7 +20,8 @@ use agens_providers::{
 };
 use agens_store::{PermissionGrantStore, SessionStore, ToolFactStore, open_media};
 use agens_tools::{
-    EffectiveCapabilitySet, McpErrorCategory, McpLifecycleState, McpStatusHandle, TaskMessageTarget,
+    EffectiveCapabilitySet, McpErrorCategory, McpLifecycleState, McpLoadPhase, McpStatusHandle,
+    TaskMessageTarget,
 };
 
 use agens_agents::{AgentModelCompatibility, agent_catalog};
@@ -450,10 +451,10 @@ pub fn headless_turn_provider_base_url(
 /// the shared status handle, in the exact form the parent turn's caller
 /// prints to stderr.
 ///
-/// The text is composed exclusively from the server name and the error
-/// category's closed label — never from the server's raw error message — so
-/// remote-controlled text can never reach a terminal even if a future caller
-/// forgets to sanitize its own message.
+/// The text is composed exclusively from the server name and the closed labels
+/// of the failing phase and error category — never from the server's raw error
+/// message — so remote-controlled text can never reach a terminal even if a
+/// future caller forgets to sanitize its own message.
 fn mcp_failure_notice_lines(status: &McpStatusHandle) -> Vec<String> {
     status
         .snapshot()
@@ -467,12 +468,14 @@ fn mcp_failure_notice_lines(status: &McpStatusHandle) -> Vec<String> {
             )
         })
         .map(|server| {
-            let category = server
-                .last_error()
-                .map_or(McpErrorCategory::Unavailable, |error| error.category());
+            let (category, phase) = server.last_error().map_or(
+                (McpErrorCategory::Unavailable, McpLoadPhase::Connect),
+                |error| (error.category(), error.phase()),
+            );
             format!(
-                "mcp: {} failed to connect ({})",
+                "mcp: {} {} ({})",
                 server.descriptor().name(),
+                phase.failure_summary(),
                 category.label()
             )
         })
@@ -800,8 +803,8 @@ mod tests {
     use agens_core::{HeadlessTurnError, MessagePart, TurnEvent};
     use agens_providers::ProviderFailureDetail;
     use agens_tools::{
-        McpErrorCategory, McpRegistry, McpServerDescriptor, McpServerSource, McpServerTransport,
-        McpStatusHandle,
+        McpErrorCategory, McpLoadPhase, McpRegistry, McpServerDescriptor, McpServerSource,
+        McpServerStatus, McpServerTransport, McpStatusHandle,
     };
 
     #[test]
@@ -943,6 +946,168 @@ mod tests {
                 "mcp: engram failed to connect (timeout)",
             ]
         );
+    }
+
+    /// The discovery reports `production_tool_runtime_for_parent` returns are
+    /// not the headless surface: every report is also recorded on the shared
+    /// status handle, which is what the parent turn prints to stderr. This
+    /// walks a real connect timeout through discovery to prove the two agree.
+    #[test]
+    fn a_connect_timeout_during_discovery_reaches_the_headless_stderr_notice() {
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        use agens_tool_runtime::mcp::ProductionMcpRuntime;
+        use agens_tools::{
+            McpLimits, McpOperationContext, McpRequest, McpResponse, McpTimeouts, McpTransport,
+            McpTransportError, ToolDispatcher,
+        };
+
+        struct TimingOutTransport;
+
+        impl McpTransport for TimingOutTransport {
+            fn execute(
+                &mut self,
+                _: McpRequest,
+                _: &McpOperationContext,
+            ) -> Result<McpResponse, McpTransportError> {
+                Err(McpTransportError::TimedOut)
+            }
+
+            fn notify(
+                &mut self,
+                _: McpRequest,
+                _: &McpOperationContext,
+            ) -> Result<(), McpTransportError> {
+                Ok(())
+            }
+
+            fn close(&mut self, _: &McpOperationContext) -> Result<(), McpTransportError> {
+                Ok(())
+            }
+        }
+
+        let status = McpStatusHandle::default();
+        let mut registry = McpRegistry::with_status_handle(status.clone());
+        registry
+            .configure_server_with_descriptor(
+                descriptor("engram", true),
+                || Ok(Box::new(TimingOutTransport)),
+                McpTimeouts::new(
+                    Duration::from_secs(10),
+                    Duration::from_secs(10),
+                    Duration::from_millis(200),
+                )
+                .unwrap(),
+                McpLimits::default(),
+            )
+            .unwrap();
+
+        let mut runtime = ProductionMcpRuntime {
+            registry: Arc::new(Mutex::new(registry)),
+            dispatcher: Arc::new(Mutex::new(ToolDispatcher::new())),
+        };
+        let (tools, reports) = runtime.discover_configured_tools().unwrap();
+
+        assert!(tools.is_empty());
+        assert!(reports.iter().all(agens_tools::McpServerReport::is_failed));
+
+        let lines = mcp_failure_notice_lines(&status);
+
+        assert_eq!(lines, vec!["mcp: engram failed to connect (timeout)"]);
+        assert!(!lines.join("\n").contains("failed to list tools"));
+    }
+
+    /// Connect and `tools/list` hold separate budgets, so a server that
+    /// answers `initialize` and then blows the list budget must not be
+    /// reported as a connect failure: the operator would verify a handshake
+    /// that already succeeded instead of widening the list budget.
+    #[test]
+    fn a_tool_listing_timeout_during_discovery_is_reported_as_a_list_failure() {
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        use agens_tool_runtime::mcp::ProductionMcpRuntime;
+        use agens_tools::{
+            MCP_PROTOCOL_VERSION, McpInitializeResult, McpLimits, McpOperationContext, McpRequest,
+            McpResponse, McpTimeouts, McpTransport, McpTransportError, ToolDispatcher,
+        };
+
+        #[derive(Default)]
+        struct ListTimingOutTransport {
+            initialized: bool,
+        }
+
+        impl McpTransport for ListTimingOutTransport {
+            fn execute(
+                &mut self,
+                _: McpRequest,
+                _: &McpOperationContext,
+            ) -> Result<McpResponse, McpTransportError> {
+                if self.initialized {
+                    return Err(McpTransportError::TimedOut);
+                }
+
+                self.initialized = true;
+                Ok(McpResponse::Initialized(McpInitializeResult::new(
+                    MCP_PROTOCOL_VERSION,
+                    serde_json::json!({"tools": {}}),
+                )))
+            }
+
+            fn notify(
+                &mut self,
+                _: McpRequest,
+                _: &McpOperationContext,
+            ) -> Result<(), McpTransportError> {
+                Ok(())
+            }
+
+            fn close(&mut self, _: &McpOperationContext) -> Result<(), McpTransportError> {
+                Ok(())
+            }
+        }
+
+        let status = McpStatusHandle::default();
+        let mut registry = McpRegistry::with_status_handle(status.clone());
+        registry
+            .configure_server_with_descriptor(
+                descriptor("engram", true),
+                || Ok(Box::new(ListTimingOutTransport::default())),
+                McpTimeouts::new(
+                    Duration::from_secs(10),
+                    Duration::from_secs(10),
+                    Duration::from_millis(200),
+                )
+                .unwrap(),
+                McpLimits::default(),
+            )
+            .unwrap();
+
+        let mut runtime = ProductionMcpRuntime {
+            registry: Arc::new(Mutex::new(registry)),
+            dispatcher: Arc::new(Mutex::new(ToolDispatcher::new())),
+        };
+        let (tools, reports) = runtime.discover_configured_tools().unwrap();
+
+        assert!(tools.is_empty());
+        assert!(reports.iter().all(agens_tools::McpServerReport::is_failed));
+        assert_eq!(
+            mcp_failure_notice_lines(&status),
+            vec!["mcp: engram failed to list tools (timeout)"]
+        );
+
+        let snapshot = status.snapshot();
+        let error = snapshot
+            .server("engram")
+            .and_then(McpServerStatus::last_error)
+            .expect("a failed server keeps its sanitized error");
+
+        assert_eq!(
+            error.message(),
+            "timeout: tool listing timed out; raise timeout_ms"
+        );
+        assert_eq!(error.phase(), McpLoadPhase::ListTools);
     }
 
     #[test]

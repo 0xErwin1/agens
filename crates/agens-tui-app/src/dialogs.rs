@@ -28,7 +28,7 @@ pub fn mcp_status_dialog(snapshot: McpStatusSnapshot) -> DialogView {
                 format!("{}  {transport}  {enabled}/{state}  {} tools", descriptor.name(), server.tool_count()),
                 format!("{} {transport} {state} {tools}", descriptor.name()),
                 format!(
-                    "Source: {source}\nEndpoint: {endpoint}\nTimeout: {}ms\nTools: {}\nLast error: {error}",
+                    "Source: {source}\nEndpoint: {endpoint}\nTool call timeout: {}ms\nTools: {}\nLast error: {error}",
                     descriptor.timeout().as_millis(),
                     if tools.is_empty() { "none" } else { &tools },
                 ),

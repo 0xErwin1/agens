@@ -5,7 +5,7 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use agens_config::McpTransport;
+use agens_config::{DEFAULT_MCP_CONNECT_TIMEOUT_MS, DEFAULT_MCP_LIST_TIMEOUT_MS, McpTransport};
 use agens_providers::OpenAiFunctionTool;
 use agens_tools::{
     McpEndpointSummary, McpErrorCategory, McpHttpTransport, McpLimits, McpRegistry,
@@ -148,8 +148,7 @@ pub fn load_configured_mcp_registry(bootstrap: &Bootstrap, project_root: &Path) 
             continue;
         }
 
-        let timeout = std::time::Duration::from_millis(server.timeout_ms);
-        let timeouts = match McpTimeouts::new(timeout, timeout, timeout) {
+        let timeouts = match configured_mcp_timeouts(server.timeout_ms) {
             Ok(timeouts) => timeouts,
             Err(error) => {
                 register_configuration_failure(&mut registry, descriptor, &error);
@@ -170,6 +169,25 @@ pub fn load_configured_mcp_registry(bootstrap: &Bootstrap, project_root: &Path) 
     }
 
     registry
+}
+
+/// Spreads the single configured `timeout_ms` over the three MCP phases.
+///
+/// `timeout_ms` sizes a tool call, which is the only phase a user can reason
+/// about. Connect and tool listing take that value as a lower bound and widen
+/// it to their own floors, so a server whose handshake is slower than one tool
+/// call still comes up. A deliberately generous `timeout_ms` still raises all
+/// three, which is what a slow remote server needs.
+fn configured_mcp_timeouts(timeout_ms: u64) -> Result<McpTimeouts, McpTransportError> {
+    let call = std::time::Duration::from_millis(timeout_ms);
+    let connect = call.max(std::time::Duration::from_millis(
+        DEFAULT_MCP_CONNECT_TIMEOUT_MS,
+    ));
+    let list = call.max(std::time::Duration::from_millis(
+        DEFAULT_MCP_LIST_TIMEOUT_MS,
+    ));
+
+    McpTimeouts::new(connect, list, call)
 }
 
 /// Records a server that failed before any connect attempt was possible
@@ -280,6 +298,38 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn a_short_configured_timeout_bounds_the_call_but_keeps_the_connect_and_list_floors() {
+        let timeouts = configured_mcp_timeouts(200).expect("200ms is a valid call timeout");
+
+        assert_eq!(timeouts.call, std::time::Duration::from_millis(200));
+        assert_eq!(
+            timeouts.connect,
+            std::time::Duration::from_millis(DEFAULT_MCP_CONNECT_TIMEOUT_MS)
+        );
+        assert_eq!(
+            timeouts.list,
+            std::time::Duration::from_millis(DEFAULT_MCP_LIST_TIMEOUT_MS)
+        );
+    }
+
+    #[test]
+    fn a_generous_configured_timeout_widens_every_phase() {
+        let timeout_ms = DEFAULT_MCP_CONNECT_TIMEOUT_MS * 12;
+        let timeouts =
+            configured_mcp_timeouts(timeout_ms).expect("a generous call timeout is valid");
+
+        let expected = std::time::Duration::from_millis(timeout_ms);
+        assert_eq!(timeouts.call, expected);
+        assert_eq!(timeouts.connect, expected);
+        assert_eq!(timeouts.list, expected);
+    }
+
+    #[test]
+    fn a_zero_configured_timeout_is_still_rejected_despite_the_connect_floor() {
+        assert!(configured_mcp_timeouts(0).is_err());
+    }
 
     #[test]
     fn invalid_timeout_still_yields_an_mcp_visible_failed_descriptor() {
