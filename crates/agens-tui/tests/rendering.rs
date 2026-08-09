@@ -2,7 +2,7 @@ use agens_core::{SubagentErrorKind, SubagentStatus};
 use std::time::Duration;
 
 use agens_core::ask_user::{AskUserMode, AskUserOption, AskUserQuestion, AskUserRequest};
-use agens_core::{Message, MessagePart, Role, TurnEvent, TurnRetryReason, Usage};
+use agens_core::{Message, MessagePart, Role, ToolInput, TurnEvent, TurnRetryReason, Usage};
 use agens_tui::{
     Action, ColorLevel, ConversationEvent, DialogEntry, DialogView, DiffLine, DiffLineKind,
     DisplayMode, Engine, Event, Key, PaletteEntry, PaletteEntryKind, RatatuiRenderer, Renderer,
@@ -7029,4 +7029,94 @@ fn session_tree_renders_depth_indented_rows_and_its_own_loading_and_error_states
         "{error:?}"
     );
     assert!(!error.contains("Loading session tree…"), "{error:?}");
+}
+
+/// The overlay carries every argument, so a `Write` content arrives as hundreds
+/// of rows and buries the output under them. The preview level bounds that, and
+/// bounding may only defer what it hides: the marker names the hidden count and
+/// the key that shows all of it, and that key has to actually produce it.
+#[test]
+fn the_tool_overlay_bounds_a_huge_argument_and_ctrl_o_still_reaches_all_of_it() {
+    let content = (1..=200)
+        .map(|index| format!("line {index}"))
+        .collect::<Vec<_>>()
+        .join("\\n");
+    let raw_input = format!(r#"{{"path":"src/lib.rs","content":"{content}"}}"#);
+
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(100, 30)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.handle(Event::Resize {
+        width: 100,
+        height: 30,
+    });
+    tui.begin_submission("write the file");
+    tui.apply_progress(TurnEvent::ToolCallRequested {
+        id: "write-1".into(),
+        name: "native::write".into(),
+        input: raw_input.clone(),
+    });
+    tui.apply_runtime_event(TuiRuntimeEvent::ToolStarted {
+        call_id: "write-1".into(),
+        name: "native::write".into(),
+        input: raw_input,
+        parsed: ToolInput::Write {
+            path: "src/lib.rs".into(),
+        },
+    });
+    tui.apply_progress(TurnEvent::ToolResult(MessagePart::ToolResult {
+        tool_call_id: "write-1".into(),
+        content: "written".into(),
+        is_error: false,
+    }));
+    tui.finish_provider_turn(agens_tui::TuiProviderOutcome::Completed("done".into()));
+
+    tui.handle(Event::MouseDown { column: 4, row: 1 });
+    tui.handle(Event::Key(Key::Char('K')));
+    tui.handle(Event::Key(Key::Enter));
+    renderer.render(tui.view()).unwrap();
+
+    let preview = rendered_text(&renderer);
+    assert!(
+        preview.contains("193 more lines · Ctrl+O for all arguments"),
+        "the elision names what it hid and the way to all of it: {preview:?}"
+    );
+    assert!(
+        !preview.contains("line 100"),
+        "the bounded preview really is bounded: {preview:?}"
+    );
+    assert!(
+        preview.contains("Output") && preview.contains("written"),
+        "bounding the arguments is what puts the output on the first screen: {preview:?}"
+    );
+    assert!(
+        tui.view()
+            .tool_overlay
+            .expect("the overlay stays open")
+            .args
+            .contains("line 100"),
+        "nothing is dropped from the overlay's own copy of the arguments"
+    );
+
+    tui.handle(Event::Key(Key::CtrlO));
+    tui.handle(Event::Key(Key::CtrlO));
+    assert_eq!(
+        tui.view().tool_display_modes.get("write-1"),
+        Some(&DisplayMode::Expanded)
+    );
+    renderer.render(tui.view()).unwrap();
+
+    let mut expanded = rendered_text(&renderer);
+    assert!(
+        !expanded.contains("Ctrl+O for all arguments"),
+        "at full detail there is nothing left to reach: {expanded:?}"
+    );
+
+    let mut scrolls = 0;
+    while !expanded.contains("line 100") {
+        assert!(scrolls < 40, "the elided rows stayed unreachable");
+        tui.handle(Event::Key(Key::PageDown));
+        renderer.render(tui.view()).unwrap();
+        expanded = rendered_text(&renderer);
+        scrolls += 1;
+    }
 }
