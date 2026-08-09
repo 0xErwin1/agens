@@ -13,11 +13,16 @@ use agens_tui::{
     SessionDialogRequest, SessionDialogScope, SessionTreeRequest, TranscriptEntry, TranscriptFocus,
     TranscriptId, Tui, TuiExecutionEvent, TuiExecutionState, TuiPermissionBridge,
     TuiPermissionReply, TuiPresentation, TuiProviderOutcome, TuiRouteProgress, TuiRuntimeEvent,
-    TuiSubagentEvent, TuiSubmissionOutcome, TurnLifecycle,
+    TuiSubagentEvent, TuiSubmissionOutcome, TurnLifecycle, UiEnvelope,
 };
 use ratatui::{Terminal, backend::TestBackend};
 use std::{
     collections::BTreeMap,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::Receiver,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -1947,6 +1952,55 @@ fn command_new_resets_only_after_backend_success_and_running_matrix_refuses_muta
     assert_eq!(app.composer(), "");
 }
 
+/// Upper bound on how long an event that was accepted for publication may take
+/// to reach the receiver.
+///
+/// Publication is bounded only by the receiver draining, so a publisher that
+/// never delivers has to end the test loudly rather than park the suite on a
+/// `recv` that will never return.
+const BRIDGE_DELIVERY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The next envelope on the bridge, or a failure if none arrives in time.
+fn next_published<T>(receiver: &Receiver<UiEnvelope<T>>) -> (u64, T) {
+    receiver
+        .recv_timeout(BRIDGE_DELIVERY_TIMEOUT)
+        .expect("a published event reaches the receiver")
+        .into_parts()
+}
+
+/// The ordinal a publish was given, or a failure describing why it got none.
+fn published_ordinal(outcome: PublishOutcome) -> u64 {
+    match outcome {
+        PublishOutcome::Published { ordinal } => ordinal,
+        other => panic!("a publish with no deadline and no cancellation must publish: {other:?}"),
+    }
+}
+
+/// Blocks until the source thread is inside `publish`, so the clone contends
+/// with a publisher that has already reached the bridge.
+fn wait_until_the_source_is_publishing(entered: &Arc<AtomicBool>) {
+    let started = Instant::now();
+
+    while !entered.load(Ordering::Acquire) {
+        assert!(
+            started.elapsed() < BRIDGE_DELIVERY_TIMEOUT,
+            "the source thread never reached publish"
+        );
+        thread::yield_now();
+    }
+}
+
+/// A publisher that takes the publication order keeps it across the wait for
+/// capacity, so no clone can slip an event between the ordinal another
+/// publisher drew and the event that ordinal belongs to.
+///
+/// The source is given the head start — the channel is already full when it
+/// publishes, so it is the one parked waiting for capacity while the clone
+/// arrives. Which of the two actually took the publication order first is
+/// nothing the bridge promises, though, so the assertion does not presume a
+/// winner: it reads the ordinals the two calls were given and requires delivery
+/// to follow them. A head start that a loaded scheduler swallows then costs the
+/// race its edge, never its verdict.
 #[test]
 fn bridge_clones_cannot_overtake_a_source_waiting_for_capacity() {
     let (bridge, receiver) = BridgeTx::bounded(1);
@@ -1957,19 +2011,36 @@ fn bridge_clones_cannot_overtake_a_source_waiting_for_capacity() {
         PublishOutcome::Published { ordinal: 0 }
     );
 
-    let first_bridge = bridge.clone();
-    let first_cancellation = cancellation.clone();
-    let first = thread::spawn(move || first_bridge.publish("first", &first_cancellation, None));
-    thread::sleep(Duration::from_millis(10));
+    let entered = Arc::new(AtomicBool::new(false));
+    let source_entered = Arc::clone(&entered);
+    let source_bridge = bridge.clone();
+    let source_cancellation = cancellation.clone();
+    let source_publish = thread::spawn(move || {
+        source_entered.store(true, Ordering::Release);
+        source_bridge.publish("source", &source_cancellation, None)
+    });
+    wait_until_the_source_is_publishing(&entered);
 
-    let second_cancellation = cancellation.clone();
-    let second = thread::spawn(move || bridge.publish("second", &second_cancellation, None));
+    let clone_publish = thread::spawn(move || bridge.publish("clone", &cancellation, None));
 
-    assert_eq!(receiver.recv().unwrap().into_parts(), (0, "occupied"));
-    assert_eq!(receiver.recv().unwrap().into_parts(), (1, "first"));
-    assert_eq!(receiver.recv().unwrap().into_parts(), (2, "second"));
-    let _ = first.join().unwrap();
-    let _ = second.join().unwrap();
+    assert_eq!(next_published(&receiver), (0, "occupied"));
+    let delivered = [next_published(&receiver), next_published(&receiver)];
+
+    let mut assigned = [
+        (published_ordinal(source_publish.join().unwrap()), "source"),
+        (published_ordinal(clone_publish.join().unwrap()), "clone"),
+    ];
+    assigned.sort_unstable();
+
+    assert_eq!(
+        [assigned[0].0, assigned[1].0],
+        [1, 2],
+        "the bridge draws every ordinal from one sequence: {assigned:?}"
+    );
+    assert_eq!(
+        delivered, assigned,
+        "a clone was delivered ahead of a publisher holding an earlier ordinal"
+    );
 }
 
 #[test]
