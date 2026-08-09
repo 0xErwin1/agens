@@ -761,12 +761,143 @@ fn truncate_operand(operand: &str, budget: usize) -> String {
     clipped
 }
 
-/// Plain-text argument detail for overlays and Expanded rows (no JSON dump).
+/// Detail-overlay argument body: every argument the call carried, as text.
+///
+/// The overlay is where an operator audits exactly what the model asked a tool
+/// to do, so a field the typed variant does not model is recovered from the raw
+/// payload as a `name: value` line instead of being dropped. Nested members are
+/// flattened onto dotted paths and array members onto indexed ones, so the body
+/// stays human-readable text and never becomes a raw JSON dump. Values under
+/// credential-shaped keys are withheld here as everywhere else.
 pub(crate) fn tool_argument_detail_text(parsed: &ToolInput, raw_input: &str) -> String {
-    expanded_argument_texts(parsed, raw_input, usize::MAX).join("\n")
+    let mut fields = typed_argument_fields(parsed);
+
+    let rendered_values = fields
+        .iter()
+        .map(|(_, value)| value.clone())
+        .collect::<Vec<_>>();
+    fields.extend(raw_argument_fields(raw_input, &rendered_values));
+
+    if fields.is_empty() {
+        let trimmed = raw_input.trim();
+        return if trimmed.starts_with('{') {
+            String::new()
+        } else {
+            redact_credential_values(trimmed)
+        };
+    }
+
+    fields
+        .into_iter()
+        .map(|(name, value)| format_detail_field(&name, &value))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
-/// Expanded argument body: human-readable fields only, never raw JSON.
+/// Labelled arguments a typed [`ToolInput`] variant models itself.
+///
+/// `Other` models nothing beyond the payload it preserves, so it contributes no
+/// typed field and leaves every argument to the raw pass.
+fn typed_argument_fields(parsed: &ToolInput) -> Vec<(String, String)> {
+    match parsed {
+        ToolInput::Bash { command } => {
+            vec![("command".to_owned(), redact_credential_values(command))]
+        }
+        ToolInput::Read { path }
+        | ToolInput::Write { path }
+        | ToolInput::Edit { path }
+        | ToolInput::List { path }
+        | ToolInput::Search { path } => vec![("path".to_owned(), path.clone())],
+        ToolInput::Glob { pattern, path } | ToolInput::Grep { pattern, path } => {
+            let mut fields = vec![("pattern".to_owned(), pattern.clone())];
+            if let Some(path) = path {
+                fields.push(("path".to_owned(), path.clone()));
+            }
+            fields
+        }
+        ToolInput::WebFetch { url } => {
+            vec![("url".to_owned(), redact_credential_values(url))]
+        }
+        ToolInput::Skill { skill } => vec![("skill".to_owned(), skill.clone())],
+        ToolInput::Other { .. } => Vec::new(),
+    }
+}
+
+/// Arguments the raw payload carries beyond the ones already rendered.
+///
+/// Matching is by value rather than by key: which member of the payload a typed
+/// variant read is the tool's own business, and comparing values keeps the same
+/// argument from being listed twice under two names.
+fn raw_argument_fields(raw_input: &str, already_rendered: &[String]) -> Vec<(String, String)> {
+    let Ok(Value::Object(arguments)) = serde_json::from_str::<Value>(raw_input.trim()) else {
+        return Vec::new();
+    };
+
+    let mut fields = Vec::new();
+    for (key, value) in arguments {
+        if let Value::String(text) = &value
+            && already_rendered.iter().any(|rendered| rendered == text)
+        {
+            continue;
+        }
+
+        flatten_argument_value(&key, &value, &mut fields);
+    }
+
+    fields
+}
+
+/// Appends `value` under `path`, descending into objects and arrays so a nested
+/// argument reaches the reader as text rather than as a JSON body.
+fn flatten_argument_value(path: &str, value: &Value, fields: &mut Vec<(String, String)>) {
+    if is_credential_key(last_path_segment(path)) {
+        fields.push((path.to_owned(), "[redacted]".to_owned()));
+        return;
+    }
+
+    match value {
+        Value::Object(members) if !members.is_empty() => {
+            for (key, member) in members {
+                flatten_argument_value(&format!("{path}.{key}"), member, fields);
+            }
+        }
+        Value::Array(items) if !items.is_empty() => {
+            for (index, item) in items.iter().enumerate() {
+                flatten_argument_value(&format!("{path}[{index}]"), item, fields);
+            }
+        }
+        Value::Object(_) | Value::Array(_) => {
+            fields.push((path.to_owned(), "(empty)".to_owned()));
+        }
+        Value::String(text) => fields.push((path.to_owned(), redact_credential_values(text))),
+        Value::Null => fields.push((path.to_owned(), "null".to_owned())),
+        other => fields.push((path.to_owned(), other.to_string())),
+    }
+}
+
+fn last_path_segment(path: &str) -> &str {
+    path.rsplit('.').next().unwrap_or(path)
+}
+
+/// One `name: value` line, or a labelled block when the value spans lines.
+fn format_detail_field(name: &str, value: &str) -> String {
+    if !value.contains('\n') {
+        return format!("{name}: {value}");
+    }
+
+    let body = value
+        .lines()
+        .map(|line| format!("  {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("{name}:\n{body}")
+}
+
+/// Inline Expanded argument body: the primary field only, so the transcript
+/// stays scannable, and never raw JSON.
+///
+/// Every other argument the call carried is reachable in the detail overlay
+/// through [`tool_argument_detail_text`].
 fn expanded_tool_argument_lines(
     parsed: &ToolInput,
     raw_input: &str,

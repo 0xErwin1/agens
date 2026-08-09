@@ -1028,6 +1028,75 @@ fn tool_modal_opens_with_enter_on_focused_tool_not_ctrl_o() {
     );
 }
 
+/// The inline row shows the primary field so the transcript stays scannable,
+/// which only works as long as the arguments it leaves out remain auditable
+/// somewhere. The overlay is that somewhere: an operator has to be able to read
+/// exactly what the model asked a tool to do, without ever meeting a JSON dump.
+#[test]
+fn the_tool_overlay_shows_every_argument_as_text_not_as_raw_json() {
+    let raw_input =
+        r#"{"command":"cargo test --workspace","timeout_ms":600000,"env":{"RUST_LOG":"debug"}}"#;
+
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.handle(Event::Resize {
+        width: 100,
+        height: 30,
+    });
+    tui.begin_submission("run the tests");
+    tui.apply_progress(TurnEvent::ToolCallRequested {
+        id: "bash-1".into(),
+        name: "native::bash".into(),
+        input: raw_input.into(),
+    });
+    tui.apply_runtime_event(TuiRuntimeEvent::ToolStarted {
+        call_id: "bash-1".into(),
+        name: "native::bash".into(),
+        input: raw_input.into(),
+        parsed: ToolInput::Bash {
+            command: "cargo test --workspace".into(),
+        },
+    });
+    tui.apply_progress(TurnEvent::ToolResult(MessagePart::ToolResult {
+        tool_call_id: "bash-1".into(),
+        content: "TOOL_BODY".into(),
+        is_error: false,
+    }));
+    tui.finish_provider_turn(TuiProviderOutcome::Completed("answer".into()));
+
+    focus_viewport(&mut tui);
+    tui.handle(Event::Key(Key::Char('K')));
+    assert_eq!(tui.view().focused_call, Some("bash-1"));
+    tui.handle(Event::Key(Key::Enter));
+
+    let overlay = tui
+        .view()
+        .tool_overlay
+        .expect("Enter on a focused tool opens the modal");
+    let args = overlay.args.clone();
+
+    assert!(
+        args.contains("command: cargo test --workspace"),
+        "the overlay names the work: {args:?}"
+    );
+    assert!(
+        args.contains("timeout_ms: 600000"),
+        "an argument the typed input does not model stays auditable: {args:?}"
+    );
+    assert!(
+        args.contains("env.RUST_LOG: debug"),
+        "a nested argument reaches the reader as text: {args:?}"
+    );
+    assert!(
+        !args.contains('{') && !args.contains('}'),
+        "and none of it arrives as a raw JSON body: {args:?}"
+    );
+    assert!(
+        overlay.output.contains("TOOL_BODY"),
+        "the overlay still carries the output: {:?}",
+        overlay.output
+    );
+}
+
 /// AGN-109 collapses every settled call, so the detail it hides has to be
 /// reachable one block at a time — a transcript-wide cycle answers "how much of
 /// everything", not "what is in this one".
