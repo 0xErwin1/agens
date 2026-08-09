@@ -164,12 +164,6 @@ fn u15_a1b2_selected_launch_uses_the_registered_production_task_runner() {
     let probe = Arc::new(Mutex::new(Vec::new()));
     let (bridge, requests) = production_tui_permission_bridge();
     let reply_bridge = bridge.clone();
-    let reply = std::thread::spawn(move || {
-        let request = requests
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .expect("selected task should request permission");
-        reply_bridge.reply(request.id(), TuiPermissionReply::AllowOnce)
-    });
     let mut runtime = production_tui_task_runtime_with_runner(
         &bootstrap,
         &agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap),
@@ -227,6 +221,17 @@ fn u15_a1b2_selected_launch_uses_the_registered_production_task_runner() {
         "Subagent #1 running in background"
     );
     drop(dispatcher);
+
+    // The prompt this answers is raised by the launch below and by nothing
+    // before it, so the answering thread starts here: a waiter spawned earlier
+    // would spend its budget on setup instead of on the prompt.
+    let reply = std::thread::spawn(move || {
+        let request = agens_tui_app::test_support::wait_for(
+            "the selected task to request permission",
+            || requests.try_recv().ok(),
+        );
+        reply_bridge.reply(request.id(), TuiPermissionReply::AllowOnce)
+    });
 
     assert_eq!(
         launch_selected_tui_task(&mut runtime, &session, "review task", false, &cancellation),
