@@ -65,6 +65,9 @@ fn manual_deadline_holds_until_advanced_and_survives_derivation() {
     );
 }
 
+/// Both directions matter, and only one of them is about the parent: a derivation that always
+/// kept the inherited deadline would still pass the first half while silently dropping the
+/// per-operation cap that the second half depends on.
 #[test]
 fn derived_timeout_keeps_the_shorter_deadline_and_the_shared_cancellation_flag() {
     let parent = HeadlessTurnCancellation::with_deadline(Duration::from_millis(25));
@@ -78,6 +81,24 @@ fn derived_timeout_keeps_the_shorter_deadline_and_the_shared_cancellation_flag()
     parent.cancel();
 
     assert!(derived.is_cancelled());
+
+    let (session, clock) =
+        HeadlessTurnCancellation::with_manual_deadline_for_test(Duration::from_secs(600));
+    let operation = session.derived_with_timeout(Duration::from_millis(25));
+
+    assert_eq!(
+        operation.adapter_view().remaining_duration(),
+        Some(Duration::from_millis(25)),
+        "an operation shorter than the session it runs under keeps its own cap"
+    );
+
+    clock.advance(Duration::from_millis(25));
+
+    assert!(operation.is_expired());
+    assert!(
+        !session.is_expired(),
+        "the operation's cap must expire on its own without ending the session around it"
+    );
 }
 
 #[test]

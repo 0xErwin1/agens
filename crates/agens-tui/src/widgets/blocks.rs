@@ -1223,12 +1223,19 @@ pub(crate) struct ToolResultBlock {
 const PREVIEW_HEAD_LINES: usize = 5;
 const PREVIEW_TAIL_LINES: usize = 3;
 
+/// Content rows the tool detail overlay asks its layout for.
+///
+/// [`ARGUMENT_PREVIEW_ROWS`] is derived from this, so the two cannot drift: a
+/// change here has to be a deliberate change to how much of the overlay the
+/// argument section is allowed to claim.
+pub(crate) const TOOL_DETAIL_CONTENT_ROWS: u16 = 24;
+
 /// Rows the overlay's argument section spends before it starts eliding.
 ///
-/// Half of the overlay's desired content height, so the Output heading lands on
-/// the same screen as the arguments: bounding the section would buy nothing if
-/// it only traded one long scroll for another.
-const ARGUMENT_PREVIEW_ROWS: usize = 12;
+/// Half of [`TOOL_DETAIL_CONTENT_ROWS`], so the Output heading lands on the
+/// same screen as the arguments: bounding the section would buy nothing if it
+/// only traded one long scroll for another.
+const ARGUMENT_PREVIEW_ROWS: usize = TOOL_DETAIL_CONTENT_ROWS as usize / 2;
 
 /// Head/tail preview window for a [`DisplayMode::Truncated`] body.
 ///
@@ -1296,6 +1303,11 @@ fn argument_fields(args: &str) -> Vec<Vec<&str>> {
     fields
 }
 
+/// Head/tail preview window for the rows of a single argument.
+///
+/// A field is returned whole whenever eliding it would hide fewer rows than the
+/// marker announcing the elision costs — the `+ 1` — so the reader is never told
+/// that something was withheld in exchange for seeing less of it.
 fn bounded_argument_field(field: &[&str]) -> Vec<Line<'static>> {
     if field.len() <= PREVIEW_HEAD_LINES + PREVIEW_TAIL_LINES + 1 {
         return field.iter().copied().map(argument_line).collect();
@@ -2007,10 +2019,9 @@ mod tests {
         assert!(!preview.iter().any(|row| row == "  line 100"));
         assert!(preview.iter().any(|row| row == "  line 200"));
         assert!(
-            preview
-                .iter()
-                .any(|row| row == "timeout_ms: 600000" || row == "  timeout_ms: 600000"),
-            "the argument after the long one stays visible: {preview:?}"
+            preview.iter().any(|row| row == "timeout_ms: 600000"),
+            "the argument after the long one stays visible, as its own field rather than folded \
+             into the value above it: {preview:?}"
         );
         assert!(
             preview
@@ -2058,15 +2069,22 @@ mod tests {
     /// The overlay is the audit surface: a credential an MCP server names the way its own
     /// ecosystem names them — camelCase, plural, or with a dot inside the key — must never reach
     /// a rendered row, whatever shape its value happens to have.
+    ///
+    /// The long key is load-bearing: it exceeds [`MAX_SUMMARIZED_KEY_WIDTH`], so the summary can
+    /// only recognize it while the predicate still sees the whole name. Judging the display key
+    /// instead leaves a name ending in `…` that no longer looks credential-shaped, and the
+    /// deliberately low-entropy value under it has nothing else to be caught by.
     #[test]
     fn no_credential_reaches_the_overlay_under_a_camel_case_plural_or_dotted_key() {
         let secret = "ghp_ABCDEFghijkl0123456789";
+        let low_entropy_secret = "deploy-me-please";
         let raw = serde_json::json!({
             "accessToken": secret,
             "tokens": [secret],
             "token.value": secret,
             "nested": { "clientSecret": secret },
             "items": [{ "authToken": secret }],
+            "deployment_configuration_token": low_entropy_secret,
             "path": "src/lib.rs",
         })
         .to_string();
@@ -2080,14 +2098,14 @@ mod tests {
         );
 
         assert!(
-            !args.contains(secret),
+            !args.contains(secret) && !args.contains(low_entropy_secret),
             "the overlay body leaks it: {args:?}"
         );
         assert!(
             args.lines()
                 .filter(|row| row.ends_with("[redacted]"))
                 .count()
-                == 5,
+                == 6,
             "every credential-shaped argument is withheld: {args:?}"
         );
         assert!(
@@ -2095,7 +2113,12 @@ mod tests {
             "an unrelated argument still arrives: {args:?}"
         );
 
-        assert!(!summarize_args("mcp::deploy", &raw).contains(secret));
+        let summary = summarize_args("mcp::deploy", &raw);
+        assert!(!summary.contains(secret), "{summary:?}");
+        assert!(
+            !summary.contains(low_entropy_secret),
+            "a credential key too long to display whole is still a credential key: {summary:?}"
+        );
     }
 
     /// The overlay body carries field boundaries in its own layout, so a JSON key is a place an

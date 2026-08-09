@@ -24,22 +24,35 @@ const SECRET_HEADER_SENTINEL: &str = "SENTINEL_CHATGPT_REMOTE_HEADER";
 const REFRESH_WORKER_ENV: &str = "AGENS_CHATGPT_REFRESH_WORKER";
 const REFRESH_LOCK_WORKER_ENV: &str = "AGENS_CHATGPT_REFRESH_LOCK_WORKER";
 const LOCK_TEST_REPETITIONS: usize = 20;
+/// How promptly a step that waits on nothing but the behavior under test has to finish.
+///
+/// This is the assertion, not scaffolding: a lock that is working hands over in microseconds,
+/// so a second is already generous and anything that spends it has misbehaved. That makes it
+/// the wrong budget for any wait whose completion depends on another process — see
+/// [`LOCK_TEST_PROCESS_WAIT`] — because such a wait would report a loaded machine as a broken
+/// lock. Do not reuse it there, and do not raise it to make one of those waits fit.
 const LOCK_TEST_WAIT: Duration = Duration::from_secs(1);
 /// How long a step may take when it is waiting on another process rather than on the
 /// behavior under test.
 ///
 /// Spawning a debug test binary, letting it build a provider and letting it complete an
-/// HTTP round trip is startup cost, not the promptness `LOCK_TEST_WAIT` measures, and on
+/// HTTP round trip is startup cost, not the promptness [`LOCK_TEST_WAIT`] measures, and on
 /// a loaded machine it is worth seconds. Sizing those waits as if they were promptness
 /// budgets makes them report a slow machine as a broken lock.
+///
+/// The ceiling is what a hang costs to report: nothing observes this budget when the lock
+/// works, so every second added here is a second the suite spends before a genuine deadlock
+/// is announced, and it has to stay comfortably under whatever wall clock the runner puts
+/// around a single test — past that the deadlock is reported as a killed run instead.
 const LOCK_TEST_PROCESS_WAIT: Duration = Duration::from_secs(30);
 /// How long the lock holder waits to be released.
 ///
-/// This is not a promptness budget like `LOCK_TEST_WAIT`: the parent releases the holder
+/// This is not a promptness budget like [`LOCK_TEST_WAIT`]: the parent releases the holder
 /// only after it has spawned a second process, cancelled it and checked the credentials
 /// it left behind, so the holder's patience has to span that whole sequence rather than
-/// the single signal the other waits cover.
-const HOLDER_RELEASE_WAIT: Duration = Duration::from_secs(60);
+/// the single signal the other waits cover. That sequence is two process-scale waits, which
+/// is where the multiplier comes from rather than from a round number of seconds.
+const HOLDER_RELEASE_WAIT: Duration = LOCK_TEST_PROCESS_WAIT.saturating_mul(2);
 
 #[test]
 fn subscription_transport_posts_the_codex_request_and_returns_text() {
@@ -2377,8 +2390,17 @@ fn spawn_refresh_lock_worker(
     command.spawn().expect("refresh lock worker should start")
 }
 
+/// How long the canceller waits for the fixture to observe the round it has to interrupt.
+///
+/// A hang detector rather than a budget the passing path spends: the request is issued from
+/// this process and observed in milliseconds. It cannot be sized upwards into a real wait,
+/// because a cancellation that arrives after the provider's own one-second request timeout
+/// fails the assertion it serves with `TimedOut` instead; all this ceiling decides is how
+/// long a fixture that never sees the request takes to say so.
+const OBSERVED_REQUEST_WAIT: Duration = Duration::from_secs(5);
+
 fn wait_for_observed_requests(observed_requests: &AtomicUsize, expected: usize) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + OBSERVED_REQUEST_WAIT;
     while observed_requests.load(Ordering::Acquire) < expected {
         assert!(
             Instant::now() < deadline,

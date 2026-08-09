@@ -2472,7 +2472,7 @@ fn render_tool_detail_overlay(
         tabs: None,
         shortcuts: &shortcuts,
         sizing: widgets::OverlaySizing::tool_detail(),
-        desired_content_rows: 24,
+        desired_content_rows: widgets::TOOL_DETAIL_CONTENT_ROWS,
     };
     let Some(layout) = widgets::OverlayLayout::solve(area, &config) else {
         return;

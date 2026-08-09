@@ -69,8 +69,14 @@ pub const DEFAULT_MCP_TIMEOUT_MS: u64 = 30_000;
 pub const DEFAULT_MCP_CONNECT_TIMEOUT_MS: u64 = 10_000;
 
 /// Floor for `tools/list`, applied independently of the configured call
-/// timeout. Paginated catalogs from large servers cost far more than the
-/// single call a user sizes `timeout_ms` for.
+/// timeout.
+///
+/// It shares its value with [`DEFAULT_MCP_CONNECT_TIMEOUT_MS`] and its failure
+/// mode: what it covers is a whole paginated catalog from a large server —
+/// several round trips, each carrying every tool's schema — and not the single
+/// call a user sizes `timeout_ms` for. Tightening it toward that call turns a
+/// large or distant server into one that connects and then exposes no tools at
+/// all, which reads as a broken server rather than as a budget that was cut.
 pub const DEFAULT_MCP_LIST_TIMEOUT_MS: u64 = 10_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
