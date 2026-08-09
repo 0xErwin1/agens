@@ -3,6 +3,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -524,7 +525,8 @@ fn device_code_login_uses_one_absolute_deadline_across_user_code_polls_and_excha
     let pkce = generate_pkce(&|length| Ok(vec![3; length])).expect("PKCE should generate");
 
     let user_server = thread::spawn(move || {
-        let (mut stream, _) = user_listener.accept().expect("user request should arrive");
+        let mut stream =
+            accept_expected_request(&user_listener).expect("user request should arrive");
         let _ = read_http_request(&mut stream);
         thread::sleep(Duration::from_millis(4));
         write_http_response(
@@ -534,11 +536,12 @@ fn device_code_login_uses_one_absolute_deadline_across_user_code_polls_and_excha
         );
     });
     let poll_server = thread::spawn(move || {
-        let (mut pending, _) = poll_listener.accept().expect("pending poll should arrive");
+        let mut pending =
+            accept_expected_request(&poll_listener).expect("pending poll should arrive");
         let _ = read_http_request(&mut pending);
         thread::sleep(Duration::from_millis(4));
         write_http_response(&mut pending, 403, "{}");
-        let (mut ready, _) = poll_listener.accept().expect("ready poll should arrive");
+        let mut ready = accept_expected_request(&poll_listener).expect("ready poll should arrive");
         let _ = read_http_request(&mut ready);
         thread::sleep(Duration::from_millis(4));
         write_http_response(
@@ -550,14 +553,21 @@ fn device_code_login_uses_one_absolute_deadline_across_user_code_polls_and_excha
             ),
         );
     });
+    // The exchange is where the shared deadline has to expire, and holding the request until
+    // the login abandons it is what makes that true for any deadline: a fixed stall has to be
+    // guessed longer than whatever budget is left by the time the exchange starts.
     let oauth_server = thread::spawn(move || {
-        let (mut stream, _) = oauth_listener.accept().expect("exchange should arrive");
+        let mut stream = accept_expected_request(&oauth_listener).expect("exchange should arrive");
         let _ = read_http_request(&mut stream);
-        thread::sleep(Duration::from_millis(150));
+        wait_for_client_close(&mut stream);
     });
     let mut options =
         ChatGptDeviceCodeLoginOptions::for_test(&user_endpoint, &poll_endpoint, &oauth_endpoint);
-    options.timeout = Duration::from_millis(100);
+    // The three requests before the exchange all have to fit inside the deadline, so it has
+    // to outlast their round trips and the fixture sleeps between them by a wide margin; a
+    // budget close to their cost makes the login stop somewhere earlier in the sequence, and
+    // the request the next fixture is waiting for never comes.
+    options.timeout = Duration::from_millis(500);
 
     assert_eq!(
         device_code_login(options, LoginCancellation::new()),
@@ -635,7 +645,7 @@ fn device_code_login_handles_pending_timeout_and_cancellation_during_sleep_and_r
         "http://{}/usercode",
         idle_listener.local_addr().expect("idle address")
     );
-    let idle_server = spawn_bounded_server(idle_listener, Duration::from_millis(50), |_| {
+    let idle_server = spawn_bounded_server(idle_listener, |_| {
         panic!("an expired login must not send a user-code request");
     });
     let mut expired_options = ChatGptDeviceCodeLoginOptions::for_test(
@@ -661,7 +671,7 @@ fn device_code_login_handles_pending_timeout_and_cancellation_during_sleep_and_r
         poll_listener.local_addr().expect("address")
     );
     let (poll_finished_send, poll_finished_receive) = mpsc::sync_channel(1);
-    let user_server = spawn_bounded_server(user_listener, Duration::from_secs(1), |stream| {
+    let user_server = spawn_bounded_server(user_listener, |stream| {
         let _ = read_http_request(stream);
         write_http_response(
             stream,
@@ -669,7 +679,7 @@ fn device_code_login_handles_pending_timeout_and_cancellation_during_sleep_and_r
             r#"{"device_auth_id":"private-device-id","user_code":"code","interval":"10"}"#,
         );
     });
-    let poll_server = spawn_bounded_server(poll_listener, Duration::from_secs(1), move |stream| {
+    let poll_server = spawn_bounded_server(poll_listener, move |stream| {
         let _ = read_http_request(stream);
         write_http_response(stream, 403, "{}");
         poll_finished_send
@@ -699,7 +709,7 @@ fn device_code_login_handles_pending_timeout_and_cancellation_during_sleep_and_r
         "http://{}/token",
         poll_listener.local_addr().expect("address")
     );
-    let user_server = spawn_bounded_server(user_listener, Duration::from_secs(1), |stream| {
+    let user_server = spawn_bounded_server(user_listener, |stream| {
         let _ = read_http_request(stream);
         write_http_response(
             stream,
@@ -707,7 +717,7 @@ fn device_code_login_handles_pending_timeout_and_cancellation_during_sleep_and_r
             r#"{"device_auth_id":"private-device-id","user_code":"code","interval":"1"}"#,
         );
     });
-    let poll_server = spawn_bounded_server(poll_listener, Duration::from_secs(1), |stream| {
+    let poll_server = spawn_bounded_server(poll_listener, |stream| {
         let _ = read_http_request(stream);
         write_http_response(stream, 404, "{}");
     });
@@ -716,7 +726,13 @@ fn device_code_login_handles_pending_timeout_and_cancellation_during_sleep_and_r
         &poll_endpoint,
         "http://127.0.0.1:1/token",
     );
-    options.timeout = Duration::from_millis(15);
+    // Both servers below are joined expecting their request, so the timeout has to outlast
+    // the user-code request and the first poll and then expire inside the one-second poll
+    // interval that follows. A budget near the cost of those two loopback requests instead
+    // races them: the login stops before it ever polls, the poll server waits for a request
+    // that is never coming, and the failure reads as a missing request rather than as the
+    // scheduling delay it is.
+    options.timeout = Duration::from_millis(500);
     assert_eq!(
         device_code_login(options, LoginCancellation::new()),
         Err(LoginError::TimedOut)
@@ -731,7 +747,7 @@ fn device_code_login_handles_pending_timeout_and_cancellation_during_sleep_and_r
     );
     let (request_started_send, request_started_receive) = mpsc::sync_channel(1);
     let (request_closed_send, request_closed_receive) = mpsc::sync_channel(1);
-    let server = spawn_bounded_server(listener, Duration::from_secs(1), move |stream| {
+    let server = spawn_bounded_server(listener, move |stream| {
         let _ = read_http_request(stream);
         request_started_send
             .send(())
@@ -895,6 +911,18 @@ fn provider_entry_upsert_preserves_existing_provider_entries() {
     fs::remove_dir_all(directory).expect("temporary directory should be removed");
 }
 
+/// The lock below is held for the whole test, so a wait that ignored its deadline would
+/// never return at all; what the elapsed bound adds is that the deadline is noticed at the
+/// wait's own polling granularity rather than some far coarser one.
+///
+/// The two halves of that bound are a deadline and the overshoot past it, and their sum is
+/// what a coarse poll has to exceed, so it is the sum that must not grow. Spending it on
+/// overshoot instead of on the deadline is what buys the room: a loaded machine adds a
+/// stall per reschedule, and a deadline close to the wait's 5 ms poll interval is crossed
+/// in a handful of polls rather than fifty, while the ceiling stays exactly where it was.
+const LOCK_WAIT_BUDGET: Duration = Duration::from_millis(25);
+const LOCK_WAIT_OVERSHOOT_BUDGET: Duration = Duration::from_millis(975);
+
 #[test]
 fn provider_entry_upsert_cancels_or_times_out_while_the_credentials_lock_is_held() {
     let directory = temporary_directory("lock-cancellation");
@@ -929,10 +957,10 @@ fn provider_entry_upsert_cancels_or_times_out_while_the_credentials_lock_is_held
             "blocked",
             json!({"value":"must-not-persist"}),
             &cancellation,
-            Instant::now() + Duration::from_millis(250),
+            Instant::now() + LOCK_WAIT_BUDGET,
         );
         assert!(
-            started.elapsed() < Duration::from_secs(1),
+            started.elapsed() < LOCK_WAIT_BUDGET + LOCK_WAIT_OVERSHOOT_BUDGET,
             "lock wait did not stop promptly: {:?}",
             started.elapsed()
         );
@@ -1026,13 +1054,21 @@ fn provider_entry_upsert_reacquires_the_os_lock_after_a_holder_crashes() {
         .env("AGENS_LOGIN_CHILD_READY", &ready)
         .spawn()
         .expect("holder should start");
-    for _ in 0..100 {
-        if ready.exists() {
-            break;
+    // Forking and exec'ing this multi-MB test binary and taking the lock is unbounded work
+    // on a loaded machine, so this budget is a hang detector rather than a timing claim; it
+    // stays under the holder's own hold so a holder that already let the lock go is reported
+    // as such, and a holder that died is reported immediately instead of waited out.
+    let ready_deadline = Instant::now() + Duration::from_secs(9);
+    while !ready.exists() {
+        if let Some(status) = holder.try_wait().expect("holder status should be readable") {
+            panic!("holder exited before the test observed its lock: {status}");
         }
+        assert!(
+            Instant::now() < ready_deadline,
+            "holder never acquired the lock"
+        );
         thread::sleep(Duration::from_millis(5));
     }
-    assert!(ready.exists(), "holder never acquired the lock");
     holder.kill().expect("holder should be killable");
     holder.wait().expect("holder should exit");
 
@@ -1578,28 +1614,40 @@ fn write_http_response(stream: &mut TcpStream, status: u16, body: &str) {
     stream.flush().expect("response should flush");
 }
 
+/// Liveness bound only, for both how long a `BoundedServer` waits for the request it
+/// expects and how long a test waits for that server to report. Every caller either expects
+/// a request or ends the wait itself through `expect_no_request`, so a server only runs this
+/// budget out when the request it was promised never came — which is a failure either way.
+/// Nothing a test proves depends on the value; it just has to outlast a loaded machine.
+const SERVER_REPORT_BUDGET: Duration = Duration::from_secs(30);
+
 struct BoundedServer {
     completed: mpsc::Receiver<bool>,
     worker: thread::JoinHandle<()>,
-    timeout: Duration,
+    stop: Arc<AtomicBool>,
 }
 
 impl BoundedServer {
     fn join(self) {
         assert!(
             self.completed
-                .recv_timeout(self.timeout + Duration::from_millis(50))
+                .recv_timeout(SERVER_REPORT_BUDGET)
                 .expect("server should report completion"),
             "server should receive its expected request"
         );
         self.worker.join().expect("server should finish");
     }
 
+    /// The login under test is synchronous and has already returned, so a request it sent
+    /// would already be queued on the listener and the next `accept` would see it. Ending
+    /// the accept loop here therefore turns "no request arrived" into an observed fact,
+    /// instead of a race between the server's own idle deadline and this receive.
     fn expect_no_request(self) {
+        self.stop.store(true, Ordering::Release);
         assert!(
             !self
                 .completed
-                .recv_timeout(self.timeout + Duration::from_millis(50))
+                .recv_timeout(SERVER_REPORT_BUDGET)
                 .expect("idle server should report completion"),
             "expired login must not send a request"
         );
@@ -1607,22 +1655,65 @@ impl BoundedServer {
     }
 }
 
+/// Accepts one connection the caller expects, reporting a miss instead of parking on it.
+///
+/// The logins these fixtures answer stop at their own deadline, so a client that gave up
+/// before opening the next connection leaves a blocking `accept` waiting for a request that
+/// is never coming — and since the test joins the server thread, that wedges the whole test
+/// binary rather than failing anything. Reporting the miss lets the caller's own expectation
+/// fail and name the request that went missing.
+fn accept_expected_request(listener: &TcpListener) -> Option<TcpStream> {
+    listener
+        .set_nonblocking(true)
+        .expect("server listener should become nonblocking");
+    let deadline = Instant::now() + SERVER_REPORT_BUDGET;
+
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                stream
+                    .set_nonblocking(false)
+                    .expect("accepted stream should block");
+                return Some(stream);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return None;
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) => panic!("server accept should succeed: {error}"),
+        }
+    }
+}
+
+/// Holds a request open until the client abandons it.
+fn wait_for_client_close(stream: &mut TcpStream) {
+    stream
+        .set_read_timeout(Some(SERVER_REPORT_BUDGET))
+        .expect("client close timeout should be set");
+
+    let mut byte = [0_u8; 1];
+    let _ = stream.read(&mut byte);
+}
+
 fn spawn_bounded_server(
     listener: TcpListener,
-    timeout: Duration,
     handle: impl FnOnce(&mut TcpStream) + Send + 'static,
 ) -> BoundedServer {
     let (completed_send, completed) = mpsc::sync_channel(1);
+    let stop = Arc::new(AtomicBool::new(false));
+    let worker_stop = Arc::clone(&stop);
     let worker = thread::spawn(move || {
         listener
             .set_nonblocking(true)
             .expect("server listener should become nonblocking");
-        let deadline = Instant::now() + timeout;
+        let deadline = Instant::now() + SERVER_REPORT_BUDGET;
         let mut stream = loop {
             match listener.accept() {
                 Ok((stream, _)) => break Some(stream),
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    if Instant::now() >= deadline {
+                    if worker_stop.load(Ordering::Acquire) || Instant::now() >= deadline {
                         break None;
                     }
                     thread::sleep(Duration::from_millis(1));
@@ -1640,7 +1731,7 @@ fn spawn_bounded_server(
     BoundedServer {
         completed,
         worker,
-        timeout,
+        stop,
     }
 }
 
@@ -1686,12 +1777,31 @@ fn client_closed_before_late_response(stream: &mut TcpStream, status: u16, body:
     client_closed
 }
 
+static TEMP_DIRECTORY_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+
+/// Claims a private directory by creating it, rather than by naming it in a way no other
+/// run is expected to have chosen.
+///
+/// Process ids are recycled and, in a pid namespace, are not even unique among live
+/// processes, so `{label}-{pid}` can name a directory that a dead run left behind or that a
+/// concurrent run is using right now — and clearing such a name on entry is what turns the
+/// second case into one run deleting the other's live state. `create_dir` fails rather than
+/// succeeds on a name that already exists, so retrying it under the next sequence number
+/// hands back a directory this call is the sole owner of whatever else is running.
 fn temporary_directory(name: &str) -> PathBuf {
-    let directory = std::env::temp_dir().join(format!(
-        "agens-providers-chatgpt-login-{name}-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&directory);
-    fs::create_dir_all(&directory).expect("temporary directory should be created");
-    directory
+    let base = std::env::temp_dir();
+    let pid = std::process::id();
+
+    loop {
+        let sequence = TEMP_DIRECTORY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let directory = base.join(format!(
+            "agens-providers-chatgpt-login-{name}-{pid}-{sequence}"
+        ));
+
+        match fs::create_dir(&directory) {
+            Ok(()) => return directory,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => panic!("temporary directory should be created: {error}"),
+        }
+    }
 }
