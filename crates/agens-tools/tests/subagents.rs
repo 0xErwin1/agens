@@ -12,8 +12,44 @@ use std::{
 use agens_core::HeadlessTurnCancellation;
 use agens_tools::{
     ChildCapability, SubagentInvocation, SubagentLimits, SubagentRunner, SubagentRunnerError,
-    SubagentTool, SubagentTurnRequest, SubagentTurnResult, ToolExecutionContext,
+    SubagentTool, SubagentTurnRequest, SubagentTurnResult, ToolExecutionContext, ToolOutput,
 };
+
+/// How long [`DelayedThenSuccessfulRunner`] ignores the supplied context on its
+/// first call.
+///
+/// Every other constant here is expressed relative to this one; it is long
+/// enough that a loaded scheduler cannot make a child that is still sleeping
+/// look like a child that already returned.
+const NON_COOPERATIVE_RUNNER_DELAY: Duration = Duration::from_millis(1_200);
+
+/// Child deadline used against a non-cooperative runner.
+///
+/// It must stay an order of magnitude below [`NON_COOPERATIVE_RUNNER_DELAY`] so
+/// the deadline — not the runner returning — is what ends a blocked call, and
+/// far above the cost of spawning the child thread and handing its result back
+/// over a channel, because the tool applies the same deadline to calls that are
+/// expected to succeed. A few milliseconds satisfies the first constraint but
+/// not the second, and turns a successful child into a spurious timeout under
+/// load.
+const NON_COOPERATIVE_CHILD_DEADLINE: Duration = Duration::from_millis(100);
+
+/// Upper bound on how long a call bounded by a deadline or a cancellation may
+/// take to come back.
+///
+/// It sits between the two constants above: high enough above
+/// [`NON_COOPERATIVE_CHILD_DEADLINE`] to absorb scheduler jitter and the
+/// result-polling interval, and low enough below
+/// [`NON_COOPERATIVE_RUNNER_DELAY`] that it still proves the call returned on
+/// its own bound instead of waiting for the runner.
+const PROMPT_RETURN_BOUND: Duration = Duration::from_millis(500);
+
+/// Overall budget for waiting on the permit a non-cooperative child holds.
+///
+/// Comfortably above [`NON_COOPERATIVE_RUNNER_DELAY`] so only a permit that is
+/// genuinely never released fails the test, and bounded so such a regression
+/// fails loudly instead of hanging.
+const PERMIT_RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[test]
 fn runs_a_validated_skill_in_an_isolated_non_recursive_child_context() {
@@ -265,10 +301,12 @@ fn rejects_a_late_child_success_after_the_parent_cancels() {
         "researcher",
         "---\nname: researcher\ndescription: Research a bounded question\n---\nUse only the supplied context.\n",
     );
+    let runner = DelayedThenSuccessfulRunner::default();
+    let entered = runner.entered();
     let tool = SubagentTool::discover(
         &skills_root,
         temporary.path.join("missing"),
-        DelayedThenSuccessfulRunner::default(),
+        runner,
         SubagentLimits::new(1, 64, 64, Duration::from_secs(1)).expect("limits"),
     )
     .expect("discover subagent skill");
@@ -283,7 +321,7 @@ fn rejects_a_late_child_success_after_the_parent_cancels() {
             &child_parent,
         )
     });
-    thread::sleep(Duration::from_millis(5));
+    wait_until_the_child_started(&entered);
     cancellation.cancel();
 
     let output = worker.join().expect("child caller");
@@ -298,7 +336,8 @@ fn rejects_a_late_child_success_after_the_parent_cancels() {
     assert_eq!(rejected.content, "subagent: concurrent child limit reached");
     assert!(rejected.is_error);
 
-    thread::sleep(Duration::from_millis(180));
+    let recovered = execute_once_the_permit_is_released(&tool, "third");
+    assert_eq!(recovered.content, "child result");
 }
 
 #[test]
@@ -376,7 +415,7 @@ fn returns_by_deadline_and_retains_the_permit_until_a_non_cooperative_runner_fin
         &skills_root,
         temporary.path.join("missing"),
         DelayedThenSuccessfulRunner::default(),
-        SubagentLimits::new(1, 64, 64, Duration::from_millis(5)).expect("limits"),
+        SubagentLimits::new(1, 64, 64, NON_COOPERATIVE_CHILD_DEADLINE).expect("limits"),
     )
     .expect("discover subagent skill");
 
@@ -386,7 +425,7 @@ fn returns_by_deadline_and_retains_the_permit_until_a_non_cooperative_runner_fin
         Arc::new(AtomicBool::new(false)),
     );
 
-    assert!(started.elapsed() < Duration::from_millis(80));
+    assert!(started.elapsed() < PROMPT_RETURN_BOUND);
     assert_eq!(timed_out.content, "subagent: deadline exceeded");
     assert!(timed_out.is_error);
 
@@ -396,11 +435,7 @@ fn returns_by_deadline_and_retains_the_permit_until_a_non_cooperative_runner_fin
     );
     assert_eq!(rejected.content, "subagent: concurrent child limit reached");
 
-    thread::sleep(Duration::from_millis(180));
-    let recovered = tool.execute(
-        SubagentInvocation::new("researcher", "third"),
-        Arc::new(AtomicBool::new(false)),
-    );
+    let recovered = execute_once_the_permit_is_released(&tool, "third");
     assert_eq!(recovered.content, "child result");
     assert!(!recovered.is_error);
 }
@@ -414,17 +449,19 @@ fn returns_promptly_when_cancellation_reaches_a_non_cooperative_runner() {
         "researcher",
         "---\nname: researcher\ndescription: Research a bounded question\n---\nUse only the supplied context.\n",
     );
+    let runner = DelayedThenSuccessfulRunner::default();
+    let entered = runner.entered();
     let tool = SubagentTool::discover(
         &skills_root,
         temporary.path.join("missing"),
-        DelayedThenSuccessfulRunner::default(),
+        runner,
         SubagentLimits::new(1, 64, 64, Duration::from_secs(1)).expect("limits"),
     )
     .expect("discover subagent skill");
     let cancellation = Arc::new(AtomicBool::new(false));
     let trigger = Arc::clone(&cancellation);
     let cancellation_worker = thread::spawn(move || {
-        thread::sleep(Duration::from_millis(5));
+        wait_until_the_child_started(&entered);
         trigger.store(true, Ordering::Release);
     });
 
@@ -432,7 +469,7 @@ fn returns_promptly_when_cancellation_reaches_a_non_cooperative_runner() {
     let cancelled = tool.execute(SubagentInvocation::new("researcher", "first"), cancellation);
 
     cancellation_worker.join().expect("cancellation worker");
-    assert!(started.elapsed() < Duration::from_millis(80));
+    assert!(started.elapsed() < PROMPT_RETURN_BOUND);
     assert_eq!(cancelled.content, "subagent: cancelled");
 
     let rejected = tool.execute(
@@ -441,7 +478,8 @@ fn returns_promptly_when_cancellation_reaches_a_non_cooperative_runner() {
     );
     assert_eq!(rejected.content, "subagent: concurrent child limit reached");
 
-    thread::sleep(Duration::from_millis(180));
+    let recovered = execute_once_the_permit_is_released(&tool, "third");
+    assert_eq!(recovered.content, "child result");
 }
 
 #[test]
@@ -619,6 +657,17 @@ impl SubagentRunner for CancellableFailureRunner {
 #[derive(Default)]
 struct DelayedThenSuccessfulRunner {
     calls: AtomicUsize,
+    entered: Arc<AtomicBool>,
+}
+
+impl DelayedThenSuccessfulRunner {
+    /// Observes the start of the first, deadline-ignoring call.
+    ///
+    /// The tool acquires the concurrency permit before spawning the child
+    /// thread, so this flag being set implies the permit is already held.
+    fn entered(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.entered)
+    }
 }
 
 impl SubagentRunner for DelayedThenSuccessfulRunner {
@@ -628,10 +677,53 @@ impl SubagentRunner for DelayedThenSuccessfulRunner {
         _context: &agens_tools::SubagentRunContext,
     ) -> Result<SubagentTurnResult, SubagentRunnerError> {
         if self.calls.fetch_add(1, Ordering::AcqRel) == 0 {
-            thread::sleep(Duration::from_millis(150));
+            self.entered.store(true, Ordering::Release);
+            thread::sleep(NON_COOPERATIVE_RUNNER_DELAY);
         }
 
         Ok(SubagentTurnResult::new("child result"))
+    }
+}
+
+/// Blocks until the non-cooperative child is actually running, so a test that
+/// wants to observe the held permit cannot race the child's admission.
+fn wait_until_the_child_started(entered: &Arc<AtomicBool>) {
+    let started = Instant::now();
+
+    while !entered.load(Ordering::Acquire) {
+        assert!(
+            started.elapsed() < PERMIT_RELEASE_TIMEOUT,
+            "the child never reached the runner"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// Retries `prompt` until the tool stops rejecting it for the concurrency
+/// limit, and returns the output of the call that was finally admitted.
+///
+/// This waits on the condition the test cares about — the non-cooperative child
+/// releasing its permit — instead of guessing how long that takes.
+fn execute_once_the_permit_is_released(
+    tool: &SubagentTool<DelayedThenSuccessfulRunner>,
+    prompt: &str,
+) -> ToolOutput {
+    let started = Instant::now();
+
+    loop {
+        let output = tool.execute(
+            SubagentInvocation::new("researcher", prompt),
+            Arc::new(AtomicBool::new(false)),
+        );
+        if output.content != "subagent: concurrent child limit reached" {
+            return output;
+        }
+
+        assert!(
+            started.elapsed() < PERMIT_RELEASE_TIMEOUT,
+            "the non-cooperative child never released its permit"
+        );
+        thread::sleep(Duration::from_millis(5));
     }
 }
 

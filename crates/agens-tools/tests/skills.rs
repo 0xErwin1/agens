@@ -1,6 +1,7 @@
 use std::{
     fs,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicUsize, Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -944,18 +945,36 @@ fn write_skill(root: &Path, directory: &str, contents: &str) {
     fs::write(skill_directory.join("SKILL.md"), contents).expect("skill manifest");
 }
 
+/// Distinguishes directories created within the same process, where the pid is
+/// shared and the clock can report the same nanosecond twice.
+static NEXT_TEMPORARY_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
+
 struct TemporaryDirectory {
     path: PathBuf,
 }
 
 impl TemporaryDirectory {
+    /// A private temporary directory keyed on the pid, a process-local
+    /// sequence number and the wall clock.
+    ///
+    /// No two live processes share a pid and no two calls in one process share
+    /// a sequence number, so concurrent runs cannot collide; the timestamp only
+    /// separates a fresh directory from one a killed process left behind under
+    /// a since-recycled pid. `create_dir` rather than `create_dir_all` keeps
+    /// any residual collision loud instead of silently sharing state.
     fn new() -> Self {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock after Unix epoch")
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("agens-skills-{timestamp}"));
-        fs::create_dir_all(&path).expect("temporary directory");
+        let sequence = NEXT_TEMPORARY_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "agens-skills-{}-{sequence}-{timestamp}",
+            std::process::id()
+        ));
+
+        fs::create_dir(&path).expect("temporary directory");
+
         Self { path }
     }
 }

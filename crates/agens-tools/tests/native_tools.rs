@@ -1,7 +1,7 @@
 use std::{
     fs,
     io::{Read, Write},
-    net::TcpListener,
+    net::{TcpListener, TcpStream},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -20,6 +20,19 @@ use serde_json::json;
 
 static NEXT_ROOT: AtomicUsize = AtomicUsize::new(0);
 
+/// Budget for tests that need an operation to run to completion but do not prove anything
+/// about the budget itself. Those tests are checking a limit, a diff or an output shape,
+/// so the only requirement is that the value comfortably exceeds the operation's real
+/// cost; the timeout paths are proven separately and deterministically, by asking for a
+/// budget that cannot be met (`Duration::from_nanos(1)`) rather than by hoping a generous
+/// one expires.
+///
+/// This is a floor, not a ceiling: nothing is weakened by raising it. Exceeding it still
+/// fails the assertion, because a timed-out operation returns a timeout message instead of
+/// the expected result, so the value only decides how long a genuinely stuck operation
+/// takes to be reported.
+const COMPLETION_BUDGET: Duration = Duration::from_secs(60);
+
 #[test]
 fn directly_constructed_native_tools_allow_long_test_commands_by_default() {
     assert_eq!(
@@ -28,11 +41,66 @@ fn directly_constructed_native_tools_allow_long_test_commands_by_default() {
     );
 }
 
-fn project_root() -> std::path::PathBuf {
-    let suffix = NEXT_ROOT.fetch_add(1, Ordering::Relaxed);
-    let root = std::env::temp_dir().join(format!("agens-tools-{}-{suffix}", std::process::id()));
-    fs::create_dir_all(&root).unwrap();
-    root
+/// A temporary project root that deletes itself when the test ends, whether the test
+/// returns normally or panics.
+///
+/// The name mixes three components because none of them is unique on its own: the kernel
+/// recycles process ids, the wall-clock stamp repeats across processes that start within
+/// the same nanosecond, and the counter only orders roots inside one process. Colliding
+/// would require a recycled process id to reach the same counter value in the same
+/// nanosecond as the run that owned the id before it.
+///
+/// Uniqueness alone is not enough: a run that panicked used to leave its root behind for
+/// whichever later process drew the same process id, and that leftover then made the next
+/// run panic too, so the failures compounded instead of dying out.
+struct TemporaryRoot {
+    path: std::path::PathBuf,
+}
+
+impl TemporaryRoot {
+    fn new() -> Self {
+        let sequence = NEXT_ROOT.fetch_add(1, Ordering::Relaxed);
+        let created = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+
+        let path = std::env::temp_dir().join(format!(
+            "agens-tools-{}-{created}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&path).unwrap();
+
+        Self { path }
+    }
+}
+
+impl std::ops::Deref for TemporaryRoot {
+    type Target = std::path::Path;
+
+    fn deref(&self) -> &Self::Target {
+        &self.path
+    }
+}
+
+impl AsRef<std::path::Path> for TemporaryRoot {
+    fn as_ref(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl Drop for TemporaryRoot {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+
+        // A test that swaps the root for a symlink leaves behind a path that
+        // `remove_dir_all` refuses to follow.
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn project_root() -> TemporaryRoot {
+    TemporaryRoot::new()
 }
 
 #[test]
@@ -92,9 +160,6 @@ fn rejects_absolute_traversal_and_symlink_escape_paths() {
             ToolOutput::failure("path: outside project root")
         );
     }
-
-    fs::remove_dir_all(root).unwrap();
-    fs::remove_dir_all(outside).unwrap();
 }
 
 #[test]
@@ -138,8 +203,6 @@ fn tui_file_candidates_are_bounded_sorted_and_safe() {
             .unwrap()
             .is_error
     );
-
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[cfg(unix)]
@@ -157,16 +220,13 @@ fn tui_file_reads_reject_root_swaps_and_invalid_utf8() {
             .unwrap()
             .is_error
     );
-    fs::rename(&root, root.with_extension("moved")).unwrap();
+    let moved = project_root();
+    fs::rename(&root, moved.join("root")).unwrap();
     std::os::unix::fs::symlink(&outside, &root).unwrap();
     assert_eq!(
         tools.read_file(ReadFileInput::new("safe.txt")).unwrap(),
         ToolOutput::failure("path: outside project root")
     );
-
-    fs::remove_file(&root).unwrap();
-    fs::remove_dir_all(root.with_extension("moved")).unwrap();
-    fs::remove_dir_all(outside).unwrap();
 }
 
 #[test]
@@ -191,8 +251,6 @@ fn writes_lists_and_searches_only_within_the_project() {
         tools.search(SearchInput::new("logs", "needle")).unwrap(),
         ToolOutput::success("logs/run.txt:2:needle\n")
     );
-
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -219,8 +277,6 @@ fn rejects_invalid_typed_inputs_before_running_tools() {
         tools.bash(BashInput::new("   ")).unwrap(),
         ToolOutput::failure("bash: command is required")
     );
-
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -244,8 +300,6 @@ fn bash_uses_the_project_root_and_reports_tool_failures() {
             .unwrap(),
         ToolOutput::failure("[stdout]\nstdout\n[stderr]\nstderr\n[exit status: 7]\n")
     );
-
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -261,7 +315,6 @@ fn bash_labels_stderr_for_success_and_tool_failures() {
         success,
         ToolOutput::success("[stdout]\n[stderr]\nsuccess-stderr\n[exit status: 0]\n")
     );
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -290,8 +343,6 @@ fn bash_enforces_one_total_labeled_output_budget_and_reports_timeout() {
     assert!(output.content.contains("[bash output truncated]\n"));
     assert!(output.content.ends_with("[exit status: 0]\n"));
     assert!(output.content.len() <= 64 * 1024);
-
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -313,8 +364,6 @@ fn bash_combines_streams_with_a_deterministic_total_budget() {
     for _ in 0..4 {
         assert_eq!(tools.bash(BashInput::new(command)).unwrap(), expected);
     }
-
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -330,8 +379,6 @@ fn bash_reserves_metadata_and_both_streams_after_lossy_utf8_expansion() {
     assert!(output.content.contains("[bash output truncated]\n"));
     assert!(output.content.ends_with("[exit status: 0]\n"));
     assert!(output.content.len() <= 64 * 1024);
-
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -342,7 +389,7 @@ fn catalog_preserves_the_bounded_bash_result_without_generic_truncation() {
         .execute(
             "native::bash",
             json!({"command": "printf 'x%.0s' {1..40000}; printf 'y%.0s' {1..40000} >&2"}),
-            &ToolExecutionContext::with_timeout(Duration::from_secs(2)),
+            &ToolExecutionContext::with_timeout(COMPLETION_BUDGET),
         )
         .unwrap();
 
@@ -352,8 +399,6 @@ fn catalog_preserves_the_bounded_bash_result_without_generic_truncation() {
     assert!(output.content.contains("yyyy"));
     assert!(output.content.contains("[bash output truncated]\n"));
     assert!(output.content.ends_with("[exit status: 0]\n"));
-
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -393,8 +438,6 @@ fn bash_timeout_kills_its_process_group_and_descendants() {
     );
     thread::sleep(Duration::from_millis(1100));
     assert!(!marker.exists());
-
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[cfg(unix)]
@@ -413,7 +456,6 @@ fn bash_does_not_wait_for_background_descendant_output() {
         ToolOutput::success("[stdout]\n[stderr]\n[exit status: 0]\n")
     );
     assert!(started.elapsed() < Duration::from_millis(500));
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[cfg(unix)]
@@ -446,7 +488,6 @@ fn bash_cancellation_kills_its_process_group_and_descendants() {
     assert!(started.elapsed() < Duration::from_secs(2));
     thread::sleep(Duration::from_millis(1100));
     assert!(!marker.exists());
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[cfg(unix)]
@@ -467,8 +508,6 @@ fn bash_killed_by_a_signal_reports_exit_code_none() {
             exit_code: None
         })
     );
-
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -490,7 +529,6 @@ fn catalog_returns_turn_cancellation_as_a_runtime_error() {
     cancelled.store(true, Ordering::Release);
 
     assert!(matches!(request.join().unwrap(), Err(Error::Cancelled)));
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -511,7 +549,6 @@ fn catalog_reports_malformed_and_empty_bash_input_as_tool_errors() {
             .unwrap(),
         ToolOutput::failure("bash: command is required")
     );
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -536,7 +573,6 @@ fn catalog_validates_the_optional_bash_timeout_override() {
             .unwrap(),
         ToolOutput::failure("bash: timeout must be greater than zero")
     );
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -556,8 +592,6 @@ fn catalog_applies_a_positive_bash_timeout_override() {
             "[stdout]\n[stderr]\n[bash: timed out after 25ms. If this command is expected to take longer, retry with a larger timeout value in milliseconds (max: 600000ms).]\n[exit status: unavailable]\n"
         )
     );
-
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -581,8 +615,6 @@ fn catalog_falls_back_to_the_configured_bash_timeout() {
             "[stdout]\n[stderr]\n[bash: timed out after 25ms. If this command is expected to take longer, retry with a larger timeout value in milliseconds (max: 600000ms).]\n[exit status: unavailable]\n"
         )
     );
-
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -594,8 +626,6 @@ fn rejects_a_zero_bash_timeout() {
     };
 
     assert!(NativeTools::open_with_limits(&root, limits).is_err());
-
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -607,7 +637,6 @@ fn reads_a_project_relative_file() {
     let output = tools.read_file(ReadFileInput::new("notes.txt")).unwrap();
 
     assert_eq!(output, ToolOutput::success("project note"));
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -626,7 +655,6 @@ fn a_successful_read_reports_its_path() {
             outcome: ToolOutcome::Succeeded,
         })
     );
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -654,7 +682,8 @@ fn absolute_paths_under_the_project_root_are_accepted_and_rewritten() {
     // Outside the root stays blocked without a post-permission execution context
     // (unit-test / unauthenticated call sites). Authorized execution is tested
     // separately — peers treat out-of-workspace as Allow-after-ask, not hard fail.
-    let outside = project_root().join("secret.txt");
+    let outside_dir = project_root();
+    let outside = outside_dir.join("secret.txt");
     fs::write(&outside, "nope").unwrap();
     assert_eq!(
         tools
@@ -663,9 +692,6 @@ fn absolute_paths_under_the_project_root_are_accepted_and_rewritten() {
         ToolOutput::failure("path: outside project root")
     );
     assert_eq!(fs::read_to_string(&outside).unwrap(), "nope");
-
-    fs::remove_dir_all(root).unwrap();
-    fs::remove_dir_all(outside.parent().unwrap()).unwrap();
 }
 
 /// After the permission gate Allow's a call (execute path always has a
@@ -703,9 +729,6 @@ fn authorized_writes_may_land_outside_the_project_root() {
             .is_error,
         "without execution context, outside write stays confined"
     );
-
-    fs::remove_dir_all(root).unwrap();
-    fs::remove_dir_all(outside_dir).unwrap();
 }
 
 #[test]
@@ -731,7 +754,6 @@ fn confined_read_write_creates_parents_and_reads_one_based_ranges() {
             .unwrap(),
         ToolOutput::success("three\n")
     );
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -752,8 +774,6 @@ fn exact_edit_replaces_one_match_and_returns_a_unified_diff() {
         fs::read_to_string(root.join("notes.txt")).unwrap(),
         "one\nTWO\nthree\n"
     );
-
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -783,8 +803,6 @@ fn exact_edit_rejects_invalid_matches_without_changing_the_target() {
             .is_error
     );
     assert_eq!(fs::read_to_string(root.join("notes.txt")).unwrap(), "aaa");
-
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[cfg(unix)]
@@ -817,9 +835,6 @@ fn exact_edit_fails_closed_for_nonregular_and_linked_targets() {
         fs::read_to_string(root.join("original.txt")).unwrap(),
         "old"
     );
-
-    fs::remove_dir_all(root).unwrap();
-    fs::remove_dir_all(outside).unwrap();
 }
 
 #[test]
@@ -858,8 +873,6 @@ fn catalog_dispatches_the_separate_edit_schema() {
         ToolOutput::failure("tool execution cancelled")
     );
     assert_eq!(fs::read_to_string(root.join("notes.txt")).unwrap(), "after");
-
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -872,7 +885,7 @@ fn native_catalog_preserves_edit_facts() {
         .execute(
             "native::edit",
             json!({"path": "notes.txt", "old": "before", "new": "after"}),
-            &ToolExecutionContext::with_timeout(Duration::from_secs(1)),
+            &ToolExecutionContext::with_timeout(COMPLETION_BUDGET),
         )
         .unwrap();
 
@@ -891,8 +904,6 @@ fn native_catalog_preserves_edit_facts() {
             }),
         })
     );
-
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[cfg(unix)]
@@ -931,8 +942,6 @@ fn confined_read_write_fails_closed_for_symlinks_and_hardlinks() {
         fs::read_to_string(root.join("original.txt")).unwrap(),
         "original"
     );
-    fs::remove_dir_all(root).unwrap();
-    fs::remove_dir_all(outside).unwrap();
 }
 
 #[test]
@@ -972,8 +981,6 @@ fn list_and_search_fail_when_configured_work_budgets_are_exhausted() {
         tools.search(SearchInput::new("flat", "needle")).unwrap(),
         ToolOutput::failure("search: entry limit of 3 exceeded")
     );
-
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -1003,8 +1010,6 @@ fn search_and_grep_report_an_untruncated_match_count() {
             truncated: false,
         })
     );
-
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -1040,8 +1045,6 @@ fn a_truncated_grep_reports_the_match_count_before_the_truncation_marker() {
             truncated: true,
         })
     );
-
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[cfg(unix)]
@@ -1077,8 +1080,6 @@ fn final_symlink_replacement_never_redirects_a_write_outside_the_project() {
 
     keep_flipping.store(false, Ordering::Release);
     flipper.join().unwrap();
-    fs::remove_dir_all(root).unwrap();
-    fs::remove_dir_all(outside).unwrap();
 }
 
 #[test]
@@ -1118,7 +1119,6 @@ fn catalog_exposes_strict_schemas_and_cancellation_suppresses_bash_output() {
         .unwrap();
     assert_eq!(output, ToolOutput::failure("tool execution cancelled"));
     assert!(!output.content.contains("SECRET_SENTINEL"));
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -1157,8 +1157,6 @@ fn grep_uses_regex_filters_and_skips_binary_and_git_files() {
         tools.grep(GrepInput::new("[")).unwrap(),
         ToolOutput::failure("grep: invalid regex")
     );
-
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -1188,8 +1186,6 @@ fn glob_lists_relative_doublestar_matches_and_reports_truncation() {
         tools.glob(GlobInput::new("**/*.toml")).unwrap(),
         ToolOutput::success("")
     );
-
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -1207,7 +1203,7 @@ fn grep_and_glob_reject_escape_patterns_and_skip_external_symlinks() {
     );
     assert_eq!(
         tools
-            .grep(GrepInput::new("EXTERNAL_SENTINEL").with_path(&outside))
+            .grep(GrepInput::new("EXTERNAL_SENTINEL").with_path(outside.to_path_buf()))
             .unwrap(),
         ToolOutput::failure("path: outside project root")
     );
@@ -1245,15 +1241,24 @@ fn grep_and_glob_reject_escape_patterns_and_skip_external_symlinks() {
             ToolOutput::success("")
         );
     }
-
-    fs::remove_dir_all(root).unwrap();
-    fs::remove_dir_all(outside).unwrap();
 }
 
 #[test]
 fn grep_and_glob_enforce_exact_default_scan_result_depth_and_timeout_bounds() {
     let root = project_root();
-    let tools = NativeTools::open(&root).unwrap();
+
+    // Every default this scans for — the entry cap, the result cap, the depth cap — is a
+    // count, and a scan that runs out of time reports the timeout instead of the count it
+    // was about to hit. The operation timeout is therefore lifted here and pinned by its
+    // own assertions below, on the default value and on a budget that cannot be met.
+    let tools = NativeTools::open_with_limits(
+        &root,
+        NativeToolLimits {
+            operation_timeout: COMPLETION_BUDGET,
+            ..NativeToolLimits::default()
+        },
+    )
+    .unwrap();
 
     for index in 0..=10_000 {
         fs::write(root.join(format!("entry-{index:05}.txt")), "needle\n").unwrap();
@@ -1281,7 +1286,7 @@ fn grep_and_glob_enforce_exact_default_scan_result_depth_and_timeout_bounds() {
         ))
     );
 
-    let mut directory = root.clone();
+    let mut directory = root.to_path_buf();
     for _ in 0..=32 {
         directory.push("nested");
         fs::create_dir(&directory).unwrap();
@@ -1317,7 +1322,6 @@ fn grep_and_glob_enforce_exact_default_scan_result_depth_and_timeout_bounds() {
         NativeToolLimits::default().operation_timeout,
         Duration::from_secs(5)
     );
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -1359,8 +1363,6 @@ fn glob_excludes_gitignored_trees_before_consuming_the_scan_budget() {
         tools.glob(GlobInput::new("**/*.md")).unwrap(),
         ToolOutput::success("README.md\nnotes.md\n")
     );
-
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -1389,8 +1391,6 @@ fn glob_applies_local_ignore_rules_safely_outside_git_repositories() {
         tools.glob(GlobInput::new("**/*.md")).unwrap(),
         ToolOutput::success("README.md\n")
     );
-
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -1413,8 +1413,6 @@ fn glob_and_list_enforce_the_exact_default_entry_cap() {
         output.content.lines().last(),
         Some("[glob output truncated after 1000 entries]")
     );
-
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -1449,8 +1447,6 @@ fn catalog_dispatches_grep_and_glob_with_their_own_schemas() {
             .unwrap(),
         ToolOutput::success("notes.txt\n")
     );
-
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -1475,22 +1471,112 @@ fn webfetch_rejects_unsafe_urls_and_honors_cancellation_before_network_access() 
             .unwrap(),
         ToolOutput::failure("webfetch: cancelled")
     );
+}
 
-    fs::remove_dir_all(root).unwrap();
+const FIXTURE_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long a test waits for a condition another thread is expected to publish. Only a
+/// hung fixture ever spends it, so it is sized to outlast scheduler starvation rather
+/// than to bound the happy path.
+const FIXTURE_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Execution budget handed to the cancellation tests. An unhonored cancellation burns
+/// all of it, because the fixture holds the connection open and never answers.
+const EXECUTION_BUDGET: Duration = Duration::from_secs(2);
+
+/// How long a cancelled webfetch may take to return once cancellation is published.
+///
+/// The real cost is one `PROCESS_POLL_INTERVAL` pickup (10ms) plus a thread join, so the
+/// bound is loose enough that CPU contention cannot trip it. What it must keep proving is
+/// that the call returned promptly instead of waiting out `EXECUTION_BUDGET`, so it has to
+/// stay far below that; do not raise it towards two seconds.
+const CANCELLATION_BUDGET: Duration = Duration::from_millis(500);
+
+/// Blocks until another thread makes `condition` hold, failing loudly instead of hanging
+/// if it never does. Preferred over a fixed sleep, whose margin evaporates under load.
+fn wait_for(condition: impl Fn() -> bool, message: &str) {
+    let deadline = Instant::now() + FIXTURE_WAIT_TIMEOUT;
+
+    while !condition() {
+        assert!(Instant::now() < deadline, "{message}");
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// Binds a loopback listener that fixture workers poll instead of parking inside
+/// `accept`, so a worker can still notice that its test is over.
+fn bind_pollable_listener() -> (TcpListener, u16) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    (listener, port)
+}
+
+/// Waits for one client connection while honoring the stop flag.
+///
+/// Under CPU contention a webfetch budget can expire before hyper's connector issues
+/// its `connect`, so the client may never open a socket at all; a bare `accept` would
+/// then park the worker forever and deadlock the `join` that ends the test. Accepted
+/// streams are handed back in blocking mode with a read timeout, because platforms
+/// differ on whether they inherit the listener's nonblocking flag and a client that
+/// connects without sending would otherwise park the worker just as hard.
+fn accept_until_stopped(listener: &TcpListener, stop: &AtomicBool) -> Option<TcpStream> {
+    while !stop.load(Ordering::Acquire) {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                stream.set_nonblocking(false).unwrap();
+                stream.set_read_timeout(Some(FIXTURE_READ_TIMEOUT)).unwrap();
+
+                return Some(stream);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => panic!("fixture listener should accept: {error}"),
+        }
+    }
+
+    None
+}
+
+/// A fixture listener thread whose `join` cannot block indefinitely: it first tells the
+/// worker to stop waiting for a connection the client may never open, then surfaces any
+/// expectation the worker failed as a test failure.
+struct FixtureServer {
+    stop: Arc<AtomicBool>,
+    worker: thread::JoinHandle<()>,
+}
+
+impl FixtureServer {
+    fn spawn<F>(body: F) -> Self
+    where
+        F: FnOnce(&AtomicBool) + Send + 'static,
+    {
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let worker = thread::spawn(move || body(&worker_stop));
+
+        Self { stop, worker }
+    }
+
+    fn join(self) {
+        self.stop.store(true, Ordering::Release);
+        self.worker.join().expect("fixture server should finish");
+    }
 }
 
 fn webfetch_fixture(
     responses: Vec<String>,
     request: Arc<Mutex<String>>,
-) -> (String, thread::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let url = format!(
-        "http://localhost:{}/",
-        listener.local_addr().unwrap().port()
-    );
-    let worker = thread::spawn(move || {
+) -> (String, FixtureServer) {
+    let (listener, port) = bind_pollable_listener();
+    let url = format!("http://localhost:{port}/");
+    let worker = FixtureServer::spawn(move |stop| {
         for response in responses {
-            let (mut stream, _) = listener.accept().unwrap();
+            let mut stream = accept_until_stopped(&listener, stop)
+                .expect("fixture client should connect for every queued response");
             let mut bytes = [0; 4096];
             let read = stream.read(&mut bytes).unwrap();
             *request.lock().unwrap() = String::from_utf8_lossy(&bytes[..read]).into_owned();
@@ -1505,8 +1591,6 @@ fn webfetch_enforces_redirects_response_contract_and_headers() {
     let root = project_root();
     let tools = NativeTools::open(&root).unwrap();
     let request = Arc::new(Mutex::new(String::new()));
-    let previous_proxy = std::env::var_os("HTTP_PROXY");
-    unsafe { std::env::set_var("HTTP_PROXY", "http://127.0.0.1:1") };
     let (url, worker) = webfetch_fixture(
         vec![
             "HTTP/1.1 302 Found\r\nLocation: /one\r\nContent-Length: 0\r\n\r\n".into(),
@@ -1523,7 +1607,7 @@ fn webfetch_enforces_redirects_response_contract_and_headers() {
         tools.webfetch(WebfetchInput::new(url)).unwrap(),
         ToolOutput::success("visible text")
     );
-    worker.join().unwrap();
+    worker.join();
 
     let (url, worker) = webfetch_fixture(
         vec![
@@ -1536,19 +1620,12 @@ fn webfetch_enforces_redirects_response_contract_and_headers() {
         tools.webfetch(WebfetchInput::new(url)).unwrap(),
         ToolOutput::failure("webfetch: URL must use http or https")
     );
-    worker.join().unwrap();
+    worker.join();
     let request = request.lock().unwrap();
     let request = request.to_ascii_lowercase();
     assert!(request.contains("user-agent: agens-webfetch/1"));
     assert!(!request.contains("authorization:"));
     assert!(!request.contains("cookie:"));
-
-    unsafe {
-        match previous_proxy {
-            Some(proxy) => std::env::set_var("HTTP_PROXY", proxy),
-            None => std::env::remove_var("HTTP_PROXY"),
-        }
-    }
 
     let (url, worker) = webfetch_fixture(
         vec!["HTTP/1.1 302 Found\r\nLocation: http://user:secret@example.test/\r\nContent-Length: 0\r\n\r\n".into()],
@@ -1558,7 +1635,7 @@ fn webfetch_enforces_redirects_response_contract_and_headers() {
         tools.webfetch(WebfetchInput::new(url)).unwrap(),
         ToolOutput::failure("webfetch: URL credentials are not allowed")
     );
-    worker.join().unwrap();
+    worker.join();
 
     let (url, worker) = webfetch_fixture(
         vec![
@@ -1571,7 +1648,7 @@ fn webfetch_enforces_redirects_response_contract_and_headers() {
         tools.webfetch(WebfetchInput::new(url)).unwrap(),
         ToolOutput::failure("webfetch: blocked network address")
     );
-    worker.join().unwrap();
+    worker.join();
 
     let (url, worker) = webfetch_fixture(
         vec!["HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\r\nraw\0body".into()],
@@ -1581,7 +1658,7 @@ fn webfetch_enforces_redirects_response_contract_and_headers() {
         tools.webfetch(WebfetchInput::new(url)).unwrap(),
         ToolOutput::success("raw\0body")
     );
-    worker.join().unwrap();
+    worker.join();
 
     let (url, worker) = webfetch_fixture(
         vec![format!(
@@ -1594,7 +1671,7 @@ fn webfetch_enforces_redirects_response_contract_and_headers() {
     assert!(!output.is_error);
     assert!(output.content.ends_with("[webfetch output truncated]"));
     assert!(output.content.len() <= 100 * 1024);
-    worker.join().unwrap();
+    worker.join();
 
     let (url, worker) = webfetch_fixture(
         vec!["HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\n\r\nmissing".into()],
@@ -1604,16 +1681,18 @@ fn webfetch_enforces_redirects_response_contract_and_headers() {
         tools.webfetch(WebfetchInput::new(url)).unwrap(),
         ToolOutput::failure("webfetch: HTTP status 404 Not Found")
     );
-    worker.join().unwrap();
+    worker.join();
 
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let url = format!(
-        "http://127.0.0.1:{}/",
-        listener.local_addr().unwrap().port()
-    );
-    let worker = thread::spawn(move || {
-        let _stream = listener.accept().unwrap().0;
-        thread::sleep(Duration::from_millis(20));
+    let (listener, port) = bind_pollable_listener();
+    let url = format!("http://127.0.0.1:{port}/");
+
+    // The one-millisecond budget can expire before the connector even dials, so a
+    // connection that never arrives is a legitimate outcome here: the assertion is
+    // about the timeout, not about the server observing a request.
+    let worker = FixtureServer::spawn(move |stop| {
+        if let Some(_stream) = accept_until_stopped(&listener, stop) {
+            thread::sleep(Duration::from_millis(20));
+        }
     });
     assert_eq!(
         tools
@@ -1621,9 +1700,7 @@ fn webfetch_enforces_redirects_response_contract_and_headers() {
             .unwrap(),
         ToolOutput::failure("webfetch: timed out")
     );
-    worker.join().unwrap();
-
-    fs::remove_dir_all(root).unwrap();
+    worker.join();
 }
 
 #[test]
@@ -1638,27 +1715,32 @@ fn webfetch_rejects_six_redirects_and_cancels_delayed_headers_and_bodies() {
         tools.webfetch(WebfetchInput::new(url)).unwrap(),
         ToolOutput::failure("webfetch: redirect limit exceeded")
     );
-    worker.join().unwrap();
+    worker.join();
 
     for response in [
         None,
         Some("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 8\r\n\r\n"),
     ] {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!(
-            "http://127.0.0.1:{}/",
-            listener.local_addr().unwrap().port()
-        );
+        let (listener, port) = bind_pollable_listener();
+        let url = format!("http://127.0.0.1:{port}/");
         let cancellation = Arc::new(AtomicBool::new(false));
-        let started = Instant::now();
-        let worker = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
+        let in_flight = Arc::new(AtomicBool::new(false));
+        let server_in_flight = Arc::clone(&in_flight);
+        let worker = FixtureServer::spawn(move |stop| {
+            let mut stream = accept_until_stopped(&listener, stop)
+                .expect("cancelled request should still reach the server");
             let mut request = [0; 4096];
             stream.read_exact(&mut request[..1]).unwrap();
             if let Some(response) = response {
                 stream.write_all(response.as_bytes()).unwrap();
             }
-            thread::sleep(Duration::from_millis(100));
+            server_in_flight.store(true, Ordering::Release);
+
+            // Holding the connection open until the test is done is what gives the
+            // budget below its meaning: the request can only finish by being cancelled.
+            while !stop.load(Ordering::Acquire) {
+                thread::sleep(Duration::from_millis(1));
+            }
         });
         let cancelled = Arc::clone(&cancellation);
         let catalog = Arc::new(NativeToolCatalog::new(NativeTools::open(&root).unwrap()));
@@ -1668,46 +1750,65 @@ fn webfetch_rejects_six_redirects_and_cancels_delayed_headers_and_bodies() {
                 .execute(
                     "native::webfetch",
                     json!({"url": url}),
-                    &ToolExecutionContext::new(cancelled, Duration::from_secs(2)),
+                    &ToolExecutionContext::new(cancelled, EXECUTION_BUDGET),
                 )
                 .unwrap()
         });
-        thread::sleep(Duration::from_millis(20));
+
+        wait_for(
+            || in_flight.load(Ordering::Acquire),
+            "the request should reach the server before it is cancelled",
+        );
+        let cancelled_at = Instant::now();
         cancellation.store(true, Ordering::Release);
         assert_eq!(
             request.join().unwrap(),
             ToolOutput::failure("tool execution cancelled")
         );
-        assert!(started.elapsed() < Duration::from_millis(100));
-        worker.join().unwrap();
+
+        assert!(
+            cancelled_at.elapsed() < CANCELLATION_BUDGET,
+            "cancellation took {:?}, which no longer distinguishes a prompt return from \
+             waiting out the {EXECUTION_BUDGET:?} execution budget",
+            cancelled_at.elapsed()
+        );
+
+        worker.join();
         drop(catalog);
     }
-
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
 fn webfetch_bounds_cancelled_request_workers_and_reuses_the_admission_slot() {
     let root = project_root();
     let tools = Arc::new(NativeTools::open(&root).unwrap());
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let url = format!(
-        "http://localhost:{}/",
-        listener.local_addr().unwrap().port()
-    );
+    let (listener, port) = bind_pollable_listener();
+    let url = format!("http://localhost:{port}/");
     let accepted = Arc::new(AtomicUsize::new(0));
     let server_accepted = Arc::clone(&accepted);
-    let server = thread::spawn(move || {
-        let (mut first, _) = listener.accept().unwrap();
+    let release_first = Arc::new(AtomicBool::new(false));
+    let server_release = Arc::clone(&release_first);
+    let server = FixtureServer::spawn(move |stop| {
+        let mut first = accept_until_stopped(&listener, stop)
+            .expect("the cancelled request should reach the server");
         server_accepted.fetch_add(1, Ordering::Release);
         let mut request = [0; 4096];
         first.read_exact(&mut request[..1]).unwrap();
-        thread::sleep(Duration::from_millis(300));
+
+        // The orphaned request worker keeps the admission slot until this response
+        // lands, so the test decides when that happens instead of racing a sleep.
+        while !server_release.load(Ordering::Acquire) {
+            if stop.load(Ordering::Acquire) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
         first
             .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nfirst")
             .unwrap();
 
-        let (mut second, _) = listener.accept().unwrap();
+        let mut second = accept_until_stopped(&listener, stop)
+            .expect("the readmitted request should reach the server");
         server_accepted.fetch_add(1, Ordering::Release);
         second.read_exact(&mut request[..1]).unwrap();
         second
@@ -1724,11 +1825,10 @@ fn webfetch_bounds_cancelled_request_workers_and_reuses_the_admission_slot() {
             .unwrap()
     });
 
-    let deadline = Instant::now() + Duration::from_secs(1);
-    while accepted.load(Ordering::Acquire) == 0 {
-        assert!(Instant::now() < deadline, "request worker did not start");
-        thread::sleep(Duration::from_millis(1));
-    }
+    wait_for(
+        || accepted.load(Ordering::Acquire) == 1,
+        "request worker did not start",
+    );
     cancellation.store(true, Ordering::Release);
     assert_eq!(
         request.join().unwrap(),
@@ -1743,15 +1843,26 @@ fn webfetch_bounds_cancelled_request_workers_and_reuses_the_admission_slot() {
     }
     assert_eq!(accepted.load(Ordering::Acquire), 1);
 
-    thread::sleep(Duration::from_millis(320));
-    assert_eq!(
-        tools.webfetch(WebfetchInput::new(url)).unwrap(),
-        ToolOutput::success("second")
-    );
+    release_first.store(true, Ordering::Release);
+
+    let deadline = Instant::now() + FIXTURE_WAIT_TIMEOUT;
+    let readmitted = loop {
+        let output = tools.webfetch(WebfetchInput::new(&url)).unwrap();
+        if output != ToolOutput::failure("webfetch: request busy") {
+            break output;
+        }
+
+        assert!(
+            Instant::now() < deadline,
+            "the admission slot was never reused after the orphaned request worker finished"
+        );
+        thread::sleep(Duration::from_millis(5));
+    };
+
+    assert_eq!(readmitted, ToolOutput::success("second"));
     assert_eq!(accepted.load(Ordering::Acquire), 2);
-    server.join().unwrap();
+    server.join();
     drop(tools);
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[cfg(unix)]
@@ -1787,5 +1898,4 @@ fn confined_open_reports_canonical_filesystem_reasons() {
     );
 
     drop(tools);
-    fs::remove_dir_all(root).unwrap();
 }

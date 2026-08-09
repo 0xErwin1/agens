@@ -28,6 +28,36 @@ use agens_tools::{
 };
 use serde_json::Value;
 
+/// Overall budget for a spawned child to be admitted and reach the blocking
+/// runner.
+///
+/// It only has to stay above the scheduler latency of starting a handful of
+/// threads, and is bounded so that permit accounting which never admits a child
+/// fails here loudly instead of hanging the test binary.
+const CHILD_ADMISSION_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Deadline handed to a child that a test parks — in [`BlockingTaskRunner`] or
+/// in a publication hook — and releases itself.
+///
+/// No assertion expects these children to expire, yet the deadline starts
+/// running when the parent context is built, which is before the tool is
+/// constructed from disk and before the calling thread is even scheduled. It
+/// therefore has to outlast all of that plus the parked window; a one-second
+/// budget does not on a saturated machine, and an expiry there does not merely
+/// slow the test down, it takes a different branch of the tool and never runs
+/// the runner at all.
+const PARKED_CHILD_DEADLINE: Duration = Duration::from_secs(30);
+
+/// Deadline for the one background task whose expiry is the behaviour under
+/// test.
+///
+/// Unlike [`PARKED_CHILD_DEADLINE`] this one has to fire — but not before the
+/// worker thread has reached the runner and reported the deadline it inherited.
+/// Both ends are wall-clock, because a parent deadline is anchored when the
+/// context is built and no API lets a test start it at child entry, so the only
+/// available lever is a margin wide enough that thread start-up cannot beat it.
+const EXPIRING_PARENT_DEADLINE: Duration = Duration::from_secs(1);
+
 #[test]
 fn parses_scalar_and_list_frontmatter_without_changing_the_body() {
     let document =
@@ -1201,17 +1231,15 @@ fn task_shares_four_permits_only_across_clones() {
         calls.push(thread::spawn(move || {
             clone
                 .execute(
-                    &ToolExecutionContext::new(cancellation, Duration::from_secs(1)),
+                    &ToolExecutionContext::new(cancellation, PARKED_CHILD_DEADLINE),
                     task_arguments(),
                 )
                 .unwrap()
         }));
     }
 
-    started_receiver
-        .recv_timeout(Duration::from_secs(1))
-        .unwrap();
-    thread::sleep(Duration::from_millis(30));
+    wait_until_children_started(&started_receiver, 4);
+
     assert_eq!(
         task.clone()
             .execute(&task_context(), task_arguments())
@@ -1255,9 +1283,8 @@ fn task_cancellation_wins_and_holds_permit_until_worker_exit() {
             .unwrap()
     });
 
-    started_receiver
-        .recv_timeout(Duration::from_secs(1))
-        .unwrap();
+    wait_until_children_started(&started_receiver, 1);
+
     cancellation.store(true, Ordering::Release);
     assert_eq!(call.join().unwrap(), ToolOutput::failure("task: cancelled"));
 
@@ -1266,10 +1293,16 @@ fn task_cancellation_wins_and_holds_permit_until_worker_exit() {
     for clone in &mut clones {
         let mut clone = clone.clone();
         callers.push(thread::spawn(move || {
-            clone.execute(&task_context(), task_arguments()).unwrap()
+            clone
+                .execute(
+                    &ToolExecutionContext::with_timeout(PARKED_CHILD_DEADLINE),
+                    task_arguments(),
+                )
+                .unwrap()
         }));
     }
-    thread::sleep(Duration::from_millis(30));
+    wait_until_children_started(&started_receiver, 3);
+
     assert_eq!(
         task.clone()
             .execute(&task_context(), task_arguments())
@@ -1321,7 +1354,7 @@ fn background_task_retains_the_inherited_parent_deadline() {
 
     let output = task
         .execute_with_launch_mode(
-            &ToolExecutionContext::with_timeout(Duration::from_millis(25)),
+            &ToolExecutionContext::with_timeout(EXPIRING_PARENT_DEADLINE),
             task_arguments(),
             TaskLaunchMode::Background,
         )
@@ -1331,12 +1364,14 @@ fn background_task_retains_the_inherited_parent_deadline() {
         output,
         ToolOutput::success("Subagent #1 running in background")
     );
+
     let (context_deadline, child_deadline) = observed_receiver
-        .recv_timeout(Duration::from_secs(1))
-        .unwrap();
+        .recv_timeout(CHILD_ADMISSION_TIMEOUT)
+        .expect("the background worker never reached the runner before its deadline");
     assert!(context_deadline.is_some());
     assert_eq!(child_deadline, context_deadline);
-    let deadline = Instant::now() + Duration::from_secs(1);
+
+    let deadline = Instant::now() + EXPIRING_PARENT_DEADLINE + CHILD_ADMISSION_TIMEOUT;
     loop {
         let snapshot = task
             .execution_registry()
@@ -1527,7 +1562,7 @@ fn u15_background_task_invocation_uses_the_shared_task_lifecycle() {
 #[test]
 fn u15_lifecycle_terminal_follows_cancellation_publication_winner() {
     let context =
-        ToolExecutionContext::new(Arc::new(AtomicBool::new(false)), Duration::from_secs(1));
+        ToolExecutionContext::new(Arc::new(AtomicBool::new(false)), PARKED_CHILD_DEADLINE);
     let (paused_sender, paused_receiver) = mpsc::channel();
     let (release_sender, release_receiver) = mpsc::channel();
     let observed = Arc::new(Mutex::new(None));
@@ -1541,13 +1576,14 @@ fn u15_lifecycle_terminal_follows_cancellation_publication_winner() {
     let call = thread::spawn(move || task.execute(&context, task_arguments()).unwrap());
 
     paused_receiver
-        .recv_timeout(Duration::from_secs(1))
-        .unwrap();
+        .recv_timeout(CHILD_ADMISSION_TIMEOUT)
+        .expect("the child never paused before publishing its result");
+
     cancellation.store(true, Ordering::Release);
 
     assert_eq!(call.join().unwrap(), ToolOutput::failure("task: cancelled"));
     release_sender.send(()).unwrap();
-    assert!(registry.wait_for_idle(Duration::from_secs(1)));
+    assert!(registry.wait_for_idle(CHILD_ADMISSION_TIMEOUT));
 
     let lifecycle = observed.lock().unwrap().clone().unwrap();
     assert_eq!(
@@ -2561,6 +2597,24 @@ impl TaskRunner for BlockingTaskRunner {
     }
 }
 
+/// Blocks until `count` further children have entered [`BlockingTaskRunner`].
+///
+/// The task tool admits a child — taking its concurrency permit — before
+/// spawning the worker that calls the runner, and [`BlockingTaskRunner`] then
+/// parks until it is released. Draining that many start signals therefore
+/// proves that many permits are held simultaneously, which a sleep cannot: a
+/// sleep only bounds how long the children were *given* to start, so on a
+/// loaded machine it asserts against children that were never admitted.
+fn wait_until_children_started(started: &mpsc::Receiver<()>, count: usize) {
+    for admitted in 0..count {
+        started
+            .recv_timeout(CHILD_ADMISSION_TIMEOUT)
+            .unwrap_or_else(|_| {
+                panic!("only {admitted} of {count} children reached the blocking runner")
+            });
+    }
+}
+
 fn task_tool<R: TaskRunner>(runner: R) -> TaskTool<R> {
     let temporary = TemporaryDirectory::new();
     let agents = temporary.path.join("agents");
@@ -2629,18 +2683,36 @@ fn write_command(root: &std::path::Path, name: &str, description: &str, body: &s
     .unwrap();
 }
 
+/// Distinguishes directories created within the same process, where the pid is
+/// shared and the clock can report the same nanosecond twice.
+static NEXT_TEMPORARY_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
+
 struct TemporaryDirectory {
     path: PathBuf,
 }
 
 impl TemporaryDirectory {
+    /// A private temporary directory keyed on the pid, a process-local
+    /// sequence number and the wall clock.
+    ///
+    /// No two live processes share a pid and no two calls in one process share
+    /// a sequence number, so concurrent runs cannot collide; the timestamp only
+    /// separates a fresh directory from one a killed process left behind under
+    /// a since-recycled pid. `create_dir` rather than `create_dir_all` keeps
+    /// any residual collision loud instead of silently sharing state.
     fn new() -> Self {
-        let name = SystemTime::now()
+        let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("agens-extensions-{name}"));
-        fs::create_dir_all(&path).unwrap();
+        let sequence = NEXT_TEMPORARY_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "agens-extensions-{}-{sequence}-{timestamp}",
+            std::process::id()
+        ));
+
+        fs::create_dir(&path).unwrap();
+
         Self { path }
     }
 }

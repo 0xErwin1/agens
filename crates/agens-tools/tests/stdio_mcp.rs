@@ -3,7 +3,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc,
     },
     thread,
@@ -145,11 +145,38 @@ fn stdio_transport_returns_promptly_when_a_child_does_not_read_stdin() {
     );
 }
 
+/// Bound on the fixture handshake that precedes the cancellation: the child has to
+/// notice its stdin pipe filled and publish the marker file, and the watcher thread has
+/// to poll for it.
+///
+/// Nothing here is the property under test, so this only has to be loud rather than
+/// hanging. The quarter of a second it replaces is not survivable: that whole handshake
+/// runs while the machine is also moving half a megabyte through a pipe, and on a loaded
+/// core it routinely takes longer.
+const CHILD_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Deadline of the cancelled call.
+///
+/// It must be unreachable rather than merely generous. The handshake above runs inside
+/// this window, so a deadline sized for a quiet machine ends the call on its own under
+/// load and returns `TimedOut`, which is indistinguishable from the cancellation never
+/// having been observed at all. Leaving cancellation as the only bound that can end the
+/// call is what makes the assertion below mean what it says.
+const UNREACHED_WRITE_DEADLINE: Duration = Duration::from_secs(30);
+
+/// Ceiling on how long the blocked write may take to come back once cancelled.
+///
+/// This one is the property the test exists for and stays a real bound. It has to remain
+/// far below [`UNREACHED_WRITE_DEADLINE`], because a call that returned only because its
+/// deadline expired would otherwise pass as a prompt cancellation; the margin above the
+/// cancellation itself is only there to absorb scheduler jitter.
+const PROMPT_CANCELLATION_CEILING: Duration = Duration::from_secs(2);
+
 #[test]
 fn stdio_transport_cancels_an_observably_blocked_stdin_write_promptly() {
     let cancellation = Arc::new(AtomicBool::new(false));
     let (mut transport, blocked_path, _temporary) = blocked_stdin_transport();
-    let context = McpOperationContext::new(Arc::clone(&cancellation), Duration::from_secs(1));
+    let context = McpOperationContext::new(Arc::clone(&cancellation), UNREACHED_WRITE_DEADLINE);
     let (sender, receiver) = mpsc::sync_channel(1);
     let signal = Arc::clone(&cancellation);
     let (blocked_sender, blocked_receiver) = mpsc::sync_channel(1);
@@ -170,12 +197,12 @@ fn stdio_transport_cancels_an_observably_blocked_stdin_write_promptly() {
     });
 
     assert_eq!(
-        blocked_receiver.recv_timeout(Duration::from_millis(250)),
+        blocked_receiver.recv_timeout(CHILD_HANDSHAKE_TIMEOUT),
         Ok(()),
         "child must confirm the stdin pipe filled before cancellation"
     );
     assert_eq!(
-        receiver.recv_timeout(Duration::from_millis(250)),
+        receiver.recv_timeout(PROMPT_CANCELLATION_CEILING),
         Ok(Err(McpTransportError::Cancelled))
     );
 }
@@ -336,21 +363,35 @@ fn assert_no_orphan(pid: i32, mode: &str) {
     }
 }
 
+/// Distinguishes directories created within the same process, where the pid is
+/// shared and the clock can report the same nanosecond twice.
+static NEXT_TEMPORARY_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
+
 struct TemporaryDirectory {
     path: PathBuf,
 }
 
 impl TemporaryDirectory {
+    /// A private temporary directory keyed on the pid, a process-local sequence
+    /// number and the wall clock.
+    ///
+    /// No two live processes share a pid and no two calls in one process share a
+    /// sequence number, so concurrent runs cannot collide; the timestamp only
+    /// separates a fresh directory from one a killed process left behind under a
+    /// since-recycled pid. `create_dir` rather than `create_dir_all` keeps any
+    /// residual collision loud instead of silently sharing state.
     fn new(name: &str) -> Self {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock should be after Unix epoch")
+            .as_nanos();
+        let sequence = NEXT_TEMPORARY_DIRECTORY.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "agens-tools-{name}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system clock should be after Unix epoch")
-                .as_nanos()
+            "agens-tools-{name}-{}-{sequence}-{timestamp}",
+            std::process::id()
         ));
-        std::fs::create_dir_all(&path).expect("temporary directory should be created");
+
+        std::fs::create_dir(&path).expect("temporary directory should be created");
 
         Self { path }
     }
