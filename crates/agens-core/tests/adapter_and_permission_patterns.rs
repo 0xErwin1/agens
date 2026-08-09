@@ -41,6 +41,46 @@ fn cancellation_adapter_distinguishes_absent_and_elapsed_deadlines() {
 }
 
 #[test]
+fn manual_deadline_holds_until_advanced_and_survives_derivation() {
+    let (cancellation, clock) =
+        HeadlessTurnCancellation::with_manual_deadline_for_test(Duration::from_millis(25));
+    let derived = cancellation.derived_with_timeout(Duration::from_secs(600));
+
+    std::thread::sleep(Duration::from_millis(50));
+
+    assert!(!cancellation.is_expired());
+    assert!(!derived.is_expired());
+    assert_eq!(
+        derived.adapter_view().remaining_duration(),
+        Some(Duration::from_millis(25))
+    );
+
+    clock.advance(Duration::from_millis(25));
+
+    assert!(cancellation.is_expired());
+    assert!(derived.is_expired());
+    assert_eq!(
+        derived.adapter_view().remaining_duration(),
+        Some(Duration::ZERO)
+    );
+}
+
+#[test]
+fn derived_timeout_keeps_the_shorter_deadline_and_the_shared_cancellation_flag() {
+    let parent = HeadlessTurnCancellation::with_deadline(Duration::from_millis(25));
+    let derived = parent.derived_with_timeout(Duration::from_secs(600));
+
+    assert_eq!(
+        derived.adapter_view().deadline(),
+        parent.adapter_view().deadline()
+    );
+
+    parent.cancel();
+
+    assert!(derived.is_cancelled());
+}
+
+#[test]
 fn validated_target_globs_match_paths_with_documented_segment_semantics() {
     let cases = [
         ("資料/**/*.txt", "資料/plan.txt", true),

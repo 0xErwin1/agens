@@ -12,8 +12,8 @@ use agens_core::{
     TurnProvider,
 };
 use agens_providers::{
-    OpenAiFunctionTool, OpenAiResponsesProvider, ProviderDiagnosticClass, ProviderDiagnosticKind,
-    ProviderDiagnosticScope, ProviderDiagnostics, ProviderFailureDetail,
+    OpenAiFunctionTool, OpenAiResponsesProvider, ProviderDiagnosticClass, ProviderDiagnosticEvent,
+    ProviderDiagnosticKind, ProviderDiagnosticScope, ProviderDiagnostics, ProviderFailureDetail,
 };
 use serde_json::json;
 
@@ -644,12 +644,17 @@ fn openai_does_not_retry_permanent_or_partial_stream_failures() {
 ///
 /// The cancelled half gets no `Retry-After`, so its shortest possible backoff is
 /// `HTTP_RETRY_FIRST_DELAY` (250 ms, jitter only adds); 200 ms is the honest ceiling
-/// there. The deadline half is answered with `Retry-After: 5`, capped at
-/// `HTTP_RETRY_AFTER_CAP` (5 s), so 600 ms still proves the backoff never ran while
-/// leaving far more room. Its deadline only has to be shorter than that 5 s backoff for
-/// `wait_for_http_retry` to take the `TimedOut` branch — 150 ms keeps the request itself
-/// comfortably inside the deadline, since the clock starts when the cancellation is
-/// constructed, before the tokio runtime is even built.
+/// there. Its stop signal is a real event — a thread that cancels once the server has
+/// observed the request — so only wall time can order it.
+///
+/// The deadline half needs no such bet. Its deadline runs on a manual clock that stands
+/// still until the retry diagnostic fires, which is emitted inside `wait_for_http_retry`
+/// after the backoff has been scheduled and before it is waited on. The deadline
+/// therefore expires exactly there, on every machine and under any load: the request can
+/// never be cut short before it is sent (so the single observed request is guaranteed,
+/// not likely), and the interrupted wait returns with no sleeping at all. What is left of
+/// the elapsed bound is a backstop against sleeping through the 5 s backoff
+/// (`Retry-After: 5`, capped at `HTTP_RETRY_AFTER_CAP`), not a latency budget.
 ///
 /// Do not tighten these back toward the request latency; they are deliberately loose.
 #[test]
@@ -679,16 +684,44 @@ fn openai_cancellation_and_deadline_interrupt_retry_backoff() {
 
     let deadline_server =
         RetryResponsesServer::start(vec![RetryResponse::StatusWithRetryAfter(429, "5")]);
+    let deadline_timeout = Duration::from_millis(150);
+    let (cancellation, clock) =
+        HeadlessTurnCancellation::with_manual_deadline_for_test(deadline_timeout);
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&events);
+    let diagnostics = ProviderDiagnostics::new(
+        "abc12345",
+        ProviderDiagnosticScope::Parent,
+        Arc::new(move |event: ProviderDiagnosticEvent| {
+            if event.event == ProviderDiagnosticKind::RetryScheduled {
+                clock.advance(deadline_timeout);
+            }
+            captured.lock().expect("event lock").push(event);
+        }),
+    )
+    .expect("diagnostics should be configured");
     let started_at = Instant::now();
+
     assert_eq!(
-        run_provider(
+        run_provider_with_diagnostics(
             deadline_server.base_url(),
-            HeadlessTurnCancellation::with_deadline(Duration::from_millis(150)),
-            Duration::from_secs(1),
+            &cancellation,
+            Duration::from_secs(2),
+            diagnostics,
         ),
         Err(HeadlessTurnPortError::TimedOut)
     );
-    assert!(started_at.elapsed() < Duration::from_millis(600));
+    assert!(started_at.elapsed() < Duration::from_secs(2));
+
+    let events = events.lock().expect("event lock");
+    assert_eq!(events.len(), 3);
+    assert_eq!(events[0].event, ProviderDiagnosticKind::Attempt);
+    assert_eq!(events[1].event, ProviderDiagnosticKind::RetryScheduled);
+    assert_eq!(events[1].class, Some(ProviderDiagnosticClass::RateLimited));
+    assert_eq!(events[1].delay_ms, Some(5000));
+    assert_eq!(events[2].event, ProviderDiagnosticKind::Terminal);
+    assert_eq!(events[2].class, Some(ProviderDiagnosticClass::Deadline));
+    drop(events);
     assert_eq!(deadline_server.join(), 1);
 }
 
@@ -1289,6 +1322,24 @@ fn run_provider(
     )
     .expect("provider should be configured");
     run_provider_instance(&mut provider, &cancellation)
+}
+
+fn run_provider_with_diagnostics(
+    base_url: String,
+    cancellation: &HeadlessTurnCancellation,
+    timeout: Duration,
+    diagnostics: ProviderDiagnostics,
+) -> Result<(), HeadlessTurnPortError> {
+    let mut provider = OpenAiResponsesProvider::from_api_key_with_timeout(
+        "test-api-key".into(),
+        Some(&base_url),
+        "test-model".into(),
+        "test prompt".into(),
+        timeout,
+    )
+    .expect("provider should be configured")
+    .with_diagnostics(diagnostics);
+    run_provider_instance(&mut provider, cancellation)
 }
 
 fn run_provider_with_operation_timeout(

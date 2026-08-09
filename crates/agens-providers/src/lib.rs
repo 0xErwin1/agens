@@ -1572,16 +1572,7 @@ pub(crate) fn provider_operation_cancellation(
     parent: &HeadlessTurnCancellation,
     timeout: Duration,
 ) -> HeadlessTurnCancellation {
-    let parent = parent.adapter_view();
-    let operation_deadline = std::time::Instant::now() + timeout;
-    let deadline = parent.deadline().map_or(operation_deadline, |deadline| {
-        deadline.min(operation_deadline)
-    });
-
-    HeadlessTurnCancellation::with_cancellation_and_deadline(
-        parent.cancellation_handle(),
-        Some(deadline),
-    )
+    parent.derived_with_timeout(timeout)
 }
 
 fn is_transient_transport_error(error: &reqwest::Error) -> bool {
