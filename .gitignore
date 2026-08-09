@@ -14,3 +14,4 @@
 
 # Reference repositories used for research, not vendored source
 /references/
+.atl/
