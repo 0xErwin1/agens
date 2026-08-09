@@ -1177,3 +1177,57 @@ fn dangerous_override_never_precedes_hard_safety_or_reuses_authorization() {
     assert!(!temporary.join("escape.txt").exists());
     std::fs::remove_dir_all(temporary).unwrap();
 }
+
+/// The confinement floor only stands against dangerous mode's fallback. A call
+/// a declared rule allows still writes wherever the person pointed it,
+/// including outside the project root — that is the peer behavior the
+/// dangerous-mode fix must not take away.
+#[test]
+fn a_decided_allow_still_writes_outside_the_project_root() {
+    let temporary = tui_session_directory("decided-external-write");
+    let project_root = temporary.join("project");
+    std::fs::create_dir_all(&project_root).unwrap();
+
+    let declared_allow = PermissionPolicy::new(
+        PermissionMode::Edit,
+        vec![PermissionRule::global(
+            PermissionDecision::Allow,
+            PermissionPattern::Exact("native::write".into()),
+            PermissionPattern::Any,
+        )],
+    );
+    let (_, dispatcher) =
+        production_dangerous_child_tool_runtime(&project_root, ToolLimitSettings::default())
+            .unwrap();
+    let allowed = Arc::new(Mutex::new(BTreeMap::new()));
+    let mut gate = ProductionPermissionGate::new(
+        declared_allow,
+        Arc::new(Mutex::new(Vec::new())),
+        PermissionSession::new(),
+        "project".into(),
+        Arc::clone(&dispatcher),
+        Arc::clone(&allowed),
+        Arc::new(Mutex::new(BTreeMap::new())),
+    );
+    let mut tool_dispatcher = ProductionToolDispatcher::new(dispatcher, allowed);
+    let cancellation = HeadlessTurnCancellation::default();
+    let outside = HeadlessToolCall {
+        id: "outside".into(),
+        name: "native::write".into(),
+        input: r#"{"path":"../commit_msg.txt","content":"decided"}"#.into(),
+    };
+
+    assert_eq!(
+        poll_permission_port(gate.evaluate(&outside, &cancellation)),
+        Ok(PermissionDecision::Allow)
+    );
+    let written = poll_permission_port(tool_dispatcher.dispatch(outside, &cancellation))
+        .expect("a decided allow should reach the tool");
+    assert!(!written.is_error, "decided external write: {written:?}");
+    assert_eq!(
+        std::fs::read_to_string(temporary.join("commit_msg.txt")).unwrap(),
+        "decided"
+    );
+
+    std::fs::remove_dir_all(temporary).unwrap();
+}

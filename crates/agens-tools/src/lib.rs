@@ -18,9 +18,9 @@ use std::{
 
 use agens_core::{
     EditMagnitude, Error, FactPath, HeadlessTaskTerminal, HeadlessTurnCancellationAdapter,
-    PermissionDecision, PermissionPolicy, PermissionReach, PermissionReadFilter, PermissionRequest,
-    PermissionSession, ProjectPermissionGrant, ToolAccess, ToolOutcome, ToolResultFacts,
-    WriteMagnitude,
+    PermissionAuthority, PermissionDecision, PermissionPolicy, PermissionReach,
+    PermissionReadFilter, PermissionRequest, PermissionSession, ProjectPermissionGrant, ToolAccess,
+    ToolOutcome, ToolResultFacts, WriteMagnitude,
 };
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use ignore::WalkBuilder;
@@ -2060,6 +2060,7 @@ pub struct ToolExecutionContext {
     headless_cancellation: Option<HeadlessTurnCancellationAdapter>,
     deadline: Option<Instant>,
     read_filter: Option<PermissionReadFilter>,
+    authority: PermissionAuthority,
 }
 
 impl ToolExecutionContext {
@@ -2077,6 +2078,7 @@ impl ToolExecutionContext {
             headless_cancellation: None,
             deadline: Some(deadline),
             read_filter: None,
+            authority: PermissionAuthority::Decided,
         }
     }
 
@@ -2087,6 +2089,25 @@ impl ToolExecutionContext {
     pub fn with_read_filter(mut self, filter: PermissionReadFilter) -> Self {
         self.read_filter = Some(filter);
         self
+    }
+
+    /// Carries who authorized this call to the tool that performs it. Set by
+    /// [`ToolDispatcher::execute`] from the authorized call's own authority.
+    #[must_use]
+    pub fn with_authority(mut self, authority: PermissionAuthority) -> Self {
+        self.authority = authority;
+        self
+    }
+
+    /// Whether this call's authorization can widen a write past the project
+    /// root once the person or the policy has already allowed it.
+    ///
+    /// Dangerous mode's fallback cannot: nobody decided that call, so the
+    /// confinement floor stays where it is. A context built without any
+    /// authority at all — a direct test of a tool — keeps the behavior it had
+    /// before there was one.
+    pub fn permits_write_outside_root(&self) -> bool {
+        self.authority == PermissionAuthority::Decided
     }
 
     /// Whether the call may report what the project-relative `path` holds.
@@ -2120,6 +2141,7 @@ impl ToolExecutionContext {
             headless_cancellation: Some(cancellation),
             deadline,
             read_filter: None,
+            authority: PermissionAuthority::Decided,
         }
     }
 
@@ -3467,7 +3489,7 @@ struct PreparedEvaluation {
 }
 
 impl PreparedEvaluation {
-    fn into_authorized_call(self) -> AuthorizedToolCall {
+    fn into_authorized_call(self, authority: PermissionAuthority) -> AuthorizedToolCall {
         let read_filter = PermissionReadFilter::new(
             self.policy,
             self.grants,
@@ -3485,6 +3507,7 @@ impl PreparedEvaluation {
             arguments_digest: digest_arguments(&self.arguments),
             arguments: self.arguments,
             read_filter,
+            authority,
         }
     }
 }
@@ -3503,6 +3526,9 @@ pub struct AuthorizedToolCall {
     /// The rules that authorized this call, kept so a tool that reads a whole
     /// file set can ask them about each file. See [`PermissionReadFilter`].
     read_filter: PermissionReadFilter,
+    /// Whether a decision authorized this call or dangerous mode's fallback
+    /// did. See [`PermissionAuthority`].
+    authority: PermissionAuthority,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -3775,7 +3801,7 @@ impl ToolDispatcher {
         }
 
         Ok(ToolEvaluationOutcome::Authorized(
-            prepared.into_authorized_call(),
+            prepared.into_authorized_call(PermissionAuthority::Decided),
         ))
     }
 
@@ -3801,19 +3827,21 @@ impl ToolDispatcher {
             return Ok(ToolEvaluationOutcome::Denied);
         }
 
-        match prepared.policy.evaluate_with_unmatched_override(
+        let (decision, authority) = prepared.policy.evaluate_with_unmatched_authority(
             &prepared.permission,
             &prepared.grants,
             &[],
             session,
             unmatched_allow,
-        ) {
+        );
+
+        match decision {
             PermissionDecision::Deny => Ok(ToolEvaluationOutcome::Denied),
             PermissionDecision::Ask => Ok(ToolEvaluationOutcome::PromptRequired(
                 PermissionPromptContext::from_request(&prepared.permission),
             )),
             PermissionDecision::Allow => Ok(ToolEvaluationOutcome::Authorized(
-                prepared.into_authorized_call(),
+                prepared.into_authorized_call(authority),
             )),
         }
     }
@@ -3890,7 +3918,10 @@ impl ToolDispatcher {
             return Err(Error::Tool("stale authorized tool call".into()));
         }
 
-        let context = context.clone().with_read_filter(handle.read_filter);
+        let context = context
+            .clone()
+            .with_read_filter(handle.read_filter)
+            .with_authority(handle.authority);
 
         match registered.tool.execute(&context, handle.arguments) {
             Ok(output) => {
@@ -5203,9 +5234,13 @@ impl NativeTools {
     /// gate (when `context` is present).
     ///
     /// - Under the project root → confined openat path (relative).
-    /// - Outside the root after authorization → unrestricted absolute path.
+    /// - Outside the root after a decided authorization → unrestricted absolute
+    ///   path.
     /// - Outside the root without a context (unit tests / unauthenticated call
     ///   sites) → still a hard confinement failure, same as before.
+    /// - Outside the root under dangerous mode's fallback → the same hard
+    ///   confinement failure: path confinement is a floor that an authorization
+    ///   nobody gave cannot lift. See [`PermissionAuthority`].
     ///
     /// Peers treat out-of-workspace paths as permission decisions; bypass/Allow
     /// must not die at openat. Explicit policy Deny never reaches execute.
@@ -5216,7 +5251,10 @@ impl NativeTools {
     ) -> Result<AuthorizedWritePath, ToolOutput> {
         match self.resolve_confined_path(path) {
             Ok(relative) => Ok(AuthorizedWritePath::Confined(relative)),
-            Err(error) if context.is_some() && is_path_confinement_refusal(&error) => {
+            Err(error)
+                if context.is_some_and(ToolExecutionContext::permits_write_outside_root)
+                    && is_path_confinement_refusal(&error) =>
+            {
                 let absolute = if path.is_absolute() {
                     path.to_path_buf()
                 } else {
