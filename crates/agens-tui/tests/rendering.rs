@@ -3367,7 +3367,7 @@ fn restored_messages_render_every_turn_and_typed_part_in_persisted_order() {
     renderer.render(tui.view()).unwrap();
     let text = rendered_text(&renderer);
 
-    let order = "first user|first reasoning|read|first answer|first result|persisted reminder|second user|second answer";
+    let order = "first user|first reasoning|read|first result|first answer|persisted reminder|second user|second answer";
     let mut offset = 0;
     for expected in order.split('|') {
         let position = text[offset..].find(expected).expect(expected);

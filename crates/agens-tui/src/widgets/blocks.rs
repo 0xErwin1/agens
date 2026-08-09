@@ -61,8 +61,27 @@ impl RowAccent {
         Span::styled(glyph.text(unicode), Style::default().fg(color))
     }
 
+    /// Wave frame the tick clock stands on.
+    ///
+    /// Rows painted inside the same frame are identical, so a cache of rendered
+    /// rows only goes stale when this number changes.
+    pub(crate) fn wave_frame(now: Duration) -> u128 {
+        now.as_millis() / (StatusGlyph::FRAME_PERIOD_MS * Self::WAVE_PERIODS)
+    }
+
+    /// Whether `span` is a wave bar, i.e. paint the tick clock keeps moving.
+    ///
+    /// Only the wave scales the running colour, so the bar glyph carrying one of
+    /// its levels identifies rows whose colour a cache must not outlive.
+    pub(crate) fn is_wave_span(span: &Span<'_>, unicode: UnicodeLevel) -> bool {
+        span.content == Glyph::AccentBar.text(unicode)
+            && Self::WAVE_LEVELS
+                .iter()
+                .any(|level| span.style.fg == Some(scaled(RolePalette::running(), *level)))
+    }
+
     fn wave_level(row: usize, now: Duration) -> u16 {
-        let frame = now.as_millis() / (StatusGlyph::FRAME_PERIOD_MS * Self::WAVE_PERIODS);
+        let frame = Self::wave_frame(now);
         let index = (frame as usize).wrapping_add(row) % Self::WAVE_LEVELS.len();
         Self::WAVE_LEVELS[index]
     }
