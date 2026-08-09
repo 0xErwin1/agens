@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
@@ -18,6 +19,15 @@ use serde_json::json;
 
 const SECRET_BODY_SENTINEL: &str = "SENTINEL_REMOTE_ERROR_BODY";
 const SECRET_HEADER_SENTINEL: &str = "SENTINEL_REMOTE_ERROR_HEADER";
+
+/// How long a cancelled request may still take to unwind, measured from the `cancel` call
+/// rather than from the start of the request so that connect and request-observation
+/// latency stay out of it.
+///
+/// This must remain well under the one-second operation timeout those tests give the
+/// provider: cancellation that is merely converted into a timeout would otherwise satisfy
+/// the bound and the test would stop proving that cancellation is what ended the request.
+const CANCELLATION_RESPONSE_BUDGET: Duration = Duration::from_millis(500);
 
 #[test]
 fn persistent_connect_failures_stop_at_the_provider_operation_deadline() {
@@ -75,22 +85,61 @@ fn cancellation_interrupts_connect_headers_stalled_body_and_late_events() {
                 thread::sleep(Duration::from_millis(10));
             }
             canceller.cancel();
+
+            Instant::now()
         });
 
-        let started_at = Instant::now();
         let result = run_provider(server.base_url(), cancellation, Duration::from_secs(1));
+        let finished_at = Instant::now();
 
         assert_eq!(result, Err(HeadlessTurnPortError::Cancelled));
-        assert!(started_at.elapsed() < Duration::from_millis(250));
-        canceller_thread
+        let cancelled_at = canceller_thread
             .join()
             .expect("canceller thread should finish");
+        assert!(
+            finished_at.saturating_duration_since(cancelled_at) < CANCELLATION_RESPONSE_BUDGET,
+            "{mode:?} took {:?} to stop after cancellation",
+            finished_at.saturating_duration_since(cancelled_at)
+        );
         server.join();
     }
 }
 
+/// Task and file-descriptor counts are process-wide, so this is the only assertion in the
+/// suite that a *sibling* test can move: libtest runs the rest of this binary on parallel
+/// threads of this same process, and each of them transiently owns threads and sockets of
+/// its own. Re-running the workload in a private child process is what makes the counts
+/// belong to it alone, so the bound below stays the strict one it was written as instead of
+/// being traded against how noisy the rest of the binary happens to be.
 #[test]
 fn one_hundred_same_process_cancellations_and_timeouts_have_bounded_resources() {
+    if std::env::var_os(RESOURCE_ISOLATION_ENV).is_some() {
+        assert_the_whole_workload_leaks_nothing();
+        return;
+    }
+
+    let child = Command::new(std::env::current_exe().expect("test executable should be locatable"))
+        .arg("--exact")
+        .arg("one_hundred_same_process_cancellations_and_timeouts_have_bounded_resources")
+        .env(RESOURCE_ISOLATION_ENV, "1")
+        .output()
+        .expect("isolated child should start");
+    let report = format!(
+        "{}{}",
+        String::from_utf8_lossy(&child.stdout),
+        String::from_utf8_lossy(&child.stderr)
+    );
+
+    assert!(child.status.success(), "{report}");
+    assert!(
+        report.contains("1 passed"),
+        "the isolated child must have run the workload: {report}"
+    );
+}
+
+const RESOURCE_ISOLATION_ENV: &str = "AGENS_OPENAI_HTTP_RESOURCE_CHILD";
+
+fn assert_the_whole_workload_leaks_nothing() {
     let baseline = ResourceSnapshot::capture();
 
     for _ in 0..100 {
@@ -124,9 +173,9 @@ fn one_hundred_same_process_cancellations_and_timeouts_have_bounded_resources() 
         server.join();
     }
 
-    // Task and file-descriptor counts are process-wide, and sibling tests in
-    // this same test binary transiently move them; a real leak is permanent
-    // and per-iteration, so it never settles, while sibling noise does.
+    // Nothing else runs in this process, so what is left to settle is the workload's own
+    // asynchronous teardown: a closed socket lingers until the kernel retires it. A real
+    // leak is permanent and per-iteration, so it never settles however long this waits.
     let settle_deadline = Instant::now() + Duration::from_secs(10);
     let mut after = ResourceSnapshot::capture();
     while after.tasks > baseline.tasks + 2 || after.file_descriptors > baseline.file_descriptors + 2
@@ -587,6 +636,22 @@ fn openai_does_not_retry_permanent_or_partial_stream_failures() {
     assert_eq!(partial.join(), 1);
 }
 
+/// Both halves prove the same property: the retry backoff was interrupted rather than
+/// slept through. That makes each elapsed bound a ceiling chosen against the backoff it
+/// must undercut, not a latency budget — it only has to stay clearly below the delay the
+/// provider would otherwise wait, and every millisecond under that is headroom for a
+/// loaded machine.
+///
+/// The cancelled half gets no `Retry-After`, so its shortest possible backoff is
+/// `HTTP_RETRY_FIRST_DELAY` (250 ms, jitter only adds); 200 ms is the honest ceiling
+/// there. The deadline half is answered with `Retry-After: 5`, capped at
+/// `HTTP_RETRY_AFTER_CAP` (5 s), so 600 ms still proves the backoff never ran while
+/// leaving far more room. Its deadline only has to be shorter than that 5 s backoff for
+/// `wait_for_http_retry` to take the `TimedOut` branch — 150 ms keeps the request itself
+/// comfortably inside the deadline, since the clock starts when the cancellation is
+/// constructed, before the tokio runtime is even built.
+///
+/// Do not tighten these back toward the request latency; they are deliberately loose.
 #[test]
 fn openai_cancellation_and_deadline_interrupt_retry_backoff() {
     let mut cancelled_server = RetryResponsesServer::start(vec![RetryResponse::Status(500)]);
@@ -608,7 +673,7 @@ fn openai_cancellation_and_deadline_interrupt_retry_backoff() {
         ),
         Err(HeadlessTurnPortError::Cancelled)
     );
-    assert!(started_at.elapsed() < Duration::from_millis(100));
+    assert!(started_at.elapsed() < Duration::from_millis(200));
     cancellation_thread.join().expect("canceller should finish");
     assert_eq!(cancelled_server.join(), 1);
 
@@ -618,12 +683,12 @@ fn openai_cancellation_and_deadline_interrupt_retry_backoff() {
     assert_eq!(
         run_provider(
             deadline_server.base_url(),
-            HeadlessTurnCancellation::with_deadline(Duration::from_millis(15)),
+            HeadlessTurnCancellation::with_deadline(Duration::from_millis(150)),
             Duration::from_secs(1),
         ),
         Err(HeadlessTurnPortError::TimedOut)
     );
-    assert!(started_at.elapsed() < Duration::from_millis(100));
+    assert!(started_at.elapsed() < Duration::from_millis(600));
     assert_eq!(deadline_server.join(), 1);
 }
 
@@ -1258,7 +1323,7 @@ fn run_provider_instance(
         .map(|_| ())
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum ServerMode {
     StalledConnect,
     DelayedHeaders,
@@ -1289,6 +1354,7 @@ struct LocalResponsesServer {
     address: std::net::SocketAddr,
     observed_request: Option<mpsc::Receiver<()>>,
     observed_body: Option<mpsc::Receiver<serde_json::Value>>,
+    stop: Arc<AtomicBool>,
     worker: thread::JoinHandle<()>,
 }
 
@@ -1309,13 +1375,7 @@ struct RetryResponsesServer {
 
 impl RetryResponsesServer {
     fn start(responses: Vec<RetryResponse>) -> Self {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("retry server should bind");
-        listener
-            .set_nonblocking(true)
-            .expect("retry listener should be nonblocking");
-        let address = listener
-            .local_addr()
-            .expect("retry server address should be available");
+        let (listener, address) = bind_pollable_listener();
         let request_count = Arc::new(AtomicUsize::new(0));
         let stop = Arc::new(AtomicBool::new(false));
         let worker_count = Arc::clone(&request_count);
@@ -1323,44 +1383,40 @@ impl RetryResponsesServer {
         let (observed_sender, observed_request) = mpsc::channel();
         let worker = thread::spawn(move || {
             let mut responses = VecDeque::from(responses);
-            while !worker_stop.load(Ordering::Acquire) && !responses.is_empty() {
-                let (mut stream, _) = match listener.accept() {
-                    Ok(connection) => connection,
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(1));
-                        continue;
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(_) => return,
+            while !responses.is_empty() {
+                let Some(mut stream) = accept_until_stopped(&listener, &worker_stop) else {
+                    return;
                 };
-                read_request(&stream);
+
+                if read_request(&stream) == RequestArrival::ClientCut {
+                    continue;
+                }
+
                 let request_number = worker_count.fetch_add(1, Ordering::AcqRel) + 1;
                 observed_sender
                     .send(request_number)
                     .expect("test should receive request observation");
                 match responses.pop_front().expect("response should be available") {
                     RetryResponse::Disconnect => {}
-                    RetryResponse::Status(status) => stream
-                        .write_all(
-                            format!(
-                                "HTTP/1.1 {status} Test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                            )
-                            .as_bytes(),
+                    RetryResponse::Status(status) => write_to_possibly_gone_client(
+                        &mut stream,
+                        format!(
+                            "HTTP/1.1 {status} Test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                         )
-                        .expect("status response should be written"),
-                    RetryResponse::StatusWithRetryAfter(status, retry_after) => stream
-                        .write_all(
+                        .as_bytes(),
+                    ),
+                    RetryResponse::StatusWithRetryAfter(status, retry_after) => {
+                        write_to_possibly_gone_client(
+                            &mut stream,
                             format!(
                                 "HTTP/1.1 {status} Test\r\nRetry-After: {retry_after}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                             )
                             .as_bytes(),
                         )
-                        .expect("retry-after response should be written"),
+                    }
                     RetryResponse::Sse(events) => {
-                        write_sse_headers(&mut stream);
-                        stream
-                            .write_all(events.as_bytes())
-                            .expect("SSE response should be written");
+                        write_to_possibly_gone_client(&mut stream, SSE_HEADERS);
+                        write_to_possibly_gone_client(&mut stream, events.as_bytes());
                     }
                 }
             }
@@ -1394,14 +1450,19 @@ impl RetryResponsesServer {
 
 impl LocalResponsesServer {
     fn start_error_response(status: u16, body: &'static str) -> Self {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("server should bind");
-        let address = listener
-            .local_addr()
-            .expect("server address should be available");
+        let (listener, address) = bind_pollable_listener();
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
         let (observed_sender, observed_request) = mpsc::channel();
         let worker = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("server should accept one request");
-            read_request(&stream);
+            let Some(mut stream) = accept_until_stopped(&listener, &worker_stop) else {
+                return;
+            };
+
+            if read_request(&stream) == RequestArrival::ClientCut {
+                return;
+            }
+
             observed_sender
                 .send(())
                 .expect("test should receive request observation");
@@ -1420,22 +1481,19 @@ impl LocalResponsesServer {
             address,
             observed_request: Some(observed_request),
             observed_body: None,
+            stop,
             worker,
         }
     }
 
     fn start(mode: ServerMode) -> Self {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("server should bind");
-        let address = listener
-            .local_addr()
-            .expect("server address should be available");
+        let (listener, address) = bind_pollable_listener();
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
         let (observed_sender, observed_request) = mpsc::channel();
         let worker = thread::spawn(move || {
             if matches!(mode, ServerMode::StalledConnect) {
                 let mut backlog_fillers = Vec::new();
-                listener
-                    .set_nonblocking(true)
-                    .expect("listener should be nonblocking while the connect backlog is filled");
                 let mut backlog_full = false;
                 for _ in 0..512 {
                     match TcpStream::connect_timeout(&address, Duration::from_millis(5)) {
@@ -1464,11 +1522,28 @@ impl LocalResponsesServer {
                 return;
             }
 
-            let (mut stream, _) = listener.accept().expect("server should accept one request");
-            read_request(&stream);
-            observed_sender
-                .send(())
-                .expect("test should receive request observation");
+            let Some(mut stream) = accept_until_stopped(&listener, &worker_stop) else {
+                return;
+            };
+
+            if read_request(&stream) == RequestArrival::ClientCut {
+                return;
+            }
+
+            let observe_request = || {
+                observed_sender
+                    .send(())
+                    .expect("test should receive request observation")
+            };
+
+            // `StalledBody` and `LateEvent` are both defined by bytes that reached the client
+            // before cancellation, and the test cancels the moment the observation lands.
+            // Observing after those bytes are written is what keeps that ordering true;
+            // otherwise each write races the cancel and the mode decays into the weaker one
+            // above it (`LateEvent` into `StalledBody`, `StalledBody` into `DelayedHeaders`).
+            if !matches!(mode, ServerMode::StalledBody | ServerMode::LateEvent) {
+                observe_request();
+            }
 
             match mode {
                 ServerMode::StalledConnect => {
@@ -1477,6 +1552,9 @@ impl LocalResponsesServer {
                 ServerMode::DelayedHeaders => wait_for_client_close(&stream),
                 ServerMode::StalledBody => {
                     write_sse_headers(&mut stream);
+
+                    observe_request();
+
                     wait_for_client_close(&stream);
                 }
                 ServerMode::LateEvent => {
@@ -1484,6 +1562,9 @@ impl LocalResponsesServer {
                     stream
                         .write_all(b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"early\"}\n\n")
                         .expect("early event should be written");
+
+                    observe_request();
+
                     wait_for_client_close(&stream);
                     let _ = stream.write_all(b"data: {\"type\":\"response.completed\"}\n\n");
                 }
@@ -1513,21 +1594,18 @@ impl LocalResponsesServer {
                         "data: {{\"type\":\"response.output_text.delta\",\"delta\":\"{}\"}}\n\n",
                         "x".repeat(2 * 1024 * 1024)
                     );
-                    stream
-                        .write_all(frame.as_bytes())
-                        .expect("oversized frame should be written");
+                    write_to_possibly_gone_client(&mut stream, frame.as_bytes());
                 }
                 ServerMode::UnterminatedOversizedFrame => {
                     write_sse_headers(&mut stream);
-                    stream
-                        .write_all(
-                            format!(
-                                "data: {{\"type\":\"response.output_text.delta\",\"delta\":\"{}\"}}",
-                                "x".repeat(2 * 1024 * 1024)
-                            )
-                            .as_bytes(),
+                    write_to_possibly_gone_client(
+                        &mut stream,
+                        format!(
+                            "data: {{\"type\":\"response.output_text.delta\",\"delta\":\"{}\"}}",
+                            "x".repeat(2 * 1024 * 1024)
                         )
-                        .expect("unterminated oversized frame should be written");
+                        .as_bytes(),
+                    );
                 }
                 ServerMode::ErrorBody => {
                     stream
@@ -1542,9 +1620,10 @@ impl LocalResponsesServer {
                 }
                 ServerMode::CancelledError => {
                     thread::sleep(Duration::from_millis(25));
-                    stream
-                        .write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-                        .expect("error response should be written");
+                    write_to_possibly_gone_client(
+                        &mut stream,
+                        b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
                 }
             }
         });
@@ -1553,23 +1632,31 @@ impl LocalResponsesServer {
             address,
             observed_request: Some(observed_request),
             observed_body: None,
+            stop,
             worker,
         }
     }
 
     fn start_scripted(responses: Vec<String>) -> Self {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("server should bind");
-        let address = listener
-            .local_addr()
-            .expect("server address should be available");
+        let (listener, address) = bind_pollable_listener();
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
         let (body_sender, observed_body) = mpsc::channel();
         let worker = thread::spawn(move || {
-            for response in responses {
-                let (mut stream, _) = listener.accept().expect("server should accept a request");
-                let body = read_request_body(&stream);
+            let mut responses = VecDeque::from(responses);
+            while !responses.is_empty() {
+                let Some(mut stream) = accept_until_stopped(&listener, &worker_stop) else {
+                    return;
+                };
+                let Some(body) = read_request_body(&stream) else {
+                    continue;
+                };
+
                 body_sender
                     .send(body)
                     .expect("test should receive the request body");
+
+                let response = responses.pop_front().expect("response should be available");
                 write_sse_headers(&mut stream);
                 stream
                     .write_all(response.as_bytes())
@@ -1581,45 +1668,78 @@ impl LocalResponsesServer {
             address,
             observed_request: None,
             observed_body: Some(observed_body),
+            stop,
             worker,
         }
     }
 
     fn start_scripted_with_stall(responses: Vec<String>, stall: ContinuationStall) -> Self {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("server should bind");
-        let address = listener
-            .local_addr()
-            .expect("server address should be available");
+        let (listener, address) = bind_pollable_listener();
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
         let (body_sender, observed_body) = mpsc::channel();
         let worker = thread::spawn(move || {
-            for response in responses {
-                let (mut stream, _) = listener.accept().expect("server should accept a request");
+            let mut responses = VecDeque::from(responses);
+            while !responses.is_empty() {
+                let Some(mut stream) = accept_until_stopped(&listener, &worker_stop) else {
+                    return;
+                };
+                let Some(body) = read_request_body(&stream) else {
+                    continue;
+                };
+
                 body_sender
-                    .send(read_request_body(&stream))
+                    .send(body)
                     .expect("test should receive the request body");
+
+                let response = responses.pop_front().expect("response should be available");
                 write_sse_headers(&mut stream);
                 stream
                     .write_all(response.as_bytes())
                     .expect("scripted response should be written");
             }
 
-            let (mut stream, _) = listener.accept().expect("server should accept a request");
-            body_sender
-                .send(read_request_body(&stream))
-                .expect("test should receive the continuation request body");
+            let Some(mut stream) = accept_until_stopped(&listener, &worker_stop) else {
+                return;
+            };
+            let Some(body) = read_request_body(&stream) else {
+                return;
+            };
+
+            let observe_continuation = move || {
+                body_sender
+                    .send(body)
+                    .expect("test should receive the continuation request body")
+            };
+
+            // The cancelling half of this test cancels the moment the continuation body is
+            // observed, so each stall writes the bytes that define it first and only then
+            // reports the body; otherwise the write races the cancel and the stall decays
+            // into a weaker one. The deadline half stops on its own clock instead, and can
+            // therefore be gone before any write lands, so these writes also tolerate a
+            // client that already left.
             match stall {
-                ContinuationStall::DelayedHeaders => wait_for_client_close(&stream),
+                ContinuationStall::DelayedHeaders => {
+                    observe_continuation();
+
+                    wait_for_client_close(&stream);
+                }
                 ContinuationStall::StalledBody => {
-                    write_sse_headers(&mut stream);
+                    write_to_possibly_gone_client(&mut stream, SSE_HEADERS);
+
+                    observe_continuation();
+
                     wait_for_client_close(&stream);
                 }
                 ContinuationStall::LateEvent => {
-                    write_sse_headers(&mut stream);
-                    stream
-                        .write_all(
-                            b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"early\"}\n\n",
-                        )
-                        .expect("early event should be written");
+                    write_to_possibly_gone_client(&mut stream, SSE_HEADERS);
+                    write_to_possibly_gone_client(
+                        &mut stream,
+                        b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"early\"}\n\n",
+                    );
+
+                    observe_continuation();
+
                     wait_for_client_close(&stream);
                     let _ = stream.write_all(b"data: {\"type\":\"response.completed\"}\n\n");
                 }
@@ -1630,6 +1750,7 @@ impl LocalResponsesServer {
             address,
             observed_request: None,
             observed_body: Some(observed_body),
+            stop,
             worker,
         }
     }
@@ -1651,6 +1772,7 @@ impl LocalResponsesServer {
     }
 
     fn join(self) {
+        self.stop.store(true, Ordering::Release);
         self.worker.join().expect("server worker should finish");
     }
 }
@@ -1676,39 +1798,82 @@ impl ResourceSnapshot {
     }
 }
 
-fn read_request(stream: &TcpStream) {
+/// Binds a listener whose accept loop can be polled, so a worker never parks in a
+/// blocking `accept` a client under test may never reach.
+fn bind_pollable_listener() -> (TcpListener, std::net::SocketAddr) {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("server should bind");
+    listener
+        .set_nonblocking(true)
+        .expect("listener should be nonblocking");
+    let address = listener
+        .local_addr()
+        .expect("server address should be available");
+
+    (listener, address)
+}
+
+/// Waits for one connection while honoring the stop flag, so `join` terminates even
+/// when the client was cancelled or timed out before it opened a socket at all.
+fn accept_until_stopped(listener: &TcpListener, stop: &AtomicBool) -> Option<TcpStream> {
+    while !stop.load(Ordering::Acquire) {
+        match listener.accept() {
+            Ok((stream, _)) => return Some(stream),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return None,
+        }
+    }
+
+    None
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RequestArrival {
+    Complete,
+    ClientCut,
+}
+
+/// Reads a request head, reporting whether the client actually sent one.
+///
+/// `accept` returns as soon as the kernel completes the handshake, so a client that
+/// is cancelled or times out before writing leaves a connection with nothing on it;
+/// that is an expected outcome of the cancellation tests, not a fixture failure. A
+/// request that does arrive complete is still asserted to be the one under test.
+fn read_request(stream: &TcpStream) -> RequestArrival {
     let mut reader = BufReader::new(stream.try_clone().expect("stream should clone"));
-    let mut request_line = String::new();
-    reader
-        .read_line(&mut request_line)
-        .expect("request line should be readable");
-    assert_eq!(request_line, "POST /responses HTTP/1.1\r\n");
+
+    if read_request_line(&mut reader) == RequestArrival::ClientCut {
+        return RequestArrival::ClientCut;
+    }
 
     loop {
         let mut header = String::new();
-        reader
-            .read_line(&mut header)
-            .expect("request header should be readable");
+        if read_line_or_cut(&mut reader, &mut header) == RequestArrival::ClientCut {
+            return RequestArrival::ClientCut;
+        }
         if header == "\r\n" {
-            return;
+            return RequestArrival::Complete;
         }
     }
 }
 
-fn read_request_body(stream: &TcpStream) -> serde_json::Value {
+/// Reads a request head plus its JSON body, yielding `None` when the client cut the
+/// connection before the request was complete.
+fn read_request_body(stream: &TcpStream) -> Option<serde_json::Value> {
     let mut reader = BufReader::new(stream.try_clone().expect("stream should clone"));
-    let mut request_line = String::new();
-    reader
-        .read_line(&mut request_line)
-        .expect("request line should be readable");
-    assert_eq!(request_line, "POST /responses HTTP/1.1\r\n");
+
+    if read_request_line(&mut reader) == RequestArrival::ClientCut {
+        return None;
+    }
 
     let mut content_length = None;
     loop {
         let mut header = String::new();
-        reader
-            .read_line(&mut header)
-            .expect("request header should be readable");
+        if read_line_or_cut(&mut reader, &mut header) == RequestArrival::ClientCut {
+            return None;
+        }
         if header == "\r\n" {
             break;
         }
@@ -1723,18 +1888,70 @@ fn read_request_body(stream: &TcpStream) -> serde_json::Value {
     }
 
     let mut body = vec![0; content_length.expect("request should include a content length")];
-    reader
-        .read_exact(&mut body)
-        .expect("request body should be readable");
-    serde_json::from_slice(&body).expect("request body should be JSON")
+    match reader.read_exact(&mut body) {
+        Ok(()) => {}
+        Err(error) if is_client_cut(&error) => return None,
+        Err(error) => panic!("request body should be readable: {error}"),
+    }
+
+    Some(serde_json::from_slice(&body).expect("request body should be JSON"))
 }
+
+fn read_request_line(reader: &mut BufReader<TcpStream>) -> RequestArrival {
+    let mut request_line = String::new();
+    if read_line_or_cut(reader, &mut request_line) == RequestArrival::ClientCut {
+        return RequestArrival::ClientCut;
+    }
+    assert_eq!(request_line, "POST /responses HTTP/1.1\r\n");
+
+    RequestArrival::Complete
+}
+
+/// A line the client never terminated — an empty read, a partial line, or a reset —
+/// means the connection was cut; anything that arrived whole is the client's own
+/// output and stays subject to the assertions above.
+fn read_line_or_cut(reader: &mut BufReader<TcpStream>, line: &mut String) -> RequestArrival {
+    match reader.read_line(line) {
+        Ok(_) if line.ends_with('\n') => RequestArrival::Complete,
+        Ok(_) => RequestArrival::ClientCut,
+        Err(error) if is_client_cut(&error) => RequestArrival::ClientCut,
+        Err(error) => panic!("request should be readable: {error}"),
+    }
+}
+
+fn is_client_cut(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::UnexpectedEof
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::BrokenPipe
+    )
+}
+
+const SSE_HEADERS: &[u8] =
+    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
 
 fn write_sse_headers(stream: &mut TcpStream) {
     stream
-        .write_all(
-            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
-        )
+        .write_all(SSE_HEADERS)
         .expect("SSE headers should be written");
+}
+
+/// Writes a response the client may already have abandoned.
+///
+/// These fixtures answer requests that the cancellation, deadline and frame-cap tests are
+/// deliberately racing against, so the client can be gone before the response leaves the
+/// server; that is the outcome under test, not a fixture failure, and it is the write-side
+/// counterpart of `is_client_cut` on the read side. Every caller reports its request
+/// unconditionally, so bytes that never land change neither what a test observes nor what
+/// `join` counts.
+fn write_to_possibly_gone_client(stream: &mut TcpStream, bytes: &[u8]) {
+    match stream.write_all(bytes) {
+        Ok(()) => {}
+        Err(error) if is_client_cut(&error) => {}
+        Err(error) => panic!("response should be writable: {error}"),
+    }
 }
 
 fn wait_for_client_close(stream: &TcpStream) {
