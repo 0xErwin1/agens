@@ -2626,6 +2626,36 @@ pub fn encode_openai_response_request_with_tools(
     Ok(request.to_string())
 }
 
+fn push_bounded_replay_message(
+    input: &mut Vec<Value>,
+    role: &str,
+    content: Vec<Value>,
+) -> Result<(), Error> {
+    let mut chunk = Vec::new();
+
+    for item in content {
+        chunk.push(item);
+        let candidate = serde_json::json!({"role": role, "content": chunk});
+        let exceeds_budget = serde_json::to_vec(&candidate)
+            .map_or(true, |bytes| bytes.len() > MAX_CHATGPT_REPLAY_ITEM_BYTES);
+
+        if exceeds_budget {
+            let item = chunk.pop().ok_or_else(invalid_resumed_history)?;
+            if chunk.is_empty() {
+                return Err(invalid_resumed_history());
+            }
+            input.push(serde_json::json!({"role": role, "content": chunk}));
+            chunk = vec![item];
+        }
+    }
+
+    if !chunk.is_empty() {
+        input.push(serde_json::json!({"role": role, "content": chunk}));
+    }
+
+    Ok(())
+}
+
 fn coalesced_message_parts(parts: &[MessagePart]) -> Vec<MessagePart> {
     const MAX_COALESCED_TEXT_BYTES: usize = MAX_CHATGPT_REPLAY_ITEM_BYTES / 8;
 
@@ -2739,14 +2769,15 @@ pub fn encode_openai_response_request_with_messages_and_media(
                 if content.is_empty() {
                     return Err(invalid_resumed_history());
                 }
-                input.push(serde_json::json!({
-                    "role": match message.role {
+                push_bounded_replay_message(
+                    &mut input,
+                    match message.role {
                         Role::System => "system",
                         Role::User => "user",
                         _ => unreachable!(),
                     },
-                    "content": content,
-                }));
+                    content,
+                )?;
             }
             Role::Assistant => {
                 if message.parts.is_empty() {
@@ -4036,6 +4067,28 @@ mod tests {
                     MessagePart::Text(chunk) => chunk.as_str(),
                     _ => unreachable!(),
                 })
+                .collect::<String>(),
+            text
+        );
+    }
+
+    #[test]
+    fn resumed_system_prompt_stays_inside_the_replay_item_budget() {
+        let text = "x".repeat(MAX_CHATGPT_REPLAY_ITEM_BYTES * 2);
+        let messages = vec![Message {
+            role: Role::System,
+            parts: vec![MessagePart::Text(text.clone())],
+        }];
+
+        let input = resumed_input("test-model", &messages, &[]).expect("history should encode");
+
+        assert!(input.len() > 1);
+        assert!(validate_chatgpt_replay_history(&input).is_ok());
+        assert_eq!(
+            input
+                .iter()
+                .flat_map(|item| item["content"].as_array().unwrap())
+                .filter_map(|content| content["text"].as_str())
                 .collect::<String>(),
             text
         );

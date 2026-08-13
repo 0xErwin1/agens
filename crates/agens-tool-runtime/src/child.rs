@@ -124,7 +124,9 @@ fn child_run_error(error: HeadlessTurnError) -> ChildRunError {
     match error {
         HeadlessTurnError::Authentication => ChildRunError::Authentication,
         HeadlessTurnError::Cancelled => ChildRunError::Cancelled,
-        HeadlessTurnError::ProviderContext => ChildRunError::Context,
+        HeadlessTurnError::ProviderContext | HeadlessTurnError::ProviderHistoryBudget => {
+            ChildRunError::Context
+        }
         HeadlessTurnError::ProviderNetwork => ChildRunError::Network,
         HeadlessTurnError::TimedOut => ChildRunError::TimedOut,
         HeadlessTurnError::Provider => ChildRunError::Provider,
