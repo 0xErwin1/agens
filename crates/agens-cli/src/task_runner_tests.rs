@@ -49,6 +49,10 @@ fn production_task_error_mapping_reserves_provider_for_provider_failures() {
         TaskRunnerError::ProviderFailure(TaskProviderFailure::Protocol)
     );
     assert_eq!(
+        map_task_turn_error(HeadlessTurnError::ProviderHistoryBudget),
+        TaskRunnerError::ProviderFailure(TaskProviderFailure::Context)
+    );
+    assert_eq!(
         map_task_turn_error(HeadlessTurnError::Tool),
         TaskRunnerError::ChildFailure
     );

@@ -2247,7 +2247,7 @@ fn render_frame_content(frame: &mut ratatui::Frame<'_>, state: &ViewState<'_>) {
         .as_ref()
         .map(|status| status.rows.len())
         .unwrap_or(0);
-    let total_rows = transcript.rows.len().saturating_add(live_status_rows);
+    let total_rows = transcript.total_rows().saturating_add(live_status_rows);
     let _perf_select = agens_perf::span!("tui.transcript.select", rows = total_rows as u64);
     let visible_rows = layout
         .transcript
@@ -2279,10 +2279,11 @@ fn render_frame_content(frame: &mut ratatui::Frame<'_>, state: &ViewState<'_>) {
             if let Some(status) = live_status.as_ref() {
                 lines.extend(status.render_lines(None));
             }
+            let window_scroll = scroll.saturating_sub(saturating_u16(transcript.first_row));
             frame.render_widget(
                 Paragraph::new(Text::from(lines))
                     .block(transcript_block)
-                    .scroll((scroll, 0)),
+                    .scroll((window_scroll, 0)),
                 layout.transcript,
             );
         }
@@ -5286,6 +5287,8 @@ struct SelectableCache {
     epoch: u64,
     transcript_id: TranscriptId,
     row_width: u16,
+    first_row: usize,
+    visible_rows: usize,
     /// Wave frame the cached rows were painted in, when any of them animates.
     ///
     /// Only rows carrying a running accent bar change with the clock, so an
@@ -5345,77 +5348,114 @@ struct SelectableRow {
 #[derive(Clone, Debug, Default)]
 struct SelectableTranscript {
     rows: Vec<SelectableRow>,
+    first_row: usize,
+    total_rows: usize,
     /// Content width these rows were wrapped at, so paint can detect a frame
     /// whose width the index does not describe.
     row_width: u16,
 }
 
+struct PlannedLine<'a> {
+    line: &'a Line<'a>,
+    first_row: usize,
+    row_count: usize,
+    continues_into_line: bool,
+}
+
+struct WrapPlan<'a> {
+    lines: Vec<PlannedLine<'a>>,
+    width: u16,
+    total_rows: usize,
+}
+
+impl<'a> WrapPlan<'a> {
+    fn from_lines(lines: &'a [Line<'a>], width: u16) -> Self {
+        let width = width.max(1);
+        let mut planned = Vec::with_capacity(lines.len());
+        let mut total_rows = 0;
+        let mut continues_into_line = false;
+
+        for line in lines {
+            let row_count = SelectableTranscript::row_count(std::slice::from_ref(line), width);
+            planned.push(PlannedLine {
+                line,
+                first_row: total_rows,
+                row_count,
+                continues_into_line,
+            });
+            total_rows = total_rows.saturating_add(row_count);
+            continues_into_line = line.spans.last().is_some_and(|span| {
+                matches!(
+                    span.content.as_ref(),
+                    render::WRAP_JOINER_SPACE | render::WRAP_JOINER_TIGHT
+                )
+            });
+        }
+
+        Self {
+            lines: planned,
+            width,
+            total_rows,
+        }
+    }
+}
+
 impl SelectableTranscript {
     fn from_lines(lines: &[Line<'_>], width: u16) -> Self {
         let width = width.max(1);
-        let chrome_width =
-            saturating_u16(widgets::ACCENT_WIDTH.saturating_add(widgets::GUTTER_WIDTH));
         let mut rows = Vec::new();
+        let mut continues_into_line = false;
 
-        let mut continues_into_this_line = false;
         for line in lines {
-            let mut cells = line
-                .styled_graphemes(Style::default())
-                .map(|grapheme| SelectableCell {
-                    text: grapheme.symbol.to_owned(),
-                    column: 0,
-                    width: saturating_u16(grapheme.symbol.width()),
-                    style: grapheme.style,
-                    copyable: true,
-                })
-                .collect::<Vec<_>>();
+            let (line_rows, joined) = selectable_rows_for_line(line, width, continues_into_line);
+            rows.extend(line_rows);
+            continues_into_line = joined;
+        }
 
-            let joined = match cells.last().map(|cell| cell.text.as_str()) {
-                Some(render::WRAP_JOINER_SPACE) => Some(RowBreak::SoftSpace),
-                Some(render::WRAP_JOINER_TIGHT) => Some(RowBreak::SoftTight),
-                _ => None,
-            };
-            if joined.is_some() {
-                cells.pop();
+        let total_rows = rows.len();
+        Self {
+            rows,
+            first_row: 0,
+            total_rows,
+            row_width: width,
+        }
+    }
+
+    fn window(plan: &WrapPlan<'_>, first_row: usize, row_count: usize) -> Self {
+        let first_row = first_row.min(plan.total_rows);
+        let end_row = first_row.saturating_add(row_count).min(plan.total_rows);
+        let mut rows = Vec::with_capacity(end_row.saturating_sub(first_row));
+
+        for planned in &plan.lines {
+            let line_end = planned.first_row.saturating_add(planned.row_count);
+            if line_end <= first_row || planned.first_row >= end_row {
+                continue;
             }
 
-            // Accent bar + bullet gutter occupy the first chrome columns of a
-            // block row. They paint with the row but must not enter the clipboard.
-            let mut chrome_column = 0_u16;
-            for cell in &mut cells {
-                if chrome_column >= chrome_width {
-                    break;
-                }
-                cell.copyable = false;
-                chrome_column = chrome_column.saturating_add(cell.width);
-            }
-
-            if continues_into_this_line {
-                for cell in cells
-                    .iter_mut()
-                    .take_while(|cell| selectable_cell_is_whitespace(cell))
-                {
-                    cell.copyable = false;
-                }
-            }
-            continues_into_this_line = joined.is_some();
-
-            let wrapped = wrap_selectable_line(cells, width);
-            let last = wrapped.len().saturating_sub(1);
-            rows.extend(wrapped.into_iter().enumerate().map(|(index, cells)| {
-                let break_after = if index == last {
-                    joined.unwrap_or(RowBreak::Hard)
-                } else {
-                    RowBreak::SoftSpace
-                };
-                selectable_row(cells, break_after)
-            }));
+            let (line_rows, _) =
+                selectable_rows_for_line(planned.line, plan.width, planned.continues_into_line);
+            let start = first_row.saturating_sub(planned.first_row);
+            let end = end_row
+                .saturating_sub(planned.first_row)
+                .min(line_rows.len());
+            rows.extend(
+                line_rows
+                    .into_iter()
+                    .skip(start)
+                    .take(end.saturating_sub(start)),
+            );
         }
 
         Self {
             rows,
-            row_width: width,
+            first_row,
+            total_rows: plan.total_rows,
+            row_width: plan.width,
         }
+    }
+
+    const fn total_rows(&self) -> usize {
+        self.total_rows
     }
 
     /// How many rows these lines wrap into, without materializing any of them.
@@ -5445,7 +5485,7 @@ impl SelectableTranscript {
     }
 
     fn position_at(&self, row: usize, column: u16) -> Option<TranscriptPosition> {
-        let cells = &self.rows.get(row)?.cells;
+        let cells = &self.rows.get(row.checked_sub(self.first_row)?)?.cells;
         let cell = cells
             .iter()
             .find(|cell| column < cell.column.saturating_add(cell.width))
@@ -5463,8 +5503,14 @@ impl SelectableTranscript {
         }
 
         let mut text = String::new();
-        for row_index in start.row..=end.row {
-            let Some(row) = self.rows.get(row_index) else {
+        let selection_start = start.row.max(self.first_row);
+        let selection_end = end.row.min(
+            self.first_row
+                .saturating_add(self.rows.len())
+                .saturating_sub(1),
+        );
+        for row_index in selection_start..=selection_end {
+            let Some(row) = self.rows.get(row_index.saturating_sub(self.first_row)) else {
                 break;
             };
             for cell in &row.cells {
@@ -5497,7 +5543,8 @@ impl SelectableTranscript {
         self.rows
             .iter()
             .enumerate()
-            .map(|(row, line)| {
+            .map(|(relative_row, line)| {
+                let row = self.first_row.saturating_add(relative_row);
                 let mut spans = Vec::new();
                 let mut current_text = String::new();
                 let mut current_style = None;
@@ -5532,6 +5579,68 @@ impl SelectableTranscript {
             })
             .collect()
     }
+}
+
+fn selectable_rows_for_line(
+    line: &Line<'_>,
+    width: u16,
+    continues_into_line: bool,
+) -> (Vec<SelectableRow>, bool) {
+    let chrome_width = saturating_u16(widgets::ACCENT_WIDTH.saturating_add(widgets::GUTTER_WIDTH));
+    let mut cells = line
+        .styled_graphemes(Style::default())
+        .map(|grapheme| SelectableCell {
+            text: grapheme.symbol.to_owned(),
+            column: 0,
+            width: saturating_u16(grapheme.symbol.width()),
+            style: grapheme.style,
+            copyable: true,
+        })
+        .collect::<Vec<_>>();
+
+    let joined = match cells.last().map(|cell| cell.text.as_str()) {
+        Some(render::WRAP_JOINER_SPACE) => Some(RowBreak::SoftSpace),
+        Some(render::WRAP_JOINER_TIGHT) => Some(RowBreak::SoftTight),
+        _ => None,
+    };
+    if joined.is_some() {
+        cells.pop();
+    }
+
+    let mut chrome_column = 0_u16;
+    for cell in &mut cells {
+        if chrome_column >= chrome_width {
+            break;
+        }
+        cell.copyable = false;
+        chrome_column = chrome_column.saturating_add(cell.width);
+    }
+
+    if continues_into_line {
+        for cell in cells
+            .iter_mut()
+            .take_while(|cell| selectable_cell_is_whitespace(cell))
+        {
+            cell.copyable = false;
+        }
+    }
+
+    let wrapped = wrap_selectable_line(cells, width);
+    let last = wrapped.len().saturating_sub(1);
+    let rows = wrapped
+        .into_iter()
+        .enumerate()
+        .map(|(index, cells)| {
+            let break_after = if index == last {
+                joined.unwrap_or(RowBreak::Hard)
+            } else {
+                RowBreak::SoftSpace
+            };
+            selectable_row(cells, break_after)
+        })
+        .collect();
+
+    (rows, joined.is_some())
 }
 
 fn wrap_selectable_line(cells: Vec<SelectableCell>, width: u16) -> Vec<Vec<SelectableCell>> {
@@ -7727,9 +7836,25 @@ where
     /// Returns an immutable snapshot for a renderer.
     pub fn view(&self) -> ViewState<'_> {
         let mut state = self.view_without_selectable();
+        let layout = self.screen_layout();
         let row_width = self.transcript_row_width();
-        state.selectable =
-            SharedSelectable::from_arc(self.selectable_transcript_for(&state, row_width));
+        let visible_rows = usize::from(
+            layout
+                .transcript
+                .height
+                .saturating_sub(transcript_chrome_rows(state.following_bottom)),
+        );
+        let first_row = usize::from(if state.following_bottom {
+            self.following_scroll_bottom()
+        } else {
+            state.scroll_offset
+        });
+        state.selectable = SharedSelectable::from_arc(self.selectable_transcript_for(
+            &state,
+            row_width,
+            first_row,
+            visible_rows,
+        ));
         state
     }
 
@@ -7857,6 +7982,8 @@ where
         &self,
         state: &ViewState<'_>,
         row_width: u16,
+        first_row: usize,
+        visible_rows: usize,
     ) -> Arc<SelectableTranscript> {
         let row_width = row_width.max(1);
         let epoch = self.selectable_epoch;
@@ -7867,6 +7994,8 @@ where
             && cache.epoch == epoch
             && cache.transcript_id == transcript_id
             && cache.row_width == row_width
+            && cache.first_row == first_row
+            && cache.visible_rows == visible_rows
             && cache.animated_at.is_none_or(|frame| frame == wave_frame)
         {
             return Arc::clone(&cache.transcript);
@@ -7880,11 +8009,19 @@ where
             .flat_map(|line| line.spans.iter())
             .any(|span| widgets::RowAccent::is_wave_span(span, state.unicode_level))
             .then_some(wave_frame);
-        let transcript = Arc::new(SelectableTranscript::from_lines(&lines, row_width));
+        let transcript = if lines.len() <= visible_rows {
+            SelectableTranscript::from_lines(&lines, row_width)
+        } else {
+            let plan = WrapPlan::from_lines(&lines, row_width);
+            SelectableTranscript::window(&plan, first_row, visible_rows)
+        };
+        let transcript = Arc::new(transcript);
         *self.selectable_cache.borrow_mut() = Some(SelectableCache {
             epoch,
             transcript_id,
             row_width,
+            first_row,
+            visible_rows,
             animated_at,
             transcript: Arc::clone(&transcript),
         });
@@ -8269,11 +8406,16 @@ where
             .width
             .saturating_sub(TRANSCRIPT_ROW_INDENT)
             .max(1);
-        let transcript = self.selectable_transcript_for(&view, row_width);
         let chrome_rows = transcript_chrome_rows(view.following_bottom);
-        let bottom = saturating_u16(transcript.rows.len().saturating_sub(usize::from(
-            layout.transcript.height.saturating_sub(chrome_rows),
-        )));
+        let visible_rows = usize::from(layout.transcript.height.saturating_sub(chrome_rows));
+        let first_row = if view.following_bottom {
+            self.following_scroll_bottom()
+        } else {
+            view.scroll_offset
+        };
+        let transcript =
+            self.selectable_transcript_for(&view, row_width, usize::from(first_row), visible_rows);
+        let bottom = saturating_u16(transcript.total_rows().saturating_sub(visible_rows));
         let scroll = if view.following_bottom {
             bottom
         } else {
@@ -14107,6 +14249,67 @@ mod runtime_tests {
             }),
             Ok("hello".into()),
             "selection that starts on chrome still copies content cells"
+        );
+    }
+
+    #[test]
+    fn selectable_transcript_windows_match_full_rendering_at_all_offsets() {
+        let lines = vec![
+            Line::raw("alpha beta gamma delta"),
+            Line::styled("café 🙂 omega", Style::default().fg(Color::Cyan)),
+            Line::raw("short"),
+            Line::raw("one two three four five six"),
+        ];
+
+        for width in [5, 9, 16] {
+            let full = SelectableTranscript::from_lines(&lines, width);
+            let plan = WrapPlan::from_lines(&lines, width);
+
+            for first_row in 0..=full.rows.len() {
+                for row_count in 0..=full.rows.len().saturating_add(1) {
+                    let window = SelectableTranscript::window(&plan, first_row, row_count);
+                    let expected = full
+                        .render_lines(None)
+                        .into_iter()
+                        .skip(first_row)
+                        .take(row_count)
+                        .collect::<Vec<_>>();
+
+                    assert_eq!(window.render_lines(None), expected);
+                    assert_eq!(window.first_row, first_row.min(full.rows.len()));
+                    assert_eq!(window.total_rows(), full.rows.len());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn selectable_transcript_window_preserves_absolute_selection_positions() {
+        let lines = vec![
+            Line::raw("alpha beta gamma delta"),
+            Line::raw("café 🙂 omega"),
+            Line::raw("tail"),
+        ];
+        let width = 8;
+        let full = SelectableTranscript::from_lines(&lines, width);
+        let plan = WrapPlan::from_lines(&lines, width);
+        let window = SelectableTranscript::window(&plan, 2, 3);
+        let selection = TranscriptSelection {
+            anchor: TranscriptPosition { row: 2, column: 0 },
+            head: TranscriptPosition { row: 4, column: 3 },
+        };
+
+        assert_eq!(
+            window.position_at(2, 0).map(|position| position.row),
+            Some(2)
+        );
+        assert_eq!(
+            window.selected_text(selection),
+            full.selected_text(selection)
+        );
+        assert_eq!(
+            window.render_lines(Some(selection)),
+            full.render_lines(Some(selection))[2..5].to_vec()
         );
     }
 

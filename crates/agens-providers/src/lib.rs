@@ -244,6 +244,26 @@ impl ProviderDiagnostics {
             delay_ms: delay.map(|delay| u64::try_from(delay.as_millis()).unwrap_or(u64::MAX)),
             status,
             class,
+            budget_dimension: None,
+            observed: None,
+            limit: None,
+        });
+    }
+
+    fn emit_replay_budget(&self, dimension: ReplayBudgetDimension, observed: usize, limit: usize) {
+        (self.sink)(ProviderDiagnosticEvent {
+            reference: self.reference.clone(),
+            scope: self.scope,
+            component: ProviderDiagnosticComponent::Responses,
+            event: ProviderDiagnosticKind::ReplayLimitExceeded,
+            attempt: 0,
+            max_attempts: 0,
+            delay_ms: None,
+            status: None,
+            class: Some(ProviderDiagnosticClass::Context),
+            budget_dimension: Some(dimension),
+            observed: Some(u64::try_from(observed).unwrap_or(u64::MAX)),
+            limit: Some(u64::try_from(limit).unwrap_or(u64::MAX)),
         });
     }
 }
@@ -373,6 +393,23 @@ impl ProviderDiagnosticClass {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReplayBudgetDimension {
+    Items,
+    ItemBytes,
+    HistoryBytes,
+}
+
+impl ReplayBudgetDimension {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Items => "items",
+            Self::ItemBytes => "item_bytes",
+            Self::HistoryBytes => "history_bytes",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProviderDiagnosticEvent {
     pub reference: DiagnosticRef,
@@ -384,6 +421,9 @@ pub struct ProviderDiagnosticEvent {
     pub delay_ms: Option<u64>,
     pub status: Option<u16>,
     pub class: Option<ProviderDiagnosticClass>,
+    pub budget_dimension: Option<ReplayBudgetDimension>,
+    pub observed: Option<u64>,
+    pub limit: Option<u64>,
 }
 
 enum ChatGptResponseError {
@@ -1813,13 +1853,16 @@ impl TurnProvider for ChatGptResponsesProvider {
                         )
                     })?;
                 replay_history.extend(outputs);
-                validate_chatgpt_replay_history(&replay_history).map_err(|()| {
-                    local_chatgpt_failure(
-                        self.diagnostics.as_ref(),
-                        ProviderDiagnosticKind::ReplayLimitExceeded,
-                        HeadlessTurnPortError::ProviderHistoryBudget,
-                    )
-                })?;
+                if let Some(exceeded) = replay_budget_exceeded(&replay_history) {
+                    if let Some(diagnostics) = &self.diagnostics {
+                        diagnostics.emit_replay_budget(
+                            exceeded.dimension,
+                            exceeded.observed,
+                            exceeded.limit,
+                        );
+                    }
+                    return Err(HeadlessTurnPortError::ProviderHistoryBudget);
+                }
                 (self.request_payload(replay_history.clone()), replay_history)
             }
             ChatGptContinuationState::Completed | ChatGptContinuationState::Failed => {
@@ -2234,24 +2277,47 @@ fn queued_user_input(
         .collect()
 }
 
-fn validate_chatgpt_replay_history(history: &[Value]) -> Result<(), ()> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ReplayBudgetExceeded {
+    dimension: ReplayBudgetDimension,
+    observed: usize,
+    limit: usize,
+}
+
+fn replay_budget_exceeded(history: &[Value]) -> Option<ReplayBudgetExceeded> {
     if history.len() > MAX_CHATGPT_REPLAY_ITEMS {
-        return Err(());
+        return Some(ReplayBudgetExceeded {
+            dimension: ReplayBudgetDimension::Items,
+            observed: history.len(),
+            limit: MAX_CHATGPT_REPLAY_ITEMS,
+        });
     }
 
     let mut bytes = 0_usize;
     for item in history {
-        let item_bytes = serde_json::to_vec(item).map_err(|_| ())?;
-        if item_bytes.len() > MAX_CHATGPT_REPLAY_ITEM_BYTES {
-            return Err(());
+        let item_bytes = serde_json::to_vec(item).ok()?.len();
+        if item_bytes > MAX_CHATGPT_REPLAY_ITEM_BYTES {
+            return Some(ReplayBudgetExceeded {
+                dimension: ReplayBudgetDimension::ItemBytes,
+                observed: item_bytes,
+                limit: MAX_CHATGPT_REPLAY_ITEM_BYTES,
+            });
         }
-        bytes = bytes.checked_add(item_bytes.len()).ok_or(())?;
+        bytes = bytes.checked_add(item_bytes)?;
         if bytes > MAX_CHATGPT_REPLAY_HISTORY_BYTES {
-            return Err(());
+            return Some(ReplayBudgetExceeded {
+                dimension: ReplayBudgetDimension::HistoryBytes,
+                observed: bytes,
+                limit: MAX_CHATGPT_REPLAY_HISTORY_BYTES,
+            });
         }
     }
 
-    Ok(())
+    None
+}
+
+fn validate_chatgpt_replay_history(history: &[Value]) -> Result<(), ()> {
+    replay_budget_exceeded(history).map_or(Ok(()), |_| Err(()))
 }
 
 fn bounded_tool_output(content: &str) -> String {
@@ -2626,6 +2692,36 @@ pub fn encode_openai_response_request_with_tools(
     Ok(request.to_string())
 }
 
+fn push_bounded_replay_message(
+    input: &mut Vec<Value>,
+    role: &str,
+    content: Vec<Value>,
+) -> Result<(), Error> {
+    let mut chunk = Vec::new();
+
+    for item in content {
+        chunk.push(item);
+        let candidate = serde_json::json!({"role": role, "content": chunk});
+        let exceeds_budget = serde_json::to_vec(&candidate)
+            .map_or(true, |bytes| bytes.len() > MAX_CHATGPT_REPLAY_ITEM_BYTES);
+
+        if exceeds_budget {
+            let item = chunk.pop().ok_or_else(invalid_resumed_history)?;
+            if chunk.is_empty() {
+                return Err(invalid_resumed_history());
+            }
+            input.push(serde_json::json!({"role": role, "content": chunk}));
+            chunk = vec![item];
+        }
+    }
+
+    if !chunk.is_empty() {
+        input.push(serde_json::json!({"role": role, "content": chunk}));
+    }
+
+    Ok(())
+}
+
 fn coalesced_message_parts(parts: &[MessagePart]) -> Vec<MessagePart> {
     const MAX_COALESCED_TEXT_BYTES: usize = MAX_CHATGPT_REPLAY_ITEM_BYTES / 8;
 
@@ -2739,14 +2835,15 @@ pub fn encode_openai_response_request_with_messages_and_media(
                 if content.is_empty() {
                     return Err(invalid_resumed_history());
                 }
-                input.push(serde_json::json!({
-                    "role": match message.role {
+                push_bounded_replay_message(
+                    &mut input,
+                    match message.role {
                         Role::System => "system",
                         Role::User => "user",
                         _ => unreachable!(),
                     },
-                    "content": content,
-                }));
+                    content,
+                )?;
             }
             Role::Assistant => {
                 if message.parts.is_empty() {
@@ -4042,6 +4139,28 @@ mod tests {
     }
 
     #[test]
+    fn resumed_system_prompt_stays_inside_the_replay_item_budget() {
+        let text = "x".repeat(MAX_CHATGPT_REPLAY_ITEM_BYTES * 2);
+        let messages = vec![Message {
+            role: Role::System,
+            parts: vec![MessagePart::Text(text.clone())],
+        }];
+
+        let input = resumed_input("test-model", &messages, &[]).expect("history should encode");
+
+        assert!(input.len() > 1);
+        assert!(validate_chatgpt_replay_history(&input).is_ok());
+        assert_eq!(
+            input
+                .iter()
+                .flat_map(|item| item["content"].as_array().unwrap())
+                .filter_map(|content| content["text"].as_str())
+                .collect::<String>(),
+            text
+        );
+    }
+
+    #[test]
     fn resumed_tool_results_stay_inside_the_replay_item_budget() {
         let stored = "x".repeat(MAX_CHATGPT_REPLAY_ITEM_BYTES * 2);
         let messages = vec![
@@ -4070,6 +4189,23 @@ mod tests {
             Some(model_visible_tool_output(&stored).as_str())
         );
         assert!(validate_chatgpt_replay_history(&input).is_ok());
+    }
+
+    #[test]
+    fn replay_budget_diagnostics_name_only_the_binding_numeric_limit() {
+        let oversized = serde_json::json!({
+            "type": "function_call_output",
+            "output": "x".repeat(MAX_CHATGPT_REPLAY_ITEM_BYTES),
+        });
+
+        assert_eq!(
+            replay_budget_exceeded(std::slice::from_ref(&oversized)),
+            Some(ReplayBudgetExceeded {
+                dimension: ReplayBudgetDimension::ItemBytes,
+                observed: serde_json::to_vec(&oversized).unwrap().len(),
+                limit: MAX_CHATGPT_REPLAY_ITEM_BYTES,
+            })
+        );
     }
 
     #[test]
