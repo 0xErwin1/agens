@@ -12,7 +12,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use agens_core::{TurnEvent, TurnProgressSink, TurnRetryReason};
 use agens_providers::{
     DiagnosticRef, ProviderDiagnosticClass, ProviderDiagnosticComponent, ProviderDiagnosticEvent,
-    ProviderDiagnosticKind, ProviderDiagnosticScope, ProviderDiagnostics,
+    ProviderDiagnosticKind, ProviderDiagnosticScope, ProviderDiagnostics, ReplayBudgetDimension,
 };
 
 use agens_bootstrap::Bootstrap;
@@ -207,6 +207,9 @@ fn diagnostic_json_line(event: &ProviderDiagnosticEvent) -> std::io::Result<Vec<
         "delay_ms": event.delay_ms,
         "status": event.status,
         "class": event.class.map(ProviderDiagnosticClass::as_str),
+        "budget_dimension": event.budget_dimension.map(ReplayBudgetDimension::as_str),
+        "observed": event.observed,
+        "limit": event.limit,
     }))
     .map_err(std::io::Error::other)?;
     line.push(b'\n');
@@ -380,6 +383,9 @@ pub fn record_subagent_model_unavailable(
         delay_ms: None,
         status: None,
         class: Some(ProviderDiagnosticClass::ModelUnavailable),
+        budget_dimension: None,
+        observed: None,
+        limit: None,
     };
     diagnostic_store(bootstrap).record_subagent_model_unavailable(
         &event,
@@ -407,6 +413,9 @@ pub fn record_subagent_terminal(
         delay_ms: None,
         status: None,
         class: Some(class),
+        budget_dimension: None,
+        observed: None,
+        limit: None,
     });
 }
 
@@ -428,6 +437,9 @@ pub fn record_subagent_surface_rejection(bootstrap: &Bootstrap, reference: &str,
             delay_ms: None,
             status: None,
             class: Some(ProviderDiagnosticClass::Runtime),
+            budget_dimension: None,
+            observed: None,
+            limit: None,
         },
         reason,
     );
@@ -458,6 +470,9 @@ pub fn record_parent_terminal(bootstrap: &Bootstrap, reference: &str, error: &Cl
         delay_ms: None,
         status: None,
         class: Some(class),
+        budget_dimension: None,
+        observed: None,
+        limit: None,
     });
 }
 
@@ -475,6 +490,9 @@ pub fn record_agent_diagnostic(bootstrap: &Bootstrap, event: ProviderDiagnosticK
         delay_ms: None,
         status: None,
         class: Some(ProviderDiagnosticClass::Runtime),
+        budget_dimension: None,
+        observed: None,
+        limit: None,
     });
 }
 
@@ -501,6 +519,9 @@ mod tests {
             delay_ms: None,
             status: None,
             class: Some(ProviderDiagnosticClass::Provider),
+            budget_dimension: None,
+            observed: None,
+            limit: None,
         };
 
         SafeDiagnosticStore::with_capture(temporary.clone(), false).record(&event);
@@ -536,6 +557,9 @@ mod tests {
             delay_ms: None,
             status: None,
             class: Some(ProviderDiagnosticClass::Runtime),
+            budget_dimension: None,
+            observed: None,
+            limit: None,
         };
 
         SafeDiagnosticStore::with_capture(temporary.clone(), true)
@@ -574,6 +598,9 @@ mod tests {
             delay_ms: Some(1500),
             status,
             class,
+            budget_dimension: None,
+            observed: None,
+            limit: None,
         }
     }
 
@@ -658,6 +685,9 @@ mod tests {
             delay_ms: None,
             status: None,
             class: Some(ProviderDiagnosticClass::ModelUnavailable),
+            budget_dimension: None,
+            observed: None,
+            limit: None,
         };
 
         store.record_subagent_model_unavailable(
@@ -703,6 +733,9 @@ mod tests {
             delay_ms: Some(275),
             status: Some(429),
             class: Some(ProviderDiagnosticClass::RateLimited),
+            budget_dimension: None,
+            observed: None,
+            limit: None,
         };
 
         store.record(&event);
@@ -727,11 +760,14 @@ mod tests {
             object.keys().map(String::as_str).collect::<BTreeSet<_>>(),
             BTreeSet::from([
                 "attempt",
+                "budget_dimension",
                 "class",
                 "component",
                 "delay_ms",
                 "event",
+                "limit",
                 "max_attempts",
+                "observed",
                 "reference",
                 "scope",
                 "status",
