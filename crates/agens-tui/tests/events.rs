@@ -3940,6 +3940,17 @@ fn media_only_composer_submit_with_empty_text() {
     );
 }
 
+#[test]
+fn media_only_live_turn_projects_its_media_without_inventing_user_text() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.set_staged_media(vec![PromptAttachment::new(1, "image/png")]);
+
+    tui.begin_submission("");
+
+    let conversation = tui.view().conversation.expect("live conversation");
+    assert_eq!(conversation.user, "[Image #1]");
+}
+
 /// The provider is told about a scheduled turn in a user-role message, so that
 /// is what the session store keeps. Replaying it verbatim showed the reader a
 /// prompt of their own that said the user had not sent it.

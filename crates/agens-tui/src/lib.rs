@@ -2208,7 +2208,12 @@ fn render_frame_content(frame: &mut ratatui::Frame<'_>, state: &ViewState<'_>) {
     let notice = notice_spans(state);
     let layout = {
         let _perf_layout = agens_perf::span!("tui.frame.layout");
-        screen_layout(area, state.input, state.queue.len())
+        screen_layout(
+            area,
+            state.input,
+            state.media_chips.len(),
+            state.queue.len(),
+        )
     };
 
     let row_width = layout
@@ -2323,25 +2328,32 @@ fn render_frame_content(frame: &mut ratatui::Frame<'_>, state: &ViewState<'_>) {
         let visible_inner_height = layout.composer.height.saturating_sub(2);
         let inner_width = usize::from(visible_inner_width.max(1));
         let inner_height = usize::from(visible_inner_height.max(1));
+        let attachment_rows = attachment_preview_lines(state.media_chips, inner_width);
         let composer_layout = composer_layout(state.input, state.input_cursor, inner_width);
         let cursor_line = composer_layout.cursor_line;
         let cursor_column = composer_layout.cursor_column;
-        let vertical_scroll = cursor_line.saturating_sub(inner_height.saturating_sub(1));
+        let attachment_row_count = attachment_rows.len();
+        let cursor_content_line = attachment_row_count.saturating_add(cursor_line);
+        let vertical_scroll = cursor_content_line.saturating_sub(inner_height.saturating_sub(1));
         let mut composer = Block::default()
             .borders(Borders::ALL)
             .padding(Padding::left(1))
             .border_style(Style::default().fg(composer_color));
-        if !state.media_chips.is_empty() {
-            composer = composer.title_top(
-                Line::from(state.media_chips.join(" "))
-                    .style(Style::default().fg(widgets::RolePalette::muted())),
-            );
-        }
         if let Some(metrics) = border_metrics(state, layout.composer) {
             composer = composer.title_bottom(metrics);
         }
+        let mut composer_text = attachment_rows
+            .into_iter()
+            .map(|line| Line::styled(line, Style::default().fg(widgets::RolePalette::muted())))
+            .collect::<Vec<_>>();
+        composer_text.extend(
+            composer_layout
+                .text
+                .lines()
+                .map(|line| Line::from(line.to_owned())),
+        );
         frame.render_widget(
-            Paragraph::new(composer_layout.text)
+            Paragraph::new(Text::from(composer_text))
                 .block(composer)
                 .scroll((saturating_u16(vertical_scroll), 0)),
             layout.composer,
@@ -2358,7 +2370,9 @@ fn render_frame_content(frame: &mut ratatui::Frame<'_>, state: &ViewState<'_>) {
                 .composer
                 .y
                 .saturating_add(1)
-                .saturating_add(saturating_u16(cursor_line.saturating_sub(vertical_scroll)));
+                .saturating_add(saturating_u16(
+                    cursor_content_line.saturating_sub(vertical_scroll),
+                ));
             let cursor_x = layout
                 .composer
                 .x
@@ -4470,7 +4484,14 @@ fn bottom_chrome(width: u16, height: u16) -> BottomChrome {
     }
 }
 
-fn composer_rows(height: u16, input: &str, width: usize) -> u16 {
+fn attachment_preview_lines(media_chips: &[String], width: usize) -> Vec<String> {
+    media_chips
+        .iter()
+        .map(|label| widgets::truncate_columns(label.trim_matches(['[', ']']), width))
+        .collect()
+}
+
+fn composer_rows(height: u16, input: &str, media_count: usize, width: usize) -> u16 {
     match height {
         0 => 0,
         1 => 1,
@@ -4479,18 +4500,20 @@ fn composer_rows(height: u16, input: &str, width: usize) -> u16 {
         _ => saturating_u16(
             composer_layout(input, input.chars().count(), width)
                 .rows
+                .saturating_add(media_count)
                 .saturating_add(2),
         )
-        .clamp(3, 8),
+        .clamp(3, 8_u16.saturating_add(saturating_u16(media_count))),
     }
 }
 
-fn screen_layout(area: Rect, input: &str, queue_len: usize) -> ScreenLayout {
+fn screen_layout(area: Rect, input: &str, media_count: usize, queue_len: usize) -> ScreenLayout {
     let area = conversation_surface(area);
     let gutter = chrome_gutter(area.width);
     let composer_width = area.width.saturating_sub(gutter.saturating_mul(2));
     let inner_width = usize::from(composer_width.saturating_sub(3).max(1));
-    let composer_rows = composer_rows(area.height, input, inner_width).min(area.height);
+    let composer_rows =
+        composer_rows(area.height, input, media_count, inner_width).min(area.height);
     let after_composer = area.height.saturating_sub(composer_rows);
     let chrome = bottom_chrome(area.width, area.height).fitted(after_composer);
     let remaining = after_composer.saturating_sub(chrome.rows());
@@ -6635,7 +6658,12 @@ where
         self.turn_duration = None;
         self.submitted_media = self.staged_media.clone();
         self.transcript.push(TranscriptEntry::User(prompt.clone()));
-        self.conversation = Some(Conversation::new(prompt));
+        self.conversation = Some(Conversation::new_with_media(
+            prompt,
+            self.submitted_media
+                .iter()
+                .map(|attachment| attachment.mime.as_str()),
+        ));
         {
             let record = self.active_record_mut();
             record.collapse_thinking = false;
@@ -7404,7 +7432,12 @@ where
     /// same rows the renderer paints.
     fn screen_layout(&self) -> ScreenLayout {
         let area = Rect::new(0, 0, self.size.0.max(1), self.size.1.max(1));
-        screen_layout(area, &self.input, self.scheduler.queued_entries().len())
+        screen_layout(
+            area,
+            &self.input,
+            self.media_chips.len(),
+            self.scheduler.queued_entries().len(),
+        )
     }
 
     /// Selects a transcript from a click on the subagent tree.
@@ -15681,7 +15714,7 @@ mod runtime_tests {
 
     #[test]
     fn bottom_chrome_bands_share_one_gutter_that_collapses_on_narrow_terminals() {
-        let layout = screen_layout(Rect::new(0, 0, 120, 24), "", 0);
+        let layout = screen_layout(Rect::new(0, 0, 120, 24), "", 0, 0);
         for band in [
             layout.composer,
             layout.notice,
@@ -15709,7 +15742,7 @@ mod runtime_tests {
         );
 
         for width in 0..=64_u16 {
-            let layout = screen_layout(Rect::new(0, 0, width, 24), "", 0);
+            let layout = screen_layout(Rect::new(0, 0, width, 24), "", 0, 0);
             assert!(layout.composer.right() <= width, "width {width}");
             assert!(
                 layout.composer.width >= width.min(MIN_GUTTERED_COMPOSER_WIDTH),
@@ -15718,7 +15751,7 @@ mod runtime_tests {
             );
         }
 
-        let with_queue = screen_layout(Rect::new(0, 0, 120, 24), "", 3);
+        let with_queue = screen_layout(Rect::new(0, 0, 120, 24), "", 0, 3);
         // Three message rows plus the muted Queued status line.
         assert_eq!(with_queue.queue.height, 4);
         assert_eq!(with_queue.queue.x, CHROME_GUTTER);
@@ -15768,7 +15801,7 @@ mod runtime_tests {
         );
         assert_eq!(windows_lines.rows, 2);
 
-        let layout = screen_layout(Rect::new(0, 0, 30, 12), input, 0);
+        let layout = screen_layout(Rect::new(0, 0, 30, 12), input, 0, 0);
         assert_eq!(layout.composer.height, 4);
 
         let mut tui = Tui::new(NoopEngine);

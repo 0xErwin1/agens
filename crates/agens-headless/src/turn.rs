@@ -164,13 +164,13 @@ pub fn run_production_headless_chat_with_progress(
                     failure_detail: failure_detail.clone(),
                 },
                 move |model, messages, tools, request_config, media_blobs| {
-                    OpenAiResponsesProvider::from_api_key_with_messages_and_tools_and_timeout(
+                    build_openai_provider_with_media(
                         api_key,
                         base_url.as_deref(),
                         model,
                         messages,
                         tools,
-                        agens_providers::DEFAULT_PROVIDER_REQUEST_TIMEOUT,
+                        media_blobs,
                     )
                     .map(|provider| {
                         provider
@@ -178,7 +178,6 @@ pub fn run_production_headless_chat_with_progress(
                             .with_request_config(request_config)
                             .with_diagnostics(provider_diagnostics)
                             .with_failure_detail(failure_detail.clone())
-                            .with_media_blobs(media_blobs)
                     })
                     .map_err(|error| {
                         provider_construction_error(
@@ -254,15 +253,14 @@ pub fn run_production_headless_chat_with_progress(
                     failure_detail: failure_detail.clone(),
                 },
                 move |model, messages, tools, request_config, media_blobs| {
-                    ChatGptResponsesProvider::from_credentials_with_messages_and_tools_and_timeout_and_auth_url(
+                    build_chatgpt_provider_with_media(
                         &credentials_path,
                         base_url.as_deref(),
-                        None,
                         model,
                         instructions,
                         messages,
                         tools,
-                        agens_providers::DEFAULT_PROVIDER_REQUEST_TIMEOUT,
+                        media_blobs,
                     )
                     .map(|provider| {
                         provider
@@ -270,7 +268,6 @@ pub fn run_production_headless_chat_with_progress(
                             .with_request_config(request_config)
                             .with_diagnostics(provider_diagnostics)
                             .with_failure_detail(failure_detail.clone())
-                            .with_media_blobs(media_blobs)
                     })
                     .map_err(|error| {
                         provider_construction_error(
@@ -289,6 +286,47 @@ pub fn run_production_headless_chat_with_progress(
         record_parent_terminal(bootstrap, &diagnostic_reference, &failure.error);
         failure.map_error(|error| error.with_diagnostic_reference(&diagnostic_reference))
     })
+}
+
+fn build_openai_provider_with_media(
+    api_key: String,
+    base_url: Option<&str>,
+    model: String,
+    messages: Vec<Message>,
+    tools: Vec<OpenAiFunctionTool>,
+    media_blobs: MediaBlobs,
+) -> Result<OpenAiResponsesProvider, agens_core::Error> {
+    OpenAiResponsesProvider::from_api_key_with_messages_tools_timeout_and_media(
+        api_key,
+        base_url,
+        model,
+        messages,
+        tools,
+        agens_providers::DEFAULT_PROVIDER_REQUEST_TIMEOUT,
+        media_blobs,
+    )
+}
+
+fn build_chatgpt_provider_with_media(
+    credentials_path: &std::path::Path,
+    base_url: Option<&str>,
+    model: String,
+    instructions: String,
+    messages: Vec<Message>,
+    tools: Vec<OpenAiFunctionTool>,
+    media_blobs: MediaBlobs,
+) -> Result<ChatGptResponsesProvider, agens_core::Error> {
+    ChatGptResponsesProvider::from_credentials_with_messages_tools_timeout_auth_and_media(
+        credentials_path,
+        base_url,
+        None,
+        model,
+        instructions,
+        messages,
+        tools,
+        agens_providers::DEFAULT_PROVIDER_REQUEST_TIMEOUT,
+        media_blobs,
+    )
 }
 
 /// Converts a headless attempt's raw outcome into a `CliError`, always draining the
@@ -799,13 +837,71 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{PartialTurnRecorder, attach_recorded_failure_detail, mcp_failure_notice_lines};
-    use agens_core::{HeadlessTurnError, MessagePart, TurnEvent};
-    use agens_providers::ProviderFailureDetail;
+    use super::{
+        PartialTurnRecorder, attach_recorded_failure_detail, build_chatgpt_provider_with_media,
+        build_openai_provider_with_media, mcp_failure_notice_lines,
+    };
+    use agens_core::{HeadlessTurnError, Message, MessagePart, Role, TurnEvent};
+    use agens_providers::{MediaBlobs, ProviderFailureDetail};
     use agens_tools::{
         McpErrorCategory, McpLoadPhase, McpRegistry, McpServerDescriptor, McpServerSource,
         McpServerStatus, McpServerTransport, McpStatusHandle,
     };
+
+    #[test]
+    fn openai_provider_wiring_supplies_media_before_history_is_encoded() {
+        let messages = vec![Message {
+            role: Role::User,
+            parts: vec![MessagePart::Media {
+                media_id: 7,
+                mime: "image/png".into(),
+            }],
+        }];
+        let mut media_blobs = MediaBlobs::new();
+        media_blobs.insert(7, vec![1, 2, 3]);
+
+        let result = build_openai_provider_with_media(
+            "synthetic-key".into(),
+            None,
+            "gpt-4.1".into(),
+            messages,
+            Vec::new(),
+            media_blobs,
+        );
+
+        assert!(
+            result.is_ok(),
+            "media-aware wiring must encode image history"
+        );
+    }
+
+    #[test]
+    fn chatgpt_provider_wiring_supplies_media_before_history_is_encoded() {
+        let messages = vec![Message {
+            role: Role::User,
+            parts: vec![MessagePart::Media {
+                media_id: 7,
+                mime: "image/png".into(),
+            }],
+        }];
+        let mut media_blobs = MediaBlobs::new();
+        media_blobs.insert(7, vec![1, 2, 3]);
+
+        let result = build_chatgpt_provider_with_media(
+            std::path::Path::new("missing-synthetic-credentials.json"),
+            None,
+            "gpt-5.5".into(),
+            "instructions".into(),
+            messages,
+            Vec::new(),
+            media_blobs,
+        );
+        let Err(error) = result else {
+            panic!("missing credentials must still fail authentication");
+        };
+
+        assert!(matches!(error, agens_core::Error::Auth(_)));
+    }
 
     #[test]
     fn attach_recorded_failure_detail_carries_the_recorded_text_into_the_cli_error() {

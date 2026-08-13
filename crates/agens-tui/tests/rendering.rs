@@ -2,7 +2,9 @@ use agens_core::{SubagentErrorKind, SubagentStatus};
 use std::time::Duration;
 
 use agens_core::ask_user::{AskUserMode, AskUserOption, AskUserQuestion, AskUserRequest};
-use agens_core::{Message, MessagePart, Role, ToolInput, TurnEvent, TurnRetryReason, Usage};
+use agens_core::{
+    Message, MessagePart, PromptAttachment, Role, ToolInput, TurnEvent, TurnRetryReason, Usage,
+};
 use agens_tui::{
     Action, ColorLevel, ConversationEvent, DialogEntry, DialogView, DiffLine, DiffLineKind,
     DisplayMode, Engine, Event, Key, PaletteEntry, PaletteEntryKind, RatatuiRenderer, Renderer,
@@ -556,6 +558,98 @@ fn empty_composer_renders_a_complete_dock() {
         buffer[(width - 1 - CHROME_GUTTER, composer_bottom)].symbol(),
         "┘"
     );
+}
+
+#[test]
+fn staged_images_render_inline_inside_the_composer_at_narrow_width() {
+    let width = 30_u16;
+    let height = 18_u16;
+    let mut renderer =
+        RatatuiRenderer::new(Terminal::new(TestBackend::new(width, height)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.set_staged_media(vec![
+        PromptAttachment::new(1, "image/png"),
+        PromptAttachment::new(2, "image/jpeg"),
+        PromptAttachment::new(3, "image/webp"),
+    ]);
+
+    renderer.render(tui.view()).unwrap();
+
+    let buffer = renderer.terminal().backend().buffer();
+    let (composer_left, top) = (0..height)
+        .find_map(|row| {
+            (0..width)
+                .find(|column| buffer[(*column, row)].symbol() == "┌")
+                .map(|column| (column, row))
+        })
+        .expect("narrow composer top");
+    let bottom = (top + 1..height)
+        .find(|row| buffer[(composer_left, *row)].symbol() == "└")
+        .expect("narrow composer bottom");
+    let text = rendered_text(&renderer);
+
+    assert!(text.contains("Image #1"), "{text:?}");
+    assert!(text.contains("Image #2"), "{text:?}");
+    assert!(text.contains("Image #3"), "{text:?}");
+    assert!(
+        rendered_line(&renderer, top as usize)
+            .trim_matches(' ')
+            .starts_with('┌')
+            && !rendered_line(&renderer, top as usize).contains("Image #"),
+        "attachment labels must not occupy the border: {:?}",
+        rendered_line(&renderer, top as usize)
+    );
+    for ordinal in 1..=3 {
+        let row = rendered_row(&renderer, &format!("Image #{ordinal}")) as u16;
+        assert!(
+            row > top && row < bottom,
+            "preview {ordinal} is outside composer"
+        );
+    }
+}
+
+#[test]
+fn composer_scroll_accounts_for_attachment_rows_when_input_exceeds_visible_height() {
+    let width = 30_u16;
+    let height = 14_u16;
+    let mut renderer =
+        RatatuiRenderer::new(Terminal::new(TestBackend::new(width, height)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.set_staged_media(vec![
+        PromptAttachment::new(1, "image/png"),
+        PromptAttachment::new(2, "image/jpeg"),
+        PromptAttachment::new(3, "image/webp"),
+    ]);
+    for character in "line-1\nline-2\nline-3\nline-4\nline-5\nline-6\nline-7\nline-8".chars() {
+        tui.handle(Event::Key(Key::Char(character)));
+    }
+
+    renderer.render(tui.view()).unwrap();
+
+    let buffer = renderer.terminal().backend().buffer();
+    let (composer_left, top) = (0..height)
+        .find_map(|row| {
+            (0..width)
+                .find(|column| buffer[(*column, row)].symbol() == "┌")
+                .map(|column| (column, row))
+        })
+        .expect("composer top");
+    let bottom = (top + 1..height)
+        .find(|row| buffer[(composer_left, *row)].symbol() == "└")
+        .expect("composer bottom");
+    let cursor = renderer.terminal().backend().cursor_position();
+    let text = rendered_text(&renderer);
+
+    assert!(cursor.y > top && cursor.y < bottom, "cursor: {cursor:?}");
+    assert_eq!(cursor.y, bottom - 1, "cursor: {cursor:?}");
+    assert!(!text.contains("Image #1"), "{text:?}");
+    assert!(!text.contains("Image #2"), "{text:?}");
+    assert!(text.contains("Image #3"), "{text:?}");
+    assert!(text.contains("line-1"), "{text:?}");
+    assert!(text.contains("line-8"), "{text:?}");
+    assert_eq!(rendered_row(&renderer, "Image #3") as u16, top + 1);
+    assert_eq!(rendered_row(&renderer, "line-1") as u16, top + 2);
+    assert_eq!(rendered_row(&renderer, "line-8") as u16, cursor.y);
 }
 
 #[test]

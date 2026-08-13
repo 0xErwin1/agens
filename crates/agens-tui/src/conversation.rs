@@ -4,7 +4,9 @@ use std::time::Duration;
 
 use crate::bridge::SubagentErrorPresentation;
 use agens_core::redaction::redact_credential_values;
-use agens_core::{DiffLine, Message, MessagePart, Role, SubagentStatus, ToolInput};
+use agens_core::{
+    DiffLine, Message, MessagePart, Role, SubagentStatus, ToolInput, media_chip_label,
+};
 use agens_core::{TuiExecutionState, TuiSubagentEvent, TuiSubagentUpdate};
 
 /// A source event accepted by the conversation projection.
@@ -198,6 +200,24 @@ impl Conversation {
             settled: false,
         }
     }
+
+    pub(crate) fn new_with_media<'a>(
+        user: impl Into<String>,
+        media_mimes: impl IntoIterator<Item = &'a str>,
+    ) -> Self {
+        let mut conversation = Self::new(user);
+
+        for (index, mime) in media_mimes.into_iter().enumerate() {
+            let chip = media_chip_label(index + 1, mime);
+            if !conversation.user.is_empty() {
+                conversation.user.push(' ');
+            }
+            conversation.user.push_str(&chip);
+            conversation.items.push(ConversationItem::User(chip));
+        }
+
+        conversation
+    }
     /// Reconstructs completed conversations from persisted messages.
     ///
     /// Restored tool calls degrade `parsed` to [`ToolInput::Other`] since no
@@ -287,7 +307,7 @@ impl Conversation {
                             }
                             MessagePart::Media { mime, .. } => {
                                 media_ordinal += 1;
-                                let chip = media_resume_chip(media_ordinal, mime);
+                                let chip = media_chip_label(media_ordinal, mime);
                                 if !conversation.user.is_empty() {
                                     conversation.user.push(' ');
                                 }
@@ -865,15 +885,6 @@ fn push_text_item(items: &mut Vec<ConversationItem>, text: String, reasoning: bo
         | (Some(ConversationItem::Assistant(current)), false) => current.push_str(&text),
         (_, true) => items.push(ConversationItem::Reasoning(text)),
         (_, false) => items.push(ConversationItem::Assistant(text)),
-    }
-}
-
-/// Path-free resume marker for a durable media part (`[Image #N]` / `[File #N]`).
-fn media_resume_chip(ordinal: usize, mime: &str) -> String {
-    if mime.starts_with("image/") {
-        format!("[Image #{ordinal}]")
-    } else {
-        format!("[File #{ordinal}]")
     }
 }
 
