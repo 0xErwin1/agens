@@ -79,7 +79,27 @@ pub fn production_tool_runtime_for_parent(
     parent_request_config: agens_core::RequestConfig,
     model_resolution_reference: Option<String>,
 ) -> Result<(Vec<OpenAiFunctionTool>, SharedToolDispatcher), CliError> {
-    production_tool_runtime_with_parent_task_runner(
+    production_tool_runtime_for_parent_with_cancellation(
+        bootstrap,
+        project_root,
+        skills,
+        parent_model,
+        parent_request_config,
+        model_resolution_reference,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+}
+
+pub fn production_tool_runtime_for_parent_with_cancellation(
+    bootstrap: &Bootstrap,
+    project_root: &Path,
+    skills: Option<&SkillCatalog>,
+    parent_model: String,
+    parent_request_config: agens_core::RequestConfig,
+    model_resolution_reference: Option<String>,
+    discovery_cancellation: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<(Vec<OpenAiFunctionTool>, SharedToolDispatcher), CliError> {
+    production_tool_runtime_with_discovery_cancellation(
         bootstrap,
         project_root,
         skills,
@@ -87,6 +107,8 @@ pub fn production_tool_runtime_for_parent(
         parent_request_config,
         model_resolution_reference,
         ProductionTaskRunner::new(bootstrap.clone(), project_root.to_path_buf()),
+        Box::new(UnavailableAskUserPort),
+        discovery_cancellation,
     )
 }
 
@@ -136,6 +158,33 @@ pub fn production_tool_runtime_with_parent_task_runner<R: TaskRunner>(
     )
 }
 
+/// Same as [`production_tool_runtime_with_parent_task_runner_and_ask_user`], but
+/// MCP discovery observes `discovery_cancellation` instead of a dead flag.
+#[allow(clippy::too_many_arguments)]
+pub fn production_tool_runtime_with_discovery_cancellation<R: TaskRunner>(
+    bootstrap: &Bootstrap,
+    project_root: &Path,
+    skills: Option<&SkillCatalog>,
+    parent_model: String,
+    parent_request_config: agens_core::RequestConfig,
+    model_resolution_reference: Option<String>,
+    task_runner: R,
+    ask_user: Box<dyn AskUserPort>,
+    discovery_cancellation: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<(Vec<OpenAiFunctionTool>, SharedToolDispatcher), CliError> {
+    production_tool_runtime_inner(
+        bootstrap,
+        project_root,
+        skills,
+        parent_model,
+        parent_request_config,
+        model_resolution_reference,
+        task_runner,
+        ask_user,
+        discovery_cancellation,
+    )
+}
+
 /// Same as [`production_tool_runtime_with_parent_task_runner`], but lets the caller supply the
 /// `ask_user` port instead of always defaulting to [`UnavailableAskUserPort`]. Kept as a
 /// separate function rather than adding a parameter to the existing one, so every one of that
@@ -148,8 +197,33 @@ pub fn production_tool_runtime_with_parent_task_runner_and_ask_user<R: TaskRunne
     parent_model: String,
     parent_request_config: agens_core::RequestConfig,
     model_resolution_reference: Option<String>,
+    task_runner: R,
+    ask_user: Box<dyn AskUserPort>,
+) -> Result<(Vec<OpenAiFunctionTool>, SharedToolDispatcher), CliError> {
+    production_tool_runtime_inner(
+        bootstrap,
+        project_root,
+        skills,
+        parent_model,
+        parent_request_config,
+        model_resolution_reference,
+        task_runner,
+        ask_user,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn production_tool_runtime_inner<R: TaskRunner>(
+    bootstrap: &Bootstrap,
+    project_root: &Path,
+    skills: Option<&SkillCatalog>,
+    parent_model: String,
+    parent_request_config: agens_core::RequestConfig,
+    model_resolution_reference: Option<String>,
     mut task_runner: R,
     ask_user: Box<dyn AskUserPort>,
+    discovery_cancellation: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<(Vec<OpenAiFunctionTool>, SharedToolDispatcher), CliError> {
     agens_callcount::note_tool_runtime_build();
 
@@ -161,6 +235,10 @@ pub fn production_tool_runtime_with_parent_task_runner_and_ask_user<R: TaskRunne
         bootstrap,
         project_root,
     )));
+    mcp_registry
+        .lock()
+        .map_err(|_| CliError::configuration("MCP tools are unavailable"))?
+        .set_discovery_cancellation(discovery_cancellation);
     // Handed over before the task tool is built, so every child this runner
     // launches dispatches through these connections rather than its own.
     task_runner.share_mcp_registry(Arc::clone(&mcp_registry));

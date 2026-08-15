@@ -138,6 +138,7 @@ pub fn mcp_servers(document: &toml::Table) -> Result<Vec<McpServerConfig>, Confi
         document,
         McpDefaultSettings {
             timeout_ms: DEFAULT_MCP_TIMEOUT_MS,
+            connect_timeout_ms: DEFAULT_MCP_CONNECT_TIMEOUT_MS,
             max_retries: 0,
         },
     )
@@ -150,6 +151,9 @@ pub fn mcp_servers_with_defaults(
     validate_mcp(document)?;
     if !(1..=600_000).contains(&defaults.timeout_ms) {
         return Err(invalid_field("mcp_defaults", "timeout_ms"));
+    }
+    if !(1..=600_000).contains(&defaults.connect_timeout_ms) {
+        return Err(invalid_field("mcp_defaults", "connect_timeout_ms"));
     }
     if defaults.max_retries > 8 {
         return Err(invalid_field("mcp_defaults", "max_retries"));
@@ -589,6 +593,15 @@ pub const SETTINGS: &[SettingSpec] = &[
         doc: "Timeout for a single MCP tool call, for servers that omit their own. Connect and tool listing keep their own floors.",
     },
     SettingSpec {
+        path: "mcp_defaults.connect_timeout_ms",
+        kind: SettingKind::Integer {
+            minimum: 1,
+            maximum: 600_000,
+        },
+        default: SettingValue::Integer(DEFAULT_MCP_CONNECT_TIMEOUT_MS as i64),
+        doc: "Timeout for the MCP connect handshake, independent of a tool-call budget.",
+    },
+    SettingSpec {
         path: "mcp_defaults.max_retries",
         kind: SettingKind::Integer {
             minimum: 0,
@@ -812,6 +825,7 @@ impl From<&ResolvedSettings> for SubagentSettings {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct McpDefaultSettings {
     pub timeout_ms: u64,
+    pub connect_timeout_ms: u64,
     pub max_retries: u32,
 }
 
@@ -819,6 +833,7 @@ impl From<&ResolvedSettings> for McpDefaultSettings {
     fn from(resolved: &ResolvedSettings) -> Self {
         Self {
             timeout_ms: unsigned_setting(resolved, "mcp_defaults.timeout_ms"),
+            connect_timeout_ms: unsigned_setting(resolved, "mcp_defaults.connect_timeout_ms"),
             max_retries: u32::try_from(integer_setting(resolved, "mcp_defaults.max_retries"))
                 .unwrap_or_default(),
         }

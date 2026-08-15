@@ -48,6 +48,7 @@ max_output_chars = 65536
 
 [mcp_defaults]
 timeout_ms = 30000
+connect_timeout_ms = 10000
 max_retries = 0
 
 # Named agent profiles can select a model and reasoning effort.
