@@ -8422,10 +8422,44 @@ where
             .get(&self.active_transcript)
             .expect("active transcript always exists")
             .scroll_offset;
+        self.rewindow_mouse_selection_snapshot(scroll);
+        true
+    }
+
+    /// Keeps the drag snapshot's window on the rows `scroll` currently shows.
+    ///
+    /// The snapshot stores a bounded selectable window, not the whole
+    /// transcript. Updating only `scroll` would map the pointer onto absolute
+    /// rows the window no longer holds, so a drag that auto-scrolls at the
+    /// edge would lose the head and dismiss the selection.
+    fn rewindow_mouse_selection_snapshot(&mut self, scroll: u16) {
+        let Some(snapshot) = self.mouse_selection_snapshot.as_ref() else {
+            return;
+        };
+        if snapshot.scroll == scroll && snapshot.transcript.first_row == usize::from(scroll) {
+            return;
+        }
+
+        let view = self.view_without_selectable();
+        let layout = self.screen_layout();
+        let row_width = layout
+            .transcript
+            .width
+            .saturating_sub(TRANSCRIPT_ROW_INDENT)
+            .max(1);
+        let visible_rows = usize::from(
+            layout
+                .transcript
+                .height
+                .saturating_sub(transcript_chrome_rows(view.following_bottom)),
+        );
+        let transcript =
+            self.selectable_transcript_for(&view, row_width, usize::from(scroll), visible_rows);
+
         if let Some(snapshot) = self.mouse_selection_snapshot.as_mut() {
             snapshot.scroll = scroll;
+            snapshot.transcript = transcript;
         }
-        true
     }
 
     fn capture_mouse_selection_snapshot(&self) -> Option<MouseSelectionSnapshot> {
