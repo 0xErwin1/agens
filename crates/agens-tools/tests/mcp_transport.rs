@@ -15,10 +15,10 @@ use agens_core::HeadlessTurnCancellation;
 use agens_tools::{
     MAX_MCP_STATUS_TOOL_NAMES, McpCallResult, McpClient, McpContentBlock, McpEndpointSummary,
     McpErrorCategory, McpHttpTransport, McpInitialize, McpInitializeResult, McpLifecycleState,
-    McpLimits, McpOperationContext, McpProtocolError, McpRegistry, McpRequest, McpResponse,
-    McpServerDescriptor, McpServerReport, McpServerSource, McpServerTransport, McpSseTransport,
-    McpStatusHandle, McpTimeouts, McpToolAnnotations, McpToolDefinition, McpToolsPage,
-    McpTransport, McpTransportError, RemoteToolAccess, ToolOutput,
+    McpLimits, McpLoadPhase, McpOperationContext, McpProtocolError, McpRegistry, McpRequest,
+    McpResponse, McpServerDescriptor, McpServerReport, McpServerSource, McpServerTransport,
+    McpSseTransport, McpStatusHandle, McpTimeouts, McpToolAnnotations, McpToolDefinition,
+    McpToolsPage, McpTransport, McpTransportError, RemoteToolAccess, ToolOutput,
 };
 use serde_json::json;
 
@@ -489,6 +489,135 @@ fn registry_retains_callable_clients_after_metadata_enumeration() {
             )
             .unwrap(),
         ToolOutput::success("ready")
+    );
+}
+
+#[test]
+fn a_transport_failure_after_discovery_marks_the_server_degraded() {
+    let transport = LocalTransport::with_responses([
+        Ok(initialized()),
+        Ok(page(vec![tool("status", Some(true))], None)),
+        Err(McpTransportError::Transport("SENTINEL_SECRET body".into())),
+    ]);
+    let mut registry = McpRegistry::new();
+    let status = registry.status_handle();
+    registry
+        .configure_server(
+            "files",
+            move || Ok(Box::new(transport.clone()) as Box<dyn McpTransport>),
+            timeouts(),
+            limits(),
+        )
+        .unwrap();
+    assert_eq!(
+        registry.discover_server("files"),
+        McpServerReport::loaded("files", 1)
+    );
+    assert_eq!(
+        status.snapshot().server("files").unwrap().state(),
+        McpLifecycleState::Ready
+    );
+
+    let error = registry
+        .call_tool(
+            "files::status",
+            json!({}),
+            &agens_tools::ToolExecutionContext::with_timeout(Duration::from_secs(1)),
+        )
+        .expect_err("a dead transport must fail the call");
+    assert_eq!(
+        error.to_string(),
+        "extension: mcp tool infrastructure failure"
+    );
+
+    let snapshot = status.snapshot();
+    let files = snapshot.server("files").unwrap();
+    assert_eq!(files.state(), McpLifecycleState::Degraded);
+    let last_error = files.last_error().expect("runtime death must be recorded");
+    assert_eq!(last_error.category(), McpErrorCategory::Transport);
+    assert_eq!(last_error.phase(), McpLoadPhase::Call);
+    assert_eq!(last_error.message(), "transport: call failed");
+    assert!(!format!("{files:?}").contains("SENTINEL_SECRET"));
+}
+
+#[test]
+fn a_tool_application_error_after_discovery_leaves_the_server_ready() {
+    let transport = LocalTransport::with_responses([
+        Ok(initialized()),
+        Ok(page(vec![tool("status", Some(true))], None)),
+        Ok(McpResponse::ToolCalled(McpCallResult {
+            content: vec![McpContentBlock::Text("no such path".into())],
+            is_error: true,
+        })),
+    ]);
+    let mut registry = McpRegistry::new();
+    let status = registry.status_handle();
+    registry
+        .configure_server(
+            "files",
+            move || Ok(Box::new(transport.clone()) as Box<dyn McpTransport>),
+            timeouts(),
+            limits(),
+        )
+        .unwrap();
+    assert_eq!(
+        registry.discover_server("files"),
+        McpServerReport::loaded("files", 1)
+    );
+
+    assert_eq!(
+        registry
+            .call_tool(
+                "files::status",
+                json!({}),
+                &agens_tools::ToolExecutionContext::with_timeout(Duration::from_secs(1)),
+            )
+            .unwrap(),
+        ToolOutput::failure("no such path")
+    );
+    let snapshot = status.snapshot();
+    let files = snapshot.server("files").unwrap();
+    assert_eq!(files.state(), McpLifecycleState::Ready);
+    assert!(files.last_error().is_none());
+}
+
+#[test]
+fn cancelling_a_call_after_discovery_does_not_mark_the_server_dead() {
+    let cancellation = Arc::new(AtomicBool::new(true));
+    let transport = LocalTransport::with_responses([
+        Ok(initialized()),
+        Ok(page(vec![tool("status", Some(true))], None)),
+        Ok(McpResponse::ToolCalled(McpCallResult {
+            content: vec![McpContentBlock::Text("ready".into())],
+            is_error: false,
+        })),
+    ]);
+    let mut registry = McpRegistry::new();
+    let status = registry.status_handle();
+    registry
+        .configure_server(
+            "files",
+            move || Ok(Box::new(transport.clone()) as Box<dyn McpTransport>),
+            timeouts(),
+            limits(),
+        )
+        .unwrap();
+    assert_eq!(
+        registry.discover_server("files"),
+        McpServerReport::loaded("files", 1)
+    );
+
+    let error = registry
+        .call_tool(
+            "files::status",
+            json!({}),
+            &agens_tools::ToolExecutionContext::new(cancellation, Duration::from_secs(1)),
+        )
+        .expect_err("a cancelled call must fail");
+    assert!(error.to_string().contains("cancel"));
+    assert_eq!(
+        status.snapshot().server("files").unwrap().state(),
+        McpLifecycleState::Ready
     );
 }
 

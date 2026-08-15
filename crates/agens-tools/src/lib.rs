@@ -2743,11 +2743,33 @@ impl McpRegistry {
             .get(qualified_name)
             .cloned()
             .ok_or_else(|| Error::Tool("unknown MCP tool".into()))?;
-        let client = self
-            .clients
-            .get_mut(&metadata.server_name)
-            .ok_or_else(|| Error::Tool("unavailable MCP tool".into()))?;
-        client.call(&metadata.tool_name, arguments, context)
+        let server_name = metadata.server_name.clone();
+        let result = {
+            let client = self
+                .clients
+                .get_mut(&server_name)
+                .ok_or_else(|| Error::Tool("unavailable MCP tool".into()))?;
+            client.call(&metadata.tool_name, arguments, context)
+        };
+        match result {
+            Ok(output) => Ok(output),
+            Err(McpTransportError::Cancelled) => Err(Error::Cancelled),
+            Err(error) => {
+                self.record_runtime_failure(&server_name, &error);
+                Err(mcp_call_error(error))
+            }
+        }
+    }
+
+    /// Records a post-discovery liveness failure without treating a tool
+    /// application error as a dead server.
+    fn record_runtime_failure(&mut self, server_name: &str, error: &McpTransportError) {
+        let category = McpErrorCategory::from(error);
+        let report = McpServerReport::Failed {
+            server_name: server_name.into(),
+            message: sanitized_mcp_load_error(category, McpLoadPhase::Call, error),
+        };
+        self.record_report(&report, Some((category, McpLoadPhase::Call)));
     }
 
     fn discover_or_reload(&mut self, server_name: &str) -> McpServerReport {
@@ -2873,7 +2895,7 @@ trait McpCallable: Send {
         tool_name: &str,
         arguments: Value,
         context: &ToolExecutionContext,
-    ) -> Result<ToolOutput, Error>;
+    ) -> Result<ToolOutput, McpTransportError>;
 
     fn close(&mut self);
 }
@@ -2906,9 +2928,8 @@ impl<T: McpTransport> McpCallable for McpClient<T> {
         tool_name: &str,
         arguments: Value,
         context: &ToolExecutionContext,
-    ) -> Result<ToolOutput, Error> {
+    ) -> Result<ToolOutput, McpTransportError> {
         self.call_tool_with_context(tool_name, arguments, &context.mcp_context())
-            .map_err(mcp_call_error)
     }
 
     fn close(&mut self) {
@@ -2953,12 +2974,14 @@ fn sanitized_mcp_load_error(
         (McpErrorCategory::Cancelled, McpLoadPhase::ListTools, _) => {
             "cancelled: tool listing cancelled".into()
         }
+        (McpErrorCategory::Cancelled, McpLoadPhase::Call, _) => "cancelled: call cancelled".into(),
         (McpErrorCategory::Timeout, McpLoadPhase::Connect, _) => {
             "timeout: connect timed out".into()
         }
         (McpErrorCategory::Timeout, McpLoadPhase::ListTools, _) => {
             "timeout: tool listing timed out; raise timeout_ms".into()
         }
+        (McpErrorCategory::Timeout, McpLoadPhase::Call, _) => "timeout: tool call timed out".into(),
         (McpErrorCategory::RetriesExhausted, _, _) => {
             "retries_exhausted: server did not respond".into()
         }
@@ -2972,6 +2995,7 @@ fn sanitized_mcp_load_error(
         (McpErrorCategory::Transport, McpLoadPhase::ListTools, _) => {
             "transport: tool listing failed".into()
         }
+        (McpErrorCategory::Transport, McpLoadPhase::Call, _) => "transport: call failed".into(),
         (McpErrorCategory::Unavailable, _, _) => "mcp server load failed; reload to retry".into(),
     }
 }
@@ -2996,6 +3020,12 @@ mod mcp_sanitized_error_tests {
                 "cancelled: tool listing cancelled",
             ),
             (
+                McpErrorCategory::Cancelled,
+                McpLoadPhase::Call,
+                McpTransportError::Cancelled,
+                "cancelled: call cancelled",
+            ),
+            (
                 McpErrorCategory::Timeout,
                 McpLoadPhase::Connect,
                 McpTransportError::TimedOut,
@@ -3006,6 +3036,12 @@ mod mcp_sanitized_error_tests {
                 McpLoadPhase::ListTools,
                 McpTransportError::TimedOut,
                 "timeout: tool listing timed out; raise timeout_ms",
+            ),
+            (
+                McpErrorCategory::Timeout,
+                McpLoadPhase::Call,
+                McpTransportError::TimedOut,
+                "timeout: tool call timed out",
             ),
             (
                 McpErrorCategory::RetriesExhausted,
@@ -3030,6 +3066,12 @@ mod mcp_sanitized_error_tests {
                 McpLoadPhase::ListTools,
                 McpTransportError::Transport("SENTINEL_SECRET body".into()),
                 "transport: tool listing failed",
+            ),
+            (
+                McpErrorCategory::Transport,
+                McpLoadPhase::Call,
+                McpTransportError::Transport("SENTINEL_SECRET body".into()),
+                "transport: call failed",
             ),
             (
                 McpErrorCategory::Transport,

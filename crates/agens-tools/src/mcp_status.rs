@@ -33,16 +33,18 @@ pub enum McpLifecycleState {
     Closed,
 }
 
-/// The phase of server startup a failure happened in.
+/// The phase a failure happened in.
 ///
 /// Connect and tool listing are budgeted separately, so a failure that names
 /// the wrong phase sends the operator after the wrong budget: a `tools/list`
 /// timeout reported as a connect timeout looks like an unreachable server even
-/// though the handshake succeeded.
+/// though the handshake succeeded. A later call failure is a third phase:
+/// the server was Ready and then became unreachable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum McpLoadPhase {
     Connect,
     ListTools,
+    Call,
 }
 
 impl McpLoadPhase {
@@ -52,6 +54,7 @@ impl McpLoadPhase {
         match self {
             Self::Connect => "failed to connect",
             Self::ListTools => "failed to list tools",
+            Self::Call => "became unreachable",
         }
     }
 }
