@@ -212,23 +212,6 @@ fn page(tools: Vec<McpToolDefinition>, next_cursor: Option<&str>) -> McpResponse
 /// latency.
 const UNOBSERVED_DEADLINE: Duration = Duration::from_secs(30);
 
-/// Deadline shared by both attempts of an SSE request whose retry
-/// [`stall_the_retry_of_a_failed_attempt`] never answers.
-///
-/// It has to comfortably exceed one loopback round trip, because the first attempt must
-/// complete inside it for the retry under test to happen at all; the fifty milliseconds
-/// this replaces are routinely spent before the first response arrives on a contended
-/// core, and the retry then never leaves the client.
-const SSE_STALLED_RETRY_DEADLINE: Duration = Duration::from_secs(1);
-
-/// Ceiling on a retried call bounded by [`SSE_STALLED_RETRY_DEADLINE`].
-///
-/// The server holding the retry open never answers it, so what this bound proves is that
-/// the call ended on its own deadline rather than on anything the server did. Keep it
-/// close to the deadline — the margin is only there to absorb the cost of noticing the
-/// deadline and unwinding on a loaded machine.
-const SSE_STALLED_RETRY_CEILING: Duration = Duration::from_millis(1_800);
-
 /// Retries allowed to a request whose attempts are each charged [`HELD_ATTEMPT`].
 ///
 /// Two is the smallest number that lets the two deadline models end differently: the shared
@@ -236,7 +219,7 @@ const SSE_STALLED_RETRY_CEILING: Duration = Duration::from_millis(1_800);
 /// renewed per attempt reaches the third and exhausts the retries instead.
 const BUDGETED_RETRIES: u32 = 2;
 
-/// Deadline shared by every attempt of an HTTP request whose attempts
+/// Deadline shared by every attempt of an HTTP or SSE request whose attempts
 /// [`fail_every_attempt_after_spending_the_budget`] deliberately spends most of.
 ///
 /// One shared deadline is only distinguishable from a deadline renewed per attempt once the
@@ -331,39 +314,6 @@ fn read_http_request(stream: &TcpStream) -> String {
 #[derive(Debug, PartialEq, Eq)]
 enum HttpAttempt {
     Failed,
-    Stalled,
-}
-
-/// Answers the first request with a retryable failure and then holds the retry open
-/// until the caller stops it, reporting each attempt it observed.
-///
-/// Stalling by holding rather than by sleeping is what lets the caller's deadline be the
-/// only thing that ends the retried call: a fixture that stops on its own clock races
-/// the client, and one that parks in a blocking `accept` never returns at all when the
-/// client gives up before retrying.
-fn stall_the_retry_of_a_failed_attempt(
-    listener: TcpListener,
-    attempts: mpsc::SyncSender<HttpAttempt>,
-    stop: Arc<AtomicBool>,
-) -> thread::JoinHandle<()> {
-    thread::spawn(move || {
-        let Some(mut failed) = accept_until_stopped(&listener, &stop) else {
-            return;
-        };
-        read_http_request(&failed);
-        respond(&mut failed, "500 Internal Server Error", b"", "");
-        attempts.send(HttpAttempt::Failed).unwrap();
-
-        let Some(stalled) = accept_until_stopped(&listener, &stop) else {
-            return;
-        };
-        read_http_request(&stalled);
-        attempts.send(HttpAttempt::Stalled).unwrap();
-
-        while !stop.load(Ordering::Acquire) {
-            thread::sleep(Duration::from_millis(1));
-        }
-    })
 }
 
 /// Spends [`HELD_ATTEMPT`] of the caller's budget on every attempt before failing it
@@ -1668,36 +1618,39 @@ fn legacy_sse_transport_retries_transient_failures_with_one_deadline() {
     );
 
     let (listener, address) = bind_pollable_listener();
-    let (stalled, attempts) = mpsc::sync_channel(2);
+    let (observed, attempts) = mpsc::sync_channel(BUDGETED_RETRIES as usize + 1);
     let stop = Arc::new(AtomicBool::new(false));
-    let server = stall_the_retry_of_a_failed_attempt(listener, stalled, Arc::clone(&stop));
-    let mut transport =
-        McpSseTransport::new(format!("http://{address}/events"), Default::default(), 1).unwrap();
+    let server =
+        fail_every_attempt_after_spending_the_budget(listener, observed, Arc::clone(&stop));
+    let mut transport = McpSseTransport::new(
+        format!("http://{address}/events"),
+        Default::default(),
+        BUDGETED_RETRIES,
+    )
+    .unwrap();
     let start = Instant::now();
 
-    assert_eq!(
-        transport.execute(
-            McpRequest::Initialize(initialize()),
-            &McpOperationContext::new(Arc::new(AtomicBool::new(false)), SSE_STALLED_RETRY_DEADLINE)
-        ),
-        Err(McpTransportError::TimedOut)
+    let result = transport.execute(
+        McpRequest::Initialize(initialize()),
+        &McpOperationContext::new(Arc::new(AtomicBool::new(false)), HTTP_SPENT_BUDGET_DEADLINE),
     );
-    assert!(
-        start.elapsed() < SSE_STALLED_RETRY_CEILING,
-        "{:?}",
-        start.elapsed()
-    );
-    assert_eq!(
-        attempts.recv_timeout(UNOBSERVED_DEADLINE),
-        Ok(HttpAttempt::Failed)
-    );
-    assert_eq!(
-        attempts.recv_timeout(UNOBSERVED_DEADLINE),
-        Ok(HttpAttempt::Stalled)
-    );
+    let elapsed = start.elapsed();
 
     stop.store(true, Ordering::Release);
     server.join().unwrap();
+
+    assert_eq!(
+        result,
+        Err(McpTransportError::TimedOut),
+        "what the first attempt spent must still bind the retries; a deadline renewed per \
+         attempt would instead pay for every one of them and report exhausted retries"
+    );
+    assert_eq!(
+        attempts.iter().collect::<Vec<_>>(),
+        vec![HttpAttempt::Failed, HttpAttempt::Failed],
+        "the shared budget must run out before the last permitted attempt is made"
+    );
+    assert!(elapsed < HTTP_SPENT_BUDGET_CEILING, "{elapsed:?}");
 }
 
 #[test]
