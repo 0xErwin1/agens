@@ -1,6 +1,6 @@
 use agens_config::{
-    McpDefaultSettings, SETTINGS, SettingKind, SettingSpec, SettingValue, mcp_servers,
-    mcp_servers_with_defaults,
+    DEFAULT_MCP_CONNECT_TIMEOUT_MS, McpDefaultSettings, SETTINGS, SettingKind, SettingSpec,
+    SettingValue, mcp_servers, mcp_servers_with_defaults,
 };
 use agens_config::{parse_toml_document, validate_toml_document};
 
@@ -187,11 +187,18 @@ fn explicit_mcp_defaults_must_stay_inside_catalog_bounds() {
     for defaults in [
         McpDefaultSettings {
             timeout_ms: 0,
+            connect_timeout_ms: DEFAULT_MCP_CONNECT_TIMEOUT_MS,
             max_retries: 0,
         },
         McpDefaultSettings {
             timeout_ms: 1,
+            connect_timeout_ms: DEFAULT_MCP_CONNECT_TIMEOUT_MS,
             max_retries: 9,
+        },
+        McpDefaultSettings {
+            timeout_ms: 1,
+            connect_timeout_ms: 0,
+            max_retries: 0,
         },
     ] {
         assert!(mcp_servers_with_defaults(&document, defaults).is_err());

@@ -52,7 +52,8 @@ use agens_store::{PromptMemoryStore, SessionStore};
 use agens_tool_runtime::runner::{ProductionTaskRunner, TuiTaskControls, TuiTaskLifecycleBridge};
 use agens_tool_runtime::runtime::task_execution_limits;
 use agens_tool_runtime::task::{
-    production_tui_task_runtime, production_tui_task_runtime_with_runner_and_parent_config,
+    production_tui_task_runtime_with_cancellation,
+    production_tui_task_runtime_with_runner_parent_config_and_cancellation,
 };
 use agens_tool_runtime::{
     launch_selected_task as launch_selected_tui_task,
@@ -321,31 +322,43 @@ pub fn run_production_tui_with_profile_store(
                     Ok(context) => context.bypass_permissions,
                     Err(error) => return tui_provider_outcome(Err(error)),
                 };
-            let mut task_runtime = match production_tui_task_runtime(
-                &runtime_bootstrap,
-                &session_project_root,
-                &skills,
-                Box::new(TuiPermissionPrompter(prompt_bridge.clone(), None)),
-                lifecycle_bridge.clone(),
-                task_parent_request_config.clone(),
-                task_diagnostic_reference.clone(),
-                session_bypass,
-                Box::new(TuiAskUserPort(submit_ask_user_bridge.clone(), None)),
-            ) {
-                Ok(runtime) => runtime,
-                Err(error) => return tui_provider_outcome(Err(error)),
+            if let Ok(metrics) = metrics.lock() {
+                metrics.publish_mcp_connecting_notices();
+            }
+            let discovery_cancellation = turn_cancellation.adapter_view().cancellation_handle();
+            let selected_origin = origin_launches_selected_subagent(origin);
+            let mut selected_runtime = if selected_origin {
+                match production_tui_task_runtime_with_cancellation(
+                    &runtime_bootstrap,
+                    &session_project_root,
+                    &skills,
+                    Box::new(TuiPermissionPrompter(prompt_bridge.clone(), None)),
+                    lifecycle_bridge.clone(),
+                    task_parent_request_config.clone(),
+                    task_diagnostic_reference.clone(),
+                    session_bypass,
+                    Box::new(TuiAskUserPort(submit_ask_user_bridge.clone(), None)),
+                    Arc::clone(&discovery_cancellation),
+                ) {
+                    Ok(runtime) => Some(runtime),
+                    Err(error) => return tui_provider_outcome(Err(error)),
+                }
+            } else {
+                None
             };
-            if let Err(error) = ensure_active_agent_runtime(
-                &runtime_bootstrap,
-                &router.session,
-                &task_runtime.dispatcher,
-            ) {
+            if let Some(runtime) = selected_runtime.as_ref()
+                && let Err(error) = ensure_active_agent_runtime(
+                    &runtime_bootstrap,
+                    &router.session,
+                    &runtime.dispatcher,
+                )
+            {
                 return tui_provider_outcome(Err(error));
             }
-            let selected_launch = if origin_launches_selected_subagent(origin) {
+            let selected_launch = if let Some(task_runtime) = selected_runtime.as_mut() {
                 selected_tui_task_skips_parent(
                     launch_selected_tui_task(
-                        &mut task_runtime,
+                        task_runtime,
                         &router.session,
                         &prompt,
                         matches!(origin, SubmitOrigin::Background),
@@ -374,47 +387,54 @@ pub fn run_production_tui_with_profile_store(
                 Some(Arc::clone(&skills)),
                 Some(&snapshot_notice),
                 |request| {
-                    let task_runtime = production_tui_task_runtime_with_runner_and_parent_config(
+                    let task_runtime =
+                        production_tui_task_runtime_with_runner_parent_config_and_cancellation(
+                            &runtime_bootstrap,
+                            &session_project_root,
+                            &skills,
+                            Box::new(TuiPermissionPrompter(prompt_bridge.clone(), None)),
+                            ProductionTaskRunner::new(
+                                runtime_bootstrap.clone(),
+                                session_project_root.clone(),
+                            )
+                            .with_lifecycle_bridge(lifecycle_bridge.clone())
+                            .with_dangerous_mode(request.dangerous_mode)
+                            .with_bypass(request.dangerously_allow_all)
+                            .with_permission_prompter({
+                                let bridge = prompt_bridge.clone();
+                                Arc::new(move |origin: agens_tool_runtime::runner::PromptOrigin| {
+                                    Box::new(TuiPermissionPrompter(
+                                        bridge.clone(),
+                                        Some(agens_tui::PromptOrigin {
+                                            execution: origin.execution,
+                                            agent: origin.agent,
+                                        }),
+                                    ))
+                                        as Box<dyn agens_permissions::PermissionPrompter>
+                                })
+                            })
+                            .with_ask_user_port({
+                                let bridge = submit_ask_user_bridge.clone();
+                                Arc::new(move |origin: agens_tool_runtime::runner::PromptOrigin| {
+                                    Box::new(TuiAskUserPort(
+                                        bridge.clone(),
+                                        Some(agens_tui::PromptOrigin {
+                                            execution: origin.execution,
+                                            agent: origin.agent,
+                                        }),
+                                    ))
+                                        as Box<dyn agens_core::ask_user::AskUserPort>
+                                })
+                            }),
+                            task_parent_request_config.clone(),
+                            Some(task_diagnostic_reference.clone()),
+                            Box::new(TuiAskUserPort(submit_ask_user_bridge.clone(), None)),
+                            Arc::clone(&discovery_cancellation),
+                        )?;
+                    ensure_active_agent_runtime(
                         &runtime_bootstrap,
-                        &session_project_root,
-                        &skills,
-                        Box::new(TuiPermissionPrompter(prompt_bridge.clone(), None)),
-                        ProductionTaskRunner::new(
-                            runtime_bootstrap.clone(),
-                            session_project_root.clone(),
-                        )
-                        .with_lifecycle_bridge(lifecycle_bridge.clone())
-                        .with_dangerous_mode(request.dangerous_mode)
-                        .with_bypass(request.dangerously_allow_all)
-                        .with_permission_prompter({
-                            let bridge = prompt_bridge.clone();
-                            Arc::new(move |origin: agens_tool_runtime::runner::PromptOrigin| {
-                                Box::new(TuiPermissionPrompter(
-                                    bridge.clone(),
-                                    Some(agens_tui::PromptOrigin {
-                                        execution: origin.execution,
-                                        agent: origin.agent,
-                                    }),
-                                ))
-                                    as Box<dyn agens_permissions::PermissionPrompter>
-                            })
-                        })
-                        .with_ask_user_port({
-                            let bridge = submit_ask_user_bridge.clone();
-                            Arc::new(move |origin: agens_tool_runtime::runner::PromptOrigin| {
-                                Box::new(TuiAskUserPort(
-                                    bridge.clone(),
-                                    Some(agens_tui::PromptOrigin {
-                                        execution: origin.execution,
-                                        agent: origin.agent,
-                                    }),
-                                ))
-                                    as Box<dyn agens_core::ask_user::AskUserPort>
-                            })
-                        }),
-                        task_parent_request_config.clone(),
-                        Some(task_diagnostic_reference.clone()),
-                        Box::new(TuiAskUserPort(submit_ask_user_bridge.clone(), None)),
+                        &router.session,
+                        &task_runtime.dispatcher,
                     )?;
                     run_production_headless_chat_with_progress(
                         request,

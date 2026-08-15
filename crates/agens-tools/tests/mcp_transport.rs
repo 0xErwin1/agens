@@ -1279,6 +1279,42 @@ fn connect_and_list_tools_enforce_one_deadline_across_internal_steps() {
 }
 
 #[test]
+fn discover_server_observes_a_live_cancellation_flag_during_connect() {
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let transport =
+        LocalTransport::with_responses([Ok(initialized())]).delayed(Duration::from_secs(5));
+    let mut registry = McpRegistry::new();
+    registry
+        .configure_server(
+            "files",
+            move || Ok(Box::new(transport.clone())),
+            timeouts(),
+            limits(),
+        )
+        .unwrap();
+    registry.set_discovery_cancellation(Arc::clone(&cancellation));
+
+    let started = Instant::now();
+    let worker_cancellation = Arc::clone(&cancellation);
+    let worker = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(5));
+        worker_cancellation.store(true, Ordering::Release);
+        registry.discover_server("files")
+    });
+    let report = worker.join().unwrap();
+
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert!(report.is_failed());
+    assert_eq!(
+        report,
+        McpServerReport::Failed {
+            server_name: "files".into(),
+            message: "cancelled: connect cancelled".into(),
+        }
+    );
+}
+
+#[test]
 fn concurrent_server_loading_isolates_a_cooperative_deadline_and_keeps_resources_bounded() {
     let cancellation = Arc::new(AtomicBool::new(false));
     let slow = LocalTransport::with_responses([Ok(initialized())]).delayed(Duration::from_secs(5));

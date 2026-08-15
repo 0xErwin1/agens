@@ -2411,6 +2411,7 @@ pub struct McpRegistry {
     claimed: std::collections::BTreeSet<String>,
     closed: bool,
     status: McpStatusHandle,
+    discovery_cancellation: Arc<AtomicBool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2443,7 +2444,12 @@ impl McpRegistry {
             claimed: BTreeSet::new(),
             closed: false,
             status,
+            discovery_cancellation: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    pub fn set_discovery_cancellation(&mut self, cancellation: Arc<AtomicBool>) {
+        self.discovery_cancellation = cancellation;
     }
 
     pub fn len(&self) -> usize {
@@ -2727,7 +2733,10 @@ impl McpRegistry {
             && let Some((server_name, _)) = qualified_name.split_once("::")
             && self.configured.contains_key(server_name)
         {
+            let previous = Arc::clone(&self.discovery_cancellation);
+            self.discovery_cancellation = context.cancellation_handle();
             let _ = self.discover_server(server_name);
+            self.discovery_cancellation = previous;
         }
         let metadata = self
             .tools
@@ -2770,7 +2779,7 @@ impl McpRegistry {
                 ),
                 timeouts,
                 limits,
-                Arc::new(AtomicBool::new(false)),
+                Arc::clone(&self.discovery_cancellation),
             ),
             Err(error) => {
                 let category = McpErrorCategory::from(&error);

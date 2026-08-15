@@ -5,7 +5,7 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use agens_config::{DEFAULT_MCP_CONNECT_TIMEOUT_MS, DEFAULT_MCP_LIST_TIMEOUT_MS, McpTransport};
+use agens_config::{DEFAULT_MCP_LIST_TIMEOUT_MS, McpTransport};
 use agens_providers::OpenAiFunctionTool;
 use agens_tools::{
     McpEndpointSummary, McpErrorCategory, McpHttpTransport, McpLimits, McpRegistry,
@@ -148,7 +148,10 @@ pub fn load_configured_mcp_registry(bootstrap: &Bootstrap, project_root: &Path) 
             continue;
         }
 
-        let timeouts = match configured_mcp_timeouts(server.timeout_ms) {
+        let timeouts = match configured_mcp_timeouts(
+            server.timeout_ms,
+            bootstrap.mcp_defaults().connect_timeout_ms,
+        ) {
             Ok(timeouts) => timeouts,
             Err(error) => {
                 register_configuration_failure(&mut registry, descriptor, &error);
@@ -178,11 +181,12 @@ pub fn load_configured_mcp_registry(bootstrap: &Bootstrap, project_root: &Path) 
 /// it to their own floors, so a server whose handshake is slower than one tool
 /// call still comes up. A deliberately generous `timeout_ms` still raises all
 /// three, which is what a slow remote server needs.
-fn configured_mcp_timeouts(timeout_ms: u64) -> Result<McpTimeouts, McpTransportError> {
+fn configured_mcp_timeouts(
+    timeout_ms: u64,
+    connect_timeout_ms: u64,
+) -> Result<McpTimeouts, McpTransportError> {
     let call = std::time::Duration::from_millis(timeout_ms);
-    let connect = call.max(std::time::Duration::from_millis(
-        DEFAULT_MCP_CONNECT_TIMEOUT_MS,
-    ));
+    let connect = std::time::Duration::from_millis(connect_timeout_ms);
     let list = call.max(std::time::Duration::from_millis(
         DEFAULT_MCP_LIST_TIMEOUT_MS,
     ));
@@ -297,11 +301,14 @@ mod tests {
         McpLifecycleState, ToolDispatchRequest, ToolEvaluationOutcome, ToolExecutionContext,
     };
 
+    use agens_config::DEFAULT_MCP_CONNECT_TIMEOUT_MS;
+
     use super::*;
 
     #[test]
-    fn a_short_configured_timeout_bounds_the_call_but_keeps_the_connect_and_list_floors() {
-        let timeouts = configured_mcp_timeouts(200).expect("200ms is a valid call timeout");
+    fn a_short_configured_timeout_bounds_the_call_but_keeps_the_list_floor() {
+        let timeouts = configured_mcp_timeouts(200, DEFAULT_MCP_CONNECT_TIMEOUT_MS)
+            .expect("200ms is a valid call timeout");
 
         assert_eq!(timeouts.call, std::time::Duration::from_millis(200));
         assert_eq!(
@@ -315,20 +322,33 @@ mod tests {
     }
 
     #[test]
-    fn a_generous_configured_timeout_widens_every_phase() {
+    fn a_short_connect_timeout_does_not_follow_the_call_budget() {
+        let timeouts = configured_mcp_timeouts(30_000, 50).expect("50ms connect is valid");
+
+        assert_eq!(timeouts.call, std::time::Duration::from_millis(30_000));
+        assert_eq!(timeouts.connect, std::time::Duration::from_millis(50));
+        assert_eq!(timeouts.list, std::time::Duration::from_millis(30_000));
+    }
+
+    #[test]
+    fn a_generous_configured_timeout_widens_call_and_list() {
         let timeout_ms = DEFAULT_MCP_CONNECT_TIMEOUT_MS * 12;
-        let timeouts =
-            configured_mcp_timeouts(timeout_ms).expect("a generous call timeout is valid");
+        let timeouts = configured_mcp_timeouts(timeout_ms, DEFAULT_MCP_CONNECT_TIMEOUT_MS)
+            .expect("a generous call timeout is valid");
 
         let expected = std::time::Duration::from_millis(timeout_ms);
         assert_eq!(timeouts.call, expected);
-        assert_eq!(timeouts.connect, expected);
+        assert_eq!(
+            timeouts.connect,
+            std::time::Duration::from_millis(DEFAULT_MCP_CONNECT_TIMEOUT_MS)
+        );
         assert_eq!(timeouts.list, expected);
     }
 
     #[test]
     fn a_zero_configured_timeout_is_still_rejected_despite_the_connect_floor() {
-        assert!(configured_mcp_timeouts(0).is_err());
+        assert!(configured_mcp_timeouts(0, DEFAULT_MCP_CONNECT_TIMEOUT_MS).is_err());
+        assert!(configured_mcp_timeouts(200, 0).is_err());
     }
 
     #[test]

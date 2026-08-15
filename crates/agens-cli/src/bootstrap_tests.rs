@@ -55,6 +55,7 @@ mod resolution {
         assert_eq!(subagents.max_output_chars, 65_536);
 
         assert_eq!(bootstrap.mcp_defaults().timeout_ms, 30_000);
+        assert_eq!(bootstrap.mcp_defaults().connect_timeout_ms, 10_000);
         assert_eq!(bootstrap.mcp_defaults().max_retries, 0);
         assert!(bootstrap.debug());
         assert_eq!(bootstrap.default_agent(), None);
@@ -90,7 +91,7 @@ mod resolution {
         let bootstrap = bootstrap_from_configuration(
             "config-mcp-defaults",
             Some(
-                "[mcp_defaults]\ntimeout_ms = 60000\nmax_retries = 2\n\
+                "[mcp_defaults]\ntimeout_ms = 60000\nconnect_timeout_ms = 50\nmax_retries = 2\n\
                  [mcp.engram]\ntransport = \"http\"\nurl = \"https://mcp.example.test\"\n\
                  [mcp.files]\ntransport = \"stdio\"\ncommand = \"server\"\n\
                  [mcp.atlas]\ntransport = \"http\"\nurl = \"https://atlas.example.test\"\ntimeout_ms = 5000\nmax_retries = 1\n",
@@ -99,6 +100,7 @@ mod resolution {
         );
 
         assert_eq!(bootstrap.mcp_defaults().timeout_ms, 60_000);
+        assert_eq!(bootstrap.mcp_defaults().connect_timeout_ms, 50);
         assert_eq!(bootstrap.mcp_defaults().max_retries, 2);
         assert_eq!(bootstrap.mcp_servers.len(), 3);
         let engram = bootstrap

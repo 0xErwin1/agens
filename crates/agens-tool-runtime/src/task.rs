@@ -16,7 +16,7 @@ use agens_tools::{
 };
 
 use crate::runner::{ProductionTaskRunner, TuiTaskLifecycleBridge};
-use crate::runtime::production_tool_runtime_with_parent_task_runner_and_ask_user;
+use crate::runtime::production_tool_runtime_with_discovery_cancellation;
 use agens_agents::{ProfileOrigin, TaskModelValidator, task_agent_catalog, task_model_catalog};
 use agens_bootstrap::Bootstrap;
 use agens_diagnostics::{next_diagnostic_reference, record_subagent_model_unavailable};
@@ -64,7 +64,34 @@ pub fn production_tui_task_runtime(
     bypass: bool,
     ask_user: Box<dyn AskUserPort>,
 ) -> Result<ProductionTuiTaskRuntime, CliError> {
-    production_tui_task_runtime_with_runner_and_parent_config(
+    production_tui_task_runtime_with_cancellation(
+        bootstrap,
+        project_root,
+        skills,
+        prompter,
+        lifecycle_bridge,
+        parent_request_config,
+        model_resolution_reference,
+        bypass,
+        ask_user,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn production_tui_task_runtime_with_cancellation(
+    bootstrap: &Bootstrap,
+    project_root: &Path,
+    skills: &SkillCatalog,
+    prompter: Box<dyn PermissionPrompter>,
+    lifecycle_bridge: TuiTaskLifecycleBridge,
+    parent_request_config: agens_core::RequestConfig,
+    model_resolution_reference: String,
+    bypass: bool,
+    ask_user: Box<dyn AskUserPort>,
+    discovery_cancellation: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<ProductionTuiTaskRuntime, CliError> {
+    production_tui_task_runtime_with_runner_parent_config_and_cancellation(
         bootstrap,
         project_root,
         skills,
@@ -75,6 +102,7 @@ pub fn production_tui_task_runtime(
         parent_request_config,
         Some(model_resolution_reference),
         ask_user,
+        discovery_cancellation,
     )
 }
 
@@ -109,6 +137,31 @@ pub fn production_tui_task_runtime_with_runner_and_parent_config(
     model_resolution_reference: Option<String>,
     ask_user: Box<dyn AskUserPort>,
 ) -> Result<ProductionTuiTaskRuntime, CliError> {
+    production_tui_task_runtime_with_runner_parent_config_and_cancellation(
+        bootstrap,
+        project_root,
+        skills,
+        prompter,
+        task_runner,
+        parent_request_config,
+        model_resolution_reference,
+        ask_user,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn production_tui_task_runtime_with_runner_parent_config_and_cancellation(
+    bootstrap: &Bootstrap,
+    project_root: &Path,
+    skills: &SkillCatalog,
+    prompter: Box<dyn PermissionPrompter>,
+    task_runner: ProductionTaskRunner,
+    parent_request_config: agens_core::RequestConfig,
+    model_resolution_reference: Option<String>,
+    ask_user: Box<dyn AskUserPort>,
+    discovery_cancellation: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<ProductionTuiTaskRuntime, CliError> {
     let bypass = task_runner.bypass();
     let task_registry = task_runner.execution_registry().unwrap_or_default();
     let parent_model = match bootstrap.model() {
@@ -119,17 +172,17 @@ pub fn production_tui_task_runtime_with_runner_and_parent_config(
             })?
             .to_owned(),
     };
-    let (provider_tools, dispatcher) =
-        production_tool_runtime_with_parent_task_runner_and_ask_user(
-            bootstrap,
-            project_root,
-            Some(skills),
-            parent_model,
-            parent_request_config,
-            model_resolution_reference,
-            task_runner,
-            ask_user,
-        )?;
+    let (provider_tools, dispatcher) = production_tool_runtime_with_discovery_cancellation(
+        bootstrap,
+        project_root,
+        Some(skills),
+        parent_model,
+        parent_request_config,
+        model_resolution_reference,
+        task_runner,
+        ask_user,
+        discovery_cancellation,
+    )?;
     let project = project_root.display().to_string();
     let session_root =
         agens_bootstrap::session_root::SessionRoot::confined_to(project_root.to_path_buf());

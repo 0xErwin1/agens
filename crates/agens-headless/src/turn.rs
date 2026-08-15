@@ -46,7 +46,7 @@ use agens_session::turns::{
 };
 use agens_tool_runtime::block_on_headless_turn;
 use agens_tool_runtime::child::TaskMailboxProvider;
-use agens_tool_runtime::runtime::production_tool_runtime_for_parent;
+use agens_tool_runtime::runtime::production_tool_runtime_for_parent_with_cancellation;
 use agens_tool_runtime::task::ProductionTuiTaskRuntime;
 
 #[derive(Default)]
@@ -584,13 +584,14 @@ where
             Arc::clone(&task_runtime.dispatcher),
         ),
         None => {
-            let runtime = production_tool_runtime_for_parent(
+            let runtime = production_tool_runtime_for_parent_with_cancellation(
                 context.bootstrap,
                 project_root,
                 request.skills.as_deref(),
                 model.clone(),
                 request.request_config.clone(),
                 Some(context.diagnostic_reference.to_owned()),
+                context.cancellation.adapter_view().cancellation_handle(),
             )?;
             // Discovery for this turn's own registry has already run
             // synchronously inside `production_tool_runtime_for_parent`, so

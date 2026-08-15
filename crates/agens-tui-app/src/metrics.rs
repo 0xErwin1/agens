@@ -69,6 +69,32 @@ impl TuiMetricsPublisher {
         );
     }
 
+    /// Tells the reader which MCP servers the next discovery pass will wait on.
+    pub fn publish_mcp_connecting_notices(&self) {
+        let Some(mcp) = self.mcp.as_ref() else {
+            return;
+        };
+        for server in mcp.status.snapshot().servers() {
+            let descriptor = server.descriptor();
+            if !descriptor.enabled()
+                || !matches!(
+                    server.state(),
+                    McpLifecycleState::Idle | McpLifecycleState::Connecting
+                )
+            {
+                continue;
+            }
+            let _ = self.bridge.publish(
+                TuiRuntimeEvent::Notice {
+                    text: format!("mcp: {} connecting", descriptor.name()),
+                    severity: NoticeSeverity::Info,
+                },
+                &self.cancellation,
+                None,
+            );
+        }
+    }
+
     /// Publishes one `Notice` per enabled server currently `Failed` or
     /// `Degraded` that has not already been noticed, and clears any server
     /// that has recovered to `Ready` from the noticed set so a later
@@ -842,5 +868,46 @@ mod tests {
         ] {
             assert!(!text.contains("SENTINEL_SECRET"), "{text}");
         }
+    }
+
+    #[test]
+    fn tui_metrics_publisher_announces_idle_enabled_servers_before_discovery() {
+        let status = agens_tools::McpStatusHandle::default();
+        let mut registry = agens_tools::McpRegistry::with_status_handle(status.clone());
+        registry
+            .configure_server_with_descriptor(
+                mcp_test_descriptor("files", true),
+                || Err(agens_tools::McpTransportError::Transport("unused".into())),
+                agens_tools::McpTimeouts::new(
+                    std::time::Duration::from_millis(50),
+                    std::time::Duration::from_millis(50),
+                    std::time::Duration::from_millis(50),
+                )
+                .unwrap(),
+                agens_tools::McpLimits::default(),
+            )
+            .unwrap();
+        registry
+            .register_disabled_server(mcp_test_descriptor("vault", false))
+            .unwrap();
+
+        let (bridge, receiver) = agens_tui::BridgeTx::bounded(8);
+        let publisher = TuiMetricsPublisher::new(bridge, BridgeCancel::new(), "model")
+            .with_mcp_notices(status, Arc::new(Mutex::new(BTreeSet::new())));
+        publisher.publish_mcp_connecting_notices();
+
+        let event = receiver
+            .recv_timeout(std::time::Duration::from_millis(50))
+            .unwrap()
+            .into_parts()
+            .1;
+        assert!(matches!(
+            event,
+            TuiRuntimeEvent::Notice {
+                text,
+                severity: NoticeSeverity::Info
+            } if text == "mcp: files connecting"
+        ));
+        assert!(receiver.try_recv().is_err());
     }
 }
