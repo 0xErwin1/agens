@@ -346,41 +346,49 @@ mod tests {
     }
     #[test]
     fn bounds_admission_and_aborts_for_cancellation_and_deadline() {
-        for (timeout, expected, cancel) in [
-            (Duration::from_secs(1), HttpWorkerError::Cancelled, true),
-            (Duration::from_millis(10), HttpWorkerError::TimedOut, false),
-        ] {
-            let (started_sender, started_receiver) = mpsc::sync_channel(1);
-            let (worker, _) = worker(1, Behavior::Pending, Some(started_sender));
-            let worker = Arc::new(worker);
-            let (cancellation, deadline) = context(timeout);
-            let active_worker = Arc::clone(&worker);
-            let active_cancellation = Arc::clone(&cancellation);
-            let active = thread::spawn(move || {
-                active_worker.request(
-                    request(),
-                    Arc::new(move || active_cancellation.load(Ordering::Acquire)),
-                    deadline,
-                )
-            });
-            started_receiver
-                .recv_timeout(Duration::from_millis(250))
-                .unwrap();
-            let (other_cancellation, other_deadline) = context(Duration::from_secs(1));
-            assert_eq!(
-                worker.request(
-                    request(),
-                    Arc::new(move || other_cancellation.load(Ordering::Acquire)),
-                    other_deadline
-                ),
-                Err(HttpWorkerError::Busy)
-            );
-            if cancel {
-                cancellation.store(true, Ordering::Release);
-            }
-            assert_eq!(active.join().unwrap(), Err(expected));
-            worker.close().unwrap();
-        }
+        let (started_sender, started_receiver) = mpsc::sync_channel(1);
+        let (held, _) = worker(1, Behavior::Pending, Some(started_sender));
+        let held = Arc::new(held);
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let active_worker = Arc::clone(&held);
+        let active_cancellation = Arc::clone(&cancellation);
+        let active = thread::spawn(move || {
+            active_worker.request(
+                request(),
+                Arc::new(move || active_cancellation.load(Ordering::Acquire)),
+                None,
+            )
+        });
+        started_receiver
+            .recv_timeout(Duration::from_millis(250))
+            .unwrap();
+        assert_eq!(
+            held.request(request(), Arc::new(|| false), None),
+            Err(HttpWorkerError::Busy),
+            "admission must reject while the slot is held; a deadline on the second \
+             request can expire before this thread is scheduled and report TimedOut instead"
+        );
+        cancellation.store(true, Ordering::Release);
+        assert_eq!(active.join().unwrap(), Err(HttpWorkerError::Cancelled));
+        held.close().unwrap();
+
+        let (started_sender, started_receiver) = mpsc::sync_channel(1);
+        let (worker, _) = worker(1, Behavior::Pending, Some(started_sender));
+        let worker = Arc::new(worker);
+        let (cancellation, deadline) = context(Duration::from_millis(10));
+        let active_worker = Arc::clone(&worker);
+        let active = thread::spawn(move || {
+            active_worker.request(
+                request(),
+                Arc::new(move || cancellation.load(Ordering::Acquire)),
+                deadline,
+            )
+        });
+        started_receiver
+            .recv_timeout(Duration::from_millis(250))
+            .unwrap();
+        assert_eq!(active.join().unwrap(), Err(HttpWorkerError::TimedOut));
+        worker.close().unwrap();
     }
     #[test]
     fn startup_error_returns_startup() {
