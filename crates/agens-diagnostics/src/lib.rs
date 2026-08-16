@@ -22,6 +22,20 @@ pub const DIAGNOSTIC_FILE_LIMIT_BYTES: u64 = 1024 * 1024;
 pub const DIAGNOSTIC_FILE_COUNT_LIMIT: usize = 4;
 pub static DIAGNOSTIC_REFERENCE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static DIAGNOSTIC_FILE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static BEST_EFFORT_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+/// Discards a fallible side effect that must not replace the caller's primary
+/// result. Failures are counted in process memory and never written back into
+/// the diagnostics log: that path is how we got here.
+pub fn best_effort<T, E>(result: Result<T, E>) {
+    if result.is_err() {
+        BEST_EFFORT_FAILURES.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub fn best_effort_failures() -> u64 {
+    BEST_EFFORT_FAILURES.load(Ordering::Relaxed)
+}
 
 #[derive(Clone)]
 pub struct SafeDiagnosticStore {
@@ -47,7 +61,7 @@ impl SafeDiagnosticStore {
             .get_or_init(|| Mutex::new(()))
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        let _ = self.write(event);
+        best_effort(self.write(event));
     }
 
     pub fn record_subagent_model_unavailable(
@@ -64,8 +78,12 @@ impl SafeDiagnosticStore {
             .get_or_init(|| Mutex::new(()))
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        let _ =
-            self.write_subagent_model_unavailable(event, agent, requested_model, fallback_model);
+        best_effort(self.write_subagent_model_unavailable(
+            event,
+            agent,
+            requested_model,
+            fallback_model,
+        ));
     }
 
     /// Records why a delegated subagent's declared tool surface was refused.
@@ -82,7 +100,7 @@ impl SafeDiagnosticStore {
             .get_or_init(|| Mutex::new(()))
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        let _ = self.write_subagent_surface_rejection(event, reason);
+        best_effort(self.write_subagent_surface_rejection(event, reason));
     }
 
     fn write(&self, event: &ProviderDiagnosticEvent) -> std::io::Result<()> {
@@ -502,6 +520,47 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use super::*;
+
+    #[test]
+    fn a_diagnostics_write_failure_is_counted_and_does_not_change_the_caller() {
+        let temporary = std::env::temp_dir().join(format!(
+            "agens-diagnostic-write-fail-{}",
+            std::process::id()
+        ));
+        std::fs::remove_dir_all(&temporary).ok();
+        std::fs::create_dir_all(&temporary).expect("test data directory should be creatable");
+        std::fs::write(temporary.join("diagnostics"), b"not a directory")
+            .expect("blocking file should be writable");
+
+        let event = ProviderDiagnosticEvent {
+            reference: DiagnosticRef::new("abcd1234".to_owned()).unwrap(),
+            scope: ProviderDiagnosticScope::Parent,
+            component: ProviderDiagnosticComponent::Responses,
+            event: ProviderDiagnosticKind::Terminal,
+            attempt: 0,
+            max_attempts: 0,
+            delay_ms: None,
+            status: None,
+            class: Some(ProviderDiagnosticClass::Provider),
+            budget_dimension: None,
+            observed: None,
+            limit: None,
+        };
+
+        let before = best_effort_failures();
+        let store = SafeDiagnosticStore::with_capture(temporary.clone(), true);
+
+        store.record(&event);
+        store.record(&event);
+
+        assert!(
+            best_effort_failures() >= before + 2,
+            "write failures must be counted without writing them back into the log"
+        );
+        assert!(temporary.join("diagnostics").is_file());
+
+        std::fs::remove_dir_all(&temporary).ok();
+    }
 
     #[test]
     fn diagnostics_capture_follows_the_debug_setting() {
