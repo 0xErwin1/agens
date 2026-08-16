@@ -59,6 +59,7 @@
         tests/bootstrap/verify-contracts.sh
         tests/bootstrap/standards-contract.sh
         tests/bootstrap/perf-offpath.sh
+        tests/bootstrap/discarded-results-contract.sh
       '';
     };
 

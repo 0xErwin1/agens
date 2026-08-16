@@ -71,7 +71,7 @@ assert_lines 'cargo test --workspace --all-targets --locked --no-fail-fast' "$(s
 assert_lines 'cargo build --workspace --locked' "$(steps build)" "Rust build"
 assert_lines 'cargo deny check' "$(steps deny)" "supply-chain check"
 
-assert_lines $'tests/bootstrap/assert-workspace.sh\ntests/bootstrap/assert-surface-boundary.sh\ntests/bootstrap/docs-contract.sh\ntests/bootstrap/target-budget.sh\ntests/bootstrap/verify-contracts.sh\ntests/bootstrap/standards-contract.sh\ntests/bootstrap/perf-offpath.sh' "$(steps contracts)" "bootstrap contracts"
+assert_lines $'tests/bootstrap/assert-workspace.sh\ntests/bootstrap/assert-surface-boundary.sh\ntests/bootstrap/docs-contract.sh\ntests/bootstrap/target-budget.sh\ntests/bootstrap/verify-contracts.sh\ntests/bootstrap/standards-contract.sh\ntests/bootstrap/perf-offpath.sh\ntests/bootstrap/discarded-results-contract.sh' "$(steps contracts)" "bootstrap contracts"
 
 # The expansion is captured before matching: piping it into `grep -q` lets grep
 # exit on the first hit, killing the producer with SIGPIPE, and under pipefail
