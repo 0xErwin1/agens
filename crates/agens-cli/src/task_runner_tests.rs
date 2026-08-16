@@ -56,6 +56,10 @@ fn production_task_error_mapping_reserves_provider_for_provider_failures() {
         map_task_turn_error(HeadlessTurnError::Tool),
         TaskRunnerError::ChildFailure
     );
+    assert_eq!(
+        map_task_turn_error(HeadlessTurnError::Authentication),
+        TaskRunnerError::ProviderFailure(TaskProviderFailure::Authentication)
+    );
 }
 
 #[test]

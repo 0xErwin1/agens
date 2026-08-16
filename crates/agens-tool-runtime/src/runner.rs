@@ -13,7 +13,6 @@ use agens_core::{MessagePart, TurnEvent, TurnProgressSink};
 use agens_core::{SubagentErrorKind, SubagentStatus};
 use agens_core::{TuiExecutionEvent, TuiRuntimeEvent, TuiSubagentEvent};
 #[cfg(any(test, feature = "probe"))]
-use agens_tools::TaskProviderFailure;
 use agens_tools::{
     TaskExecutionEvent, TaskExecutionLifecycle, TaskExecutionRegistry, TaskLaunchMode,
     TaskRunContext, TaskRunner, TaskRunnerError, TaskTurnRequest, TaskTurnResult,
@@ -723,30 +722,7 @@ impl TaskRunner for ProductionTaskRunner {
 
 #[cfg(any(test, feature = "probe"))]
 pub fn map_task_turn_error(error: HeadlessTurnError) -> TaskRunnerError {
-    match error {
-        HeadlessTurnError::Cancelled => TaskRunnerError::Cancelled,
-        HeadlessTurnError::TimedOut => TaskRunnerError::TimedOut,
-        HeadlessTurnError::Provider | HeadlessTurnError::ProviderProtocol => {
-            TaskRunnerError::ProviderFailure(TaskProviderFailure::Protocol)
-        }
-        HeadlessTurnError::ProviderContext => {
-            TaskRunnerError::ProviderFailure(TaskProviderFailure::Context)
-        }
-        HeadlessTurnError::ProviderHistoryBudget => {
-            TaskRunnerError::ProviderFailure(TaskProviderFailure::ReplayBudget)
-        }
-        HeadlessTurnError::ProviderRejected => {
-            TaskRunnerError::ProviderFailure(TaskProviderFailure::Rejected)
-        }
-        HeadlessTurnError::ProviderRateLimited => {
-            TaskRunnerError::ProviderFailure(TaskProviderFailure::RateLimited)
-        }
-        HeadlessTurnError::ProviderServer => {
-            TaskRunnerError::ProviderFailure(TaskProviderFailure::Server)
-        }
-        HeadlessTurnError::MaxIterations => TaskRunnerError::ChildFailure,
-        _ => TaskRunnerError::ChildFailure,
-    }
+    crate::child::child_run_error(error).task_runner_error()
 }
 
 #[cfg(test)]

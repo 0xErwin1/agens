@@ -126,7 +126,7 @@ impl ChildRunError {
     }
 }
 
-fn child_run_error(error: HeadlessTurnError) -> ChildRunError {
+pub(crate) fn child_run_error(error: HeadlessTurnError) -> ChildRunError {
     match error {
         HeadlessTurnError::Authentication => ChildRunError::Authentication,
         HeadlessTurnError::Cancelled => ChildRunError::Cancelled,
@@ -140,8 +140,13 @@ fn child_run_error(error: HeadlessTurnError) -> ChildRunError {
         HeadlessTurnError::ProviderRejected => ChildRunError::Rejected,
         HeadlessTurnError::ProviderServer => ChildRunError::Server,
         HeadlessTurnError::Tool => ChildRunError::Tool,
-        HeadlessTurnError::MaxIterations => ChildRunError::Runtime,
-        _ => ChildRunError::Runtime,
+        HeadlessTurnError::MaxIterations
+        | HeadlessTurnError::Permission
+        | HeadlessTurnError::PermissionEvaluation
+        | HeadlessTurnError::PermissionRequired
+        | HeadlessTurnError::Store
+        | HeadlessTurnError::State
+        | HeadlessTurnError::TaskTerminal(_) => ChildRunError::Runtime,
     }
 }
 
