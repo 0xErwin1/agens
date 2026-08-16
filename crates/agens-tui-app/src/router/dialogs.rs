@@ -457,7 +457,7 @@ impl TuiRuntimeRouter {
                 .server(&name)
                 .is_some_and(|status| status.state() == McpLifecycleState::Ready);
             if !ready {
-                let _ = runtime.reload_server(&name);
+                runtime.reload_server(&name)?;
             }
         }
         Ok(())
@@ -1035,5 +1035,60 @@ impl TuiRuntimeRouter {
             display: "Retrying recovered attempt.".into(),
             prompt,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use agens_config::McpTransport;
+    use agens_session::context::SessionContext;
+    use agens_tools::{CommandCatalog, SkillCatalog};
+
+    use super::super::TuiRuntimeRouter;
+    use crate::test_support::{tui_session_bootstrap, tui_session_directory};
+
+    #[test]
+    fn mcp_reload_surfaces_a_runtime_lock_failure() {
+        let temporary = tui_session_directory("mcp-reload-lock");
+        let mut bootstrap = tui_session_bootstrap(&temporary, &[]);
+        bootstrap.mcp_servers = vec![agens_config::McpServerConfig {
+            name: "files".into(),
+            disabled: false,
+            transport: McpTransport::Stdio,
+            command: Some("/bin/echo".into()),
+            args: Vec::new(),
+            environment: std::collections::BTreeMap::new(),
+            cwd: None,
+            url: None,
+            headers: std::collections::BTreeMap::new(),
+            max_retries: 0,
+            timeout_ms: 250,
+        }];
+        let session = Arc::new(Mutex::new(SessionContext::fresh()));
+        let router = TuiRuntimeRouter::new(
+            bootstrap,
+            session,
+            Arc::new(Mutex::new(None)),
+            Arc::new(CommandCatalog::default()),
+            Arc::new(SkillCatalog::default()),
+        );
+
+        {
+            let runtime = router.mcp_runtime.lock().unwrap();
+            let dispatcher = Arc::clone(&runtime.dispatcher);
+            drop(runtime);
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _guard = dispatcher.lock().unwrap();
+                panic!("poison dispatcher");
+            }));
+        }
+
+        assert!(
+            router.open_dialog("mcp:reload").is_err(),
+            "a failed reconnect must not look like a successful refresh"
+        );
+        std::fs::remove_dir_all(temporary).unwrap();
     }
 }

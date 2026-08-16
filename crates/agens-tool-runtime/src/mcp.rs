@@ -15,6 +15,7 @@ use agens_tools::{
 };
 
 use agens_bootstrap::Bootstrap;
+use agens_diagnostics::best_effort;
 use agens_dispatch::RegisteredMcpTool;
 use agens_error::CliError;
 use agens_permissions::SharedToolDispatcher;
@@ -144,7 +145,7 @@ pub fn load_configured_mcp_registry(bootstrap: &Bootstrap, project_root: &Path) 
     for server in &bootstrap.mcp_servers {
         let descriptor = mcp_server_descriptor(server);
         if server.disabled {
-            let _ = registry.register_disabled_server(descriptor);
+            best_effort(registry.register_disabled_server(descriptor));
             continue;
         }
 
@@ -205,7 +206,7 @@ fn register_configuration_failure(
 ) {
     let category = McpErrorCategory::from(error);
     let message = format!("{}: server configuration is invalid", category.label());
-    let _ = registry.register_failed_server(descriptor, category, &message);
+    best_effort(registry.register_failed_server(descriptor, category, &message));
 }
 
 fn mcp_server_descriptor(server: &agens_config::McpServerConfig) -> McpServerDescriptor {
@@ -349,6 +350,40 @@ mod tests {
     fn a_zero_configured_timeout_is_still_rejected_despite_the_connect_floor() {
         assert!(configured_mcp_timeouts(0, DEFAULT_MCP_CONNECT_TIMEOUT_MS).is_err());
         assert!(configured_mcp_timeouts(200, 0).is_err());
+    }
+
+    #[test]
+    fn a_rejected_disabled_server_is_counted_as_best_effort() {
+        let mut bootstrap =
+            agens_fixtures::bootstrap_from_configuration("rejected-disabled-mcp", None, None);
+        bootstrap.mcp_servers = vec![agens_config::McpServerConfig {
+            name: "bad::name".into(),
+            disabled: true,
+            transport: McpTransport::Stdio,
+            command: Some("/bin/echo".into()),
+            args: Vec::new(),
+            environment: std::collections::BTreeMap::new(),
+            cwd: None,
+            url: None,
+            headers: std::collections::BTreeMap::new(),
+            max_retries: 0,
+            timeout_ms: 250,
+        }];
+
+        let before = agens_diagnostics::best_effort_failures();
+        let registry = load_configured_mcp_registry(&bootstrap, Path::new("/tmp"));
+
+        assert!(
+            agens_diagnostics::best_effort_failures() > before,
+            "a rejected disabled-server registration must be counted"
+        );
+        assert!(
+            registry
+                .status_handle()
+                .snapshot()
+                .server("bad::name")
+                .is_none()
+        );
     }
 
     #[test]
