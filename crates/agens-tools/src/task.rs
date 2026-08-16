@@ -1643,9 +1643,10 @@ fn task_terminal(terminal: HeadlessTaskTerminal) -> ToolOutput {
 
 /// Names the rejected skill and why, so the parent can correct the call itself.
 ///
-/// Both halves come from closed sets -- a catalog name and a fixed reason -- so
-/// the sanitizer guarding model-visible output can still verify the whole
-/// message without host detail ever reaching it.
+/// The reason is a closed set. The skill name is the model's argument, accepted
+/// only when it is non-empty and at most 64 characters; it has no charset
+/// restriction. That is not host detail (the model authored it this turn) and
+/// it does not go through `sanitized_native_tool_failure`.
 fn skill_unavailable_output(skill: &str, reason: TaskSkillRejection) -> ToolOutput {
     let mut output = task_terminal(HeadlessTaskTerminal::SkillUnavailable);
     output.content.push_str(" [skill: ");

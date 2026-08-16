@@ -90,9 +90,10 @@ const MAX_NATIVE_TOOL_FAILURE_CHARS: usize = 16_384;
 ///
 /// A raw failure carries command output, filesystem paths and other host detail. Path
 /// confinement refusals are rewritten to actionable guidance that never names a host path
-/// (no `/tmp`, no home directory). Everything else passes through redacted and bounded:
-/// real bash failures never carry a `"<tool>: "` prefix and used to lose all compiler and
-/// test output when they were collapsed.
+/// (no `/tmp`, no home directory). The rewrite matches only the closed native reason
+/// phrases, not a substring in free-form MCP text. Everything else passes through
+/// redacted and bounded: real bash failures never carry a `"<tool>: "` prefix and used
+/// to lose all compiler and test output when they were collapsed.
 pub fn sanitized_native_tool_failure(content: &str) -> String {
     if let Some((tool, reason)) = content.split_once(": ")
         && !tool.contains('\n')
@@ -100,20 +101,18 @@ pub fn sanitized_native_tool_failure(content: &str) -> String {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
     {
-        if reason.contains("outside project root") {
+        if reason == "outside project root" || reason == "path is outside project root" {
             return format!(
                 "{tool}: path is outside the project workspace; use a relative path under \
                  the project root (not /tmp or other absolute locations outside it)"
             );
         }
-        if reason.contains("traversal is not allowed") {
+        if reason == "traversal is not allowed" {
             return format!(
                 "{tool}: path traversal is not allowed; use a path under the project root"
             );
         }
-        if reason.contains("must be a non-empty relative path")
-            || reason.contains("must be a non-empty path")
-        {
+        if reason == "must be a non-empty relative path" || reason == "must be a non-empty path" {
             return format!("{tool}: path must be a non-empty path under the project root");
         }
     }
@@ -317,6 +316,22 @@ mod tests {
         let converted = sanitized_native_tool_failure(content);
 
         assert_eq!(converted, content);
+    }
+
+    /// A one-line MCP `isError` body can mention "outside project root" without being a native
+    /// confinement refusal. The guard must not treat `Error` as a tool name and replace the
+    /// server's words with our workspace guidance.
+    #[test]
+    fn one_line_mcp_path_message_is_not_rewritten_as_a_confinement_refusal() {
+        let content = "Error: the requested resource is outside project root";
+
+        let converted = sanitized_native_tool_failure(content);
+
+        assert_eq!(converted, content);
+        assert!(
+            !converted.contains("path is outside the project workspace"),
+            "{converted}"
+        );
     }
 
     /// `render_bash_result` puts `[stderr]` and `[exit status: N]` at the end of the content, so
