@@ -226,7 +226,6 @@ pub fn persist_pending_agent_correction(bootstrap: &Bootstrap, context: &mut Ses
     if !context.agent_correction_pending {
         return;
     }
-    context.agent_correction_pending = false;
 
     let Some(metadata) = context.metadata.as_mut() else {
         return;
@@ -238,6 +237,7 @@ pub fn persist_pending_agent_correction(bootstrap: &Bootstrap, context: &mut Ses
         .is_ok()
     {
         *metadata = corrected;
+        context.agent_correction_pending = false;
     }
 }
 

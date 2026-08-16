@@ -1454,6 +1454,41 @@ mod tests {
     }
 
     #[test]
+    fn persist_pending_agent_correction_keeps_the_flag_when_the_write_fails() {
+        let temporary = tui_session_directory("correction-write-fails");
+        let mut bootstrap = tui_session_bootstrap(&temporary, &[]);
+        let blocked = temporary.join("not-a-store");
+        std::fs::write(&blocked, b"blocked").unwrap();
+        bootstrap.data_directory = blocked;
+
+        let mut context = SessionContext::fresh();
+        context.agent_correction_pending = true;
+        context.metadata = Some(agens_core::SessionMetadata {
+            id: 1,
+            project: "project".into(),
+            title: "title".into(),
+            active_agent: "primary".into(),
+            provider_id: None,
+            model_id: None,
+            reasoning_effort: None,
+            created_at: 1,
+            updated_at: 1,
+            completed_turn_count: 0,
+            resumable: false,
+            parent_session_id: None,
+            fork_message_count: None,
+        });
+
+        persist_pending_agent_correction(&bootstrap, &mut context);
+
+        assert!(
+            context.agent_correction_pending,
+            "a failed persist must leave the correction pending so a later call retries"
+        );
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
     fn resumed_primary_uses_the_configured_profile_instead_of_the_saved_model() {
         let label = "resume-configured-primary-model";
         let bootstrap = bootstrap_from_configuration(
