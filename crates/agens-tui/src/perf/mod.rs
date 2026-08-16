@@ -317,6 +317,24 @@ mod tests {
     }
 
     #[test]
+    fn long_transcript_measures_scroll_on_a_long_session() {
+        let mut ctx = super::ScenarioContext::new(super::BASE_WIDTH, super::BASE_HEIGHT)
+            .expect("test backend always builds");
+
+        (SCENARIOS
+            .iter()
+            .find(|scenario| scenario.name == "long_transcript")
+            .expect("long_transcript is registered")
+            .run)(&mut ctx)
+        .expect("scenario runs to completion");
+
+        assert!(
+            !ctx.view().following_bottom,
+            "a long-session measurement that stays pinned to the bottom is still a single paint"
+        );
+    }
+
+    #[test]
     fn every_registered_scenario_has_a_unique_name() {
         let mut seen = std::collections::HashSet::new();
         for scenario in SCENARIOS {
