@@ -160,6 +160,7 @@ fn safe_diagnostic_entry(value: &serde_json::Value, relative_path: &str) -> Opti
                 "deadline",
                 "model_unavailable",
                 "network",
+                "permission",
                 "provider",
                 "protocol",
                 "rate_limited",
@@ -167,13 +168,42 @@ fn safe_diagnostic_entry(value: &serde_json::Value, relative_path: &str) -> Opti
                 "replay_budget",
                 "runtime",
                 "server",
+                "store",
                 "tool",
             ],
         )?),
         Some(serde_json::Value::Null) | None => None,
         Some(_) => return None,
     };
-    let class_label = class.unwrap_or("success");
+    let input_class = match object.get("input_class") {
+        Some(serde_json::Value::String(input_class)) => Some(allowlisted_diagnostic_value(
+            input_class,
+            &[
+                "authentication",
+                "cancelled",
+                "context",
+                "deadline",
+                "model_unavailable",
+                "network",
+                "permission",
+                "provider",
+                "protocol",
+                "rate_limited",
+                "rejected",
+                "replay_budget",
+                "runtime",
+                "server",
+                "store",
+                "tool",
+            ],
+        )?),
+        Some(serde_json::Value::Null) | None => None,
+        Some(_) => return None,
+    };
+    let class_label = match (input_class, class) {
+        (Some(input), Some(output)) if input != output => format!("{input}→{output}"),
+        _ => class.unwrap_or("success").to_owned(),
+    };
     let status_label = status.map_or_else(|| "none".into(), |status| status.to_string());
     let delay_label = delay.map_or_else(|| "none".into(), |delay| format!("{delay}ms"));
     let attempt_label = if attempt == 0 && max_attempts == 0 {
@@ -457,7 +487,11 @@ mod tests {
                 "\"max_attempts\":0,\"delay_ms\":null,\"status\":null,\"class\":\"replay_budget\"}\n",
                 "{\"timestamp_ms\":6,\"reference\":\"aaa00004\",\"scope\":\"parent\",",
                 "\"component\":\"responses\",\"event\":\"tool_output_correlation_rejected\",\"attempt\":0,",
-                "\"max_attempts\":0,\"delay_ms\":null,\"status\":null,\"class\":\"protocol\"}\n"
+                "\"max_attempts\":0,\"delay_ms\":null,\"status\":null,\"class\":\"protocol\"}\n",
+                "{\"timestamp_ms\":7,\"reference\":\"aaa00005\",\"scope\":\"subagent\",",
+                "\"component\":\"subagent\",\"event\":\"terminal\",\"attempt\":0,",
+                "\"max_attempts\":0,\"delay_ms\":null,\"status\":null,\"class\":\"runtime\",",
+                "\"input_class\":\"permission\"}\n"
             ),
         )
         .expect("diagnostic fixture should be written");
@@ -482,6 +516,7 @@ mod tests {
                 "missing diagnostic event: {event}"
             );
         }
+        assert!(rendered.contains("permission→runtime"));
         assert!(rendered.contains("Attempt: not applicable"));
         assert!(!rendered.contains(&data_directory.display().to_string()));
         assert!(!rendered.contains("SENTINEL_SECRET"));

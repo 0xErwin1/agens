@@ -693,6 +693,7 @@ impl TaskRunner for ProductionTaskRunner {
                 &self.bootstrap,
                 &diagnostic_reference,
                 error.diagnostic_class(),
+                error.input_class(),
             );
         }
         if let (Some(lifecycle_bridge), Some(execution), Err(error)) =

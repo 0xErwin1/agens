@@ -41,10 +41,10 @@ use std::path::PathBuf;
 
 /// Why a delegated child turn ended without a result.
 ///
-/// Every variant but [`Self::DeclarationRejected`] is payload-free on purpose:
-/// the parent is told a class, never host detail. A rejected declaration is the
-/// exception because the operator wrote the offending name themselves and
-/// cannot act on the failure without seeing which one it was.
+/// Most variants are payload-free: the parent is told a class, never host
+/// detail. [`Self::DeclarationRejected`] names the operator-authored tool.
+/// [`Self::Degraded`] keeps the input diagnostic class so debug JSONL can
+/// show what was collapsed to runtime.
 #[derive(Clone)]
 pub enum ChildRunError {
     Authentication,
@@ -60,6 +60,12 @@ pub enum ChildRunError {
     Server,
     Tool,
     Runtime,
+    /// A typed `HeadlessTurnError` that this layer can only report as runtime.
+    /// `input` is the class that entered the mapping; `diagnostic_class` is
+    /// still `Runtime`.
+    Degraded {
+        input: ProviderDiagnosticClass,
+    },
     DeclarationRejected(ChildSurfaceRejection),
 }
 
@@ -78,7 +84,16 @@ impl ChildRunError {
             Self::Rejected => ProviderDiagnosticClass::Rejected,
             Self::Server => ProviderDiagnosticClass::Server,
             Self::Tool => ProviderDiagnosticClass::Tool,
-            Self::Runtime | Self::DeclarationRejected(_) => ProviderDiagnosticClass::Runtime,
+            Self::Runtime | Self::Degraded { .. } | Self::DeclarationRejected(_) => {
+                ProviderDiagnosticClass::Runtime
+            }
+        }
+    }
+
+    pub const fn input_class(&self) -> Option<ProviderDiagnosticClass> {
+        match self {
+            Self::Degraded { input } => Some(*input),
+            _ => None,
         }
     }
 
@@ -95,7 +110,9 @@ impl ChildRunError {
             Self::Rejected => Some(SubagentErrorKind::Rejected),
             Self::Server => Some(SubagentErrorKind::Server),
             Self::Tool => Some(SubagentErrorKind::Tool),
-            Self::Runtime | Self::DeclarationRejected(_) => Some(SubagentErrorKind::Runtime),
+            Self::Runtime | Self::Degraded { .. } | Self::DeclarationRejected(_) => {
+                Some(SubagentErrorKind::Runtime)
+            }
         }
     }
 
@@ -117,7 +134,7 @@ impl ChildRunError {
             Self::RateLimited => TaskRunnerError::ProviderFailure(TaskProviderFailure::RateLimited),
             Self::Rejected => TaskRunnerError::ProviderFailure(TaskProviderFailure::Rejected),
             Self::Server => TaskRunnerError::ProviderFailure(TaskProviderFailure::Server),
-            Self::Tool | Self::Runtime => TaskRunnerError::ChildFailure,
+            Self::Tool | Self::Runtime | Self::Degraded { .. } => TaskRunnerError::ChildFailure,
             Self::DeclarationRejected(rejection) => TaskRunnerError::DeclarationRejected {
                 reason: rejection.reason,
                 tool: rejection.tool,
@@ -140,11 +157,15 @@ pub(crate) fn child_run_error(error: HeadlessTurnError) -> ChildRunError {
         HeadlessTurnError::ProviderRejected => ChildRunError::Rejected,
         HeadlessTurnError::ProviderServer => ChildRunError::Server,
         HeadlessTurnError::Tool => ChildRunError::Tool,
-        HeadlessTurnError::MaxIterations
-        | HeadlessTurnError::Permission
+        HeadlessTurnError::Permission
         | HeadlessTurnError::PermissionEvaluation
-        | HeadlessTurnError::PermissionRequired
-        | HeadlessTurnError::Store
+        | HeadlessTurnError::PermissionRequired => ChildRunError::Degraded {
+            input: ProviderDiagnosticClass::Permission,
+        },
+        HeadlessTurnError::Store => ChildRunError::Degraded {
+            input: ProviderDiagnosticClass::Store,
+        },
+        HeadlessTurnError::MaxIterations
         | HeadlessTurnError::State
         | HeadlessTurnError::TaskTerminal(_) => ChildRunError::Runtime,
     }
@@ -727,6 +748,29 @@ mod tests {
             ProviderDiagnosticClass::ReplayBudget
         );
         assert_ne!(budget.diagnostic_class(), ProviderDiagnosticClass::Context);
+    }
+
+    #[test]
+    fn a_permission_failure_keeps_its_input_class_when_mapped_to_runtime() {
+        let mapped = child_run_error(HeadlessTurnError::PermissionRequired);
+
+        assert_eq!(mapped.diagnostic_class(), ProviderDiagnosticClass::Runtime);
+        assert_eq!(
+            mapped.input_class(),
+            Some(ProviderDiagnosticClass::Permission)
+        );
+        assert_eq!(
+            mapped.clone().task_runner_error(),
+            TaskRunnerError::ChildFailure
+        );
+    }
+
+    #[test]
+    fn a_store_failure_keeps_its_input_class_when_mapped_to_runtime() {
+        let mapped = child_run_error(HeadlessTurnError::Store);
+
+        assert_eq!(mapped.diagnostic_class(), ProviderDiagnosticClass::Runtime);
+        assert_eq!(mapped.input_class(), Some(ProviderDiagnosticClass::Store));
     }
 
     /// A prompter that records what it was asked and answers as scripted,

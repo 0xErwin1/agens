@@ -225,6 +225,7 @@ fn diagnostic_json_line(event: &ProviderDiagnosticEvent) -> std::io::Result<Vec<
         "delay_ms": event.delay_ms,
         "status": event.status,
         "class": event.class.map(ProviderDiagnosticClass::as_str),
+        "input_class": event.input_class.map(ProviderDiagnosticClass::as_str),
         "budget_dimension": event.budget_dimension.map(ReplayBudgetDimension::as_str),
         "observed": event.observed,
         "limit": event.limit,
@@ -401,6 +402,7 @@ pub fn record_subagent_model_unavailable(
         delay_ms: None,
         status: None,
         class: Some(ProviderDiagnosticClass::ModelUnavailable),
+        input_class: None,
         budget_dimension: None,
         observed: None,
         limit: None,
@@ -417,6 +419,7 @@ pub fn record_subagent_terminal(
     bootstrap: &Bootstrap,
     reference: &str,
     class: ProviderDiagnosticClass,
+    input_class: Option<ProviderDiagnosticClass>,
 ) {
     let Ok(reference) = DiagnosticRef::new(reference.to_owned()) else {
         return;
@@ -431,6 +434,7 @@ pub fn record_subagent_terminal(
         delay_ms: None,
         status: None,
         class: Some(class),
+        input_class,
         budget_dimension: None,
         observed: None,
         limit: None,
@@ -455,6 +459,7 @@ pub fn record_subagent_surface_rejection(bootstrap: &Bootstrap, reference: &str,
             delay_ms: None,
             status: None,
             class: Some(ProviderDiagnosticClass::Runtime),
+            input_class: None,
             budget_dimension: None,
             observed: None,
             limit: None,
@@ -488,6 +493,7 @@ pub fn record_parent_terminal(bootstrap: &Bootstrap, reference: &str, error: &Cl
         delay_ms: None,
         status: None,
         class: Some(class),
+        input_class: None,
         budget_dimension: None,
         observed: None,
         limit: None,
@@ -508,6 +514,7 @@ pub fn record_agent_diagnostic(bootstrap: &Bootstrap, event: ProviderDiagnosticK
         delay_ms: None,
         status: None,
         class: Some(ProviderDiagnosticClass::Runtime),
+        input_class: None,
         budget_dimension: None,
         observed: None,
         limit: None,
@@ -520,6 +527,50 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use super::*;
+
+    #[test]
+    fn a_degraded_terminal_records_input_and_output_class() {
+        let temporary =
+            std::env::temp_dir().join(format!("agens-diagnostic-degraded-{}", std::process::id()));
+        std::fs::remove_dir_all(&temporary).ok();
+        std::fs::create_dir_all(&temporary).expect("test data directory should be creatable");
+
+        let store = SafeDiagnosticStore::with_capture(temporary.clone(), true);
+        store.record(&ProviderDiagnosticEvent {
+            reference: DiagnosticRef::new("abcd1234".to_owned()).unwrap(),
+            scope: ProviderDiagnosticScope::Subagent,
+            component: ProviderDiagnosticComponent::Subagent,
+            event: ProviderDiagnosticKind::Terminal,
+            attempt: 0,
+            max_attempts: 0,
+            delay_ms: None,
+            status: None,
+            class: Some(ProviderDiagnosticClass::Runtime),
+            input_class: Some(ProviderDiagnosticClass::Permission),
+            budget_dimension: None,
+            observed: None,
+            limit: None,
+        });
+
+        let recorded = std::fs::read_dir(temporary.join("diagnostics"))
+            .expect("enabled capture should create the directory")
+            .filter_map(Result::ok)
+            .map(|entry| std::fs::read_to_string(entry.path()).unwrap_or_default())
+            .collect::<String>();
+
+        assert!(
+            recorded.contains(r#""class":"runtime""#),
+            "output class must survive: {recorded}"
+        );
+        assert!(
+            recorded.contains(r#""input_class":"permission""#),
+            "input class must survive the degradation: {recorded}"
+        );
+        assert!(!recorded.contains("/home/"));
+        assert!(!recorded.contains("authorization"));
+
+        std::fs::remove_dir_all(&temporary).ok();
+    }
 
     #[test]
     fn a_diagnostics_write_failure_is_counted_and_does_not_change_the_caller() {
@@ -542,6 +593,7 @@ mod tests {
             delay_ms: None,
             status: None,
             class: Some(ProviderDiagnosticClass::Provider),
+            input_class: None,
             budget_dimension: None,
             observed: None,
             limit: None,
@@ -578,6 +630,7 @@ mod tests {
             delay_ms: None,
             status: None,
             class: Some(ProviderDiagnosticClass::Provider),
+            input_class: None,
             budget_dimension: None,
             observed: None,
             limit: None,
@@ -616,6 +669,7 @@ mod tests {
             delay_ms: None,
             status: None,
             class: Some(ProviderDiagnosticClass::Runtime),
+            input_class: None,
             budget_dimension: None,
             observed: None,
             limit: None,
@@ -657,6 +711,7 @@ mod tests {
             delay_ms: Some(1500),
             status,
             class,
+            input_class: None,
             budget_dimension: None,
             observed: None,
             limit: None,
@@ -744,6 +799,7 @@ mod tests {
             delay_ms: None,
             status: None,
             class: Some(ProviderDiagnosticClass::ModelUnavailable),
+            input_class: None,
             budget_dimension: None,
             observed: None,
             limit: None,
@@ -766,6 +822,7 @@ mod tests {
         assert_eq!(object["requested_model"], "unavailable-model");
         assert_eq!(object["fallback_model"], "session-model");
         assert_eq!(object["class"], "model_unavailable");
+        assert!(object.get("input_class").is_none() || object["input_class"].is_null());
 
         std::fs::remove_dir_all(data_directory).expect("test directory should be removed");
     }
@@ -792,6 +849,7 @@ mod tests {
             delay_ms: Some(275),
             status: Some(429),
             class: Some(ProviderDiagnosticClass::RateLimited),
+            input_class: None,
             budget_dimension: None,
             observed: None,
             limit: None,
@@ -824,6 +882,7 @@ mod tests {
                 "component",
                 "delay_ms",
                 "event",
+                "input_class",
                 "limit",
                 "max_attempts",
                 "observed",
