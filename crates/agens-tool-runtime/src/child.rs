@@ -50,6 +50,7 @@ pub enum ChildRunError {
     Authentication,
     Cancelled,
     Context,
+    ReplayBudget,
     Network,
     TimedOut,
     Provider,
@@ -68,6 +69,7 @@ impl ChildRunError {
             Self::Authentication => ProviderDiagnosticClass::Authentication,
             Self::Cancelled => ProviderDiagnosticClass::Cancelled,
             Self::Context => ProviderDiagnosticClass::Context,
+            Self::ReplayBudget => ProviderDiagnosticClass::Context,
             Self::Network => ProviderDiagnosticClass::Network,
             Self::TimedOut => ProviderDiagnosticClass::Deadline,
             Self::Provider => ProviderDiagnosticClass::Provider,
@@ -85,6 +87,7 @@ impl ChildRunError {
             Self::Cancelled | Self::TimedOut => None,
             Self::Authentication => Some(SubagentErrorKind::Authentication),
             Self::Context => Some(SubagentErrorKind::Context),
+            Self::ReplayBudget => Some(SubagentErrorKind::ReplayBudget),
             Self::Network => Some(SubagentErrorKind::Network),
             Self::Provider => Some(SubagentErrorKind::Provider),
             Self::Protocol => Some(SubagentErrorKind::Protocol),
@@ -104,6 +107,9 @@ impl ChildRunError {
                 TaskRunnerError::ProviderFailure(TaskProviderFailure::Authentication)
             }
             Self::Context => TaskRunnerError::ProviderFailure(TaskProviderFailure::Context),
+            Self::ReplayBudget => {
+                TaskRunnerError::ProviderFailure(TaskProviderFailure::ReplayBudget)
+            }
             Self::Network => TaskRunnerError::ProviderFailure(TaskProviderFailure::Network),
             Self::Provider | Self::Protocol => {
                 TaskRunnerError::ProviderFailure(TaskProviderFailure::Protocol)
@@ -124,9 +130,8 @@ fn child_run_error(error: HeadlessTurnError) -> ChildRunError {
     match error {
         HeadlessTurnError::Authentication => ChildRunError::Authentication,
         HeadlessTurnError::Cancelled => ChildRunError::Cancelled,
-        HeadlessTurnError::ProviderContext | HeadlessTurnError::ProviderHistoryBudget => {
-            ChildRunError::Context
-        }
+        HeadlessTurnError::ProviderContext => ChildRunError::Context,
+        HeadlessTurnError::ProviderHistoryBudget => ChildRunError::ReplayBudget,
         HeadlessTurnError::ProviderNetwork => ChildRunError::Network,
         HeadlessTurnError::TimedOut => ChildRunError::TimedOut,
         HeadlessTurnError::Provider => ChildRunError::Provider,
@@ -692,6 +697,27 @@ impl HeadlessPermissionResolver for ChildPermissionResolver {
 mod tests {
     use super::*;
     use agens_core::HeadlessPermissionGate;
+
+    #[test]
+    fn history_budget_does_not_collapse_to_context_or_child_failure() {
+        let budget = child_run_error(HeadlessTurnError::ProviderHistoryBudget);
+        let context = child_run_error(HeadlessTurnError::ProviderContext);
+
+        assert_ne!(
+            budget.clone().task_runner_error(),
+            context.task_runner_error()
+        );
+        assert_ne!(
+            budget.clone().task_runner_error(),
+            TaskRunnerError::ChildFailure
+        );
+        assert_eq!(
+            budget.clone().task_runner_error(),
+            TaskRunnerError::ProviderFailure(TaskProviderFailure::ReplayBudget)
+        );
+        assert_ne!(budget.tui_kind(), Some(SubagentErrorKind::Context));
+        assert_eq!(budget.tui_kind(), Some(SubagentErrorKind::ReplayBudget));
+    }
 
     /// A prompter that records what it was asked and answers as scripted,
     /// standing in for the person at the parent's terminal.

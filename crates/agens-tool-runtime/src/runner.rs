@@ -729,8 +729,11 @@ pub fn map_task_turn_error(error: HeadlessTurnError) -> TaskRunnerError {
         HeadlessTurnError::Provider | HeadlessTurnError::ProviderProtocol => {
             TaskRunnerError::ProviderFailure(TaskProviderFailure::Protocol)
         }
-        HeadlessTurnError::ProviderContext | HeadlessTurnError::ProviderHistoryBudget => {
+        HeadlessTurnError::ProviderContext => {
             TaskRunnerError::ProviderFailure(TaskProviderFailure::Context)
+        }
+        HeadlessTurnError::ProviderHistoryBudget => {
+            TaskRunnerError::ProviderFailure(TaskProviderFailure::ReplayBudget)
         }
         HeadlessTurnError::ProviderRejected => {
             TaskRunnerError::ProviderFailure(TaskProviderFailure::Rejected)

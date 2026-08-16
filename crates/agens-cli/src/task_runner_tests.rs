@@ -50,7 +50,7 @@ fn production_task_error_mapping_reserves_provider_for_provider_failures() {
     );
     assert_eq!(
         map_task_turn_error(HeadlessTurnError::ProviderHistoryBudget),
-        TaskRunnerError::ProviderFailure(TaskProviderFailure::Context)
+        TaskRunnerError::ProviderFailure(TaskProviderFailure::ReplayBudget)
     );
     assert_eq!(
         map_task_turn_error(HeadlessTurnError::Tool),
@@ -458,6 +458,14 @@ fn production_runner_error_publication_orders_sanitized_typed_failure_before_ter
             ChildRunError::Context,
             TaskRunnerError::ProviderFailure(TaskProviderFailure::Context),
             Some(SubagentErrorKind::Context),
+            TuiExecutionEvent::Failed { id: 1 },
+            SubagentStatus::Failure,
+            "failed",
+        ),
+        (
+            ChildRunError::ReplayBudget,
+            TaskRunnerError::ProviderFailure(TaskProviderFailure::ReplayBudget),
+            Some(SubagentErrorKind::ReplayBudget),
             TuiExecutionEvent::Failed { id: 1 },
             SubagentStatus::Failure,
             "failed",

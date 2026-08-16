@@ -497,6 +497,7 @@ pub enum SessionMetadataError {
 pub enum SubagentErrorKind {
     Authentication,
     Context,
+    ReplayBudget,
     Network,
     Provider,
     Protocol,
@@ -1423,6 +1424,10 @@ impl HeadlessTaskTerminal {
 pub enum TaskProviderFailure {
     Authentication,
     Context,
+    /// The session's own history outgrew what one request may replay. Distinct
+    /// from [`Self::Context`]: that one is the model's window, this one is the
+    /// runtime replay budget.
+    ReplayBudget,
     Network,
     Protocol,
     RateLimited,
@@ -1431,9 +1436,10 @@ pub enum TaskProviderFailure {
 }
 
 impl TaskProviderFailure {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Authentication,
         Self::Context,
+        Self::ReplayBudget,
         Self::Network,
         Self::Protocol,
         Self::RateLimited,
@@ -1445,6 +1451,7 @@ impl TaskProviderFailure {
         match self {
             Self::Authentication => "authentication",
             Self::Context => "context length",
+            Self::ReplayBudget => "replay budget",
             Self::Network => "network",
             Self::Protocol => "response protocol",
             Self::RateLimited => "rate limited",

@@ -441,6 +441,7 @@ impl SubagentErrorPresentation for SubagentErrorKind {
         match self {
             Self::Authentication => "Subagent authentication failed.",
             Self::Context => "Subagent request exceeds the model context window.",
+            Self::ReplayBudget => "Subagent session history outgrew the replay budget.",
             Self::Network => "Subagent network request failed.",
             Self::Provider => "Subagent provider request failed.",
             Self::Protocol => "Subagent provider response protocol failed.",
@@ -456,6 +457,7 @@ impl SubagentErrorPresentation for SubagentErrorKind {
         match self {
             Self::Authentication => "Check provider credentials, then retry.",
             Self::Context => "Reduce the task context, then retry.",
+            Self::ReplayBudget => "Inspect replay-budget diagnostics, then retry.",
             Self::Network => "Check network connectivity, then retry.",
             Self::Provider => "Retry the subagent request.",
             Self::Protocol => "Retry the subagent request or inspect diagnostics.",
@@ -470,7 +472,8 @@ impl SubagentErrorPresentation for SubagentErrorKind {
 
 #[cfg(test)]
 mod tests {
-    use super::{Parked, PromptOrigin, TuiAskUserBridge};
+    use super::{Parked, PromptOrigin, SubagentErrorPresentation, TuiAskUserBridge};
+    use agens_core::SubagentErrorKind;
     use agens_core::ask_user::{
         AskUserAnswer, AskUserMode, AskUserOption, AskUserQuestion, AskUserReply, AskUserRequest,
         AskUserUnavailable,
@@ -478,6 +481,16 @@ mod tests {
     use std::sync::mpsc;
     use std::sync::{Arc, Barrier};
     use std::thread;
+
+    #[test]
+    fn replay_budget_card_does_not_blame_the_model_context_window() {
+        let message = SubagentErrorKind::ReplayBudget.message();
+        let action = SubagentErrorKind::ReplayBudget.action();
+
+        assert!(message.contains("replay budget"), "{message}");
+        assert!(!message.contains("context window"), "{message}");
+        assert!(action.contains("replay-budget"), "{action}");
+    }
 
     fn single_question_request() -> AskUserRequest {
         let options = vec![
