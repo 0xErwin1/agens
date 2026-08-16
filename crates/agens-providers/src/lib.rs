@@ -251,7 +251,7 @@ impl ProviderDiagnostics {
             max_attempts: 0,
             delay_ms: None,
             status: None,
-            class: Some(ProviderDiagnosticClass::Context),
+            class: Some(ProviderDiagnosticClass::ReplayBudget),
             budget_dimension: Some(dimension),
             observed: Some(u64::try_from(observed).unwrap_or(u64::MAX)),
             limit: Some(u64::try_from(limit).unwrap_or(u64::MAX)),
@@ -359,6 +359,7 @@ pub enum ProviderDiagnosticClass {
     Protocol,
     RateLimited,
     Rejected,
+    ReplayBudget,
     Runtime,
     Server,
     Tool,
@@ -377,6 +378,7 @@ impl ProviderDiagnosticClass {
             Self::Protocol => "protocol",
             Self::RateLimited => "rate_limited",
             Self::Rejected => "rejected",
+            Self::ReplayBudget => "replay_budget",
             Self::Runtime => "runtime",
             Self::Server => "server",
             Self::Tool => "tool",
@@ -1647,7 +1649,7 @@ fn diagnostic_class_for_port_error(error: HeadlessTurnPortError) -> ProviderDiag
         HeadlessTurnPortError::Cancelled => ProviderDiagnosticClass::Cancelled,
         HeadlessTurnPortError::TimedOut => ProviderDiagnosticClass::Deadline,
         HeadlessTurnPortError::ProviderContext => ProviderDiagnosticClass::Context,
-        HeadlessTurnPortError::ProviderHistoryBudget => ProviderDiagnosticClass::Context,
+        HeadlessTurnPortError::ProviderHistoryBudget => ProviderDiagnosticClass::ReplayBudget,
         HeadlessTurnPortError::ProviderNetwork => ProviderDiagnosticClass::Network,
         HeadlessTurnPortError::ProviderRateLimited => ProviderDiagnosticClass::RateLimited,
         HeadlessTurnPortError::ProviderRejected => ProviderDiagnosticClass::Rejected,
@@ -4182,6 +4184,38 @@ mod tests {
             Some(model_visible_tool_output(&stored).as_str())
         );
         assert!(validate_chatgpt_replay_history(&input).is_ok());
+    }
+
+    #[test]
+    fn replay_budget_diagnostics_are_not_classified_as_context() {
+        assert_eq!(
+            diagnostic_class_for_port_error(HeadlessTurnPortError::ProviderHistoryBudget),
+            ProviderDiagnosticClass::ReplayBudget
+        );
+        assert_eq!(
+            diagnostic_class_for_port_error(HeadlessTurnPortError::ProviderContext),
+            ProviderDiagnosticClass::Context
+        );
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let sink = {
+            let captured = Arc::clone(&captured);
+            Arc::new(move |event| captured.lock().expect("event lock").push(event))
+        };
+        let diagnostics =
+            ProviderDiagnostics::new("abc12345", ProviderDiagnosticScope::Parent, sink)
+                .expect("diagnostics should be configured");
+
+        diagnostics.emit_replay_budget(ReplayBudgetDimension::ItemBytes, 10, 5);
+
+        let events = captured.lock().expect("event lock");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event, ProviderDiagnosticKind::ReplayLimitExceeded);
+        assert_eq!(events[0].class, Some(ProviderDiagnosticClass::ReplayBudget));
+        assert_eq!(
+            events[0].budget_dimension,
+            Some(ReplayBudgetDimension::ItemBytes)
+        );
     }
 
     #[test]

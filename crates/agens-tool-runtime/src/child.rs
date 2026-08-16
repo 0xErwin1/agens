@@ -69,7 +69,7 @@ impl ChildRunError {
             Self::Authentication => ProviderDiagnosticClass::Authentication,
             Self::Cancelled => ProviderDiagnosticClass::Cancelled,
             Self::Context => ProviderDiagnosticClass::Context,
-            Self::ReplayBudget => ProviderDiagnosticClass::Context,
+            Self::ReplayBudget => ProviderDiagnosticClass::ReplayBudget,
             Self::Network => ProviderDiagnosticClass::Network,
             Self::TimedOut => ProviderDiagnosticClass::Deadline,
             Self::Provider => ProviderDiagnosticClass::Provider,
@@ -722,6 +722,11 @@ mod tests {
         );
         assert_ne!(budget.tui_kind(), Some(SubagentErrorKind::Context));
         assert_eq!(budget.tui_kind(), Some(SubagentErrorKind::ReplayBudget));
+        assert_eq!(
+            budget.diagnostic_class(),
+            ProviderDiagnosticClass::ReplayBudget
+        );
+        assert_ne!(budget.diagnostic_class(), ProviderDiagnosticClass::Context);
     }
 
     /// A prompter that records what it was asked and answers as scripted,

@@ -164,6 +164,7 @@ fn safe_diagnostic_entry(value: &serde_json::Value, relative_path: &str) -> Opti
                 "protocol",
                 "rate_limited",
                 "rejected",
+                "replay_budget",
                 "runtime",
                 "server",
                 "tool",
@@ -453,7 +454,7 @@ mod tests {
                 "\"max_attempts\":0,\"delay_ms\":null,\"status\":null,\"class\":\"protocol\"}\n",
                 "{\"timestamp_ms\":5,\"reference\":\"aaa00003\",\"scope\":\"parent\",",
                 "\"component\":\"responses\",\"event\":\"replay_limit_exceeded\",\"attempt\":0,",
-                "\"max_attempts\":0,\"delay_ms\":null,\"status\":null,\"class\":\"context\"}\n",
+                "\"max_attempts\":0,\"delay_ms\":null,\"status\":null,\"class\":\"replay_budget\"}\n",
                 "{\"timestamp_ms\":6,\"reference\":\"aaa00004\",\"scope\":\"parent\",",
                 "\"component\":\"responses\",\"event\":\"tool_output_correlation_rejected\",\"attempt\":0,",
                 "\"max_attempts\":0,\"delay_ms\":null,\"status\":null,\"class\":\"protocol\"}\n"
