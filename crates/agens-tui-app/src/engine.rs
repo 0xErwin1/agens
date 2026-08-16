@@ -704,16 +704,25 @@ pub fn run_tui_prompt_with(
     let boundary = turn_boundary(&previous_messages, &session.messages);
     record_turn(&mut session, prompt, boundary, before, after);
     if let Some(identifier) = session.identifier {
-        // Best-effort, like the write above: this call gets another attempt on every subsequent
-        // completed turn, and the toggle command (the moment the user actually asked for a
-        // change) surfaces a failed write directly instead of staying silent here too.
-        let _ = write_through_bypass_permission_prompts(
-            bootstrap,
-            identifier,
-            session.bypass_permissions,
-        );
+        if let Some(message) =
+            failed_bypass_persist_notice(write_through_bypass_permission_prompts(
+                bootstrap,
+                identifier,
+                session.bypass_permissions,
+            ))
+        {
+            if let Some(notice) = notice {
+                notice(message);
+            }
+        }
     }
     result
+}
+
+fn failed_bypass_persist_notice(result: Result<(), CliError>) -> Option<String> {
+    result.err().map(|_| {
+        "Permission bypass state could not be saved and may not persist across resume.".to_owned()
+    })
 }
 
 /// Removes exactly the attachments the finished turn carried from the session staging.
@@ -1518,6 +1527,20 @@ mod tests {
         );
 
         std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn a_failed_bypass_persist_after_a_turn_is_named_rather_than_swallowed() {
+        assert_eq!(
+            failed_bypass_persist_notice(Err(CliError::storage(
+                "permission bypass state could not be saved"
+            ))),
+            Some(
+                "Permission bypass state could not be saved and may not persist across resume."
+                    .to_owned()
+            )
+        );
+        assert_eq!(failed_bypass_persist_notice(Ok(())), None);
     }
 
     /// The sequence the feature is judged by: a turn is taken back, the reader sends the next
