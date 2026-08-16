@@ -61,6 +61,10 @@ pub(super) struct SettledConversation {
     pub index: usize,
 }
 
+/// Width is part of the key because rows are already wrapped. A resize is
+/// therefore a new entry for every visible settled turn, not a reflow of the
+/// old one. Elision keeps that set to a handful of turns, so the miss cost
+/// tracks the window, not the session length.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct SettledConversationKey {
     conversation: SettledConversation,
@@ -3655,13 +3659,13 @@ thread_local! {
 }
 
 #[cfg(test)]
-fn reset_settled_conversation_test_state() {
+pub(super) fn reset_settled_conversation_test_state() {
     SETTLED_CONVERSATION_CACHE.with_borrow_mut(VecDeque::clear);
     SETTLED_CONVERSATION_RENDERS.with(|renders| renders.set(0));
 }
 
 #[cfg(test)]
-fn settled_conversation_test_renders() -> usize {
+pub(super) fn settled_conversation_test_renders() -> usize {
     SETTLED_CONVERSATION_RENDERS.with(std::cell::Cell::get)
 }
 

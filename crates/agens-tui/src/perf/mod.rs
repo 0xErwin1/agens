@@ -335,6 +335,40 @@ mod tests {
     }
 
     #[test]
+    fn a_resize_rebuilds_the_visible_window_not_the_session() {
+        use crate::perf::fixtures;
+        use crate::render::{
+            reset_settled_conversation_test_state, settled_conversation_test_renders,
+        };
+
+        reset_settled_conversation_test_state();
+        let mut ctx = super::ScenarioContext::new(super::BASE_WIDTH, super::BASE_HEIGHT)
+            .expect("test backend always builds");
+        let fixture = fixtures::transcript(40, 12);
+        ctx.load_transcript(&fixture.messages)
+            .expect("fixture is a valid conversation");
+        ctx.render_frame(true).expect("first frame renders");
+        let after_load = settled_conversation_test_renders();
+        assert!(
+            after_load > 0,
+            "the first paint has to go through the settled cache"
+        );
+        assert!(
+            after_load < 40,
+            "elision should keep the first paint far below the session, got {after_load}"
+        );
+
+        ctx.resize(80, super::BASE_HEIGHT)
+            .expect("test backend resizes");
+        ctx.render_frame(true).expect("resized frame renders");
+        let after_resize = settled_conversation_test_renders();
+        assert!(
+            after_resize < 40,
+            "one resize must not rebuild the hidden session, renders {after_resize} after {after_load}"
+        );
+    }
+
+    #[test]
     fn every_registered_scenario_has_a_unique_name() {
         let mut seen = std::collections::HashSet::new();
         for scenario in SCENARIOS {
