@@ -13,14 +13,17 @@
 //! distinguishable from other high-entropy text (a padded base64 blob, for example) on shape
 //! alone, so it is accepted as a residual risk rather than mangling unrelated content.
 
-const CREDENTIAL_KEYS: [&str; 13] = [
+const CREDENTIAL_KEYS: [&str; 16] = [
     "api_key",
     "apikey",
     "api-key",
     "x-api-key",
     "authorization",
+    "auth",
     "credential",
     "password",
+    "passwd",
+    "pat",
     "private_key",
     "secret",
     "token",
@@ -553,6 +556,7 @@ fn redact_inline_key_value(word: &str) -> Option<String> {
     if redaction_value.is_empty()
         || redaction_value.starts_with(REDACTED_MARKER_PREFIX)
         || is_auth_scheme(redaction_value)
+        || !is_replaceable_credential_value(redaction_value)
     {
         return None;
     }
@@ -577,6 +581,31 @@ pub fn redact_absolute_paths(value: &str) -> String {
 }
 
 fn is_absolute_path_token(word: &str) -> bool {
+    let candidate = strip_wrapping_path_punctuation(word);
+    if looks_like_absolute_path(candidate) {
+        return true;
+    }
+    if let Some((_, rest)) = candidate.split_once('=')
+        && looks_like_absolute_path(rest)
+    {
+        return true;
+    }
+    if let Some((_, rest)) = candidate.split_once("://") {
+        return looks_like_absolute_path(rest) || rest.starts_with('/');
+    }
+    false
+}
+
+fn strip_wrapping_path_punctuation(word: &str) -> &str {
+    word.trim_matches(|character: char| {
+        matches!(
+            character,
+            '`' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>'
+        )
+    })
+}
+
+fn looks_like_absolute_path(word: &str) -> bool {
     word.starts_with('/') || word.starts_with("~/") || is_windows_drive_path(word)
 }
 
@@ -995,6 +1024,40 @@ mod tests {
                 "/home/user/project".to_owned(),
                 "/home/user/project".to_owned(),
             ),
+            (
+                "negative: glued short password without credential shape survives like the spaced form",
+                "password=hunterhunt".to_owned(),
+                "password=hunterhunt".to_owned(),
+            ),
+            (
+                "negative: spaced short password without credential shape survives",
+                "password: hunterhunt".to_owned(),
+                "password: hunterhunt".to_owned(),
+            ),
+            (
+                "namespaced GH_PAT environment assignment",
+                format!("env GH_PAT={github_token_value} exported"),
+                format!(
+                    "env GH_PAT=[redacted: {} characters] exported",
+                    github_token_value.chars().count()
+                ),
+            ),
+            (
+                "namespaced MCP_AUTH environment assignment",
+                format!("env MCP_AUTH={opaque_bearer_token} exported"),
+                format!(
+                    "env MCP_AUTH=[redacted: {} characters] exported",
+                    opaque_bearer_token.chars().count()
+                ),
+            ),
+            (
+                "passwd key=value glued shape",
+                format!("config passwd={equals_value} saved"),
+                format!(
+                    "config passwd=[redacted: {} characters] saved",
+                    equals_value.chars().count()
+                ),
+            ),
         ]
     }
 
@@ -1111,6 +1174,9 @@ mod tests {
             "AWS_SECRET_ACCESS_KEY",
             "x-api-key",
             "token",
+            "GH_PAT",
+            "MCP_AUTH",
+            "passwd",
         ];
 
         for name in credential_names {
@@ -1161,16 +1227,20 @@ mod tests {
         }
     }
 
-    /// The one shape plural matching costs: a `key=value` pair glued into a single token is
-    /// replaced on the key alone, with no test of the value, because a short or low-entropy
-    /// secret is still a secret. A token COUNT written in that shape is therefore withheld too.
-    /// This is a visibly marked loss of a diagnostic number, traded against rendering every
-    /// element of a `tokens` array verbatim, and the count survives in every spaced shape.
+    /// The glued `key=value` rule used to skip the value-shape check the other three rules
+    /// apply. That withheld a token COUNT written as `max_tokens=128000` and redacted
+    /// `password=hunterhunt` while the spaced and JSON forms of the same value survived. All
+    /// four rules now share the shape check. A short alphabetic-only secret is a residual in
+    /// every syntax.
     #[test]
-    fn plural_matching_withholds_a_glued_token_count_as_its_accepted_cost() {
+    fn glued_and_spaced_key_value_share_the_value_shape_check() {
         assert_eq!(
             redact_credential_values("max_tokens=128000 exceeded"),
-            "max_tokens=[redacted: 6 characters] exceeded"
+            "max_tokens=128000 exceeded"
+        );
+        assert_eq!(
+            redact_credential_values("max_tokens: 128000 exceeded"),
+            "max_tokens: 128000 exceeded"
         );
     }
 
@@ -1228,6 +1298,33 @@ mod tests {
 
         let relative = "see src/main.rs:12 for detail";
         assert_eq!(redact_absolute_paths(relative), relative);
+    }
+
+    #[test]
+    fn redact_absolute_paths_withholds_paths_wrapped_by_punctuation_or_flags() {
+        let cases: Vec<(&str, &str)> = vec![
+            ("backticks", "failed at `/home/user/proj/crates/x`"),
+            ("parentheses", "open (/home/user/proj/crates/x)"),
+            (
+                "equals flag",
+                "cargo --manifest-path=/home/user/proj/Cargo.toml",
+            ),
+            ("file url", "see file:///home/user/proj/Cargo.toml"),
+        ];
+
+        for (name, input) in cases {
+            let redacted = redact_absolute_paths(input);
+            assert!(redacted.contains("[path]"), "case: {name}: {redacted:?}");
+            assert!(
+                !redacted.contains("/home/user"),
+                "case: {name}: {redacted:?}"
+            );
+        }
+
+        assert_eq!(
+            redact_absolute_paths("see `src/main.rs` for detail"),
+            "see `src/main.rs` for detail"
+        );
     }
 
     #[test]
