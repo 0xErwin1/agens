@@ -4,6 +4,7 @@
 use std::sync::Mutex;
 
 use agens_core::{FactIdentity, ToolResultFacts, TurnEvent};
+use agens_diagnostics::best_effort;
 use agens_store::ToolFactStore;
 
 use agens_session::turns::sanitize_subagent_summary;
@@ -93,12 +94,12 @@ pub fn record_tool_result_fact(
     };
 
     if let Ok(mut store) = store.lock() {
-        let _ = store.record(
+        best_effort(store.record(
             session_id,
             attempt_id,
             identity.sequence,
             &identity.tool_call_id,
             facts,
-        );
+        ));
     }
 }
