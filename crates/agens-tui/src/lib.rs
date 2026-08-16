@@ -11939,6 +11939,14 @@ impl FrameSchedule {
     }
 }
 
+/// Drives one pass of the render-skip gate.
+///
+/// A live turn or subagent forces a full frame: spinner and elapsed counters
+/// have to move. The settled-turn cache already avoids rebuilding frozen
+/// conversations, but the frame still walks the window and runs the buffer
+/// post-passes (selection paint, OSC 8, colour quantize). Those passes have
+/// no region they can legally skip, so a spinner tick cannot be a one-glyph
+/// update without a second renderer. That cost is structural.
 fn render_progress_frame<E, R>(
     tui: &mut Tui<E>,
     renderer: &mut R,
