@@ -142,7 +142,7 @@ fn encode_message(
                 let mut tool_message = json!({
                     "role": "tool",
                     "tool_call_id": tool_call_id,
-                    "content": content,
+                    "content": crate::model_visible_tool_output(content),
                 });
 
                 if let Some(name) = tool_names.get(tool_call_id) {
@@ -585,6 +585,38 @@ mod tests {
         assert_eq!(encoded[2]["content"], json!("sunny"));
         assert_eq!(encoded[3]["tool_call_id"], json!("call_1"));
         assert_eq!(encoded[3]["name"], json!("get_weather"));
+    }
+
+    #[test]
+    fn a_long_tool_result_keeps_the_tail_like_the_other_dialects() {
+        let noisy_stdout = "line of build output\n".repeat(600);
+        let content =
+            format!("[stdout]\n{noisy_stdout}[stderr]\nreal error here\n[exit status: 2]\n");
+        let messages = [
+            Message {
+                role: Role::Assistant,
+                parts: vec![MessagePart::ToolCall {
+                    id: "call_0".to_owned(),
+                    name: "get_weather".to_owned(),
+                    input: "{}".to_owned(),
+                }],
+            },
+            Message {
+                role: Role::Tool,
+                parts: vec![MessagePart::ToolResult {
+                    tool_call_id: "call_0".to_owned(),
+                    content,
+                    is_error: true,
+                }],
+            },
+        ];
+
+        let encoded = encode_messages(&messages, &empty_media()).expect("encode");
+        let sent = encoded[1]["content"].as_str().expect("tool content");
+
+        assert!(sent.contains("[truncated:"), "{sent}");
+        assert!(sent.contains("real error here"), "{sent}");
+        assert!(sent.contains("[exit status: 2]"), "{sent}");
     }
 
     #[test]

@@ -13,6 +13,7 @@ use std::time::{Duration, SystemTime};
 mod moonshot;
 pub use moonshot::MoonshotProvider;
 
+use agens_core::redaction::bounded_detail;
 use agens_core::{
     Error, HeadlessTurnCancellation, HeadlessTurnPortError, Message, MessagePart, RequestConfig,
     Role, TurnEvent, TurnProgressSink, TurnProvider, Usage,
@@ -47,7 +48,7 @@ pub const FIRST_RESPONSE_BYTE_TIMEOUT: Duration = Duration::from_secs(90);
 /// plausible model output; a session with many MCP servers exceeds 128 KiB.
 const MAX_SSE_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_CHATGPT_ERROR_BODY_BYTES: usize = 8 * 1024;
-const MAX_TOOL_OUTPUT_BYTES: usize = 8 * 1024;
+const MAX_TOOL_OUTPUT_CHARS: usize = 8 * 1024;
 /// Items one request may replay.
 ///
 /// The byte budgets below are what actually protect the request; this bounds
@@ -148,8 +149,6 @@ pub struct ChatGptResponsesProvider {
 pub struct ProviderFailureDetail(Arc<Mutex<Option<String>>>);
 
 const MAX_PROVIDER_FAILURE_DETAIL_CHARS: usize = 8 * 1024;
-const PROVIDER_FAILURE_DETAIL_TRUNCATION_MARKER: &str =
-    "\n[truncated: only the first 8192 characters of this provider failure detail were captured]";
 
 impl ProviderFailureDetail {
     pub fn new() -> Self {
@@ -181,15 +180,7 @@ impl ProviderFailureDetail {
 }
 
 fn bound_provider_failure_detail(value: &str) -> String {
-    if value.chars().count() <= MAX_PROVIDER_FAILURE_DETAIL_CHARS {
-        return value.to_owned();
-    }
-    let mut bounded: String = value
-        .chars()
-        .take(MAX_PROVIDER_FAILURE_DETAIL_CHARS)
-        .collect();
-    bounded.push_str(PROVIDER_FAILURE_DETAIL_TRUNCATION_MARKER);
-    bounded
+    bounded_detail(value, MAX_PROVIDER_FAILURE_DETAIL_CHARS)
 }
 
 pub type ProviderDiagnosticSink = Arc<dyn Fn(ProviderDiagnosticEvent) + Send + Sync>;
@@ -2321,16 +2312,7 @@ fn validate_chatgpt_replay_history(history: &[Value]) -> Result<(), ()> {
 }
 
 fn bounded_tool_output(content: &str) -> String {
-    if content.len() <= MAX_TOOL_OUTPUT_BYTES {
-        return content.to_owned();
-    }
-
-    let mut end = MAX_TOOL_OUTPUT_BYTES;
-    while !content.is_char_boundary(end) {
-        end -= 1;
-    }
-
-    content[..end].to_owned()
+    bounded_detail(content, MAX_TOOL_OUTPUT_CHARS)
 }
 
 /// Classifies a failed body read while a response stream is still open.
@@ -3797,6 +3779,21 @@ mod tests {
     }
 
     #[test]
+    fn provider_failure_detail_keeps_a_later_record() {
+        let detail = ProviderFailureDetail::new();
+
+        detail.record(&"H".repeat(9_000));
+        detail.record("TAIL-SPECIFIC");
+
+        let captured = detail.take().expect("combined detail should be recorded");
+        assert!(
+            captured.contains("TAIL-SPECIFIC"),
+            "later record must survive the bound: {captured}"
+        );
+        assert!(captured.contains("[truncated:"), "{captured}");
+    }
+
+    #[test]
     fn provider_failure_detail_bounds_long_text_with_a_visible_marker() {
         let detail = ProviderFailureDetail::new();
         let long = "a".repeat(MAX_PROVIDER_FAILURE_DETAIL_CHARS + 500);
@@ -3805,12 +3802,8 @@ mod tests {
 
         let captured = detail.take().expect("bounded text should be recorded");
         assert!(captured.starts_with(&"a".repeat(64)));
-        assert!(captured.ends_with(PROVIDER_FAILURE_DETAIL_TRUNCATION_MARKER));
-        assert_eq!(
-            captured.chars().count(),
-            MAX_PROVIDER_FAILURE_DETAIL_CHARS
-                + PROVIDER_FAILURE_DETAIL_TRUNCATION_MARKER.chars().count()
-        );
+        assert!(captured.contains("[truncated:"));
+        assert!(captured.ends_with('a'));
     }
 
     #[test]
@@ -4209,13 +4202,33 @@ mod tests {
     }
 
     #[test]
+    fn bounded_tool_output_keeps_stderr_and_exit_status() {
+        let noisy_stdout = "line of build output\n".repeat(600);
+        let content =
+            format!("[stdout]\n{noisy_stdout}[stderr]\nreal error here\n[exit status: 2]\n");
+        assert!(content.chars().count() > MAX_TOOL_OUTPUT_CHARS);
+
+        let bounded = bounded_tool_output(&content);
+
+        assert!(bounded.chars().count() < content.chars().count());
+        assert!(bounded.contains("[truncated:"));
+        assert!(bounded.contains("real error here"));
+        assert!(bounded.contains("[exit status: 2]"));
+    }
+
+    #[test]
     fn provider_tool_and_replay_caps_count_utf8_bytes() {
-        let bounded = bounded_tool_output(&"€".repeat(MAX_TOOL_OUTPUT_BYTES));
+        let bounded = bounded_tool_output(&"€".repeat(MAX_TOOL_OUTPUT_CHARS + 100));
+        assert!(bounded.contains("[truncated:"));
+        assert!(bounded.starts_with('€'));
+        assert!(bounded.ends_with('€'));
         assert_eq!(
-            bounded.len(),
-            MAX_TOOL_OUTPUT_BYTES - (MAX_TOOL_OUTPUT_BYTES % 3)
+            bounded
+                .chars()
+                .filter(|&character| character == '€')
+                .count(),
+            MAX_TOOL_OUTPUT_CHARS
         );
-        assert!(bounded.is_char_boundary(bounded.len()));
 
         let exact = serde_json::json!({
             "type": "function_call_output",
