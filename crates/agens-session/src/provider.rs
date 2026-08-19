@@ -20,7 +20,7 @@ use agens_providers::{ChatGptAuthState, load_chatgpt_auth_state};
 
 use agens_bootstrap::provider_api_key;
 use agens_error::CliError;
-use agens_models::ModelSource;
+use agens_models::{ModelSource, QualifiedModel};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProviderKind {
@@ -71,6 +71,148 @@ impl ProviderKind {
         Self::ALL
             .into_iter()
             .find(|provider| provider.identifier() == value)
+    }
+
+    pub fn for_source(source: ModelSource) -> Self {
+        match source {
+            ModelSource::OpenAiApi => Self::OpenAiApi,
+            ModelSource::ChatGptSubscription => Self::OpenAiChatGpt,
+            ModelSource::MoonshotApi => Self::Moonshot,
+        }
+    }
+}
+
+/// A model identifier resolved to the provider that will serve it, and the
+/// bare identifier that provider's API accepts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedProvider {
+    pub provider: ProviderKind,
+    pub model: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProviderResolutionError {
+    /// Several authenticated providers serve this identifier, so nothing in it
+    /// says where the request goes.
+    Ambiguous {
+        model: String,
+        candidates: Vec<ProviderKind>,
+    },
+    /// No model was named and more than one provider could answer.
+    AmbiguousDefault {
+        candidates: Vec<ProviderKind>,
+    },
+    /// The provider that serves this model has no usable credentials.
+    Unauthenticated(ProviderKind),
+    UnknownModel(String),
+    NoProvider,
+}
+
+impl ProviderResolutionError {
+    pub fn message(&self) -> String {
+        match self {
+            Self::Ambiguous { model, candidates } => format!(
+                "model \"{model}\" is served by {}; qualify it as \"{}/{model}\"",
+                names(candidates),
+                candidates
+                    .first()
+                    .map_or("provider", |provider| provider.identifier())
+            ),
+            Self::AmbiguousDefault { candidates } => format!(
+                "no model is configured and {} are authenticated; name one as \"provider/model\"",
+                names(candidates)
+            ),
+            Self::Unauthenticated(provider) => format!(
+                "provider \"{}\" serves this model but has no usable credentials",
+                provider.identifier()
+            ),
+            Self::UnknownModel(model) => {
+                format!("model \"{model}\" is not served by any known provider")
+            }
+            Self::NoProvider => "no provider has usable credentials".to_owned(),
+        }
+    }
+}
+
+fn names(candidates: &[ProviderKind]) -> String {
+    candidates
+        .iter()
+        .map(|provider| format!("\"{}\"", provider.identifier()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Resolves which provider serves a model, from the identifier alone.
+///
+/// A `provider/model` prefix is the whole answer. A bare identifier resolves
+/// only when exactly one authenticated provider serves it: with two reachable
+/// providers offering the same name, picking one would send the request, and
+/// its spend, somewhere the user never named.
+pub fn resolve_provider_for_model(
+    model: Option<&str>,
+    credentials: &Path,
+    resolver: &CredentialResolver,
+) -> Result<ResolvedProvider, ProviderResolutionError> {
+    let authenticated = |provider: ProviderKind| resolver.status(credentials, provider).available();
+
+    let Some(model) = model else {
+        let candidates: Vec<ProviderKind> = ModelSource::ALL
+            .into_iter()
+            .map(ProviderKind::for_source)
+            .filter(|provider| authenticated(*provider))
+            .collect();
+
+        return match candidates.as_slice() {
+            [] => Err(ProviderResolutionError::NoProvider),
+            [only] => Ok(ResolvedProvider {
+                provider: *only,
+                model: only.default_model().to_owned(),
+            }),
+            _ => Err(ProviderResolutionError::AmbiguousDefault { candidates }),
+        };
+    };
+
+    let parsed = QualifiedModel::parse(model)
+        .map_err(|_| ProviderResolutionError::UnknownModel(model.to_owned()))?;
+    let serving: Vec<ProviderKind> = agens_models::sources_serving(parsed.model())
+        .into_iter()
+        .map(ProviderKind::for_source)
+        .collect();
+
+    if let Some(named) = parsed.source().map(ProviderKind::for_source) {
+        if !serving.contains(&named) {
+            return Err(ProviderResolutionError::UnknownModel(
+                parsed.model().to_owned(),
+            ));
+        }
+
+        return authenticated(named)
+            .then(|| ResolvedProvider {
+                provider: named,
+                model: parsed.model().to_owned(),
+            })
+            .ok_or(ProviderResolutionError::Unauthenticated(named));
+    }
+
+    let candidates: Vec<ProviderKind> = serving
+        .iter()
+        .copied()
+        .filter(|provider| authenticated(*provider))
+        .collect();
+
+    match (candidates.as_slice(), serving.as_slice()) {
+        ([only], _) => Ok(ResolvedProvider {
+            provider: *only,
+            model: parsed.model().to_owned(),
+        }),
+        ([], []) => Err(ProviderResolutionError::UnknownModel(
+            parsed.model().to_owned(),
+        )),
+        ([], [unreachable, ..]) => Err(ProviderResolutionError::Unauthenticated(*unreachable)),
+        _ => Err(ProviderResolutionError::Ambiguous {
+            model: parsed.model().to_owned(),
+            candidates,
+        }),
     }
 }
 
