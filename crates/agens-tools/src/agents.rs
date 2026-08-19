@@ -13,10 +13,39 @@ use crate::markdown::{self, FrontmatterValue, MarkdownDocument};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentModelValidationError {
     Unavailable,
+    /// The model is real, but only under a provider this session is not using.
+    /// Kept distinct from [`Self::Unavailable`] because the two need opposite
+    /// corrections: one is a typo, the other is a provider selection.
+    ProviderMismatch {
+        requested: &'static str,
+        active: &'static str,
+    },
+}
+
+impl AgentModelValidationError {
+    /// The user-facing explanation, naming the model and — for a mismatch —
+    /// both providers, since the same failure otherwise reads identically
+    /// whether the model does not exist or merely lives elsewhere.
+    pub fn message(self, model: &str) -> String {
+        match self {
+            Self::Unavailable => format!("agent model \"{model}\" is unavailable"),
+            Self::ProviderMismatch { requested, active } => format!(
+                "agent model \"{model}\" is served by provider \"{requested}\", not by this session's \"{active}\""
+            ),
+        }
+    }
 }
 
 pub trait AgentModelValidator {
     fn validate_model(&self, model: &str) -> Result<(), AgentModelValidationError>;
+}
+
+/// The diagnostic an unusable model produces, or `None` when it validates.
+fn model_rejection_message(model: &str, validator: &dyn AgentModelValidator) -> Option<String> {
+    validator
+        .validate_model(model)
+        .err()
+        .map(|error| error.message(model))
 }
 
 struct AllowAllModels;
@@ -173,14 +202,14 @@ fn load_built_ins(
                 .push(diagnostic(source, "invalid or duplicate built-in agent"));
             continue;
         }
-        if agent
+        if let Some(message) = agent
             .model
             .as_deref()
-            .is_some_and(|model| validator.validate_model(model).is_err())
+            .and_then(|model| model_rejection_message(model, validator))
         {
             discovery
                 .diagnostics
-                .push(diagnostic(source.clone(), "agent model is unavailable"));
+                .push(diagnostic(source.clone(), message));
         }
         for message in permission_diagnostics(agent) {
             discovery
@@ -236,15 +265,14 @@ fn load_root(
                     continue;
                 }
                 accepted += 1;
-                if agent
+                if let Some(message) = agent
                     .model
                     .as_deref()
-                    .is_some_and(|model| validator.validate_model(model).is_err())
+                    .and_then(|model| model_rejection_message(model, validator))
                 {
-                    discovery.diagnostics.push(diagnostic(
-                        document.source().into(),
-                        "agent model is unavailable",
-                    ));
+                    discovery
+                        .diagnostics
+                        .push(diagnostic(document.source().into(), message));
                 }
                 for message in permission_diagnostics(&agent) {
                     discovery

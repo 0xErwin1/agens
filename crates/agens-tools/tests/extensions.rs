@@ -544,7 +544,7 @@ fn catalog_preserves_models_rejected_by_the_tools_owned_validator() {
     );
     assert_eq!(
         discovery.diagnostics()[0].message(),
-        "agent model is unavailable"
+        "agent model \"unsupported\" is unavailable"
     );
 }
 

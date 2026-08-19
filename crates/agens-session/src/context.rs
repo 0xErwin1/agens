@@ -7,7 +7,9 @@
 
 use agens_core::{AgentDefinition, Message, SessionMetadata};
 use agens_store::SessionStore;
-use agens_tools::{AgentModelValidator, EffectiveCapabilitySet, ToolDispatcher};
+use agens_tools::{
+    AgentModelValidationError, AgentModelValidator, EffectiveCapabilitySet, ToolDispatcher,
+};
 
 use crate::provider::ProviderKind;
 use agens_models::ModelSelection;
@@ -121,18 +123,21 @@ impl ActiveAgentRuntime {
         dispatcher: &ToolDispatcher,
         validator: &dyn AgentModelValidator,
     ) -> Result<Self, AgentRotationError> {
-        if agent
+        if let Some((model, error)) = agent
             .model
             .as_deref()
-            .is_some_and(|model| validator.validate_model(model).is_err())
+            .and_then(|model| Some((model, validator.validate_model(model).err()?)))
         {
-            return Err(AgentRotationError::ModelUnavailable);
+            return Err(AgentRotationError::ModelUnavailable {
+                model: model.to_owned(),
+                error,
+            });
         }
         let model = agent
             .model
             .as_deref()
-            .or(inherited_model)
-            .map(str::to_owned);
+            .map(bare_model_identifier)
+            .or_else(|| inherited_model.map(str::to_owned));
         Ok(Self {
             name: agent.name.clone(),
             model,
@@ -174,10 +179,23 @@ pub fn reset_session(context: &mut SessionContext) -> Result<(), SessionMutation
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The identifier a provider's API accepts, with any `provider/` prefix
+/// removed. An unparseable value is returned untouched so it fails where it
+/// already did.
+fn bare_model_identifier(model: &str) -> String {
+    agens_models::QualifiedModel::parse(model)
+        .map_or_else(|_| model.to_owned(), |parsed| parsed.model().to_owned())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AgentRotationError {
     Busy,
-    ModelUnavailable,
+    /// Carries the identifier and the validator's verdict so the rotation
+    /// failure explains itself the same way a startup failure does.
+    ModelUnavailable {
+        model: String,
+        error: AgentModelValidationError,
+    },
     Persistence,
 }
 pub fn rotate_active_agent(

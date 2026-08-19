@@ -17,7 +17,7 @@ use agens_session::context::SessionContext;
 use agens_session::context::current_session_timestamp;
 use agens_session::model::{effective_model, model_source};
 use agens_store::SessionStore;
-use agens_tools::{AgentCatalog, AgentModelValidator};
+use agens_tools::{AgentCatalog, AgentModelValidationError, AgentModelValidator};
 
 use crate::catalog::{agent_catalog, agent_rotation_error, task_agent_catalog};
 use crate::models::AgentModelCompatibility;
@@ -29,9 +29,14 @@ pub struct PersistedAgentResolution {
     fallback_from: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PersistedAgentResolutionError {
-    Model,
+    /// Carries the identifier and the validator's verdict, so the message can
+    /// tell a typo apart from a model that lives under another provider.
+    Model {
+        model: String,
+        error: AgentModelValidationError,
+    },
     Agent,
     Primary,
 }
@@ -43,11 +48,11 @@ pub fn resolve_persisted_active_agent(
     validator: &dyn AgentModelValidator,
 ) -> Result<PersistedAgentResolution, PersistedAgentResolutionError> {
     let unvalidated = unvalidated_catalog.agent(name);
-    if unvalidated
+    if let Some(error) = unvalidated
         .and_then(|agent| agent.model.as_deref())
-        .is_some_and(|model| validator.validate_model(model).is_err())
+        .and_then(|model| rejected_model(model, validator))
     {
-        return Err(PersistedAgentResolutionError::Model);
+        return Err(error);
     }
     if let Some(agent) = catalog
         .agent(name)
@@ -71,12 +76,12 @@ pub fn resolve_persisted_active_agent(
     if unvalidated_primary.mode == agens_core::AgentMode::Subagent {
         return Err(PersistedAgentResolutionError::Primary);
     }
-    if unvalidated_primary
+    if let Some(error) = unvalidated_primary
         .model
         .as_deref()
-        .is_some_and(|model| validator.validate_model(model).is_err())
+        .and_then(|model| rejected_model(model, validator))
     {
-        return Err(PersistedAgentResolutionError::Model);
+        return Err(error);
     }
     let primary = catalog
         .agent("primary")
@@ -88,10 +93,25 @@ pub fn resolve_persisted_active_agent(
     })
 }
 
+/// The rejection an unusable model produces, or `None` when the validator
+/// accepts it.
+fn rejected_model(
+    model: &str,
+    validator: &dyn AgentModelValidator,
+) -> Option<PersistedAgentResolutionError> {
+    validator
+        .validate_model(model)
+        .err()
+        .map(|error| PersistedAgentResolutionError::Model {
+            model: model.to_owned(),
+            error,
+        })
+}
+
 pub fn persisted_agent_resolution_error(error: PersistedAgentResolutionError) -> CliError {
     match error {
-        PersistedAgentResolutionError::Model => {
-            CliError::configuration("agent model is unavailable")
+        PersistedAgentResolutionError::Model { model, error } => {
+            CliError::configuration(error.message(&model))
         }
         PersistedAgentResolutionError::Agent => {
             CliError::configuration("active agent is unavailable")
@@ -190,18 +210,23 @@ fn apply_configured_agent_profile(
     if profile.model.origin != ProfileOrigin::SessionInherited {
         validator
             .validate_model(&profile.model.value)
-            .map_err(|_| CliError::configuration("agent model is unavailable"))?;
+            .map_err(|error| CliError::configuration(error.message(&profile.model.value)))?;
     }
 
+    let requested = bare_model_identifier(&profile.model.value);
     let mut selection =
         agens_models::ModelSelection::for_source(&session_model, model_source(bootstrap, context));
-    if selection.apply_model(&profile.model.value).is_err() {
+    if selection.apply_model(&requested).is_err() {
         if profile.model.origin == ProfileOrigin::SessionInherited {
-            selection
-                .apply_unverified_model(&profile.model.value)
-                .map_err(|_| CliError::configuration("agent model is unavailable"))?;
+            selection.apply_unverified_model(&requested).map_err(|_| {
+                CliError::configuration(
+                    AgentModelValidationError::Unavailable.message(&profile.model.value),
+                )
+            })?;
         } else {
-            return Err(CliError::configuration("agent model is unavailable"));
+            return Err(CliError::configuration(
+                AgentModelValidationError::Unavailable.message(&profile.model.value),
+            ));
         }
     }
     if let Some(effort) = profile.effort.value {
@@ -210,10 +235,18 @@ fn apply_configured_agent_profile(
             .map_err(|_| CliError::configuration("agent reasoning effort is unavailable"))?;
     }
 
-    agent.model = Some(profile.model.value);
+    agent.model = Some(requested);
     agent.reasoning_effort = profile.effort.value;
     context.selection = Some(selection);
     Ok(agent)
+}
+
+/// The identifier a provider's API accepts, with any `provider/` prefix
+/// removed. An unparseable value is returned untouched so it fails where it
+/// already did, with the message that names it.
+fn bare_model_identifier(model: &str) -> String {
+    agens_models::QualifiedModel::parse(model)
+        .map_or_else(|_| model.to_owned(), |parsed| parsed.model().to_owned())
 }
 
 fn parse_reasoning_effort(value: &str) -> Option<ReasoningEffort> {

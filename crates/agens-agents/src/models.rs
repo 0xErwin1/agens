@@ -8,15 +8,16 @@ use std::sync::Arc;
 
 use agens_bootstrap::Bootstrap;
 use agens_error::CliError;
-use agens_models::{ModelSelection, ModelSource};
+use agens_models::{ModelSelection, ModelSource, QualifiedModel};
 use agens_models::{default_model, unknown_provider_message};
 use agens_session::context::SessionContext;
 use agens_session::model::model_source;
 use agens_session::provider::ProviderKind;
-use agens_tools::AgentModelValidator;
+use agens_tools::{AgentModelValidationError, AgentModelValidator};
 
 #[derive(Clone)]
 pub struct AgentModelCompatibility {
+    source: ModelSource,
     available: Arc<BTreeSet<String>>,
 }
 
@@ -28,6 +29,7 @@ impl AgentModelCompatibility {
             .into_iter()
             .collect();
         Ok(Self {
+            source,
             available: Arc::new(available),
         })
     }
@@ -37,15 +39,49 @@ impl AgentModelCompatibility {
     }
 
     pub fn is_available(&self, model: &str) -> bool {
-        self.available.contains(model)
+        self.validate_model(model).is_ok()
+    }
+
+    /// The provider that would serve `model` if this session were using it, or
+    /// `None` when no bundled catalog lists it at all.
+    fn served_elsewhere(&self, model: &str) -> Option<ModelSource> {
+        agens_models::sources_serving(model)
+            .into_iter()
+            .find(|source| *source != self.source)
+    }
+
+    fn mismatch(&self, requested: ModelSource) -> AgentModelValidationError {
+        AgentModelValidationError::ProviderMismatch {
+            requested: requested.provider_type(),
+            active: self.source.provider_type(),
+        }
     }
 }
 
 impl AgentModelValidator for AgentModelCompatibility {
-    fn validate_model(&self, model: &str) -> Result<(), agens_tools::AgentModelValidationError> {
-        self.is_available(model)
-            .then_some(())
-            .ok_or(agens_tools::AgentModelValidationError::Unavailable)
+    /// Accepts a bare identifier against the session's own provider, and a
+    /// `provider/model` identifier only against the provider it names.
+    fn validate_model(&self, model: &str) -> Result<(), AgentModelValidationError> {
+        let Ok(parsed) = QualifiedModel::parse(model) else {
+            return Err(AgentModelValidationError::Unavailable);
+        };
+
+        if let Some(requested) = parsed.source().filter(|source| *source != self.source) {
+            return Err(if parsed.is_available() {
+                self.mismatch(requested)
+            } else {
+                AgentModelValidationError::Unavailable
+            });
+        }
+
+        if self.available.contains(parsed.model()) {
+            return Ok(());
+        }
+
+        Err(match self.served_elsewhere(parsed.model()) {
+            Some(requested) => self.mismatch(requested),
+            None => AgentModelValidationError::Unavailable,
+        })
     }
 }
 

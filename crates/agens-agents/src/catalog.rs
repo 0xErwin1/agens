@@ -175,8 +175,8 @@ fn explore_permission_rules() -> Vec<PermissionRule> {
 pub fn agent_rotation_error(error: AgentRotationError) -> CliError {
     match error {
         AgentRotationError::Busy => CliError::runtime(HeadlessTurnError::State),
-        AgentRotationError::ModelUnavailable => {
-            CliError::configuration("agent model is unavailable")
+        AgentRotationError::ModelUnavailable { model, error } => {
+            CliError::configuration(error.message(&model))
         }
         AgentRotationError::Persistence => CliError::storage("active agent could not be saved"),
     }

@@ -1580,6 +1580,56 @@ mod tests {
         std::fs::remove_dir_all(temporary).unwrap();
     }
 
+    /// A provider-qualified identifier names the provider the session already
+    /// speaks to, so it resolves; what reaches the request is the bare model
+    /// identifier the provider's API accepts.
+    #[test]
+    fn a_provider_qualified_agent_model_resolves_to_its_bare_identifier() {
+        let temporary = tui_session_directory("qualified-model");
+        let bootstrap = tui_session_bootstrap_for_provider(
+            &temporary,
+            &[(
+                "primary",
+                "---\nname: primary\ndescription: primary\nmode: primary\nmodel: moonshotai/kimi-k3\npermissions: []\n---\nWork.\n",
+            )],
+            "moonshotai",
+            "kimi-k3",
+        );
+        let mut store = SessionStore::open(bootstrap.data_directory()).unwrap();
+        let metadata = persist_tui_session_metadata(
+            &mut store,
+            &tui_project(&temporary),
+            "qualified",
+            "primary",
+            100,
+        );
+        drop(store);
+
+        let resumed = resume_tui_session(
+            &bootstrap,
+            metadata.id,
+            &SkillCatalog::default(),
+            &CredentialResolver::production(),
+        )
+        .unwrap()
+        .context;
+
+        assert_eq!(
+            resumed
+                .selection
+                .as_ref()
+                .expect("a qualified model still selects one")
+                .model(),
+            "kimi-k3"
+        );
+        assert_eq!(
+            apply_session_to_request(&resumed, bare_headless_request()).model,
+            Some("kimi-k3".to_owned())
+        );
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
     #[test]
     fn explicit_unavailable_agent_model_and_ineligible_primary_are_hard_errors() {
         for (case, definition, active_agent, expected) in [
@@ -1587,7 +1637,19 @@ mod tests {
                 "explicit-model",
                 "---\nname: reviewer\ndescription: reviewer\nmode: primary\nmodel: gpt-4o\npermissions: []\n---\nReview.\n",
                 "reviewer",
-                "agent model is unavailable",
+                "agent model \"gpt-4o\" is served by provider \"openai-api\", not by this session's \"openai-chatgpt\"",
+            ),
+            (
+                "other-provider-model",
+                "---\nname: reviewer\ndescription: reviewer\nmode: primary\nmodel: kimi-k3\npermissions: []\n---\nReview.\n",
+                "reviewer",
+                "agent model \"kimi-k3\" is served by provider \"moonshotai\", not by this session's \"openai-chatgpt\"",
+            ),
+            (
+                "unknown-model",
+                "---\nname: reviewer\ndescription: reviewer\nmode: primary\nmodel: no-such-model\npermissions: []\n---\nReview.\n",
+                "reviewer",
+                "agent model \"no-such-model\" is unavailable",
             ),
             (
                 "ineligible-primary",
