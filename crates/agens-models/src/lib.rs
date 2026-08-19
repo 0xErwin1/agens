@@ -1,3 +1,5 @@
+use std::fmt;
+
 use agens_core::{ReasoningEffort, RequestConfig};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -158,6 +160,28 @@ pub enum ModelSource {
 }
 
 impl ModelSource {
+    pub const ALL: [Self; 3] = [
+        Self::OpenAiApi,
+        Self::ChatGptSubscription,
+        Self::MoonshotApi,
+    ];
+
+    /// The `provider.type` value that selects this source, and the prefix a
+    /// [`QualifiedModel`] names it by.
+    pub const fn provider_type(self) -> &'static str {
+        match self {
+            Self::OpenAiApi => "openai-api",
+            Self::ChatGptSubscription => "openai-chatgpt",
+            Self::MoonshotApi => "moonshotai",
+        }
+    }
+
+    pub fn from_provider_type(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|source| source.provider_type() == value)
+    }
+
     pub const fn label(self) -> &'static str {
         match self {
             Self::OpenAiApi => "OpenAI API",
@@ -175,6 +199,92 @@ impl ModelSource {
             Self::OpenAiApi => "openai-api",
             Self::ChatGptSubscription => "chatgpt-subscription",
             Self::MoonshotApi => "moonshot-api",
+        }
+    }
+}
+
+/// A model identifier that may name the provider it belongs to.
+///
+/// Two authenticated providers can serve overlapping identifiers, so a bare
+/// `gpt-5.5` does not say whether the request goes to the OpenAI API or to the
+/// ChatGPT subscription. Writing `openai-chatgpt/gpt-5.5` says it. A bare
+/// identifier keeps its existing meaning: whichever provider the session
+/// resolved.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QualifiedModel {
+    source: Option<ModelSource>,
+    model: String,
+}
+
+impl QualifiedModel {
+    /// Parses `provider/model` or a bare `model`.
+    ///
+    /// An unrecognized prefix is an error rather than a model identifier that
+    /// happens to contain a slash. Reading it as a bare identifier would defer
+    /// the mistake to an "unavailable model" message that names neither the
+    /// provider the user meant nor the one the session used.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        let value = value.trim();
+        if let Some((prefix, model)) = value.split_once('/') {
+            let source = ModelSource::from_provider_type(prefix).ok_or_else(|| {
+                format!(
+                    "provider \"{prefix}\" is not supported; valid values are {}",
+                    KNOWN_PROVIDER_TYPES.join(", ")
+                )
+            })?;
+            return Self::checked(Some(source), model);
+        }
+
+        Self::checked(None, value)
+    }
+
+    fn checked(source: Option<ModelSource>, model: &str) -> Result<Self, String> {
+        if !valid_model_id(model) {
+            return Err(format!("model identifier \"{model}\" is invalid"));
+        }
+
+        Ok(Self {
+            source,
+            model: model.to_owned(),
+        })
+    }
+
+    pub const fn source(&self) -> Option<ModelSource> {
+        self.source
+    }
+
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    /// Whether the named source lists this model. A bare identifier has no
+    /// source to resolve against and is reported as unavailable here; the
+    /// caller that knows the session's source validates it instead.
+    pub fn is_available(&self) -> bool {
+        self.source
+            .is_some_and(|source| sources_serving(&self.model).contains(&source))
+    }
+}
+
+/// Every source whose bundled catalog lists this model identifier.
+///
+/// More than one can, which is the reason a bare identifier is ambiguous:
+/// both OpenAI dialects serve overlapping `gpt-*` names.
+pub fn sources_serving(model: &str) -> Vec<ModelSource> {
+    ModelSource::ALL
+        .into_iter()
+        .filter(|source| {
+            source_models(*source)
+                .is_ok_and(|models| models.iter().any(|candidate| candidate.id == model))
+        })
+        .collect()
+}
+
+impl fmt::Display for QualifiedModel {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.source {
+            Some(source) => write!(formatter, "{}/{}", source.provider_type(), self.model),
+            None => formatter.write_str(&self.model),
         }
     }
 }
@@ -997,5 +1107,94 @@ mod tests {
             crate::accepts_input_mime("gpt-5.5", "image/png"),
             Some(true)
         );
+    }
+
+    #[test]
+    fn every_model_source_round_trips_through_its_provider_type() {
+        for source in crate::ModelSource::ALL {
+            assert_eq!(
+                crate::ModelSource::from_provider_type(source.provider_type()),
+                Some(source)
+            );
+        }
+    }
+
+    #[test]
+    fn known_provider_types_name_exactly_the_model_sources() {
+        let mut from_sources: Vec<&str> = crate::ModelSource::ALL
+            .into_iter()
+            .map(crate::ModelSource::provider_type)
+            .collect();
+        from_sources.sort_unstable();
+
+        let mut known = crate::KNOWN_PROVIDER_TYPES.to_vec();
+        known.sort_unstable();
+
+        assert_eq!(from_sources, known);
+    }
+
+    #[test]
+    fn a_bare_model_identifier_parses_without_a_provider() {
+        let parsed = crate::QualifiedModel::parse("kimi-k3").expect("a bare identifier parses");
+
+        assert_eq!(parsed.source(), None);
+        assert_eq!(parsed.model(), "kimi-k3");
+        assert_eq!(parsed.to_string(), "kimi-k3");
+    }
+
+    #[test]
+    fn a_qualified_model_identifier_carries_its_source() {
+        let parsed = crate::QualifiedModel::parse("moonshotai/kimi-k3")
+            .expect("a qualified identifier parses");
+
+        assert_eq!(parsed.source(), Some(crate::ModelSource::MoonshotApi));
+        assert_eq!(parsed.model(), "kimi-k3");
+        assert_eq!(parsed.to_string(), "moonshotai/kimi-k3");
+    }
+
+    #[test]
+    fn both_openai_dialects_qualify_the_same_model_identifier() {
+        let api = crate::QualifiedModel::parse("openai-api/gpt-5.5").expect("api form parses");
+        let subscription = crate::QualifiedModel::parse("openai-chatgpt/gpt-5.5")
+            .expect("subscription form parses");
+
+        assert_eq!(api.model(), subscription.model());
+        assert_ne!(api.source(), subscription.source());
+    }
+
+    /// An unrecognized prefix is rejected rather than read as a model identifier
+    /// that happens to contain a slash: guessing here reproduces the opaque
+    /// "model is unavailable" this syntax exists to replace.
+    #[test]
+    fn an_unrecognized_provider_prefix_is_rejected_by_name() {
+        let error =
+            crate::QualifiedModel::parse("openai/gpt-5.5").expect_err("the prefix is unknown");
+
+        assert!(error.contains("openai"), "{error}");
+        assert!(error.contains("moonshotai"), "{error}");
+    }
+
+    #[test]
+    fn a_qualified_identifier_without_a_model_is_rejected() {
+        crate::QualifiedModel::parse("moonshotai/").expect_err("the model half is empty");
+    }
+
+    #[test]
+    fn an_invalid_model_identifier_is_rejected() {
+        crate::QualifiedModel::parse("kimi k3").expect_err("a space is not a model identifier");
+        crate::QualifiedModel::parse("").expect_err("an empty identifier is rejected");
+    }
+
+    #[test]
+    fn a_qualified_model_resolves_against_the_source_it_names() {
+        let parsed = crate::QualifiedModel::parse("moonshotai/kimi-k3")
+            .expect("a qualified identifier parses");
+
+        assert!(parsed.is_available());
+
+        let absent = crate::QualifiedModel::parse("openai-chatgpt/kimi-k3")
+            .expect("a qualified identifier parses");
+
+        assert!(!absent.is_available());
     }
 }
