@@ -42,7 +42,7 @@ pub use agens_fixtures::{
     session_bootstrap as tui_session_bootstrap,
     session_bootstrap_for_provider as tui_session_bootstrap_for_provider,
     session_bootstrap_without_provider as tui_session_bootstrap_without_provider,
-    session_directory as tui_session_directory, wait_for,
+    session_directory as tui_session_directory, try_bootstrap_from_configuration, wait_for,
 };
 
 /// A native tool that records every path it acts on into a shared log and can

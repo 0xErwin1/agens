@@ -263,8 +263,13 @@ pub fn resolve(host: &HostEnvironment) -> Result<Bootstrap, CliError> {
         .as_deref()
         .and_then(|provider| provider_api_key(provider, credentials.as_deref(), &environment));
 
+    let model = settings
+        .text("provider.model")
+        .map(|model| resolve_configured_model(model, provider_type.as_deref()))
+        .transpose()?;
+
     Ok(Bootstrap {
-        model: settings.text("provider.model").map(ToOwned::to_owned),
+        model,
         provider_type,
         provider_source,
         max_iterations: settings
@@ -462,6 +467,28 @@ pub fn resolve_provider_type(
     }
 
     Ok(sniff_provider_type(credentials, environment))
+}
+
+/// Reduces `provider.model` to the identifier a provider's API accepts.
+///
+/// A `provider/model` value that names the configured provider is redundant but
+/// legal. One that names a different provider is a contradiction: honoring
+/// either half silently sends the run, and its spend, somewhere the user did
+/// not ask for.
+fn resolve_configured_model(model: &str, provider_type: Option<&str>) -> Result<String, CliError> {
+    let parsed = agens_models::QualifiedModel::parse(model)
+        .map_err(|message| CliError::configuration(format!("provider.model: {message}")))?;
+
+    if let Some((named, configured)) = parsed.source().zip(provider_type)
+        && named.provider_type() != configured
+    {
+        return Err(CliError::configuration(format!(
+            "provider.model \"{model}\" names provider \"{}\", but provider.type is \"{configured}\"",
+            named.provider_type()
+        )));
+    }
+
+    Ok(parsed.model().to_owned())
 }
 
 fn sniff_provider_type(

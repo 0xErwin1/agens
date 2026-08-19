@@ -70,6 +70,17 @@ pub fn bootstrap_from_configuration(
     global: Option<&str>,
     project: Option<&str>,
 ) -> Bootstrap {
+    try_bootstrap_from_configuration(label, global, project)
+        .expect("configuration fixture should be valid")
+}
+
+/// The same fixture, keeping the rejection so a test can assert how invalid
+/// configuration is refused rather than only that valid configuration resolves.
+pub fn try_bootstrap_from_configuration(
+    label: &str,
+    global: Option<&str>,
+    project: Option<&str>,
+) -> Result<Bootstrap, agens_error::CliError> {
     let temporary = std::env::temp_dir().join(format!("agens-{label}-{}", std::process::id()));
     let config_home = temporary.join("config");
     let project_root = temporary.join("project");
@@ -88,7 +99,6 @@ pub fn bootstrap_from_configuration(
         config_home_environment(&config_home),
         files,
     )
-    .expect("configuration fixture should be valid")
 }
 
 /// A second bootstrap sharing `origin`'s data directory (and therefore its
