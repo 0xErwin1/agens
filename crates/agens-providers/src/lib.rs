@@ -1351,8 +1351,26 @@ impl ChatGptResponsesProvider {
             == ChatGptAuthState::RefreshRequired
         {
             self.refresh_or_adopt(cancellation).await?;
+        } else {
+            self.adopt_rotated_account_id()?;
         }
         stop_before_mapping(cancellation)
+    }
+
+    /// Adopts an account id rotated on disk by another provider, so a ready
+    /// reload never sends a stale `ChatGPT-Account-ID` header. The access
+    /// token stays untouched: adoption there belongs to `refresh_or_adopt`,
+    /// which pairs it with the file lock on the refresh and 401 paths.
+    fn adopt_rotated_account_id(&mut self) -> Result<(), HeadlessTurnPortError> {
+        let credentials = read_credentials(&self.credentials_path)
+            .map_err(|_| HeadlessTurnPortError::Authentication)?;
+        let entry =
+            chatgpt_entry(&credentials).map_err(|_| HeadlessTurnPortError::Authentication)?;
+        let account_id = required_credential_string(entry, "account_id")
+            .map_err(|_| HeadlessTurnPortError::Authentication)?;
+
+        self.account_id = account_id.to_owned();
+        Ok(())
     }
 
     async fn refresh_or_adopt(
@@ -4332,6 +4350,58 @@ mod tests {
             }
         }"#
         .to_owned()
+    }
+
+    #[test]
+    fn a_ready_reload_adopts_an_account_id_rotated_by_another_provider() {
+        let directory = temporary_directory("ready-account-adoption");
+        let credentials_path = directory.join("auth.json");
+        fs::write(
+            &credentials_path,
+            r#"{
+                "openai-chatgpt": {
+                    "access_token": "synthetic-new-access",
+                    "refresh_token": "synthetic-new-refresh",
+                    "account_id": "account_456",
+                    "expires_at": "2026-07-17T13:00:00Z"
+                }
+            }"#,
+        )
+        .expect("rotated credentials should be written");
+
+        let mut provider = ChatGptResponsesProvider {
+            access_token: "synthetic-old-access".to_owned(),
+            account_id: "account_123".to_owned(),
+            credentials_path,
+            base_url: String::new(),
+            oauth_url: String::new(),
+            model: String::new(),
+            request_config: RequestConfig::default(),
+            instructions: String::new(),
+            initial_input: Vec::new(),
+            session_id: String::new(),
+            client: reqwest::Client::new(),
+            operation_timeout: Duration::from_secs(1),
+            tools: Vec::new(),
+            parallel_tool_calls: false,
+            state: ChatGptContinuationState::Initial,
+            seen_item_ids: BTreeSet::new(),
+            seen_call_ids: BTreeSet::new(),
+            seen_replay_item_ids: BTreeSet::new(),
+            progress: None,
+            diagnostics: None,
+            failure_detail: None,
+            media_blobs: MediaBlobs::default(),
+        };
+
+        provider
+            .adopt_rotated_account_id()
+            .expect("rotated account id should be adopted");
+
+        assert_eq!(provider.access_token, "synthetic-old-access");
+        assert_eq!(provider.account_id, "account_456");
+
+        fs::remove_dir_all(directory).expect("temporary directory should be removed");
     }
 
     fn temporary_directory(name: &str) -> std::path::PathBuf {
