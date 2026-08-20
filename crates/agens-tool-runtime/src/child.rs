@@ -36,6 +36,9 @@ use agens_permissions::{
     PermissionPrompter, ProductionPermissionGate, ProductionPermissionResolver,
     ProductionPromptAuthorization, SharedToolDispatcher, configured_permission_rules,
 };
+use agens_session::provider::{
+    ProviderKind, ResolvedProvider, bootstrap_authentication, resolve_provider_for_model,
+};
 use agens_store::PermissionGrantStore;
 use std::path::PathBuf;
 
@@ -215,6 +218,18 @@ pub struct ProductionTaskExecutionContext<'a> {
     pub depth: usize,
 }
 
+/// The provider an isolated subagent turn speaks to, chosen by its own model.
+///
+/// Resolved per turn rather than per process, so a subagent may run against a
+/// different provider than the parent that dispatched it.
+fn resolve_child_provider(
+    bootstrap: &Bootstrap,
+    model: &str,
+) -> Result<ResolvedProvider, ChildRunError> {
+    resolve_provider_for_model(Some(model), &bootstrap_authentication(bootstrap))
+        .map_err(|_| ChildRunError::Runtime)
+}
+
 pub fn run_production_task(
     request: TaskTurnRequest,
     context: ProductionTaskExecutionContext<'_>,
@@ -304,16 +319,21 @@ pub fn run_production_task(
     )
     .map_err(|_| ChildRunError::Runtime)?;
 
-    match bootstrap.provider_type() {
-        Some("openai-api") => {
-            let api_key = bootstrap.api_key.clone().ok_or(ChildRunError::Runtime)?;
+    let resolved = resolve_child_provider(bootstrap, request.model())?;
+    let model = resolved.model.clone();
+
+    match resolved.provider {
+        ProviderKind::OpenAiApi => {
+            let api_key = bootstrap
+                .api_key_for("openai-api")
+                .ok_or(ChildRunError::Runtime)?;
             let base_url = task_provider_base_url(bootstrap, project_root)
                 .map_err(|_| ChildRunError::Runtime)?;
             let provider =
                 OpenAiResponsesProvider::from_api_key_with_messages_and_tools_and_timeout(
                     api_key,
                     base_url.as_deref(),
-                    request.model().to_owned(),
+                    model.clone(),
                     messages,
                     provider_tools,
                     agens_providers::DEFAULT_PROVIDER_REQUEST_TIMEOUT,
@@ -344,14 +364,16 @@ pub fn run_production_task(
                 },
             )
         }
-        Some("moonshotai") => {
-            let api_key = bootstrap.api_key.clone().ok_or(ChildRunError::Runtime)?;
+        ProviderKind::Moonshot => {
+            let api_key = bootstrap
+                .api_key_for("moonshotai")
+                .ok_or(ChildRunError::Runtime)?;
             let base_url = task_provider_base_url(bootstrap, project_root)
                 .map_err(|_| ChildRunError::Runtime)?;
             let provider = MoonshotProvider::from_api_key_with_messages_and_tools_and_timeout(
                 api_key,
                 base_url.as_deref(),
-                request.model().to_owned(),
+                model.clone(),
                 messages,
                 provider_tools,
                 agens_providers::DEFAULT_PROVIDER_REQUEST_TIMEOUT,
@@ -382,14 +404,14 @@ pub fn run_production_task(
                 },
             )
         }
-        Some("openai-chatgpt") => {
+        ProviderKind::OpenAiChatGpt => {
             let base_url = task_provider_base_url(bootstrap, project_root)
                 .map_err(|_| ChildRunError::Runtime)?;
             let provider = ChatGptResponsesProvider::from_credentials_with_messages_and_tools_and_timeout_and_auth_url(
                 &bootstrap.paths.credentials,
                 base_url.as_deref(),
                 None,
-                request.model().to_owned(),
+                model.clone(),
                 task_system_prompt(&request),
                 messages,
                 provider_tools,
@@ -421,7 +443,6 @@ pub fn run_production_task(
                 },
             )
         }
-        _ => Err(ChildRunError::Runtime),
     }
 }
 

@@ -74,7 +74,9 @@ fn a_new_session_inherits_the_remembered_model_and_its_effort() {
         &context,
         chat_request(chat_args_with_prompt("work")).unwrap(),
     );
-    assert_eq!(request.model.as_deref(), Some("gpt-5.5"));
+    // The request carries the provider in the identifier: an explicit selection
+    // is the one place a turn learns which provider it was pointed at.
+    assert_eq!(request.model.as_deref(), Some("openai-api/gpt-5.5"));
     assert_eq!(
         request.session_reasoning_effort,
         Some(agens_core::ReasoningEffort::High)
@@ -126,7 +128,11 @@ fn resumed_primary_inherits_every_effective_pinned_model_and_compatible_effort()
                 &context,
                 chat_request(chat_args_with_prompt("first submission")).unwrap(),
             );
-            assert_eq!(request.model.as_deref(), Some(model), "{provider} {model}");
+            assert_eq!(
+                request.model.as_deref(),
+                Some(format!("{provider}/{model}").as_str()),
+                "{provider} {model}"
+            );
             assert_eq!(
                 request.request_config.reasoning_effort(),
                 Some(agens_core::ReasoningEffort::High),
@@ -208,7 +214,11 @@ fn explicit_agent_models_use_the_provider_aware_effective_registry() {
             &context,
             chat_request(chat_args_with_prompt("review")).unwrap(),
         );
-        assert_eq!(request.model.as_deref(), Some(model), "{provider} {model}");
+        assert_eq!(
+            request.model.as_deref(),
+            Some(format!("{provider}/{model}").as_str()),
+            "{provider} {model}"
+        );
         assert_eq!(
             request.request_config.reasoning_effort(),
             expected_effort,

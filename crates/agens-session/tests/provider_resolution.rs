@@ -2,7 +2,8 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use agens_session::provider::{
-    CredentialResolver, ProviderKind, ProviderResolutionError, resolve_provider_for_model,
+    CredentialResolver, ProviderKind, ProviderResolutionError,
+    resolve_provider_for_model_with_credentials,
 };
 
 struct Credentials {
@@ -44,7 +45,7 @@ fn resolve(
 ) -> Result<(ProviderKind, String), ProviderResolutionError> {
     let credentials = Credentials::new(label, &format!("{{{}}}", entries.join(", ")));
 
-    resolve_provider_for_model(model, &credentials.path(), &resolver())
+    resolve_provider_for_model_with_credentials(model, &credentials.path(), &resolver())
         .map(|resolved| (resolved.provider, resolved.model))
 }
 
@@ -137,13 +138,19 @@ fn a_model_no_provider_serves_is_reported_as_unknown() {
             "no-such-model".to_owned()
         ))
     );
+}
+
+/// The prefix names the provider, so a model the bundled snapshot has never
+/// heard of is still routable: the provider itself rejects it if it is wrong.
+#[test]
+fn a_qualified_model_outside_the_bundled_catalog_still_resolves() {
     assert_eq!(
         resolve(
             "unknown-qualified",
             &[MOONSHOT_ENTRY],
             Some("moonshotai/nope")
         ),
-        Err(ProviderResolutionError::UnknownModel("nope".to_owned()))
+        Ok((ProviderKind::Moonshot, "nope".to_owned()))
     );
 }
 

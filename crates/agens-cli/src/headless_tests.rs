@@ -131,7 +131,11 @@ fn a_headless_turns_permission_policy_is_scoped_to_its_own_root_not_the_bootstra
     let mut files = BTreeMap::new();
     files.insert(
         config_home.join("config.toml"),
-        "[provider]\ntype = \"openai-api\"\nmodel = \"gpt-4.1\"\n".to_owned(),
+        "[provider]\ntype = \"openai-api\"\nmodel = \"openai-api/gpt-4.1\"\n".to_owned(),
+    );
+    files.insert(
+        config_home.join("auth.json"),
+        r#"{"openai-api": {"api_key": "fixture"}}"#.to_owned(),
     );
     files.insert(
         root_b.join(".agens/config.toml"),
@@ -219,10 +223,16 @@ fn a_headless_ask_user_call_returns_unavailable_within_a_bounded_deadline_and_ne
             "AGENS_CONFIG_HOME".to_owned(),
             temporary.join("config").display().to_string(),
         )]),
-        BTreeMap::from([(
-            temporary.join("config/config.toml"),
-            "[provider]\ntype = \"openai-api\"\nmodel = \"gpt-4.1\"\n".to_owned(),
-        )]),
+        BTreeMap::from([
+            (
+                temporary.join("config/config.toml"),
+                "[provider]\ntype = \"openai-api\"\nmodel = \"openai-api/gpt-4.1\"\n".to_owned(),
+            ),
+            (
+                temporary.join("config/auth.json"),
+                r#"{"openai-api": {"api_key": "fixture"}}"#.to_owned(),
+            ),
+        ]),
     ))
     .unwrap();
 
@@ -880,13 +890,19 @@ fn production_resumed_headless_turn_replays_typed_history_and_appends_to_the_sam
             ),
             ("OPENAI_API_KEY".to_owned(), "test-key".to_owned()),
         ]),
-        BTreeMap::from([(
-            config_home.join("config.toml"),
-            format!(
-                "[provider]\ntype = \"openai-api\"\nmodel = \"gpt-4.1\"\nbase_url = \"http://{address}\"\n\n[options]\ndata_dir = \"{}\"\n",
-                data_directory.display()
+        BTreeMap::from([
+            (
+                config_home.join("config.toml"),
+                format!(
+                    "[provider]\ntype = \"openai-api\"\nmodel = \"openai-api/gpt-4.1\"\nbase_url = \"http://{address}\"\n\n[options]\ndata_dir = \"{}\"\n",
+                    data_directory.display()
+                ),
             ),
-        )]),
+            (
+                config_home.join("auth.json"),
+                r#"{"openai-api": {"api_key": "fixture"}}"#.to_owned(),
+            ),
+        ]),
     );
     let bootstrap = bootstrap(&dependencies).expect("production bootstrap should be valid");
     let initial_messages = vec![

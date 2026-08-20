@@ -56,6 +56,22 @@ fn config_home_environment(config_home: &Path) -> BTreeMap<String, String> {
     )])
 }
 
+/// The credentials a fixture provider needs to authenticate.
+///
+/// A run now picks its provider from the model it was given, and only from
+/// providers it can actually reach, so a fixture that names a provider has to
+/// supply that provider's credentials the way a real machine would.
+fn provider_credentials(provider: &str) -> String {
+    match provider {
+        "openai-chatgpt" => concat!(
+            r#"{"openai-chatgpt": {"access_token": "fixture", "refresh_token": "fixture", "#,
+            r#""account_id": "fixture", "expires_at": "2099-01-01T00:00:00Z"}}"#
+        )
+        .to_owned(),
+        other => format!(r#"{{"{other}": {{"api_key": "fixture"}}}}"#),
+    }
+}
+
 fn provider_configuration(provider: &str, model: &str, data_directory: &Path) -> String {
     format!(
         "[provider]\ntype = \"{provider}\"\nmodel = \"{model}\"\n\n[options]\ndata_dir = \"{}\"\n",
@@ -86,6 +102,10 @@ pub fn try_bootstrap_from_configuration(
     let project_root = temporary.join("project");
 
     let mut files = BTreeMap::new();
+    files.insert(
+        config_home.join("auth.json"),
+        provider_credentials("openai-api"),
+    );
     if let Some(global) = global {
         files.insert(config_home.join("config.toml"), global.to_owned());
     }
@@ -113,10 +133,16 @@ pub fn bootstrap_from_a_different_working_directory(origin: &Path, label: &str) 
         elsewhere.join("project"),
         Some(elsewhere.join("home")),
         config_home_environment(&config_home),
-        BTreeMap::from([(
-            config_home.join("config.toml"),
-            provider_configuration("openai-api", "gpt-4.1", &origin.join("data")),
-        )]),
+        BTreeMap::from([
+            (
+                config_home.join("config.toml"),
+                provider_configuration("openai-api", "gpt-4.1", &origin.join("data")),
+            ),
+            (
+                config_home.join("auth.json"),
+                provider_credentials("openai-api"),
+            ),
+        ]),
     )
     .expect("relocated bootstrap fixture should be valid")
 }
@@ -161,14 +187,30 @@ pub fn session_bootstrap_for_provider(
             .expect("fixture agent definition should be written");
     }
 
+    let credentials = config_home.join("auth.json");
+    std::fs::create_dir_all(&config_home).expect("fixture config home should be created");
+    // Never clobber credentials a test wrote for itself: some fixtures assert on
+    // entries this default would replace.
+    if !credentials.exists() {
+        std::fs::write(&credentials, provider_credentials(provider))
+            .expect("fixture credentials should be written");
+    }
+
     resolve(
         temporary.join("project"),
         Some(temporary.join("home")),
         config_home_environment(&config_home),
-        BTreeMap::from([(
-            config_home.join("config.toml"),
-            provider_configuration(provider, model, &temporary.join("data")),
-        )]),
+        BTreeMap::from([
+            (
+                config_home.join("config.toml"),
+                provider_configuration(provider, model, &temporary.join("data")),
+            ),
+            (
+                credentials.clone(),
+                std::fs::read_to_string(&credentials)
+                    .unwrap_or_else(|_| provider_credentials(provider)),
+            ),
+        ]),
     )
     .expect("session bootstrap fixture should be valid")
 }

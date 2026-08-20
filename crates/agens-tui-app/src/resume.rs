@@ -1637,13 +1637,13 @@ mod tests {
                 "explicit-model",
                 "---\nname: reviewer\ndescription: reviewer\nmode: primary\nmodel: gpt-4o\npermissions: []\n---\nReview.\n",
                 "reviewer",
-                "agent model \"gpt-4o\" is served by provider \"openai-api\", not by this session's \"openai-chatgpt\"",
+                "agent model \"gpt-4o\" is served by provider \"openai-api\", which has no usable credentials",
             ),
             (
                 "other-provider-model",
                 "---\nname: reviewer\ndescription: reviewer\nmode: primary\nmodel: kimi-k3\npermissions: []\n---\nReview.\n",
                 "reviewer",
-                "agent model \"kimi-k3\" is served by provider \"moonshotai\", not by this session's \"openai-chatgpt\"",
+                "agent model \"kimi-k3\" is served by provider \"moonshotai\", which has no usable credentials",
             ),
             (
                 "unknown-model",

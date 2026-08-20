@@ -261,7 +261,14 @@ pub fn apply_session_to_request(
     }
 
     let selected_model = context.selection.as_ref().map(|selection| {
-        request.model = Some(selection.model().to_owned());
+        // An explicit selection already knows which provider it came from, so it
+        // travels qualified: the identifier is the only carrier of provider
+        // identity a turn resolves from.
+        request.model = Some(format!(
+            "{}/{}",
+            selection.source().provider_type(),
+            selection.model()
+        ));
         request.request_config = selection.request_config().clone();
         request.session_reasoning_effort = selection.reasoning_effort_value();
         selection.model()

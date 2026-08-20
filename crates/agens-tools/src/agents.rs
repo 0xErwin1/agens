@@ -10,15 +10,19 @@ use agens_core::{
 
 use crate::markdown::{self, FrontmatterValue, MarkdownDocument};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AgentModelValidationError {
     Unavailable,
-    /// The model is real, but only under a provider this session is not using.
-    /// Kept distinct from [`Self::Unavailable`] because the two need opposite
-    /// corrections: one is a typo, the other is a provider selection.
-    ProviderMismatch {
-        requested: &'static str,
-        active: &'static str,
+    /// The model is real, but the provider that serves it has no usable
+    /// credentials. Kept distinct from [`Self::Unavailable`] because the two
+    /// need opposite corrections: one is a typo, the other is authentication.
+    Unreachable {
+        provider: &'static str,
+    },
+    /// Several authenticated providers serve this bare identifier, so it does
+    /// not say where the request would go.
+    Ambiguous {
+        candidates: String,
     },
 }
 
@@ -26,11 +30,14 @@ impl AgentModelValidationError {
     /// The user-facing explanation, naming the model and — for a mismatch —
     /// both providers, since the same failure otherwise reads identically
     /// whether the model does not exist or merely lives elsewhere.
-    pub fn message(self, model: &str) -> String {
+    pub fn message(&self, model: &str) -> String {
         match self {
             Self::Unavailable => format!("agent model \"{model}\" is unavailable"),
-            Self::ProviderMismatch { requested, active } => format!(
-                "agent model \"{model}\" is served by provider \"{requested}\", not by this session's \"{active}\""
+            Self::Unreachable { provider } => format!(
+                "agent model \"{model}\" is served by provider \"{provider}\", which has no usable credentials"
+            ),
+            Self::Ambiguous { candidates } => format!(
+                "agent model \"{model}\" is served by {candidates}; qualify it as \"provider/{model}\""
             ),
         }
     }

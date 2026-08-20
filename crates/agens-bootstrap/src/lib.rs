@@ -48,6 +48,10 @@ pub struct Bootstrap {
     pub mcp_defaults: McpDefaultSettings,
     pub settings: ResolvedSettings,
     pub api_key: Option<String>,
+    /// The environment this run resolved against, retained so a per-provider
+    /// credential lookup answers the same way `resolve` did instead of reading
+    /// the real process environment behind an injected host's back.
+    pub(crate) environment: BTreeMap<String, String>,
     pub data_directory: PathBuf,
     pub project_root: Option<PathBuf>,
     pub mcp_servers: Vec<agens_config::McpServerConfig>,
@@ -92,6 +96,7 @@ impl Clone for Bootstrap {
             mcp_defaults: self.mcp_defaults,
             settings: self.settings.clone(),
             api_key: self.api_key.clone(),
+            environment: self.environment.clone(),
             data_directory: self.data_directory.clone(),
             project_root: self.project_root.clone(),
             mcp_servers: self.mcp_servers.clone(),
@@ -153,6 +158,23 @@ impl Bootstrap {
 
     pub fn provider_type(&self) -> Option<&str> {
         self.provider_type.as_deref()
+    }
+
+    /// The environment this run resolved against, for a credential lookup that
+    /// must answer identically to `resolve` under an injected host.
+    pub fn credential_environment(&self) -> BTreeMap<String, String> {
+        self.environment.clone()
+    }
+
+    /// One provider's API key, resolved the way this run's own credentials were.
+    ///
+    /// Separate from [`Self::api_key`], which holds a single provider's key: a
+    /// turn now picks its provider from the model it was given, so any of them
+    /// may need authenticating within the same run.
+    pub fn api_key_for(&self, provider: &str) -> Option<String> {
+        let credentials = (self.config_reader)(&self.paths.credentials).ok().flatten();
+
+        provider_api_key(provider, credentials.as_deref(), &self.environment)
     }
 
     pub fn data_directory(&self) -> &Path {
@@ -265,12 +287,13 @@ pub fn resolve(host: &HostEnvironment) -> Result<Bootstrap, CliError> {
 
     let model = settings
         .text("provider.model")
-        .map(|model| resolve_configured_model(model, provider_type.as_deref()))
+        .map(resolve_configured_model)
         .transpose()?;
 
     Ok(Bootstrap {
         model,
         provider_type,
+        environment: environment.clone(),
         provider_source,
         max_iterations: settings
             .integer("agent.max_iterations")
@@ -469,26 +492,15 @@ pub fn resolve_provider_type(
     Ok(sniff_provider_type(credentials, environment))
 }
 
-/// Reduces `provider.model` to the identifier a provider's API accepts.
+/// Validates `provider.model` without reducing it.
 ///
-/// A `provider/model` value that names the configured provider is redundant but
-/// legal. One that names a different provider is a contradiction: honoring
-/// either half silently sends the run, and its spend, somewhere the user did
-/// not ask for.
-fn resolve_configured_model(model: &str, provider_type: Option<&str>) -> Result<String, CliError> {
-    let parsed = agens_models::QualifiedModel::parse(model)
-        .map_err(|message| CliError::configuration(format!("provider.model: {message}")))?;
-
-    if let Some((named, configured)) = parsed.source().zip(provider_type)
-        && named.provider_type() != configured
-    {
-        return Err(CliError::configuration(format!(
-            "provider.model \"{model}\" names provider \"{}\", but provider.type is \"{configured}\"",
-            named.provider_type()
-        )));
-    }
-
-    Ok(parsed.model().to_owned())
+/// The identifier now carries the provider, so the `provider/model` form has to
+/// survive to whoever resolves the turn; stripping it here would throw away the
+/// only statement of which provider was meant.
+fn resolve_configured_model(model: &str) -> Result<String, CliError> {
+    agens_models::QualifiedModel::parse(model)
+        .map(|parsed| parsed.to_string())
+        .map_err(|message| CliError::configuration(format!("provider.model: {message}")))
 }
 
 fn sniff_provider_type(

@@ -2,89 +2,87 @@ use agens_agents::AgentModelCompatibility;
 use agens_models::ModelSource;
 use agens_tools::{AgentModelValidationError, AgentModelValidator};
 
-fn validator(source: ModelSource) -> AgentModelCompatibility {
-    AgentModelCompatibility::for_source(source).expect("the bundled catalog is available")
+fn validator(authenticated: &[ModelSource]) -> AgentModelCompatibility {
+    AgentModelCompatibility::for_authenticated(authenticated.to_vec())
+        .expect("the bundled catalog is available")
+}
+
+/// The point of the qualified form: one catalog may mix providers, and each
+/// agent's identifier says which one it means.
+#[test]
+fn agents_on_different_providers_both_validate_in_the_same_run() {
+    let both = validator(&[ModelSource::MoonshotApi, ModelSource::ChatGptSubscription]);
+
+    assert_eq!(both.validate_model("moonshotai/kimi-k3"), Ok(()));
+    assert_eq!(both.validate_model("openai-chatgpt/gpt-5.5"), Ok(()));
 }
 
 #[test]
-fn a_model_the_session_provider_serves_is_accepted_bare_or_qualified() {
-    let moonshot = validator(ModelSource::MoonshotApi);
+fn a_bare_identifier_only_one_authenticated_provider_serves_is_accepted() {
+    let both = validator(&[ModelSource::MoonshotApi, ModelSource::ChatGptSubscription]);
 
-    assert_eq!(moonshot.validate_model("kimi-k3"), Ok(()));
-    assert_eq!(moonshot.validate_model("moonshotai/kimi-k3"), Ok(()));
+    assert_eq!(both.validate_model("kimi-k3"), Ok(()));
 }
 
-/// The case this diagnostic exists for: the model is real and its credentials
-/// may well be present, but the session resolved another provider.
+/// `gpt-5.5` exists under both OpenAI dialects, so a bare identifier does not
+/// say which one an agent meant.
 #[test]
-fn a_model_served_only_by_another_provider_names_both_providers() {
-    let error = validator(ModelSource::ChatGptSubscription)
-        .validate_model("kimi-k3")
-        .expect_err("the ChatGPT catalog has no Moonshot model");
+fn a_bare_identifier_two_authenticated_providers_serve_is_refused_with_its_candidates() {
+    let error = validator(&[ModelSource::OpenAiApi, ModelSource::ChatGptSubscription])
+        .validate_model("gpt-5.5")
+        .expect_err("both dialects serve it");
 
     assert_eq!(
         error,
-        AgentModelValidationError::ProviderMismatch {
-            requested: "moonshotai",
-            active: "openai-chatgpt",
+        AgentModelValidationError::Ambiguous {
+            candidates: "\"openai-api\", \"openai-chatgpt\"".to_owned(),
         }
     );
 
-    let message = error.message("kimi-k3");
+    let message = error.message("gpt-5.5");
 
-    assert!(message.contains("kimi-k3"), "{message}");
-    assert!(message.contains("moonshotai"), "{message}");
+    assert!(message.contains("openai-api"), "{message}");
     assert!(message.contains("openai-chatgpt"), "{message}");
 }
 
 #[test]
-fn an_explicit_provider_prefix_is_rejected_against_a_different_session_provider() {
-    let error = validator(ModelSource::MoonshotApi)
-        .validate_model("openai-chatgpt/gpt-5.5")
-        .expect_err("the session speaks to Moonshot");
+fn a_model_whose_provider_is_not_authenticated_names_that_provider() {
+    let error = validator(&[ModelSource::ChatGptSubscription])
+        .validate_model("moonshotai/kimi-k3")
+        .expect_err("Moonshot has no credentials here");
 
     assert_eq!(
         error,
-        AgentModelValidationError::ProviderMismatch {
-            requested: "openai-chatgpt",
-            active: "moonshotai",
+        AgentModelValidationError::Unreachable {
+            provider: "moonshotai",
         }
     );
-}
-
-/// Both OpenAI dialects serve `gpt-5.5`, so only the prefix distinguishes them.
-#[test]
-fn an_overlapping_identifier_is_resolved_by_its_prefix_not_by_the_session() {
-    let api = validator(ModelSource::OpenAiApi);
-
-    assert_eq!(api.validate_model("openai-api/gpt-5.5"), Ok(()));
-    assert_eq!(
-        api.validate_model("openai-chatgpt/gpt-5.5"),
-        Err(AgentModelValidationError::ProviderMismatch {
-            requested: "openai-chatgpt",
-            active: "openai-api",
-        })
+    assert!(
+        error.message("moonshotai/kimi-k3").contains("credentials"),
+        "the message points at authentication"
     );
 }
 
 #[test]
 fn a_model_no_provider_serves_stays_plainly_unavailable() {
-    let chatgpt = validator(ModelSource::ChatGptSubscription);
+    let moonshot = validator(&[ModelSource::MoonshotApi]);
 
     assert_eq!(
-        chatgpt.validate_model("no-such-model"),
+        moonshot.validate_model("no-such-model"),
         Err(AgentModelValidationError::Unavailable)
     );
     assert_eq!(
-        chatgpt.validate_model("moonshotai/no-such-model"),
+        moonshot.validate_model("openai/gpt-5.5"),
         Err(AgentModelValidationError::Unavailable)
     );
 }
 
+/// The prefix names the provider, so an identifier the bundled snapshot does
+/// not list is still accepted: the provider itself rejects it if it is wrong.
 #[test]
-fn an_unrecognized_provider_prefix_is_unavailable_rather_than_a_mismatch() {
+fn a_qualified_identifier_outside_the_bundled_catalog_is_accepted() {
     assert_eq!(
-        validator(ModelSource::MoonshotApi).validate_model("openai/gpt-5.5"),
-        Err(AgentModelValidationError::Unavailable)
+        validator(&[ModelSource::MoonshotApi]).validate_model("moonshotai/kimi-k9"),
+        Ok(())
     );
 }

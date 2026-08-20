@@ -3341,6 +3341,11 @@ fn busy_subagent_commands_run_locally_without_queueing_or_refusing() {
 #[test]
 fn persisted_selection_updates_and_resume_are_atomic_and_credential_fresh() {
     let temporary = tui_session_directory("persisted-selection");
+    // This case is about resuming with no usable credentials, so it supplies an
+    // empty credentials file before the fixture would write a working one.
+    let config_home = temporary.join("config");
+    std::fs::create_dir_all(&config_home).unwrap();
+    std::fs::write(config_home.join("auth.json"), "{}").unwrap();
     let bootstrap = tui_session_bootstrap(&temporary, &[]);
     let mut store = SessionStore::open(bootstrap.data_directory()).unwrap();
     let mut metadata = persist_tui_session(&mut store, &tui_project(&temporary), "selection");

@@ -142,6 +142,45 @@ fn names(candidates: &[ProviderKind]) -> String {
         .join(", ")
 }
 
+/// Whether this run can authenticate a given provider.
+///
+/// API-key providers are resolved through the bootstrap so an injected host
+/// answers the same way it answered at configuration time; the ChatGPT
+/// subscription is resolved from its credentials file, which is where its
+/// provider reads it too.
+pub fn bootstrap_authentication(
+    bootstrap: &agens_bootstrap::Bootstrap,
+) -> impl Fn(ProviderKind) -> bool + use<'_> {
+    let credentials = bootstrap.paths.credentials.clone();
+    let resolver = CredentialResolver::with_environment(bootstrap.credential_environment());
+
+    move |provider| match provider {
+        ProviderKind::OpenAiChatGpt => resolver.status(&credentials, provider).available(),
+        ProviderKind::OpenAiApi | ProviderKind::Moonshot => {
+            bootstrap.api_key_for(provider.identifier()).is_some()
+        }
+    }
+}
+
+/// Every provider this run can authenticate, as model sources.
+pub fn authenticated_sources(authenticated: &dyn Fn(ProviderKind) -> bool) -> Vec<ModelSource> {
+    ModelSource::ALL
+        .into_iter()
+        .filter(|source| authenticated(ProviderKind::for_source(*source)))
+        .collect()
+}
+
+/// [`resolve_provider_for_model`] against an on-disk credentials file.
+pub fn resolve_provider_for_model_with_credentials(
+    model: Option<&str>,
+    credentials: &Path,
+    resolver: &CredentialResolver,
+) -> Result<ResolvedProvider, ProviderResolutionError> {
+    resolve_provider_for_model(model, &|provider| {
+        resolver.status(credentials, provider).available()
+    })
+}
+
 /// Resolves which provider serves a model, from the identifier alone.
 ///
 /// A `provider/model` prefix is the whole answer. A bare identifier resolves
@@ -150,11 +189,8 @@ fn names(candidates: &[ProviderKind]) -> String {
 /// its spend, somewhere the user never named.
 pub fn resolve_provider_for_model(
     model: Option<&str>,
-    credentials: &Path,
-    resolver: &CredentialResolver,
+    authenticated: &dyn Fn(ProviderKind) -> bool,
 ) -> Result<ResolvedProvider, ProviderResolutionError> {
-    let authenticated = |provider: ProviderKind| resolver.status(credentials, provider).available();
-
     let Some(model) = model else {
         let candidates: Vec<ProviderKind> = ModelSource::ALL
             .into_iter()
@@ -179,13 +215,11 @@ pub fn resolve_provider_for_model(
         .map(ProviderKind::for_source)
         .collect();
 
+    // A prefix names the provider outright, so nothing has to be inferred from
+    // the catalog. Requiring catalog membership here would make the bundled
+    // snapshot authoritative over which models exist, and a model newer than
+    // the snapshot, or served by a proxy, unusable.
     if let Some(named) = parsed.source().map(ProviderKind::for_source) {
-        if !serving.contains(&named) {
-            return Err(ProviderResolutionError::UnknownModel(
-                parsed.model().to_owned(),
-            ));
-        }
-
         return authenticated(named)
             .then(|| ResolvedProvider {
                 provider: named,

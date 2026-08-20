@@ -47,7 +47,11 @@ fn a_task_runtimes_permission_policy_is_scoped_to_its_own_root_not_the_bootstrap
     let mut files = BTreeMap::new();
     files.insert(
         config_home.join("config.toml"),
-        "[provider]\ntype = \"openai-api\"\nmodel = \"gpt-4.1\"\n".to_owned(),
+        "[provider]\ntype = \"openai-api\"\nmodel = \"openai-api/gpt-4.1\"\n".to_owned(),
+    );
+    files.insert(
+        config_home.join("auth.json"),
+        r#"{"openai-api": {"api_key": "fixture"}}"#.to_owned(),
     );
     files.insert(
         root_b.join(".agens/config.toml"),

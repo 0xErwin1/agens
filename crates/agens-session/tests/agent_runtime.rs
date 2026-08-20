@@ -14,9 +14,8 @@ struct RejectEveryModel;
 
 impl AgentModelValidator for RejectEveryModel {
     fn validate_model(&self, _: &str) -> Result<(), AgentModelValidationError> {
-        Err(AgentModelValidationError::ProviderMismatch {
-            requested: "moonshotai",
-            active: "openai-chatgpt",
+        Err(AgentModelValidationError::Unreachable {
+            provider: "moonshotai",
         })
     }
 }
@@ -85,9 +84,8 @@ fn a_rejected_model_carries_its_identifier_and_verdict() {
         error,
         AgentRotationError::ModelUnavailable {
             model: "moonshotai/kimi-k3".into(),
-            error: AgentModelValidationError::ProviderMismatch {
-                requested: "moonshotai",
-                active: "openai-chatgpt",
+            error: AgentModelValidationError::Unreachable {
+                provider: "moonshotai",
             },
         }
     );

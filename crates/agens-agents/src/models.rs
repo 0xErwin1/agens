@@ -9,28 +9,31 @@ use std::sync::Arc;
 use agens_bootstrap::Bootstrap;
 use agens_error::CliError;
 use agens_models::{ModelSelection, ModelSource, QualifiedModel};
-use agens_models::{default_model, unknown_provider_message};
 use agens_session::context::SessionContext;
 use agens_session::model::model_source;
-use agens_session::provider::ProviderKind;
+use agens_session::provider::{authenticated_sources, bootstrap_authentication};
 use agens_tools::{AgentModelValidationError, AgentModelValidator};
 
 #[derive(Clone)]
 pub struct AgentModelCompatibility {
-    source: ModelSource,
-    available: Arc<BTreeSet<String>>,
+    authenticated: Arc<Vec<ModelSource>>,
 }
 
 impl AgentModelCompatibility {
+    /// A validator over exactly one provider. Kept for callers that already
+    /// know which provider a run reached.
     pub fn for_source(source: ModelSource) -> Result<Self, CliError> {
-        let available = ModelSelection::for_source("gpt-4.1", source)
-            .model_values()
-            .map_err(CliError::unavailable)?
-            .into_iter()
-            .collect();
+        Self::for_authenticated(vec![source])
+    }
+
+    /// A validator over every provider this run can authenticate.
+    ///
+    /// An agent names its own provider through its model identifier, so a
+    /// catalog may legitimately mix them; validating against one provider
+    /// would reject exactly the agents that mixing exists for.
+    pub fn for_authenticated(authenticated: Vec<ModelSource>) -> Result<Self, CliError> {
         Ok(Self {
-            source,
-            available: Arc::new(available),
+            authenticated: Arc::new(authenticated),
         })
     }
 
@@ -41,48 +44,56 @@ impl AgentModelCompatibility {
     pub fn is_available(&self, model: &str) -> bool {
         self.validate_model(model).is_ok()
     }
-
-    /// The provider that would serve `model` if this session were using it, or
-    /// `None` when no bundled catalog lists it at all.
-    fn served_elsewhere(&self, model: &str) -> Option<ModelSource> {
-        agens_models::sources_serving(model)
-            .into_iter()
-            .find(|source| *source != self.source)
-    }
-
-    fn mismatch(&self, requested: ModelSource) -> AgentModelValidationError {
-        AgentModelValidationError::ProviderMismatch {
-            requested: requested.provider_type(),
-            active: self.source.provider_type(),
-        }
-    }
 }
 
 impl AgentModelValidator for AgentModelCompatibility {
-    /// Accepts a bare identifier against the session's own provider, and a
-    /// `provider/model` identifier only against the provider it names.
+    /// Accepts a `provider/model` identifier when that provider is
+    /// authenticated, and a bare one when exactly one authenticated provider
+    /// serves it.
     fn validate_model(&self, model: &str) -> Result<(), AgentModelValidationError> {
         let Ok(parsed) = QualifiedModel::parse(model) else {
             return Err(AgentModelValidationError::Unavailable);
         };
 
-        if let Some(requested) = parsed.source().filter(|source| *source != self.source) {
-            return Err(if parsed.is_available() {
-                self.mismatch(requested)
-            } else {
-                AgentModelValidationError::Unavailable
-            });
+        // A prefix names the provider outright, so the bundled catalog does not
+        // get to decide whether the model exists.
+        if let Some(named) = parsed.source() {
+            return self.authenticated.contains(&named).then_some(()).ok_or(
+                AgentModelValidationError::Unreachable {
+                    provider: named.provider_type(),
+                },
+            );
         }
 
-        if self.available.contains(parsed.model()) {
-            return Ok(());
+        let serving = agens_models::sources_serving(parsed.model());
+        if serving.is_empty() {
+            return Err(AgentModelValidationError::Unavailable);
         }
 
-        Err(match self.served_elsewhere(parsed.model()) {
-            Some(requested) => self.mismatch(requested),
-            None => AgentModelValidationError::Unavailable,
-        })
+        let reachable: Vec<ModelSource> = serving
+            .iter()
+            .copied()
+            .filter(|source| self.authenticated.contains(source))
+            .collect();
+
+        match (reachable.as_slice(), serving.as_slice()) {
+            ([_], _) => Ok(()),
+            ([], [unreachable, ..]) => Err(AgentModelValidationError::Unreachable {
+                provider: unreachable.provider_type(),
+            }),
+            _ => Err(AgentModelValidationError::Ambiguous {
+                candidates: provider_names(&reachable),
+            }),
+        }
     }
+}
+
+fn provider_names(sources: &[ModelSource]) -> String {
+    sources
+        .iter()
+        .map(|source| format!("\"{}\"", source.provider_type()))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 #[derive(Clone)]
@@ -107,17 +118,39 @@ impl AgentModelValidator for TaskModelValidator {
     }
 }
 
+/// Every model a delegated task may be given: the union of the catalogs of
+/// every provider this run can authenticate, each listed bare and qualified.
+///
+/// The qualified form has to be listed too, because a subagent profile names
+/// its provider that way and an unlisted identifier silently falls back to the
+/// parent's model.
 pub fn task_model_catalog(bootstrap: &Bootstrap) -> Result<Vec<String>, CliError> {
-    let source = bootstrap
-        .provider_type()
-        .and_then(ProviderKind::parse)
-        .map(ProviderKind::source)
-        .ok_or_else(|| CliError::configuration("task provider is unavailable"))?;
-    let model = default_model(bootstrap.provider_type()).ok_or_else(|| {
-        CliError::configuration(unknown_provider_message(bootstrap.provider_type()))
-    })?;
+    let sources = authenticated_sources(&bootstrap_authentication(bootstrap));
+    if sources.is_empty() {
+        return Err(CliError::configuration("task provider is unavailable"));
+    }
 
-    ModelSelection::for_source(model, source)
-        .model_values()
-        .map_err(CliError::unavailable)
+    let mut models = Vec::new();
+    for source in sources {
+        let listed = ModelSelection::for_source(default_model_for(source), source)
+            .model_values()
+            .map_err(CliError::unavailable)?;
+
+        for model in listed {
+            models.push(format!("{}/{model}", source.provider_type()));
+            models.push(model);
+        }
+    }
+    models.sort_unstable();
+    models.dedup();
+
+    Ok(models)
+}
+
+const fn default_model_for(source: ModelSource) -> &'static str {
+    match source {
+        ModelSource::OpenAiApi => "gpt-4.1",
+        ModelSource::ChatGptSubscription => "gpt-5.5",
+        ModelSource::MoonshotApi => "kimi-k3",
+    }
 }

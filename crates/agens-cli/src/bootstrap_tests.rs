@@ -39,34 +39,31 @@ mod resolution {
         assert!(bootstrap.collapse_thinking);
     }
 
-    /// The prefix names the provider a model belongs to; what the request
-    /// carries is the identifier the provider's API accepts.
+    /// The identifier carries the provider, so the qualified form has to reach
+    /// whoever resolves the turn intact.
     #[test]
-    fn a_provider_qualified_configured_model_is_stored_bare() {
+    fn a_provider_qualified_configured_model_is_kept_whole() {
         let bootstrap = bootstrap_from_configuration(
             "config-qualified-model",
-            Some("[provider]\ntype = \"moonshotai\"\nmodel = \"moonshotai/kimi-k3\"\n"),
+            Some("[provider]\nmodel = \"moonshotai/kimi-k3\"\n"),
             None,
         );
 
-        assert_eq!(bootstrap.model(), Some("kimi-k3"));
+        assert_eq!(bootstrap.model(), Some("moonshotai/kimi-k3"));
     }
 
-    /// Silently honoring one half of a contradiction is how a run reaches a
-    /// provider the user did not name, so the contradiction is refused.
     #[test]
-    fn a_configured_model_naming_another_provider_is_refused_by_name() {
+    fn an_unparseable_configured_model_is_refused_by_name() {
         let error = try_bootstrap_from_configuration(
-            "config-crossed-model",
-            Some("[provider]\ntype = \"openai-chatgpt\"\nmodel = \"moonshotai/kimi-k3\"\n"),
+            "config-bad-model",
+            Some("[provider]\nmodel = \"nope/gpt-5.5\"\n"),
             None,
         )
         .err()
-        .expect("the model and the provider disagree");
+        .expect("the prefix is not a provider");
 
-        assert!(error.message.contains("moonshotai"), "{}", error.message);
         assert!(
-            error.message.contains("openai-chatgpt"),
+            error.message.contains("provider.model"),
             "{}",
             error.message
         );

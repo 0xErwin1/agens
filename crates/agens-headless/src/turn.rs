@@ -39,7 +39,10 @@ use agens_session::attempt::{
     run_session_attempt_lifecycle_with_terminal_writer, write_terminal_attempt,
     write_terminal_attempt_with_history,
 };
-use agens_session::provider::ProviderKind;
+use agens_session::provider::{
+    ProviderKind, ProviderResolutionError, ResolvedProvider, authenticated_sources,
+    bootstrap_authentication, resolve_provider_for_model,
+};
 use agens_session::turns::{
     completed_session_turn_from_events_with_media, completed_session_turn_with_media,
     next_session_metadata,
@@ -84,6 +87,9 @@ impl PartialTurnRecorder {
 
 struct HeadlessProviderContext<'a> {
     bootstrap: &'a Bootstrap,
+    /// The provider this turn resolved from its own model, rather than a
+    /// process-wide setting: one run may reach several providers.
+    provider: ProviderKind,
     cancellation: &'a HeadlessTurnCancellation,
     progress: Option<&'a TurnProgressSink>,
     prompter: Box<dyn PermissionPrompter>,
@@ -91,6 +97,36 @@ struct HeadlessProviderContext<'a> {
     diagnostic_reference: &'a str,
     include_system_prompt: bool,
     failure_detail: ProviderFailureDetail,
+}
+
+/// The provider this turn speaks to, chosen by the model it was given.
+///
+/// A `provider/model` identifier names it outright; a bare one resolves only
+/// when a single authenticated provider serves it. Nothing process-wide takes
+/// part, so one run can reach several providers.
+fn resolve_turn_provider(
+    bootstrap: &Bootstrap,
+    model: Option<&str>,
+) -> Result<ResolvedProvider, CliError> {
+    resolve_provider_for_model(model, &bootstrap_authentication(bootstrap)).map_err(|error| {
+        match error {
+            // Missing credentials stay an authentication failure rather than
+            // becoming a configuration one: the run is configured correctly and
+            // the operator has to authenticate, not edit a file.
+            ProviderResolutionError::Unauthenticated(provider) => {
+                CliError::authentication(provider_authentication_message(provider))
+            }
+            other => CliError::configuration(other.message()),
+        }
+    })
+}
+
+const fn provider_authentication_message(provider: ProviderKind) -> &'static str {
+    match provider {
+        ProviderKind::OpenAiApi => "OpenAI API authentication is unavailable",
+        ProviderKind::OpenAiChatGpt => "ChatGPT credentials are unavailable or invalid",
+        ProviderKind::Moonshot => "Moonshot AI authentication is unavailable",
+    }
 }
 
 pub fn run_production_headless_chat_with_progress(
@@ -104,12 +140,13 @@ pub fn run_production_headless_chat_with_progress(
 ) -> Result<HeadlessChatCompletion, HeadlessChatFailure> {
     agens_callcount::note_provider_runtime_build();
 
-    let source = bootstrap
-        .provider_type()
-        .and_then(ProviderKind::parse)
-        .map(ProviderKind::source)
-        .ok_or_else(|| CliError::configuration("task provider is unavailable"))?;
-    let validator = AgentModelCompatibility::for_source(source)?;
+    let requested_model = request
+        .model
+        .clone()
+        .or_else(|| bootstrap.model().map(ToOwned::to_owned));
+    let validator = AgentModelCompatibility::for_authenticated(authenticated_sources(
+        &bootstrap_authentication(bootstrap),
+    ))?;
     let agent_catalog_root = headless_turn_project_root(bootstrap, task_runtime)?;
     // Only a genuinely new session (no `task_runtime` yet) resolves its own base prompt through
     // `headless_turn_system_prompt`'s explicit/fallback dance below. A resumed TUI turn's
@@ -145,9 +182,23 @@ pub fn run_production_headless_chat_with_progress(
     let diagnostic_reference = diagnostics.reference;
     let provider_diagnostics = diagnostics.provider;
     let failure_detail = ProviderFailureDetail::new();
-    let result = match bootstrap.provider_type() {
-        Some("openai-api") => {
-            let api_key = bootstrap.api_key.clone().ok_or_else(|| {
+    // Resolved here rather than earlier so a provider failure carries this
+    // turn's diagnostic reference like every other terminal failure does.
+    let resolved = match resolve_turn_provider(bootstrap, requested_model.as_deref()) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            let failure = HeadlessChatFailure::from(error);
+            record_parent_terminal(bootstrap, &diagnostic_reference, &failure.error);
+            return Err(
+                failure.map_error(|error| error.with_diagnostic_reference(&diagnostic_reference))
+            );
+        }
+    };
+    request.model = Some(resolved.model.clone());
+
+    let result = match resolved.provider {
+        ProviderKind::OpenAiApi => {
+            let api_key = bootstrap.api_key_for("openai-api").ok_or_else(|| {
                 CliError::authentication("OpenAI API authentication is unavailable")
             })?;
             let base_url = headless_turn_provider_base_url(bootstrap, &agent_catalog_root)?;
@@ -155,6 +206,7 @@ pub fn run_production_headless_chat_with_progress(
                 request,
                 HeadlessProviderContext {
                     bootstrap,
+                    provider: resolved.provider,
                     cancellation,
                     progress,
                     prompter,
@@ -188,8 +240,8 @@ pub fn run_production_headless_chat_with_progress(
                 },
             )
         }
-        Some("moonshotai") => {
-            let api_key = bootstrap.api_key.clone().ok_or_else(|| {
+        ProviderKind::Moonshot => {
+            let api_key = bootstrap.api_key_for("moonshotai").ok_or_else(|| {
                 CliError::authentication("Moonshot AI authentication is unavailable")
             })?;
             let base_url = headless_turn_provider_base_url(bootstrap, &agent_catalog_root)?;
@@ -197,6 +249,7 @@ pub fn run_production_headless_chat_with_progress(
                 request,
                 HeadlessProviderContext {
                     bootstrap,
+                    provider: resolved.provider,
                     cancellation,
                     progress,
                     prompter,
@@ -231,7 +284,7 @@ pub fn run_production_headless_chat_with_progress(
                 },
             )
         }
-        Some("openai-chatgpt") => {
+        ProviderKind::OpenAiChatGpt => {
             let credentials_path = bootstrap.paths.credentials.clone();
             let instructions = match request.system_prompt.clone() {
                 Some(explicit) => explicit,
@@ -244,6 +297,7 @@ pub fn run_production_headless_chat_with_progress(
                 request,
                 HeadlessProviderContext {
                     bootstrap,
+                    provider: resolved.provider,
                     cancellation,
                     progress,
                     prompter,
@@ -278,9 +332,6 @@ pub fn run_production_headless_chat_with_progress(
                 },
             )
         }
-        _ => Err(HeadlessChatFailure::from(CliError::configuration(
-            "headless chat requires provider.type = \"openai-api\", \"openai-chatgpt\", or \"moonshotai\"",
-        ))),
     };
     result.map_err(|failure| {
         record_parent_terminal(bootstrap, &diagnostic_reference, &failure.error);
@@ -564,14 +615,11 @@ where
         .model
         .clone()
         .or_else(|| context.bootstrap.model().map(ToOwned::to_owned))
-        .unwrap_or_else(|| match context.bootstrap.provider_type() {
-            Some("openai-chatgpt") => "gpt-5.5".to_owned(),
-            _ => "gpt-4.1".to_owned(),
-        });
+        .unwrap_or_else(|| context.provider.default_model().to_owned());
     // Capability gate before any provider construction or network I/O.
     preflight_request_media(&model, &request)
         .map_err(|error| HeadlessChatFailure::from(CliError::configuration(error.to_string())))?;
-    let session_provider = context.bootstrap.provider_type().map(str::to_owned);
+    let session_provider = Some(context.provider.identifier().to_owned());
     let session_model = model.clone();
     let session_effort = request
         .session_reasoning_effort
