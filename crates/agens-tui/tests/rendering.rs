@@ -642,13 +642,15 @@ fn composer_scroll_accounts_for_attachment_rows_when_input_exceeds_visible_heigh
 
     assert!(cursor.y > top && cursor.y < bottom, "cursor: {cursor:?}");
     assert_eq!(cursor.y, bottom - 1, "cursor: {cursor:?}");
-    assert!(!text.contains("Image #1"), "{text:?}");
-    assert!(!text.contains("Image #2"), "{text:?}");
-    assert!(text.contains("Image #3"), "{text:?}");
-    assert!(text.contains("line-1"), "{text:?}");
+    // Attachments and text share one bounded box: both scroll, and the box
+    // keeps at most a third of the screen instead of pushing the transcript out.
+    assert!(bottom - top < height / 3, "composer: {top}..={bottom}");
+    for chip in ["Image #1", "Image #2", "Image #3"] {
+        assert!(!text.contains(chip), "{text:?}");
+    }
+    assert!(!text.contains("line-1"), "{text:?}");
     assert!(text.contains("line-8"), "{text:?}");
-    assert_eq!(rendered_row(&renderer, "Image #3") as u16, top + 1);
-    assert_eq!(rendered_row(&renderer, "line-1") as u16, top + 2);
+    assert!(text.contains("↑9"), "hidden-row marker missing: {text:?}");
     assert_eq!(rendered_row(&renderer, "line-8") as u16, cursor.y);
 }
 
@@ -748,9 +750,11 @@ fn responsive_layout_saturates_heights_one_through_six() {
 
     renderer.render(tui.view()).unwrap();
     let text = rendered_text(&renderer);
-    // Multiline composer input is still present without the old "N lines" chrome.
-    assert!(text.contains("line-04"), "{text:?}");
+    // Multiline composer input scrolls inside its ceiling without the old "N
+    // lines" chrome: the cursor line stays visible and the rest is counted.
+    assert!(!text.contains("line-04"), "{text:?}");
     assert!(text.contains("line-09"), "{text:?}");
+    assert!(text.contains("↑8"), "hidden-row marker missing: {text:?}");
     assert!(!text.contains("10 lines"), "{text:?}");
 }
 

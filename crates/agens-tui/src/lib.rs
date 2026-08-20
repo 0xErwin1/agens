@@ -2335,12 +2335,21 @@ fn render_frame_content(frame: &mut ratatui::Frame<'_>, state: &ViewState<'_>) {
         let attachment_row_count = attachment_rows.len();
         let cursor_content_line = attachment_row_count.saturating_add(cursor_line);
         let vertical_scroll = cursor_content_line.saturating_sub(inner_height.saturating_sub(1));
+        let content_rows = attachment_row_count.saturating_add(composer_layout.rows);
         let mut composer = Block::default()
             .borders(Borders::ALL)
             .padding(Padding::left(1))
             .border_style(Style::default().fg(composer_color));
         if let Some(metrics) = border_metrics(state, layout.composer) {
             composer = composer.title_bottom(metrics);
+        }
+        if let Some(hidden) = hidden_rows_marker(
+            content_rows,
+            vertical_scroll,
+            inner_height,
+            layout.composer.width,
+        ) {
+            composer = composer.title_top(hidden);
         }
         let mut composer_text = attachment_rows
             .into_iter()
@@ -3698,6 +3707,50 @@ fn queue_status_line(count: usize, focused: bool, width: usize) -> Line<'static>
     )])
 }
 
+/// Marker spliced into the composer's top border counting the rows scrolled out
+/// of view, or `None` when everything typed is on screen or the border is too
+/// narrow to say so whole.
+///
+/// The composer stops growing at its ceiling, so past that point the only thing
+/// that tells a reader their text continues above or below the box is this
+/// count.
+fn hidden_rows_marker(
+    content_rows: usize,
+    scroll: usize,
+    visible_rows: usize,
+    composer_width: u16,
+) -> Option<Line<'static>> {
+    let above = scroll;
+    let below = content_rows.saturating_sub(scroll.saturating_add(visible_rows));
+    if above == 0 && below == 0 {
+        return None;
+    }
+
+    let mut label = String::new();
+    if above > 0 {
+        label.push_str(&format!("↑{above}"));
+    }
+    if below > 0 {
+        if !label.is_empty() {
+            label.push(' ');
+        }
+        label.push_str(&format!("↓{below}"));
+    }
+    let label = format!(" {label} ");
+
+    if saturating_u16(label.width()) > border_metrics_budget(composer_width) {
+        return None;
+    }
+
+    Some(
+        Line::from(Span::styled(
+            label,
+            Style::default().fg(widgets::RolePalette::chrome()),
+        ))
+        .right_aligned(),
+    )
+}
+
 /// Metadata spliced into the composer's border, right-aligned and held one column
 /// off the closing corner, or `None` when the band cannot host it whole.
 ///
@@ -4491,6 +4544,24 @@ fn attachment_preview_lines(media_chips: &[String], width: usize) -> Vec<String>
         .collect()
 }
 
+/// Tallest the composer may ever grow, however tall the terminal is.
+const MAX_COMPOSER_ROWS: u16 = 8;
+/// Shortest composer the layout still calls scrollable: both borders plus one
+/// row of text.
+const MIN_COMPOSER_ROWS: u16 = 3;
+/// Share of the screen the composer may claim before it scrolls internally: a
+/// third, so the transcript always keeps the majority of the rows.
+const COMPOSER_VIEWPORT_SHARE: u16 = 3;
+
+/// Rows the composer may grow to on a screen of this height.
+///
+/// The ceiling is a function of the terminal alone, never of what was typed or
+/// staged, so a long prompt or a stack of attachments scrolls inside the box
+/// instead of pushing the transcript off screen.
+fn composer_ceiling(height: u16) -> u16 {
+    (height / COMPOSER_VIEWPORT_SHARE).clamp(MIN_COMPOSER_ROWS, MAX_COMPOSER_ROWS)
+}
+
 fn composer_rows(height: u16, input: &str, media_count: usize, width: usize) -> u16 {
     match height {
         0 => 0,
@@ -4503,7 +4574,7 @@ fn composer_rows(height: u16, input: &str, media_count: usize, width: usize) -> 
                 .saturating_add(media_count)
                 .saturating_add(2),
         )
-        .clamp(3, 8_u16.saturating_add(saturating_u16(media_count))),
+        .clamp(MIN_COMPOSER_ROWS, composer_ceiling(height)),
     }
 }
 
@@ -15862,6 +15933,60 @@ mod runtime_tests {
 
         assert!(rendered.contains("abcdefghijklmnop"), "{rendered:?}");
         assert!(rendered.contains("tuvwxyz"), "{rendered:?}");
+    }
+
+    #[test]
+    fn composer_stops_growing_at_its_ceiling() {
+        let long = "x".repeat(700);
+
+        let tall = screen_layout(Rect::new(0, 0, 80, 40), &long, 0, 0);
+        assert_eq!(tall.composer.height, MAX_COMPOSER_ROWS);
+        assert!(tall.transcript.height > 0);
+
+        // A short terminal caps the composer below the absolute ceiling so the
+        // transcript keeps most of the screen.
+        let short = screen_layout(Rect::new(0, 0, 80, 15), &long, 0, 0);
+        assert_eq!(short.composer.height, composer_ceiling(15));
+        assert!(short.composer.height < MAX_COMPOSER_ROWS);
+        assert!(short.transcript.height > short.composer.height);
+
+        // Attachments scroll inside the box instead of lifting the ceiling.
+        let with_attachments = screen_layout(Rect::new(0, 0, 80, 40), &long, 12, 0);
+        assert_eq!(with_attachments.composer.height, MAX_COMPOSER_ROWS);
+    }
+
+    #[test]
+    fn composer_scrolls_past_its_ceiling_keeping_the_cursor_and_marking_hidden_rows() {
+        let input = (0..30)
+            .map(|index| format!("row{index:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let mut tui = Tui::new(NoopEngine);
+        assert_eq!(tui.handle(Event::Paste(input)), Action::Render);
+        let terminal = RatatuiTerminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        let mut renderer = RatatuiRenderer::new(terminal);
+        renderer.render(tui.view()).unwrap();
+        let buffer = renderer.terminal().backend().buffer().clone();
+        let rows = buffer
+            .content
+            .chunks(usize::from(buffer.area.width))
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>();
+        let rendered = rows.join("\n");
+
+        assert!(
+            rows.iter().any(|row| row.contains("row29")),
+            "the cursor line must stay visible: {rendered}"
+        );
+        assert!(
+            !rows.iter().any(|row| row.contains("row00")),
+            "rows past the ceiling must scroll out of view: {rendered}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("↑24")),
+            "the composer must say how many rows are hidden: {rendered}"
+        );
     }
 
     #[test]
