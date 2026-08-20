@@ -37,6 +37,82 @@ pub fn best_effort_failures() -> u64 {
     BEST_EFFORT_FAILURES.load(Ordering::Relaxed)
 }
 
+/// How a turn ended, as a fact rather than as prose a supervisor has to parse.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TurnOutcome {
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl TurnOutcome {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// The events a supervisor needs to follow a session without reading its
+/// terminal: whether a turn is running, how it ended, which tool failed, and
+/// whether the session is waiting on a permission decision.
+///
+/// Each variant carries only the fields that apply to it, so a recorded line is
+/// readable on its own and no reader has to know which fields are meaningful
+/// for which event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionLifecycle<'a> {
+    TurnStarted {
+        model: &'a str,
+    },
+    TurnEnded {
+        outcome: TurnOutcome,
+    },
+    ToolFailed {
+        tool: &'a str,
+        class: ProviderDiagnosticClass,
+    },
+    /// The session cannot proceed until someone decides. This is the one state
+    /// an external observer cannot infer from anything else: the process is
+    /// alive, spending nothing, and making no progress.
+    ///
+    /// The blocked target is deliberately absent. A permission target carries
+    /// the argument that triggered it — a whole shell command, a path — and
+    /// this file is read by the audit overlay, so recording it would publish
+    /// whatever secret the argument happened to contain. Which tool and which
+    /// access level is what a supervisor needs to act.
+    PermissionBlocked {
+        tool: &'a str,
+        access: &'a str,
+    },
+}
+
+impl SessionLifecycle<'_> {
+    const fn kind(self) -> ProviderDiagnosticKind {
+        match self {
+            Self::TurnStarted { .. } => ProviderDiagnosticKind::TurnStarted,
+            Self::TurnEnded { .. } => ProviderDiagnosticKind::TurnEnded,
+            Self::ToolFailed { .. } => ProviderDiagnosticKind::ToolFailed,
+            Self::PermissionBlocked { .. } => ProviderDiagnosticKind::PermissionBlocked,
+        }
+    }
+
+    fn detail(self) -> serde_json::Value {
+        match self {
+            Self::TurnStarted { model } => serde_json::json!({ "model": model }),
+            Self::TurnEnded { outcome } => serde_json::json!({ "outcome": outcome.as_str() }),
+            Self::ToolFailed { tool, class } => {
+                serde_json::json!({ "tool": tool, "class": class.as_str() })
+            }
+            Self::PermissionBlocked { tool, access } => {
+                serde_json::json!({ "tool": tool, "access": access })
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct SafeDiagnosticStore {
     directory: PathBuf,
@@ -101,6 +177,37 @@ impl SafeDiagnosticStore {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         best_effort(self.write_subagent_surface_rejection(event, reason));
+    }
+
+    /// Records one session-lifecycle event.
+    ///
+    /// Kept apart from [`Self::record`] because a lifecycle event has no
+    /// attempt, no retry budget and no HTTP status: forcing it through the
+    /// provider event shape would write a line whose fields are mostly null and
+    /// whose meaning a reader has to guess.
+    pub fn record_session_lifecycle(
+        &self,
+        reference: &DiagnosticRef,
+        scope: ProviderDiagnosticScope,
+        event: SessionLifecycle<'_>,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        let _guard = DIAGNOSTIC_FILE_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        best_effort(self.write_session_lifecycle(reference, scope, event));
+    }
+
+    fn write_session_lifecycle(
+        &self,
+        reference: &DiagnosticRef,
+        scope: ProviderDiagnosticScope,
+        event: SessionLifecycle<'_>,
+    ) -> std::io::Result<()> {
+        self.append(session_lifecycle_json_line(reference, scope, event)?)
     }
 
     fn write(&self, event: &ProviderDiagnosticEvent) -> std::io::Result<()> {
@@ -231,6 +338,31 @@ fn diagnostic_json_line(event: &ProviderDiagnosticEvent) -> std::io::Result<Vec<
         "limit": event.limit,
     }))
     .map_err(std::io::Error::other)?;
+    line.push(b'\n');
+    Ok(line)
+}
+
+fn session_lifecycle_json_line(
+    reference: &DiagnosticRef,
+    scope: ProviderDiagnosticScope,
+    event: SessionLifecycle<'_>,
+) -> std::io::Result<Vec<u8>> {
+    let timestamp_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let mut line = serde_json::json!({
+        "timestamp_ms": u64::try_from(timestamp_ms).unwrap_or(u64::MAX),
+        "reference": reference.as_str(),
+        "scope": scope.as_str(),
+        "component": ProviderDiagnosticComponent::Session.as_str(),
+        "event": event.kind().as_str(),
+    });
+    if let (Some(line), Some(detail)) = (line.as_object_mut(), event.detail().as_object()) {
+        line.extend(detail.clone());
+    }
+
+    let mut line = serde_json::to_vec(&line).map_err(std::io::Error::other)?;
     line.push(b'\n');
     Ok(line)
 }
@@ -498,6 +630,19 @@ pub fn record_parent_terminal(bootstrap: &Bootstrap, reference: &str, error: &Cl
         observed: None,
         limit: None,
     });
+}
+
+/// Records a session-lifecycle event against this run's diagnostic store.
+pub fn record_session_lifecycle(
+    bootstrap: &Bootstrap,
+    reference: &str,
+    scope: ProviderDiagnosticScope,
+    event: SessionLifecycle<'_>,
+) {
+    let Ok(reference) = DiagnosticRef::new(reference.to_owned()) else {
+        return;
+    };
+    diagnostic_store(bootstrap).record_session_lifecycle(&reference, scope, event);
 }
 
 pub fn record_agent_diagnostic(bootstrap: &Bootstrap, event: ProviderDiagnosticKind) {
@@ -931,5 +1076,149 @@ mod tests {
         );
 
         std::fs::remove_dir_all(data_directory).expect("test directory should be removed");
+    }
+
+    /// A supervisor asks three questions of a running session, and until these
+    /// events existed the only way to answer them was reading the terminal.
+    #[test]
+    fn a_session_lifecycle_is_recorded_as_typed_events() {
+        let temporary =
+            std::env::temp_dir().join(format!("agens-diagnostic-lifecycle-{}", std::process::id()));
+        std::fs::remove_dir_all(&temporary).ok();
+        std::fs::create_dir_all(&temporary).expect("test data directory should be creatable");
+
+        let store = SafeDiagnosticStore::with_capture(temporary.clone(), true);
+        let reference = DiagnosticRef::new("abcd1234".to_owned()).unwrap();
+        store.record_session_lifecycle(
+            &reference,
+            ProviderDiagnosticScope::Parent,
+            SessionLifecycle::TurnStarted {
+                model: "moonshotai/kimi-k3",
+            },
+        );
+        store.record_session_lifecycle(
+            &reference,
+            ProviderDiagnosticScope::Parent,
+            SessionLifecycle::ToolFailed {
+                tool: "bash",
+                class: ProviderDiagnosticClass::Tool,
+            },
+        );
+        store.record_session_lifecycle(
+            &reference,
+            ProviderDiagnosticScope::Parent,
+            SessionLifecycle::PermissionBlocked {
+                tool: "bash",
+                access: "write",
+            },
+        );
+        store.record_session_lifecycle(
+            &reference,
+            ProviderDiagnosticScope::Parent,
+            SessionLifecycle::TurnEnded {
+                outcome: TurnOutcome::Failed,
+            },
+        );
+
+        let recorded = recorded_lines(&temporary);
+        let events: Vec<&str> = recorded
+            .iter()
+            .filter_map(|line| line["event"].as_str())
+            .collect();
+
+        assert_eq!(
+            events,
+            vec![
+                "turn_started",
+                "tool_failed",
+                "permission_blocked",
+                "turn_ended"
+            ]
+        );
+        assert!(
+            recorded.iter().all(|line| line["component"] == "session"
+                && line["reference"] == "abcd1234"
+                && line["scope"] == "parent"),
+            "{recorded:?}"
+        );
+        assert_eq!(recorded[0]["model"], "moonshotai/kimi-k3");
+        assert_eq!(recorded[1]["tool"], "bash");
+        assert_eq!(recorded[1]["class"], "tool");
+        assert_eq!(recorded[2]["access"], "write");
+        assert!(
+            recorded[2].get("target").is_none(),
+            "a permission target can carry a secret and is never recorded: {:?}",
+            recorded[2]
+        );
+        assert_eq!(recorded[3]["outcome"], "failed");
+
+        std::fs::remove_dir_all(&temporary).ok();
+    }
+
+    /// The whole point is that a supervisor never has to read the terminal, so
+    /// a lifecycle line has to be readable on its own.
+    #[test]
+    fn a_lifecycle_line_carries_only_fields_that_apply_to_it() {
+        let temporary = std::env::temp_dir().join(format!(
+            "agens-diagnostic-lifecycle-shape-{}",
+            std::process::id()
+        ));
+        std::fs::remove_dir_all(&temporary).ok();
+        std::fs::create_dir_all(&temporary).expect("test data directory should be creatable");
+
+        let store = SafeDiagnosticStore::with_capture(temporary.clone(), true);
+        store.record_session_lifecycle(
+            &DiagnosticRef::new("abcd1234".to_owned()).unwrap(),
+            ProviderDiagnosticScope::Parent,
+            SessionLifecycle::TurnEnded {
+                outcome: TurnOutcome::Completed,
+            },
+        );
+
+        let recorded = recorded_lines(&temporary);
+        let line = recorded.first().expect("one line is recorded");
+
+        assert_eq!(line["outcome"], "completed");
+        assert!(line.get("tool").is_none(), "{line:?}");
+        assert!(line.get("model").is_none(), "{line:?}");
+        assert!(line["timestamp_ms"].is_u64(), "{line:?}");
+
+        std::fs::remove_dir_all(&temporary).ok();
+    }
+
+    /// Capture stays the single switch: `options.debug` off writes nothing at
+    /// all, lifecycle included.
+    #[test]
+    fn disabled_capture_records_no_lifecycle_event() {
+        let temporary = std::env::temp_dir().join(format!(
+            "agens-diagnostic-lifecycle-off-{}",
+            std::process::id()
+        ));
+        std::fs::remove_dir_all(&temporary).ok();
+        std::fs::create_dir_all(&temporary).expect("test data directory should be creatable");
+
+        SafeDiagnosticStore::with_capture(temporary.clone(), false).record_session_lifecycle(
+            &DiagnosticRef::new("abcd1234".to_owned()).unwrap(),
+            ProviderDiagnosticScope::Parent,
+            SessionLifecycle::TurnEnded {
+                outcome: TurnOutcome::Cancelled,
+            },
+        );
+
+        assert!(!temporary.join("diagnostics").exists());
+
+        std::fs::remove_dir_all(&temporary).ok();
+    }
+
+    fn recorded_lines(directory: &std::path::Path) -> Vec<serde_json::Value> {
+        std::fs::read_dir(directory.join("diagnostics"))
+            .expect("enabled capture should create the directory")
+            .filter_map(Result::ok)
+            .map(|entry| std::fs::read_to_string(entry.path()).unwrap_or_default())
+            .collect::<String>()
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).expect("each line is JSON"))
+            .collect()
     }
 }

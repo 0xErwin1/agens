@@ -15,8 +15,9 @@ use agens_core::{
     run_headless_turn_with_max_iterations_and_progress,
 };
 use agens_providers::{
-    ChatGptResponsesProvider, MediaBlobs, MoonshotProvider, OpenAiFunctionTool,
-    OpenAiResponsesProvider, ProgressAwareProvider, ProviderDiagnosticScope, ProviderFailureDetail,
+    ChatGptResponsesProvider, DiagnosticRef, MediaBlobs, MoonshotProvider, OpenAiFunctionTool,
+    OpenAiResponsesProvider, ProgressAwareProvider, ProviderDiagnosticClass,
+    ProviderDiagnosticScope, ProviderFailureDetail,
 };
 use agens_store::{PermissionGrantStore, SessionStore, ToolFactStore, open_media};
 use agens_tools::{
@@ -27,7 +28,10 @@ use agens_tools::{
 use agens_agents::{AgentModelCompatibility, agent_catalog};
 use agens_bootstrap::Bootstrap;
 use agens_bootstrap::effective_max_iterations;
-use agens_diagnostics::{operation_diagnostics_with_progress, record_parent_terminal};
+use agens_diagnostics::{
+    SafeDiagnosticStore, SessionLifecycle, TurnOutcome, diagnostic_store,
+    operation_diagnostics_with_progress, record_parent_terminal, record_session_lifecycle,
+};
 use agens_dispatch::ProductionToolDispatcher;
 use agens_error::{CliError, ExitStatus, cancellation_result};
 use agens_permissions::{
@@ -187,7 +191,18 @@ pub fn run_production_headless_chat_with_progress(
     let resolved = match resolve_turn_provider(bootstrap, requested_model.as_deref()) {
         Ok(resolved) => resolved,
         Err(error) => {
+            // Still a turn that ended: a supervisor waiting on `turn_ended`
+            // would otherwise wait forever on the one failure that happens
+            // before a provider is even chosen.
             let failure = HeadlessChatFailure::from(error);
+            record_session_lifecycle(
+                bootstrap,
+                &diagnostic_reference,
+                ProviderDiagnosticScope::Parent,
+                SessionLifecycle::TurnEnded {
+                    outcome: TurnOutcome::Failed,
+                },
+            );
             record_parent_terminal(bootstrap, &diagnostic_reference, &failure.error);
             return Err(
                 failure.map_error(|error| error.with_diagnostic_reference(&diagnostic_reference))
@@ -195,6 +210,14 @@ pub fn run_production_headless_chat_with_progress(
         }
     };
     request.model = Some(resolved.model.clone());
+    record_session_lifecycle(
+        bootstrap,
+        &diagnostic_reference,
+        ProviderDiagnosticScope::Parent,
+        SessionLifecycle::TurnStarted {
+            model: &resolved.model,
+        },
+    );
 
     let result = match resolved.provider {
         ProviderKind::OpenAiApi => {
@@ -333,10 +356,108 @@ pub fn run_production_headless_chat_with_progress(
             )
         }
     };
+    record_session_lifecycle(
+        bootstrap,
+        &diagnostic_reference,
+        ProviderDiagnosticScope::Parent,
+        SessionLifecycle::TurnEnded {
+            outcome: turn_outcome(&result),
+        },
+    );
+
     result.map_err(|failure| {
         record_parent_terminal(bootstrap, &diagnostic_reference, &failure.error);
         failure.map_error(|error| error.with_diagnostic_reference(&diagnostic_reference))
     })
+}
+
+/// Cancellation is reported as itself rather than folded into failure: a
+/// supervisor that cannot tell the two apart will retry work the operator
+/// deliberately stopped.
+fn turn_outcome<T>(result: &Result<T, HeadlessChatFailure>) -> TurnOutcome {
+    match result {
+        Ok(_) => TurnOutcome::Completed,
+        Err(failure) if failure.error.category == "cancelled" => TurnOutcome::Cancelled,
+        Err(_) => TurnOutcome::Failed,
+    }
+}
+
+/// The tool a reported fact came from. The identity carries no name, but the
+/// fact's own shape does: a supervisor is told `bash` failed, not that call
+/// `toolu_017` did.
+const fn tool_fact_name(facts: &agens_core::ToolResultFacts) -> &'static str {
+    match facts {
+        agens_core::ToolResultFacts::Write { .. } => "write",
+        agens_core::ToolResultFacts::Edit { .. } => "edit",
+        agens_core::ToolResultFacts::Bash { .. } => "bash",
+        agens_core::ToolResultFacts::Read { .. } => "read",
+        agens_core::ToolResultFacts::Search { .. } => "search",
+        _ => "unknown",
+    }
+}
+
+/// `None` for a tool that succeeded.
+///
+/// A denial stays distinct from a failure: one means the operator said no and
+/// the other means the tool broke, and a supervisor that retries the first is
+/// overriding a decision rather than recovering from a fault.
+const fn tool_failure_class(
+    facts: &agens_core::ToolResultFacts,
+) -> Option<ProviderDiagnosticClass> {
+    let outcome = match facts {
+        agens_core::ToolResultFacts::Write { outcome, .. }
+        | agens_core::ToolResultFacts::Edit { outcome, .. }
+        | agens_core::ToolResultFacts::Bash { outcome, .. }
+        | agens_core::ToolResultFacts::Read { outcome, .. }
+        | agens_core::ToolResultFacts::Search { outcome, .. } => outcome,
+        // The enum is `#[non_exhaustive]`. A fact variant this build does not
+        // know reports nothing rather than guessing an outcome for it, so a new
+        // tool stays invisible to supervision until it is taught here.
+        _ => return None,
+    };
+
+    match outcome {
+        agens_core::ToolOutcome::Succeeded => None,
+        agens_core::ToolOutcome::Failed => Some(ProviderDiagnosticClass::Tool),
+        agens_core::ToolOutcome::Denied => Some(ProviderDiagnosticClass::Permission),
+        _ => None,
+    }
+}
+
+/// Wraps a prompter so a supervisor learns the session is waiting on a
+/// decision.
+///
+/// A decorator rather than a change to each `PermissionPrompter`: the
+/// implementations live in the terminal, the CLI and the subagent runtime, and
+/// none of them has this run's diagnostic store. Blocking is also the one
+/// session state nothing else reveals — the process is alive, spending nothing,
+/// and producing no output at all.
+struct RecordingPrompter {
+    inner: Box<dyn PermissionPrompter>,
+    store: SafeDiagnosticStore,
+    reference: DiagnosticRef,
+}
+
+impl PermissionPrompter for RecordingPrompter {
+    fn prompt(
+        &mut self,
+        context: &agens_permissions::PermissionPromptContext,
+        cancellation: &agens_core::HeadlessTurnCancellation,
+    ) -> Result<agens_permissions::PermissionPromptAnswer, agens_core::HeadlessTurnPortError> {
+        self.store.record_session_lifecycle(
+            &self.reference,
+            ProviderDiagnosticScope::Parent,
+            SessionLifecycle::PermissionBlocked {
+                tool: agens_core::bare_tool_name(&context.tool_identity).as_ref(),
+                access: match context.access {
+                    agens_core::ToolAccess::ReadOnly => "read_only",
+                    agens_core::ToolAccess::Write => "write",
+                },
+            },
+        );
+
+        self.inner.prompt(context, cancellation)
+    }
 }
 
 fn build_openai_provider_with_media(
@@ -689,8 +810,15 @@ where
         Arc::clone(&pending),
         Arc::clone(&prompts),
     );
+    let prompt_diagnostic_reference =
+        DiagnosticRef::new(context.diagnostic_reference.to_owned())
+            .map_err(|_| CliError::configuration("diagnostic reference is invalid"))?;
     let mut resolver = ProductionPermissionResolver::new(
-        context.prompter,
+        Box::new(RecordingPrompter {
+            inner: context.prompter,
+            store: diagnostic_store(context.bootstrap),
+            reference: prompt_diagnostic_reference.clone(),
+        }) as Box<dyn PermissionPrompter>,
         grant_store,
         grants,
         prompts,
@@ -762,6 +890,8 @@ where
                     other => progress(other),
                 }) as TurnProgressSink
             });
+            let lifecycle_store = diagnostic_store(context.bootstrap);
+            let lifecycle_reference = prompt_diagnostic_reference.clone();
             let accepted_partial_events = Arc::clone(&runtime_partial_events);
             let headless_progress: TurnProgressSink = Arc::new(move |event: TurnEvent| {
                 if !matches!(event, TurnEvent::ProviderPart(_) | TurnEvent::Usage(_))
@@ -771,6 +901,16 @@ where
                 }
                 if let TurnEvent::ToolResultFacts { identity, facts } = &event {
                     record_tool_result_fact(&fact_store, identity, facts);
+                    if let Some(class) = tool_failure_class(facts) {
+                        lifecycle_store.record_session_lifecycle(
+                            &lifecycle_reference,
+                            ProviderDiagnosticScope::Parent,
+                            SessionLifecycle::ToolFailed {
+                                tool: tool_fact_name(facts),
+                                class,
+                            },
+                        );
+                    }
                 }
                 if let Some(progress) = &forwarded_progress {
                     progress(event);

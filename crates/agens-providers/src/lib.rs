@@ -306,12 +306,15 @@ pub enum ProviderDiagnosticComponent {
     OauthRefresh,
     Subagent,
     Agent,
+    /// The session's own lifecycle, as opposed to one provider call inside it.
+    Session,
 }
 
 impl ProviderDiagnosticComponent {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Responses => "responses",
+            Self::Session => "session",
             Self::ChatCompletions => "chat_completions",
             Self::OauthRefresh => "oauth_refresh",
             Self::Subagent => "subagent",
@@ -331,6 +334,10 @@ pub enum ProviderDiagnosticKind {
     ReplayItemRejected,
     ReplayLimitExceeded,
     ToolOutputCorrelationRejected,
+    TurnStarted,
+    TurnEnded,
+    ToolFailed,
+    PermissionBlocked,
 }
 
 impl ProviderDiagnosticKind {
@@ -345,6 +352,10 @@ impl ProviderDiagnosticKind {
             Self::ReplayItemRejected => "replay_item_rejected",
             Self::ReplayLimitExceeded => "replay_limit_exceeded",
             Self::ToolOutputCorrelationRejected => "tool_output_correlation_rejected",
+            Self::TurnStarted => "turn_started",
+            Self::TurnEnded => "turn_ended",
+            Self::ToolFailed => "tool_failed",
+            Self::PermissionBlocked => "permission_blocked",
         }
     }
 }

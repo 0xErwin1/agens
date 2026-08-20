@@ -123,6 +123,7 @@ fn safe_diagnostic_entry(value: &serde_json::Value, relative_path: &str) -> Opti
             "oauth_refresh",
             "subagent",
             "agent",
+            "session",
         ],
     )?;
     let event = allowlisted_diagnostic_value(
@@ -138,6 +139,10 @@ fn safe_diagnostic_entry(value: &serde_json::Value, relative_path: &str) -> Opti
             "replay_item_rejected",
             "replay_limit_exceeded",
             "tool_output_correlation_rejected",
+            "turn_started",
+            "turn_ended",
+            "tool_failed",
+            "permission_blocked",
         ],
     )?;
     let attempt = object
@@ -431,6 +436,7 @@ mod tests {
                 ProviderDiagnosticComponent::OauthRefresh => component.as_str(),
                 ProviderDiagnosticComponent::Subagent => component.as_str(),
                 ProviderDiagnosticComponent::Agent => component.as_str(),
+                ProviderDiagnosticComponent::Session => component.as_str(),
             }
         }
 
@@ -440,6 +446,7 @@ mod tests {
             ProviderDiagnosticComponent::OauthRefresh,
             ProviderDiagnosticComponent::Subagent,
             ProviderDiagnosticComponent::Agent,
+            ProviderDiagnosticComponent::Session,
         ] {
             let component_str = component_as_str(component);
             assert!(
