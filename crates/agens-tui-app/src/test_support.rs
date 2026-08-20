@@ -41,6 +41,7 @@ pub use agens_fixtures::{
     bootstrap_from_a_different_working_directory, bootstrap_from_configuration,
     session_bootstrap as tui_session_bootstrap,
     session_bootstrap_for_provider as tui_session_bootstrap_for_provider,
+    session_bootstrap_from_credentials as tui_session_bootstrap_from_credentials,
     session_bootstrap_without_provider as tui_session_bootstrap_without_provider,
     session_directory as tui_session_directory, try_bootstrap_from_configuration, wait_for,
 };

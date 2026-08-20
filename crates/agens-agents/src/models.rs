@@ -10,7 +10,6 @@ use agens_bootstrap::Bootstrap;
 use agens_error::CliError;
 use agens_models::{ModelSelection, ModelSource, QualifiedModel};
 use agens_session::context::SessionContext;
-use agens_session::model::model_source;
 use agens_session::provider::{authenticated_sources, bootstrap_authentication};
 use agens_tools::{AgentModelValidationError, AgentModelValidator};
 
@@ -37,8 +36,13 @@ impl AgentModelCompatibility {
         })
     }
 
-    pub fn for_context(bootstrap: &Bootstrap, context: &SessionContext) -> Result<Self, CliError> {
-        Self::for_source(model_source(bootstrap, context))
+    /// A validator for a live session.
+    ///
+    /// Built from what this run can authenticate rather than from the session's
+    /// own provider: an agent names its provider through its model, and the
+    /// session's is not the only one it may name.
+    pub fn for_context(bootstrap: &Bootstrap, _: &SessionContext) -> Result<Self, CliError> {
+        Self::for_authenticated(authenticated_sources(&bootstrap_authentication(bootstrap)))
     }
 
     pub fn is_available(&self, model: &str) -> bool {

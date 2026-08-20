@@ -56,6 +56,19 @@ fn config_home_environment(config_home: &Path) -> BTreeMap<String, String> {
     )])
 }
 
+/// The provider a configuration fragment names, defaulting to the OpenAI API
+/// the way the untouched fixtures always have.
+fn configured_provider(global: Option<&str>) -> &'static str {
+    let Some(global) = global else {
+        return "openai-api";
+    };
+
+    ["openai-chatgpt", "moonshotai", "openai-api"]
+        .into_iter()
+        .find(|provider| global.contains(&format!("\"{provider}\"")))
+        .unwrap_or("openai-api")
+}
+
 /// The credentials a fixture provider needs to authenticate.
 ///
 /// A run now picks its provider from the model it was given, and only from
@@ -101,11 +114,17 @@ pub fn try_bootstrap_from_configuration(
     let config_home = temporary.join("config");
     let project_root = temporary.join("project");
 
+    // Credentials for the provider this configuration actually names: a run can
+    // only select a provider it can authenticate, and authenticating a second
+    // one would make a bare model identifier ambiguous.
+    let provider = configured_provider(global);
+    let credentials = config_home.join("auth.json");
+    std::fs::create_dir_all(&config_home).expect("fixture config home should be created");
+    std::fs::write(&credentials, provider_credentials(provider))
+        .expect("fixture credentials should be written");
+
     let mut files = BTreeMap::new();
-    files.insert(
-        config_home.join("auth.json"),
-        provider_credentials("openai-api"),
-    );
+    files.insert(credentials, provider_credentials(provider));
     if let Some(global) = global {
         files.insert(config_home.join("config.toml"), global.to_owned());
     }
@@ -162,6 +181,57 @@ pub fn session_directory(label: &str) -> PathBuf {
     std::fs::create_dir_all(temporary.join("project/.git"))
         .expect("fixture project directory should be created");
     temporary
+}
+
+/// A `Bootstrap` fixture with several providers authenticated and no
+/// `provider.type` at all, so the provider can only come from the model.
+pub fn session_bootstrap_from_credentials(
+    temporary: &Path,
+    agents: &[(&str, &str)],
+    providers: &[&str],
+    model: &str,
+) -> Bootstrap {
+    let config_home = temporary.join("config");
+    let agents_directory = config_home.join("agents");
+
+    std::fs::create_dir_all(&agents_directory).expect("fixture agents directory should be created");
+    for (name, contents) in agents {
+        std::fs::write(agents_directory.join(format!("{name}.md")), contents)
+            .expect("fixture agent definition should be written");
+    }
+
+    let entries: Vec<String> = providers
+        .iter()
+        .map(|provider| {
+            let single = provider_credentials(provider);
+            let inner = single.trim();
+            inner
+                .strip_prefix('{')
+                .and_then(|value| value.strip_suffix('}'))
+                .expect("fixture credentials are a JSON object")
+                .to_owned()
+        })
+        .collect();
+    let credentials = format!("{{{}}}", entries.join(", "));
+    std::fs::write(config_home.join("auth.json"), &credentials)
+        .expect("fixture credentials should be written");
+
+    resolve(
+        temporary.join("project"),
+        Some(temporary.join("home")),
+        config_home_environment(&config_home),
+        BTreeMap::from([
+            (
+                config_home.join("config.toml"),
+                format!(
+                    "[provider]\nmodel = \"{model}\"\n\n[options]\ndata_dir = \"{}\"\n",
+                    temporary.join("data").display()
+                ),
+            ),
+            (config_home.join("auth.json"), credentials),
+        ]),
+    )
+    .expect("session bootstrap fixture should be valid")
 }
 
 /// A `Bootstrap` fixture wired for the OpenAI API provider, with the given

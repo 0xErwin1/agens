@@ -214,8 +214,15 @@ fn apply_configured_agent_profile(
     }
 
     let requested = bare_model_identifier(&profile.model.value);
-    let mut selection =
-        agens_models::ModelSelection::for_source(&session_model, model_source(bootstrap, context));
+    // The source comes from the model itself: a session-wide provider would
+    // reject an agent that named a different one.
+    let source = agens_session::provider::resolve_provider_for_model(
+        Some(&profile.model.value),
+        &agens_session::provider::bootstrap_authentication(bootstrap),
+    )
+    .map(|resolved| resolved.provider.source())
+    .unwrap_or_else(|_| model_source(bootstrap, context));
+    let mut selection = agens_models::ModelSelection::for_source(&session_model, source);
     if selection.apply_model(&requested).is_err() {
         if profile.model.origin == ProfileOrigin::SessionInherited {
             selection.apply_unverified_model(&requested).map_err(|_| {

@@ -496,8 +496,8 @@ mod tests {
         bootstrap_from_a_different_working_directory, bootstrap_from_configuration,
         persist_tui_session, persist_tui_session_metadata, render_tui_test_backend,
         rotation_dispatcher, tui_project, tui_session_bootstrap,
-        tui_session_bootstrap_for_provider, tui_session_bootstrap_with_global_bypass,
-        tui_session_directory, tui_session_messages,
+        tui_session_bootstrap_for_provider, tui_session_bootstrap_from_credentials,
+        tui_session_bootstrap_with_global_bypass, tui_session_directory, tui_session_messages,
     };
     use agens_agents::ensure_active_agent_runtime;
     use agens_callcount::{Counts, counts as call_counts, reset as reset_call_counts};
@@ -1577,6 +1577,56 @@ mod tests {
         assert_eq!(
             persisted.reasoning_effort,
             Some(agens_core::ReasoningEffort::High)
+        );
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    /// The shape this design exists for: two providers authenticated, no
+    /// `provider.type` anywhere, and each agent naming its own through its
+    /// model identifier.
+    #[test]
+    fn an_agent_names_its_provider_with_no_global_setting_present() {
+        let temporary = tui_session_directory("no-global-provider");
+        let bootstrap = tui_session_bootstrap_from_credentials(
+            &temporary,
+            &[(
+                "primary",
+                "---\nname: primary\ndescription: primary\nmode: primary\nmodel: moonshotai/kimi-k3\npermissions: []\n---\nWork.\n",
+            )],
+            &["moonshotai", "openai-chatgpt"],
+            "moonshotai/kimi-k3",
+        );
+        let mut store = SessionStore::open(bootstrap.data_directory()).unwrap();
+        let metadata = persist_tui_session_metadata(
+            &mut store,
+            &tui_project(&temporary),
+            "no-global",
+            "primary",
+            100,
+        );
+        drop(store);
+
+        let resumed = resume_tui_session(
+            &bootstrap,
+            metadata.id,
+            &SkillCatalog::default(),
+            &CredentialResolver::production(),
+        )
+        .unwrap()
+        .context;
+
+        assert_eq!(
+            resumed
+                .selection
+                .as_ref()
+                .expect("the agent's own model is selected")
+                .model(),
+            "kimi-k3"
+        );
+        assert_eq!(
+            apply_session_to_request(&resumed, bare_headless_request()).model,
+            Some("moonshotai/kimi-k3".to_owned())
         );
 
         std::fs::remove_dir_all(temporary).unwrap();
