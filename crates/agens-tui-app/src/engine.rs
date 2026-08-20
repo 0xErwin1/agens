@@ -965,7 +965,7 @@ mod tests {
             "gpt-5.6-sol"
         );
         let request = agens_headless::apply_session_to_request(&context, bare_headless_request());
-        assert_eq!(request.model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(request.model.as_deref(), Some("openai-chatgpt/gpt-5.6-sol"));
         assert_eq!(
             request.request_config.reasoning_effort(),
             Some(agens_core::ReasoningEffort::High)

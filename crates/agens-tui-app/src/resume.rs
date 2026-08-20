@@ -1540,15 +1540,17 @@ mod tests {
         let effort = request
             .session_reasoning_effort
             .or_else(|| request.request_config.reasoning_effort());
-        assert_eq!(model, "gpt-5.6-sol");
+        assert_eq!(model, "openai-chatgpt/gpt-5.6-sol");
         assert_eq!(effort, Some(agens_core::ReasoningEffort::High));
+        // A turn persists the identifier it resolved, not the qualified one the
+        // request carried: the row already records the provider beside it.
         let next = next_session_metadata(
             &bootstrap,
             "continued",
             request.session.as_ref(),
             request.active_agent.as_deref(),
             Some("openai-chatgpt".into()),
-            model,
+            "gpt-5.6-sol".to_owned(),
             effort,
         )
         .unwrap();
@@ -1580,11 +1582,11 @@ mod tests {
         std::fs::remove_dir_all(temporary).unwrap();
     }
 
-    /// A provider-qualified identifier names the provider the session already
-    /// speaks to, so it resolves; what reaches the request is the bare model
-    /// identifier the provider's API accepts.
+    /// A provider-qualified agent model resolves, selecting the bare identifier
+    /// the provider's API accepts while the request keeps carrying which
+    /// provider it belongs to.
     #[test]
-    fn a_provider_qualified_agent_model_resolves_to_its_bare_identifier() {
+    fn a_provider_qualified_agent_model_selects_its_bare_identifier() {
         let temporary = tui_session_directory("qualified-model");
         let bootstrap = tui_session_bootstrap_for_provider(
             &temporary,
@@ -1624,7 +1626,7 @@ mod tests {
         );
         assert_eq!(
             apply_session_to_request(&resumed, bare_headless_request()).model,
-            Some("kimi-k3".to_owned())
+            Some("moonshotai/kimi-k3".to_owned())
         );
 
         std::fs::remove_dir_all(temporary).unwrap();
