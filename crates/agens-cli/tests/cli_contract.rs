@@ -2191,6 +2191,10 @@ fn table_b_ratified_deltas_hold() {
 /// writes real credentials, so it runs against a throwaway
 /// `AGENS_CONFIG_HOME` scoped to this case's own [`TemporaryDirectory`], and
 /// it asserts only that a credentials file now exists — never its contents.
+///
+/// The input context is pinned rather than inherited: `--api-key` is only
+/// honored when standard input is not a terminal, so a run under a PTY would
+/// otherwise see the terminal refusal instead of this login.
 #[test]
 fn table_b_equals_flag_credential_write_is_pinned() {
     let temporary = TemporaryDirectory::new("ratified-auth-login-api-key-equals-flag");
@@ -2206,7 +2210,8 @@ fn table_b_equals_flag_credential_write_is_pinned() {
         Some(temporary.home()),
         environment,
         BTreeMap::new(),
-    );
+    )
+    .with_stdin_is_terminal(false);
 
     let actual = execute(
         argv(&["auth", "login", "api-key", "openai-api", "--api-key=k"])
@@ -2219,6 +2224,49 @@ fn table_b_equals_flag_credential_write_is_pinned() {
     assert!(
         credentials_path.is_file(),
         "auth login api-key ... --api-key=k should write a credentials file, found none at {}",
+        credentials_path.display()
+    );
+}
+
+/// The other side of that seam: with standard input on a terminal,
+/// `--api-key` is refused, because a terminal login reads the key from a
+/// hidden prompt instead. No credentials file is written.
+#[test]
+fn table_b_equals_flag_credential_write_is_refused_on_a_terminal() {
+    let temporary =
+        TemporaryDirectory::new("ratified-auth-login-api-key-equals-flag-on-a-terminal");
+    let config_home = temporary.path().join("throwaway-config-home");
+    let credentials_path = config_home.join("auth.json");
+    let mut environment = BTreeMap::new();
+    environment.insert(
+        "AGENS_CONFIG_HOME".to_owned(),
+        config_home.display().to_string(),
+    );
+    let dependencies = CliDependencies::for_test(
+        temporary.project_root(),
+        Some(temporary.home()),
+        environment,
+        BTreeMap::new(),
+    )
+    .with_stdin_is_terminal(true);
+
+    let actual = execute(
+        argv(&["auth", "login", "api-key", "openai-api", "--api-key=k"])
+            .iter()
+            .map(String::as_str),
+        &dependencies,
+    );
+
+    assert_eq!(
+        actual,
+        failure(
+            ExitStatus::Usage,
+            "usage: auth login api-key does not accept --api-key from a terminal",
+        )
+    );
+    assert!(
+        !credentials_path.exists(),
+        "a refused terminal login must not write credentials, found a file at {}",
         credentials_path.display()
     );
 }

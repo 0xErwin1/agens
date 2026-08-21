@@ -2,7 +2,7 @@
 //! interactive and API-key login flows, and clears stored credentials on logout.
 
 use std::fs;
-use std::io::{IsTerminal, Read, Write};
+use std::io::{Read, Write};
 use std::path::Path;
 
 use agens_core::HeadlessTurnCancellation;
@@ -167,7 +167,7 @@ fn run_api_key_login(
     }
 
     let supplied_key = validate_api_key_flag(api_key)?;
-    let api_key = read_api_key(supplied_key.as_deref())?;
+    let api_key = read_api_key(supplied_key.as_deref(), dependencies)?;
     let bootstrap = bootstrap(dependencies)?;
     upsert_provider_entry(
         &bootstrap.paths.credentials,
@@ -197,8 +197,11 @@ fn validate_api_key_flag(api_key: Option<String>) -> Result<Option<String>, CliE
     }
 }
 
-fn read_api_key(supplied_key: Option<&str>) -> Result<String, CliError> {
-    if std::io::stdin().is_terminal() {
+fn read_api_key(
+    supplied_key: Option<&str>,
+    dependencies: &CliDependencies,
+) -> Result<String, CliError> {
+    if (dependencies.stdin_is_terminal)() {
         if supplied_key.is_some() {
             return Err(CliError::usage(
                 "auth login api-key does not accept --api-key from a terminal",
