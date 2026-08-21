@@ -21,7 +21,7 @@ use agens_headless::{
     headless_turn_own_system_prompt, headless_turn_permission_policy, headless_turn_project_root,
     headless_turn_provider_base_url, headless_turn_system_prompt,
 };
-use agens_store::{DirectiveGrain, DirectiveStore, SessionStore, ToolFactStore};
+use agens_store::{DirectiveGrain, DirectiveStore, DirectiveTarget, SessionStore, ToolFactStore};
 use agens_tools::SkillCatalog;
 
 use agens_tui_app::permission_prompt::TtyPermissionPrompter;
@@ -951,7 +951,7 @@ fn production_headless_turn_persists_the_turn_directives_it_delivered_before_the
         DirectiveStore::open(&data_directory).expect("directive queue should open");
     directives
         .enqueue(
-            1,
+            &DirectiveTarget::Session(1),
             IntraTurnInputSource::Supervisor,
             DirectiveGrain::Turn,
             "replan before answering",
@@ -959,7 +959,7 @@ fn production_headless_turn_persists_the_turn_directives_it_delivered_before_the
         .expect("supervisor directive should enqueue");
     directives
         .enqueue(
-            1,
+            &DirectiveTarget::Session(1),
             IntraTurnInputSource::Human,
             DirectiveGrain::Turn,
             "and keep it short",

@@ -6,10 +6,10 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use agens_core::{
-    CompletedSessionTurn, CompletedTurnSnapshot, IntraTurnInputSource, Message, MessagePart, Role,
-    SessionMessage, SessionMetadata, TurnEvent,
+    CompletedSessionTurn, CompletedTurnSnapshot, Message, MessagePart, Role, SessionMessage,
+    SessionMetadata, TurnEvent,
 };
-use agens_store::{DirectiveGrain, DirectiveStore, SessionStore};
+use agens_store::{DirectiveGrain, DirectiveStore, DirectiveTarget, SessionStore};
 
 use crate::context::CompletedSubagentTurn;
 use crate::context::SessionContext;
@@ -28,16 +28,13 @@ pub fn drain_turn_directive_messages(
     let mut store = DirectiveStore::open(data_directory)
         .map_err(|_| CliError::storage("session directives are unavailable"))?;
     let directives = store
-        .drain(session_id, DirectiveGrain::Turn)
+        .drain(&DirectiveTarget::Session(session_id), DirectiveGrain::Turn)
         .map_err(|_| CliError::storage("session directives could not be drained"))?;
 
     Ok(directives
         .into_iter()
         .map(|directive| Message {
-            role: match directive.source {
-                IntraTurnInputSource::Human => Role::User,
-                IntraTurnInputSource::Supervisor => Role::Supervisor,
-            },
+            role: directive.source.role(),
             parts: vec![MessagePart::Text(directive.text)],
         })
         .collect())
@@ -167,10 +164,7 @@ pub fn completed_session_turn_from_events_with_media(
                     flush_parts(&mut messages, role, &mut parts);
                 }
                 messages.push(Message {
-                    role: match source {
-                        IntraTurnInputSource::Human => Role::User,
-                        IntraTurnInputSource::Supervisor => Role::Supervisor,
-                    },
+                    role: source.role(),
                     parts: vec![MessagePart::Text(text.clone())],
                 });
                 continue;

@@ -58,7 +58,8 @@ fn a_remembered_model_and_effort_survive_a_reopen_as_one_selection() {
             "0010_prompt_memory_media",
             "0011_session_fork_lineage",
             "0012_directives",
-            "0013_supervisor_role"
+            "0013_supervisor_role",
+            "0014_directive_child_target"
         ]
     );
     drop(connection);

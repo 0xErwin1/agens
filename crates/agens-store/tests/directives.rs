@@ -1,5 +1,5 @@
 use agens_core::IntraTurnInputSource;
-use agens_store::{DirectiveGrain, DirectiveStore};
+use agens_store::{DirectiveGrain, DirectiveStore, DirectiveTarget};
 
 struct Temporary {
     path: std::path::PathBuf,
@@ -33,7 +33,7 @@ fn a_queued_directive_is_delivered_once_and_in_order() {
 
     store
         .enqueue(
-            7,
+            &DirectiveTarget::Session(7),
             IntraTurnInputSource::Human,
             DirectiveGrain::ToolCall,
             "first",
@@ -41,14 +41,16 @@ fn a_queued_directive_is_delivered_once_and_in_order() {
         .unwrap();
     store
         .enqueue(
-            7,
+            &DirectiveTarget::Session(7),
             IntraTurnInputSource::Supervisor,
             DirectiveGrain::ToolCall,
             "second",
         )
         .unwrap();
 
-    let drained = store.drain(7, DirectiveGrain::ToolCall).unwrap();
+    let drained = store
+        .drain(&DirectiveTarget::Session(7), DirectiveGrain::ToolCall)
+        .unwrap();
 
     assert_eq!(
         drained
@@ -61,7 +63,10 @@ fn a_queued_directive_is_delivered_once_and_in_order() {
         ]
     );
     assert!(
-        store.drain(7, DirectiveGrain::ToolCall).unwrap().is_empty(),
+        store
+            .drain(&DirectiveTarget::Session(7), DirectiveGrain::ToolCall)
+            .unwrap()
+            .is_empty(),
         "a delivered directive is never handed over twice"
     );
 }
@@ -74,7 +79,7 @@ fn each_grain_is_drained_on_its_own() {
 
     store
         .enqueue(
-            1,
+            &DirectiveTarget::Session(1),
             IntraTurnInputSource::Supervisor,
             DirectiveGrain::Turn,
             "replan",
@@ -82,18 +87,26 @@ fn each_grain_is_drained_on_its_own() {
         .unwrap();
     store
         .enqueue(
-            1,
+            &DirectiveTarget::Session(1),
             IntraTurnInputSource::Human,
             DirectiveGrain::ToolCall,
             "use the manifest",
         )
         .unwrap();
 
-    let at_tool_call = store.drain(1, DirectiveGrain::ToolCall).unwrap();
+    let at_tool_call = store
+        .drain(&DirectiveTarget::Session(1), DirectiveGrain::ToolCall)
+        .unwrap();
 
     assert_eq!(at_tool_call.len(), 1);
     assert_eq!(at_tool_call[0].text, "use the manifest");
-    assert_eq!(store.drain(1, DirectiveGrain::Turn).unwrap().len(), 1);
+    assert_eq!(
+        store
+            .drain(&DirectiveTarget::Session(1), DirectiveGrain::Turn)
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 /// One session's queue never reaches another's.
@@ -103,15 +116,26 @@ fn a_directive_is_scoped_to_its_session() {
 
     store
         .enqueue(
-            1,
+            &DirectiveTarget::Session(1),
             IntraTurnInputSource::Human,
             DirectiveGrain::ToolCall,
             "for one",
         )
         .unwrap();
 
-    assert!(store.drain(2, DirectiveGrain::ToolCall).unwrap().is_empty());
-    assert_eq!(store.drain(1, DirectiveGrain::ToolCall).unwrap().len(), 1);
+    assert!(
+        store
+            .drain(&DirectiveTarget::Session(2), DirectiveGrain::ToolCall)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .drain(&DirectiveTarget::Session(1), DirectiveGrain::ToolCall)
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 /// A queue that survives the process is the point: a message written while the
@@ -122,7 +146,7 @@ fn a_queued_directive_survives_a_reopen() {
     DirectiveStore::open(&temporary.path)
         .unwrap()
         .enqueue(
-            3,
+            &DirectiveTarget::Session(3),
             IntraTurnInputSource::Supervisor,
             DirectiveGrain::ToolCall,
             "still here",
@@ -131,7 +155,7 @@ fn a_queued_directive_survives_a_reopen() {
 
     let drained = DirectiveStore::open(&temporary.path)
         .unwrap()
-        .drain(3, DirectiveGrain::ToolCall)
+        .drain(&DirectiveTarget::Session(3), DirectiveGrain::ToolCall)
         .unwrap();
 
     assert_eq!(drained.len(), 1);
@@ -144,7 +168,12 @@ fn an_empty_directive_is_refused() {
 
     assert!(
         store
-            .enqueue(1, IntraTurnInputSource::Human, DirectiveGrain::ToolCall, "")
+            .enqueue(
+                &DirectiveTarget::Session(1),
+                IntraTurnInputSource::Human,
+                DirectiveGrain::ToolCall,
+                ""
+            )
             .is_err()
     );
 }
@@ -160,7 +189,7 @@ fn the_turn_facing_inbox_ignores_the_turn_grain() {
     let mut store = DirectiveStore::open(&temporary.path).unwrap();
     store
         .enqueue(
-            5,
+            &DirectiveTarget::Session(5),
             IntraTurnInputSource::Supervisor,
             DirectiveGrain::Turn,
             "replan",
@@ -168,14 +197,14 @@ fn the_turn_facing_inbox_ignores_the_turn_grain() {
         .unwrap();
     store
         .enqueue(
-            5,
+            &DirectiveTarget::Session(5),
             IntraTurnInputSource::Human,
             DirectiveGrain::ToolCall,
             "use the manifest",
         )
         .unwrap();
 
-    let mut inbox = DirectiveInbox::new(store, 5);
+    let mut inbox = DirectiveInbox::new(store, DirectiveTarget::Session(5));
     let drained = block_on(inbox.drain()).expect("the inbox reads");
 
     assert_eq!(drained.len(), 1);
@@ -193,4 +222,107 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
             return value;
         }
     }
+}
+
+/// The one property that makes a child inbox safe to add: two addressees never
+/// see each other's queue. Several children run under one session at a time, so
+/// a shared queue would hand a parent's message to whichever child drained
+/// first, and nothing would record that it happened.
+#[test]
+fn a_child_and_its_session_never_read_each_others_queue() {
+    let (_temporary, mut store) = store("child-isolation");
+
+    store
+        .enqueue(
+            &DirectiveTarget::Session(9),
+            IntraTurnInputSource::Supervisor,
+            DirectiveGrain::ToolCall,
+            "for the parent turn",
+        )
+        .unwrap();
+    store
+        .enqueue(
+            &DirectiveTarget::Child("a1b2c3d4".into()),
+            IntraTurnInputSource::Supervisor,
+            DirectiveGrain::ToolCall,
+            "for the child turn",
+        )
+        .unwrap();
+    store
+        .enqueue(
+            &DirectiveTarget::Child("e5f6a7b8".into()),
+            IntraTurnInputSource::Human,
+            DirectiveGrain::ToolCall,
+            "for the sibling",
+        )
+        .unwrap();
+
+    let child = store
+        .drain(
+            &DirectiveTarget::Child("a1b2c3d4".into()),
+            DirectiveGrain::ToolCall,
+        )
+        .unwrap();
+    assert_eq!(
+        child
+            .iter()
+            .map(|directive| directive.text.as_str())
+            .collect::<Vec<_>>(),
+        vec!["for the child turn"]
+    );
+
+    let session = store
+        .drain(&DirectiveTarget::Session(9), DirectiveGrain::ToolCall)
+        .unwrap();
+    assert_eq!(
+        session
+            .iter()
+            .map(|directive| directive.text.as_str())
+            .collect::<Vec<_>>(),
+        vec!["for the parent turn"],
+        "a child draining first must not consume the parent's message"
+    );
+
+    let sibling = store
+        .drain(
+            &DirectiveTarget::Child("e5f6a7b8".into()),
+            DirectiveGrain::ToolCall,
+        )
+        .unwrap();
+    assert_eq!(sibling.len(), 1);
+}
+
+/// A child turn reads its own address and nothing else, through the same
+/// tool-call-grain inbox the parent turn uses.
+#[test]
+fn the_child_inbox_reads_only_what_names_that_child() {
+    use agens_core::HeadlessIntraTurnInbox;
+    use agens_store::DirectiveInbox;
+
+    let temporary = Temporary::new("child-inbox");
+    let mut store = DirectiveStore::open(&temporary.path).unwrap();
+    store
+        .enqueue(
+            &DirectiveTarget::Session(4),
+            IntraTurnInputSource::Human,
+            DirectiveGrain::ToolCall,
+            "parent only",
+        )
+        .unwrap();
+    store
+        .enqueue(
+            &DirectiveTarget::Child("0f0f0f0f".into()),
+            IntraTurnInputSource::Supervisor,
+            DirectiveGrain::ToolCall,
+            "narrow the search",
+        )
+        .unwrap();
+    drop(store);
+
+    let mut inbox = DirectiveInbox::for_child(&temporary.path, "0f0f0f0f");
+    let drained = block_on(inbox.drain()).expect("the inbox reads");
+
+    assert_eq!(drained.len(), 1);
+    assert_eq!(drained[0].text, "narrow the search");
+    assert_eq!(drained[0].source, IntraTurnInputSource::Supervisor);
 }

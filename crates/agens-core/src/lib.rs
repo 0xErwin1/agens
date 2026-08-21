@@ -668,6 +668,18 @@ impl IntraTurnInputSource {
             Self::Supervisor => "supervisor",
         }
     }
+
+    /// The speaker this input is encoded as once it enters a history.
+    ///
+    /// Defined here rather than at each encoder, so the turn that hands the
+    /// message to a provider mid-flight and the store that writes it down
+    /// afterwards can never disagree about who spoke.
+    pub const fn role(self) -> Role {
+        match self {
+            Self::Human => Role::User,
+            Self::Supervisor => Role::Supervisor,
+        }
+    }
 }
 
 /// Why a turn is waiting before it tries the provider again.
@@ -2113,6 +2125,39 @@ pub async fn run_isolated_headless_turn_with_progress(
     .await
 }
 
+/// An isolated child turn that a supervisor can reach while it runs.
+///
+/// Separate from [`run_isolated_headless_turn_with_progress`] for the same
+/// reason the parent has two entry points: a delegation nobody is watching
+/// should not have to name an inbox it will never read.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_isolated_headless_turn_with_inbox(
+    provider: &mut impl TurnProvider,
+    permission_gate: &mut impl HeadlessPermissionGate,
+    permission_resolver: &mut impl HeadlessPermissionResolver,
+    dispatcher: &mut impl HeadlessToolDispatcher,
+    repository: &mut impl CompletedTurnRepository,
+    cancellation: &HeadlessTurnCancellation,
+    progress: Option<&TurnProgressSink>,
+    attempt: Option<AttemptKey>,
+    inbox: &mut impl HeadlessIntraTurnInbox,
+) -> Result<CompletedTurnSnapshot, HeadlessTurnError> {
+    run_headless_turn_with_iteration_limit(
+        provider,
+        permission_gate,
+        permission_resolver,
+        dispatcher,
+        repository,
+        cancellation,
+        None,
+        progress,
+        attempt,
+        AskUnreachable::PromptIsUnreachable,
+        inbox,
+    )
+    .await
+}
+
 /// Whether a call resolving to [`PermissionDecision::Ask`] can actually
 /// reach a human. An isolated child turn has no such channel: its
 /// [`HeadlessPermissionResolver`] denies every `Ask` unconditionally, so a
@@ -2384,14 +2429,29 @@ async fn run_headless_turn_with_iteration_limit(
         // one point in a turn where another speaker can be added without
         // splitting a provider message or separating tool results from the
         // assistant turn that called them.
+        let mut queued = Vec::new();
         for input in inbox
             .drain()
             .await
             .map_err(|error| finish_port_error(&mut coordinator, error, HeadlessTurnError::State))?
         {
+            queued.push(Message {
+                role: input.source.role(),
+                parts: vec![MessagePart::Text(input.text.clone())],
+            });
             coordinator
                 .accept_intra_turn_input(input.source, input.text)
                 .map_err(|_| fail_state(&mut coordinator))?;
+        }
+        // Recorded and then handed over, in that order. The event is the durable
+        // trace of the steer, and the queue is what puts it in front of the model
+        // before the next request goes out: without this the message would only
+        // reach the model a whole turn later, which is the wait the tool-call
+        // grain exists to avoid.
+        if !queued.is_empty() {
+            provider.queue_user_messages(queued).map_err(|error| {
+                finish_port_error(&mut coordinator, error, HeadlessTurnError::Provider)
+            })?;
         }
         flush_progress(&coordinator, progress, &mut progress_cursor);
     }

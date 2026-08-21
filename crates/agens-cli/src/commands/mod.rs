@@ -37,10 +37,18 @@ pub(crate) fn dispatch(
         Some(cli::Command::Sessions { action }) => run_sessions(action, dependencies),
         Some(cli::Command::Direct {
             session,
+            child,
             at_turn_end,
             as_supervisor,
             message,
-        }) => run_direct(session, at_turn_end, as_supervisor, message, dependencies),
+        }) => run_direct(
+            session,
+            child,
+            at_turn_end,
+            as_supervisor,
+            message,
+            dependencies,
+        ),
         Some(cli::Command::Version) => Ok(format!("agens {}\n", env!("CARGO_PKG_VERSION"))),
     }
 }

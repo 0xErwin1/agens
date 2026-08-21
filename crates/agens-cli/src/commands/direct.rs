@@ -6,21 +6,19 @@
 
 use agens_core::IntraTurnInputSource;
 use agens_error::CliError;
-use agens_store::{DirectiveGrain, DirectiveStore, SessionStore};
+use agens_store::{DirectiveGrain, DirectiveStore, DirectiveTarget, SessionStore};
 
 use crate::CliDependencies;
 use crate::deps::bootstrap;
 
 pub(crate) fn run_direct(
-    session: String,
+    session: Option<String>,
+    child: Option<String>,
     at_turn_end: bool,
     as_supervisor: bool,
     message: Vec<String>,
     dependencies: &CliDependencies,
 ) -> Result<String, CliError> {
-    let session_id = session
-        .parse::<i64>()
-        .map_err(|_| CliError::usage("direct requires a numeric session id"))?;
     let message = message.join(" ");
     let message = message.trim();
     if message.is_empty() {
@@ -28,13 +26,41 @@ pub(crate) fn run_direct(
     }
 
     let bootstrap = bootstrap(dependencies)?;
-    // Refuse an unknown session here rather than letting the row sit in the
-    // queue forever: a message addressed to nothing is a typo, and the only
-    // moment anyone is present to hear about it is now.
-    SessionStore::open(&bootstrap.data_directory)
-        .map_err(|_| CliError::storage("sessions database is unavailable"))?
-        .load_session_for_resume(session_id)
-        .map_err(|_| CliError::usage("no session by that id"))?;
+    let (target, addressee) = match (session, child) {
+        (_, Some(child)) => {
+            let child = child.trim();
+            if child.is_empty() {
+                return Err(CliError::usage("direct requires a child reference"));
+            }
+            // Unverifiable on purpose. A delegated turn lives only inside the
+            // process running it and leaves no row behind, so there is nothing
+            // to look the reference up in — the reference itself is what the
+            // child published when it started.
+            (
+                DirectiveTarget::Child(child.to_owned()),
+                format!("child {child}"),
+            )
+        }
+        (Some(session), None) => {
+            let session_id = session
+                .parse::<i64>()
+                .map_err(|_| CliError::usage("direct requires a numeric session id"))?;
+            // Refuse an unknown session here rather than letting the row sit in
+            // the queue forever: a message addressed to nothing is a typo, and
+            // the only moment anyone is present to hear about it is now.
+            SessionStore::open(&bootstrap.data_directory)
+                .map_err(|_| CliError::storage("sessions database is unavailable"))?
+                .load_session_for_resume(session_id)
+                .map_err(|_| CliError::usage("no session by that id"))?;
+            (
+                DirectiveTarget::Session(session_id),
+                format!("session {session_id}"),
+            )
+        }
+        (None, None) => {
+            return Err(CliError::usage("direct requires a session id or --child"));
+        }
+    };
 
     let grain = if at_turn_end {
         DirectiveGrain::Turn
@@ -48,11 +74,11 @@ pub(crate) fn run_direct(
     };
 
     DirectiveStore::open(&bootstrap.data_directory)
-        .and_then(|mut store| store.enqueue(session_id, source, grain, message))
+        .and_then(|mut store| store.enqueue(&target, source, grain, message))
         .map_err(|_| CliError::storage("the directive could not be queued"))?;
 
     Ok(format!(
-        "Queued for session {session_id}, delivered at the next {}.\n",
+        "Queued for {addressee}, delivered at the next {}.\n",
         match grain {
             DirectiveGrain::ToolCall => "tool batch",
             DirectiveGrain::Turn => "turn end",
@@ -66,7 +92,7 @@ mod tests {
     use std::path::PathBuf;
 
     use agens_core::{IntraTurnInputSource, SessionMetadata};
-    use agens_store::{DirectiveGrain, DirectiveStore, SessionStore};
+    use agens_store::{DirectiveGrain, DirectiveStore, DirectiveTarget, SessionStore};
 
     use super::run_direct;
     use crate::CliDependencies;
@@ -121,7 +147,8 @@ mod tests {
             .session_id();
 
         let message = run_direct(
-            session_id.to_string(),
+            Some(session_id.to_string()),
+            None,
             false,
             true,
             vec!["change course".to_owned()],
@@ -135,7 +162,10 @@ mod tests {
         );
         let queued = DirectiveStore::open(&data_directory)
             .unwrap()
-            .drain(session_id, DirectiveGrain::ToolCall)
+            .drain(
+                &DirectiveTarget::Session(session_id),
+                DirectiveGrain::ToolCall,
+            )
             .unwrap();
         assert_eq!(
             queued
@@ -144,6 +174,80 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(IntraTurnInputSource::Supervisor, "change course")]
         );
+
+        std::fs::remove_dir_all(&data_home).ok();
+    }
+
+    /// A child turn is the longest stretch of a delegation and the one a
+    /// supervisor most needs to reach, so it is addressable by the reference
+    /// its own `turn_started` diagnostic published — without a session id,
+    /// which a delegation does not have.
+    #[test]
+    fn a_child_turn_is_addressable_by_the_reference_it_published() {
+        let data_home = std::env::temp_dir().join(format!(
+            "agens-direct-child-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::remove_dir_all(&data_home).ok();
+        let data_directory = data_home.join("agens");
+        std::fs::create_dir_all(&data_directory).unwrap();
+
+        let message = run_direct(
+            None,
+            Some("a1b2c3d4".to_owned()),
+            false,
+            true,
+            vec!["read the manifest first".to_owned()],
+            &dependencies(&data_home),
+        )
+        .unwrap();
+
+        assert_eq!(
+            message,
+            "Queued for child a1b2c3d4, delivered at the next tool batch.\n"
+        );
+        let queued = DirectiveStore::open(&data_directory)
+            .unwrap()
+            .drain(
+                &DirectiveTarget::Child("a1b2c3d4".to_owned()),
+                DirectiveGrain::ToolCall,
+            )
+            .unwrap();
+        assert_eq!(
+            queued
+                .iter()
+                .map(|directive| (directive.source, directive.text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(IntraTurnInputSource::Supervisor, "read the manifest first")]
+        );
+
+        std::fs::remove_dir_all(&data_home).ok();
+    }
+
+    /// Naming neither addressee is refused rather than defaulted. Guessing
+    /// which running turn a message meant would deliver it to the wrong one,
+    /// and a directive is only worth having if it lands where it was aimed.
+    #[test]
+    fn a_directive_addressed_to_nothing_is_refused() {
+        let data_home = std::env::temp_dir().join(format!(
+            "agens-direct-unaddressed-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::remove_dir_all(&data_home).ok();
+        std::fs::create_dir_all(data_home.join("agens")).unwrap();
+
+        let error = run_direct(
+            None,
+            None,
+            false,
+            false,
+            vec!["change course".to_owned()],
+            &dependencies(&data_home),
+        )
+        .expect_err("an unaddressed directive is refused");
+        assert!(error.to_string().contains("--child"), "{error}");
 
         std::fs::remove_dir_all(&data_home).ok();
     }

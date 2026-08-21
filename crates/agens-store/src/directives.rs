@@ -37,6 +37,31 @@ impl DirectiveGrain {
     }
 }
 
+/// Who a queued message is addressed to.
+///
+/// A delegated child does not read its parent session's queue. Several children
+/// run under one session at once, so whichever drained first would take a
+/// message meant for another and the parent turn would lose whatever a child
+/// reached before it. Each addressable turn reads only what names it.
+///
+/// A child is named by the diagnostic reference its own turn publishes when it
+/// starts, which is the only identity of a delegation that exists outside the
+/// process running it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DirectiveTarget {
+    Session(i64),
+    Child(String),
+}
+
+impl DirectiveTarget {
+    fn columns(&self) -> (Option<i64>, Option<&str>) {
+        match self {
+            Self::Session(id) => (Some(*id), None),
+            Self::Child(reference) => (None, Some(reference.as_str())),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DirectiveStoreError {
     message: String,
@@ -90,7 +115,7 @@ impl DirectiveStore {
 
     pub fn enqueue(
         &mut self,
-        session_id: i64,
+        target: &DirectiveTarget,
         source: IntraTurnInputSource,
         grain: DirectiveGrain,
         text: &str,
@@ -101,12 +126,14 @@ impl DirectiveStore {
             ));
         }
 
+        let (session_id, child) = target.columns();
         self.connection
             .execute(
-                "INSERT INTO directives (session_id, source, grain, text, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO directives (session_id, child, source, grain, text, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
                     session_id,
+                    child,
                     source.as_str(),
                     grain.as_str(),
                     text,
@@ -120,17 +147,18 @@ impl DirectiveStore {
         Ok(())
     }
 
-    /// Hands over every undelivered directive for one session and grain, oldest
-    /// first, and marks them delivered in the same transaction.
+    /// Hands over every undelivered directive for one addressee and grain,
+    /// oldest first, and marks them delivered in the same transaction.
     ///
     /// One transaction because the two halves cannot disagree: a directive read
     /// but not marked is delivered twice, and a directive marked but not
     /// returned is lost with no trace of what was meant to steer the turn.
     pub fn drain(
         &mut self,
-        session_id: i64,
+        target: &DirectiveTarget,
         grain: DirectiveGrain,
     ) -> Result<Vec<PendingIntraTurnInput>, DirectiveStoreError> {
+        let (session_id, child) = target.columns();
         let transaction = self
             .connection
             .transaction()
@@ -140,14 +168,15 @@ impl DirectiveStore {
             let mut statement = transaction
                 .prepare(
                     "SELECT id, source, text FROM directives
-                     WHERE session_id = ?1 AND grain = ?2 AND delivered_at IS NULL
+                     WHERE session_id IS ?1 AND child IS ?2 AND grain = ?3
+                       AND delivered_at IS NULL
                      ORDER BY id",
                 )
                 .map_err(|error| {
                     DirectiveStoreError::operation("drain", &self.database_path, error)
                 })?;
             statement
-                .query_map(params![session_id, grain.as_str()], |row| {
+                .query_map(params![session_id, child, grain.as_str()], |row| {
                     Ok((
                         row.get::<_, i64>(0)?,
                         row.get::<_, String>(1)?,
@@ -197,14 +226,14 @@ impl DirectiveStore {
 /// that grain belongs to whoever assembles the next prompt.
 pub struct DirectiveInbox {
     store: Option<DirectiveStore>,
-    session_id: i64,
+    target: DirectiveTarget,
 }
 
 impl DirectiveInbox {
-    pub const fn new(store: DirectiveStore, session_id: i64) -> Self {
+    pub const fn new(store: DirectiveStore, target: DirectiveTarget) -> Self {
         Self {
             store: Some(store),
-            session_id,
+            target,
         }
     }
 
@@ -215,9 +244,20 @@ impl DirectiveInbox {
     /// start over an unreadable inbox would make an optional channel a
     /// precondition for working at all.
     pub fn for_session(data_directory: impl AsRef<Path>, session_id: i64) -> Self {
+        Self::for_target(data_directory, DirectiveTarget::Session(session_id))
+    }
+
+    /// The inbox for one delegated child turn, named by the reference that
+    /// turn published when it started. Best-effort for the same reason: a
+    /// delegation nobody can reach still has work to finish.
+    pub fn for_child(data_directory: impl AsRef<Path>, reference: impl Into<String>) -> Self {
+        Self::for_target(data_directory, DirectiveTarget::Child(reference.into()))
+    }
+
+    fn for_target(data_directory: impl AsRef<Path>, target: DirectiveTarget) -> Self {
         Self {
             store: DirectiveStore::open(data_directory).ok(),
-            session_id,
+            target,
         }
     }
 }
@@ -230,9 +270,10 @@ impl HeadlessIntraTurnInbox for DirectiveInbox {
         // A queue that cannot be read is reported as empty rather than failing
         // the turn: losing a directive is bad, and killing work in progress over
         // an unreadable inbox is worse.
+        let target = &self.target;
         let drained = self.store.as_mut().map_or_else(Vec::new, |store| {
             store
-                .drain(self.session_id, DirectiveGrain::ToolCall)
+                .drain(target, DirectiveGrain::ToolCall)
                 .unwrap_or_default()
         });
 

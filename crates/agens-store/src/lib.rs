@@ -16,7 +16,9 @@ mod fact_store;
 mod media;
 mod prompt_memory;
 mod session_writer;
-pub use directives::{DirectiveGrain, DirectiveInbox, DirectiveStore, DirectiveStoreError};
+pub use directives::{
+    DirectiveGrain, DirectiveInbox, DirectiveStore, DirectiveStoreError, DirectiveTarget,
+};
 pub use fact_store::{ToolFactStore, ToolFactStoreError};
 pub use media::{
     MAX_MEDIA_BYTES, MediaRecord, MediaStoreError, guess_mime_from_bytes, guess_mime_from_path,

@@ -55,7 +55,13 @@ pub(crate) enum Command {
     #[command(about = "queue a message for a running session, delivered at its next safe point")]
     Direct {
         /// The session the message is for; a session only ever reads its own.
-        session: String,
+        #[arg(required_unless_present = "child", conflicts_with = "child")]
+        session: Option<String>,
+        /// A delegated child turn instead of a session, named by the reference
+        /// its `turn_started` diagnostic published. A child holds no session of
+        /// its own, so it reads only what names it.
+        #[arg(long, conflicts_with = "at_turn_end")]
+        child: Option<String>,
         /// Wait for the turn to end instead of the next tool batch. Use it when
         /// the message changes what the run is doing and the worker has to
         /// replan from a settled plan.

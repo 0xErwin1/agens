@@ -57,7 +57,7 @@ struct Migration {
     preserved_tables: &'static [&'static str],
 }
 
-const MIGRATIONS: [Migration; 13] = [
+const MIGRATIONS: [Migration; 14] = [
     Migration {
         id: "0001_permission_grants",
         ddl: permission_grants_ddl,
@@ -128,6 +128,11 @@ const MIGRATIONS: [Migration; 13] = [
         // rebuild proves preservation in a test of its own instead
         // (`a_supervisor_role_migration_keeps_every_message_and_part`).
         preserved_tables: &[],
+    },
+    Migration {
+        id: "0014_directive_child_target",
+        ddl: directive_child_target_ddl,
+        preserved_tables: &["directives"],
     },
 ];
 
@@ -504,6 +509,43 @@ fn directives_ddl() -> String {
     );
     CREATE INDEX directives_pending
         ON directives(session_id, grain, id)
+        WHERE delivered_at IS NULL;
+    "
+    .to_owned()
+}
+
+/// Gives a directive a second kind of addressee: a delegated child turn.
+///
+/// A child cannot read its parent session's queue. Several children run under
+/// one session at a time, so whichever drained first would take a message meant
+/// for another, and the parent turn would lose whatever a child got to first.
+/// The two columns are exclusive rather than a target kind plus one opaque id,
+/// because a session addressee is an integer with a foreign key's shape and a
+/// child addressee is the reference its own diagnostics publish.
+fn directive_child_target_ddl() -> String {
+    "
+    CREATE TABLE directives_keep AS SELECT * FROM directives;
+    DROP TABLE directives;
+    CREATE TABLE directives (
+        id INTEGER PRIMARY KEY,
+        session_id INTEGER,
+        child TEXT,
+        source TEXT NOT NULL CHECK(source IN ('human', 'supervisor')),
+        grain TEXT NOT NULL CHECK(grain IN ('tool_call', 'turn')),
+        text TEXT NOT NULL CHECK(text <> ''),
+        created_at TEXT NOT NULL,
+        delivered_at TEXT,
+        CHECK((session_id IS NULL) <> (child IS NULL))
+    );
+    INSERT INTO directives (id, session_id, child, source, grain, text, created_at, delivered_at)
+        SELECT id, session_id, NULL, source, grain, text, created_at, delivered_at
+        FROM directives_keep;
+    DROP TABLE directives_keep;
+    CREATE INDEX directives_pending
+        ON directives(session_id, grain, id)
+        WHERE delivered_at IS NULL;
+    CREATE INDEX directives_child_pending
+        ON directives(child, grain, id)
         WHERE delivered_at IS NULL;
     "
     .to_owned()
@@ -1476,6 +1518,60 @@ mod tests {
                      VALUES ('chatgpt-subscription', 'gpt-5.5', NULL);",
             )
             .expect("distinct sources must coexist");
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The rebuild carries every queued directive across and leaves each one
+    /// addressed exactly as it was: a message queued for a session before this
+    /// migration must not come back looking like it was meant for a child.
+    #[test]
+    fn migration_0014_keeps_every_queued_directive_addressed_to_its_session() {
+        let directory = data_directory();
+        let (path, mut connection) = open_unified_database(&directory).unwrap();
+
+        connection
+            .execute_batch(
+                "INSERT INTO directives (session_id, source, grain, text, created_at)
+                 VALUES (3, 'supervisor', 'tool_call', 'queued before the rebuild', '1');",
+            )
+            .unwrap();
+
+        // Re-running the ledgered migration is a no-op, so the rebuild is
+        // replayed against the row above by forgetting it was ever applied.
+        connection
+            .execute(
+                "DELETE FROM schema_migrations WHERE id = '0014_directive_child_target'",
+                [],
+            )
+            .unwrap();
+        run_pending_migrations(&mut connection, &path).unwrap();
+
+        let (session_id, child, text): (Option<i64>, Option<String>, String) = connection
+            .query_row(
+                "SELECT session_id, child, text FROM directives",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(session_id, Some(3));
+        assert_eq!(child, None);
+        assert_eq!(text, "queued before the rebuild");
+
+        // Exactly one addressee, enforced by the schema rather than by the
+        // callers: a row naming both or neither is unroutable.
+        for values in [
+            "(1, 'a1b2c3d4', 'human', 'tool_call', 'both', '1')",
+            "(NULL, NULL, 'human', 'tool_call', 'neither', '1')",
+        ] {
+            connection
+                .execute_batch(&format!(
+                    "INSERT INTO directives
+                         (session_id, child, source, grain, text, created_at)
+                     VALUES {values};"
+                ))
+                .expect_err("a directive names exactly one addressee");
+        }
 
         fs::remove_dir_all(directory).unwrap();
     }
