@@ -48,7 +48,7 @@ use agens_session::provider::{
 };
 use agens_session::turns::{
     completed_session_turn_from_events_with_media, completed_session_turn_with_media,
-    next_session_metadata,
+    drain_turn_directive_messages, next_session_metadata,
 };
 use agens_tool_runtime::block_on_headless_turn;
 use agens_tool_runtime::child::TaskMailboxProvider;
@@ -873,9 +873,16 @@ where
             // outcome never drains on its own error path, so without this the next attempt to
             // reuse the handle could otherwise inherit a stale, unrelated record.
             context.failure_detail.take();
+            let mut provider_request = request.clone();
+            provider_request
+                .history
+                .extend(drain_turn_directive_messages(
+                    context.bootstrap.data_directory(),
+                    attempt_key.session_id(),
+                )?);
             let mut provider = build_provider(
                 model,
-                provider_messages(&request, context.include_system_prompt),
+                provider_messages(&provider_request, context.include_system_prompt),
                 provider_tools,
                 request.request_config.clone(),
                 media_blobs,

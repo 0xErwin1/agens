@@ -2,13 +2,14 @@
 //! headless or subagent turn, and sanitizes subagent summaries and results before they are
 //! written to durable storage.
 
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use agens_core::{
     CompletedSessionTurn, CompletedTurnSnapshot, IntraTurnInputSource, Message, MessagePart, Role,
     SessionMessage, SessionMetadata, TurnEvent,
 };
-use agens_store::SessionStore;
+use agens_store::{DirectiveGrain, DirectiveStore, SessionStore};
 
 use crate::context::CompletedSubagentTurn;
 use crate::context::SessionContext;
@@ -17,6 +18,30 @@ use agens_bootstrap::Bootstrap;
 use agens_error::CliError;
 
 const EMPTY_TOOL_RESULT_CONTENT: &str = "[tool returned no output]";
+
+/// Drains the directives due before a session's next prompt and maps each
+/// recorded speaker to the provider conversation role it owns.
+pub fn drain_turn_directive_messages(
+    data_directory: impl AsRef<Path>,
+    session_id: i64,
+) -> Result<Vec<Message>, CliError> {
+    let mut store = DirectiveStore::open(data_directory)
+        .map_err(|_| CliError::storage("session directives are unavailable"))?;
+    let directives = store
+        .drain(session_id, DirectiveGrain::Turn)
+        .map_err(|_| CliError::storage("session directives could not be drained"))?;
+
+    Ok(directives
+        .into_iter()
+        .map(|directive| Message {
+            role: match directive.source {
+                IntraTurnInputSource::Human => Role::User,
+                IntraTurnInputSource::Supervisor => Role::Supervisor,
+            },
+            parts: vec![MessagePart::Text(directive.text)],
+        })
+        .collect())
+}
 
 /// Builds the metadata for the next persisted attempt: unchanged when resuming an existing
 /// session (its `project` was already recorded), or freshly seeded from the process's own
