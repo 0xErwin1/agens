@@ -308,8 +308,17 @@ fn ensure_private_diagnostics_directory(directory: &Path) -> std::io::Result<()>
         }
         Ok(_) => Err(std::io::Error::other("diagnostics path is not a directory")),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // Recursive because the data directory itself may not exist yet: a
+            // run's first diagnostic is emitted before anything opens the
+            // store, and a non-recursive create fails there, silently dropping
+            // the one event that says the session started.
+            //
+            // The mode applies to every directory this creates, so a data
+            // directory born here is private like the rest of the run's state.
+            // An existing directory keeps whatever mode it already had.
             let mut builder = fs::DirBuilder::new();
             builder.mode(0o700);
+            builder.recursive(true);
             builder.create(directory)
         }
         Err(error) => Err(error),
@@ -1208,6 +1217,41 @@ mod tests {
         assert!(!temporary.join("diagnostics").exists());
 
         std::fs::remove_dir_all(&temporary).ok();
+    }
+
+    /// The first diagnostic of a run happens before anything else has created
+    /// the data directory, so a store that cannot create its own parent drops
+    /// exactly the event that says a session started.
+    #[test]
+    fn a_missing_data_directory_is_created_rather_than_dropping_the_first_event() {
+        let temporary = std::env::temp_dir().join(format!(
+            "agens-diagnostic-absent-parent-{}/data",
+            std::process::id()
+        ));
+        std::fs::remove_dir_all(temporary.parent().unwrap()).ok();
+        assert!(!temporary.exists(), "the parent must be absent to start");
+
+        // The failure counter is process-wide, so this compares against its own
+        // baseline instead of zero: another test in this binary may have
+        // recorded a deliberate failure already.
+        let failures_before = best_effort_failures();
+        SafeDiagnosticStore::with_capture(temporary.clone(), true).record_session_lifecycle(
+            &DiagnosticRef::new("abcd1234".to_owned()).unwrap(),
+            ProviderDiagnosticScope::Parent,
+            SessionLifecycle::TurnStarted { model: "kimi-k3" },
+        );
+
+        let recorded = recorded_lines(&temporary);
+
+        assert_eq!(recorded.len(), 1, "{recorded:?}");
+        assert_eq!(recorded[0]["event"], "turn_started");
+        assert_eq!(
+            best_effort_failures(),
+            failures_before,
+            "no write was silently dropped"
+        );
+
+        std::fs::remove_dir_all(temporary.parent().unwrap()).ok();
     }
 
     fn recorded_lines(directory: &std::path::Path) -> Vec<serde_json::Value> {
