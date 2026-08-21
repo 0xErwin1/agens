@@ -212,16 +212,31 @@ fn completed_session_turn_rejects_invalid_sequence_boundaries() {
             session_message(Role::System, MessagePart::Text("two".into())),
             session_message(Role::User, MessagePart::Text("question".into())),
         ],
-        vec![
-            session_message(Role::User, MessagePart::Text("one".into())),
-            session_message(Role::User, MessagePart::Text("two".into())),
-        ],
     ] {
         assert_eq!(
             CompletedSessionTurn::new(messages),
             Err(CompletedSessionTurnError::InvalidMessageOrder)
         );
     }
+}
+
+/// A second user message used to be rejected here. It is legal now: input can
+/// reach a running turn at a tool boundary, and it is carried as a further
+/// `User` message because no provider role exists for a mid-turn speaker.
+///
+/// What the order still guarantees is unchanged — a turn begins with the user's
+/// prompt, and nothing precedes it but a system reminder.
+#[test]
+fn completed_session_turn_accepts_input_that_arrived_mid_turn() {
+    assert!(
+        CompletedSessionTurn::new(vec![
+            session_message(Role::User, MessagePart::Text("question".into())),
+            session_message(Role::Assistant, MessagePart::Text("working".into())),
+            session_message(Role::User, MessagePart::Text("use the other file".into())),
+            session_message(Role::Assistant, MessagePart::Text("done".into())),
+        ])
+        .is_ok()
+    );
 }
 
 #[test]

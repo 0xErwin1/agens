@@ -1442,10 +1442,10 @@ fn intra_turn_input_is_accepted_at_the_tool_boundary_as_its_own_event() {
         .unwrap();
     coordinator.finish_provider_iteration().unwrap();
     coordinator
-        .accept_intra_turn_input(IntraTurnInputSource::Human, "use the other file".into())
+        .accept_tool_result("call-1", "package manifest".into(), false, None)
         .unwrap();
     coordinator
-        .accept_tool_result("call-1", "package manifest".into(), false, None)
+        .accept_intra_turn_input(IntraTurnInputSource::Human, "use the other file".into())
         .unwrap();
 
     assert!(coordinator.events().contains(&TurnEvent::IntraTurnInput {
@@ -1461,18 +1461,51 @@ fn intra_turn_input_is_accepted_at_the_tool_boundary_as_its_own_event() {
     );
 }
 
-/// A turn only reaches a boundary while it is dispatching tools. Accepting
-/// input mid-stream would splice a message between a provider's own parts.
+/// Mid-stream is not a boundary: a message spliced between a provider's own
+/// parts belongs to no speaker.
 #[test]
-fn intra_turn_input_is_refused_away_from_a_tool_boundary() {
+fn intra_turn_input_is_refused_while_a_provider_is_streaming() {
     let mut coordinator = TurnCoordinator::new();
 
     coordinator.begin().unwrap();
+    coordinator
+        .accept_provider_part(MessagePart::Text("thinking".into()))
+        .unwrap();
 
     assert!(
         coordinator
             .accept_intra_turn_input(IntraTurnInputSource::Supervisor, "stop".into())
             .is_err()
+    );
+}
+
+/// A half-delivered batch is not a boundary either. A message between two tool
+/// results separates them from the assistant turn that called them, which the
+/// provider history validator rejects outright.
+#[test]
+fn intra_turn_input_is_refused_between_the_results_of_one_batch() {
+    let mut coordinator = TurnCoordinator::new();
+
+    coordinator.begin().unwrap();
+    for id in ["call-1", "call-2"] {
+        coordinator
+            .accept_provider_part(MessagePart::ToolCall {
+                id: id.into(),
+                name: "read".into(),
+                input: "{\"path\":\"Cargo.toml\"}".into(),
+            })
+            .unwrap();
+    }
+    coordinator.finish_provider_iteration().unwrap();
+    coordinator
+        .accept_tool_result("call-1", "first".into(), false, None)
+        .unwrap();
+
+    assert!(
+        coordinator
+            .accept_intra_turn_input(IntraTurnInputSource::Human, "wait".into())
+            .is_err(),
+        "the second result has not arrived yet"
     );
 }
 
@@ -1492,13 +1525,13 @@ fn a_completed_turn_replays_its_intra_turn_input() {
         .unwrap();
     coordinator.finish_provider_iteration().unwrap();
     coordinator
+        .accept_tool_result("call-1", "package manifest".into(), false, None)
+        .unwrap();
+    coordinator
         .accept_intra_turn_input(
             IntraTurnInputSource::Supervisor,
             "prefer the manifest".into(),
         )
-        .unwrap();
-    coordinator
-        .accept_tool_result("call-1", "package manifest".into(), false, None)
         .unwrap();
     coordinator
         .accept_provider_part(MessagePart::Text("done".into()))

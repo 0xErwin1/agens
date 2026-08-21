@@ -160,12 +160,17 @@ impl CompletedSessionTurn {
                 ..
             })
         ));
+        // A turn still begins with the user's prompt. What it no longer claims
+        // is that the user never speaks again: input can now reach a running
+        // turn at a tool boundary, from a person or from a supervisor, and it
+        // is carried as a further `User` message because no provider role
+        // exists for either of them mid-turn.
         if messages
             .get(user_index)
             .is_none_or(|message| message.role != Role::User)
             || messages[user_index + 1..]
                 .iter()
-                .any(|message| !matches!(message.role, Role::Assistant | Role::Tool))
+                .any(|message| !matches!(message.role, Role::Assistant | Role::Tool | Role::User))
         {
             return Err(CompletedSessionTurnError::InvalidMessageOrder);
         }
@@ -988,6 +993,19 @@ fn validate_completed_turn_events(events: &[TurnEvent]) -> Result<(), CompletedT
     while event_index < events.len() {
         match coordinator.state() {
             TurnState::Requesting => {
+                if let Some(TurnEvent::IntraTurnInput { source, text }) = events.get(event_index) {
+                    let source = *source;
+                    let text = text.clone();
+
+                    consume_generated_events(
+                        &mut coordinator,
+                        events,
+                        &mut event_index,
+                        move |coordinator| coordinator.accept_intra_turn_input(source, text),
+                    )?;
+                    continue;
+                }
+
                 let Some(TurnEvent::StateChanged(TurnState::Streaming)) = events.get(event_index)
                 else {
                     return Err(CompletedTurnSnapshotError::invalid());
@@ -1026,19 +1044,6 @@ fn validate_completed_turn_events(events: &[TurnEvent]) -> Result<(), CompletedT
                 _ => return Err(CompletedTurnSnapshotError::invalid()),
             },
             TurnState::Dispatching => {
-                if let Some(TurnEvent::IntraTurnInput { source, text }) = events.get(event_index) {
-                    let source = *source;
-                    let text = text.clone();
-
-                    consume_generated_events(
-                        &mut coordinator,
-                        events,
-                        &mut event_index,
-                        move |coordinator| coordinator.accept_intra_turn_input(source, text),
-                    )?;
-                    continue;
-                }
-
                 let Some(TurnEvent::ToolResult(MessagePart::ToolResult {
                     tool_call_id,
                     content,
@@ -1307,18 +1312,23 @@ impl TurnCoordinator {
     /// caller states its choice explicitly, including replay, which always
     /// passes `None`. The facts event is live-only: it is excluded from
     /// persisted history and must never be regenerated during replay.
-    /// Records input that arrived while this turn was dispatching tools.
+    /// Records input that arrived while this turn was running.
     ///
-    /// `Dispatching` is the only state that accepts it, and that is the safe
-    /// point itself: a turn mid-stream is receiving one provider message, and
-    /// splicing a second speaker into it would produce a history no provider
-    /// was ever given.
+    /// `Requesting` is the only state that accepts it, and that is the safe
+    /// point: the turn has finished a whole batch of tool results and has not
+    /// yet asked the provider again.
+    ///
+    /// Not `Streaming`, which would splice a second speaker into one provider
+    /// message. Not `Dispatching` either, and that one is not merely untidy: a
+    /// message between two tool results separates them from the assistant turn
+    /// that called them, which is exactly what
+    /// `validate_encoded_tool_call_adjacency` rejects before a request goes out.
     pub fn accept_intra_turn_input(
         &mut self,
         source: IntraTurnInputSource,
         text: String,
     ) -> Result<(), TurnEventError> {
-        if self.state != TurnState::Dispatching {
+        if self.state != TurnState::Requesting {
             return Err(TurnEventError::UnexpectedIntraTurnInput);
         }
 
