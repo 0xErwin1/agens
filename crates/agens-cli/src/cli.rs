@@ -52,6 +52,23 @@ pub(crate) enum Command {
         #[command(subcommand)]
         action: SessionsAction,
     },
+    #[command(about = "queue a message for a running session, delivered at its next safe point")]
+    Direct {
+        /// The session the message is for; a session only ever reads its own.
+        session: String,
+        /// Wait for the turn to end instead of the next tool batch. Use it when
+        /// the message changes what the run is doing and the worker has to
+        /// replan from a settled plan.
+        #[arg(long)]
+        at_turn_end: bool,
+        /// Send with the narrower authority of an automated supervisor rather
+        /// than as the user.
+        #[arg(long)]
+        as_supervisor: bool,
+        /// The message itself.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        message: Vec<String>,
+    },
     /// Bare `agens version`; `--version`/`-V` are handled by clap itself.
     #[command(hide = true)]
     Version,

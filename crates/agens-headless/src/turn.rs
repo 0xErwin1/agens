@@ -11,15 +11,14 @@ use std::sync::{Arc, Mutex};
 
 use agens_core::{
     BeginSessionAttemptError, HeadlessTurnCancellation, HeadlessTurnError, Message, MessagePart,
-    PermissionMode, PermissionSession, TurnEvent, TurnProgressSink,
-    run_headless_turn_with_max_iterations_and_progress,
+    PermissionMode, PermissionSession, TurnEvent, TurnProgressSink, run_headless_turn_with_inbox,
 };
 use agens_providers::{
     ChatGptResponsesProvider, DiagnosticRef, MediaBlobs, MoonshotProvider, OpenAiFunctionTool,
     OpenAiResponsesProvider, ProgressAwareProvider, ProviderDiagnosticClass,
     ProviderDiagnosticScope, ProviderFailureDetail,
 };
-use agens_store::{PermissionGrantStore, SessionStore, ToolFactStore, open_media};
+use agens_store::{DirectiveInbox, PermissionGrantStore, SessionStore, ToolFactStore, open_media};
 use agens_tools::{
     EffectiveCapabilitySet, McpErrorCategory, McpLifecycleState, McpLoadPhase, McpStatusHandle,
     TaskMessageTarget,
@@ -932,34 +931,24 @@ where
             let mut provider =
                 TaskMailboxProvider::new(provider, task_registry.clone(), TaskMessageTarget::Main);
             cancellation_result(context.cancellation)?;
-            let turn_outcome = match effective_max_iterations(
-                request.max_iterations,
-                context.bootstrap.max_iterations,
-            ) {
-                Some(max_iterations) => {
-                    block_on_headless_turn(run_headless_turn_with_max_iterations_and_progress(
-                        &mut provider,
-                        &mut gate,
-                        &mut resolver,
-                        &mut dispatcher,
-                        &mut repository,
-                        context.cancellation,
-                        max_iterations,
-                        headless_progress,
-                        Some(attempt_key),
-                    ))
-                }
-                None => block_on_headless_turn(agens_core::run_headless_turn_with_progress(
-                    &mut provider,
-                    &mut gate,
-                    &mut resolver,
-                    &mut dispatcher,
-                    &mut repository,
-                    context.cancellation,
-                    headless_progress,
-                    Some(attempt_key),
-                )),
-            }?;
+            // The queue is scoped to this session, so the turn only ever
+            // collects what was addressed to it.
+            let mut inbox = DirectiveInbox::for_session(
+                context.bootstrap.data_directory(),
+                attempt_key.session_id(),
+            );
+            let turn_outcome = block_on_headless_turn(run_headless_turn_with_inbox(
+                &mut provider,
+                &mut gate,
+                &mut resolver,
+                &mut dispatcher,
+                &mut repository,
+                context.cancellation,
+                effective_max_iterations(request.max_iterations, context.bootstrap.max_iterations),
+                headless_progress,
+                Some(attempt_key),
+                &mut inbox,
+            ))?;
             let snapshot = attach_recorded_failure_detail(turn_outcome, &context.failure_detail)?;
             let turn = completed_session_turn_with_media(
                 &request.prompt,

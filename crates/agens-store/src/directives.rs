@@ -196,13 +196,29 @@ impl DirectiveStore {
 /// the time a turn ends it is closed and can accept nothing, so what waits for
 /// that grain belongs to whoever assembles the next prompt.
 pub struct DirectiveInbox {
-    store: DirectiveStore,
+    store: Option<DirectiveStore>,
     session_id: i64,
 }
 
 impl DirectiveInbox {
     pub const fn new(store: DirectiveStore, session_id: i64) -> Self {
-        Self { store, session_id }
+        Self {
+            store: Some(store),
+            session_id,
+        }
+    }
+
+    /// The inbox for one session, opening the queue best-effort.
+    ///
+    /// Infallible on purpose: a turn that cannot open the queue runs without
+    /// one, exactly as every turn did before the queue existed. Refusing to
+    /// start over an unreadable inbox would make an optional channel a
+    /// precondition for working at all.
+    pub fn for_session(data_directory: impl AsRef<Path>, session_id: i64) -> Self {
+        Self {
+            store: DirectiveStore::open(data_directory).ok(),
+            session_id,
+        }
     }
 }
 
@@ -214,10 +230,13 @@ impl HeadlessIntraTurnInbox for DirectiveInbox {
         // A queue that cannot be read is reported as empty rather than failing
         // the turn: losing a directive is bad, and killing work in progress over
         // an unreadable inbox is worse.
-        ready(Ok(self
-            .store
-            .drain(self.session_id, DirectiveGrain::ToolCall)
-            .unwrap_or_default()))
+        let drained = self.store.as_mut().map_or_else(Vec::new, |store| {
+            store
+                .drain(self.session_id, DirectiveGrain::ToolCall)
+                .unwrap_or_default()
+        });
+
+        ready(Ok(drained))
     }
 }
 
