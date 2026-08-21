@@ -209,14 +209,6 @@ pub fn run_production_headless_chat_with_progress(
         }
     };
     request.model = Some(resolved.model.clone());
-    record_session_lifecycle(
-        bootstrap,
-        &diagnostic_reference,
-        ProviderDiagnosticScope::Parent,
-        SessionLifecycle::TurnStarted {
-            model: &resolved.model,
-        },
-    );
 
     let result = match resolved.provider {
         ProviderKind::OpenAiApi => {
@@ -867,6 +859,7 @@ where
         .collect();
     let media_blobs = load_media_blobs_for_request(context.bootstrap.data_directory(), &request)
         .map_err(HeadlessChatFailure::from)?;
+    let lifecycle_model = model.clone();
     let completion = run_session_attempt_lifecycle_with_terminal_writer(
         active_session_attempts(),
         &mut store,
@@ -874,6 +867,19 @@ where
         request.prompt.clone(),
         request.media_ids.clone(),
         |attempt_key| {
+            // Recorded here rather than before the attempt begins because this is
+            // the first moment the session has an id at all: a new session is
+            // registered by the attempt, and the id is what a supervisor needs in
+            // order to address the turn while it is still running.
+            record_session_lifecycle(
+                context.bootstrap,
+                context.diagnostic_reference,
+                ProviderDiagnosticScope::Parent,
+                SessionLifecycle::TurnStarted {
+                    model: &lifecycle_model,
+                    session: attempt_key.session_id(),
+                },
+            );
             // Discards whatever an earlier use of this handle left behind before this attempt's
             // own provider is even built. See `attach_recorded_failure_detail`: a successful
             // outcome never drains on its own error path, so without this the next attempt to

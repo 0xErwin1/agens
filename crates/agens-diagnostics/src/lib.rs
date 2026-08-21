@@ -64,8 +64,13 @@ impl TurnOutcome {
 /// for which event.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SessionLifecycle<'a> {
+    /// Carries the session it started so a supervisor learns the id from the
+    /// event itself. The first turn of a new session is otherwise unaddressable
+    /// while it runs: nothing has completed yet, so the session is absent from
+    /// every listing a supervisor could poll.
     TurnStarted {
         model: &'a str,
+        session: i64,
     },
     TurnEnded {
         outcome: TurnOutcome,
@@ -101,7 +106,9 @@ impl SessionLifecycle<'_> {
 
     fn detail(self) -> serde_json::Value {
         match self {
-            Self::TurnStarted { model } => serde_json::json!({ "model": model }),
+            Self::TurnStarted { model, session } => {
+                serde_json::json!({ "model": model, "session": session })
+            }
             Self::TurnEnded { outcome } => serde_json::json!({ "outcome": outcome.as_str() }),
             Self::ToolFailed { tool, class } => {
                 serde_json::json!({ "tool": tool, "class": class.as_str() })
@@ -1103,6 +1110,7 @@ mod tests {
             ProviderDiagnosticScope::Parent,
             SessionLifecycle::TurnStarted {
                 model: "moonshotai/kimi-k3",
+                session: 42,
             },
         );
         store.record_session_lifecycle(
@@ -1151,6 +1159,7 @@ mod tests {
             "{recorded:?}"
         );
         assert_eq!(recorded[0]["model"], "moonshotai/kimi-k3");
+        assert_eq!(recorded[0]["session"], 42);
         assert_eq!(recorded[1]["tool"], "bash");
         assert_eq!(recorded[1]["class"], "tool");
         assert_eq!(recorded[2]["access"], "write");
@@ -1234,7 +1243,10 @@ mod tests {
         SafeDiagnosticStore::with_capture(temporary.clone(), true).record_session_lifecycle(
             &DiagnosticRef::new("abcd1234".to_owned()).unwrap(),
             ProviderDiagnosticScope::Parent,
-            SessionLifecycle::TurnStarted { model: "kimi-k3" },
+            SessionLifecycle::TurnStarted {
+                model: "kimi-k3",
+                session: 7,
+            },
         );
 
         let recorded = recorded_lines(&temporary);
