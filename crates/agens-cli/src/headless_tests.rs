@@ -8,6 +8,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
+use agens_core::IntraTurnInputSource;
 use agens_core::TurnEvent;
 use agens_core::{
     HeadlessTurnCancellation, Message, MessagePart, PermissionMode, Role, SessionMetadata,
@@ -20,7 +21,7 @@ use agens_headless::{
     headless_turn_own_system_prompt, headless_turn_permission_policy, headless_turn_project_root,
     headless_turn_provider_base_url, headless_turn_system_prompt,
 };
-use agens_store::{SessionStore, ToolFactStore};
+use agens_store::{DirectiveGrain, DirectiveStore, SessionStore, ToolFactStore};
 use agens_tools::SkillCatalog;
 
 use agens_tui_app::permission_prompt::TtyPermissionPrompter;
@@ -816,6 +817,241 @@ fn a_ledger_write_failure_does_not_fail_the_turn() {
     assert_eq!(recorded_count, 0);
 
     std::fs::remove_dir_all(directory).unwrap();
+}
+
+/// A drained turn-grain directive is the supervisor's only record of having
+/// corrected the run. Injecting it into the provider request alone made it
+/// visible for one turn and gone from the session the next, so the turn that
+/// delivered it has to persist it too.
+#[test]
+fn production_headless_turn_persists_the_turn_directives_it_delivered_before_the_prompt() {
+    let temporary = std::env::temp_dir().join(format!(
+        "agens-directive-headless-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock should be after Unix epoch")
+            .as_nanos()
+    ));
+    let project_root = temporary.join("project");
+    let config_home = temporary.join("config");
+    let data_directory = temporary.join("data");
+    std::fs::create_dir_all(project_root.join(".git")).expect("project marker should be created");
+    std::fs::create_dir_all(&config_home).expect("config directory should be created");
+
+    let listener =
+        std::net::TcpListener::bind(("127.0.0.1", 0)).expect("mock provider should bind");
+    let address = listener
+        .local_addr()
+        .expect("mock provider should have an address");
+    let worker = std::thread::spawn(move || {
+        use std::io::{BufRead, BufReader, Write};
+
+        let (mut stream, _) = listener
+            .accept()
+            .expect("mock provider should accept the directive request");
+        let mut reader = BufReader::new(stream.try_clone().expect("stream should clone"));
+        let mut request_line = String::new();
+        reader
+            .read_line(&mut request_line)
+            .expect("request line should be readable");
+
+        let mut content_length = None;
+        loop {
+            let mut header = String::new();
+            reader
+                .read_line(&mut header)
+                .expect("request header should be readable");
+            if header == "\r\n" {
+                break;
+            }
+            if let Some(value) = header.strip_prefix("content-length: ") {
+                content_length = Some(
+                    value
+                        .trim()
+                        .parse::<usize>()
+                        .expect("content length should be numeric"),
+                );
+            }
+        }
+
+        let mut body = vec![0_u8; content_length.expect("request should include content length")];
+        std::io::Read::read_exact(&mut reader, &mut body).expect("request body should be readable");
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"replanned\"}\n\ndata: {\"type\":\"response.completed\"}\n\n")
+            .expect("mock response should be written");
+
+        serde_json::from_slice::<serde_json::Value>(&body)
+            .expect("directive provider request should be valid JSON")
+    });
+
+    let dependencies = CliDependencies::for_test(
+        project_root.clone(),
+        Some(temporary.join("home")),
+        BTreeMap::from([
+            (
+                "AGENS_CONFIG_HOME".to_owned(),
+                config_home.display().to_string(),
+            ),
+            ("OPENAI_API_KEY".to_owned(), "test-key".to_owned()),
+        ]),
+        BTreeMap::from([
+            (
+                config_home.join("config.toml"),
+                format!(
+                    "[provider]\ntype = \"openai-api\"\nmodel = \"openai-api/gpt-4.1\"\nbase_url = \"http://{address}\"\n\n[options]\ndata_dir = \"{}\"\n",
+                    data_directory.display()
+                ),
+            ),
+            (
+                config_home.join("auth.json"),
+                r#"{"openai-api": {"api_key": "fixture"}}"#.to_owned(),
+            ),
+        ]),
+    );
+    let bootstrap = bootstrap(&dependencies).expect("production bootstrap should be valid");
+    let initial_turn = CompletedSessionTurn::new(
+        [
+            Message {
+                role: Role::User,
+                parts: vec![MessagePart::Text("first input".into())],
+            },
+            Message {
+                role: Role::Assistant,
+                parts: vec![MessagePart::Text("first answer".into())],
+            },
+        ]
+        .into_iter()
+        .map(SessionMessage::try_from)
+        .collect::<Result<_, _>>()
+        .expect("seed history should be a valid completed turn"),
+    )
+    .expect("seed history should be a valid completed turn");
+    let metadata = SessionMetadata {
+        id: 0,
+        project: project_root.display().to_string(),
+        title: "first input".into(),
+        active_agent: "primary".into(),
+        provider_id: None,
+        model_id: None,
+        reasoning_effort: None,
+        created_at: 10,
+        updated_at: 10,
+        completed_turn_count: 0,
+        resumable: false,
+        parent_session_id: None,
+        fork_message_count: None,
+    };
+    SessionStore::open(&data_directory)
+        .expect("session store should open")
+        .persist_completed_session_turn(&metadata, &initial_turn)
+        .expect("seed session should persist");
+
+    let mut directives =
+        DirectiveStore::open(&data_directory).expect("directive queue should open");
+    directives
+        .enqueue(
+            1,
+            IntraTurnInputSource::Supervisor,
+            DirectiveGrain::Turn,
+            "replan before answering",
+        )
+        .expect("supervisor directive should enqueue");
+    directives
+        .enqueue(
+            1,
+            IntraTurnInputSource::Human,
+            DirectiveGrain::Turn,
+            "and keep it short",
+        )
+        .expect("human directive should enqueue");
+    drop(directives);
+
+    let resumed = agens_tui_app::resume::resume_tui_session(
+        &bootstrap,
+        1,
+        &SkillCatalog::default(),
+        &agens_session::provider::CredentialResolver::production(),
+    )
+    .expect("seed session should resume")
+    .context;
+    let request = apply_session_to_request(
+        &resumed,
+        HeadlessChatRequest {
+            prompt: "second input".into(),
+            history: Vec::new(),
+            model: None,
+            system_prompt: None,
+            max_iterations: None,
+            mode: PermissionMode::Edit,
+            dangerously_allow_all: false,
+            dangerous_mode: false,
+            request_config: agens_core::RequestConfig::default(),
+            session_reasoning_effort: None,
+            session: None,
+            active_agent: None,
+            effective_capabilities: None,
+            pending_system_reminder: None,
+            skills: None,
+            media_ids: Vec::new(),
+            media_mimes: Vec::new(),
+        },
+    );
+    run_production_headless_chat_with_progress(
+        request,
+        &bootstrap,
+        &HeadlessTurnCancellation::new(),
+        None,
+        Box::new(TtyPermissionPrompter),
+        None,
+        None,
+    )
+    .expect("directive turn should complete");
+
+    let provider_request = worker.join().expect("mock provider should finish");
+    assert_eq!(
+        provider_request["input"],
+        serde_json::json!([
+            {"role": "user", "content": [{"type": "input_text", "text": "first input"}]},
+            {"role": "assistant", "content": [{"type": "output_text", "text": "first answer"}]},
+            {"role": "user", "content": [{"type": "input_text", "text": "replan before answering"}]},
+            {"role": "user", "content": [{"type": "input_text", "text": "and keep it short"}]},
+            {"role": "user", "content": [{"type": "input_text", "text": "second input"}]},
+        ]),
+        "the turn's own request still delivers the drained directives before the prompt"
+    );
+
+    let reopened = SessionStore::open(&data_directory)
+        .expect("session store should reopen")
+        .load_session_for_resume(1)
+        .expect("same session should remain resumable");
+    assert_eq!(
+        reopened
+            .messages
+            .iter()
+            .map(|message| (message.role, message.parts.clone()))
+            .collect::<Vec<_>>(),
+        vec![
+            (Role::User, vec![MessagePart::Text("first input".into())]),
+            (
+                Role::Assistant,
+                vec![MessagePart::Text("first answer".into())]
+            ),
+            (
+                Role::Supervisor,
+                vec![MessagePart::Text("replan before answering".into())]
+            ),
+            (
+                Role::User,
+                vec![MessagePart::Text("and keep it short".into())]
+            ),
+            (Role::User, vec![MessagePart::Text("second input".into())]),
+            (Role::Assistant, vec![MessagePart::Text("replanned".into())]),
+        ],
+        "the next turn replays the directives this one delivered, with their recorded roles"
+    );
+
+    std::fs::remove_dir_all(temporary).expect("temporary files should be removed");
 }
 
 #[test]

@@ -534,7 +534,7 @@ mod tests {
             |store, write| {
                 assert_eq!(write.status, agens_core::SessionAttemptStatus::Cancelled);
 
-                write_terminal_attempt(store, write, &note)
+                write_terminal_attempt(store, write, &[], &note)
             },
         )
         .unwrap_err();

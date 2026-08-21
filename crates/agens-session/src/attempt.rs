@@ -269,7 +269,7 @@ pub fn run_session_attempt_lifecycle(
         prompt,
         Vec::new(),
         |_attempt| runtime(),
-        |store, write| write_terminal_attempt(store, write, interrupted_note),
+        |store, write| write_terminal_attempt(store, write, &[], interrupted_note),
     )
 }
 
@@ -380,6 +380,7 @@ pub fn attempt_failure_status(error: &CliError) -> agens_core::SessionAttemptSta
 pub fn write_terminal_attempt(
     store: &mut SessionStore,
     write: TerminalAttemptWrite<'_>,
+    directives: &[Message],
     note: &str,
 ) -> Result<Option<PartialTurnRecord>, AttemptStoreError> {
     if write.status != agens_core::SessionAttemptStatus::Cancelled {
@@ -389,7 +390,8 @@ pub fn write_terminal_attempt(
             .map_err(|_| AttemptStoreError);
     }
 
-    let turn = interrupted_session_turn(write.prompt, note).map_err(|_| AttemptStoreError)?;
+    let turn =
+        interrupted_session_turn(write.prompt, directives, note).map_err(|_| AttemptStoreError)?;
     write_terminal_attempt_with_history(store, write, &turn)
 }
 
@@ -423,14 +425,17 @@ pub fn write_terminal_attempt_with_history(
     }))
 }
 
-/// Keeps the interrupted turn to the prompt and a plain assistant note: a tool call that never
-/// answered must not gain a fabricated result, because the tool may already have changed the
-/// project and claiming otherwise would assert something unverified.
+/// Keeps the interrupted turn to the directives it had already delivered, the prompt, and a plain
+/// assistant note: a tool call that never answered must not gain a fabricated result, because the
+/// tool may already have changed the project and claiming otherwise would assert something
+/// unverified.
 fn interrupted_session_turn(
     prompt: &str,
+    directives: &[Message],
     note: &str,
 ) -> Result<CompletedSessionTurn, SessionMessageError> {
-    let messages = [
+    let mut messages = directives.to_vec();
+    messages.extend([
         Message {
             role: Role::User,
             parts: vec![MessagePart::Text(prompt.to_owned())],
@@ -439,10 +444,11 @@ fn interrupted_session_turn(
             role: Role::Assistant,
             parts: vec![MessagePart::Text(note.to_owned())],
         },
-    ]
-    .into_iter()
-    .map(SessionMessage::try_from)
-    .collect::<Result<Vec<_>, _>>()?;
+    ]);
+    let messages = messages
+        .into_iter()
+        .map(SessionMessage::try_from)
+        .collect::<Result<Vec<_>, _>>()?;
 
     CompletedSessionTurn::new(messages).map_err(|_| SessionMessageError::EmptyParts)
 }

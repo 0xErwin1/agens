@@ -96,20 +96,23 @@ pub fn completed_session_turn(
     snapshot: &CompletedTurnSnapshot,
     pending_system_reminder: Option<&str>,
 ) -> Result<CompletedSessionTurn, CliError> {
-    completed_session_turn_with_media(prompt, &[], snapshot, pending_system_reminder)
+    completed_session_turn_with_media(prompt, &[], &[], snapshot, pending_system_reminder)
 }
 
 /// Like [`completed_session_turn`], but persists path-free user [`MessagePart::Media`]
-/// parts alongside the prompt text (same shape as the live headless request).
+/// parts alongside the prompt text (same shape as the live headless request), and
+/// the directives the turn delivered before it read that prompt.
 pub fn completed_session_turn_with_media(
     prompt: &str,
     media: &[(i64, String)],
+    directives: &[Message],
     snapshot: &CompletedTurnSnapshot,
     pending_system_reminder: Option<&str>,
 ) -> Result<CompletedSessionTurn, CliError> {
     completed_session_turn_from_events_with_media(
         prompt,
         media,
+        directives,
         snapshot.events(),
         pending_system_reminder,
     )
@@ -120,14 +123,20 @@ pub fn completed_session_turn_from_events(
     events: &[TurnEvent],
     pending_system_reminder: Option<&str>,
 ) -> Result<CompletedSessionTurn, CliError> {
-    completed_session_turn_from_events_with_media(prompt, &[], events, pending_system_reminder)
+    completed_session_turn_from_events_with_media(prompt, &[], &[], events, pending_system_reminder)
 }
 
 /// Builds a durable completed turn whose user message includes text (when non-empty)
 /// and path-free media refs. Media-only turns (empty prompt + media) are valid.
+///
+/// `directives` are the turn-grain messages this turn drained before it ran. They
+/// are recorded ahead of the prompt, in the order they were delivered, because the
+/// next turn replays this history and a directive absent from it is a correction the
+/// session silently forgets.
 pub fn completed_session_turn_from_events_with_media(
     prompt: &str,
     media: &[(i64, String)],
+    directives: &[Message],
     events: &[TurnEvent],
     pending_system_reminder: Option<&str>,
 ) -> Result<CompletedSessionTurn, CliError> {
@@ -138,6 +147,9 @@ pub fn completed_session_turn_from_events_with_media(
         })
         .into_iter()
         .collect::<Vec<_>>();
+
+    messages.extend(directives.iter().cloned());
+
     messages.push(Message {
         role: Role::User,
         parts: durable_user_parts(prompt, media),
@@ -444,9 +456,14 @@ mod tests {
             (11, "image/jpeg".to_owned()),
         ];
 
-        let turn =
-            completed_session_turn_from_events_with_media("describe this", &media, &events, None)
-                .expect("text plus media should encode");
+        let turn = completed_session_turn_from_events_with_media(
+            "describe this",
+            &media,
+            &[],
+            &events,
+            None,
+        )
+        .expect("text plus media should encode");
 
         let user = &turn.messages()[0];
         assert_eq!(user.role, Role::User);
@@ -476,12 +493,56 @@ mod tests {
         }
     }
 
+    /// The provider sees a drained directive in the turn that delivered it. The
+    /// durable turn is what the next turn replays, so a directive missing from
+    /// it is a supervisor correction the session forgets one turn later.
+    #[test]
+    fn completed_turn_records_delivered_directives_ahead_of_the_prompt() {
+        let events = [TurnEvent::ProviderPart(MessagePart::Text("done".into()))];
+        let directives = [
+            Message {
+                role: Role::Supervisor,
+                parts: vec![MessagePart::Text("replan first".into())],
+            },
+            Message {
+                role: Role::User,
+                parts: vec![MessagePart::Text("then continue".into())],
+            },
+        ];
+
+        let turn = completed_session_turn_from_events_with_media(
+            "the prompt",
+            &[],
+            &directives,
+            &events,
+            Some("a reminder"),
+        )
+        .expect("delivered directives should encode");
+
+        assert_eq!(
+            turn.messages()
+                .iter()
+                .map(|message| (message.role, message.parts.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (Role::System, vec![MessagePart::Text("a reminder".into())]),
+                (
+                    Role::Supervisor,
+                    vec![MessagePart::Text("replan first".into())]
+                ),
+                (Role::User, vec![MessagePart::Text("then continue".into())]),
+                (Role::User, vec![MessagePart::Text("the prompt".into())]),
+                (Role::Assistant, vec![MessagePart::Text("done".into())]),
+            ]
+        );
+    }
+
     #[test]
     fn completed_turn_media_only_empty_prompt_skips_empty_text_part() {
         let events = [TurnEvent::ProviderPart(MessagePart::Text("ok".into()))];
         let media = [(3_i64, "image/png".to_owned())];
 
-        let turn = completed_session_turn_from_events_with_media("", &media, &events, None)
+        let turn = completed_session_turn_from_events_with_media("", &media, &[], &events, None)
             .expect("media-only turn must not hit EmptyPart");
 
         assert_eq!(

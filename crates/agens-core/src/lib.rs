@@ -165,13 +165,22 @@ impl CompletedSessionTurn {
             .map(SessionMessage::into_message)
             .collect::<Vec<_>>();
 
-        let user_index = usize::from(matches!(
+        let head = usize::from(matches!(
             messages.first(),
             Some(Message {
                 role: Role::System,
                 ..
             })
         ));
+        // Directives queued for the turn boundary are delivered before the
+        // prompt, so the durable turn records them there. Only a supervisor
+        // shows up in that run: a person's directive is a `User` message, and
+        // nothing distinguishes it from the prompt it precedes.
+        let user_index = head
+            + messages[head..]
+                .iter()
+                .take_while(|message| message.role == Role::Supervisor)
+                .count();
         // A turn still begins with the user's prompt. What it no longer claims
         // is that the user never speaks again: input can now reach a running
         // turn at a tool boundary, from a person or from a supervisor, and it

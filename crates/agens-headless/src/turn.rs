@@ -848,6 +848,12 @@ where
         session_model,
         session_effort,
     )?;
+    // The drain marks a directive delivered, and both persistence paths — the
+    // completed turn and the terminal writer for one that stopped early — have
+    // to record what it took.
+    let delivered_directives = Arc::new(Mutex::new(Vec::<Message>::new()));
+    let runtime_directives = Arc::clone(&delivered_directives);
+    let terminal_directives = Arc::clone(&delivered_directives);
     let partial_events = Arc::new(Mutex::new(PartialTurnRecorder::default()));
     let runtime_partial_events = Arc::clone(&partial_events);
     let terminal_partial_events = Arc::clone(&partial_events);
@@ -873,13 +879,18 @@ where
             // outcome never drains on its own error path, so without this the next attempt to
             // reuse the handle could otherwise inherit a stale, unrelated record.
             context.failure_detail.take();
+            // Recorded before the provider even runs: the drain marks these
+            // delivered, so a turn that stops early still has to persist them
+            // or the queue has consumed a message no history carries.
+            let directives = drain_turn_directive_messages(
+                context.bootstrap.data_directory(),
+                attempt_key.session_id(),
+            )?;
+            if let Ok(mut delivered) = runtime_directives.lock() {
+                delivered.clone_from(&directives);
+            }
             let mut provider_request = request.clone();
-            provider_request
-                .history
-                .extend(drain_turn_directive_messages(
-                    context.bootstrap.data_directory(),
-                    attempt_key.session_id(),
-                )?);
+            provider_request.history.extend(directives.iter().cloned());
             let mut provider = build_provider(
                 model,
                 provider_messages(&provider_request, context.include_system_prompt),
@@ -960,6 +971,7 @@ where
             let turn = completed_session_turn_with_media(
                 &request.prompt,
                 &partial_media,
+                &directives,
                 &snapshot,
                 request.pending_system_reminder.as_deref(),
             )?;
@@ -970,12 +982,22 @@ where
             let events = terminal_partial_events
                 .lock()
                 .map_err(|_| agens_session::attempt::AttemptStoreError)?;
+            let directives = terminal_directives
+                .lock()
+                .map_err(|_| agens_session::attempt::AttemptStoreError)?
+                .clone();
             if !events.has_partial_history() {
-                return write_terminal_attempt(store, write, &interrupted_turn_note(&[]));
+                return write_terminal_attempt(
+                    store,
+                    write,
+                    &directives,
+                    &interrupted_turn_note(&[]),
+                );
             }
             let turn = completed_session_turn_from_events_with_media(
                 &partial_prompt,
                 &partial_media,
+                &directives,
                 &events.events,
                 partial_system_reminder.as_deref(),
             )

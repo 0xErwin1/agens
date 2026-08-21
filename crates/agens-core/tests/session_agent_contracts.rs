@@ -239,6 +239,37 @@ fn completed_session_turn_accepts_input_that_arrived_mid_turn() {
     );
 }
 
+/// Directives queued for the turn boundary are delivered before the prompt, so
+/// the durable turn records them there. A supervisor is the only speaker that
+/// can open a turn: a person's directive is a `User` message, and nothing
+/// distinguishes it from the prompt it precedes.
+#[test]
+fn completed_session_turn_accepts_directives_delivered_before_the_prompt() {
+    assert!(
+        CompletedSessionTurn::new(vec![
+            session_message(Role::System, MessagePart::Text("reminder".into())),
+            session_message(Role::Supervisor, MessagePart::Text("replan first".into())),
+            session_message(Role::User, MessagePart::Text("then continue".into())),
+            session_message(Role::User, MessagePart::Text("question".into())),
+            session_message(Role::Assistant, MessagePart::Text("done".into())),
+        ])
+        .is_ok()
+    );
+}
+
+/// A turn whose only speaker is the supervisor still has no prompt, and the
+/// order it claims to encode is the one it must refuse.
+#[test]
+fn completed_session_turn_rejects_a_turn_that_never_reaches_the_prompt() {
+    assert_eq!(
+        CompletedSessionTurn::new(vec![
+            session_message(Role::Supervisor, MessagePart::Text("replan first".into())),
+            session_message(Role::Assistant, MessagePart::Text("done".into())),
+        ]),
+        Err(CompletedSessionTurnError::InvalidMessageOrder)
+    );
+}
+
 #[test]
 fn session_metadata_enforces_identity_and_completion_boundaries() {
     let resumable = SessionMetadata {
