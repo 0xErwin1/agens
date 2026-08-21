@@ -9,6 +9,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -35,6 +36,13 @@ type HeadlessChat = Box<
 >;
 type TuiLauncher = Box<dyn Fn(&Bootstrap, Option<i64>) -> Result<String, CliError>>;
 type AuthLogin = Box<dyn Fn(&Path, bool, &HeadlessTurnCancellation) -> Result<String, CliError>>;
+/// Whether the process's standard input is attached to a terminal.
+///
+/// This is a dependency rather than a direct `is_terminal()` call so a test
+/// states the input context it exercises instead of inheriting whatever the
+/// runner happens to provide: the same argv means a hidden prompt under a
+/// terminal and a piped read without one.
+type StdinIsTerminal = Box<dyn Fn() -> bool>;
 
 pub struct CliDependencies {
     pub(crate) host: HostEnvironment,
@@ -42,6 +50,7 @@ pub struct CliDependencies {
     pub(crate) headless_chat: HeadlessChat,
     pub(crate) tui_launcher: TuiLauncher,
     pub(crate) auth_login: AuthLogin,
+    pub(crate) stdin_is_terminal: StdinIsTerminal,
 }
 
 impl CliDependencies {
@@ -82,6 +91,7 @@ impl CliDependencies {
             headless_chat: Box::new(run_production_headless_chat),
             tui_launcher: Box::new(run_production_tui),
             auth_login: Box::new(run_production_auth_login),
+            stdin_is_terminal: Box::new(|| std::io::stdin().is_terminal()),
         }
     }
 
@@ -97,6 +107,7 @@ impl CliDependencies {
             headless_chat: Box::new(|_, _, _| Err(CliError::unavailable(UNAVAILABLE_MESSAGE))),
             tui_launcher: Box::new(|_, _| Err(CliError::unavailable(UNAVAILABLE_MESSAGE))),
             auth_login: Box::new(|_, _, _| Err(CliError::unavailable(UNAVAILABLE_MESSAGE))),
+            stdin_is_terminal: Box::new(|| false),
         }
     }
 
@@ -134,6 +145,11 @@ impl CliDependencies {
         login: impl Fn(&Path, bool, &HeadlessTurnCancellation) -> Result<String, CliError> + 'static,
     ) -> Self {
         self.auth_login = Box::new(login);
+        self
+    }
+
+    pub fn with_stdin_is_terminal(mut self, is_terminal: bool) -> Self {
+        self.stdin_is_terminal = Box::new(move || is_terminal);
         self
     }
 }
