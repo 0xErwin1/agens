@@ -4,11 +4,12 @@ use std::sync::{Arc, Mutex};
 
 use agens_core::{
     AttemptKey, CompletedTurnRepository, CompletedTurnSnapshot, CompletedTurnStoreError, FactPath,
-    HeadlessPermissionGate, HeadlessPermissionResolver, HeadlessToolCall, HeadlessToolDispatcher,
-    HeadlessToolOutput, HeadlessTurnCancellation, HeadlessTurnError, HeadlessTurnPortError,
-    MessagePart, PermissionDecision, ToolOutcome, ToolResultFacts, TurnEvent, TurnProgressSink,
-    TurnProvider, TurnState, run_headless_turn, run_headless_turn_with_max_iterations,
-    run_headless_turn_with_progress,
+    HeadlessIntraTurnInbox, HeadlessPermissionGate, HeadlessPermissionResolver, HeadlessToolCall,
+    HeadlessToolDispatcher, HeadlessToolOutput, HeadlessTurnCancellation, HeadlessTurnError,
+    HeadlessTurnPortError, IntraTurnInputSource, MessagePart, PendingIntraTurnInput,
+    PermissionDecision, ToolOutcome, ToolResultFacts, TurnEvent, TurnProgressSink, TurnProvider,
+    TurnState, run_headless_turn, run_headless_turn_with_inbox,
+    run_headless_turn_with_max_iterations, run_headless_turn_with_progress,
 };
 
 #[test]
@@ -1243,4 +1244,143 @@ impl HeadlessToolDispatcher for RecordingDispatcher {
         }
         ready(self.outputs.remove(0))
     }
+}
+
+/// Input handed to a running turn lands after the tool batch it interrupted,
+/// as its own event, and the turn keeps going.
+#[test]
+fn a_running_turn_collects_input_after_the_tool_batch() {
+    struct OnceInbox(Option<PendingIntraTurnInput>);
+
+    impl HeadlessIntraTurnInbox for OnceInbox {
+        fn drain(
+            &mut self,
+        ) -> impl std::future::Future<
+            Output = Result<Vec<PendingIntraTurnInput>, HeadlessTurnPortError>,
+        > + Send {
+            std::future::ready(Ok(self.0.take().into_iter().collect()))
+        }
+    }
+
+    let mut provider = Provider {
+        iterations: vec![
+            Ok(vec![MessagePart::ToolCall {
+                id: "call-1".into(),
+                name: "git_read".into(),
+                input: r#"{"operation":"diff"}"#.into(),
+            }]),
+            Ok(vec![MessagePart::Text("acknowledged".into())]),
+        ],
+    };
+    let mut inbox = OnceInbox(Some(PendingIntraTurnInput {
+        source: IntraTurnInputSource::Supervisor,
+        text: "prefer the manifest".into(),
+    }));
+
+    let snapshot = block_on_ready(run_headless_turn_with_inbox(
+        &mut provider,
+        &mut PermissionGate {
+            decisions: vec![PermissionDecision::Allow],
+            denial_facts: None,
+        },
+        &mut PermissionResolver::default(),
+        &mut ToolDispatcher {
+            outputs: vec![Ok(HeadlessToolOutput::success("diff"))],
+            calls: Vec::new(),
+        },
+        &mut Repository::default(),
+        &HeadlessTurnCancellation::new(),
+        None,
+        None,
+        None,
+        &mut inbox,
+    ))
+    .expect("the turn completes after collecting input");
+
+    let events = snapshot.events();
+    let input_at = events
+        .iter()
+        .position(|event| matches!(event, TurnEvent::IntraTurnInput { .. }))
+        .expect("the input is recorded");
+    let result_at = events
+        .iter()
+        .position(|event| matches!(event, TurnEvent::ToolResult(_)))
+        .expect("the tool ran");
+
+    assert!(input_at > result_at, "{events:?}");
+    assert_eq!(
+        events[input_at],
+        TurnEvent::IntraTurnInput {
+            source: IntraTurnInputSource::Supervisor,
+            text: "prefer the manifest".into(),
+        }
+    );
+}
+
+/// An empty inbox is the common case and must cost the turn nothing.
+#[test]
+fn an_empty_inbox_leaves_a_turn_byte_for_byte_unchanged() {
+    struct EmptyInbox;
+
+    impl HeadlessIntraTurnInbox for EmptyInbox {
+        fn drain(
+            &mut self,
+        ) -> impl std::future::Future<
+            Output = Result<Vec<PendingIntraTurnInput>, HeadlessTurnPortError>,
+        > + Send {
+            std::future::ready(Ok(Vec::new()))
+        }
+    }
+
+    let iterations = || {
+        vec![
+            Ok(vec![MessagePart::ToolCall {
+                id: "call-1".into(),
+                name: "git_read".into(),
+                input: r#"{"operation":"diff"}"#.into(),
+            }]),
+            Ok(vec![MessagePart::Text("done".into())]),
+        ]
+    };
+
+    let with_inbox = block_on_ready(run_headless_turn_with_inbox(
+        &mut Provider {
+            iterations: iterations(),
+        },
+        &mut PermissionGate {
+            decisions: vec![PermissionDecision::Allow],
+            denial_facts: None,
+        },
+        &mut PermissionResolver::default(),
+        &mut ToolDispatcher {
+            outputs: vec![Ok(HeadlessToolOutput::success("diff"))],
+            calls: Vec::new(),
+        },
+        &mut Repository::default(),
+        &HeadlessTurnCancellation::new(),
+        None,
+        None,
+        None,
+        &mut EmptyInbox,
+    ))
+    .expect("the turn completes");
+    let without_inbox = block_on_ready(run_headless_turn(
+        &mut Provider {
+            iterations: iterations(),
+        },
+        &mut PermissionGate {
+            decisions: vec![PermissionDecision::Allow],
+            denial_facts: None,
+        },
+        &mut PermissionResolver::default(),
+        &mut ToolDispatcher {
+            outputs: vec![Ok(HeadlessToolOutput::success("diff"))],
+            calls: Vec::new(),
+        },
+        &mut Repository::default(),
+        &HeadlessTurnCancellation::new(),
+    ))
+    .expect("the turn completes");
+
+    assert_eq!(with_inbox.events(), without_inbox.events());
 }

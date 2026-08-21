@@ -1,7 +1,7 @@
 use std::{
     borrow::Cow,
     fmt,
-    future::Future,
+    future::{Future, ready},
     path::{Component, Path},
     sync::{
         Arc,
@@ -1654,6 +1654,37 @@ pub trait HeadlessPermissionResolver {
     ) -> impl Future<Output = Result<PermissionDecision, HeadlessTurnPortError>> + Send;
 }
 
+/// Input waiting to be handed to a running turn.
+pub struct PendingIntraTurnInput {
+    pub source: IntraTurnInputSource,
+    pub text: String,
+}
+
+/// Where a running turn collects input that arrived while it was working.
+///
+/// A port rather than a queue this crate owns: the durable one lives in the
+/// store, and the turn loop stays independent of it. Pull, never push — the
+/// turn asks at a boundary it chose, so nothing outside it decides when a
+/// message lands.
+pub trait HeadlessIntraTurnInbox {
+    fn drain(
+        &mut self,
+    ) -> impl Future<Output = Result<Vec<PendingIntraTurnInput>, HeadlessTurnPortError>> + Send;
+}
+
+/// The inbox for a turn nobody can reach: every existing entry point uses it,
+/// so a turn without a supervisor behaves exactly as it did before.
+pub struct NoIntraTurnInput;
+
+impl HeadlessIntraTurnInbox for NoIntraTurnInput {
+    fn drain(
+        &mut self,
+    ) -> impl Future<Output = Result<Vec<PendingIntraTurnInput>, HeadlessTurnPortError>> + Send
+    {
+        ready(Ok(Vec::new()))
+    }
+}
+
 pub trait HeadlessToolDispatcher {
     fn dispatch(
         &mut self,
@@ -1938,6 +1969,7 @@ pub async fn run_headless_turn_with_progress(
         progress,
         attempt,
         AskUnreachable::PromptIsReachable,
+        &mut NoIntraTurnInput,
     )
     .await
 }
@@ -1988,6 +2020,7 @@ pub async fn run_headless_turn_with_max_iterations_and_progress(
         progress,
         attempt,
         AskUnreachable::PromptIsReachable,
+        &mut NoIntraTurnInput,
     )
     .await
 }
@@ -2021,6 +2054,7 @@ pub async fn run_isolated_headless_turn_with_max_iterations_and_progress(
         progress,
         attempt,
         AskUnreachable::PromptIsUnreachable,
+        &mut NoIntraTurnInput,
     )
     .await
 }
@@ -2050,6 +2084,7 @@ pub async fn run_isolated_headless_turn_with_progress(
         progress,
         attempt,
         AskUnreachable::PromptIsUnreachable,
+        &mut NoIntraTurnInput,
     )
     .await
 }
@@ -2086,6 +2121,39 @@ enum PreflightAuthorization {
     UnreachablePromptDenial,
 }
 
+/// A turn that can receive input while it runs.
+///
+/// Separate entry point rather than a parameter added to the existing ones: a
+/// turn with no supervisor should not have to name an inbox it will never read.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_headless_turn_with_inbox(
+    provider: &mut impl TurnProvider,
+    permission_gate: &mut impl HeadlessPermissionGate,
+    permission_resolver: &mut impl HeadlessPermissionResolver,
+    dispatcher: &mut impl HeadlessToolDispatcher,
+    repository: &mut impl CompletedTurnRepository,
+    cancellation: &HeadlessTurnCancellation,
+    max_iterations: Option<usize>,
+    progress: Option<&TurnProgressSink>,
+    attempt: Option<AttemptKey>,
+    inbox: &mut impl HeadlessIntraTurnInbox,
+) -> Result<CompletedTurnSnapshot, HeadlessTurnError> {
+    run_headless_turn_with_iteration_limit(
+        provider,
+        permission_gate,
+        permission_resolver,
+        dispatcher,
+        repository,
+        cancellation,
+        max_iterations,
+        progress,
+        attempt,
+        AskUnreachable::PromptIsReachable,
+        inbox,
+    )
+    .await
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_headless_turn_with_iteration_limit(
     provider: &mut impl TurnProvider,
@@ -2098,6 +2166,7 @@ async fn run_headless_turn_with_iteration_limit(
     progress: Option<&TurnProgressSink>,
     attempt: Option<AttemptKey>,
     ask_unreachable: AskUnreachable,
+    inbox: &mut impl HeadlessIntraTurnInbox,
 ) -> Result<CompletedTurnSnapshot, HeadlessTurnError> {
     let mut coordinator = match attempt {
         Some(key) => TurnCoordinator::for_attempt(key),
@@ -2286,6 +2355,21 @@ async fn run_headless_turn_with_iteration_limit(
                 return Err(error);
             }
         }
+
+        // The batch is complete and the provider has not been asked again: the
+        // one point in a turn where another speaker can be added without
+        // splitting a provider message or separating tool results from the
+        // assistant turn that called them.
+        for input in inbox
+            .drain()
+            .await
+            .map_err(|error| finish_port_error(&mut coordinator, error, HeadlessTurnError::State))?
+        {
+            coordinator
+                .accept_intra_turn_input(input.source, input.text)
+                .map_err(|_| fail_state(&mut coordinator))?;
+        }
+        flush_progress(&coordinator, progress, &mut progress_cursor);
     }
 }
 
