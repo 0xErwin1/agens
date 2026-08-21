@@ -229,7 +229,7 @@ fn replay_safe_history(history: &[Message]) -> Vec<Message> {
                 })
                 .cloned()
                 .collect(),
-            Role::System | Role::User => message.parts.clone(),
+            Role::System | Role::User | Role::Supervisor => message.parts.clone(),
         };
         if !parts.is_empty() {
             replay.push(Message {

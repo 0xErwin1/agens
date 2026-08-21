@@ -41,6 +41,17 @@ pub enum Role {
     User,
     Assistant,
     Tool,
+    /// An automated supervisor speaking to a running turn.
+    ///
+    /// Its own role rather than a labelled user message: a label lives in the
+    /// text, and text is the one thing a message can forge. No provider has a
+    /// wire role for it, so each encoder maps it to one — but the mapping is
+    /// made once, at the boundary, from a field content cannot reach.
+    ///
+    /// Authorship, not transport. A supervisor relaying an instruction the
+    /// person actually gave sends it as [`Self::User`]: the authority belongs
+    /// to whoever wrote the instruction, not to the process that carried it.
+    Supervisor,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -110,6 +121,7 @@ fn validate_session_message_part(
             MessagePart::Text(_) | MessagePart::Reasoning(_) | MessagePart::ToolCall { .. }
         ),
         Role::Tool => matches!(part, MessagePart::ToolResult { .. }),
+        Role::Supervisor => matches!(part, MessagePart::Text(_)),
     };
 
     if !allowed {
@@ -168,9 +180,12 @@ impl CompletedSessionTurn {
         if messages
             .get(user_index)
             .is_none_or(|message| message.role != Role::User)
-            || messages[user_index + 1..]
-                .iter()
-                .any(|message| !matches!(message.role, Role::Assistant | Role::Tool | Role::User))
+            || messages[user_index + 1..].iter().any(|message| {
+                !matches!(
+                    message.role,
+                    Role::Assistant | Role::Tool | Role::User | Role::Supervisor
+                )
+            })
         {
             return Err(CompletedSessionTurnError::InvalidMessageOrder);
         }

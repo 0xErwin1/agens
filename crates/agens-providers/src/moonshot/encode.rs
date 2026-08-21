@@ -54,10 +54,13 @@ fn tool_json(tool: &OpenAiFunctionTool) -> Value {
     })
 }
 
+/// The wire role. No provider has one for a supervisor, so it travels as a
+/// user message; what makes it distinguishable is the framing added once at
+/// this boundary, not a word inside the text it carries.
 fn role_name(role: Role) -> &'static str {
     match role {
         Role::System => "system",
-        Role::User => "user",
+        Role::User | Role::Supervisor => "user",
         Role::Assistant => "assistant",
         Role::Tool => "tool",
     }

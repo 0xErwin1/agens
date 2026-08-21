@@ -1920,6 +1920,7 @@ fn encode_role(role: Role) -> &'static str {
         Role::User => "user",
         Role::Assistant => "assistant",
         Role::Tool => "tool",
+        Role::Supervisor => "supervisor",
     }
 }
 
@@ -1990,6 +1991,7 @@ fn decode_role(role: &str, database_path: &std::path::Path) -> Result<Role, Sess
         "user" => Ok(Role::User),
         "assistant" => Ok(Role::Assistant),
         "tool" => Ok(Role::Tool),
+        "supervisor" => Ok(Role::Supervisor),
         _ => Err(SessionStoreError::operation(
             "decode session message",
             database_path,

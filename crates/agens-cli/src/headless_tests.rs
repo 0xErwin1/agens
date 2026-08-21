@@ -465,7 +465,8 @@ fn a_headless_turns_own_system_prompt_appends_this_sessions_agents_md_instructio
     assert_eq!(
         prompt,
         format!(
-            "You are Agens, a helpful coding agent.\n\n## Instructions from {}\nPROJECT-INSTRUCTIONS",
+            "{}\n\n## Instructions from {}\nPROJECT-INSTRUCTIONS",
+            agens_core::prompt::BASE_SYSTEM_PROMPT,
             canonical.display()
         ),
         "the hardcoded fallback must still carry this session's own AGENTS.md instructions"
@@ -596,7 +597,11 @@ fn a_headless_turns_own_system_prompt_composes_a_configured_prompt_after_the_bas
     let prompt = headless_turn_own_system_prompt(&bootstrap, &project_root, None).unwrap();
 
     assert_eq!(
-        prompt, "You are Agens, a helpful coding agent.\n\nYou are the project's own assistant.",
+        prompt,
+        format!(
+            "{}\n\nYou are the project's own assistant.",
+            agens_core::prompt::BASE_SYSTEM_PROMPT
+        ),
         "the direct SessionConfig path must compose the configured prompt after the built-in \
          base, not replace it"
     );
@@ -647,7 +652,7 @@ fn all_four_prompt_layers_are_assembled_in_the_fixed_order() {
     assert_eq!(
         prompt,
         format!(
-            "You are Agens, a helpful coding agent.\n\nYou are the project's own assistant.\n\n\
+            "{}\n\nYou are the project's own assistant.\n\n\
              ## Instructions from {}\nPROJECT-INSTRUCTIONS\n\nWhen the user explicitly asks for \
              subagent delegation, use the `task` tool instead of completing the delegated work \
              inline. Use `task_control` to inspect, background, or cancel a live execution and \
@@ -665,6 +670,7 @@ fn all_four_prompt_layers_are_assembled_in_the_fixed_order() {
              only on a confirmed scope violation or irreversible-action risk. Keep one change \
              with one agent start to finish; if an execution was interrupted, resume the same \
              role with full context instead of compensating with a different agent.",
+            agens_core::prompt::BASE_SYSTEM_PROMPT,
             canonical.display()
         ),
         "the base must precede the configured prompt, which must precede the AGENTS.md \

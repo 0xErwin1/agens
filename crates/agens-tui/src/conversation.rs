@@ -283,6 +283,19 @@ impl Conversation {
                         }
                     }
                 }
+                // Inside the turn it steered, never starting a new one: a
+                // supervisor message arrived while that turn was running, and
+                // showing it as a fresh exchange would claim the person spoke.
+                Role::Supervisor => {
+                    ensure_current(&mut current, &mut pending_system);
+                    let conversation = current.as_mut().expect("ensure_current");
+                    for part in &message.parts {
+                        if let MessagePart::Text(text) = part {
+                            let _ = conversation
+                                .apply(ConversationEvent::Info(format!("supervisor: {text}")));
+                        }
+                    }
+                }
                 Role::User => {
                     if let Some(conversation) = current.take() {
                         conversations.push(conversation);

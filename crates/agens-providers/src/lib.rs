@@ -2691,7 +2691,7 @@ pub fn encode_openai_response_request_with_tools(
     };
     let role = match message.role {
         Role::System => "system",
-        Role::User => "user",
+        Role::User | Role::Supervisor => "user",
         _ => {
             return Err(Error::Provider(
                 "OpenAI request error: only system and user messages are supported".to_owned(),
@@ -2838,7 +2838,7 @@ pub fn encode_openai_response_request_with_messages_and_media(
 
     for message in &messages {
         match message.role {
-            Role::System | Role::User => {
+            Role::System | Role::User | Role::Supervisor => {
                 let content = message
                     .parts
                     .iter()
@@ -2859,7 +2859,7 @@ pub fn encode_openai_response_request_with_messages_and_media(
                     &mut input,
                     match message.role {
                         Role::System => "system",
-                        Role::User => "user",
+                        Role::User | Role::Supervisor => "user",
                         _ => unreachable!(),
                     },
                     content,

@@ -91,6 +91,7 @@ crates/agens-tui/src/conversation.rs	let _ = conversation.apply(ConversationEven
 crates/agens-tui/src/conversation.rs	let _ = conversation.apply(ConversationEvent::Info(message));	closed_channel
 crates/agens-tui/src/conversation.rs	let _ = conversation.apply(ConversationEvent::Info(notice));	closed_channel
 crates/agens-tui/src/conversation.rs	let _ = conversation	closed_channel
+crates/agens-tui/src/conversation.rs	let _ = conversation	closed_channel
 crates/agens-tui/src/conversation.rs	let _ = conversation.apply(ConversationEvent::ToolCall {	closed_channel
 crates/agens-tui/src/conversation.rs	let _ = conversation	closed_channel
 crates/agens-tui/src/conversation.rs	let _ = conversation	closed_channel

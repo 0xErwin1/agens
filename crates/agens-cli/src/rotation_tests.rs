@@ -160,7 +160,8 @@ fn the_built_in_primary_agents_system_prompt_is_scoped_to_its_own_root_not_the_b
     let primary = catalog.agent("primary").unwrap();
 
     assert_eq!(
-        primary.system_prompt, "You are Agens, a helpful coding agent.",
+        primary.system_prompt,
+        agens_core::prompt::BASE_SYSTEM_PROMPT,
         "a system prompt written for a DIFFERENT project root's config must not silently \
          become the built-in primary agent's system prompt for a catalog scoped to this root"
     );
@@ -185,7 +186,10 @@ fn the_built_in_primary_agents_system_prompt_is_scoped_to_its_own_root_not_the_b
 
     assert_eq!(
         primary.system_prompt,
-        "You are Agens, a helpful coding agent.\n\nYou are root A's own assistant.",
+        format!(
+            "{}\n\nYou are root A's own assistant.",
+            agens_core::prompt::BASE_SYSTEM_PROMPT
+        ),
         "a session's OWN project configuration must compose after the built-in base for the \
          primary agent's system prompt"
     );
@@ -298,8 +302,8 @@ fn a_configured_system_prompt_is_preserved_with_agents_md_instructions_appended_
     let canonical_instructions_path =
         std::fs::canonicalize(project_root.join("AGENTS.md")).unwrap();
     let expected = format!(
-        "You are Agens, a helpful coding agent.\n\nCONFIGURED-CUSTOM-PROMPT\n\n## Instructions \
-         from {}\nPROJECT-INSTRUCTIONS-TEXT",
+        "{}\n\nCONFIGURED-CUSTOM-PROMPT\n\n## Instructions from {}\nPROJECT-INSTRUCTIONS-TEXT",
+        agens_core::prompt::BASE_SYSTEM_PROMPT,
         canonical_instructions_path.display()
     );
     assert_eq!(

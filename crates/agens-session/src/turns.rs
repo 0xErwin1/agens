@@ -124,16 +124,17 @@ pub fn completed_session_turn_from_events_with_media(
             TurnEvent::ProviderPart(part) => (Role::Assistant, part.clone()),
             TurnEvent::ToolResult(part) => (Role::Tool, persistable_tool_result(part)),
             TurnEvent::IntraTurnInput { source, text } => {
-                // Its own message, never coalesced into a neighbour. No provider
-                // has a role for a supervisor, so the only structural boundary
-                // available is the message itself; merging it into an adjacent
-                // one would leave the label as the sole separator.
+                // Its own message, never coalesced into a neighbour: merging it
+                // into an adjacent one would put two speakers in one message.
                 if let Some(role) = role.take() {
                     flush_parts(&mut messages, role, &mut parts);
                 }
                 messages.push(Message {
-                    role: Role::User,
-                    parts: vec![MessagePart::Text(intra_turn_input_text(*source, text))],
+                    role: match source {
+                        IntraTurnInputSource::Human => Role::User,
+                        IntraTurnInputSource::Supervisor => Role::Supervisor,
+                    },
+                    parts: vec![MessagePart::Text(text.clone())],
                 });
                 continue;
             }
@@ -392,26 +393,6 @@ fn persistable_tool_result(part: &MessagePart) -> MessagePart {
             is_error: *is_error,
         },
         _ => part.clone(),
-    }
-}
-
-/// How mid-turn input reads to the model.
-///
-/// A supervisor's message is labelled and the user's is not, because the two
-/// do not carry the same authority: an automated supervisor answering on the
-/// user's behalf cannot widen what the turn was allowed to do, and an unlabelled
-/// message would be indistinguishable from one that can.
-///
-/// The label is inside the message because no provider role exists for it. That
-/// is a known weakness: text that imitates the label is not detectable here, so
-/// the message boundary above is what actually separates speakers, and the
-/// label only names them.
-fn intra_turn_input_text(source: IntraTurnInputSource, text: &str) -> String {
-    match source {
-        IntraTurnInputSource::Human => text.to_owned(),
-        IntraTurnInputSource::Supervisor => {
-            format!("[supervisor, not the user] {text}")
-        }
     }
 }
 

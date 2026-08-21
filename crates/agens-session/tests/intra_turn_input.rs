@@ -82,7 +82,7 @@ fn a_supervisor_message_is_never_merged_into_the_users() {
 
     assert_eq!(
         encoded,
-        vec![Role::User, Role::User, Role::Assistant],
-        "the prompt and the supervisor stay separate messages"
+        vec![Role::User, Role::Supervisor, Role::Assistant],
+        "the supervisor speaks in its own role, not as the person"
     );
 }
