@@ -1,9 +1,11 @@
 //! Conversation block presentation builders (thinking, tool rows).
 
-use std::time::Duration;
+use std::{collections::HashSet, time::Duration};
 
 use agens_core::ToolInput;
-use agens_core::redaction::{is_credential_key, redact_credential_values};
+use agens_core::redaction::{
+    is_credential_key, key_carries_any_segment, redact_credential_values, redacted_marker,
+};
 use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
@@ -614,6 +616,7 @@ fn summarize_arguments_by_value(raw: &str) -> Option<String> {
         // to its budget, or carrying a newline, is no longer credential-shaped to
         // the predicate even though the argument it names still holds a secret.
         let is_credential = is_credential_key(key);
+        let is_auditable = key_carries_any_segment(key, &AUDITABLE_ARGUMENT_KEYS);
         let key = truncate_operand(&collapse_whitespace(key), MAX_SUMMARIZED_KEY_WIDTH);
 
         let rendered = match value {
@@ -627,6 +630,11 @@ fn summarize_arguments_by_value(raw: &str) -> Option<String> {
             _ if is_credential => "[redacted]".to_owned(),
             Value::String(text) => {
                 let text = redact_credential_values(&collapse_whitespace(text));
+                let text = if is_auditable {
+                    text
+                } else {
+                    redact_opaque_argument_words(&text)
+                };
                 truncate_operand(&text, MAX_SUMMARIZED_VALUE_WIDTH)
             }
             other => other.to_string(),
@@ -788,7 +796,7 @@ pub(crate) fn tool_argument_detail_text(parsed: &ToolInput, raw_input: &str) -> 
         return if trimmed.starts_with('{') {
             String::new()
         } else {
-            redact_credential_values(trimmed)
+            audit_argument_value("", trimmed)
         };
     }
 
@@ -874,7 +882,7 @@ fn flatten_argument_value(path: &str, value: &Value, fields: &mut Vec<(String, S
         Value::Object(_) | Value::Array(_) => {
             fields.push((path.to_owned(), "(empty)".to_owned()));
         }
-        Value::String(text) => fields.push((path.to_owned(), redact_credential_values(text))),
+        Value::String(text) => fields.push((path.to_owned(), audit_argument_value(path, text))),
         Value::Null => fields.push((path.to_owned(), "null".to_owned())),
         other => fields.push((path.to_owned(), other.to_string())),
     }
@@ -888,6 +896,155 @@ fn flatten_argument_value(path: &str, value: &Value, fields: &mut Vec<(String, S
 /// last dot let a key that contains one (`token.value`) escape pruning entirely.
 fn path_carries_credential_key(path: &str) -> bool {
     path.split(['[', ']']).any(is_credential_key)
+}
+
+/// Argument names whose legitimate values are themselves long opaque tokens.
+///
+/// This list is not "keys that are safe" — most keys are, and listing them all is the trap an
+/// allowlist walks into. It is the far smaller set of keys an operator reads as one unbroken
+/// run of characters with no spaces in it: a path, a glob, a URL, a command line, a commit or
+/// record id. Those are exactly the values [`is_opaque_argument_word`] cannot tell apart from a
+/// credential, so the key is what settles it. Every other name — `name`, `status`, `model`,
+/// `body`, `env` — is absent on purpose: its real values are short or spaced, so they clear the
+/// shape rule on their own and need no exemption.
+const AUDITABLE_ARGUMENT_KEYS: [&str; 31] = [
+    "command",
+    "cmd",
+    "script",
+    "path",
+    "file",
+    "filepath",
+    "dir",
+    "directory",
+    "folder",
+    "cwd",
+    "root",
+    "pattern",
+    "glob",
+    "regex",
+    "query",
+    "search",
+    "url",
+    "uri",
+    "endpoint",
+    "host",
+    "hostname",
+    "domain",
+    "origin",
+    "id",
+    "slug",
+    "sha",
+    "hash",
+    "checksum",
+    "commit",
+    "revision",
+    "ref",
+];
+
+/// Characters an opaque token is built from. Deliberately wide: base64, base64url, hex, and
+/// every vendor prefix scheme stay inside it, and so do paths and URLs — which is why the key
+/// allowlist above exists rather than a carve-out here.
+fn is_opaque_argument_char(character: char) -> bool {
+    character.is_ascii_alphanumeric()
+        || matches!(character, '-' | '_' | '.' | '+' | '/' | '=' | '~' | ':')
+}
+
+/// Length at which an unspaced run stops being a word and starts being a possible credential.
+/// The shortest credential this has to catch is a 20-character AWS access key id.
+const MIN_OPAQUE_ARGUMENT_CHARS: usize = 20;
+
+/// Distinct characters a run carries before it reads as random rather than repetitive, so a
+/// long run of one character or a padded placeholder is not mistaken for a key.
+const MIN_OPAQUE_ARGUMENT_DISTINCT_CHARS: usize = 8;
+
+/// Whether one unspaced run of an argument value has the shape of a credential.
+///
+/// The shared value-shape detector recognizes credentials by context — a known prefix, an auth
+/// scheme in front, a credential-shaped key — and documents that it carries no standalone
+/// high-entropy rule, because mangling unrelated prose in an error message costs more than the
+/// residual. This sink inverts that trade: it prints the raw arguments a model sent a tool,
+/// which is where real tokens live, and it exists so an operator can decide whether a call is
+/// safe. A view that leaks what it audits is worse than no view, so here an unrecognized run
+/// is withheld and the false positives — a long hash or a long path under a key this module
+/// does not know — are the accepted cost, bounded to one field and announced by length.
+fn is_opaque_argument_word(word: &str) -> bool {
+    if word.chars().count() < MIN_OPAQUE_ARGUMENT_CHARS
+        || !word.chars().all(is_opaque_argument_char)
+    {
+        return false;
+    }
+
+    let has_letter = word
+        .chars()
+        .any(|character| character.is_ascii_alphabetic());
+    let has_digit = word.chars().any(|character| character.is_ascii_digit());
+    if !has_letter || !has_digit {
+        return false;
+    }
+
+    let distinct: HashSet<char> = word.chars().collect();
+    distinct.len() >= MIN_OPAQUE_ARGUMENT_DISTINCT_CHARS
+}
+
+/// Replaces every credential-shaped run in `value` with a withheld marker, preserving the
+/// whitespace between runs so a multi-line command still reads as one.
+fn redact_opaque_argument_words(value: &str) -> String {
+    let mut rendered = String::with_capacity(value.len());
+    let mut word_start: Option<usize> = None;
+
+    for (index, character) in value.char_indices() {
+        if character.is_whitespace() {
+            if let Some(start) = word_start.take() {
+                rendered.push_str(&render_argument_word(&value[start..index]));
+            }
+            rendered.push(character);
+        } else if word_start.is_none() {
+            word_start = Some(index);
+        }
+    }
+
+    if let Some(start) = word_start {
+        rendered.push_str(&render_argument_word(&value[start..]));
+    }
+
+    rendered
+}
+
+fn render_argument_word(word: &str) -> String {
+    if is_opaque_argument_word(word) {
+        redacted_marker(word)
+    } else {
+        word.to_owned()
+    }
+}
+
+/// The name the value actually hangs off, with the flattener's dotted path and array indices
+/// stripped away.
+///
+/// The allowlist is answered by the leaf alone, unlike the credential predicate which answers
+/// on any part of the path: an ancestor named `command` says nothing about whether the member
+/// `command.env.AWS_KEY` under it is safe to print, while an ancestor named `secret` is enough
+/// to withhold everything beneath it.
+fn argument_leaf_key(path: &str) -> &str {
+    path.split(['.', '[', ']'])
+        .rfind(|part| !part.is_empty() && !part.chars().all(|part| part.is_ascii_digit()))
+        .unwrap_or("")
+}
+
+/// One argument value as the overlay may print it.
+///
+/// A value under a credential-shaped key never reaches here — [`flatten_argument_value`] prunes
+/// at the path. What is left is everything else, and the policy for it is the inverse of the
+/// shared one: an argument name whose values are legitimately opaque is printed under the
+/// shared value-shape rules, and every other name additionally has its opaque runs withheld.
+fn audit_argument_value(path: &str, value: &str) -> String {
+    let redacted = redact_credential_values(value);
+
+    if key_carries_any_segment(argument_leaf_key(path), &AUDITABLE_ARGUMENT_KEYS) {
+        return redacted;
+    }
+
+    redact_opaque_argument_words(&redacted)
 }
 
 /// One `name: value` line, or a labelled block when the value spans lines.
@@ -997,7 +1154,7 @@ fn expanded_argument_texts(parsed: &ToolInput, raw_input: &str, width: usize) ->
                     wrap_command_lines(&format_key_shape(&object_keys(trimmed)), width)
                 } else {
                     wrap_command_lines(
-                        &redact_credential_values(&collapse_whitespace(trimmed)),
+                        &audit_argument_value("", &collapse_whitespace(trimmed)),
                         width,
                     )
                 }
@@ -2119,6 +2276,127 @@ mod tests {
             !summary.contains(low_entropy_secret),
             "a credential key too long to display whole is still a credential key: {summary:?}"
         );
+    }
+
+    /// The keys a denylist anticipates are the ones that never mattered. An MCP server names its
+    /// arguments whatever it likes, and a token arriving under `body`, `payload`, `env` or a
+    /// server's own vocabulary is exactly the case the overlay exists to catch — the view an
+    /// operator reads to decide a call is safe is the one sink that must not leak.
+    #[test]
+    fn a_credential_under_an_unanticipated_key_never_reaches_the_overlay() {
+        let secrets = [
+            ("body", "ghp_ABCDEFghijkl0123456789ABCDEFghijkl01"),
+            ("payload", "github_pat_11ABCDE0y0aBcDeFgHiJkL0123456789"),
+            ("input", "xoxz-1234567890-1234567890123-AbCdEfGhIjKlMnOp"),
+            ("data", "AKIAIOSFODNN7EXAMPLE"),
+            ("env", "wJalrXUtnFEMI0K7MDENG1bPxRfiCYEXAMPLEKEY"),
+            ("key", "AKIAIOSFODNN7EXAMPLE"),
+        ];
+        let raw = serde_json::Value::Object(
+            secrets
+                .iter()
+                .map(|(key, secret)| {
+                    (
+                        (*key).to_owned(),
+                        serde_json::Value::String((*secret).to_owned()),
+                    )
+                })
+                .collect(),
+        )
+        .to_string();
+
+        let args = tool_argument_detail_text(
+            &ToolInput::Other {
+                name: "mcp::deploy".into(),
+                raw: raw.clone(),
+            },
+            &raw,
+        );
+        let summary = summarize_args("mcp::deploy", &raw);
+
+        for (key, secret) in secrets {
+            assert!(
+                !args.contains(secret),
+                "the overlay body leaks the value under {key}: {args:?}"
+            );
+            assert!(
+                !summary.contains(secret),
+                "the collapsed summary leaks the value under {key}: {summary:?}"
+            );
+        }
+        assert_eq!(
+            args.lines()
+                .filter(|row| row.contains("[redacted: "))
+                .count(),
+            secrets.len(),
+            "every withheld value names its length so the operator sees the field existed: {args:?}"
+        );
+    }
+
+    /// The cost of inverting the policy is the view itself, so the keys whose values are
+    /// legitimately one long opaque run have to survive whole. An operator who cannot read
+    /// `command`, `path`, `url` or the record id a call names is auditing nothing.
+    #[test]
+    fn an_argument_whose_values_are_legitimately_opaque_still_arrives_whole() {
+        let auditable = [
+            ("command", "cargo test --package agens-tui-app12"),
+            (
+                "file_path",
+                "/home/operator/dev/agens/crates/agens-tui/src/widgets/blocks.rs",
+            ),
+            ("url", "https://api.example.com/v2/records/9f3c1d7e4b2a8065"),
+            ("task_id", "9f3c1d7e-4b2a-8065-a1c2-d3e4f5061728"),
+            ("glob", "crates/**/src/**/*_2024.rs"),
+        ];
+        let raw = serde_json::Value::Object(
+            auditable
+                .iter()
+                .map(|(key, value)| {
+                    (
+                        (*key).to_owned(),
+                        serde_json::Value::String((*value).to_owned()),
+                    )
+                })
+                .collect(),
+        )
+        .to_string();
+
+        let args = tool_argument_detail_text(
+            &ToolInput::Other {
+                name: "mcp::inspect".into(),
+                raw: raw.clone(),
+            },
+            &raw,
+        );
+
+        for (key, value) in auditable {
+            assert!(
+                args.contains(value),
+                "the overlay withheld an auditable argument under {key}: {args:?}"
+            );
+        }
+    }
+
+    /// A credential embedded in an otherwise ordinary sentence is the same leak: the run is what
+    /// is withheld, and the prose around it survives so the argument still reads.
+    #[test]
+    fn a_credential_embedded_in_prose_is_withheld_without_losing_the_prose() {
+        let raw = serde_json::json!({
+            "note": "deploy with ghp_ABCDEFghijkl0123456789ABCDEFghijkl01 before friday",
+        })
+        .to_string();
+
+        let args = tool_argument_detail_text(
+            &ToolInput::Other {
+                name: "mcp::deploy".into(),
+                raw: raw.clone(),
+            },
+            &raw,
+        );
+
+        assert!(!args.contains("ghp_ABCDEF"), "{args:?}");
+        assert!(args.contains("deploy with "), "{args:?}");
+        assert!(args.ends_with(" before friday"), "{args:?}");
     }
 
     /// The overlay body carries field boundaries in its own layout, so a JSON key is a place an

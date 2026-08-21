@@ -110,7 +110,12 @@ fn is_delimiter_char(character: char) -> bool {
 
 const REDACTED_MARKER_PREFIX: &str = "[redacted:";
 
-fn redacted_marker(value: &str) -> String {
+/// The withheld marker every sink writes in place of a value it will not print.
+///
+/// Public so a sink that decides on its own policy which values to withhold still writes the
+/// same marker as this module does. Two spellings of "withheld" in one rendered body read as
+/// two different things having happened.
+pub fn redacted_marker(value: &str) -> String {
     format!("[redacted: {} characters]", value.chars().count())
 }
 
@@ -298,15 +303,27 @@ fn is_credential_shaped_value(value: &str) -> bool {
 /// it is worse than missing a scalar, because the sinks that prune on this predicate prune at
 /// the parent path — a missed plural leaves every element of the array rendered.
 pub fn is_credential_key(name: &str) -> bool {
+    key_carries_any_segment(name, &CREDENTIAL_KEYS)
+}
+
+/// Whether `name` carries any of `segments` as a whole segment, under the same boundary rules
+/// [`is_credential_key`] applies.
+///
+/// Exposed because a sink may need to recognize its own vocabulary of key names — an allowlist
+/// of argument names whose values are safe to print, for instance — and a second, subtly
+/// different matcher would recognize `accessToken` in one place and miss it in another. A name
+/// carrying a character no key convention produces matches nothing, so an unparsable name is
+/// always the unrecognized one.
+pub fn key_carries_any_segment(name: &str, segments: &[&str]) -> bool {
     if name.is_empty() || !name.chars().all(is_credential_key_char) {
         return false;
     }
 
     let normalized = normalize_key_boundaries(name);
 
-    CREDENTIAL_KEYS
+    segments
         .iter()
-        .any(|key| contains_credential_key_segment(&normalized, key))
+        .any(|segment| contains_key_segment(&normalized, segment))
 }
 
 fn is_credential_key_char(character: char) -> bool {
@@ -348,7 +365,7 @@ fn opens_camel_case_word(characters: &[char], index: usize) -> bool {
                 .is_some_and(char::is_ascii_lowercase))
 }
 
-fn contains_credential_key_segment(name: &str, key: &str) -> bool {
+fn contains_key_segment(name: &str, key: &str) -> bool {
     name.match_indices(key).any(|(start, matched)| {
         is_key_segment_boundary(name, start) && ends_key_segment(name, start + matched.len())
     })
