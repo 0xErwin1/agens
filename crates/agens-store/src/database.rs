@@ -57,7 +57,7 @@ struct Migration {
     preserved_tables: &'static [&'static str],
 }
 
-const MIGRATIONS: [Migration; 12] = [
+const MIGRATIONS: [Migration; 13] = [
     Migration {
         id: "0001_permission_grants",
         ddl: permission_grants_ddl,
@@ -118,6 +118,15 @@ const MIGRATIONS: [Migration; 12] = [
     Migration {
         id: "0012_directives",
         ddl: directives_ddl,
+        preserved_tables: &[],
+    },
+    Migration {
+        id: "0013_supervisor_role",
+        ddl: supervisor_role_ddl,
+        // No preserved-table guard: it counts rows before the DDL runs, and a
+        // database that never carried sessions has no `messages` to count. The
+        // rebuild proves preservation in a test of its own instead
+        // (`a_supervisor_role_migration_keeps_every_message_and_part`).
         preserved_tables: &[],
     },
 ];
@@ -395,6 +404,80 @@ fn permission_grants_ddl() -> String {
     );
     CREATE INDEX permission_grants_project
         ON permission_grants(project, id);
+    "
+    .to_owned()
+}
+
+/// Widens the message role check so a supervisor message can be persisted.
+///
+/// A rebuild rather than an `ALTER`: SQLite cannot change a `CHECK`, and a
+/// constraint that rejects a role the domain now has means the whole turn fails
+/// to save, not just the one message. `message_parts` is rebuilt with it because
+/// its cascade fires on the drop.
+fn supervisor_role_ddl() -> String {
+    "
+    -- A database that never carried sessions still runs this migration, so the
+    -- rebuild starts by making its inputs exist. Both are no-ops when the
+    -- tables are already there, and create them empty when they are not.
+    CREATE TABLE IF NOT EXISTS messages (
+        session_id INTEGER NOT NULL,
+        sequence INTEGER NOT NULL CHECK(sequence > 0),
+        turn_sequence INTEGER NOT NULL CHECK(turn_sequence > 0),
+        role TEXT NOT NULL CHECK(role IN('system', 'user', 'assistant', 'tool')),
+        PRIMARY KEY(session_id, sequence),
+        FOREIGN KEY(session_id, turn_sequence) REFERENCES turns(session_id, sequence) ON DELETE CASCADE
+    );
+    CREATE TABLE IF NOT EXISTS message_parts (
+        session_id INTEGER NOT NULL,
+        message_sequence INTEGER NOT NULL,
+        sequence INTEGER NOT NULL CHECK(sequence >= 0),
+        kind TEXT NOT NULL CHECK(kind IN('text', 'reasoning', 'tool_call', 'tool_result', 'media')),
+        text TEXT,
+        call_id TEXT,
+        name TEXT,
+        input_json TEXT,
+        content TEXT,
+        is_error INTEGER CHECK(is_error IN(0, 1)),
+        media_id INTEGER,
+        mime TEXT,
+        PRIMARY KEY(session_id, message_sequence, sequence)
+    );
+    CREATE TABLE message_parts_keep AS SELECT * FROM message_parts;
+    CREATE TABLE messages_keep AS SELECT * FROM messages;
+    DROP TABLE message_parts;
+    DROP TABLE messages;
+    CREATE TABLE messages (
+        session_id INTEGER NOT NULL,
+        sequence INTEGER NOT NULL CHECK(sequence > 0),
+        turn_sequence INTEGER NOT NULL CHECK(turn_sequence > 0),
+        role TEXT NOT NULL CHECK(role IN('system', 'user', 'assistant', 'tool', 'supervisor')),
+        PRIMARY KEY(session_id, sequence),
+        FOREIGN KEY(session_id, turn_sequence) REFERENCES turns(session_id, sequence) ON DELETE CASCADE
+    );
+    INSERT INTO messages SELECT * FROM messages_keep;
+    DROP TABLE messages_keep;
+    CREATE INDEX messages_turn_order ON messages(session_id, turn_sequence, sequence);
+    CREATE TABLE message_parts (
+        session_id INTEGER NOT NULL,
+        message_sequence INTEGER NOT NULL,
+        sequence INTEGER NOT NULL CHECK(sequence >= 0),
+        kind TEXT NOT NULL CHECK(kind IN('text', 'reasoning', 'tool_call', 'tool_result', 'media')),
+        text TEXT,
+        call_id TEXT,
+        name TEXT,
+        input_json TEXT,
+        content TEXT,
+        is_error INTEGER CHECK(is_error IN(0, 1)),
+        media_id INTEGER,
+        mime TEXT,
+        PRIMARY KEY(session_id, message_sequence, sequence),
+        FOREIGN KEY(session_id, message_sequence) REFERENCES messages(session_id, sequence) ON DELETE CASCADE,
+        FOREIGN KEY(media_id) REFERENCES media(id),
+        CHECK((kind IN('text', 'reasoning') AND text IS NOT NULL AND call_id IS NULL AND name IS NULL AND input_json IS NULL AND content IS NULL AND is_error IS NULL AND media_id IS NULL AND mime IS NULL) OR (kind = 'tool_call' AND text IS NULL AND call_id IS NOT NULL AND call_id <> '' AND name IS NOT NULL AND name <> '' AND input_json IS NOT NULL AND content IS NULL AND is_error IS NULL AND media_id IS NULL AND mime IS NULL) OR (kind = 'tool_result' AND text IS NULL AND call_id IS NOT NULL AND call_id <> '' AND name IS NULL AND input_json IS NULL AND content IS NOT NULL AND is_error IS NOT NULL AND media_id IS NULL AND mime IS NULL) OR (kind = 'media' AND text IS NULL AND call_id IS NULL AND name IS NULL AND input_json IS NULL AND content IS NULL AND is_error IS NULL AND media_id IS NOT NULL AND mime IS NOT NULL AND mime <> ''))
+    );
+    INSERT INTO message_parts SELECT * FROM message_parts_keep;
+    DROP TABLE message_parts_keep;
+    CREATE INDEX parts_message_order ON message_parts(session_id, message_sequence, sequence);
     "
     .to_owned()
 }

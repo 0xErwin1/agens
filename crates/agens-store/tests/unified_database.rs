@@ -92,7 +92,8 @@ fn the_ledger_records_each_applied_migration_once() {
             "0009_media",
             "0010_prompt_memory_media",
             "0011_session_fork_lineage",
-            "0012_directives"
+            "0012_directives",
+            "0013_supervisor_role"
         ]
     );
 
@@ -160,6 +161,7 @@ fn an_unknown_ledger_id_is_tolerated_and_known_missing_migrations_still_apply() 
             ("0010_prompt_memory_media".to_owned(), rows[9].1),
             ("0011_session_fork_lineage".to_owned(), rows[10].1),
             ("0012_directives".to_owned(), rows[11].1),
+            ("0013_supervisor_role".to_owned(), rows[12].1),
             ("9999_unknown".to_owned(), 0),
         ]
     );
@@ -408,7 +410,8 @@ fn a_partially_applied_database_is_completed() {
             "0009_media",
             "0010_prompt_memory_media",
             "0011_session_fork_lineage",
-            "0012_directives"
+            "0012_directives",
+            "0013_supervisor_role"
         ]
     );
 
@@ -494,7 +497,8 @@ fn all_three_domains_share_one_database_file() {
             "0009_media",
             "0010_prompt_memory_media",
             "0011_session_fork_lineage",
-            "0012_directives"
+            "0012_directives",
+            "0013_supervisor_role"
         ]
     );
 
@@ -575,7 +579,8 @@ fn a_bootstrap_only_ledger_with_no_user_tables_is_accepted() {
             "0009_media",
             "0010_prompt_memory_media",
             "0011_session_fork_lineage",
-            "0012_directives"
+            "0012_directives",
+            "0013_supervisor_role"
         ]
     );
 

@@ -680,7 +680,7 @@ const NORMALIZED_SESSION_SCHEMA_V2: &str = "
         session_id INTEGER NOT NULL,
         sequence INTEGER NOT NULL CHECK(sequence > 0),
         turn_sequence INTEGER NOT NULL CHECK(turn_sequence > 0),
-        role TEXT NOT NULL CHECK(role IN('system', 'user', 'assistant', 'tool')),
+        role TEXT NOT NULL CHECK(role IN('system', 'user', 'assistant', 'tool', 'supervisor')),
         PRIMARY KEY(session_id, sequence),
         FOREIGN KEY(session_id, turn_sequence) REFERENCES turns(session_id, sequence) ON DELETE CASCADE
     );

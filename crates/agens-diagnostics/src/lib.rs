@@ -1231,10 +1231,6 @@ mod tests {
         std::fs::remove_dir_all(temporary.parent().unwrap()).ok();
         assert!(!temporary.exists(), "the parent must be absent to start");
 
-        // The failure counter is process-wide, so this compares against its own
-        // baseline instead of zero: another test in this binary may have
-        // recorded a deliberate failure already.
-        let failures_before = best_effort_failures();
         SafeDiagnosticStore::with_capture(temporary.clone(), true).record_session_lifecycle(
             &DiagnosticRef::new("abcd1234".to_owned()).unwrap(),
             ProviderDiagnosticScope::Parent,
@@ -1244,12 +1240,10 @@ mod tests {
         let recorded = recorded_lines(&temporary);
 
         assert_eq!(recorded.len(), 1, "{recorded:?}");
+        // The recorded line is the whole proof. The best-effort failure counter
+        // is process-wide, so a before/after comparison measures every test
+        // running beside this one, not this write.
         assert_eq!(recorded[0]["event"], "turn_started");
-        assert_eq!(
-            best_effort_failures(),
-            failures_before,
-            "no write was silently dropped"
-        );
 
         std::fs::remove_dir_all(temporary.parent().unwrap()).ok();
     }
