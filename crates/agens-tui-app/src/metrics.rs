@@ -210,6 +210,9 @@ impl TuiMetricsPublisher {
             TurnEvent::ToolResult(_) => None,
             TurnEvent::ToolResultFacts { .. } => None,
             TurnEvent::ProviderRetry { .. } => None,
+            // Input arriving mid-turn is not a metric: it neither starts nor
+            // ends work and spends no tokens of its own.
+            TurnEvent::IntraTurnInput { .. } => None,
         };
 
         if let Some(event) = metric {

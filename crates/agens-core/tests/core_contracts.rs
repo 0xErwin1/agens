@@ -5,11 +5,11 @@ use std::{
 
 use agens_core::{
     AttemptKey, CompletedTurnPersistenceError, CompletedTurnRepository, CompletedTurnSnapshot,
-    CompletedTurnStoreError, Error, ErrorCategory, FactPath, Message, MessagePart,
-    PermissionDecision, PermissionMode, PermissionPattern, PermissionPolicy, PermissionRequest,
-    PermissionRule, PermissionSession, ProjectPermissionGrant, Role, ToolAccess, ToolOutcome,
-    ToolResultFacts, TurnCoordinator, TurnEvent, TurnEventError, TurnState, TurnTransitionError,
-    WriteMagnitude,
+    CompletedTurnStoreError, Error, ErrorCategory, FactPath, IntraTurnInputSource, Message,
+    MessagePart, PermissionDecision, PermissionMode, PermissionPattern, PermissionPolicy,
+    PermissionRequest, PermissionRule, PermissionSession, ProjectPermissionGrant, Role, ToolAccess,
+    ToolOutcome, ToolResultFacts, TurnCoordinator, TurnEvent, TurnEventError, TurnState,
+    TurnTransitionError, WriteMagnitude,
 };
 
 #[derive(Default)]
@@ -1420,4 +1420,93 @@ fn two_concurrent_tool_calls_pin_the_full_result_facts_slice() {
         other => panic!("expected call-b's facts event, got {other:?}"),
     }
     assert_eq!(tail[4], TurnEvent::StateChanged(TurnState::Requesting));
+}
+
+/// Input that arrives while a turn is running lands at the tool boundary, as
+/// its own event rather than folded into the tool result that carried it.
+///
+/// The whole point of a separate variant is provenance: a directive appended
+/// into a tool result body reads as if the tool said it, which is the
+/// data-versus-instruction confusion the structural boundary exists to close.
+#[test]
+fn intra_turn_input_is_accepted_at_the_tool_boundary_as_its_own_event() {
+    let mut coordinator = TurnCoordinator::new();
+
+    coordinator.begin().unwrap();
+    coordinator
+        .accept_provider_part(MessagePart::ToolCall {
+            id: "call-1".into(),
+            name: "read".into(),
+            input: "{\"path\":\"Cargo.toml\"}".into(),
+        })
+        .unwrap();
+    coordinator.finish_provider_iteration().unwrap();
+    coordinator
+        .accept_intra_turn_input(IntraTurnInputSource::Human, "use the other file".into())
+        .unwrap();
+    coordinator
+        .accept_tool_result("call-1", "package manifest".into(), false, None)
+        .unwrap();
+
+    assert!(coordinator.events().contains(&TurnEvent::IntraTurnInput {
+        source: IntraTurnInputSource::Human,
+        text: "use the other file".into(),
+    }));
+    assert!(
+        coordinator
+            .events()
+            .iter()
+            .all(|event| !matches!(event, TurnEvent::ToolResult(MessagePart::ToolResult { content, .. }) if content.contains("use the other file"))),
+        "the directive never enters a tool result body"
+    );
+}
+
+/// A turn only reaches a boundary while it is dispatching tools. Accepting
+/// input mid-stream would splice a message between a provider's own parts.
+#[test]
+fn intra_turn_input_is_refused_away_from_a_tool_boundary() {
+    let mut coordinator = TurnCoordinator::new();
+
+    coordinator.begin().unwrap();
+
+    assert!(
+        coordinator
+            .accept_intra_turn_input(IntraTurnInputSource::Supervisor, "stop".into())
+            .is_err()
+    );
+}
+
+/// Intra-turn input is persisted and replayed like any other turn event: a
+/// resumed session that lost it would answer a question nobody asked.
+#[test]
+fn a_completed_turn_replays_its_intra_turn_input() {
+    let mut coordinator = TurnCoordinator::new();
+
+    coordinator.begin().unwrap();
+    coordinator
+        .accept_provider_part(MessagePart::ToolCall {
+            id: "call-1".into(),
+            name: "read".into(),
+            input: "{\"path\":\"Cargo.toml\"}".into(),
+        })
+        .unwrap();
+    coordinator.finish_provider_iteration().unwrap();
+    coordinator
+        .accept_intra_turn_input(
+            IntraTurnInputSource::Supervisor,
+            "prefer the manifest".into(),
+        )
+        .unwrap();
+    coordinator
+        .accept_tool_result("call-1", "package manifest".into(), false, None)
+        .unwrap();
+    coordinator
+        .accept_provider_part(MessagePart::Text("done".into()))
+        .unwrap();
+    coordinator.finish_provider_iteration().unwrap();
+
+    let events = coordinator.events().to_vec();
+
+    CompletedTurnSnapshot::from_persisted_events(events)
+        .expect("a turn carrying intra-turn input replays");
 }

@@ -4,9 +4,9 @@ use std::{
 };
 
 use agens_core::{
-    CompletedTurnRepository, CompletedTurnSnapshot, CompletedTurnStoreError, MessagePart,
-    PermissionDecision, PermissionPattern, ProjectPermissionGrant, ReasoningEffort, RequestConfig,
-    TurnEvent, TurnState,
+    CompletedTurnRepository, CompletedTurnSnapshot, CompletedTurnStoreError, IntraTurnInputSource,
+    MessagePart, PermissionDecision, PermissionPattern, ProjectPermissionGrant, ReasoningEffort,
+    RequestConfig, TurnEvent, TurnState,
 };
 use rusqlite::{Connection, Transaction, TransactionBehavior, params};
 
@@ -1502,8 +1502,31 @@ const TOOL_RESULT_FIELDS: PersistedEventFieldMatrix = PersistedEventFieldMatrix 
     is_error: true,
 };
 
+/// Intra-turn input reuses the existing columns rather than adding two: the
+/// source travels in `part_kind` and the text in `content`, so persisting it
+/// needs no migration.
+const INTRA_TURN_INPUT_FIELDS: PersistedEventFieldMatrix = PersistedEventFieldMatrix {
+    state: false,
+    part_kind: true,
+    call_id: false,
+    name: false,
+    input: false,
+    content: true,
+    is_error: false,
+};
+
 fn encode_turn_event(event: &TurnEvent) -> EncodedTurnEvent<'_> {
     match event {
+        TurnEvent::IntraTurnInput { source, text } => EncodedTurnEvent {
+            kind: "intra_turn_input",
+            state: None,
+            part_kind: Some(source.as_str()),
+            call_id: None,
+            name: None,
+            input: None,
+            content: Some(text),
+            is_error: None,
+        },
         TurnEvent::StateChanged(state) => EncodedTurnEvent {
             kind: "state_changed",
             state: Some(encode_turn_state(*state)),
@@ -1646,6 +1669,19 @@ fn decode_turn_event(fields: PersistedTurnEvent) -> Result<TurnEvent, &'static s
                     _ => return Err("invalid tool result error flag"),
                 },
             }))
+        }
+        "intra_turn_input" => {
+            let fields = required_fields(fields, INTRA_TURN_INPUT_FIELDS)?;
+            let source = match fields.part_kind.as_deref() {
+                Some("human") => IntraTurnInputSource::Human,
+                Some("supervisor") => IntraTurnInputSource::Supervisor,
+                _ => return Err("invalid intra-turn input source"),
+            };
+
+            Ok(TurnEvent::IntraTurnInput {
+                source,
+                text: fields.content.unwrap(),
+            })
         }
         _ => Err("invalid persisted event kind"),
     }

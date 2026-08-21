@@ -610,6 +610,35 @@ pub enum TurnEvent {
         delay: Option<Duration>,
         reason: TurnRetryReason,
     },
+    /// Input that reached a running turn at a tool boundary.
+    ///
+    /// Its own event rather than text folded into the tool result that carried
+    /// it: an instruction appended to a tool's output reads as if the tool
+    /// produced it, and a boundary a message can imitate is not a boundary.
+    IntraTurnInput {
+        source: IntraTurnInputSource,
+        text: String,
+    },
+}
+
+/// Who sent input that arrived mid-turn.
+///
+/// Recorded rather than inferred, because the two do not carry the same
+/// authority: a person can widen what a turn is allowed to do, and an
+/// automated supervisor answering on their behalf cannot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IntraTurnInputSource {
+    Human,
+    Supervisor,
+}
+
+impl IntraTurnInputSource {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Human => "human",
+            Self::Supervisor => "supervisor",
+        }
+    }
 }
 
 /// Why a turn is waiting before it tries the provider again.
@@ -887,6 +916,7 @@ pub enum TurnEventError {
     InvalidProviderPart,
     DuplicateToolCallId { id: String },
     UnexpectedToolResult { tool_call_id: String },
+    UnexpectedIntraTurnInput,
 }
 
 impl fmt::Display for TurnEventError {
@@ -895,6 +925,9 @@ impl fmt::Display for TurnEventError {
             Self::Transition(error) => error.fmt(formatter),
             Self::InvalidProviderPart => formatter.write_str("provider cannot emit a tool result"),
             Self::DuplicateToolCallId { id } => write!(formatter, "duplicate tool call id: {id}"),
+            Self::UnexpectedIntraTurnInput => {
+                formatter.write_str("input can only arrive at a tool boundary")
+            }
             Self::UnexpectedToolResult { tool_call_id } => {
                 write!(formatter, "unexpected tool result: {tool_call_id}")
             }
@@ -993,6 +1026,19 @@ fn validate_completed_turn_events(events: &[TurnEvent]) -> Result<(), CompletedT
                 _ => return Err(CompletedTurnSnapshotError::invalid()),
             },
             TurnState::Dispatching => {
+                if let Some(TurnEvent::IntraTurnInput { source, text }) = events.get(event_index) {
+                    let source = *source;
+                    let text = text.clone();
+
+                    consume_generated_events(
+                        &mut coordinator,
+                        events,
+                        &mut event_index,
+                        move |coordinator| coordinator.accept_intra_turn_input(source, text),
+                    )?;
+                    continue;
+                }
+
                 let Some(TurnEvent::ToolResult(MessagePart::ToolResult {
                     tool_call_id,
                     content,
@@ -1261,6 +1307,25 @@ impl TurnCoordinator {
     /// caller states its choice explicitly, including replay, which always
     /// passes `None`. The facts event is live-only: it is excluded from
     /// persisted history and must never be regenerated during replay.
+    /// Records input that arrived while this turn was dispatching tools.
+    ///
+    /// `Dispatching` is the only state that accepts it, and that is the safe
+    /// point itself: a turn mid-stream is receiving one provider message, and
+    /// splicing a second speaker into it would produce a history no provider
+    /// was ever given.
+    pub fn accept_intra_turn_input(
+        &mut self,
+        source: IntraTurnInputSource,
+        text: String,
+    ) -> Result<(), TurnEventError> {
+        if self.state != TurnState::Dispatching {
+            return Err(TurnEventError::UnexpectedIntraTurnInput);
+        }
+
+        self.events.push(TurnEvent::IntraTurnInput { source, text });
+        Ok(())
+    }
+
     pub fn accept_tool_result(
         &mut self,
         tool_call_id: &str,
