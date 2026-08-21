@@ -57,7 +57,7 @@ struct Migration {
     preserved_tables: &'static [&'static str],
 }
 
-const MIGRATIONS: [Migration; 11] = [
+const MIGRATIONS: [Migration; 12] = [
     Migration {
         id: "0001_permission_grants",
         ddl: permission_grants_ddl,
@@ -113,6 +113,11 @@ const MIGRATIONS: [Migration; 11] = [
     Migration {
         id: "0011_session_fork_lineage",
         ddl: session_fork_lineage_ddl,
+        preserved_tables: &[],
+    },
+    Migration {
+        id: "0012_directives",
+        ddl: directives_ddl,
         preserved_tables: &[],
     },
 ];
@@ -390,6 +395,33 @@ fn permission_grants_ddl() -> String {
     );
     CREATE INDEX permission_grants_project
         ON permission_grants(project, id);
+    "
+    .to_owned()
+}
+
+/// The durable queue a running turn drains at a safe point.
+///
+/// Durable rather than in-memory so a message encoded while the turn was
+/// working is not lost if the process dies before the turn reaches its next
+/// boundary — which, measured on this repo, can be half an hour away.
+///
+/// `delivered_at` is set rather than the row deleted: a turn that was steered
+/// mid-flight is only explicable afterwards if the steering is still there to
+/// read.
+fn directives_ddl() -> String {
+    "
+    CREATE TABLE directives (
+        id INTEGER PRIMARY KEY,
+        session_id INTEGER NOT NULL,
+        source TEXT NOT NULL CHECK(source IN ('human', 'supervisor')),
+        grain TEXT NOT NULL CHECK(grain IN ('tool_call', 'turn')),
+        text TEXT NOT NULL CHECK(text <> ''),
+        created_at TEXT NOT NULL,
+        delivered_at TEXT
+    );
+    CREATE INDEX directives_pending
+        ON directives(session_id, grain, id)
+        WHERE delivered_at IS NULL;
     "
     .to_owned()
 }

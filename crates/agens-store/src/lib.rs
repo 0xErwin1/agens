@@ -11,10 +11,12 @@ use agens_core::{
 use rusqlite::{Connection, Transaction, TransactionBehavior, params};
 
 mod database;
+mod directives;
 mod fact_store;
 mod media;
 mod prompt_memory;
 mod session_writer;
+pub use directives::{DirectiveGrain, DirectiveInbox, DirectiveStore, DirectiveStoreError};
 pub use fact_store::{ToolFactStore, ToolFactStoreError};
 pub use media::{
     MAX_MEDIA_BYTES, MediaRecord, MediaStoreError, guess_mime_from_bytes, guess_mime_from_path,

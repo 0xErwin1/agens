@@ -91,7 +91,8 @@ fn the_ledger_records_each_applied_migration_once() {
             "0008_prompt_memory",
             "0009_media",
             "0010_prompt_memory_media",
-            "0011_session_fork_lineage"
+            "0011_session_fork_lineage",
+            "0012_directives"
         ]
     );
 
@@ -158,6 +159,7 @@ fn an_unknown_ledger_id_is_tolerated_and_known_missing_migrations_still_apply() 
             ("0009_media".to_owned(), rows[8].1),
             ("0010_prompt_memory_media".to_owned(), rows[9].1),
             ("0011_session_fork_lineage".to_owned(), rows[10].1),
+            ("0012_directives".to_owned(), rows[11].1),
             ("9999_unknown".to_owned(), 0),
         ]
     );
@@ -405,7 +407,8 @@ fn a_partially_applied_database_is_completed() {
             "0008_prompt_memory",
             "0009_media",
             "0010_prompt_memory_media",
-            "0011_session_fork_lineage"
+            "0011_session_fork_lineage",
+            "0012_directives"
         ]
     );
 
@@ -490,7 +493,8 @@ fn all_three_domains_share_one_database_file() {
             "0008_prompt_memory",
             "0009_media",
             "0010_prompt_memory_media",
-            "0011_session_fork_lineage"
+            "0011_session_fork_lineage",
+            "0012_directives"
         ]
     );
 
@@ -570,7 +574,8 @@ fn a_bootstrap_only_ledger_with_no_user_tables_is_accepted() {
             "0008_prompt_memory",
             "0009_media",
             "0010_prompt_memory_media",
-            "0011_session_fork_lineage"
+            "0011_session_fork_lineage",
+            "0012_directives"
         ]
     );
 
