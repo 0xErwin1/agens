@@ -2595,3 +2595,51 @@ fn the_fork_lineage_migration_is_idempotent_on_an_already_migrated_database() {
         1
     );
 }
+
+/// Registering a session at the start of its first attempt is what makes that
+/// turn addressable while it runs. The cost is a session row with no completed
+/// turn behind it, so this pins the other half of that trade: such a row is
+/// reachable by id, and it never appears in the listing a reader resumes from.
+#[test]
+fn a_session_registered_by_its_first_attempt_is_reachable_but_never_listed() {
+    let directory = directory();
+    let mut store = SessionStore::open(&directory).unwrap();
+    let metadata = SessionMetadata {
+        id: 0,
+        project: "project".into(),
+        title: "first turn".into(),
+        active_agent: "primary".into(),
+        provider_id: None,
+        model_id: None,
+        reasoning_effort: None,
+        created_at: 40,
+        updated_at: 40,
+        completed_turn_count: 0,
+        resumable: false,
+        parent_session_id: None,
+        fork_message_count: None,
+    };
+
+    let attempt = store
+        .begin_session_attempt(&metadata, "first prompt".into())
+        .unwrap();
+    let session_id = attempt.key().session_id();
+
+    let registered = store.load_session_for_resume(session_id).unwrap();
+    assert_eq!(registered.metadata.id, session_id);
+    assert_eq!(registered.metadata.completed_turn_count, 0);
+    assert!(!registered.metadata.resumable);
+    assert!(registered.messages.is_empty());
+    assert_eq!(store.list_sessions().unwrap(), Vec::new());
+
+    assert_eq!(
+        store
+            .finish_session_attempt(attempt.key(), SessionAttemptStatus::Cancelled, 41)
+            .unwrap(),
+        AttemptFinishOutcome::Finished
+    );
+
+    let cancelled = store.load_session_for_resume(session_id).unwrap();
+    assert!(!cancelled.metadata.resumable);
+    assert_eq!(store.list_sessions().unwrap(), Vec::new());
+}

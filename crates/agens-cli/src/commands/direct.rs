@@ -59,3 +59,92 @@ pub(crate) fn run_direct(
         }
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    use agens_core::{IntraTurnInputSource, SessionMetadata};
+    use agens_store::{DirectiveGrain, DirectiveStore, SessionStore};
+
+    use super::run_direct;
+    use crate::CliDependencies;
+
+    fn dependencies(data_home: &std::path::Path) -> CliDependencies {
+        CliDependencies::for_test(
+            PathBuf::from("/workspace"),
+            None,
+            BTreeMap::from([("XDG_DATA_HOME".to_owned(), data_home.display().to_string())]),
+            BTreeMap::new(),
+        )
+    }
+
+    fn fresh_metadata() -> SessionMetadata {
+        SessionMetadata {
+            id: 0,
+            project: "/workspace".into(),
+            title: "first turn".into(),
+            active_agent: "primary".into(),
+            provider_id: None,
+            model_id: None,
+            reasoning_effort: None,
+            created_at: 1,
+            updated_at: 1,
+            completed_turn_count: 0,
+            resumable: false,
+            parent_session_id: None,
+            fork_message_count: None,
+        }
+    }
+
+    /// The first turn is the longest and the least observable one, so it is the
+    /// turn a supervisor most needs to reach. It is also the only turn with no
+    /// completed history behind it, which is why this pins the reachability of
+    /// a session that has begun an attempt and nothing more.
+    #[test]
+    fn a_session_is_reachable_while_its_first_turn_is_still_running() {
+        let data_home = std::env::temp_dir().join(format!(
+            "agens-direct-first-turn-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::remove_dir_all(&data_home).ok();
+        let data_directory = data_home.join("agens");
+        std::fs::create_dir_all(&data_directory).unwrap();
+
+        let session_id = SessionStore::open(&data_directory)
+            .unwrap()
+            .begin_session_attempt(&fresh_metadata(), "first prompt".into())
+            .unwrap()
+            .key()
+            .session_id();
+
+        let message = run_direct(
+            session_id.to_string(),
+            false,
+            true,
+            vec!["change course".to_owned()],
+            &dependencies(&data_home),
+        )
+        .unwrap();
+
+        assert_eq!(
+            message,
+            format!("Queued for session {session_id}, delivered at the next tool batch.\n")
+        );
+        let queued = DirectiveStore::open(&data_directory)
+            .unwrap()
+            .drain(session_id, DirectiveGrain::ToolCall)
+            .unwrap();
+        assert_eq!(
+            queued
+                .iter()
+                .map(|directive| (directive.source, directive.text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(IntraTurnInputSource::Supervisor, "change course")]
+        );
+
+        std::fs::remove_dir_all(&data_home).ok();
+    }
+}
