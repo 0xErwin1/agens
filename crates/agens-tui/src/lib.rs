@@ -2322,9 +2322,13 @@ fn render_frame_content(frame: &mut ratatui::Frame<'_>, state: &ViewState<'_>) {
 
     let composer_color = widgets::RolePalette::muted();
     if layout.composer.height > 0 && state.active_transcript == TranscriptId::Main {
-        // Two borders plus the column of padding that puts typed text in the
-        // same column as the prose above it.
-        let visible_inner_width = layout.composer.width.saturating_sub(3);
+        // Two borders plus one blank column inside each, so the text neither
+        // touches the frame nor loses the column the prose above it starts on.
+        let padding = composer_padding(layout.composer.width);
+        let visible_inner_width = layout
+            .composer
+            .width
+            .saturating_sub(composer_frame_columns(layout.composer.width));
         let visible_inner_height = layout.composer.height.saturating_sub(2);
         let inner_width = usize::from(visible_inner_width.max(1));
         let inner_height = usize::from(visible_inner_height.max(1));
@@ -2338,7 +2342,7 @@ fn render_frame_content(frame: &mut ratatui::Frame<'_>, state: &ViewState<'_>) {
         let content_rows = attachment_row_count.saturating_add(composer_layout.rows);
         let mut composer = Block::default()
             .borders(Borders::ALL)
-            .padding(Padding::left(1))
+            .padding(padding)
             .border_style(Style::default().fg(composer_color));
         if let Some(metrics) = border_metrics(state, layout.composer) {
             composer = composer.title_bottom(metrics);
@@ -4544,6 +4548,29 @@ fn attachment_preview_lines(media_chips: &[String], width: usize) -> Vec<String>
         .collect()
 }
 
+/// Columns the composer frame takes from the text when it can afford them:
+/// both borders and the blank column inside each of them.
+const COMPOSER_FRAME_COLUMNS: u16 = 4;
+
+/// Blank columns between the composer's borders and its text.
+///
+/// The left column keeps typed text on the column the prose above it starts
+/// on, so it survives any width. The right column is breathing room, and a box
+/// too narrow to hold a glyph beside it spends it on the glyph instead.
+fn composer_padding(composer_width: u16) -> Padding {
+    if composer_width > COMPOSER_FRAME_COLUMNS {
+        Padding::horizontal(1)
+    } else {
+        Padding::left(1)
+    }
+}
+
+/// Columns the frame leaves unavailable to the text at this composer width.
+fn composer_frame_columns(composer_width: u16) -> u16 {
+    let padding = composer_padding(composer_width);
+    padding.left.saturating_add(padding.right).saturating_add(2)
+}
+
 /// Tallest the composer may ever grow, however tall the terminal is.
 const MAX_COMPOSER_ROWS: u16 = 8;
 /// Shortest composer the layout still calls scrollable: both borders plus one
@@ -4582,7 +4609,11 @@ fn screen_layout(area: Rect, input: &str, media_count: usize, queue_len: usize) 
     let area = conversation_surface(area);
     let gutter = chrome_gutter(area.width);
     let composer_width = area.width.saturating_sub(gutter.saturating_mul(2));
-    let inner_width = usize::from(composer_width.saturating_sub(3).max(1));
+    let inner_width = usize::from(
+        composer_width
+            .saturating_sub(composer_frame_columns(composer_width))
+            .max(1),
+    );
     let composer_rows =
         composer_rows(area.height, input, media_count, inner_width).min(area.height);
     let after_composer = area.height.saturating_sub(composer_rows);
@@ -6008,6 +6039,11 @@ struct ComposerLayout {
     rows: usize,
 }
 
+/// Lays the composer text out at `width` columns.
+///
+/// Words wrap whole onto the next row; only a word wider than a row breaks at
+/// the column edge. A space that lands past the edge stays off screen, so the
+/// cursor after it starts the next row instead of hanging past the border.
 fn composer_layout(input: &str, cursor: usize, width: usize) -> ComposerLayout {
     let width = width.max(1);
     let cursor = cursor.min(input.chars().count());
@@ -6016,11 +6052,13 @@ fn composer_layout(input: &str, cursor: usize, width: usize) -> ComposerLayout {
     let mut line = 0;
     let mut column = 0;
     let mut cursor_position = None;
+    let mut at_word_start = true;
 
-    for grapheme in input.graphemes(true) {
+    for (offset, grapheme) in input.grapheme_indices(true) {
         let grapheme_end = character_index.saturating_add(grapheme.chars().count());
+        let holds_cursor = cursor >= character_index && cursor < grapheme_end;
         if grapheme.ends_with('\n') {
-            if cursor >= character_index && cursor < grapheme_end {
+            if holds_cursor {
                 cursor_position = Some(wrapped_cursor_position(line, column, width));
             }
 
@@ -6028,16 +6066,41 @@ fn composer_layout(input: &str, cursor: usize, width: usize) -> ComposerLayout {
             character_index = grapheme_end;
             line += 1;
             column = 0;
+            at_word_start = true;
             continue;
         }
 
         let grapheme_width = grapheme.width();
+        let is_space = grapheme.chars().all(char::is_whitespace);
+        if is_space {
+            at_word_start = true;
+
+            if column.saturating_add(grapheme_width) > width {
+                if holds_cursor {
+                    cursor_position = Some(wrapped_cursor_position(line, width, width));
+                }
+
+                character_index = grapheme_end;
+                column = width;
+                continue;
+            }
+        } else if at_word_start {
+            at_word_start = false;
+
+            let word_width = word_width_at(input, offset);
+            if column > 0 && column.saturating_add(word_width) > width && word_width <= width {
+                text.push('\n');
+                line += 1;
+                column = 0;
+            }
+        }
+
         if column > 0 && column.saturating_add(grapheme_width) > width {
             text.push('\n');
             line += 1;
             column = 0;
         }
-        if cursor >= character_index && cursor < grapheme_end {
+        if holds_cursor {
             let prefix_characters = cursor.saturating_sub(character_index);
             let prefix_end = grapheme
                 .char_indices()
@@ -6071,6 +6134,16 @@ fn composer_layout(input: &str, cursor: usize, width: usize) -> ComposerLayout {
         cursor_column,
         rows,
     }
+}
+
+/// Display width of the word starting at byte `offset`: every grapheme up to
+/// the next whitespace or line break.
+fn word_width_at(input: &str, offset: usize) -> usize {
+    input[offset..]
+        .graphemes(true)
+        .take_while(|grapheme| !grapheme.chars().all(char::is_whitespace))
+        .map(UnicodeWidthStr::width)
+        .sum()
 }
 
 fn wrapped_cursor_position(line: usize, column: usize, width: usize) -> (usize, usize) {
@@ -16014,6 +16087,48 @@ mod runtime_tests {
             .collect::<String>();
 
         assert!(rendered.contains('\u{fffd}'), "{rendered:?}");
+    }
+
+    #[test]
+    fn composer_wraps_between_words_instead_of_inside_them() {
+        let input = "hello wonderful world";
+        let wrapped = composer_layout(input, input.chars().count(), 12);
+        assert_eq!(wrapped.text, "hello \nwonderful \nworld");
+        assert_eq!((wrapped.cursor_line, wrapped.cursor_column), (2, 5));
+        assert_eq!(wrapped.rows, 3);
+
+        // A cursor inside a word that moved to the next row moves with it.
+        let inside_word = composer_layout(input, 8, 12);
+        assert_eq!((inside_word.cursor_line, inside_word.cursor_column), (1, 2));
+
+        // A word that cannot fit any row still breaks at the column edge.
+        let long_word = "hi abcdefghij";
+        let hard_broken = composer_layout(long_word, long_word.chars().count(), 6);
+        assert_eq!(hard_broken.text, "hi abc\ndefghi\nj");
+        assert_eq!((hard_broken.cursor_line, hard_broken.cursor_column), (2, 1));
+
+        // A hard newline keeps its own row even when the words around it fit.
+        let explicit = composer_layout("one two\nthree", 8, 20);
+        assert_eq!(explicit.text, "one two\nthree");
+        assert_eq!((explicit.cursor_line, explicit.cursor_column), (1, 0));
+    }
+
+    #[test]
+    fn composer_space_past_the_edge_moves_the_cursor_to_the_next_row() {
+        let full_row = "hello world";
+        let after_space = format!("{full_row} ");
+        let layout = composer_layout(&after_space, after_space.chars().count(), 11);
+        assert_eq!(layout.text, full_row);
+        assert_eq!((layout.cursor_line, layout.cursor_column), (1, 0));
+        assert_eq!(layout.rows, 2);
+
+        let next_word = format!("{full_row} x");
+        let continued = composer_layout(&next_word, next_word.chars().count(), 11);
+        assert_eq!(continued.text, "hello world\nx");
+        assert_eq!((continued.cursor_line, continued.cursor_column), (1, 1));
+
+        let before_x = composer_layout(&next_word, 12, 11);
+        assert_eq!((before_x.cursor_line, before_x.cursor_column), (1, 0));
     }
 
     fn secret_entry_view() -> SecretEntryView {
