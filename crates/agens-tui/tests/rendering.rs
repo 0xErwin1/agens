@@ -712,6 +712,46 @@ fn bottom_chrome_bands_share_one_gutter_and_the_composer_keeps_both_edges_free()
 }
 
 #[test]
+fn composer_text_keeps_one_blank_column_inside_each_border() {
+    let (width, height) = (40_u16, 14_u16);
+    let mut renderer =
+        RatatuiRenderer::new(Terminal::new(TestBackend::new(width, height)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.handle(Event::Resize { width, height });
+    for character in "x".repeat(80).chars() {
+        tui.handle(Event::Key(Key::Char(character)));
+    }
+
+    renderer.render(tui.view()).unwrap();
+    let top = composer_top_row(&renderer);
+    let bottom = composer_bottom_row(&renderer);
+    let buffer = renderer.terminal().backend().buffer();
+    let left_border = CHROME_GUTTER;
+    let right_border = width - 1 - CHROME_GUTTER;
+
+    assert!(
+        bottom - top >= 3,
+        "the input must fill several rows: {top}..={bottom}"
+    );
+    for row in top + 1..bottom {
+        assert_eq!(buffer[(left_border, row)].symbol(), "│");
+        assert_eq!(buffer[(right_border, row)].symbol(), "│");
+        assert_eq!(
+            buffer[(left_border + 1, row)].symbol(),
+            " ",
+            "left padding column at row {row}"
+        );
+        assert_eq!(
+            buffer[(right_border - 1, row)].symbol(),
+            " ",
+            "right padding column at row {row}"
+        );
+    }
+    assert_eq!(buffer[(left_border + 2, top + 1)].symbol(), "x");
+    assert_eq!(buffer[(right_border - 2, top + 1)].symbol(), "x");
+}
+
+#[test]
 fn responsive_layout_saturates_heights_one_through_six() {
     for height in 1_u16..=12 {
         let mut renderer =
