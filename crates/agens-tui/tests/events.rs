@@ -2975,7 +2975,11 @@ fn typed_provider_completion_keeps_success_clean_and_failure_actionable() {
         prompt: "request".into(),
     });
     failure.finish_provider_turn(TuiProviderOutcome::Failed {
-        message: "provider: token=SENTINEL".into(),
+        // Hyphenated on purpose. Redaction spares a value that reads like a
+        // single plain word — a ratified negative case in
+        // `agens_core::redaction` — so a bare `SENTINEL` would assert nothing
+        // about a real token, which is never shaped like prose.
+        message: "provider: token=SENTINEL-A1B2C3D4".into(),
         action: "Check provider credentials and retry.".into(),
     });
 
@@ -2983,7 +2987,7 @@ fn typed_provider_completion_keeps_success_clean_and_failure_actionable() {
         failure.transcript(),
         [
             TranscriptEntry::User("request".into()),
-            TranscriptEntry::Error("provider: token=[redacted: 8 characters]".into()),
+            TranscriptEntry::Error("provider: token=[redacted: 17 characters]".into()),
         ]
     );
     let view = failure.view();
@@ -2991,7 +2995,7 @@ fn typed_provider_completion_keeps_success_clean_and_failure_actionable() {
     assert_eq!(view.conversation.unwrap().errors.len(), 1);
     assert_eq!(
         view.conversation.unwrap().errors[0].message,
-        "provider: token=[redacted: 8 characters]"
+        "provider: token=[redacted: 17 characters]"
     );
     assert!(
         !view.conversation.unwrap().errors[0]

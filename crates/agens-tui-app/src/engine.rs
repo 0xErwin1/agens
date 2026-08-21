@@ -703,18 +703,16 @@ pub fn run_tui_prompt_with(
     }
     let boundary = turn_boundary(&previous_messages, &session.messages);
     record_turn(&mut session, prompt, boundary, before, after);
-    if let Some(identifier) = session.identifier {
-        if let Some(message) =
+    if let Some(identifier) = session.identifier
+        && let Some(message) =
             failed_bypass_persist_notice(write_through_bypass_permission_prompts(
                 bootstrap,
                 identifier,
                 session.bypass_permissions,
             ))
-        {
-            if let Some(notice) = notice {
-                notice(message);
-            }
-        }
+        && let Some(notice) = notice
+    {
+        notice(message);
     }
     result
 }

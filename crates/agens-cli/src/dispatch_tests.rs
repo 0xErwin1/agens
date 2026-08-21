@@ -790,8 +790,13 @@ fn production_dispatcher_preserves_safe_native_failure_reason() {
         }) if content == "glob: entry limit of 10000 exceeded"
     )));
     assert_eq!(
-        sanitized_native_tool_failure("glob: /home/user/private token=SECRET remote body details"),
-        "glob: [path] token=[redacted: 6 characters] remote body details"
+        // The token value is hyphenated on purpose: redaction spares a value
+        // that reads like a single plain word, so a bare `SECRET` would assert
+        // nothing about a real credential.
+        sanitized_native_tool_failure(
+            "glob: /home/user/private token=SECRET-A1B2C3D4 remote body details"
+        ),
+        "glob: [path] token=[redacted: 15 characters] remote body details"
     );
     let outside = sanitized_native_tool_failure("glob: path is outside project root");
     assert!(
