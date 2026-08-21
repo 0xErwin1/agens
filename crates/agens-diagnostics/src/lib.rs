@@ -72,6 +72,17 @@ pub enum SessionLifecycle<'a> {
         model: &'a str,
         session: i64,
     },
+    /// A delegated child turn starting.
+    ///
+    /// It carries no session, because a child has none: it holds no session
+    /// row, appears in no listing, and ends without leaving one. What addresses
+    /// it is this line's own `reference`, so the moment it starts is the only
+    /// moment its identity becomes knowable from outside the process running
+    /// it.
+    ChildTurnStarted {
+        agent: &'a str,
+        model: &'a str,
+    },
     TurnEnded {
         outcome: TurnOutcome,
     },
@@ -97,7 +108,9 @@ pub enum SessionLifecycle<'a> {
 impl SessionLifecycle<'_> {
     const fn kind(self) -> ProviderDiagnosticKind {
         match self {
-            Self::TurnStarted { .. } => ProviderDiagnosticKind::TurnStarted,
+            Self::TurnStarted { .. } | Self::ChildTurnStarted { .. } => {
+                ProviderDiagnosticKind::TurnStarted
+            }
             Self::TurnEnded { .. } => ProviderDiagnosticKind::TurnEnded,
             Self::ToolFailed { .. } => ProviderDiagnosticKind::ToolFailed,
             Self::PermissionBlocked { .. } => ProviderDiagnosticKind::PermissionBlocked,
@@ -108,6 +121,9 @@ impl SessionLifecycle<'_> {
         match self {
             Self::TurnStarted { model, session } => {
                 serde_json::json!({ "model": model, "session": session })
+            }
+            Self::ChildTurnStarted { agent, model } => {
+                serde_json::json!({ "model": model, "agent": agent })
             }
             Self::TurnEnded { outcome } => serde_json::json!({ "outcome": outcome.as_str() }),
             Self::ToolFailed { tool, class } => {
@@ -1169,6 +1185,46 @@ mod tests {
             recorded[2]
         );
         assert_eq!(recorded[3]["outcome"], "failed");
+
+        std::fs::remove_dir_all(&temporary).ok();
+    }
+
+    /// A delegated turn has no session id to carry, so the line's own reference
+    /// is the address a supervisor writes to. If that reference were missing or
+    /// the line named a session the child does not have, a supervisor would
+    /// have nothing to aim at for the longest stretch of a delegation.
+    #[test]
+    fn a_child_turn_publishes_the_reference_that_addresses_it() {
+        let temporary = std::env::temp_dir().join(format!(
+            "agens-diagnostic-child-turn-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::remove_dir_all(&temporary).ok();
+        std::fs::create_dir_all(&temporary).expect("test data directory should be creatable");
+
+        let store = SafeDiagnosticStore::with_capture(temporary.clone(), true);
+        store.record_session_lifecycle(
+            &DiagnosticRef::new("a1b2c3d4".to_owned()).unwrap(),
+            ProviderDiagnosticScope::Subagent,
+            SessionLifecycle::ChildTurnStarted {
+                agent: "reviewer",
+                model: "moonshotai/kimi-k3",
+            },
+        );
+
+        let recorded = recorded_lines(&temporary);
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0]["event"], "turn_started");
+        assert_eq!(recorded[0]["scope"], "subagent");
+        assert_eq!(recorded[0]["reference"], "a1b2c3d4");
+        assert_eq!(recorded[0]["agent"], "reviewer");
+        assert_eq!(recorded[0]["model"], "moonshotai/kimi-k3");
+        assert!(
+            recorded[0].get("session").is_none(),
+            "a delegated turn holds no session: {:?}",
+            recorded[0]
+        );
 
         std::fs::remove_dir_all(&temporary).ok();
     }

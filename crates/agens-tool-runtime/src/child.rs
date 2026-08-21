@@ -10,7 +10,7 @@ use agens_core::{
     HeadlessPermissionResolver, HeadlessToolCall, HeadlessTurnCancellation, HeadlessTurnError,
     HeadlessTurnPortError, Message, MessagePart, PermissionDecision, PermissionMode,
     PermissionPattern, PermissionPolicy, PermissionRule, PermissionSession, Role, SafetyPredicate,
-    TurnEvent, TurnProgressSink, TurnProvider, run_isolated_headless_turn_with_progress,
+    TurnEvent, TurnProgressSink, TurnProvider, run_isolated_headless_turn_with_inbox,
 };
 use agens_providers::{
     ChatGptResponsesProvider, MoonshotProvider, OpenAiResponsesProvider, ProgressAwareProvider,
@@ -29,7 +29,9 @@ use agens_bootstrap::session_config::SessionConfig;
 use agens_bootstrap::session_root::SessionRoot;
 use agens_core::DiscardCompletedTurnRepository;
 use agens_core::SubagentErrorKind;
-use agens_diagnostics::{diagnostic_store, record_subagent_surface_rejection};
+use agens_diagnostics::{
+    SessionLifecycle, diagnostic_store, record_session_lifecycle, record_subagent_surface_rejection,
+};
 use agens_dispatch::ProductionToolDispatcher;
 use agens_error::CliError;
 use agens_permissions::{
@@ -39,7 +41,7 @@ use agens_permissions::{
 use agens_session::provider::{
     ProviderKind, ResolvedProvider, bootstrap_authentication, resolve_provider_for_model,
 };
-use agens_store::PermissionGrantStore;
+use agens_store::{DirectiveInbox, PermissionGrantStore};
 use std::path::PathBuf;
 
 /// Why a delegated child turn ended without a result.
@@ -322,6 +324,19 @@ pub fn run_production_task(
     let resolved = resolve_child_provider(bootstrap, request.model())?;
     let model = resolved.model.clone();
 
+    // Published before the first provider call, because this line's reference
+    // is the address the child answers to and a supervisor cannot learn it any
+    // other way: a delegation holds no session row and appears in no listing.
+    record_session_lifecycle(
+        bootstrap,
+        diagnostic_reference,
+        ProviderDiagnosticScope::Subagent,
+        SessionLifecycle::ChildTurnStarted {
+            agent: request.agent_name(),
+            model: &model,
+        },
+    );
+
     match resolved.provider {
         ProviderKind::OpenAiApi => {
             let api_key = bootstrap
@@ -359,8 +374,9 @@ pub fn run_production_task(
                         target: TaskMessageTarget::Execution(execution_id),
                     },
                     permission_prompter: permission_prompter.clone(),
-                    grant_store_root: bootstrap.data_directory().to_path_buf(),
+                    data_directory: bootstrap.data_directory().to_path_buf(),
                     origin: Some(origin.clone()),
+                    reference: diagnostic_reference.to_owned(),
                 },
             )
         }
@@ -399,8 +415,9 @@ pub fn run_production_task(
                         target: TaskMessageTarget::Execution(execution_id),
                     },
                     permission_prompter: permission_prompter.clone(),
-                    grant_store_root: bootstrap.data_directory().to_path_buf(),
+                    data_directory: bootstrap.data_directory().to_path_buf(),
                     origin: Some(origin.clone()),
+                    reference: diagnostic_reference.to_owned(),
                 },
             )
         }
@@ -438,8 +455,9 @@ pub fn run_production_task(
                         target: TaskMessageTarget::Execution(execution_id),
                     },
                     permission_prompter: permission_prompter.clone(),
-                    grant_store_root: bootstrap.data_directory().to_path_buf(),
+                    data_directory: bootstrap.data_directory().to_path_buf(),
                     origin: Some(origin.clone()),
+                    reference: diagnostic_reference.to_owned(),
                 },
             )
         }
@@ -603,8 +621,11 @@ struct IsolatedTaskTurnContext<'a> {
     surface: &'a crate::child_catalog::ChildToolSurface,
     mailbox: TaskMailboxContext,
     permission_prompter: Option<crate::runner::PrompterFactory>,
-    grant_store_root: PathBuf,
+    data_directory: PathBuf,
     origin: Option<crate::runner::PromptOrigin>,
+    /// The reference this child turn publishes when it starts, which is also
+    /// the address a supervisor writes to.
+    reference: String,
 }
 
 /// Runs a subagent's isolated turn with no session attempt of its own, so the
@@ -625,8 +646,9 @@ where
         surface,
         mailbox,
         permission_prompter,
-        grant_store_root,
+        data_directory,
         origin,
+        reference,
     } = context;
     let mut provider = TaskMailboxProvider::new(provider, Some(mailbox.registry), mailbox.target);
     let policy = PermissionPolicy::with_safety_predicates(
@@ -653,7 +675,7 @@ where
     )
     .with_dangerous_override(dangerous_mode);
     let mut resolver = match permission_prompter.and_then(|build| {
-        PermissionGrantStore::open(&grant_store_root)
+        PermissionGrantStore::open(&data_directory)
             .ok()
             .map(|store| {
                 (
@@ -680,7 +702,11 @@ where
         None => ChildPermissionResolver::Unreachable,
     };
     let mut dispatcher = ProductionToolDispatcher::new(tool_runtime, pending);
-    let snapshot = block_on_headless_turn(run_isolated_headless_turn_with_progress(
+    // Addressed to this child alone. A child that drained its parent's queue
+    // would take a message meant for the parent turn, or for whichever sibling
+    // asked second, and nothing would record that it did.
+    let mut inbox = DirectiveInbox::for_child(&data_directory, reference);
+    let snapshot = block_on_headless_turn(run_isolated_headless_turn_with_inbox(
         &mut provider,
         &mut gate,
         &mut resolver,
@@ -689,6 +715,7 @@ where
         cancellation,
         progress,
         None,
+        &mut inbox,
     ))
     .map_err(|_| ChildRunError::Runtime)?
     .map_err(child_run_error)?;
@@ -744,6 +771,19 @@ impl HeadlessPermissionResolver for ChildPermissionResolver {
 mod tests {
     use super::*;
     use agens_core::HeadlessPermissionGate;
+
+    /// A directory of this test's own. The stores a child turn opens restrict
+    /// the permissions of the directory they are given, so handing them the
+    /// shared temporary root would narrow it for everything else on the host.
+    fn test_data_directory(label: &str) -> PathBuf {
+        let directory = std::env::temp_dir().join(format!(
+            "agens-child-turn-{label}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&directory).expect("test data directory");
+        directory
+    }
 
     #[test]
     fn history_budget_does_not_collapse_to_context_or_child_failure() {
@@ -931,6 +971,142 @@ mod tests {
         std::fs::remove_dir_all(&temporary).ok();
     }
 
+    /// A delegated turn is the longest stretch of a delegation, and until it
+    /// opened an inbox a supervisor had no way to correct its course at all.
+    /// It reads its own address, so a message aimed at one child never lands
+    /// in a sibling or in the parent turn.
+    #[test]
+    fn a_child_turn_collects_the_directives_addressed_to_it() {
+        struct OnceProvider {
+            requests: Arc<Mutex<usize>>,
+            queued: Arc<Mutex<Vec<Message>>>,
+        }
+
+        impl TurnProvider for OnceProvider {
+            fn queue_user_messages(
+                &mut self,
+                messages: Vec<Message>,
+            ) -> Result<(), HeadlessTurnPortError> {
+                self.queued.lock().unwrap().extend(messages);
+                Ok(())
+            }
+
+            fn next_parts(
+                &mut self,
+                _events: &[TurnEvent],
+                _cancellation: &HeadlessTurnCancellation,
+            ) -> impl std::future::Future<Output = Result<Vec<MessagePart>, HeadlessTurnPortError>> + Send
+            {
+                let mut requests = self.requests.lock().unwrap();
+                *requests += 1;
+                let parts = if *requests == 1 {
+                    vec![MessagePart::ToolCall {
+                        id: "read-1".into(),
+                        name: "native::read".into(),
+                        input: r#"{"path":"notes.md"}"#.into(),
+                    }]
+                } else {
+                    vec![MessagePart::Text("done".into())]
+                };
+                std::future::ready(Ok(parts))
+            }
+        }
+
+        impl ProgressAwareProvider for OnceProvider {
+            fn with_progress_sink(self, _sink: TurnProgressSink) -> Self {
+                self
+            }
+        }
+
+        struct ReadTool;
+
+        impl agens_tools::DispatchTool for ReadTool {
+            fn execute(
+                &mut self,
+                _context: &agens_tools::ToolExecutionContext,
+                _arguments: serde_json::Value,
+            ) -> Result<agens_tools::ToolOutput, agens_core::Error> {
+                Ok(agens_tools::ToolOutput::success("read"))
+            }
+        }
+
+        let data_directory = test_data_directory("inbox");
+        let mut store = agens_store::DirectiveStore::open(&data_directory).unwrap();
+        store
+            .enqueue(
+                &agens_store::DirectiveTarget::Child("c0ffee00".into()),
+                agens_core::IntraTurnInputSource::Supervisor,
+                agens_store::DirectiveGrain::ToolCall,
+                "narrow the search to the manifest",
+            )
+            .unwrap();
+        store
+            .enqueue(
+                &agens_store::DirectiveTarget::Child("deadbeef".into()),
+                agens_core::IntraTurnInputSource::Human,
+                agens_store::DirectiveGrain::ToolCall,
+                "meant for a sibling",
+            )
+            .unwrap();
+        drop(store);
+
+        let registry = TaskExecutionRegistry::with_limits(agens_tools::TaskExecutionLimits {
+            check_interval: 32,
+            max_concurrency: 1,
+            max_output_chars: 1_024,
+        });
+        let execution_id = registry
+            .admit(agens_tools::TaskLaunchMode::Foreground)
+            .unwrap();
+        let queued = Arc::new(Mutex::new(Vec::new()));
+        let mut dispatcher = agens_tools::ToolDispatcher::new();
+        dispatcher
+            .register_native("native::read", agens_core::ToolAccess::ReadOnly, ReadTool)
+            .unwrap();
+
+        let output = run_isolated_task_turn(
+            OnceProvider {
+                requests: Arc::new(Mutex::new(0)),
+                queued: Arc::clone(&queued),
+            },
+            Arc::new(Mutex::new(dispatcher)),
+            IsolatedTaskTurnContext {
+                project_root: Path::new("."),
+                dangerous_mode: false,
+                cancellation: &HeadlessTurnCancellation::new(),
+                progress: None,
+                surface: &crate::child_catalog::resolve_child_surface(&[], &[], &[]).unwrap(),
+                mailbox: TaskMailboxContext {
+                    registry,
+                    target: TaskMessageTarget::Execution(execution_id),
+                },
+                permission_prompter: None,
+                data_directory,
+                reference: "c0ffee00".into(),
+                origin: None,
+            },
+        );
+
+        let Ok(output) = output else {
+            panic!("the child turn completes");
+        };
+        assert_eq!(output, "done");
+        let queued = queued.lock().unwrap();
+        assert_eq!(
+            queued
+                .iter()
+                .map(|message| (message.role, message.parts.clone()))
+                .collect::<Vec<_>>(),
+            vec![(
+                Role::Supervisor,
+                vec![MessagePart::Text(
+                    "narrow the search to the manifest".into()
+                )]
+            )],
+            "a child reads its own address and nothing else"
+        );
+    }
+
     /// Pins the subagent-scope split (`PermissionSession::new()` above, never
     /// `with_temporary_bypass()`): a child never inherits a bypass, so a
     /// session that turned prompting off for itself does not turn it off for
@@ -1040,7 +1216,8 @@ mod tests {
                     target: TaskMessageTarget::Execution(execution_id),
                 },
                 permission_prompter: None,
-                grant_store_root: std::env::temp_dir(),
+                data_directory: test_data_directory("isolated"),
+                reference: "test0000".into(),
                 origin: None,
             },
         );
@@ -1220,7 +1397,8 @@ mod tests {
                         target: TaskMessageTarget::Main,
                     },
                     permission_prompter: None,
-                    grant_store_root: std::env::temp_dir(),
+                    data_directory: test_data_directory("isolated"),
+                    reference: "test0000".into(),
                     origin: None,
                 },
             );
@@ -1360,7 +1538,8 @@ mod tests {
                     target: TaskMessageTarget::Main,
                 },
                 permission_prompter: None,
-                grant_store_root: std::env::temp_dir(),
+                data_directory: test_data_directory("isolated"),
+                reference: "test0000".into(),
                 origin: None,
             },
         ) {

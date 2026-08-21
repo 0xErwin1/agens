@@ -1,6 +1,6 @@
 use agens_core::{IntraTurnInputSource, MessagePart, Role, TurnEvent, TurnState};
 use agens_session::turns::{completed_session_turn_from_events, drain_turn_directive_messages};
-use agens_store::{DirectiveGrain, DirectiveStore};
+use agens_store::{DirectiveGrain, DirectiveStore, DirectiveTarget};
 
 fn tool_call(id: &str) -> TurnEvent {
     TurnEvent::ProviderPart(MessagePart::ToolCall {
@@ -55,7 +55,7 @@ fn next_turn_drains_turn_directives_before_new_input_with_their_recorded_roles()
     let mut store = DirectiveStore::open(&temporary.path).expect("the queue opens");
     store
         .enqueue(
-            42,
+            &DirectiveTarget::Session(42),
             IntraTurnInputSource::Supervisor,
             DirectiveGrain::Turn,
             "replan first",
@@ -63,7 +63,7 @@ fn next_turn_drains_turn_directives_before_new_input_with_their_recorded_roles()
         .unwrap();
     store
         .enqueue(
-            42,
+            &DirectiveTarget::Session(42),
             IntraTurnInputSource::Human,
             DirectiveGrain::Turn,
             "then continue",
@@ -71,7 +71,7 @@ fn next_turn_drains_turn_directives_before_new_input_with_their_recorded_roles()
         .unwrap();
     store
         .enqueue(
-            42,
+            &DirectiveTarget::Session(42),
             IntraTurnInputSource::Human,
             DirectiveGrain::ToolCall,
             "not at turn start",
@@ -97,11 +97,17 @@ fn next_turn_drains_turn_directives_before_new_input_with_their_recorded_roles()
 
     let mut reopened = DirectiveStore::open(&temporary.path).unwrap();
     assert!(
-        reopened.drain(42, DirectiveGrain::Turn).unwrap().is_empty(),
+        reopened
+            .drain(&DirectiveTarget::Session(42), DirectiveGrain::Turn)
+            .unwrap()
+            .is_empty(),
         "the next turn marks every injected directive delivered"
     );
     assert_eq!(
-        reopened.drain(42, DirectiveGrain::ToolCall).unwrap().len(),
+        reopened
+            .drain(&DirectiveTarget::Session(42), DirectiveGrain::ToolCall)
+            .unwrap()
+            .len(),
         1,
         "the turn boundary leaves tool-call directives for their own safe point"
     );

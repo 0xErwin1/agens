@@ -12,7 +12,6 @@ use agens_core::HeadlessTurnError;
 use agens_core::{MessagePart, TurnEvent, TurnProgressSink};
 use agens_core::{SubagentErrorKind, SubagentStatus};
 use agens_core::{TuiExecutionEvent, TuiRuntimeEvent, TuiSubagentEvent};
-#[cfg(any(test, feature = "probe"))]
 use agens_tools::{
     TaskExecutionEvent, TaskExecutionLifecycle, TaskExecutionRegistry, TaskLaunchMode,
     TaskRunContext, TaskRunner, TaskRunnerError, TaskTurnRequest, TaskTurnResult,

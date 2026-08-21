@@ -6,9 +6,9 @@ use agens_core::{
     AttemptKey, CompletedTurnRepository, CompletedTurnSnapshot, CompletedTurnStoreError, FactPath,
     HeadlessIntraTurnInbox, HeadlessPermissionGate, HeadlessPermissionResolver, HeadlessToolCall,
     HeadlessToolDispatcher, HeadlessToolOutput, HeadlessTurnCancellation, HeadlessTurnError,
-    HeadlessTurnPortError, IntraTurnInputSource, MessagePart, PendingIntraTurnInput,
-    PermissionDecision, ToolOutcome, ToolResultFacts, TurnEvent, TurnProgressSink, TurnProvider,
-    TurnState, run_headless_turn, run_headless_turn_with_inbox,
+    HeadlessTurnPortError, IntraTurnInputSource, Message, MessagePart, PendingIntraTurnInput,
+    PermissionDecision, Role, ToolOutcome, ToolResultFacts, TurnEvent, TurnProgressSink,
+    TurnProvider, TurnState, run_headless_turn, run_headless_turn_with_inbox,
     run_headless_turn_with_max_iterations, run_headless_turn_with_progress,
 };
 
@@ -19,9 +19,7 @@ fn progress_sink_receives_state_and_provider_events_before_completion() {
         let observed = Arc::clone(&observed);
         Arc::new(move |event| observed.lock().unwrap().push(event))
     };
-    let mut provider = Provider {
-        iterations: vec![Ok(vec![MessagePart::Text("visible early".into())])],
-    };
+    let mut provider = Provider::new(vec![Ok(vec![MessagePart::Text("visible early".into())])]);
     let mut gate = PermissionGate::default();
     let mut resolver = PermissionResolver::default();
     let mut dispatcher = ToolDispatcher::default();
@@ -57,16 +55,14 @@ fn a_fact_emitted_in_a_real_attempt_carries_that_attempts_identity() {
         let observed = Arc::clone(&observed);
         Arc::new(move |event| observed.lock().unwrap().push(event))
     };
-    let mut provider = Provider {
-        iterations: vec![
-            Ok(vec![MessagePart::ToolCall {
-                id: "call-1".into(),
-                name: "bash".into(),
-                input: "{\"command\":\"exit 0\"}".into(),
-            }]),
-            Ok(vec![MessagePart::Text("complete".into())]),
-        ],
-    };
+    let mut provider = Provider::new(vec![
+        Ok(vec![MessagePart::ToolCall {
+            id: "call-1".into(),
+            name: "bash".into(),
+            input: "{\"command\":\"exit 0\"}".into(),
+        }]),
+        Ok(vec![MessagePart::Text("complete".into())]),
+    ]);
     let mut gate = PermissionGate {
         decisions: vec![PermissionDecision::Allow],
         denial_facts: None,
@@ -116,16 +112,14 @@ fn headless_turn_forwards_tool_result_facts_to_the_progress_sink() {
         let observed = Arc::clone(&observed);
         Arc::new(move |event| observed.lock().unwrap().push(event))
     };
-    let mut provider = Provider {
-        iterations: vec![
-            Ok(vec![MessagePart::ToolCall {
-                id: "call-1".into(),
-                name: "bash".into(),
-                input: "{\"command\":\"exit 2\"}".into(),
-            }]),
-            Ok(vec![MessagePart::Text("complete".into())]),
-        ],
-    };
+    let mut provider = Provider::new(vec![
+        Ok(vec![MessagePart::ToolCall {
+            id: "call-1".into(),
+            name: "bash".into(),
+            input: "{\"command\":\"exit 2\"}".into(),
+        }]),
+        Ok(vec![MessagePart::Text("complete".into())]),
+    ]);
     let mut gate = PermissionGate {
         decisions: vec![PermissionDecision::Allow],
         denial_facts: None,
@@ -190,16 +184,14 @@ fn an_invalid_permission_target_becomes_a_recoverable_tool_result() {
         }
     }
 
-    let mut provider = Provider {
-        iterations: vec![
-            Ok(vec![MessagePart::ToolCall {
-                id: "invalid".into(),
-                name: "git_read".into(),
-                input: r#"{"operation":"diff"}"#.into(),
-            }]),
-            Ok(vec![MessagePart::Text("recovered".into())]),
-        ],
-    };
+    let mut provider = Provider::new(vec![
+        Ok(vec![MessagePart::ToolCall {
+            id: "invalid".into(),
+            name: "git_read".into(),
+            input: r#"{"operation":"diff"}"#.into(),
+        }]),
+        Ok(vec![MessagePart::Text("recovered".into())]),
+    ]);
     let mut dispatcher = ToolDispatcher::default();
     let mut repository = Repository::default();
 
@@ -233,16 +225,14 @@ fn a_denied_call_carries_the_gates_denial_facts() {
         let observed = Arc::clone(&observed);
         Arc::new(move |event| observed.lock().unwrap().push(event))
     };
-    let mut provider = Provider {
-        iterations: vec![
-            Ok(vec![MessagePart::ToolCall {
-                id: "call-1".into(),
-                name: "write".into(),
-                input: "{\"path\":\"secret.txt\"}".into(),
-            }]),
-            Ok(vec![MessagePart::Text("complete".into())]),
-        ],
-    };
+    let mut provider = Provider::new(vec![
+        Ok(vec![MessagePart::ToolCall {
+            id: "call-1".into(),
+            name: "write".into(),
+            input: "{\"path\":\"secret.txt\"}".into(),
+        }]),
+        Ok(vec![MessagePart::Text("complete".into())]),
+    ]);
     let mut gate = PermissionGate {
         decisions: vec![PermissionDecision::Deny],
         denial_facts: Some(ToolResultFacts::Write {
@@ -288,16 +278,14 @@ fn a_denied_call_carries_the_gates_denial_facts() {
 
 #[test]
 fn a_gate_with_no_denial_facts_leaves_a_denied_call_pathless() {
-    let mut provider = Provider {
-        iterations: vec![
-            Ok(vec![MessagePart::ToolCall {
-                id: "call-1".into(),
-                name: "write".into(),
-                input: "{\"path\":\"secret.txt\"}".into(),
-            }]),
-            Ok(vec![MessagePart::Text("complete".into())]),
-        ],
-    };
+    let mut provider = Provider::new(vec![
+        Ok(vec![MessagePart::ToolCall {
+            id: "call-1".into(),
+            name: "write".into(),
+            input: "{\"path\":\"secret.txt\"}".into(),
+        }]),
+        Ok(vec![MessagePart::Text("complete".into())]),
+    ]);
     let mut gate = PermissionGate {
         decisions: vec![PermissionDecision::Deny],
         denial_facts: None,
@@ -327,16 +315,14 @@ fn a_gate_with_no_denial_facts_leaves_a_denied_call_pathless() {
 
 #[test]
 fn headless_turn_snapshot_omits_tool_result_facts() {
-    let mut provider = Provider {
-        iterations: vec![
-            Ok(vec![MessagePart::ToolCall {
-                id: "call-1".into(),
-                name: "bash".into(),
-                input: "{\"command\":\"exit 2\"}".into(),
-            }]),
-            Ok(vec![MessagePart::Text("complete".into())]),
-        ],
-    };
+    let mut provider = Provider::new(vec![
+        Ok(vec![MessagePart::ToolCall {
+            id: "call-1".into(),
+            name: "bash".into(),
+            input: "{\"command\":\"exit 2\"}".into(),
+        }]),
+        Ok(vec![MessagePart::Text("complete".into())]),
+    ]);
     let mut gate = PermissionGate {
         decisions: vec![PermissionDecision::Allow],
         denial_facts: None,
@@ -376,9 +362,25 @@ fn headless_turn_snapshot_omits_tool_result_facts() {
 #[derive(Default)]
 struct Provider {
     iterations: Vec<Result<Vec<MessagePart>, HeadlessTurnPortError>>,
+    /// What the turn handed over for the next request, in the order it did.
+    queued: Arc<Mutex<Vec<Message>>>,
+}
+
+impl Provider {
+    fn new(iterations: Vec<Result<Vec<MessagePart>, HeadlessTurnPortError>>) -> Self {
+        Self {
+            iterations,
+            queued: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
 }
 
 impl TurnProvider for Provider {
+    fn queue_user_messages(&mut self, messages: Vec<Message>) -> Result<(), HeadlessTurnPortError> {
+        self.queued.lock().unwrap().extend(messages);
+        Ok(())
+    }
+
     fn next_parts(
         &mut self,
         _events: &[TurnEvent],
@@ -508,29 +510,27 @@ fn block_on_ready<T>(future: impl Future<Output = T>) -> T {
 
 #[test]
 fn runs_ordered_provider_tool_iterations_and_persists_one_completed_snapshot() {
-    let mut provider = Provider {
-        iterations: vec![
-            Ok(vec![
-                MessagePart::Text("planning".into()),
-                MessagePart::ToolCall {
-                    id: "ask".into(),
-                    name: "read".into(),
-                    input: "file.txt".into(),
-                },
-                MessagePart::ToolCall {
-                    id: "deny".into(),
-                    name: "write".into(),
-                    input: "file.txt".into(),
-                },
-                MessagePart::ToolCall {
-                    id: "allow".into(),
-                    name: "search".into(),
-                    input: "needle".into(),
-                },
-            ]),
-            Ok(vec![MessagePart::Text("complete".into())]),
-        ],
-    };
+    let mut provider = Provider::new(vec![
+        Ok(vec![
+            MessagePart::Text("planning".into()),
+            MessagePart::ToolCall {
+                id: "ask".into(),
+                name: "read".into(),
+                input: "file.txt".into(),
+            },
+            MessagePart::ToolCall {
+                id: "deny".into(),
+                name: "write".into(),
+                input: "file.txt".into(),
+            },
+            MessagePart::ToolCall {
+                id: "allow".into(),
+                name: "search".into(),
+                input: "needle".into(),
+            },
+        ]),
+        Ok(vec![MessagePart::Text("complete".into())]),
+    ]);
     let mut gate = PermissionGate {
         decisions: vec![
             PermissionDecision::Ask,
@@ -598,9 +598,7 @@ fn runs_ordered_provider_tool_iterations_and_persists_one_completed_snapshot() {
 
 #[test]
 fn cancellation_provider_tool_and_store_failures_are_typed_and_never_persist_partial_turns() {
-    let mut cancelled_provider = Provider {
-        iterations: vec![Ok(vec![MessagePart::Text("ignored".into())])],
-    };
+    let mut cancelled_provider = Provider::new(vec![Ok(vec![MessagePart::Text("ignored".into())])]);
     let mut cancelled_repository = Repository::default();
     let cancelled = block_on_ready(run_headless_turn(
         &mut cancelled_provider,
@@ -617,9 +615,7 @@ fn cancellation_provider_tool_and_store_failures_are_typed_and_never_persist_par
     assert_eq!(cancelled, Err(agens_core::HeadlessTurnError::Cancelled));
     assert!(cancelled_repository.snapshots.is_empty());
 
-    let mut provider_failure = Provider {
-        iterations: vec![Err(HeadlessTurnPortError::Provider)],
-    };
+    let mut provider_failure = Provider::new(vec![Err(HeadlessTurnPortError::Provider)]);
     let mut provider_repository = Repository::default();
     let provider_result = block_on_ready(run_headless_turn(
         &mut provider_failure,
@@ -635,13 +631,11 @@ fn cancellation_provider_tool_and_store_failures_are_typed_and_never_persist_par
     );
     assert!(provider_repository.snapshots.is_empty());
 
-    let mut tool_provider = Provider {
-        iterations: vec![Ok(vec![MessagePart::ToolCall {
-            id: "tool".into(),
-            name: "read".into(),
-            input: "file.txt".into(),
-        }])],
-    };
+    let mut tool_provider = Provider::new(vec![Ok(vec![MessagePart::ToolCall {
+        id: "tool".into(),
+        name: "read".into(),
+        input: "file.txt".into(),
+    }])]);
     let mut tool_repository = Repository::default();
     let tool_result = block_on_ready(run_headless_turn(
         &mut tool_provider,
@@ -660,9 +654,7 @@ fn cancellation_provider_tool_and_store_failures_are_typed_and_never_persist_par
     assert_eq!(tool_result, Err(agens_core::HeadlessTurnError::Tool));
     assert!(tool_repository.snapshots.is_empty());
 
-    let mut store_provider = Provider {
-        iterations: vec![Ok(vec![MessagePart::Text("complete".into())])],
-    };
+    let mut store_provider = Provider::new(vec![Ok(vec![MessagePart::Text("complete".into())])]);
     let mut store_repository = Repository {
         failure: Some(CompletedTurnStoreError::new("database unavailable")),
         ..Repository::default()
@@ -681,9 +673,7 @@ fn cancellation_provider_tool_and_store_failures_are_typed_and_never_persist_par
 
 #[test]
 fn authentication_port_failures_are_typed_failed_and_never_persist_partial_turns() {
-    let mut provider = Provider {
-        iterations: vec![Err(HeadlessTurnPortError::Authentication)],
-    };
+    let mut provider = Provider::new(vec![Err(HeadlessTurnPortError::Authentication)]);
     let mut repository = Repository::default();
 
     let result = block_on_ready(run_headless_turn(
@@ -741,9 +731,7 @@ fn cancellation_reaches_an_in_flight_provider_and_suppresses_persistence() {
 
 #[test]
 fn expired_deadline_is_a_distinct_failure_and_never_persists_a_partial_turn() {
-    let mut provider = Provider {
-        iterations: vec![Ok(vec![MessagePart::Text("late".into())])],
-    };
+    let mut provider = Provider::new(vec![Ok(vec![MessagePart::Text("late".into())])]);
     let mut repository = Repository::default();
     let cancellation = HeadlessTurnCancellation::with_deadline(std::time::Duration::ZERO);
 
@@ -763,13 +751,11 @@ fn expired_deadline_is_a_distinct_failure_and_never_persists_a_partial_turn() {
 #[test]
 fn permission_evaluation_distinguishes_unresolved_asks_without_exposing_tool_input() {
     let secret_input = "credential=do-not-expose";
-    let mut provider = Provider {
-        iterations: vec![Ok(vec![MessagePart::ToolCall {
-            id: "permission-needed".into(),
-            name: "read".into(),
-            input: secret_input.into(),
-        }])],
-    };
+    let mut provider = Provider::new(vec![Ok(vec![MessagePart::ToolCall {
+        id: "permission-needed".into(),
+        name: "read".into(),
+        input: secret_input.into(),
+    }])]);
     let mut repository = Repository::default();
 
     let result = block_on_ready(run_headless_turn(
@@ -802,16 +788,14 @@ fn denied_permissions_emit_sanitized_tool_results_and_continue_without_dispatch(
         (PermissionDecision::Deny, None),
         (PermissionDecision::Ask, Some(PermissionDecision::Deny)),
     ] {
-        let mut provider = Provider {
-            iterations: vec![
-                Ok(vec![MessagePart::ToolCall {
-                    id: "denied".into(),
-                    name: "read".into(),
-                    input: "credential=do-not-expose".into(),
-                }]),
-                Ok(vec![MessagePart::Text("complete".into())]),
-            ],
-        };
+        let mut provider = Provider::new(vec![
+            Ok(vec![MessagePart::ToolCall {
+                id: "denied".into(),
+                name: "read".into(),
+                input: "credential=do-not-expose".into(),
+            }]),
+            Ok(vec![MessagePart::Text("complete".into())]),
+        ]);
         let mut repository = Repository::default();
         let mut resolver = PermissionResolver {
             decisions: resolver_decision.into_iter().collect(),
@@ -859,13 +843,11 @@ fn gate_permission_errors_still_end_the_turn() {
         }
     }
 
-    let mut provider = Provider {
-        iterations: vec![Ok(vec![MessagePart::ToolCall {
-            id: "permission-error".into(),
-            name: "read".into(),
-            input: "credential=do-not-expose".into(),
-        }])],
-    };
+    let mut provider = Provider::new(vec![Ok(vec![MessagePart::ToolCall {
+        id: "permission-error".into(),
+        name: "read".into(),
+        input: "credential=do-not-expose".into(),
+    }])]);
     let mut repository = Repository::default();
     let mut failing_gate = FailingGate;
     let mut resolver = PermissionResolver::default();
@@ -898,18 +880,16 @@ fn resolver_permission_errors_refuse_the_call_and_let_the_agent_continue() {
         }
     }
 
-    let mut provider = Provider {
-        iterations: vec![
-            Ok(vec![MessagePart::ToolCall {
-                id: "permission-error".into(),
-                name: "read".into(),
-                input: "credential=do-not-expose".into(),
-            }]),
-            Ok(vec![MessagePart::Text(
-                "recovered after tool refusal".into(),
-            )]),
-        ],
-    };
+    let mut provider = Provider::new(vec![
+        Ok(vec![MessagePart::ToolCall {
+            id: "permission-error".into(),
+            name: "read".into(),
+            input: "credential=do-not-expose".into(),
+        }]),
+        Ok(vec![MessagePart::Text(
+            "recovered after tool refusal".into(),
+        )]),
+    ]);
     let mut repository = Repository::default();
     let mut gate = PermissionGate {
         decisions: vec![PermissionDecision::Ask],
@@ -958,16 +938,14 @@ fn resolver_permission_errors_refuse_the_call_and_let_the_agent_continue() {
 
 #[test]
 fn max_iterations_stops_before_a_second_provider_request_without_persisting() {
-    let mut provider = Provider {
-        iterations: vec![
-            Ok(vec![MessagePart::ToolCall {
-                id: "continue".into(),
-                name: "read".into(),
-                input: "file.txt".into(),
-            }]),
-            Ok(vec![MessagePart::Text("must not be requested".into())]),
-        ],
-    };
+    let mut provider = Provider::new(vec![
+        Ok(vec![MessagePart::ToolCall {
+            id: "continue".into(),
+            name: "read".into(),
+            input: "file.txt".into(),
+        }]),
+        Ok(vec![MessagePart::Text("must not be requested".into())]),
+    ]);
     let mut repository = Repository::default();
 
     let result = block_on_ready(run_headless_turn_with_max_iterations(
@@ -994,16 +972,14 @@ fn max_iterations_stops_before_a_second_provider_request_without_persisting() {
 #[test]
 fn preflights_a_provider_batch_before_sequential_dispatch_and_continues_denials() {
     let observed = Arc::new(Mutex::new(Vec::new()));
-    let mut provider = Provider {
-        iterations: vec![
-            Ok(vec![
-                tool_call("allow", "read"),
-                tool_call("deny", "write"),
-                tool_call("after", "search"),
-            ]),
-            Ok(vec![MessagePart::Text("complete".into())]),
-        ],
-    };
+    let mut provider = Provider::new(vec![
+        Ok(vec![
+            tool_call("allow", "read"),
+            tool_call("deny", "write"),
+            tool_call("after", "search"),
+        ]),
+        Ok(vec![MessagePart::Text("complete".into())]),
+    ]);
     let mut gate = RecordingGate {
         decisions: vec![
             PermissionDecision::Ask,
@@ -1067,12 +1043,10 @@ fn preflights_a_provider_batch_before_sequential_dispatch_and_continues_denials(
 fn cancellation_during_preflight_runs_nothing_and_during_execution_keeps_completed_results() {
     let preflight_cancellation = HeadlessTurnCancellation::new();
     let observed = Arc::new(Mutex::new(Vec::new()));
-    let mut provider = Provider {
-        iterations: vec![Ok(vec![
-            tool_call("first", "read"),
-            tool_call("second", "search"),
-        ])],
-    };
+    let mut provider = Provider::new(vec![Ok(vec![
+        tool_call("first", "read"),
+        tool_call("second", "search"),
+    ])]);
     let mut gate = CancellingGate {
         decisions: vec![PermissionDecision::Allow, PermissionDecision::Allow],
         cancellation: preflight_cancellation.clone(),
@@ -1098,12 +1072,10 @@ fn cancellation_during_preflight_runs_nothing_and_during_execution_keeps_complet
     assert!(repository.snapshots.is_empty());
 
     let execution_cancellation = HeadlessTurnCancellation::new();
-    let mut provider = Provider {
-        iterations: vec![Ok(vec![
-            tool_call("first", "read"),
-            tool_call("second", "search"),
-        ])],
-    };
+    let mut provider = Provider::new(vec![Ok(vec![
+        tool_call("first", "read"),
+        tool_call("second", "search"),
+    ])]);
     let mut dispatcher = RecordingDispatcher {
         outputs: vec![Ok(HeadlessToolOutput::success("first result"))],
         observed: Arc::new(Mutex::new(Vec::new())),
@@ -1262,16 +1234,14 @@ fn a_running_turn_collects_input_after_the_tool_batch() {
         }
     }
 
-    let mut provider = Provider {
-        iterations: vec![
-            Ok(vec![MessagePart::ToolCall {
-                id: "call-1".into(),
-                name: "git_read".into(),
-                input: r#"{"operation":"diff"}"#.into(),
-            }]),
-            Ok(vec![MessagePart::Text("acknowledged".into())]),
-        ],
-    };
+    let mut provider = Provider::new(vec![
+        Ok(vec![MessagePart::ToolCall {
+            id: "call-1".into(),
+            name: "git_read".into(),
+            input: r#"{"operation":"diff"}"#.into(),
+        }]),
+        Ok(vec![MessagePart::Text("acknowledged".into())]),
+    ]);
     let mut inbox = OnceInbox(Some(PendingIntraTurnInput {
         source: IntraTurnInputSource::Supervisor,
         text: "prefer the manifest".into(),
@@ -1317,6 +1287,73 @@ fn a_running_turn_collects_input_after_the_tool_batch() {
     );
 }
 
+/// Recording the steer is not delivering it. The point of the tool-call grain
+/// is that the message lands before the next request goes out, so the turn has
+/// to hand it to the provider as well as write it down — otherwise the model
+/// only reads it a whole turn later, which is the wait this grain exists to
+/// avoid.
+#[test]
+fn collected_input_reaches_the_provider_before_the_next_request() {
+    struct OnceInbox(Option<PendingIntraTurnInput>);
+
+    impl HeadlessIntraTurnInbox for OnceInbox {
+        fn drain(
+            &mut self,
+        ) -> impl std::future::Future<
+            Output = Result<Vec<PendingIntraTurnInput>, HeadlessTurnPortError>,
+        > + Send {
+            std::future::ready(Ok(self.0.take().into_iter().collect()))
+        }
+    }
+
+    let mut provider = Provider::new(vec![
+        Ok(vec![MessagePart::ToolCall {
+            id: "call-1".into(),
+            name: "git_read".into(),
+            input: r#"{"operation":"diff"}"#.into(),
+        }]),
+        Ok(vec![MessagePart::Text("acknowledged".into())]),
+    ]);
+    let queued = Arc::clone(&provider.queued);
+    let mut inbox = OnceInbox(Some(PendingIntraTurnInput {
+        source: IntraTurnInputSource::Supervisor,
+        text: "prefer the manifest".into(),
+    }));
+
+    block_on_ready(run_headless_turn_with_inbox(
+        &mut provider,
+        &mut PermissionGate {
+            decisions: vec![PermissionDecision::Allow],
+            denial_facts: None,
+        },
+        &mut PermissionResolver::default(),
+        &mut ToolDispatcher {
+            outputs: vec![Ok(HeadlessToolOutput::success("diff"))],
+            calls: Vec::new(),
+        },
+        &mut Repository::default(),
+        &HeadlessTurnCancellation::new(),
+        None,
+        None,
+        None,
+        &mut inbox,
+    ))
+    .expect("the turn completes after collecting input");
+
+    let queued = queued.lock().unwrap();
+    assert_eq!(
+        queued
+            .iter()
+            .map(|message| (message.role, message.parts.clone()))
+            .collect::<Vec<_>>(),
+        vec![(
+            Role::Supervisor,
+            vec![MessagePart::Text("prefer the manifest".into())]
+        )],
+        "the supervisor's message is handed over as its own speaker"
+    );
+}
+
 /// An empty inbox is the common case and must cost the turn nothing.
 #[test]
 fn an_empty_inbox_leaves_a_turn_byte_for_byte_unchanged() {
@@ -1344,9 +1381,7 @@ fn an_empty_inbox_leaves_a_turn_byte_for_byte_unchanged() {
     };
 
     let with_inbox = block_on_ready(run_headless_turn_with_inbox(
-        &mut Provider {
-            iterations: iterations(),
-        },
+        &mut Provider::new(iterations()),
         &mut PermissionGate {
             decisions: vec![PermissionDecision::Allow],
             denial_facts: None,
@@ -1365,9 +1400,7 @@ fn an_empty_inbox_leaves_a_turn_byte_for_byte_unchanged() {
     ))
     .expect("the turn completes");
     let without_inbox = block_on_ready(run_headless_turn(
-        &mut Provider {
-            iterations: iterations(),
-        },
+        &mut Provider::new(iterations()),
         &mut PermissionGate {
             decisions: vec![PermissionDecision::Allow],
             denial_facts: None,
