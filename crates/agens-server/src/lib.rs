@@ -9,6 +9,7 @@ mod blocking;
 mod fsm;
 mod instance;
 mod sessions;
+mod timers;
 
 use std::os::unix::net::UnixListener;
 use std::path::Path;
@@ -29,6 +30,10 @@ pub use sessions::{
     SessionAdmission, SessionBudget, SessionBudgetHandle, SessionId, SessionLimits, SessionOutcome,
     SessionProvider, SessionRegistry, SessionRegistryError, SessionRuntime, SessionShutdown,
     SessionState, SessionStatus, SessionSupervisor,
+};
+pub use timers::{
+    CHECKPOINT_EVENT, CHECKPOINT_OVERDUE_EVENT, DEFAULT_CHECKPOINT_GRACE_PERCENT, ExpiredQuestion,
+    ManualTimerClock, OverdueCheckpoint, QuotaReset, TimerSettings, TimerTick, TimerWheel,
 };
 
 #[derive(Debug)]
