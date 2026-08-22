@@ -481,9 +481,12 @@ fn a_transport_failure_after_discovery_marks_the_server_degraded() {
             &agens_tools::ToolExecutionContext::with_timeout(Duration::from_secs(1)),
         )
         .expect_err("a dead transport must fail the call");
+    // The cause travels with the failure now: a connection that could not be
+    // rebuilt is a different fact from a call the server refused, and the
+    // model used to receive one fixed phrase for both.
     assert_eq!(
         error.to_string(),
-        "extension: mcp tool infrastructure failure"
+        "extension: mcp tool infrastructure failure: transport: server did not restart"
     );
 
     let snapshot = status.snapshot();

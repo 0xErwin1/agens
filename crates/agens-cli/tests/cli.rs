@@ -4326,14 +4326,32 @@ fn production_binary_recovers_from_mcp_infrastructure_failures_and_persists_comp
     // fails there, so do not tighten this. Above, it must stay well under the
     // five seconds `call-sleep` blocks for, or the call would answer in time and
     // the case would stop proving that a timeout is what produced the error.
-    for (name, mode, timeout_ms, expected_tool_error) in [
-        ("timeout", "call-sleep", 1_000, "tool operation timed out"),
-        ("crash", "call-crash", 1_000, "tool infrastructure failure"),
+    // An infrastructure failure carries the cause the transport reported, so a
+    // model that cannot call a server at all can tell a dead process from a
+    // rejected frame. `expected_class` is what the same failure is recorded as
+    // under the `mcp` component; a timeout is not one of those, and is
+    // asserted to record nothing there.
+    for (name, mode, timeout_ms, expected_tool_error, expected_class) in [
+        (
+            "timeout",
+            "call-sleep",
+            1_000,
+            "tool operation timed out",
+            None,
+        ),
+        (
+            "crash",
+            "call-crash",
+            1_000,
+            "tool infrastructure failure: transport: call failed",
+            Some("network"),
+        ),
         (
             "malformed protocol",
             "call-malformed",
             1_000,
-            "tool infrastructure failure",
+            "tool infrastructure failure: protocol: server response rejected",
+            Some("protocol"),
         ),
     ] {
         let temporary = TemporaryDirectory::new(&format!("production-mcp-{name}"));
@@ -4454,6 +4472,31 @@ fn production_binary_recovers_from_mcp_infrastructure_failures_and_persists_comp
                 "SENTINEL_MCP_STDERR",
             ],
         );
+
+        // The session that reported this failure used to leave nothing at all
+        // under the `mcp` component, so a supervisor reading the diagnostics
+        // file could not tell that a server had broken.
+        let mcp_events = diagnostic_json_events(&data_directory)
+            .into_iter()
+            .filter(|event| event["component"] == "mcp")
+            .collect::<Vec<_>>();
+        match expected_class {
+            Some(class) => {
+                assert_eq!(mcp_events.len(), 1, "{name}");
+                assert_eq!(mcp_events[0]["event"], "tool_failed", "{name}");
+                assert_eq!(mcp_events[0]["scope"], "parent", "{name}");
+                assert_eq!(mcp_events[0]["tool"], "files::first", "{name}");
+                assert_eq!(mcp_events[0]["class"], class, "{name}");
+                assert_eq!(
+                    mcp_events[0]["cause"],
+                    expected_tool_error
+                        .strip_prefix("tool infrastructure failure: ")
+                        .unwrap(),
+                    "{name}"
+                );
+            }
+            None => assert!(mcp_events.is_empty(), "{name}"),
+        }
 
         server.join();
     }
