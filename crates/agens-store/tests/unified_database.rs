@@ -94,7 +94,9 @@ fn the_ledger_records_each_applied_migration_once() {
             "0011_session_fork_lineage",
             "0012_directives",
             "0013_supervisor_role",
-            "0014_directive_child_target"
+            "0014_directive_child_target",
+            "0015_control_plane",
+            "0016_directive_kind"
         ]
     );
 
@@ -164,6 +166,8 @@ fn an_unknown_ledger_id_is_tolerated_and_known_missing_migrations_still_apply() 
             ("0012_directives".to_owned(), rows[11].1),
             ("0013_supervisor_role".to_owned(), rows[12].1),
             ("0014_directive_child_target".to_owned(), rows[13].1),
+            ("0015_control_plane".to_owned(), rows[14].1),
+            ("0016_directive_kind".to_owned(), rows[15].1),
             ("9999_unknown".to_owned(), 0),
         ]
     );
@@ -414,7 +418,9 @@ fn a_partially_applied_database_is_completed() {
             "0011_session_fork_lineage",
             "0012_directives",
             "0013_supervisor_role",
-            "0014_directive_child_target"
+            "0014_directive_child_target",
+            "0015_control_plane",
+            "0016_directive_kind"
         ]
     );
 
@@ -502,7 +508,9 @@ fn all_three_domains_share_one_database_file() {
             "0011_session_fork_lineage",
             "0012_directives",
             "0013_supervisor_role",
-            "0014_directive_child_target"
+            "0014_directive_child_target",
+            "0015_control_plane",
+            "0016_directive_kind"
         ]
     );
 
@@ -585,7 +593,9 @@ fn a_bootstrap_only_ledger_with_no_user_tables_is_accepted() {
             "0011_session_fork_lineage",
             "0012_directives",
             "0013_supervisor_role",
-            "0014_directive_child_target"
+            "0014_directive_child_target",
+            "0015_control_plane",
+            "0016_directive_kind"
         ]
     );
 

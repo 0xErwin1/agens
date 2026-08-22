@@ -37,6 +37,30 @@ impl DirectiveGrain {
     }
 }
 
+/// What a queued row is: an answer to a question, a directive that steers, or
+/// the "continue" that resumes a parked run.
+///
+/// All three drain through the same queue at the same two grains. The
+/// distinction is for whoever reads the queue afterwards and for the run the
+/// row belongs to: a resumed run has to be told apart from a steered one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DirectiveKind {
+    Answer,
+    Directive,
+    Continue,
+}
+
+impl DirectiveKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Answer => "answer",
+            Self::Directive => "directive",
+            Self::Continue => "continue",
+        }
+    }
+}
+
 /// Who a queued message is addressed to.
 ///
 /// A delegated child does not read its parent session's queue. Several children
@@ -113,9 +137,22 @@ impl DirectiveStore {
         self.database_path.clone()
     }
 
+    /// Queues a message that steers the turn it reaches.
     pub fn enqueue(
         &mut self,
         target: &DirectiveTarget,
+        source: IntraTurnInputSource,
+        grain: DirectiveGrain,
+        text: &str,
+    ) -> Result<(), DirectiveStoreError> {
+        self.enqueue_kind(target, DirectiveKind::Directive, source, grain, text)
+    }
+
+    /// Queues a message and says what it is.
+    pub fn enqueue_kind(
+        &mut self,
+        target: &DirectiveTarget,
+        kind: DirectiveKind,
         source: IntraTurnInputSource,
         grain: DirectiveGrain,
         text: &str,
@@ -129,11 +166,12 @@ impl DirectiveStore {
         let (session_id, child) = target.columns();
         self.connection
             .execute(
-                "INSERT INTO directives (session_id, child, source, grain, text, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO directives (session_id, child, kind, source, grain, text, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     session_id,
                     child,
+                    kind.as_str(),
                     source.as_str(),
                     grain.as_str(),
                     text,

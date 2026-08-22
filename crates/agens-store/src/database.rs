@@ -57,7 +57,7 @@ struct Migration {
     preserved_tables: &'static [&'static str],
 }
 
-const MIGRATIONS: [Migration; 14] = [
+const MIGRATIONS: [Migration; 16] = [
     Migration {
         id: "0001_permission_grants",
         ddl: permission_grants_ddl,
@@ -132,6 +132,16 @@ const MIGRATIONS: [Migration; 14] = [
     Migration {
         id: "0014_directive_child_target",
         ddl: directive_child_target_ddl,
+        preserved_tables: &["directives"],
+    },
+    Migration {
+        id: "0015_control_plane",
+        ddl: control_plane_ddl,
+        preserved_tables: &[],
+    },
+    Migration {
+        id: "0016_directive_kind",
+        ddl: directive_kind_ddl,
         preserved_tables: &["directives"],
     },
 ];
@@ -547,6 +557,210 @@ fn directive_child_target_ddl() -> String {
     CREATE INDEX directives_child_pending
         ON directives(child, grain, id)
         WHERE delivered_at IS NULL;
+    "
+    .to_owned()
+}
+
+/// The control plane's own tables, alongside the session and message tables the
+/// harness already owns.
+///
+/// Everything here is written by a single actor, the coordinator, which is what
+/// lets the state machines, the scheduler and the timer wheel run without
+/// distributed locking. Two boundaries this schema deliberately does not cross:
+///
+/// - `runs.repo_id` is a repository fingerprint and is NEVER joined against
+///   `sessions.project` or `permission_grants.project`. Those are session
+///   identity, one per worktree, and their narrowness is a security property: a
+///   grant made by an autonomous worker inside a throwaway worktree must not
+///   reach the user's real checkout. `repo_root` and `remote_url` sit next to
+///   the fingerprint so a changed origin is diagnosable rather than silent, and
+///   the fingerprint is persisted, never recomputed when reading history.
+/// - `events` is the coordinator's own journal. `tool_result_facts` is the
+///   harness's evidence ledger, an input the coordinator reads. They stay two
+///   tables with two writers; making the harness a writer of the journal would
+///   give up the single-writer property the unified database bought.
+///
+/// Two questions this migration was asked to settle, and how:
+///
+/// - **`attempts` is a new table, not a reuse of `session_attempts`.** They are
+///   two entities, not two names for one. `session_attempts` is the harness's
+///   universal physical record of execution and carries no run: a manual TUI
+///   session, a headless invocation, a subagent and a takeover all produce one.
+///   `attempts` is the run-scoped logical entity the control plane needs, with
+///   an attempt number, a business outcome, a retry trigger and its own
+///   accounting. Folding the run-scoped fields into the physical ledger would
+///   leave them NULL for every detached execution, and folding the physical
+///   lifecycle into the control plane would give a run-less session nowhere to
+///   live.
+/// - **The correlation is `attempts.session_attempt_id`, and it exists from the
+///   first migration.** It is the only join from a run to the harness's
+///   evidence ledger, which is keyed by `(session_id, attempt_id, sequence)`
+///   where that attempt is the physical one. Adding it later would mean
+///   migrating the key of a populated lifecycle, which is the failure this
+///   schema was warned about.
+///
+/// `attempts` is a table rather than a counter for the same reason it carries
+/// those columns: an attempt has its own cost and duration, and the interface
+/// shows them per node.
+///
+/// Timestamps are epoch seconds supplied by the caller, matching
+/// `tool_result_facts`. The store reads no clock of its own, so a coordinator
+/// replaying or reconciling decides what "now" means.
+fn control_plane_ddl() -> String {
+    "
+    CREATE TABLE runs (
+        id INTEGER PRIMARY KEY,
+        repo_id TEXT NOT NULL CHECK(repo_id <> ''),
+        repo_root TEXT NOT NULL CHECK(repo_root <> ''),
+        remote_url TEXT,
+        external_ref TEXT,
+        parent_run_id INTEGER,
+        task TEXT NOT NULL CHECK(task <> ''),
+        scope TEXT NOT NULL,
+        dod TEXT NOT NULL,
+        genesis_paths TEXT
+            CHECK(genesis_paths IS NULL
+                  OR (json_valid(genesis_paths) AND json_type(genesis_paths) = 'array')),
+        state TEXT NOT NULL CHECK(state IN (
+            'draft', 'queued', 'running', 'awaiting_input', 'awaiting_quota',
+            'done', 'failed', 'interrupted', 'cancelled'
+        )),
+        priority INTEGER NOT NULL,
+        dep_run_id INTEGER,
+        provider TEXT NOT NULL CHECK(provider <> ''),
+        budget_tokens INTEGER CHECK(budget_tokens IS NULL OR budget_tokens >= 0),
+        worktree_path TEXT,
+        worktree_status TEXT
+            CHECK(worktree_status IS NULL
+                  OR worktree_status IN ('active', 'reclaimable', 'cleaned')),
+        created_at INTEGER NOT NULL,
+        result TEXT,
+        FOREIGN KEY(parent_run_id) REFERENCES runs(id) ON DELETE SET NULL,
+        FOREIGN KEY(dep_run_id) REFERENCES runs(id) ON DELETE SET NULL,
+        CHECK(parent_run_id IS NULL OR parent_run_id <> id),
+        CHECK(dep_run_id IS NULL OR dep_run_id <> id)
+    );
+    CREATE INDEX runs_repo_state ON runs(repo_id, state, id);
+    CREATE INDEX runs_state ON runs(state, priority DESC, id);
+
+    CREATE TABLE attempts (
+        id INTEGER PRIMARY KEY,
+        run_id INTEGER NOT NULL,
+        n INTEGER NOT NULL CHECK(n > 0),
+        session_id INTEGER,
+        session_attempt_id INTEGER,
+        started_at INTEGER NOT NULL,
+        ended_at INTEGER,
+        outcome TEXT CHECK(outcome IS NULL OR outcome IN (
+            'succeeded', 'failed', 'changes_requested', 'interrupted'
+        )),
+        retry_trigger TEXT
+            CHECK(retry_trigger IS NULL OR retry_trigger IN ('user', 'praetor', 'coordinator')),
+        tokens INTEGER CHECK(tokens IS NULL OR tokens >= 0),
+        cost_micros INTEGER CHECK(cost_micros IS NULL OR cost_micros >= 0),
+        FOREIGN KEY(run_id) REFERENCES runs(id) ON DELETE CASCADE,
+        FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE SET NULL,
+        FOREIGN KEY(session_attempt_id) REFERENCES session_attempts(id) ON DELETE SET NULL,
+        CHECK((ended_at IS NULL) = (outcome IS NULL))
+    );
+    CREATE UNIQUE INDEX attempts_run_n ON attempts(run_id, n);
+    CREATE INDEX attempts_session_attempt ON attempts(session_attempt_id);
+
+    CREATE TABLE events (
+        id INTEGER PRIMARY KEY,
+        run_id INTEGER,
+        type TEXT NOT NULL CHECK(type <> ''),
+        class TEXT NOT NULL CHECK(class IN ('agent', 'infra')),
+        payload TEXT NOT NULL CHECK(json_valid(payload)),
+        ts INTEGER NOT NULL,
+        FOREIGN KEY(run_id) REFERENCES runs(id) ON DELETE CASCADE
+    );
+    CREATE INDEX events_run ON events(run_id, id);
+
+    CREATE TABLE questions (
+        id INTEGER PRIMARY KEY,
+        run_id INTEGER NOT NULL,
+        kind TEXT NOT NULL CHECK(kind IN ('question', 'approval')),
+        blocked_decision TEXT NOT NULL CHECK(blocked_decision <> ''),
+        options TEXT NOT NULL
+            CHECK(json_valid(options) AND json_type(options) = 'array'),
+        recommendation TEXT,
+        answer TEXT,
+        author TEXT CHECK(author IS NULL OR author IN ('praetor', 'user')),
+        expires_at INTEGER,
+        tree_hash TEXT CHECK(tree_hash IS NULL OR tree_hash <> ''),
+        paths_digest TEXT CHECK(paths_digest IS NULL OR paths_digest <> ''),
+        state TEXT NOT NULL CHECK(state IN ('open', 'answered', 'delivered', 'expired')),
+        created_at INTEGER NOT NULL,
+        FOREIGN KEY(run_id) REFERENCES runs(id) ON DELETE CASCADE,
+        CHECK((answer IS NULL) = (author IS NULL)),
+        CHECK(state IN ('open', 'expired') OR answer IS NOT NULL),
+        CHECK((kind = 'approval') = (tree_hash IS NOT NULL)),
+        CHECK((tree_hash IS NULL) = (paths_digest IS NULL))
+    );
+    CREATE INDEX questions_run ON questions(run_id, id);
+    CREATE INDEX questions_open ON questions(state, id) WHERE state = 'open';
+
+    CREATE TABLE findings (
+        id INTEGER PRIMARY KEY,
+        run_id INTEGER NOT NULL,
+        checkpoint_id INTEGER,
+        description TEXT NOT NULL CHECK(description <> ''),
+        evidence_class TEXT NOT NULL
+            CHECK(evidence_class IN ('deterministic', 'inferential', 'insufficient')),
+        proof_refs TEXT NOT NULL
+            CHECK(json_valid(proof_refs) AND json_type(proof_refs) = 'array'),
+        causal_disposition TEXT NOT NULL
+            CHECK(causal_disposition IN ('candidate_caused', 'pre_existing', 'unknown')),
+        created_at INTEGER NOT NULL,
+        FOREIGN KEY(run_id) REFERENCES runs(id) ON DELETE CASCADE,
+        FOREIGN KEY(checkpoint_id) REFERENCES events(id) ON DELETE SET NULL
+    );
+    CREATE INDEX findings_run ON findings(run_id, id);
+
+    CREATE TABLE providers (
+        provider TEXT PRIMARY KEY CHECK(provider <> ''),
+        quota_state TEXT NOT NULL CHECK(quota_state IN ('ok', 'capped')),
+        reset_at INTEGER,
+        updated_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE run_health (
+        run_id INTEGER PRIMARY KEY,
+        last_progress_turn INTEGER
+            CHECK(last_progress_turn IS NULL OR last_progress_turn >= 0),
+        noop_turns INTEGER NOT NULL CHECK(noop_turns >= 0),
+        failing_test_signature TEXT,
+        tokens_since_progress INTEGER NOT NULL CHECK(tokens_since_progress >= 0),
+        updated_at INTEGER NOT NULL,
+        FOREIGN KEY(run_id) REFERENCES runs(id) ON DELETE CASCADE
+    );
+    "
+    .to_owned()
+}
+
+/// Tells apart the three things the safe-point queue carries.
+///
+/// The queue itself already existed, addressed and grained exactly as the
+/// coordinator design asks; what it had no way to say was whether a row is an
+/// answer to a question, a directive that steers, or the "continue" that
+/// resumes a parked run. Those three are drained the same way but mean
+/// different things to whoever reads the queue afterwards, and to the run they
+/// belong to.
+///
+/// `'directive'` is the default because every row written before this column
+/// existed was human or supervisor steering, which is exactly that.
+///
+/// The queue itself is migrated rather than replaced: a second queue would give
+/// the safe-point drain two places to look and one of them would go unread. The
+/// remaining differences from the control plane design are naming and a
+/// superset, not divergence — `source` is that design's `created_by`, `kind`
+/// plus `text` is its `payload`, and `child` addresses a delegated turn the
+/// design does not model.
+fn directive_kind_ddl() -> String {
+    "
+    ALTER TABLE directives ADD COLUMN kind TEXT NOT NULL DEFAULT 'directive'
+        CHECK(kind IN ('answer', 'directive', 'continue'));
     "
     .to_owned()
 }
