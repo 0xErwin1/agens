@@ -14,6 +14,7 @@ use agens_core::{
 use agens_providers::{
     OpenAiFunctionTool, OpenAiResponsesProvider, ProviderDiagnosticClass, ProviderDiagnosticEvent,
     ProviderDiagnosticKind, ProviderDiagnosticScope, ProviderDiagnostics, ProviderFailureDetail,
+    RetryPolicy,
 };
 use serde_json::json;
 
@@ -595,7 +596,11 @@ fn openai_emits_allowlisted_retry_diagnostics_with_one_reference() {
     assert_eq!(events[0].event, ProviderDiagnosticKind::Attempt);
     assert_eq!(events[1].event, ProviderDiagnosticKind::RetryScheduled);
     assert_eq!(events[1].class, Some(ProviderDiagnosticClass::Server));
-    assert!(matches!(events[1].delay_ms, Some(250..=350)));
+    assert!(matches!(events[1].delay_ms, Some(1_000..=1_250)));
+    assert_eq!(
+        events[1].max_attempts,
+        u8::try_from(RetryPolicy::default().max_attempts()).expect("the budget fits in a byte")
+    );
     assert_eq!(events[2].event, ProviderDiagnosticKind::Attempt);
     assert_eq!(events[3].event, ProviderDiagnosticKind::Terminal);
     assert_eq!(events[3].class, None);
@@ -606,6 +611,149 @@ fn openai_emits_allowlisted_retry_diagnostics_with_one_reference() {
     );
     drop(events);
     assert_eq!(server.join(), 2);
+}
+
+/// The truncation this covers is the one the provider actually produces: a
+/// response that opens, sends its lifecycle preamble, and then loses its
+/// connection. Before, that failed the turn as a protocol error and the user
+/// re-sent the whole prompt.
+#[test]
+fn openai_retries_a_stream_cut_before_it_produced_output() {
+    let server = RetryResponsesServer::start(vec![
+        RetryResponse::Sse(created_only_response("cut")),
+        RetryResponse::Sse(completed_text_response("retried", "done")),
+    ]);
+
+    assert_eq!(
+        run_provider_with_retry_policy(
+            server.base_url(),
+            &HeadlessTurnCancellation::new(),
+            Duration::from_secs(2),
+            brisk_retry_policy(4),
+            None,
+        ),
+        Ok(())
+    );
+    assert_eq!(server.join(), 2);
+}
+
+/// Retrying is only honest while nothing has reached the user. The decoded
+/// deltas are handed to the progress sink as they arrive, so a second attempt
+/// after the first has streamed text would show that text twice.
+#[test]
+fn openai_does_not_retry_a_stream_cut_after_it_produced_output() {
+    let server = RetryResponsesServer::start(vec![
+        RetryResponse::Sse(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"half an answer\"}\n\n"
+                .to_owned(),
+        ),
+        RetryResponse::Sse(completed_text_response("retried", "done")),
+    ]);
+
+    assert_eq!(
+        run_provider_with_retry_policy(
+            server.base_url(),
+            &HeadlessTurnCancellation::new(),
+            Duration::from_secs(2),
+            brisk_retry_policy(4),
+            None,
+        ),
+        Err(HeadlessTurnPortError::ProviderNetwork)
+    );
+    assert_eq!(server.join(), 1);
+}
+
+/// A stream that is cut every time still ends, and it ends against the attempt
+/// budget rather than against the user's patience.
+#[test]
+fn openai_stops_retrying_a_stream_cut_at_the_attempt_budget() {
+    let server = RetryResponsesServer::start(vec![
+        RetryResponse::Sse(created_only_response("cut")),
+        RetryResponse::Sse(created_only_response("cut")),
+        RetryResponse::Sse(created_only_response("cut")),
+        RetryResponse::Sse(created_only_response("cut")),
+    ]);
+
+    assert_eq!(
+        run_provider_with_retry_policy(
+            server.base_url(),
+            &HeadlessTurnCancellation::new(),
+            Duration::from_secs(2),
+            brisk_retry_policy(3),
+            None,
+        ),
+        Err(HeadlessTurnPortError::ProviderNetwork)
+    );
+    assert_eq!(server.join(), 3);
+}
+
+/// Connection failures used to be exempt from the attempt budget and retried
+/// once a second forever. An interactive turn carries no deadline of its own,
+/// so that was a spinner with no end.
+#[test]
+fn openai_bounds_connection_retries_by_the_attempt_budget() {
+    let (listener, address) = bind_pollable_listener();
+    drop(listener);
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&events);
+    let diagnostics = ProviderDiagnostics::new(
+        "abc12345",
+        ProviderDiagnosticScope::Parent,
+        Arc::new(move |event| captured.lock().expect("event lock").push(event)),
+    )
+    .expect("diagnostics should be configured");
+
+    let started_at = Instant::now();
+    assert_eq!(
+        run_provider_with_retry_policy(
+            format!("http://{address}"),
+            &HeadlessTurnCancellation::new(),
+            Duration::from_secs(2),
+            brisk_retry_policy(3),
+            Some(diagnostics),
+        ),
+        Err(HeadlessTurnPortError::ProviderNetwork)
+    );
+    assert!(started_at.elapsed() < Duration::from_secs(5));
+
+    // Each scheduled retry now names the budget it counts against, which is
+    // what the status line renders as `Retrying (n/m)`. While connection
+    // retries were unbounded there was no `m` to report, so the one failure a
+    // user is most likely to hit was also the one they could see least of.
+    let events = events.lock().expect("event lock");
+    let scheduled = events
+        .iter()
+        .filter(|event| event.event == ProviderDiagnosticKind::RetryScheduled)
+        .collect::<Vec<_>>();
+    assert_eq!(scheduled.len(), 2);
+    for event in scheduled {
+        assert_eq!(event.class, Some(ProviderDiagnosticClass::Network));
+        assert_eq!(event.max_attempts, 3);
+        assert!(event.delay_ms.is_some());
+    }
+}
+
+/// The read timeout is the only thing bounding a response that opened and then
+/// stopped emitting. Without it the body read waited forever and the session
+/// stayed "running" until somebody cancelled it by hand.
+#[test]
+fn openai_read_timeout_ends_a_stream_that_stops_emitting() {
+    let server = LocalResponsesServer::start(ServerMode::StalledBody);
+    let started_at = Instant::now();
+
+    assert_eq!(
+        run_provider_with_retry_policy(
+            server.base_url(),
+            &HeadlessTurnCancellation::new(),
+            Duration::from_millis(200),
+            brisk_retry_policy(1),
+            None,
+        ),
+        Err(HeadlessTurnPortError::ProviderNetwork)
+    );
+    assert!(started_at.elapsed() < Duration::from_secs(5));
+
+    server.join();
 }
 
 #[test]
@@ -1273,6 +1421,12 @@ data: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"{response_id}\"}
     )
 }
 
+/// A stream that opens and is then cut: the lifecycle preamble arrives, no
+/// output part is decoded, and no terminal event ever comes.
+fn created_only_response(response_id: &str) -> String {
+    format!("data: {{\"type\":\"response.created\",\"response\":{{\"id\":\"{response_id}\"}}}}\n\n")
+}
+
 fn completed_text_response(response_id: &str, text: &str) -> String {
     format!(
         "data: {{\"type\":\"response.created\",\"response\":{{\"id\":\"{response_id}\"}}}}\n\n\
@@ -1340,6 +1494,39 @@ fn run_provider_with_diagnostics(
     .expect("provider should be configured")
     .with_diagnostics(diagnostics);
     run_provider_instance(&mut provider, cancellation)
+}
+
+fn run_provider_with_retry_policy(
+    base_url: String,
+    cancellation: &HeadlessTurnCancellation,
+    timeout: Duration,
+    retry_policy: RetryPolicy,
+    diagnostics: Option<ProviderDiagnostics>,
+) -> Result<(), HeadlessTurnPortError> {
+    let mut provider = OpenAiResponsesProvider::from_api_key_with_timeout(
+        "test-api-key".into(),
+        Some(&base_url),
+        "test-model".into(),
+        "test prompt".into(),
+        timeout,
+    )
+    .expect("provider should be configured")
+    .with_retry_policy(retry_policy);
+    if let Some(diagnostics) = diagnostics {
+        provider = provider.with_diagnostics(diagnostics);
+    }
+    run_provider_instance(&mut provider, cancellation)
+}
+
+/// A schedule short enough to sleep through in a test, with the same shape as
+/// the production one.
+fn brisk_retry_policy(max_attempts: usize) -> RetryPolicy {
+    RetryPolicy::new(
+        max_attempts,
+        Duration::from_millis(10),
+        Duration::from_millis(40),
+        Duration::from_millis(40),
+    )
 }
 
 fn run_provider_with_operation_timeout(

@@ -24,9 +24,9 @@ use agens_core::{
 use serde_json::Value;
 
 use crate::{
-    Error, MAX_HTTP_STATUS_ATTEMPTS, MAX_SSE_FRAME_BYTES, MediaBlobs, OpenAiFunctionTool,
-    ProgressAwareProvider, ProviderDiagnosticClass, ProviderDiagnosticComponent,
-    ProviderDiagnosticKind, ProviderDiagnostics, ProviderFailureDetail,
+    Error, MAX_SSE_FRAME_BYTES, MediaBlobs, OpenAiFunctionTool, ProgressAwareProvider,
+    ProviderDiagnosticClass, ProviderDiagnosticComponent, ProviderDiagnosticKind,
+    ProviderDiagnostics, ProviderFailureDetail, RetryPolicy, ScheduledRetry,
     classify_openai_response_status, diagnostic_class_for_port_error, diagnostic_class_for_status,
     is_transient_http_status, provider_operation_cancellation, retry_after_from_headers,
     should_retry_transport_error, stop_before_mapping, wait_for_http_retry, wait_for_stop,
@@ -68,6 +68,7 @@ pub struct MoonshotProvider {
     state: TurnState,
     client: reqwest::Client,
     operation_timeout: Duration,
+    retry_policy: RetryPolicy,
     diagnostics: Option<ProviderDiagnostics>,
     progress: Option<TurnProgressSink>,
     failure_detail: Option<ProviderFailureDetail>,
@@ -144,6 +145,7 @@ impl MoonshotProvider {
                 .build()
                 .map_err(|_| Error::Provider("Moonshot client is unavailable".to_owned()))?,
             operation_timeout: crate::DEFAULT_PROVIDER_REQUEST_TIMEOUT,
+            retry_policy: RetryPolicy::default(),
             diagnostics: None,
             progress: None,
             failure_detail: None,
@@ -176,7 +178,16 @@ impl MoonshotProvider {
 
     #[must_use]
     pub fn with_diagnostics(mut self, diagnostics: ProviderDiagnostics) -> Self {
-        self.diagnostics = Some(diagnostics);
+        self.diagnostics = Some(diagnostics.with_max_attempts(self.retry_policy.max_attempts()));
+        self
+    }
+
+    #[must_use]
+    pub fn with_retry_policy(mut self, retry_policy: RetryPolicy) -> Self {
+        self.retry_policy = retry_policy;
+        self.diagnostics = self
+            .diagnostics
+            .map(|diagnostics| diagnostics.with_max_attempts(retry_policy.max_attempts()));
         self
     }
 
@@ -236,6 +247,7 @@ impl MoonshotProvider {
         cancellation: &HeadlessTurnCancellation,
     ) -> Result<(reqwest::Response, tokio::time::Instant), HeadlessTurnPortError> {
         let first_byte_deadline = tokio::time::Instant::now() + crate::FIRST_RESPONSE_BYTE_TIMEOUT;
+        let policy = self.retry_policy;
         let mut attempt = 0;
         let mut last_transient_status = None;
         let mut saw_request_timeout = false;
@@ -277,15 +289,19 @@ impl MoonshotProvider {
                         attempt,
                         last_transient_status,
                         saw_request_timeout,
+                        policy,
                     ) {
                         wait_for_http_retry(
                             cancellation,
                             attempt,
                             None,
-                            self.diagnostics.as_ref(),
-                            ProviderDiagnosticComponent::ChatCompletions,
-                            ProviderDiagnosticClass::Network,
-                            None,
+                            ScheduledRetry {
+                                diagnostics: self.diagnostics.as_ref(),
+                                component: ProviderDiagnosticComponent::ChatCompletions,
+                                class: ProviderDiagnosticClass::Network,
+                                status: None,
+                                policy,
+                            },
                         )
                         .await?;
                         attempt += 1;
@@ -306,18 +322,21 @@ impl MoonshotProvider {
             };
 
             let status = response.status().as_u16();
-            if is_transient_http_status(status) && attempt + 1 < MAX_HTTP_STATUS_ATTEMPTS {
+            if is_transient_http_status(status) && policy.has_attempt_after(attempt) {
                 last_transient_status = Some(status);
-                let retry_after = retry_after_from_headers(response.headers());
+                let retry_after = retry_after_from_headers(response.headers(), policy);
                 drop(response);
                 wait_for_http_retry(
                     cancellation,
                     attempt,
                     retry_after,
-                    self.diagnostics.as_ref(),
-                    ProviderDiagnosticComponent::ChatCompletions,
-                    diagnostic_class_for_status(status, false),
-                    Some(status),
+                    ScheduledRetry {
+                        diagnostics: self.diagnostics.as_ref(),
+                        component: ProviderDiagnosticComponent::ChatCompletions,
+                        class: diagnostic_class_for_status(status, false),
+                        status: Some(status),
+                        policy,
+                    },
                 )
                 .await?;
                 attempt += 1;
