@@ -25,11 +25,10 @@ use serde_json::Value;
 
 use crate::{
     Error, MAX_SSE_FRAME_BYTES, MediaBlobs, OpenAiFunctionTool, ProgressAwareProvider,
-    ProviderDiagnosticClass, ProviderDiagnosticComponent, ProviderDiagnosticKind,
-    ProviderDiagnostics, ProviderFailureDetail, RetryPolicy, ScheduledRetry,
-    classify_openai_response_status, diagnostic_class_for_port_error, diagnostic_class_for_status,
-    is_transient_http_status, provider_operation_cancellation, retry_after_from_headers,
-    should_retry_transport_error, stop_before_mapping, wait_for_http_retry, wait_for_stop,
+    ProviderDiagnosticComponent, ProviderDiagnostics, ProviderFailureDetail, RetryLoop,
+    RetryPolicy, classify_openai_response_status, diagnostic_class_for_port_error,
+    diagnostic_class_for_status, provider_operation_cancellation, stop_before_mapping,
+    wait_for_stop,
 };
 
 use decode::CompletionsDecoder;
@@ -214,25 +213,6 @@ impl MoonshotProvider {
         .map_err(|_| HeadlessTurnPortError::Provider)
     }
 
-    fn emit(
-        &self,
-        kind: ProviderDiagnosticKind,
-        attempt: usize,
-        status: Option<u16>,
-        class: Option<ProviderDiagnosticClass>,
-    ) {
-        if let Some(diagnostics) = &self.diagnostics {
-            diagnostics.emit(
-                ProviderDiagnosticComponent::ChatCompletions,
-                kind,
-                attempt,
-                None,
-                status,
-                class,
-            );
-        }
-    }
-
     /// Sends one request, bounding the wait for its first sign of life.
     ///
     /// `client.execute` resolves as soon as the response headers arrive, so the
@@ -247,14 +227,15 @@ impl MoonshotProvider {
         cancellation: &HeadlessTurnCancellation,
     ) -> Result<(reqwest::Response, tokio::time::Instant), HeadlessTurnPortError> {
         let first_byte_deadline = tokio::time::Instant::now() + crate::FIRST_RESPONSE_BYTE_TIMEOUT;
-        let policy = self.retry_policy;
-        let mut attempt = 0;
-        let mut last_transient_status = None;
-        let mut saw_request_timeout = false;
+        let mut retry = RetryLoop::new(
+            self.retry_policy,
+            self.diagnostics.as_ref(),
+            ProviderDiagnosticComponent::ChatCompletions,
+        );
 
         loop {
             stop_before_mapping(cancellation)?;
-            self.emit(ProviderDiagnosticKind::Attempt, attempt + 1, None, None);
+            retry.begin_attempt();
 
             let request = self
                 .client
@@ -283,37 +264,15 @@ impl MoonshotProvider {
             let response = match response {
                 Ok(response) => response,
                 Err(error) => {
-                    saw_request_timeout |= error.is_timeout();
-                    if should_retry_transport_error(
-                        &error,
-                        attempt,
-                        last_transient_status,
-                        saw_request_timeout,
-                        policy,
-                    ) {
-                        wait_for_http_retry(
-                            cancellation,
-                            attempt,
-                            None,
-                            ScheduledRetry {
-                                diagnostics: self.diagnostics.as_ref(),
-                                component: ProviderDiagnosticComponent::ChatCompletions,
-                                class: ProviderDiagnosticClass::Network,
-                                status: None,
-                                policy,
-                            },
-                        )
-                        .await?;
-                        attempt += 1;
+                    if retry.retry_transport_error(&error, cancellation).await? {
                         continue;
                     }
 
+                    let last_transient_status = retry.last_transient_status();
                     let error = last_transient_status
                         .map(|status| classify_openai_response_status(status, false))
                         .unwrap_or(HeadlessTurnPortError::ProviderNetwork);
-                    self.emit(
-                        ProviderDiagnosticKind::Terminal,
-                        attempt + 1,
+                    retry.emit_terminal(
                         last_transient_status,
                         Some(diagnostic_class_for_port_error(error)),
                     );
@@ -321,27 +280,10 @@ impl MoonshotProvider {
                 }
             };
 
-            let status = response.status().as_u16();
-            if is_transient_http_status(status) && policy.has_attempt_after(attempt) {
-                last_transient_status = Some(status);
-                let retry_after = retry_after_from_headers(response.headers(), policy);
-                drop(response);
-                wait_for_http_retry(
-                    cancellation,
-                    attempt,
-                    retry_after,
-                    ScheduledRetry {
-                        diagnostics: self.diagnostics.as_ref(),
-                        component: ProviderDiagnosticComponent::ChatCompletions,
-                        class: diagnostic_class_for_status(status, false),
-                        status: Some(status),
-                        policy,
-                    },
-                )
-                .await?;
-                attempt += 1;
+            let Some(response) = retry.retry_transient_status(response, cancellation).await? else {
                 continue;
-            }
+            };
+            let status = response.status().as_u16();
 
             if !response.status().is_success() {
                 if let Some(failure_detail) = &self.failure_detail {
@@ -351,9 +293,7 @@ impl MoonshotProvider {
                 let context_exceeded =
                     read_context_overflow(response, cancellation, self.failure_detail.as_ref())
                         .await?;
-                self.emit(
-                    ProviderDiagnosticKind::Terminal,
-                    attempt + 1,
+                retry.emit_terminal(
                     Some(status),
                     Some(diagnostic_class_for_status(status, context_exceeded)),
                 );
