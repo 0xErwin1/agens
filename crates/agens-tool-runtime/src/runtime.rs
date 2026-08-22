@@ -153,7 +153,38 @@ pub fn production_tool_runtime_for_parent_with_cancellation(
     model_resolution_reference: Option<String>,
     discovery_cancellation: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<(Vec<OpenAiFunctionTool>, SharedToolDispatcher), CliError> {
-    production_tool_runtime_with_discovery_cancellation(
+    production_tool_runtime_for_parent_executing_run(
+        bootstrap,
+        project_root,
+        skills,
+        parent_model,
+        parent_request_config,
+        model_resolution_reference,
+        discovery_cancellation,
+        None,
+    )
+}
+
+/// Same as [`production_tool_runtime_for_parent_with_cancellation`], for a
+/// parent session that is executing a coordinator run.
+///
+/// The factory is the only difference, and it is what registers `checkpoint`
+/// and `ask` for this session. A parent that is not executing a run passes
+/// `None` and is offered neither, which is also how a sub-agent is kept from
+/// reaching them: children build their own runtime through
+/// [`ProductionTaskRunner`], which has no factory to hand on.
+#[allow(clippy::too_many_arguments)]
+pub fn production_tool_runtime_for_parent_executing_run(
+    bootstrap: &Bootstrap,
+    project_root: &Path,
+    skills: Option<&SkillCatalog>,
+    parent_model: String,
+    parent_request_config: agens_core::RequestConfig,
+    model_resolution_reference: Option<String>,
+    discovery_cancellation: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    run_introspection: Option<RunIntrospectionFactory>,
+) -> Result<(Vec<OpenAiFunctionTool>, SharedToolDispatcher), CliError> {
+    production_tool_runtime_inner(
         bootstrap,
         project_root,
         skills,
@@ -165,6 +196,7 @@ pub fn production_tool_runtime_for_parent_with_cancellation(
         model_resolution_reference
             .map(|reference| diagnosed_working_directory(bootstrap, project_root, reference)),
         discovery_cancellation,
+        run_introspection,
     )
 }
 

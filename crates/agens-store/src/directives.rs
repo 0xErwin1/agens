@@ -292,7 +292,10 @@ impl DirectiveInbox {
         Self::for_target(data_directory, DirectiveTarget::Child(reference.into()))
     }
 
-    fn for_target(data_directory: impl AsRef<Path>, target: DirectiveTarget) -> Self {
+    /// The inbox for a queue addressed to anything the target can name. A run's
+    /// mailbox is one: it is addressed to the run rather than to whichever
+    /// session is executing it.
+    pub fn for_target(data_directory: impl AsRef<Path>, target: DirectiveTarget) -> Self {
         Self {
             store: DirectiveStore::open(data_directory).ok(),
             target,

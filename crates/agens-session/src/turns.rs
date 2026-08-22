@@ -25,10 +25,23 @@ pub fn drain_turn_directive_messages(
     data_directory: impl AsRef<Path>,
     session_id: i64,
 ) -> Result<Vec<Message>, CliError> {
+    drain_turn_directives_for(data_directory, &DirectiveTarget::Session(session_id))
+}
+
+/// The same drain, for a queue addressed to something other than the session.
+///
+/// A coordinator run's queue is one: what a delivery is meant for is the run,
+/// which outlives the session that happens to be executing it, so an answer
+/// queued while the run was parked has to reach whichever session picks it up
+/// next.
+pub fn drain_turn_directives_for(
+    data_directory: impl AsRef<Path>,
+    target: &DirectiveTarget,
+) -> Result<Vec<Message>, CliError> {
     let mut store = DirectiveStore::open(data_directory)
         .map_err(|_| CliError::storage("session directives are unavailable"))?;
     let directives = store
-        .drain(&DirectiveTarget::Session(session_id), DirectiveGrain::Turn)
+        .drain(target, DirectiveGrain::Turn)
         .map_err(|_| CliError::storage("session directives could not be drained"))?;
 
     Ok(directives
