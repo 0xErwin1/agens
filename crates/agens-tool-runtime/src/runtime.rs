@@ -158,12 +158,43 @@ pub fn production_tool_runtime_for_parent_with_cancellation(
         skills,
         parent_model,
         parent_request_config,
-        model_resolution_reference,
+        model_resolution_reference.clone(),
         ProductionTaskRunner::new(bootstrap.clone(), project_root.to_path_buf()),
         Box::new(UnavailableAskUserPort),
-        None,
+        model_resolution_reference
+            .map(|reference| diagnosed_working_directory(bootstrap, project_root, reference)),
         discovery_cancellation,
     )
+}
+
+/// The session's working directory with its moves recorded in this run's
+/// diagnostics.
+///
+/// Without it a headless run reaches the tools with no published directory at
+/// all, so a `cd` or a `worktree` moved the session and left no trace: the
+/// supervisor reading the run's jsonl still saw the directory the session
+/// started in. The TUI installs its own observer, which also writes the move
+/// back onto the session it owns; there is no such session object here, so
+/// this one only records.
+fn diagnosed_working_directory(
+    bootstrap: &Bootstrap,
+    project_root: &Path,
+    reference: String,
+) -> WorkingDirectory {
+    let bootstrap = bootstrap.clone();
+
+    WorkingDirectory::new(project_root).with_observer(std::sync::Arc::new(
+        move |directory: &Path| {
+            agens_diagnostics::record_session_lifecycle(
+                &bootstrap,
+                &reference,
+                agens_providers::ProviderDiagnosticScope::Parent,
+                agens_diagnostics::SessionLifecycle::WorkingDirectoryChanged {
+                    directory: &directory.display().to_string(),
+                },
+            );
+        },
+    ))
 }
 
 pub fn production_tool_runtime_with_task_runner<R: TaskRunner>(
@@ -1804,6 +1835,80 @@ mod tests {
             output.content,
             "{\"status\":\"unavailable\",\"reason\":\"no interactive surface\"}"
         );
+    }
+
+    /// A headless run has no surface watching the session, so a move a tool
+    /// makes reaches the outside only through the run's own diagnostics.
+    /// Without it a supervisor reading the jsonl still believes the session is
+    /// in the directory it started in.
+    #[test]
+    fn a_headless_move_is_recorded_in_the_runs_diagnostics() {
+        let temporary = tui_session_directory("headless-working-directory-diagnostics");
+        let bootstrap = tui_session_bootstrap(&temporary, &[]);
+        let project_root = agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap);
+        let nested = project_root.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        let reference = agens_diagnostics::next_diagnostic_reference();
+
+        let (_, dispatcher) = production_tool_runtime_for_parent(
+            &bootstrap,
+            &project_root,
+            Some(&SkillCatalog::default()),
+            "gpt-4.1".to_owned(),
+            agens_core::RequestConfig::default(),
+            Some(reference.clone()),
+        )
+        .unwrap();
+
+        let policy = PermissionPolicy::new(PermissionMode::Edit, vec![]);
+        let cancellation = HeadlessTurnCancellation::new();
+        let context = ToolExecutionContext::from_headless_adapter(cancellation.adapter_view());
+        let mut dispatcher = dispatcher.lock().unwrap();
+        let ToolEvaluationOutcome::Authorized(handle) = dispatcher
+            .evaluate(
+                &policy,
+                &[],
+                &PermissionSession::with_temporary_bypass(),
+                ToolDispatchRequest::new(
+                    "project",
+                    "native::cd",
+                    serde_json::json!({ "path": "nested" }),
+                ),
+            )
+            .unwrap()
+        else {
+            panic!("cd should authorize under a bypassed session");
+        };
+
+        let output = dispatcher.execute(handle, &context).unwrap();
+        assert!(!output.is_error, "{}", output.content);
+
+        let recorded = recorded_diagnostics(&bootstrap);
+        assert!(
+            recorded.contains("working_directory_changed"),
+            "the move was not recorded: {recorded}"
+        );
+        assert!(
+            recorded.contains(
+                &std::fs::canonicalize(&nested)
+                    .unwrap()
+                    .display()
+                    .to_string()
+            ),
+            "the recorded move does not name the directory: {recorded}"
+        );
+    }
+
+    fn recorded_diagnostics(bootstrap: &Bootstrap) -> String {
+        let directory = bootstrap.data_directory().join("diagnostics");
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            return String::new();
+        };
+
+        entries
+            .filter_map(Result::ok)
+            .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+            .collect()
     }
 
     #[test]
