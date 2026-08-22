@@ -40,6 +40,7 @@ mod mcp_status;
 mod stdio_mcp;
 mod task;
 mod working_directory;
+mod worktree_provisioning;
 mod worktrees;
 
 pub use agens_core::{TaskProviderFailure, TaskSkillRejection};
@@ -66,6 +67,11 @@ pub use task::{
     TaskTurnRequest, TaskTurnResult,
 };
 pub use working_directory::{WorkingDirectory, WorkingDirectoryObserver};
+pub use worktree_provisioning::{
+    HookAuthorization, HookAuthorizationRequest, HookFailure, HookFailureReason,
+    HookFailureResponse, HookPlan, ProvisioningContract, ProvisioningDecisions, ProvisioningError,
+    ProvisioningOutcome, ProvisioningReport, ProvisioningRequest, WorktreeProvisioner,
+};
 pub use worktrees::{SessionWorktrees, WorktreeError, WorktreeStatus};
 
 #[cfg(unix)]
