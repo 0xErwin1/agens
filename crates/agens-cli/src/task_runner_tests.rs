@@ -5,6 +5,7 @@
 //! must not gain a surface even in its test build.
 #![cfg(test)]
 
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 
 use agens_bus::BridgeTx;
@@ -454,8 +455,26 @@ fn a_foreground_subagent_neither_persists_a_turn_nor_notifies_the_main_thread() 
         identifier: Some(seeded.id),
         ..SessionContext::fresh()
     }));
-    let lifecycle_bridge = TuiTaskLifecycleBridge::new(events, controls.clone())
+    let mut lifecycle_bridge = TuiTaskLifecycleBridge::new(events, controls.clone())
         .with_session_writer(bootstrap.clone(), Arc::clone(&session));
+    // The real session writer stays installed, wrapped in a counter: what this
+    // asserts is that the bridge never reaches it, and a hook that was
+    // replaced rather than wrapped would say nothing about what it would have
+    // written.
+    let session_writer = lifecycle_bridge
+        .persist_completed
+        .take()
+        .expect("session writer should be installed");
+    let persist_calls = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&persist_calls);
+    lifecycle_bridge.persist_completed = Some(Arc::new(move |turn| {
+        counted.fetch_add(1, std::sync::atomic::Ordering::Release);
+        session_writer(turn)
+    }));
+    let persist_hook = lifecycle_bridge
+        .persist_completed
+        .clone()
+        .expect("the counting writer is installed");
     let mut runtime = production_tui_task_runtime_with_runner(
         &bootstrap,
         &agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap),
@@ -483,6 +502,11 @@ fn a_foreground_subagent_neither_persists_a_turn_nor_notifies_the_main_thread() 
         )],
     );
     let cancellation = HeadlessTurnCancellation::new();
+    // The watcher thread holds a clone of the hook for as long as it runs, so
+    // the count returning to what it was before the launch is what says the
+    // watcher reached its end — including the branch that would have
+    // persisted. Sleeping instead left the assertion below unable to fail.
+    let idle_hook_holders = Arc::strong_count(&persist_hook);
 
     assert_eq!(
         launch_selected_tui_task(&mut runtime, &session, "review task", false, &cancellation),
@@ -510,8 +534,19 @@ fn a_foreground_subagent_neither_persists_a_turn_nor_notifies_the_main_thread() 
             terminal_seen = true;
         }
     }
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    while Arc::strong_count(&persist_hook) > idle_hook_holders {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the subagent watcher should reach its end"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
 
+    assert_eq!(
+        persist_calls.load(std::sync::atomic::Ordering::Acquire),
+        0,
+        "a foreground subagent must not persist a turn of its own"
+    );
     let stored = SessionStore::open(bootstrap.data_directory())
         .unwrap()
         .load_session_for_resume(seeded.id)

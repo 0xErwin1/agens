@@ -25,11 +25,10 @@ use serde_json::Value;
 
 use crate::{
     Error, MAX_SSE_FRAME_BYTES, MediaBlobs, OpenAiFunctionTool, ProgressAwareProvider,
-    ProviderDiagnosticClass, ProviderDiagnosticComponent, ProviderDiagnosticKind,
-    ProviderDiagnostics, ProviderFailureDetail, RetryPolicy, ScheduledRetry,
-    classify_openai_response_status, diagnostic_class_for_port_error, diagnostic_class_for_status,
-    is_transient_http_status, provider_operation_cancellation, retry_after_from_headers,
-    should_retry_transport_error, stop_before_mapping, wait_for_http_retry, wait_for_stop,
+    ProviderDiagnosticComponent, ProviderDiagnostics, ProviderFailureDetail, RetryLoop,
+    RetryPolicy, StreamFailure, classify_openai_response_status, diagnostic_class_for_port_error,
+    diagnostic_class_for_status, provider_operation_cancellation, stop_before_mapping,
+    wait_for_stop,
 };
 
 use decode::CompletionsDecoder;
@@ -214,22 +213,93 @@ impl MoonshotProvider {
         .map_err(|_| HeadlessTurnPortError::Provider)
     }
 
-    fn emit(
+    /// Sends the request and reads the turn out of its answer, retrying what
+    /// the shared driver says is worth another attempt.
+    ///
+    /// The stream read sits inside the loop rather than after it because a
+    /// body that ends before its finish reason is a cut connection, not a
+    /// malformed response, and a cut that delivered nothing costs nothing to
+    /// ask for again. Leaving it outside made this the one provider that
+    /// surfaced a truncated stream as a turn failure.
+    async fn request_turn(
         &self,
-        kind: ProviderDiagnosticKind,
-        attempt: usize,
-        status: Option<u16>,
-        class: Option<ProviderDiagnosticClass>,
-    ) {
-        if let Some(diagnostics) = &self.diagnostics {
-            diagnostics.emit(
-                ProviderDiagnosticComponent::ChatCompletions,
-                kind,
-                attempt,
-                None,
-                status,
-                class,
-            );
+        payload: Value,
+        cancellation: &HeadlessTurnCancellation,
+    ) -> Result<(Vec<MessagePart>, Option<Usage>, bool), HeadlessTurnPortError> {
+        let mut retry = RetryLoop::new(
+            self.retry_policy,
+            self.diagnostics.as_ref(),
+            ProviderDiagnosticComponent::ChatCompletions,
+        );
+
+        loop {
+            stop_before_mapping(cancellation)?;
+            retry.begin_attempt();
+
+            // Each attempt is a request of its own, so each gets its own
+            // window to answer in. A deadline shared across attempts would be
+            // spent by the waits between them and expire the retries it was
+            // supposed to bound.
+            let first_byte_deadline =
+                tokio::time::Instant::now() + crate::FIRST_RESPONSE_BYTE_TIMEOUT;
+
+            let response = match self
+                .send(&payload, first_byte_deadline, cancellation)
+                .await?
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    if retry.retry_transport_error(&error, cancellation).await? {
+                        continue;
+                    }
+
+                    let last_transient_status = retry.last_transient_status();
+                    let error = last_transient_status
+                        .map(|status| classify_openai_response_status(status, false))
+                        .unwrap_or(HeadlessTurnPortError::ProviderNetwork);
+                    retry.emit_terminal(
+                        last_transient_status,
+                        Some(diagnostic_class_for_port_error(error)),
+                    );
+                    return Err(error);
+                }
+            };
+
+            let Some(response) = retry.retry_transient_status(response, cancellation).await? else {
+                continue;
+            };
+            let status = response.status().as_u16();
+
+            if !response.status().is_success() {
+                if let Some(failure_detail) = &self.failure_detail {
+                    failure_detail
+                        .record(&format!("HTTP {status} rejected model \"{}\"", self.model));
+                }
+                let context_exceeded =
+                    read_context_overflow(response, cancellation, self.failure_detail.as_ref())
+                        .await?;
+                retry.emit_terminal(
+                    Some(status),
+                    Some(diagnostic_class_for_status(status, context_exceeded)),
+                );
+                return Err(classify_openai_response_status(status, context_exceeded));
+            }
+
+            let read = self
+                .read_stream(response, first_byte_deadline, cancellation)
+                .await;
+            if let Err(failure) = &read
+                && failure.is_resumable()
+                && retry.retry_stream_failure(cancellation).await?
+            {
+                continue;
+            }
+
+            let read = read.map_err(StreamFailure::into_port_error);
+            if let Some(error) = read.as_ref().err().copied() {
+                retry.emit_terminal(None, Some(diagnostic_class_for_port_error(error)));
+            }
+            return read;
         }
     }
 
@@ -241,127 +311,41 @@ impl MoonshotProvider {
     /// That silence is the stall this bounds: `FIRST_RESPONSE_BYTE_TIMEOUT`
     /// covers headers plus the first body byte, and `read_stream` reuses the
     /// same deadline so the window is not spent twice.
+    ///
+    /// A transport failure is handed back rather than mapped: whether it earns
+    /// another attempt is the caller's retry budget to spend, not this
+    /// function's.
     async fn send(
         &self,
-        payload: Value,
+        payload: &Value,
+        first_byte_deadline: tokio::time::Instant,
         cancellation: &HeadlessTurnCancellation,
-    ) -> Result<(reqwest::Response, tokio::time::Instant), HeadlessTurnPortError> {
-        let first_byte_deadline = tokio::time::Instant::now() + crate::FIRST_RESPONSE_BYTE_TIMEOUT;
-        let policy = self.retry_policy;
-        let mut attempt = 0;
-        let mut last_transient_status = None;
-        let mut saw_request_timeout = false;
+    ) -> Result<Result<reqwest::Response, reqwest::Error>, HeadlessTurnPortError> {
+        let request = self
+            .client
+            .post(format!("{}/chat/completions", self.base_url))
+            .bearer_auth(&self.api_key)
+            .header("Accept", "text/event-stream")
+            .json(payload)
+            .build()
+            .map_err(|_| HeadlessTurnPortError::ProviderProtocol)?;
 
-        loop {
-            stop_before_mapping(cancellation)?;
-            self.emit(ProviderDiagnosticKind::Attempt, attempt + 1, None, None);
-
-            let request = self
-                .client
-                .post(format!("{}/chat/completions", self.base_url))
-                .bearer_auth(&self.api_key)
-                .header("Accept", "text/event-stream")
-                .json(&payload)
-                .build()
-                .map_err(|_| HeadlessTurnPortError::ProviderProtocol)?;
-
-            let response = tokio::select! {
-                response = self.client.execute(request) => {
-                    stop_before_mapping(cancellation)?;
-                    response
-                }
-                stop = wait_for_stop(cancellation) => return Err(stop),
-                () = tokio::time::sleep_until(first_byte_deadline) => {
-                    crate::emit_first_byte_stall(
-                        self.diagnostics.as_ref(),
-                        ProviderDiagnosticComponent::ChatCompletions,
-                    );
-                    return Err(HeadlessTurnPortError::ProviderNetwork);
-                }
-            };
-
-            let response = match response {
-                Ok(response) => response,
-                Err(error) => {
-                    saw_request_timeout |= error.is_timeout();
-                    if should_retry_transport_error(
-                        &error,
-                        attempt,
-                        last_transient_status,
-                        saw_request_timeout,
-                        policy,
-                    ) {
-                        wait_for_http_retry(
-                            cancellation,
-                            attempt,
-                            None,
-                            ScheduledRetry {
-                                diagnostics: self.diagnostics.as_ref(),
-                                component: ProviderDiagnosticComponent::ChatCompletions,
-                                class: ProviderDiagnosticClass::Network,
-                                status: None,
-                                policy,
-                            },
-                        )
-                        .await?;
-                        attempt += 1;
-                        continue;
-                    }
-
-                    let error = last_transient_status
-                        .map(|status| classify_openai_response_status(status, false))
-                        .unwrap_or(HeadlessTurnPortError::ProviderNetwork);
-                    self.emit(
-                        ProviderDiagnosticKind::Terminal,
-                        attempt + 1,
-                        last_transient_status,
-                        Some(diagnostic_class_for_port_error(error)),
-                    );
-                    return Err(error);
-                }
-            };
-
-            let status = response.status().as_u16();
-            if is_transient_http_status(status) && policy.has_attempt_after(attempt) {
-                last_transient_status = Some(status);
-                let retry_after = retry_after_from_headers(response.headers(), policy);
-                drop(response);
-                wait_for_http_retry(
-                    cancellation,
-                    attempt,
-                    retry_after,
-                    ScheduledRetry {
-                        diagnostics: self.diagnostics.as_ref(),
-                        component: ProviderDiagnosticComponent::ChatCompletions,
-                        class: diagnostic_class_for_status(status, false),
-                        status: Some(status),
-                        policy,
-                    },
-                )
-                .await?;
-                attempt += 1;
-                continue;
+        let response = tokio::select! {
+            response = self.client.execute(request) => {
+                stop_before_mapping(cancellation)?;
+                response
             }
-
-            if !response.status().is_success() {
-                if let Some(failure_detail) = &self.failure_detail {
-                    failure_detail
-                        .record(&format!("HTTP {status} rejected model \"{}\"", self.model));
-                }
-                let context_exceeded =
-                    read_context_overflow(response, cancellation, self.failure_detail.as_ref())
-                        .await?;
-                self.emit(
-                    ProviderDiagnosticKind::Terminal,
-                    attempt + 1,
-                    Some(status),
-                    Some(diagnostic_class_for_status(status, context_exceeded)),
+            stop = wait_for_stop(cancellation) => return Err(stop),
+            () = tokio::time::sleep_until(first_byte_deadline) => {
+                crate::emit_first_byte_stall(
+                    self.diagnostics.as_ref(),
+                    ProviderDiagnosticComponent::ChatCompletions,
                 );
-                return Err(classify_openai_response_status(status, context_exceeded));
+                return Err(HeadlessTurnPortError::ProviderNetwork);
             }
+        };
 
-            return Ok((response, first_byte_deadline));
-        }
+        Ok(response)
     }
 
     /// Reads the streamed response into the parts of one assistant turn.
@@ -375,25 +359,44 @@ impl MoonshotProvider {
     /// started, so the window covers the response headers plus the first body
     /// byte exactly once. Once the stream has started, the request's read
     /// timeout resumes bounding it.
+    ///
+    /// Every failure says whether the decoder had already produced anything,
+    /// because that is what separates a cut worth asking about again from one
+    /// whose retry would repeat output the reader has already seen.
     async fn read_stream(
         &self,
         mut response: reqwest::Response,
         first_byte_deadline: tokio::time::Instant,
         cancellation: &HeadlessTurnCancellation,
-    ) -> Result<(Vec<MessagePart>, Option<Usage>, bool), HeadlessTurnPortError> {
+    ) -> Result<(Vec<MessagePart>, Option<Usage>, bool), StreamFailure> {
         let mut decoder = CompletionsDecoder::new();
         let mut frame = Vec::new();
         let mut first_byte_deadline = Some(first_byte_deadline);
 
+        // Every exit reports whether the decoder produced anything, and a
+        // helper closure cannot: it would hold `decoder` borrowed across the
+        // code that decodes into it.
+        macro_rules! fail {
+            ($error:expr) => {
+                return Err(StreamFailure::new($error, decoder.produced_output()))
+            };
+        }
+
         loop {
             let next_chunk = tokio::select! {
                 chunk = response.chunk() => {
-                    stop_before_mapping(cancellation)?;
-                    chunk.map_err(|error| {
-                        crate::stream_read_failure(&error, HeadlessTurnPortError::ProviderProtocol)
-                    })?
+                    if let Err(stop) = stop_before_mapping(cancellation) {
+                        fail!(stop);
+                    }
+                    match chunk {
+                        Ok(chunk) => chunk,
+                        Err(error) => fail!(crate::stream_read_failure(
+                            &error,
+                            HeadlessTurnPortError::ProviderProtocol,
+                        )),
+                    }
                 }
-                stop = wait_for_stop(cancellation) => return Err(stop),
+                stop = wait_for_stop(cancellation) => fail!(stop),
                 () = async {
                     match first_byte_deadline {
                         Some(deadline) => tokio::time::sleep_until(deadline).await,
@@ -404,35 +407,62 @@ impl MoonshotProvider {
                         self.diagnostics.as_ref(),
                         ProviderDiagnosticComponent::ChatCompletions,
                     );
-                    return Err(HeadlessTurnPortError::ProviderNetwork);
+                    fail!(HeadlessTurnPortError::ProviderNetwork);
                 }
             };
 
             first_byte_deadline = None;
 
             let Some(chunk) = next_chunk else {
-                stop_before_mapping(cancellation)?;
+                if let Err(stop) = stop_before_mapping(cancellation) {
+                    fail!(stop);
+                }
                 let usage = decoder.usage();
                 let wants_tool_results = decoder.wants_tool_results();
-                return Ok((decoder.finish()?, usage, wants_tool_results));
+                let surfaced_output = decoder.produced_output();
+                // A body that ran out before its finish reason was cut, not
+                // malformed: nothing the decoder read was wrong, there was
+                // simply less of it than the dialect promises. Anything the
+                // decoder rejects after a finish reason stays a protocol
+                // failure, which no retry can act on.
+                let cut = !decoder.saw_finish_reason();
+                return decoder
+                    .finish()
+                    .map(|parts| (parts, usage, wants_tool_results))
+                    .map_err(|error| {
+                        let error = if cut {
+                            HeadlessTurnPortError::ProviderNetwork
+                        } else {
+                            error
+                        };
+                        StreamFailure::new(error, surfaced_output)
+                    });
             };
 
             for byte in chunk {
                 if byte == b'\n' {
-                    accept_frame(&mut decoder, &frame, self.progress.as_ref())?;
+                    if let Err(error) = accept_frame(&mut decoder, &frame, self.progress.as_ref()) {
+                        fail!(error);
+                    }
                     frame.clear();
-                    stop_before_mapping(cancellation)?;
+                    if let Err(stop) = stop_before_mapping(cancellation) {
+                        fail!(stop);
+                    }
                     continue;
                 }
 
                 if frame.len() == MAX_SSE_FRAME_BYTES {
-                    stop_before_mapping(cancellation)?;
-                    return Err(HeadlessTurnPortError::ProviderProtocol);
+                    if let Err(stop) = stop_before_mapping(cancellation) {
+                        fail!(stop);
+                    }
+                    fail!(HeadlessTurnPortError::ProviderProtocol);
                 }
                 frame.push(byte);
             }
 
-            stop_before_mapping(cancellation)?;
+            if let Err(stop) = stop_before_mapping(cancellation) {
+                fail!(stop);
+            }
         }
     }
 }
@@ -604,10 +634,8 @@ impl TurnProvider for MoonshotProvider {
             }
         }
 
-        let (response, first_byte_deadline) = self.send(self.payload()?, cancellation).await?;
-        let (parts, usage, wants_tool_results) = self
-            .read_stream(response, first_byte_deadline, cancellation)
-            .await?;
+        let (parts, usage, wants_tool_results) =
+            self.request_turn(self.payload()?, cancellation).await?;
 
         if let Some(progress) = &self.progress
             && let Some(usage) = usage

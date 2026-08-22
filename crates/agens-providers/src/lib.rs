@@ -782,22 +782,14 @@ impl OpenAiResponsesProvider {
         payload: Value,
         cancellation: &HeadlessTurnCancellation,
     ) -> Result<DecodedResponse, HeadlessTurnPortError> {
-        let policy = self.retry_policy;
-        let mut attempt = 0;
-        let mut last_transient_status = None;
-        let mut saw_request_timeout = false;
+        let mut retry = RetryLoop::new(
+            self.retry_policy,
+            self.diagnostics.as_ref(),
+            ProviderDiagnosticComponent::Responses,
+        );
         loop {
             stop_before_mapping(cancellation)?;
-            if let Some(diagnostics) = &self.diagnostics {
-                diagnostics.emit(
-                    ProviderDiagnosticComponent::Responses,
-                    ProviderDiagnosticKind::Attempt,
-                    attempt + 1,
-                    None,
-                    None,
-                    None,
-                );
-            }
+            retry.begin_attempt();
             let request = self
                 .client
                 .post(format!("{}/responses", self.base_url))
@@ -816,67 +808,24 @@ impl OpenAiResponsesProvider {
             let response = match response {
                 Ok(response) => response,
                 Err(error) => {
-                    saw_request_timeout |= error.is_timeout();
-                    if should_retry_transport_error(
-                        &error,
-                        attempt,
-                        last_transient_status,
-                        saw_request_timeout,
-                        policy,
-                    ) {
-                        wait_for_http_retry(
-                            cancellation,
-                            attempt,
-                            None,
-                            ScheduledRetry {
-                                diagnostics: self.diagnostics.as_ref(),
-                                component: ProviderDiagnosticComponent::Responses,
-                                class: ProviderDiagnosticClass::Network,
-                                status: None,
-                                policy,
-                            },
-                        )
-                        .await?;
-                        attempt += 1;
+                    if retry.retry_transport_error(&error, cancellation).await? {
                         continue;
                     }
+                    let last_transient_status = retry.last_transient_status();
                     let error = last_transient_status
                         .map(|status| classify_openai_response_status(status, false))
                         .unwrap_or(HeadlessTurnPortError::ProviderNetwork);
-                    if let Some(diagnostics) = &self.diagnostics {
-                        diagnostics.emit(
-                            ProviderDiagnosticComponent::Responses,
-                            ProviderDiagnosticKind::Terminal,
-                            attempt + 1,
-                            None,
-                            last_transient_status,
-                            Some(diagnostic_class_for_port_error(error)),
-                        );
-                    }
+                    retry.emit_terminal(
+                        last_transient_status,
+                        Some(diagnostic_class_for_port_error(error)),
+                    );
                     return Err(error);
                 }
             };
-            let status = response.status().as_u16();
-            if is_transient_http_status(status) && policy.has_attempt_after(attempt) {
-                last_transient_status = Some(status);
-                let retry_after = retry_after_from_headers(response.headers(), policy);
-                drop(response);
-                wait_for_http_retry(
-                    cancellation,
-                    attempt,
-                    retry_after,
-                    ScheduledRetry {
-                        diagnostics: self.diagnostics.as_ref(),
-                        component: ProviderDiagnosticComponent::Responses,
-                        class: diagnostic_class_for_status(status, false),
-                        status: Some(status),
-                        policy,
-                    },
-                )
-                .await?;
-                attempt += 1;
+            let Some(response) = retry.retry_transient_status(response, cancellation).await? else {
                 continue;
-            }
+            };
+            let status = response.status().as_u16();
 
             stop_before_mapping(cancellation)?;
             if !response.status().is_success() {
@@ -890,16 +839,10 @@ impl OpenAiResponsesProvider {
                     self.failure_detail.as_ref(),
                 )
                 .await?;
-                if let Some(diagnostics) = &self.diagnostics {
-                    diagnostics.emit(
-                        ProviderDiagnosticComponent::Responses,
-                        ProviderDiagnosticKind::Terminal,
-                        attempt + 1,
-                        None,
-                        Some(status),
-                        Some(diagnostic_class_for_status(status, context_exceeded)),
-                    );
-                }
+                retry.emit_terminal(
+                    Some(status),
+                    Some(diagnostic_class_for_status(status, context_exceeded)),
+                );
                 return Err(classify_openai_response_status(status, context_exceeded));
             }
 
@@ -915,39 +858,19 @@ impl OpenAiResponsesProvider {
             .await;
             if let Err(failure) = &result
                 && failure.is_resumable()
-                && policy.has_attempt_after(attempt)
+                && retry.retry_stream_failure(cancellation).await?
             {
-                wait_for_http_retry(
-                    cancellation,
-                    attempt,
-                    None,
-                    ScheduledRetry {
-                        diagnostics: self.diagnostics.as_ref(),
-                        component: ProviderDiagnosticComponent::Responses,
-                        class: ProviderDiagnosticClass::Network,
-                        status: None,
-                        policy,
-                    },
-                )
-                .await?;
-                attempt += 1;
                 continue;
             }
             let result = result.map_err(StreamFailure::into_port_error);
-            if let Some(diagnostics) = &self.diagnostics {
-                diagnostics.emit(
-                    ProviderDiagnosticComponent::Responses,
-                    ProviderDiagnosticKind::Terminal,
-                    attempt + 1,
-                    None,
-                    None,
-                    result
-                        .as_ref()
-                        .err()
-                        .copied()
-                        .map(diagnostic_class_for_port_error),
-                );
-            }
+            retry.emit_terminal(
+                None,
+                result
+                    .as_ref()
+                    .err()
+                    .copied()
+                    .map(diagnostic_class_for_port_error),
+            );
             return result;
         }
     }
@@ -1297,22 +1220,14 @@ impl ChatGptResponsesProvider {
         payload: Value,
         cancellation: &HeadlessTurnCancellation,
     ) -> Result<DecodedResponse, ChatGptResponseError> {
-        let policy = self.retry_policy;
-        let mut attempt = 0;
-        let mut last_transient_status = None;
-        let mut saw_request_timeout = false;
+        let mut retry = RetryLoop::new(
+            self.retry_policy,
+            self.diagnostics.as_ref(),
+            ProviderDiagnosticComponent::Responses,
+        );
         loop {
             stop_before_mapping(cancellation).map_err(ChatGptResponseError::Other)?;
-            if let Some(diagnostics) = &self.diagnostics {
-                diagnostics.emit(
-                    ProviderDiagnosticComponent::Responses,
-                    ProviderDiagnosticKind::Attempt,
-                    attempt + 1,
-                    None,
-                    None,
-                    None,
-                );
-            }
+            retry.begin_attempt();
             let request = self
                 .client
                 .post(&self.base_url)
@@ -1339,75 +1254,35 @@ impl ChatGptResponsesProvider {
             let response = match response {
                 Ok(response) => response,
                 Err(error) => {
-                    saw_request_timeout |= error.is_timeout();
-                    if should_retry_transport_error(
-                        &error,
-                        attempt,
-                        last_transient_status,
-                        saw_request_timeout,
-                        policy,
-                    ) {
-                        wait_for_http_retry(
-                            cancellation,
-                            attempt,
-                            None,
-                            ScheduledRetry {
-                                diagnostics: self.diagnostics.as_ref(),
-                                component: ProviderDiagnosticComponent::Responses,
-                                class: ProviderDiagnosticClass::Network,
-                                status: None,
-                                policy,
-                            },
-                        )
+                    if retry
+                        .retry_transport_error(&error, cancellation)
                         .await
-                        .map_err(ChatGptResponseError::Other)?;
-                        attempt += 1;
+                        .map_err(ChatGptResponseError::Other)?
+                    {
                         continue;
                     }
+                    let last_transient_status = retry.last_transient_status();
                     let error = last_transient_status
                         .map(chatgpt_transient_status_error)
                         .unwrap_or(ChatGptResponseError::Other(
                             HeadlessTurnPortError::ProviderNetwork,
                         ));
-                    if let Some(diagnostics) = &self.diagnostics {
-                        let class = last_transient_status
-                            .map_or(ProviderDiagnosticClass::Network, |status| {
-                                diagnostic_class_for_status(status, false)
-                            });
-                        diagnostics.emit(
-                            ProviderDiagnosticComponent::Responses,
-                            ProviderDiagnosticKind::Terminal,
-                            attempt + 1,
-                            None,
-                            last_transient_status,
-                            Some(class),
-                        );
-                    }
+                    let class = last_transient_status
+                        .map_or(ProviderDiagnosticClass::Network, |status| {
+                            diagnostic_class_for_status(status, false)
+                        });
+                    retry.emit_terminal(last_transient_status, Some(class));
                     return Err(error);
                 }
             };
-            let status = response.status().as_u16();
-            if is_transient_http_status(status) && policy.has_attempt_after(attempt) {
-                last_transient_status = Some(status);
-                let retry_after = retry_after_from_headers(response.headers(), policy);
-                drop(response);
-                wait_for_http_retry(
-                    cancellation,
-                    attempt,
-                    retry_after,
-                    ScheduledRetry {
-                        diagnostics: self.diagnostics.as_ref(),
-                        component: ProviderDiagnosticComponent::Responses,
-                        class: diagnostic_class_for_status(status, false),
-                        status: Some(status),
-                        policy,
-                    },
-                )
+            let Some(response) = retry
+                .retry_transient_status(response, cancellation)
                 .await
-                .map_err(ChatGptResponseError::Other)?;
-                attempt += 1;
+                .map_err(ChatGptResponseError::Other)?
+            else {
                 continue;
-            }
+            };
+            let status = response.status().as_u16();
 
             stop_before_mapping(cancellation).map_err(ChatGptResponseError::Other)?;
             if !response.status().is_success() {
@@ -1419,19 +1294,13 @@ impl ChatGptResponsesProvider {
                     read_safe_chatgpt_error(response, cancellation, self.failure_detail.as_ref())
                         .await
                         .map_err(ChatGptResponseError::Other)?;
-                if let Some(diagnostics) = &self.diagnostics {
-                    diagnostics.emit(
-                        ProviderDiagnosticComponent::Responses,
-                        ProviderDiagnosticKind::Terminal,
-                        attempt + 1,
-                        None,
-                        Some(status),
-                        Some(diagnostic_class_for_status(
-                            status,
-                            safe_error == Some(SafeRemoteError::ContextLengthExceeded),
-                        )),
-                    );
-                }
+                retry.emit_terminal(
+                    Some(status),
+                    Some(diagnostic_class_for_status(
+                        status,
+                        safe_error == Some(SafeRemoteError::ContextLengthExceeded),
+                    )),
+                );
                 return Err(match status {
                     401 | 403 => ChatGptResponseError::Authentication(status),
                     429 => ChatGptResponseError::RateLimited,
@@ -1456,23 +1325,11 @@ impl ChatGptResponsesProvider {
             .await;
             if let Err(failure) = &decoded
                 && failure.is_resumable()
-                && policy.has_attempt_after(attempt)
+                && retry
+                    .retry_stream_failure(cancellation)
+                    .await
+                    .map_err(ChatGptResponseError::Other)?
             {
-                wait_for_http_retry(
-                    cancellation,
-                    attempt,
-                    None,
-                    ScheduledRetry {
-                        diagnostics: self.diagnostics.as_ref(),
-                        component: ProviderDiagnosticComponent::Responses,
-                        class: ProviderDiagnosticClass::Network,
-                        status: None,
-                        policy,
-                    },
-                )
-                .await
-                .map_err(ChatGptResponseError::Other)?;
-                attempt += 1;
                 continue;
             }
             // A dropped connection is not the decoder's fault. Folding every
@@ -1485,26 +1342,15 @@ impl ChatGptResponsesProvider {
                 | HeadlessTurnPortError::ProviderNetwork) => ChatGptResponseError::Other(error),
                 _ => ChatGptResponseError::Protocol,
             });
-            if let Some(diagnostics) = &self.diagnostics {
-                let class = result.as_ref().err().map(|error| match error {
-                    ChatGptResponseError::Other(error) => diagnostic_class_for_port_error(*error),
-                    ChatGptResponseError::Authentication(_) => {
-                        ProviderDiagnosticClass::Authentication
-                    }
-                    ChatGptResponseError::Rejected => ProviderDiagnosticClass::Rejected,
-                    ChatGptResponseError::RateLimited => ProviderDiagnosticClass::RateLimited,
-                    ChatGptResponseError::Server => ProviderDiagnosticClass::Server,
-                    ChatGptResponseError::Protocol => ProviderDiagnosticClass::Protocol,
-                });
-                diagnostics.emit(
-                    ProviderDiagnosticComponent::Responses,
-                    ProviderDiagnosticKind::Terminal,
-                    attempt + 1,
-                    None,
-                    None,
-                    class,
-                );
-            }
+            let class = result.as_ref().err().map(|error| match error {
+                ChatGptResponseError::Other(error) => diagnostic_class_for_port_error(*error),
+                ChatGptResponseError::Authentication(_) => ProviderDiagnosticClass::Authentication,
+                ChatGptResponseError::Rejected => ProviderDiagnosticClass::Rejected,
+                ChatGptResponseError::RateLimited => ProviderDiagnosticClass::RateLimited,
+                ChatGptResponseError::Server => ProviderDiagnosticClass::Server,
+                ChatGptResponseError::Protocol => ProviderDiagnosticClass::Protocol,
+            });
+            retry.emit_terminal(None, class);
             return result;
         }
     }
@@ -1578,22 +1424,14 @@ impl ChatGptResponsesProvider {
             .append_pair("grant_type", "refresh_token")
             .append_pair("refresh_token", refresh_token)
             .finish();
-        let policy = self.retry_policy;
-        let mut attempt = 0;
-        let mut last_transient_status = None;
-        let mut saw_request_timeout = false;
+        let mut retry = RetryLoop::new(
+            self.retry_policy,
+            self.diagnostics.as_ref(),
+            ProviderDiagnosticComponent::OauthRefresh,
+        );
         let response = loop {
             stop_before_mapping(cancellation)?;
-            if let Some(diagnostics) = &self.diagnostics {
-                diagnostics.emit(
-                    ProviderDiagnosticComponent::OauthRefresh,
-                    ProviderDiagnosticKind::Attempt,
-                    attempt + 1,
-                    None,
-                    None,
-                    None,
-                );
-            }
+            retry.begin_attempt();
             let request = self
                 .client
                 .post(&self.oauth_url)
@@ -1614,69 +1452,21 @@ impl ChatGptResponsesProvider {
             let response = match response {
                 Ok(response) => response,
                 Err(error) => {
-                    saw_request_timeout |= error.is_timeout();
-                    if should_retry_transport_error(
-                        &error,
-                        attempt,
-                        last_transient_status,
-                        saw_request_timeout,
-                        policy,
-                    ) {
-                        wait_for_http_retry(
-                            cancellation,
-                            attempt,
-                            None,
-                            ScheduledRetry {
-                                diagnostics: self.diagnostics.as_ref(),
-                                component: ProviderDiagnosticComponent::OauthRefresh,
-                                class: ProviderDiagnosticClass::Network,
-                                status: None,
-                                policy,
-                            },
-                        )
-                        .await?;
-                        attempt += 1;
+                    if retry.retry_transport_error(&error, cancellation).await? {
                         continue;
                     }
                     return Err(HeadlessTurnPortError::Provider);
                 }
             };
-            let status = response.status().as_u16();
-            if is_transient_http_status(status) && policy.has_attempt_after(attempt) {
-                last_transient_status = Some(status);
-                let retry_after = retry_after_from_headers(response.headers(), policy);
-                drop(response);
-                wait_for_http_retry(
-                    cancellation,
-                    attempt,
-                    retry_after,
-                    ScheduledRetry {
-                        diagnostics: self.diagnostics.as_ref(),
-                        component: ProviderDiagnosticComponent::OauthRefresh,
-                        class: diagnostic_class_for_status(status, false),
-                        status: Some(status),
-                        policy,
-                    },
-                )
-                .await?;
-                attempt += 1;
+            let Some(response) = retry.retry_transient_status(response, cancellation).await? else {
                 continue;
-            }
+            };
             break response;
         };
 
         stop_before_mapping(cancellation)?;
         if response.status().as_u16() == 401 {
-            if let Some(diagnostics) = &self.diagnostics {
-                diagnostics.emit(
-                    ProviderDiagnosticComponent::OauthRefresh,
-                    ProviderDiagnosticKind::Terminal,
-                    attempt + 1,
-                    None,
-                    Some(401),
-                    Some(ProviderDiagnosticClass::Authentication),
-                );
-            }
+            retry.emit_terminal(Some(401), Some(ProviderDiagnosticClass::Authentication));
             return Err(HeadlessTurnPortError::Authentication);
         }
 
@@ -1696,20 +1486,14 @@ impl ChatGptResponsesProvider {
             } else {
                 HeadlessTurnPortError::Provider
             };
-            if let Some(diagnostics) = &self.diagnostics {
-                diagnostics.emit(
-                    ProviderDiagnosticComponent::OauthRefresh,
-                    ProviderDiagnosticKind::Terminal,
-                    attempt + 1,
-                    None,
-                    Some(status.as_u16()),
-                    Some(if error == HeadlessTurnPortError::Authentication {
-                        ProviderDiagnosticClass::Authentication
-                    } else {
-                        diagnostic_class_for_status(status.as_u16(), false)
-                    }),
-                );
-            }
+            retry.emit_terminal(
+                Some(status.as_u16()),
+                Some(if error == HeadlessTurnPortError::Authentication {
+                    ProviderDiagnosticClass::Authentication
+                } else {
+                    diagnostic_class_for_status(status.as_u16(), false)
+                }),
+            );
             return Err(error);
         }
 
@@ -1761,16 +1545,7 @@ impl ChatGptResponsesProvider {
         if let Some(account_id) = refreshed_account_id {
             self.account_id = account_id;
         }
-        if let Some(diagnostics) = &self.diagnostics {
-            diagnostics.emit(
-                ProviderDiagnosticComponent::OauthRefresh,
-                ProviderDiagnosticKind::Terminal,
-                attempt + 1,
-                None,
-                Some(200),
-                None,
-            );
-        }
+        retry.emit_terminal(Some(200), None);
         Ok(())
     }
 
@@ -1810,6 +1585,7 @@ pub struct RetryPolicy {
     base_delay: Duration,
     max_delay: Duration,
     retry_after_cap: Duration,
+    total_delay_budget: Duration,
 }
 
 impl RetryPolicy {
@@ -1820,6 +1596,7 @@ impl RetryPolicy {
         base_delay: Duration,
         max_delay: Duration,
         retry_after_cap: Duration,
+        total_delay_budget: Duration,
     ) -> Self {
         assert!(max_attempts > 0, "a request needs at least one attempt");
         Self {
@@ -1827,11 +1604,18 @@ impl RetryPolicy {
             base_delay,
             max_delay,
             retry_after_cap,
+            total_delay_budget,
         }
     }
 
     pub const fn max_attempts(self) -> usize {
         self.max_attempts
+    }
+
+    /// The longest a request may spend waiting between attempts, summed across
+    /// all of them.
+    pub const fn total_delay_budget(self) -> Duration {
+        self.total_delay_budget
     }
 
     const fn has_attempt_after(self, attempt: usize) -> bool {
@@ -1841,15 +1625,23 @@ impl RetryPolicy {
 
 impl Default for RetryPolicy {
     /// Doubling from one second to a thirty-second ceiling over eight
-    /// attempts: about a hundred seconds of transient failure a turn absorbs
-    /// without the user seeing it fail. The previous schedule spent under two
-    /// seconds, which is shorter than most of the waits a provider asks for.
+    /// attempts, and never more than a hundred seconds of waiting in total:
+    /// that is what a turn absorbs without the user seeing it fail. The
+    /// previous schedule spent under two seconds, which is shorter than most
+    /// of the waits a provider asks for.
+    ///
+    /// The total is a ceiling rather than a description of the exponential
+    /// schedule, which spends about ninety seconds of it. Without it a
+    /// provider answering every attempt with `Retry-After: 60` held a request
+    /// for seven full minutes, because a named delay replaces the schedule
+    /// instead of being bounded by it.
     fn default() -> Self {
         Self::new(
             8,
             Duration::from_secs(1),
             Duration::from_secs(30),
             Duration::from_secs(60),
+            Duration::from_secs(100),
         )
     }
 }
@@ -2034,6 +1826,219 @@ fn http_retry_delay(retry: usize, retry_after: Option<Duration>, policy: RetryPo
     base.saturating_add(jitter)
 }
 
+/// The retry scaffolding a provider request loop repeats around whatever it
+/// sends and decodes: the attempt counter, the budget those attempts spend,
+/// and the diagnostics each decision records.
+///
+/// The three loops that drive a streamed provider request disagree only about
+/// the error type a terminal failure maps to and about what a successful
+/// response means. Everything before that — when a transport failure earns
+/// another attempt, when a status does, how long to wait, and what to record —
+/// was the same code three times, and a fix to one copy reached the other two
+/// only if somebody remembered they existed.
+pub(crate) struct RetryLoop<'a> {
+    policy: RetryPolicy,
+    diagnostics: Option<&'a ProviderDiagnostics>,
+    component: ProviderDiagnosticComponent,
+    attempt: usize,
+    last_transient_status: Option<u16>,
+    saw_request_timeout: bool,
+    /// What the waits between attempts have already cost, against
+    /// [`RetryPolicy::total_delay_budget`].
+    waited: Duration,
+}
+
+impl<'a> RetryLoop<'a> {
+    pub(crate) const fn new(
+        policy: RetryPolicy,
+        diagnostics: Option<&'a ProviderDiagnostics>,
+        component: ProviderDiagnosticComponent,
+    ) -> Self {
+        Self {
+            policy,
+            diagnostics,
+            component,
+            attempt: 0,
+            last_transient_status: None,
+            saw_request_timeout: false,
+            waited: Duration::ZERO,
+        }
+    }
+
+    /// The attempt now in flight, counted from one as every diagnostic event
+    /// reports it.
+    pub(crate) const fn attempt_number(&self) -> usize {
+        self.attempt + 1
+    }
+
+    /// The last status that was retried, which is what a transport failure
+    /// after it should be reported as: a connection dropped right after a
+    /// `429` is that rate limit, not a network fault of its own.
+    pub(crate) const fn last_transient_status(&self) -> Option<u16> {
+        self.last_transient_status
+    }
+
+    /// Records that another attempt is going out.
+    pub(crate) fn begin_attempt(&self) {
+        self.emit(ProviderDiagnosticKind::Attempt, None, None);
+    }
+
+    /// Records the attempt that ended the request, so the diagnostics file
+    /// says which one was the last and how it went. No class is a request that
+    /// ended by succeeding.
+    pub(crate) fn emit_terminal(
+        &self,
+        status: Option<u16>,
+        class: Option<ProviderDiagnosticClass>,
+    ) {
+        self.emit(ProviderDiagnosticKind::Terminal, status, class);
+    }
+
+    fn emit(
+        &self,
+        kind: ProviderDiagnosticKind,
+        status: Option<u16>,
+        class: Option<ProviderDiagnosticClass>,
+    ) {
+        if let Some(diagnostics) = self.diagnostics {
+            diagnostics.emit(
+                self.component,
+                kind,
+                self.attempt_number(),
+                None,
+                status,
+                class,
+            );
+        }
+    }
+
+    fn scheduled(&self, class: ProviderDiagnosticClass, status: Option<u16>) -> ScheduledRetry<'a> {
+        ScheduledRetry {
+            diagnostics: self.diagnostics,
+            component: self.component,
+            class,
+            status,
+        }
+    }
+
+    /// Answers a failed send. `true` means the attempt was retried — the wait
+    /// already happened and the budget was spent — and `false` leaves the
+    /// caller to map the failure into its own error type.
+    pub(crate) async fn retry_transport_error(
+        &mut self,
+        error: &reqwest::Error,
+        cancellation: &HeadlessTurnCancellation,
+    ) -> Result<bool, HeadlessTurnPortError> {
+        self.saw_request_timeout |= error.is_timeout();
+        if !should_retry_transport_error(
+            error,
+            self.attempt,
+            self.last_transient_status,
+            self.saw_request_timeout,
+            self.policy,
+        ) {
+            return Ok(false);
+        }
+
+        let delay = self.delay_for(None);
+        if !self.affords(delay) {
+            return Ok(false);
+        }
+
+        self.wait(delay, ProviderDiagnosticClass::Network, None, cancellation)
+            .await?;
+        Ok(true)
+    }
+
+    /// Answers a response whose status may be worth asking again for. `None`
+    /// means the response was dropped and the attempt retried; `Some` hands
+    /// the response back for the caller to read.
+    pub(crate) async fn retry_transient_status(
+        &mut self,
+        response: reqwest::Response,
+        cancellation: &HeadlessTurnCancellation,
+    ) -> Result<Option<reqwest::Response>, HeadlessTurnPortError> {
+        let status = response.status().as_u16();
+        if !is_transient_http_status(status) || !self.policy.has_attempt_after(self.attempt) {
+            return Ok(Some(response));
+        }
+
+        let retry_after = retry_after_from_headers(response.headers(), self.policy);
+        let delay = self.delay_for(retry_after);
+        if !self.affords(delay) {
+            return Ok(Some(response));
+        }
+
+        self.last_transient_status = Some(status);
+        drop(response);
+        self.wait(
+            delay,
+            diagnostic_class_for_status(status, false),
+            Some(status),
+            cancellation,
+        )
+        .await?;
+        Ok(None)
+    }
+
+    /// Answers a stream that was cut before it delivered anything. `true`
+    /// means the request was sent again; `false` means the budget is spent and
+    /// the failure is the caller's to map.
+    pub(crate) async fn retry_stream_failure(
+        &mut self,
+        cancellation: &HeadlessTurnCancellation,
+    ) -> Result<bool, HeadlessTurnPortError> {
+        if !self.policy.has_attempt_after(self.attempt) {
+            return Ok(false);
+        }
+
+        let delay = self.delay_for(None);
+        if !self.affords(delay) {
+            return Ok(false);
+        }
+
+        self.wait(delay, ProviderDiagnosticClass::Network, None, cancellation)
+            .await?;
+        Ok(true)
+    }
+
+    /// What this attempt would wait: the delay the provider named, or the next
+    /// step of the exponential schedule.
+    fn delay_for(&self, retry_after: Option<Duration>) -> Duration {
+        http_retry_delay(self.attempt, retry_after, self.policy)
+    }
+
+    /// Whether the request can still afford to wait that long.
+    ///
+    /// A named `Retry-After` replaces the schedule rather than being bounded
+    /// by it, so without a ceiling on the sum a provider answering every
+    /// attempt with the maximum delay held one request for minutes. Spending
+    /// the budget ends the retries instead of shortening the wait: waiting
+    /// less than a provider asked for is asking to be refused again.
+    fn affords(&self, delay: Duration) -> bool {
+        self.waited.saturating_add(delay) <= self.policy.total_delay_budget
+    }
+
+    async fn wait(
+        &mut self,
+        delay: Duration,
+        class: ProviderDiagnosticClass,
+        status: Option<u16>,
+        cancellation: &HeadlessTurnCancellation,
+    ) -> Result<(), HeadlessTurnPortError> {
+        wait_for_http_retry(
+            cancellation,
+            self.attempt,
+            delay,
+            self.scheduled(class, status),
+        )
+        .await?;
+        self.attempt += 1;
+        self.waited = self.waited.saturating_add(delay);
+        Ok(())
+    }
+}
+
 /// What a scheduled retry needs to record itself: where it came from, why, and
 /// against which budget it counts.
 pub(crate) struct ScheduledRetry<'a> {
@@ -2041,13 +2046,12 @@ pub(crate) struct ScheduledRetry<'a> {
     pub(crate) component: ProviderDiagnosticComponent,
     pub(crate) class: ProviderDiagnosticClass,
     pub(crate) status: Option<u16>,
-    pub(crate) policy: RetryPolicy,
 }
 
 async fn wait_for_http_retry(
     cancellation: &HeadlessTurnCancellation,
     retry: usize,
-    retry_after: Option<Duration>,
+    delay: Duration,
     scheduled: ScheduledRetry<'_>,
 ) -> Result<(), HeadlessTurnPortError> {
     let ScheduledRetry {
@@ -2055,14 +2059,12 @@ async fn wait_for_http_retry(
         component,
         class,
         status,
-        policy,
     } = scheduled;
 
     if let Err(error) = stop_before_mapping(cancellation) {
         emit_retry_terminal(diagnostics, component, retry, status, error);
         return Err(error);
     }
-    let delay = http_retry_delay(retry, retry_after, policy);
     if let Some(diagnostics) = diagnostics {
         diagnostics.emit(
             component,
@@ -2687,18 +2689,18 @@ pub(crate) struct StreamFailure {
 }
 
 impl StreamFailure {
-    const fn new(error: HeadlessTurnPortError, surfaced_output: bool) -> Self {
+    pub(crate) const fn new(error: HeadlessTurnPortError, surfaced_output: bool) -> Self {
         Self {
             error,
             surfaced_output,
         }
     }
 
-    const fn is_resumable(self) -> bool {
+    pub(crate) const fn is_resumable(self) -> bool {
         !self.surfaced_output && matches!(self.error, HeadlessTurnPortError::ProviderNetwork)
     }
 
-    const fn into_port_error(self) -> HeadlessTurnPortError {
+    pub(crate) const fn into_port_error(self) -> HeadlessTurnPortError {
         self.error
     }
 }
@@ -4740,6 +4742,40 @@ mod tests {
 
         assert_eq!(policy.max_attempts(), expected.len() + 1);
         assert!(total >= Duration::from_secs(90), "{total:?}");
+        // The ceiling is what the default's documentation promises, and the
+        // exponential schedule has to fit under it: a budget that cut its own
+        // last steps would end a turn early on the failures it exists for.
+        let jitter = Duration::from_millis(HTTP_RETRY_MAX_JITTER) * expected.len() as u32;
+        assert!(
+            total + jitter <= policy.total_delay_budget(),
+            "{total:?} + {jitter:?}"
+        );
+    }
+
+    /// Without a ceiling on the sum, a provider naming the maximum delay on
+    /// every attempt held one request for seven minutes: the attempt budget
+    /// counts attempts, and `Retry-After` decides what each one waits.
+    #[test]
+    fn the_total_wait_budget_bounds_a_provider_that_names_the_longest_delay() {
+        let policy = RetryPolicy::default();
+        let retry_after = Some(policy.retry_after_cap);
+        let mut waited = Duration::ZERO;
+        let mut retries = 0;
+
+        while retries + 1 < policy.max_attempts() {
+            let delay = http_retry_delay(retries, retry_after, policy);
+            if waited + delay > policy.total_delay_budget() {
+                break;
+            }
+            waited += delay;
+            retries += 1;
+        }
+
+        assert!(waited <= Duration::from_secs(100), "{waited:?}");
+        assert!(
+            retries < policy.max_attempts() - 1,
+            "the wait budget must end the retries before the attempt budget does"
+        );
     }
 
     #[test]

@@ -14,7 +14,7 @@ use agens_error::CliError;
 use agens_models::ModelSelection;
 use agens_session::provider::{
     ProviderKind, bootstrap_authentication, resolve_provider_for_model,
-    snapshot_chatgpt_credentials,
+    snapshot_chatgpt_credentials, split_qualified_model,
 };
 
 use super::{AuthRouteError, TuiRuntimeRouter};
@@ -171,13 +171,10 @@ impl TuiRuntimeRouter {
         command: &str,
     ) -> Result<String, CliError> {
         let requested = command.strip_prefix("/model").unwrap_or_default().trim();
-        let named = requested
-            .split_once('/')
-            .and_then(|(prefix, model)| Some((ProviderKind::parse(prefix)?, model)));
 
-        match named {
+        match split_qualified_model(requested) {
             Some((provider, model)) => {
-                self.apply_provider_model(bootstrap, provider.identifier(), model)
+                self.apply_provider_model(bootstrap, provider.identifier(), &model)
             }
             None => select_tui_model(bootstrap, command, &self.session),
         }

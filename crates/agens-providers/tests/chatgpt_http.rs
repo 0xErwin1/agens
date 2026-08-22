@@ -2512,6 +2512,7 @@ fn brisk_retry_policy(max_attempts: usize) -> RetryPolicy {
         Duration::from_millis(10),
         Duration::from_millis(40),
         Duration::from_millis(40),
+        Duration::from_secs(60),
     )
 }
 

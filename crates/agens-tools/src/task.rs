@@ -1185,7 +1185,39 @@ impl<R: TaskRunner> TaskTool<R> {
     }
 
     pub fn input_schema() -> Value {
-        serde_json::json!({"type":"object","additionalProperties":false,"required":["description"],"properties":{"agent":{"type":"string","minLength":1,"maxLength":64},"background":{"type":"boolean","description":"Run this call in the background and return immediately. Only background calls run concurrently: several foreground calls issued together are executed one after another."},"description":{"type":"string","minLength":1,"maxLength":16384},"model":{"type":"string","minLength":1,"maxLength":64,"description":"Omit this. The agent's configured profile then decides the model, falling back to this thread's model. Send it only when the user explicitly asked for a specific model for this call: an explicit value overrides the configured profile. A model this run cannot reach falls back to this thread's model and says so."},"skills":{"type":"array","maxItems":128,"uniqueItems":true,"items":{"type":"string","minLength":1,"maxLength":64}}}})
+        serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["description"],
+            "properties": {
+                "agent": {"type": "string", "minLength": 1, "maxLength": 64},
+                "background": {
+                    "type": "boolean",
+                    "description": "Run this call in the background and return immediately. Only background calls run concurrently: several foreground calls issued together are executed one after another."
+                },
+                "description": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 16384
+                },
+                "model": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 64,
+                    "description": "Omit this. The agent's configured profile then decides the model, falling back to this thread's model. Send it only when the user explicitly asked for a specific model for this call: an explicit value overrides the configured profile. A model this run cannot reach falls back to this thread's model and says so."
+                },
+                "skills": {
+                    "type": "array",
+                    "maxItems": 128,
+                    "uniqueItems": true,
+                    "items": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 64
+                    }
+                }
+            }
+        })
     }
 
     pub fn catalog_input_schema(&self) -> Value {
@@ -1477,6 +1509,7 @@ impl<R: TaskRunner> TaskTool<R> {
         let registry = self.registry.clone();
         let worker_context = context.clone();
         let parent_model = self.parent_model.clone();
+        let parent_request_config = self.parent_request_config.clone();
         let worker = thread::spawn(move || {
             let model_notice = request.model_notice.clone();
             let mut retry_notice = None;
@@ -1490,6 +1523,7 @@ impl<R: TaskRunner> TaskTool<R> {
                         runner.as_ref(),
                         request,
                         &parent_model,
+                        &parent_request_config,
                         &worker_context,
                     )?;
                     Ok((task_result_output(result, &worker_context), notice))
@@ -1606,10 +1640,17 @@ fn task_terminal_state(output: &ToolOutput) -> TaskTerminalState {
 /// backend, and the parent's usual answer to `task: provider failure [cause:
 /// rejected]` is to delegate again identically. The parent's own model is the
 /// one identifier this run has already proven the provider serves.
+///
+/// The request configuration follows the model. A rejection is as often about
+/// a setting the other model does not take — a reasoning effort it has no
+/// level for — as about the identifier itself, and carrying that configuration
+/// onto the parent's model repeated the same rejection at the price of a
+/// second child turn.
 fn run_with_provider_fallback<R: TaskRunner>(
     runner: &R,
     request: TaskTurnRequest,
     parent_model: &str,
+    parent_request_config: &RequestConfig,
     context: &TaskRunContext,
 ) -> Result<(TaskTurnResult, Option<String>), TaskRunnerError> {
     let agent = request.agent_name.clone();
@@ -1630,6 +1671,7 @@ fn run_with_provider_fallback<R: TaskRunner>(
     };
 
     fallback.model = parent_model.to_owned();
+    fallback.request_config = parent_request_config.clone();
     let result = runner.run(fallback, context)?;
     Ok((
         result,

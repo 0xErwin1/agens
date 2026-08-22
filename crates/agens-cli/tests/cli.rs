@@ -5948,7 +5948,7 @@ fn journey_tool_loop_returns_the_tool_result_to_the_model_and_closes() {
     NetworkTripwire::shared().assert_no_connections();
 }
 
-/// AGN-102: a failure the model cannot read is a failure it cannot recover
+/// A failure the model cannot read is a failure it cannot recover
 /// from, so the tool's own text has to survive to the next request rather than
 /// being flattened into a generic "tool failed".
 #[test]
@@ -5985,7 +5985,7 @@ fn journey_tool_failure_reaches_the_model_with_the_failure_text_intact() {
     NetworkTripwire::shared().assert_no_connections();
 }
 
-/// AGN-105: a delegated child runs its own conversation, and the point of the
+/// A delegated child runs its own conversation, and the point of the
 /// journey is that the child's scope is its own — it neither inherits the
 /// parent's prompt nor widens past the toolset its agent declares.
 #[test]
@@ -6055,7 +6055,7 @@ fn journey_delegation_serves_the_child_its_own_script_within_its_own_scope() {
     NetworkTripwire::shared().assert_no_connections();
 }
 
-/// AGN-104: a stream that ends before anything reached the person is sent
+/// A stream that ends before anything reached the person is sent
 /// again inside a budget, and the attempt is recorded against that budget.
 ///
 /// The cut has to deliver nothing: a retry after the first attempt already

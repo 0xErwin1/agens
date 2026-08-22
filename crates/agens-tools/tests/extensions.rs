@@ -961,7 +961,58 @@ fn a_rejected_model_is_retried_once_on_the_parent_model() {
     );
     assert_eq!(
         *calls.lock().unwrap(),
-        vec!["worker-model".to_owned(), "parent-model".to_owned()]
+        vec![
+            ("worker-model".to_owned(), None),
+            ("parent-model".to_owned(), None),
+        ]
+    );
+}
+
+/// The retry is only worth a second child turn if it changes the request. A
+/// rejection is as often about a setting the other model does not take as
+/// about the identifier, so the fallback carries the parent's configuration
+/// rather than the rejected model's.
+#[test]
+fn the_fallback_carries_the_parent_configuration_and_not_the_rejected_one() {
+    let temporary = TemporaryDirectory::new();
+    let agents = temporary.path.join("agents");
+    fs::create_dir_all(&agents).unwrap();
+    fs::write(
+        agents.join("worker.md"),
+        "---\nname: worker\ndescription: worker agent\nmode: subagent\nmodel: worker-model\neffort: low\n---\nworker instructions\n",
+    )
+    .unwrap();
+    let agents = AgentCatalog::discover(&[], &agents, &temporary.path.join("missing"))
+        .unwrap()
+        .catalog()
+        .clone();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let mut task = TaskTool::from_catalogs_with_parent_config(
+        agents,
+        SkillCatalog::default(),
+        "parent-model",
+        RequestConfig::with_reasoning_effort("high").unwrap(),
+        TaskModels,
+        RejectingTaskRunner {
+            rejected: "worker-model".into(),
+            calls: Arc::clone(&calls),
+        },
+    );
+
+    let output = task
+        .execute(
+            &task_context(),
+            serde_json::json!({"agent":"worker","description":"retry"}),
+        )
+        .unwrap();
+
+    assert!(!output.is_error);
+    assert_eq!(
+        *calls.lock().unwrap(),
+        vec![
+            ("worker-model".to_owned(), Some(ReasoningEffort::Low)),
+            ("parent-model".to_owned(), Some(ReasoningEffort::High)),
+        ]
     );
 }
 
@@ -979,7 +1030,10 @@ fn a_rejection_on_the_parent_model_itself_is_not_retried() {
         output,
         ToolOutput::failure("task: provider failure [cause: request rejected]")
     );
-    assert_eq!(*calls.lock().unwrap(), vec!["parent-model".to_owned()]);
+    assert_eq!(
+        *calls.lock().unwrap(),
+        vec![("parent-model".to_owned(), None)]
+    );
 }
 
 #[test]
@@ -2565,10 +2619,11 @@ impl TaskRunner for SizedTaskRunner {
 }
 
 /// Refuses exactly one model identifier the way a provider refuses one it no
-/// longer serves, and records every model it was asked to run.
+/// longer serves, and records every model and configuration it was asked to
+/// run.
 struct RejectingTaskRunner {
     rejected: String,
-    calls: Arc<Mutex<Vec<String>>>,
+    calls: CapturedTaskModels,
 }
 
 impl TaskRunner for RejectingTaskRunner {
@@ -2577,7 +2632,10 @@ impl TaskRunner for RejectingTaskRunner {
         request: TaskTurnRequest,
         _: &TaskRunContext,
     ) -> Result<TaskTurnResult, TaskRunnerError> {
-        self.calls.lock().unwrap().push(request.model().to_owned());
+        self.calls.lock().unwrap().push((
+            request.model().to_owned(),
+            request.request_config().reasoning_effort(),
+        ));
         if request.model() == self.rejected {
             return Err(TaskRunnerError::ProviderFailure(
                 agens_tools::TaskProviderFailure::Rejected,
