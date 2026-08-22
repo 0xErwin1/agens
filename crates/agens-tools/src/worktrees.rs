@@ -32,7 +32,7 @@ impl SessionWorktrees {
         validate_git_argument(branch, "branch")?;
         validate_git_argument(start_point, "start point")?;
 
-        let repository_directory = self.repository_directory(repo_id);
+        let repository_directory = self.repository_directory_unchecked(repo_id);
         std::fs::create_dir_all(&repository_directory).map_err(|error| WorktreeError::Storage {
             action: "create worktree directory",
             detail: error.to_string(),
@@ -105,12 +105,20 @@ impl SessionWorktrees {
         Ok(())
     }
 
-    fn repository_directory(&self, repo_id: &str) -> PathBuf {
+    /// Where one repository's session worktrees live, once `repo_id` is known
+    /// to be a single path component.
+    pub fn repository_directory(&self, repo_id: &str) -> Result<PathBuf, WorktreeError> {
+        validate_component(repo_id, "repository id")?;
+
+        Ok(self.repository_directory_unchecked(repo_id))
+    }
+
+    fn repository_directory_unchecked(&self, repo_id: &str) -> PathBuf {
         self.data_directory.join("worktrees").join(repo_id)
     }
 
     fn worktree_path(&self, repo_id: &str, name: &str) -> PathBuf {
-        self.repository_directory(repo_id).join(name)
+        self.repository_directory_unchecked(repo_id).join(name)
     }
 }
 
