@@ -56,7 +56,7 @@ pub use ingest::{
     HealthSignal, HealthThresholds, Ingest, IngestFact, IngestRejection, LostReason,
     ReportedCheckpoint, ReportedFact, channel as ingest_channel, detect_worker_lost,
 };
-pub use instance::{ServeInstance, ServeInstanceError};
+pub use instance::{ServeInstance, ServeInstanceError, socket_path};
 pub use introspection::{Clock, RunIntrospection};
 pub use ports::{
     Admissions, GitWorktreeGate, JournalFeed, RunDeliveries, SupervisedSessions, run_mailbox,

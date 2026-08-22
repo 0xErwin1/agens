@@ -1,101 +1,494 @@
-use std::{
-    fs,
-    path::{Path, PathBuf},
-    sync::atomic::{AtomicUsize, Ordering},
-    thread,
-    time::{Duration, Instant},
-};
+//! The composed daemon, driven the way a client drives it.
+//!
+//! One run, one path: a proposed execution is approved over the gRPC facade,
+//! the scheduler admits it, a peer session executes it, the journal reaches a
+//! subscriber over the wire, the worker's `ask` parks the run on
+//! `awaiting_input`, and `AnswerQuestion` resumes it — after which the run is
+//! admitted a second time and the answer is waiting in the run's own mailbox.
+//!
+//! Nothing here reaches into the daemon. Every control-plane move goes through
+//! a connected client, and every assertion about what happened is read back
+//! through the Feed plane, because a composition root that only works when its
+//! own test calls its internals is not composed.
+//!
+//! The one piece supplied by the test is the worker factory, which is the seam
+//! the composition root leaves open: what a run's session is made of belongs to
+//! the surface that knows about models, and nothing fills it in yet.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agens_core::HeadlessTurnCancellation;
-use agens_server::{ServeInstance, ServeInstanceError, ServerError, run_until_shutdown};
+use agens_core::run_introspection::{Ask, AskOption, RunIntrospectionPort};
+use agens_server::grpc::proto::{self, feed_client::FeedClient, team_client::TeamClient};
+use agens_server::{
+    CoordinatorSettings, LaunchError, RunIntrospection, RunLaunch, RunSession, RunWorkerFactory,
+    SessionAdmission, SessionBudget, SessionId, SessionOutcome, SessionProvider, SessionRuntime,
+};
+use agens_store::{
+    ControlPlaneStore, DirectiveGrain, DirectiveStore, DirectiveTarget, RunRow, RunState,
+};
+use tonic::transport::{Endpoint, Uri};
+
+const REPO: &str = "a1b2c3d4e5f60718";
+const PROVIDER: &str = "scripted";
+const ANSWER: &str = "keep";
+
+/// How long an assertion waits for a loop that ticks on a heartbeat.
+const PATIENCE: Duration = Duration::from_secs(20);
 
 static NEXT_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
 
-fn data_directory() -> PathBuf {
+fn scratch_directory(kind: &str) -> PathBuf {
     let suffix = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!(
-        "agens-server-daemon-{}-{suffix}",
+    let directory = std::env::temp_dir().join(format!(
+        "agens-server-daemon-{kind}-{}-{suffix}",
         std::process::id()
-    ))
+    ));
+    fs::create_dir_all(&directory).unwrap();
+
+    directory
 }
 
-fn socket_path(directory: &Path) -> PathBuf {
-    directory.join("serve.sock")
+fn now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| i64::try_from(elapsed.as_secs()).unwrap_or(0))
 }
 
-/// Waits for the daemon to publish its socket rather than sleeping a guessed
-/// interval, so the test does not race a slow machine.
-fn wait_for_socket(path: &Path) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+/// A proposed run, which is where a client's approval finds one.
+fn proposed_run() -> RunRow {
+    RunRow {
+        id: None,
+        repo_id: REPO.to_owned(),
+        repo_root: "/home/dev/agens".to_owned(),
+        remote_url: None,
+        external_ref: Some("agens/AGN-180".to_owned()),
+        parent_run_id: None,
+        task: "wire the daemon to the core".to_owned(),
+        scope: "crates/agens-server".to_owned(),
+        dod: "serve runs the composed daemon".to_owned(),
+        genesis_paths: None,
+        state: RunState::Draft,
+        priority: 5,
+        dep_run_id: None,
+        provider: PROVIDER.to_owned(),
+        budget_tokens: None,
+        worktree_path: None,
+        worktree_status: None,
+        created_at: now(),
+        result: None,
+    }
+}
 
-    while !path.exists() {
-        assert!(Instant::now() < deadline, "the daemon never bound {path:?}");
-        thread::sleep(Duration::from_millis(10));
+/// The client one session speaks through. The daemon guarantees that no two
+/// sessions share one, and this test's worker needs nothing more of it.
+struct ScriptedClient;
+
+impl SessionProvider for ScriptedClient {
+    fn model(&self) -> &str {
+        "scripted/none"
+    }
+}
+
+/// What the worker did, read back by the test.
+#[derive(Default)]
+struct Script {
+    /// Everything the resumed session found waiting in the run's mailbox.
+    delivered: Mutex<Vec<String>>,
+}
+
+/// Opens the session row a launch runs as.
+///
+/// A session is durable before it executes anything: the attempt the admission
+/// transition writes carries the session that ran it, and the column is a
+/// foreign key. The real worker opens this row through `agens-session`; the
+/// test writes it directly, which is the same thing the ingest suite does for
+/// the rows only a live session creates.
+fn open_session_row(data_directory: &Path, run_id: i64) -> Result<SessionId, LaunchError> {
+    let connection = rusqlite::Connection::open(data_directory.join("agens.db"))
+        .map_err(|error| LaunchError(error.to_string()))?;
+
+    connection
+        .execute(
+            "INSERT INTO sessions (project, title, active_agent, created_at, updated_at)
+             VALUES (?1, ?2, 'primary', ?3, ?3)",
+            rusqlite::params!["/home/dev/agens", format!("run {run_id}"), now()],
+        )
+        .map_err(|error| LaunchError(error.to_string()))?;
+
+    Ok(SessionId::new(connection.last_insert_rowid()))
+}
+
+/// A worker that asks a question on its first attempt and reads its mailbox on
+/// the second.
+///
+/// It is the whole of what the composition root leaves to its caller, and it
+/// uses only the surfaces a real worker uses: the run's introspection port for
+/// `ask`, and the run's own mailbox for what was delivered to it.
+fn scripted_worker(script: Arc<Script>) -> RunWorkerFactory {
+    Arc::new(move |launch: &RunLaunch<'_>| {
+        let session = open_session_row(&launch.data_directory, launch.run_id)?;
+        let core = Arc::clone(&launch.core);
+        let run_id = launch.run_id;
+        let resumed = launch.resumed;
+        let mailbox = launch.mailbox.clone();
+        let data_directory = launch.data_directory.clone();
+        let script = Arc::clone(&script);
+
+        let work = Box::new(move |_runtime: SessionRuntime| {
+            // The launch happens before the admission transition, so the run is
+            // still queued for as long as the tick that started this session
+            // holds the core. A worker with anything to report waits for the
+            // row it is executing to say it is executing.
+            if !await_state(&core, run_id, RunState::Running) {
+                return SessionOutcome::Failed;
+            }
+
+            if resumed {
+                let delivered = drain_mailbox(&data_directory, &mailbox);
+                script
+                    .delivered
+                    .lock()
+                    .expect("the script is readable")
+                    .extend(delivered);
+
+                return SessionOutcome::Completed;
+            }
+
+            let mut introspection = RunIntrospection::new(Arc::clone(&core), run_id, Arc::new(now))
+                .for_attempt(Some(session.value()), None);
+
+            let asked = introspection.ask(
+                &Ask::new(
+                    "keep the options as JSON or split them into a table".to_owned(),
+                    vec![
+                        AskOption::new(
+                            ANSWER,
+                            "keep the JSON array",
+                            Some("no migration".to_owned()),
+                        ),
+                        AskOption::new("split", "split it into its own table", None),
+                    ],
+                    Some(ANSWER.to_owned()),
+                )
+                .expect("the question is valid"),
+            );
+
+            match asked {
+                Ok(_) => SessionOutcome::Completed,
+                Err(_) => SessionOutcome::Failed,
+            }
+        });
+
+        Ok(RunSession {
+            admission: SessionAdmission::new(
+                session,
+                Box::new(ScriptedClient),
+                SessionBudget::unlimited(),
+            ),
+            work,
+            session_attempt_id: None,
+        })
+    }) as RunWorkerFactory
+}
+
+/// Waits for the run to reach one state, reading it through the core the way
+/// the worker's own writes go through it.
+fn await_state(core: &Arc<Mutex<agens_server::ApiCore>>, run_id: i64, wanted: RunState) -> bool {
+    let deadline = Instant::now() + PATIENCE;
+
+    while Instant::now() < deadline {
+        let state = core.lock().ok().and_then(|core| {
+            core.machines()
+                .store()
+                .load_run(run_id)
+                .ok()
+                .flatten()
+                .map(|run| run.state)
+        });
+
+        if state == Some(wanted) {
+            return true;
+        }
+
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    false
+}
+
+/// Everything queued for this run at a tool-call edge, which is where an answer
+/// to a question lands.
+fn drain_mailbox(data_directory: &Path, mailbox: &str) -> Vec<String> {
+    let Ok(mut store) = DirectiveStore::open(data_directory) else {
+        return Vec::new();
+    };
+
+    store
+        .drain(
+            &DirectiveTarget::Child(mailbox.to_owned()),
+            DirectiveGrain::ToolCall,
+        )
+        .map(|drained| drained.into_iter().map(|input| input.text).collect())
+        .unwrap_or_default()
+}
+
+async fn connect(socket: PathBuf) -> tonic::transport::Channel {
+    for _ in 0..400 {
+        if tokio::net::UnixStream::connect(&socket).await.is_ok() {
+            let path = socket.clone();
+
+            return Endpoint::try_from("http://localhost")
+                .unwrap()
+                .connect_with_connector(tower::service_fn(move |_: Uri| {
+                    let path = path.clone();
+
+                    async move {
+                        let stream = tokio::net::UnixStream::connect(path).await?;
+
+                        Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(stream))
+                    }
+                }))
+                .await
+                .unwrap();
+        }
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    panic!("the daemon never accepted on its socket");
+}
+
+/// Cancels the daemon however the thread holding it ends.
+struct Stopper(HeadlessTurnCancellation);
+
+impl Drop for Stopper {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+/// One run's journal, for an assertion that has to say what happened instead.
+async fn journal_of(
+    client: &mut FeedClient<tonic::transport::Channel>,
+    run_id: i64,
+) -> Vec<String> {
+    client
+        .run_detail(proto::RunDetailRequest { run_id })
+        .await
+        .map(|view| {
+            view.into_inner()
+                .events
+                .into_iter()
+                .map(|event| format!("{}: {}", event.r#type, event.payload))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// One run's state as the Feed plane reports it.
+async fn run_state(client: &mut FeedClient<tonic::transport::Channel>, run_id: i64) -> String {
+    client
+        .run_detail(proto::RunDetailRequest { run_id })
+        .await
+        .expect("the run is readable")
+        .into_inner()
+        .run
+        .expect("a run view carries its run")
+        .state
+}
+
+/// Waits for the Feed plane to report one state, which is the only place this
+/// test looks for what the daemon did.
+async fn await_reported_state(
+    client: &mut FeedClient<tonic::transport::Channel>,
+    run_id: i64,
+    wanted: &str,
+) -> String {
+    let deadline = Instant::now() + PATIENCE;
+
+    loop {
+        let state = run_state(client, run_id).await;
+
+        if state == wanted || Instant::now() >= deadline {
+            return state;
+        }
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
 }
 
 #[test]
-fn the_daemon_binds_its_socket_and_releases_it_on_shutdown() {
-    let directory = data_directory();
-    let socket = socket_path(&directory);
+fn the_daemon_runs_a_run_from_approval_to_a_question_and_back() {
+    let directory = scratch_directory("lifecycle");
+    let run_id = {
+        let mut store = ControlPlaneStore::open(&directory).expect("open the control plane");
+
+        store.insert_run(&proposed_run()).expect("insert the run")
+    };
+
+    let script = Arc::new(Script::default());
     let shutdown = HeadlessTurnCancellation::new();
-    let daemon_shutdown = shutdown.clone();
-    let daemon_directory = directory.clone();
+    let socket = agens_server::socket_path(&directory);
 
-    let daemon = thread::spawn(move || run_until_shutdown(&daemon_directory, &daemon_shutdown));
-    wait_for_socket(&socket);
+    // The daemon is stopped however the client thread ends: a client that
+    // panicked would otherwise leave it serving and the test hanging on a join
+    // that never comes.
+    let stopper = Stopper(shutdown.clone());
+    let client_script = Arc::clone(&script);
 
-    shutdown.cancel();
-    daemon.join().unwrap().unwrap();
+    // The daemon takes its own runtime with it, so the client drives another.
+    let asking = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
 
-    assert!(!socket.exists(), "shutdown left the socket behind");
+        let stopper = stopper;
 
-    fs::remove_dir_all(directory).unwrap();
-}
+        runtime.block_on(async move {
+            let channel = connect(socket).await;
+            let mut team = TeamClient::new(channel.clone());
+            let mut feed = FeedClient::new(channel);
 
-#[test]
-fn a_second_daemon_refuses_to_start_while_one_is_running() {
-    let directory = data_directory();
-    let socket = socket_path(&directory);
-    let shutdown = HeadlessTurnCancellation::new();
-    let daemon_shutdown = shutdown.clone();
-    let daemon_directory = directory.clone();
+            // Subscribed before anything moves, so what crosses the stream is
+            // the run's own history rather than a replay of it.
+            let mut events = feed
+                .subscribe(proto::EventFilter {
+                    repo_id: Some(REPO.to_owned()),
+                    run_id: Some(run_id),
+                    classes: Vec::new(),
+                })
+                .await
+                .expect("the feed accepts a subscriber")
+                .into_inner();
 
-    let daemon = thread::spawn(move || run_until_shutdown(&daemon_directory, &daemon_shutdown));
-    wait_for_socket(&socket);
+            team.approve_plan(proto::ApprovePlanRequest { run_id })
+                .await
+                .expect("the user may approve a proposed run");
 
-    assert!(matches!(
-        run_until_shutdown(&directory, &HeadlessTurnCancellation::new()),
-        Err(ServerError::AlreadyRunning)
-    ));
+            let parked = await_reported_state(&mut feed, run_id, "awaiting_input").await;
+
+            let inbox = feed
+                .inbox(proto::InboxRequest {
+                    repo_id: REPO.to_owned(),
+                })
+                .await
+                .expect("the inbox is readable")
+                .into_inner();
+
+            let question_id = inbox.items.first().map(|item| item.question_id);
+
+            if let Some(question_id) = question_id {
+                team.answer_question(proto::AnswerQuestionRequest {
+                    question_id,
+                    answer: ANSWER.to_owned(),
+                })
+                .await
+                .expect("the user may answer a question");
+            }
+
+            let resumed = await_reported_state(&mut feed, run_id, "running").await;
+
+            // The second session drains what was delivered to the run, so the
+            // answer arriving is asserted on the worker's side rather than on
+            // the queue's.
+            let deadline = Instant::now() + PATIENCE;
+            while client_script
+                .delivered
+                .lock()
+                .expect("the script is readable")
+                .is_empty()
+                && Instant::now() < deadline
+            {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+
+            let streamed = collect_streamed(&mut events).await;
+            let journal = journal_of(&mut feed, run_id).await;
+
+            drop(stopper);
+
+            (parked, resumed, streamed, journal)
+        })
+    });
+
+    let report = agens_server::serve_until_shutdown(
+        &directory,
+        &CoordinatorSettings {
+            heartbeat: Duration::from_millis(25),
+            ..CoordinatorSettings::default()
+        },
+        scripted_worker(Arc::clone(&script)),
+        None,
+        &shutdown,
+    )
+    .expect("the daemon serves");
+
+    let (parked, resumed, streamed, journal) = asking.join().expect("the client thread finishes");
+
+    assert!(report.is_clean(), "every session ended: {report:?}");
+    assert_eq!(
+        parked, "awaiting_input",
+        "the worker's ask parks the run on a person, journal: {journal:?}"
+    );
+    assert_eq!(
+        resumed, "running",
+        "the answer requeues the run and the scheduler admits it again, journal: {journal:?}"
+    );
+    assert_eq!(
+        script
+            .delivered
+            .lock()
+            .expect("the script is readable")
+            .as_slice(),
+        [ANSWER.to_owned()],
+        "the resumed session finds the answer in the run's mailbox"
+    );
+    // The generic move is what a subscriber follows without knowing every
+    // domain event by name, and the domain events are the run's own history:
+    // approved, started, parked, answered, resumed, started again.
     assert!(
-        socket.exists(),
-        "the refused daemon removed the running one's socket"
+        streamed.iter().any(|event| event == "run_state_changed"),
+        "the journal reaches a subscriber over the wire: {streamed:?}"
+    );
+    assert_eq!(
+        streamed
+            .iter()
+            .filter(|event| *event != "run_state_changed")
+            .cloned()
+            .collect::<Vec<_>>(),
+        [
+            "run_approved",
+            "run_started",
+            "run_awaiting_input",
+            "question_answered",
+            "run_resumed",
+            "run_started",
+        ],
+        "the subscriber sees the whole of what the daemon did"
     );
 
-    shutdown.cancel();
-    daemon.join().unwrap().unwrap();
-
     fs::remove_dir_all(directory).unwrap();
 }
 
-/// The slot is released for the next process, not merely for the next call.
-#[test]
-fn the_machine_slot_is_free_again_after_shutdown() {
-    let directory = data_directory();
-    let shutdown = HeadlessTurnCancellation::new();
-    let daemon_shutdown = shutdown.clone();
-    let daemon_directory = directory.clone();
+/// Everything already on the stream, without waiting for one more.
+///
+/// The daemon is about to be stopped, so a read that waits on the next entry
+/// would wait for a publisher that is shutting down.
+async fn collect_streamed(events: &mut tonic::Streaming<proto::Event>) -> Vec<String> {
+    let mut seen = Vec::new();
 
-    let daemon = thread::spawn(move || run_until_shutdown(&daemon_directory, &daemon_shutdown));
-    wait_for_socket(&socket_path(&directory));
-    shutdown.cancel();
-    daemon.join().unwrap().unwrap();
+    while let Ok(Some(event)) = tokio::time::timeout(Duration::from_millis(200), events.message())
+        .await
+        .unwrap_or(Ok(None))
+    {
+        seen.push(event.r#type);
+    }
 
-    assert!(matches!(
-        ServeInstance::acquire(&directory),
-        Ok(_) | Err(ServeInstanceError::Unavailable(_))
-    ));
-
-    fs::remove_dir_all(directory).unwrap();
+    seen
 }

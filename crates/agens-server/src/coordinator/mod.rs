@@ -54,6 +54,14 @@ use crate::timers::{TimerSettings, TimerWheel};
 /// How often a loop looks again when nothing woke it.
 const HEARTBEAT: Duration = Duration::from_millis(250);
 
+/// How many heartbeats admission waits after a launch that did not work.
+///
+/// A failed launch is not a condition that passes on its own the way a ceiling
+/// does: the run stays queued and the next tick offers it the same slot, so
+/// without a pause one refusal becomes a session started and abandoned on every
+/// heartbeat for as long as the daemon runs.
+const FAILED_LAUNCH_BACKOFF: u32 = 20;
+
 /// What the coordinator is configured with.
 ///
 /// Resolved by whoever reads the operator's configuration, never here: this
@@ -262,6 +270,7 @@ fn admission_loop(
     let stopping = Arc::clone(stopping);
     let scheduler = Scheduler::new(settings.scheduler.clone());
     let heartbeat = settings.heartbeat;
+    let backoff = settings.heartbeat * FAILED_LAUNCH_BACKOFF;
     let data_directory = data_directory.to_path_buf();
 
     std::thread::spawn(move || {
@@ -289,11 +298,22 @@ fn admission_loop(
                 ..SchedulerLoad::default()
             };
 
-            if let Ok(mut core) = core.lock() {
+            let failed = match core.lock() {
                 // A tick that could not read the queue did nothing and is not
-                // fatal: the next heartbeat reads it again, and the runs it
+                // fatal: the next occasion reads it again, and the runs it
                 // would have admitted are still queued where they were.
-                let _ = scheduler.tick(core.machines_mut(), &launcher, &load);
+                Ok(mut core) => scheduler
+                    .tick(core.machines_mut(), &launcher, &load)
+                    .map_or(true, |report| !report.failures.is_empty()),
+                Err(_) => true,
+            };
+
+            // A launch that did not work leaves its run queued, so the next
+            // occasion offers it the same slot and it fails the same way. The
+            // pause is what keeps that from spending a session per heartbeat
+            // on a run nothing has changed about.
+            if failed {
+                std::thread::sleep(backoff);
             }
         }
     })
@@ -381,11 +401,17 @@ fn publisher_loop(
         while !stopping.load(Ordering::Acquire) {
             std::thread::sleep(heartbeat);
 
+            // The head is read before the subscribers are counted, and never
+            // after: a subscriber that arrived in between would otherwise have
+            // the entries it was registered for skipped over by a watermark
+            // taken past them.
+            let head = store.latest_event_id().unwrap_or(watermark);
+
             if feed.subscribers() == 0 {
                 // Nobody is watching, so the tail is not read. The watermark
                 // still moves, because a subscriber arriving later asks for
                 // what happens next rather than for what it missed.
-                watermark = store.latest_event_id().unwrap_or(watermark);
+                watermark = head;
                 continue;
             }
 
