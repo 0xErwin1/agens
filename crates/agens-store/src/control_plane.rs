@@ -514,6 +514,19 @@ impl ControlPlaneStore {
         )
     }
 
+    /// Every run in one state, oldest first, across every repository.
+    ///
+    /// The daemon is one process per machine serving N projects, so the queue
+    /// the scheduler admits from spans repositories: a ceiling expressed in
+    /// slots is a ceiling on the machine, not on one checkout.
+    pub fn runs_in_state(&self, state: RunState) -> Result<Vec<RunRow>> {
+        self.load_all(
+            "load runs in state",
+            &format!("{RUN_SELECT} WHERE state = ?1 ORDER BY id"),
+            params![state.as_str()],
+        )
+    }
+
     pub fn insert_attempt(&mut self, attempt: &AttemptRow) -> Result<i64> {
         insert_attempt_row(&self.connection, attempt).map_err(|error| {
             ControlPlaneError::operation("insert attempt", &self.database_path, error)

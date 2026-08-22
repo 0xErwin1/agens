@@ -9,6 +9,7 @@ mod blocking;
 mod fsm;
 mod gates;
 mod instance;
+mod scheduler;
 mod sessions;
 
 use std::os::unix::net::UnixListener;
@@ -30,6 +31,11 @@ pub use gates::{
     ReclaimRequest, ReclaimVerdict, SubAgentKind, SubAgentRequest, freeze_receipt,
 };
 pub use instance::{ServeInstance, ServeInstanceError};
+pub use scheduler::{
+    Admission, AdmissionFailure, Candidate, Deferral, Ineligible, LaunchError, LaunchedSession,
+    PendingRun, Queue, QueueReport, RunLauncher, RunSession, Scheduler, SchedulerError,
+    SchedulerLimits, SchedulerLoad, SupervisorLauncher,
+};
 pub use sessions::{
     SessionAdmission, SessionBudget, SessionBudgetHandle, SessionId, SessionLimits, SessionOutcome,
     SessionProvider, SessionRegistry, SessionRegistryError, SessionRuntime, SessionShutdown,
