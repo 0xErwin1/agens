@@ -82,8 +82,15 @@ fn open_session_native_tools(
         let resumed = working_directory.current();
         if resumed != project_root {
             // A directory that is gone, or no longer reachable, leaves the
-            // session at its root rather than failing the turn.
-            let _ = tools.change_directory(&resumed);
+            // session at its root rather than failing the turn it was about
+            // to take. The handle is corrected to match, so nothing reading it
+            // afterwards reports a place the session is not.
+            let reopened = tools
+                .change_directory(&resumed)
+                .is_ok_and(|outcome| !outcome.is_error);
+            if !reopened {
+                working_directory.moved_to(project_root);
+            }
         }
         tools = tools.with_published_directory(working_directory);
     }

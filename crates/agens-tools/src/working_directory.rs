@@ -53,8 +53,13 @@ impl WorkingDirectory {
         }
     }
 
-    /// Records a completed move. Only the tools that perform one call this.
-    pub(crate) fn moved_to(&self, directory: &Path) {
+    /// Records a completed move.
+    ///
+    /// Called by the tools that perform one, and by the runtime that opens
+    /// them when the directory it was told to reopen in is gone: leaving the
+    /// recorded location pointing at a directory nothing can read would make
+    /// every later reader of this handle report a place the session is not.
+    pub fn moved_to(&self, directory: &Path) {
         match self.current.lock() {
             Ok(mut current) => *current = directory.to_path_buf(),
             Err(poisoned) => *poisoned.into_inner() = directory.to_path_buf(),
