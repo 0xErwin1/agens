@@ -177,6 +177,7 @@ impl StateMachines {
                 next: transition.to,
             }),
             question: None,
+            new_question: None,
             attempt: None,
             provider: None,
             events: &events,
@@ -191,6 +192,7 @@ impl StateMachines {
             domain_event: transition.domain_event,
             state_changed_event_id,
             domain_event_id,
+            opened_question_id: None,
         }))
     }
 }
