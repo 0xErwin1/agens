@@ -2834,7 +2834,7 @@ impl McpRegistry {
         // stream was retired. Noticing before the call keeps the model from
         // paying for a round trip that was never going to arrive.
         if !self.server_is_alive(&server_name) {
-            self.reconnect(&server_name);
+            self.reconnect_for(&server_name, context);
         }
 
         match self.dispatch(
@@ -2846,7 +2846,7 @@ impl McpRegistry {
             Ok(output) => Ok(output),
             Err(McpTransportError::Cancelled) => Err(Error::Cancelled),
             Err(error) if is_recoverable_call_failure(&error) => {
-                if !self.reconnect(&server_name) {
+                if !self.reconnect_for(&server_name, context) {
                     // Recorded after the failed reconnect so the status keeps
                     // the call that actually failed, rather than the connect
                     // attempt made trying to recover from it.
@@ -2908,6 +2908,24 @@ impl McpRegistry {
             client.close();
         }
         !self.reload_server(server_name).is_failed()
+    }
+
+    /// Rebuilds a connection on behalf of one tool call, under that call's
+    /// cancellation rather than the registry's own.
+    ///
+    /// Discovery reads `discovery_cancellation`, a handle that lives as long
+    /// as the daemon. A reconnect made for a call spends the caller's budget
+    /// on connect and on every page of `tools/list`, so it has to answer to
+    /// the same Esc the call does. The previous handle is restored so a later
+    /// discovery outside any call keeps its own.
+    fn reconnect_for(&mut self, server_name: &str, context: &ToolExecutionContext) -> bool {
+        let previous = Arc::clone(&self.discovery_cancellation);
+        self.discovery_cancellation = context.cancellation_handle();
+
+        let reconnected = self.reconnect(server_name);
+
+        self.discovery_cancellation = previous;
+        reconnected
     }
 
     /// Records a post-discovery liveness failure without treating a tool
@@ -3532,12 +3550,18 @@ impl<T: McpTransport> McpClient<T> {
         }
     }
 
+    /// Ends an operation the caller stopped waiting for.
+    ///
+    /// Only a deadline takes the connection down with it: a server that did
+    /// not answer inside its budget is a server the next call should not be
+    /// handed. Cancellation says nothing about the server, so it keeps the
+    /// connection and the transport abandons the pending request on its own.
     fn abort(
         &mut self,
         context: &McpOperationContext,
         primary: McpTransportError,
     ) -> Result<McpResponse, McpTransportError> {
-        let _ = self.transport.close(context);
+        self.close_on_deadline(context, &primary);
         Err(primary)
     }
 
@@ -3546,8 +3570,14 @@ impl<T: McpTransport> McpClient<T> {
         context: &McpOperationContext,
         primary: McpTransportError,
     ) -> Result<(), McpTransportError> {
-        let _ = self.transport.close(context);
+        self.close_on_deadline(context, &primary);
         Err(primary)
+    }
+
+    fn close_on_deadline(&mut self, context: &McpOperationContext, primary: &McpTransportError) {
+        if matches!(primary, McpTransportError::TimedOut) {
+            let _ = self.transport.close(context);
+        }
     }
     /// Shuts the transport down, budgeting the shutdown with the connect
     /// timeout: `McpTimeouts` carries no separate close budget, and a server

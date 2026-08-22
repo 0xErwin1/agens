@@ -234,15 +234,11 @@ impl McpStdioTransport {
                         }
                         return result;
                     }
-                    Err(primary) => {
-                        let _ = self.terminate();
-                        return Err(primary);
-                    }
+                    Err(primary) => return self.give_up(primary),
                 },
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     if let Err(primary) = context.check() {
-                        let _ = self.terminate();
-                        return Err(primary);
+                        return self.give_up(primary);
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -252,6 +248,24 @@ impl McpStdioTransport {
                 }
             }
         }
+    }
+
+    /// Ends a request whose caller stopped waiting for it.
+    ///
+    /// Cancellation abandons the pending id and nothing else. The server is
+    /// healthy and will answer, and `frame_routing` walks past every id below
+    /// the pending one, so the next call reaches the same process instead of
+    /// paying for a reconnect nobody needed.
+    ///
+    /// A deadline is different evidence: the server did not answer inside its
+    /// budget. Abandoning that id would leave the reader holding the stdout
+    /// lock for every later call while `is_alive` still reports a healthy
+    /// server, so nothing would ever rebuild the connection. The process goes.
+    fn give_up<T>(&self, primary: McpTransportError) -> Result<T, McpTransportError> {
+        if matches!(primary, McpTransportError::TimedOut) {
+            let _ = self.terminate();
+        }
+        Err(primary)
     }
 
     fn write_frame(
@@ -514,8 +528,7 @@ fn wait_for_write(
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 if let Err(primary) = context.check() {
-                    let _ = transport.terminate();
-                    return Err(primary);
+                    return transport.give_up(primary);
                 }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {

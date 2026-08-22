@@ -59,6 +59,9 @@ fn main() {
 
     let stdin = io::stdin();
     let mut stdout = io::stdout();
+    // Held across iterations so a mode can make only the first tool call slow
+    // and answer the rest at once, from the same process.
+    let mut slow_call_pending = mode == "call-slow-once";
     for line in stdin.lock().lines() {
         let request: Value =
             match line.and_then(|line| serde_json::from_str(&line).map_err(io::Error::other)) {
@@ -222,6 +225,10 @@ fn main() {
                 }
                 if mode == "call-sleep" {
                     std::thread::sleep(std::time::Duration::from_secs(5));
+                }
+                if slow_call_pending {
+                    slow_call_pending = false;
+                    std::thread::sleep(std::time::Duration::from_millis(300));
                 }
                 json!({"jsonrpc":"2.0","id":response_id,"result":{"content":[{"type":"text","text":"tool succeeded"}]}})
             }
