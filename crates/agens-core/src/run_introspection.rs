@@ -891,7 +891,9 @@ mod tests {
             Err(RunIntrospectionError::NoRun)
         );
         assert_eq!(
-            port.ask(&Ask::new("which schema wins".to_owned(), vec![option("keep")], None).unwrap()),
+            port.ask(
+                &Ask::new("which schema wins".to_owned(), vec![option("keep")], None).unwrap()
+            ),
             Err(RunIntrospectionError::NoRun)
         );
     }

@@ -883,10 +883,7 @@ fn insert_attempt_row(connection: &Connection, attempt: &AttemptRow) -> rusqlite
     Ok(connection.last_insert_rowid())
 }
 
-fn insert_question_row(
-    connection: &Connection,
-    question: &QuestionRow,
-) -> rusqlite::Result<i64> {
+fn insert_question_row(connection: &Connection, question: &QuestionRow) -> rusqlite::Result<i64> {
     connection.execute(
         "INSERT INTO questions (
              run_id, kind, blocked_decision, options, recommendation, answer, author,

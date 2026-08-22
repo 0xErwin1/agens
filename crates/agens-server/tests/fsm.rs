@@ -118,6 +118,14 @@ fn facts_for(store: &mut ControlPlaneStore, run_id: i64, transition: &RunTransit
                 .unwrap();
             facts.answered_question_id = Some(question_id);
         }
+        RunGuard::AskOpensQuestion => {
+            facts.opened_question = Some(question_in(
+                run_id,
+                QuestionKind::Question,
+                QuestionState::Open,
+                None,
+            ));
+        }
         RunGuard::QuotaResetElapsed => {
             store
                 .record_provider(&ProviderRow {
