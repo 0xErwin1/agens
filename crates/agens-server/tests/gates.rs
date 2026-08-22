@@ -23,6 +23,10 @@ use agens_store::{
 use agens_tools::SessionWorktrees;
 
 const NOW: i64 = 1_700_000_500;
+/// The genesis paths a fixture's run froze: the one path its branch touches.
+/// A run that froze none is refused by the gate, so it is the tests about that
+/// refusal that pass `None`.
+const GENESIS: Option<&str> = Some("[\"feature.txt\"]");
 const REPOSITORY_ID: &str = "agens-a1b2c3d4";
 const WORKTREE_NAME: &str = "agn-60";
 const BRANCH: &str = "feature/agn-60";
@@ -201,6 +205,15 @@ impl Gated {
             .collect()
     }
 
+    fn question_state(&self) -> QuestionState {
+        self.machines
+            .store()
+            .load_question(self.approval_id)
+            .expect("load approval")
+            .expect("the approval exists")
+            .state
+    }
+
     fn worktree_status(&self) -> Option<WorktreeStatus> {
         self.machines
             .store()
@@ -284,7 +297,7 @@ fn refusal(verdict: PreMergeVerdict) -> GateRefusal {
 
 #[test]
 fn a_clean_merge_journals_its_verdict_before_the_worktree_is_released() {
-    let mut gated = Gated::new(None);
+    let mut gated = Gated::new(GENESIS);
 
     let verdict = gated.pre_merge(MergePath::Integrate);
 
@@ -300,11 +313,14 @@ fn a_clean_merge_journals_its_verdict_before_the_worktree_is_released() {
         gated.events(),
         [
             "gate_result",
+            "run_state_changed",
+            "approval_consumed",
             "merged",
             "run_state_changed",
             "worktree_reclaimable"
         ],
-        "the verdict and the merge are journaled before the worktree is released"
+        "the verdict, the authorization it spent and the merge are all journaled before the \
+         worktree is released"
     );
     assert_eq!(
         git(&gated.fixture.checkout, &["log", "--oneline", "main"])
@@ -317,7 +333,7 @@ fn a_clean_merge_journals_its_verdict_before_the_worktree_is_released() {
 
 #[test]
 fn an_approval_bound_to_an_older_tree_refuses_the_merge() {
-    let mut gated = Gated::new(None);
+    let mut gated = Gated::new(GENESIS);
     gated.fixture.commit("afterthought.txt", "one more\n");
 
     let verdict = gated.pre_merge(MergePath::Integrate);
@@ -337,7 +353,7 @@ fn an_approval_bound_to_an_older_tree_refuses_the_merge() {
 
 #[test]
 fn a_commit_that_only_moves_bytes_within_the_same_paths_still_refuses() {
-    let mut gated = Gated::new(None);
+    let mut gated = Gated::new(GENESIS);
     gated.fixture.commit("feature.txt", "work, revised\n");
 
     let GateRefusal::ReceiptStale { frozen, derived } =
@@ -354,7 +370,7 @@ fn a_commit_that_only_moves_bytes_within_the_same_paths_still_refuses() {
 
 #[test]
 fn an_expired_approval_authorizes_nothing() {
-    let mut gated = Gated::with_approval(None, QuestionState::Answered, Some(NOW - 1));
+    let mut gated = Gated::with_approval(GENESIS, QuestionState::Answered, Some(NOW - 1));
 
     assert_eq!(
         refusal(gated.pre_merge(MergePath::Integrate)),
@@ -366,7 +382,7 @@ fn an_expired_approval_authorizes_nothing() {
 
 #[test]
 fn an_unanswered_approval_authorizes_nothing() {
-    let mut gated = Gated::with_approval(None, QuestionState::Open, None);
+    let mut gated = Gated::with_approval(GENESIS, QuestionState::Open, None);
 
     assert_eq!(
         refusal(gated.pre_merge(MergePath::Integrate)),
@@ -376,7 +392,7 @@ fn an_unanswered_approval_authorizes_nothing() {
 
 #[test]
 fn a_consumed_approval_is_not_presented_twice() {
-    let mut gated = Gated::with_approval(None, QuestionState::Delivered, None);
+    let mut gated = Gated::with_approval(GENESIS, QuestionState::Delivered, None);
 
     assert_eq!(
         refusal(gated.pre_merge(MergePath::Integrate)),
@@ -386,7 +402,7 @@ fn a_consumed_approval_is_not_presented_twice() {
 
 #[test]
 fn an_approval_belonging_to_another_run_is_not_an_approval_for_this_one() {
-    let mut gated = Gated::new(None);
+    let mut gated = Gated::new(GENESIS);
     let request = PreMergeRequest {
         approval_id: gated.approval_id + 1,
         ..gated.request(MergePath::Integrate)
@@ -399,7 +415,7 @@ fn an_approval_belonging_to_another_run_is_not_an_approval_for_this_one() {
 
 #[test]
 fn a_dirty_worktree_refuses_the_merge() {
-    let mut gated = Gated::new(None);
+    let mut gated = Gated::new(GENESIS);
     write(&gated.fixture.worktree, "scratch.txt", "uncommitted\n");
 
     assert_eq!(
@@ -411,7 +427,7 @@ fn a_dirty_worktree_refuses_the_merge() {
 
 #[test]
 fn a_detached_head_has_no_branch_to_merge() {
-    let mut gated = Gated::new(None);
+    let mut gated = Gated::new(GENESIS);
     git(
         &gated.fixture.worktree,
         &["checkout", "--quiet", "--detach"],
@@ -425,7 +441,7 @@ fn a_detached_head_has_no_branch_to_merge() {
 
 #[test]
 fn an_unrelated_history_has_no_merge_base() {
-    let mut gated = Gated::new(None);
+    let mut gated = Gated::new(GENESIS);
     git(
         &gated.fixture.worktree,
         &["checkout", "--quiet", "--orphan", "orphan/agn-60"],
@@ -443,7 +459,7 @@ fn an_unrelated_history_has_no_merge_base() {
 
 #[test]
 fn attempts_past_the_cap_refuse_the_merge() {
-    let mut gated = Gated::new(None);
+    let mut gated = Gated::new(GENESIS);
     let mut store = gated.fixture.store();
     for n in 1..=4 {
         store
@@ -460,7 +476,7 @@ fn attempts_past_the_cap_refuse_the_merge() {
 
 #[test]
 fn an_interrupted_attempt_does_not_count_against_the_cap() {
-    let mut gated = Gated::new(None);
+    let mut gated = Gated::new(GENESIS);
     let mut store = gated.fixture.store();
     for (n, outcome) in [
         (1, AttemptOutcome::Failed),
@@ -577,7 +593,7 @@ fn a_genesis_path_never_covers_the_directory_beside_it() {
 
 #[test]
 fn a_merge_that_does_not_apply_asks_for_an_integration_sub_agent() {
-    let mut gated = Gated::new(None);
+    let mut gated = Gated::new(GENESIS);
     write(&gated.fixture.checkout, "feature.txt", "conflicting\n");
     git(&gated.fixture.checkout, &["add", "."]);
     git(
@@ -598,12 +614,21 @@ fn a_merge_that_does_not_apply_asks_for_an_integration_sub_agent() {
         "the aborted merge leaves the checkout as it was"
     );
     assert_eq!(gated.worktree_status(), Some(WorktreeStatus::Active));
-    assert_eq!(gated.events(), ["gate_result"]);
+    assert_eq!(
+        gated.events(),
+        ["gate_result", "sub_agent_requested"],
+        "the request outlives the caller that received it"
+    );
+    assert_eq!(
+        gated.question_state(),
+        QuestionState::Answered,
+        "a merge that did not apply spends nothing"
+    );
 }
 
 #[test]
 fn an_attestation_is_verified_against_git_and_never_merges() {
-    let mut gated = Gated::new(None);
+    let mut gated = Gated::new(GENESIS);
     git(&gated.fixture.checkout, &["merge", "--quiet", BRANCH]);
 
     let verdict = gated.pre_merge(MergePath::Attested);
@@ -620,6 +645,8 @@ fn an_attestation_is_verified_against_git_and_never_merges() {
         gated.events(),
         [
             "gate_result",
+            "run_state_changed",
+            "approval_consumed",
             "merged",
             "run_state_changed",
             "worktree_reclaimable"
@@ -629,7 +656,7 @@ fn an_attestation_is_verified_against_git_and_never_merges() {
 
 #[test]
 fn an_attestation_over_a_tree_that_moved_after_the_approval_is_refused() {
-    let mut gated = Gated::new(None);
+    let mut gated = Gated::new(GENESIS);
     gated.fixture.commit("afterthought.txt", "one more\n");
     git(&gated.fixture.checkout, &["merge", "--quiet", BRANCH]);
 
@@ -644,7 +671,7 @@ fn an_attestation_over_a_tree_that_moved_after_the_approval_is_refused() {
 
 #[test]
 fn an_attestation_that_git_contradicts_is_refused() {
-    let mut gated = Gated::new(None);
+    let mut gated = Gated::new(GENESIS);
 
     assert_eq!(
         refusal(gated.pre_merge(MergePath::Attested)),
@@ -654,26 +681,60 @@ fn an_attestation_that_git_contradicts_is_refused() {
 }
 
 #[test]
-fn a_gate_that_runs_twice_reports_the_same_verdict() {
-    let mut gated = Gated::new(None);
+fn the_authorization_a_merge_spent_is_not_presented_twice() {
+    let mut gated = Gated::new(GENESIS);
 
     assert!(matches!(
         gated.pre_merge(MergePath::Integrate),
         PreMergeVerdict::Merged { .. }
     ));
+    assert_eq!(
+        gated.question_state(),
+        QuestionState::Delivered,
+        "the merge spent the authorization it went through"
+    );
 
-    let verdict = gated.pre_merge(MergePath::Integrate);
+    assert_eq!(
+        refusal(gated.pre_merge(MergePath::Integrate)),
+        GateRefusal::NotAuthorized { state: "delivered" },
+        "the receipt no longer separates the second presentation from the first, so the spent \
+         approval is what refuses it"
+    );
+    assert_eq!(
+        gated.events(),
+        [
+            "gate_result",
+            "run_state_changed",
+            "approval_consumed",
+            "merged",
+            "run_state_changed",
+            "worktree_reclaimable",
+            "gate_result",
+        ],
+        "the authorization is spent between the verdict and the merge it authorized"
+    );
+}
 
-    let PreMergeVerdict::Merged { commit, worktree } = verdict else {
-        panic!("the second run sees the branch already landed, got {verdict:?}");
-    };
-    assert_eq!(commit, None);
-    assert_eq!(worktree, None, "the worktree was already reclaimable");
+#[test]
+fn a_run_that_froze_no_genesis_paths_is_refused_the_merge() {
+    let mut gated = Gated::new(None);
+
+    assert_eq!(
+        refusal(gated.pre_merge(MergePath::Integrate)),
+        GateRefusal::GenesisUnfrozen,
+        "there is no frozen scope to confine the diff to"
+    );
+    assert_eq!(gated.worktree_status(), Some(WorktreeStatus::Active));
+    assert_eq!(
+        gated.question_state(),
+        QuestionState::Answered,
+        "a refusal leaves the authorization where it is"
+    );
 }
 
 #[test]
 fn reclaim_releases_a_worktree_whose_branch_landed() {
-    let mut gated = Gated::new(None);
+    let mut gated = Gated::new(GENESIS);
     git(&gated.fixture.checkout, &["merge", "--quiet", BRANCH]);
 
     let verdict = gated.reclaim();
@@ -690,7 +751,7 @@ fn reclaim_releases_a_worktree_whose_branch_landed() {
 
 #[test]
 fn reclaim_refuses_a_worktree_git_says_is_not_merged() {
-    let mut gated = Gated::new(None);
+    let mut gated = Gated::new(GENESIS);
 
     let verdict = gated.reclaim();
 
@@ -703,7 +764,7 @@ fn reclaim_refuses_a_worktree_git_says_is_not_merged() {
 
 #[test]
 fn reclaim_asks_for_cleanup_before_releasing_a_dirty_worktree() {
-    let mut gated = Gated::new(None);
+    let mut gated = Gated::new(GENESIS);
     git(&gated.fixture.checkout, &["merge", "--quiet", BRANCH]);
     write(&gated.fixture.worktree, "scratch.txt", "uncommitted\n");
 
@@ -715,6 +776,11 @@ fn reclaim_asks_for_cleanup_before_releasing_a_dirty_worktree() {
     assert_eq!(request.kind, SubAgentKind::Cleanup);
     assert_eq!(request.branch.as_deref(), Some(BRANCH));
     assert_eq!(gated.worktree_status(), Some(WorktreeStatus::Active));
+    assert_eq!(
+        gated.events(),
+        ["gate_result", "sub_agent_requested"],
+        "the request outlives the caller that received it"
+    );
 }
 
 #[test]

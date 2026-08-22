@@ -32,10 +32,27 @@
 //! landed and the coordinator verifies it without running a merge
 //! ([`MergePath::Attested`]).
 //!
+//! **The authorization is spent by the merge it authorized.** A landed merge
+//! moves its approval to `delivered` inside [`Gates::pre_merge`], and the
+//! question machine has no transition out of that state. Without it the same
+//! `approval_id` would pass the gate again: once the branch has landed the
+//! paths digest is no longer compared, so nothing else would tell the second
+//! presentation from the first.
+//!
 //! What the gate does **not** do is invoke a sub-agent. A merge that does not
 //! apply, and a worktree that is dirty when the reclaim sweep reaches it, both
-//! leave as a typed [`SubAgentRequest`] for the caller to act on. The
-//! coordinator is deterministic and never invokes a model.
+//! leave as a typed [`SubAgentRequest`] for the caller to act on, and are
+//! journaled beside the verdict that produced them so the request outlives the
+//! caller that received it. The coordinator is deterministic and never invokes
+//! a model.
+//!
+//! **This is the one worktree gate.** The daemon reaches it through the sweep
+//! its composition root runs, built for the span of each sweep from
+//! `ApiCore::machines_mut`. [`crate::GitWorktreeGate`] is not a second one:
+//! it is the narrow git seam the service core's own operations derive and
+//! dispose through, it forms no verdict and moves no row of its own, and both
+//! derive through the same [`SessionWorktrees`] pass so the two sides of a
+//! receipt comparison cannot disagree.
 
 use std::path::Path;
 
@@ -44,8 +61,8 @@ use agens_tools::{GateDerivation, MergeOutcome, SessionWorktrees, WorktreeError}
 use sha2::{Digest, Sha256};
 
 use crate::fsm::{
-    AppliedWorktreeTransition, StateMachines, TransitionOutcome, TransitionRejection,
-    WorktreeFacts, WorktreeTrigger,
+    AppliedWorktreeTransition, QuestionFacts, QuestionTrigger, StateMachines, TransitionOutcome,
+    TransitionRejection, WorktreeFacts, WorktreeTrigger,
 };
 
 /// Which of the two doors a merge came through.
@@ -138,9 +155,9 @@ pub enum PreMergeVerdict {
         /// The merge commit, or `None` when the branch had already landed and
         /// nothing was executed.
         commit: Option<String>,
-        /// `None` when the worktree was already past `active`, so a gate that
-        /// runs twice reports the same verdict rather than failing the second
-        /// time.
+        /// `None` when the worktree was already past `active`. It is the
+        /// attestation path that reaches this: a branch somebody else landed
+        /// and released is still a branch the gate can verify.
         worktree: Option<AppliedWorktreeTransition>,
     },
     IntegrationRequired(SubAgentRequest),
@@ -191,6 +208,10 @@ pub enum GateRefusal {
         charged: i64,
         cap: i64,
     },
+    /// The run never froze its genesis paths, so there is no scope to compare
+    /// the diff against. An unfrozen run merges without confinement, which is
+    /// the one thing the comparison exists to prevent.
+    GenesisUnfrozen,
     /// The diff reaches outside the frozen genesis paths.
     OutsideGenesisPaths {
         paths: Vec<String>,
@@ -214,6 +235,7 @@ impl GateRefusal {
             Self::ReceiptMissing => "receipt_missing",
             Self::ReceiptStale { .. } => "receipt_stale",
             Self::AttemptsExhausted { .. } => "attempts_exhausted",
+            Self::GenesisUnfrozen => "genesis_unfrozen",
             Self::OutsideGenesisPaths { .. } => "outside_genesis_paths",
             Self::NotMerged => "not_merged",
         }
@@ -311,9 +333,10 @@ impl<'a> Gates<'a> {
     /// first because everything after it is a comparison against what git says
     /// now, the authorization is checked against that derivation, the
     /// transaction is checked against the frozen scope, and only then does
-    /// anything land. `gate_result` and `merged` are journaled before the
-    /// worktree becomes reclaimable, so a subscriber never sees a worktree
-    /// released without the verdict that released it.
+    /// anything land. `gate_result`, the authorization being spent and `merged`
+    /// are all journaled before the worktree becomes reclaimable, so a
+    /// subscriber never sees a worktree released without the verdict that
+    /// released it, and never a merge whose authorization is still standing.
     pub fn pre_merge(&mut self, request: &PreMergeRequest) -> Result<PreMergeVerdict, GateError> {
         let run = self.load_run(request.run_id)?;
 
@@ -346,6 +369,7 @@ impl<'a> Gates<'a> {
             request.now,
             &gate_payload(request, Some(&derivation), None),
         )?;
+        self.consume_authorization(request)?;
         self.journal_merged(request, &branch, commit.as_deref())?;
 
         let worktree = self.release_worktree(request.run_id, request.now, &derivation)?;
@@ -387,13 +411,16 @@ impl<'a> Gates<'a> {
                 Some(&GateRefusal::WorktreeDirty),
             )?;
 
-            return Ok(ReclaimVerdict::CleanupRequired(SubAgentRequest {
+            let work = SubAgentRequest {
                 kind: SubAgentKind::Cleanup,
                 run_id: request.run_id,
                 worktree_path: worktree,
                 branch: derivation.branch.clone(),
                 detail: "the worktree holds uncommitted changes".to_owned(),
-            }));
+            };
+            self.journal_sub_agent_request(&work, request.now)?;
+
+            return Ok(ReclaimVerdict::CleanupRequired(work));
         }
 
         self.journal_reclaim_result(request, Some(&derivation), None)?;
@@ -438,14 +465,17 @@ impl<'a> Gates<'a> {
                     &gate_payload(request, Some(derivation), Some("integration_required")),
                 )?;
 
+                let work = SubAgentRequest {
+                    kind: SubAgentKind::Integration,
+                    run_id: request.run_id,
+                    worktree_path: worktree_path(run).unwrap_or_default().to_owned(),
+                    branch: Some(branch.to_owned()),
+                    detail,
+                };
+                self.journal_sub_agent_request(&work, request.now)?;
+
                 Ok(Integration::Refused(PreMergeVerdict::IntegrationRequired(
-                    SubAgentRequest {
-                        kind: SubAgentKind::Integration,
-                        run_id: request.run_id,
-                        worktree_path: worktree_path(run).unwrap_or_default().to_owned(),
-                        branch: Some(branch.to_owned()),
-                        detail,
-                    },
+                    work,
                 )))
             }
         }
@@ -526,7 +556,7 @@ impl<'a> Gates<'a> {
         }
 
         let Some(genesis) = run.genesis_paths.as_deref() else {
-            return Ok(None);
+            return Ok(Some(GateRefusal::GenesisUnfrozen));
         };
         let genesis = parse_genesis_paths(genesis)?;
         let outside = paths_outside(&derivation.changed_paths, &genesis);
@@ -536,6 +566,31 @@ impl<'a> Gates<'a> {
         } else {
             Ok(Some(GateRefusal::OutsideGenesisPaths { paths: outside }))
         }
+    }
+
+    /// Spends the authorization the merge went through.
+    ///
+    /// The question machine has no transition out of `delivered`, so this is
+    /// what makes an approval single-use: the same id presented again lands on
+    /// [`GateRefusal::NotAuthorized`] instead of passing a receipt comparison
+    /// that a landed branch has already made vacuous.
+    ///
+    /// It runs after the verdict is journaled and before `merged` is, so the
+    /// journal can hold neither a merge whose authorization was never spent nor
+    /// a spent authorization with no verdict behind it. A refusal never reaches
+    /// here: the approval stands, bound to bytes that did not move, and asking
+    /// again is the caller's.
+    fn consume_authorization(&mut self, request: &PreMergeRequest) -> Result<(), GateError> {
+        self.machines.apply_question(
+            request.approval_id,
+            QuestionTrigger::Deliver,
+            &QuestionFacts {
+                now: request.now,
+                ..QuestionFacts::default()
+            },
+        )?;
+
+        Ok(())
     }
 
     /// Moves the worktree to `reclaimable`, reporting `None` when it was
@@ -601,6 +656,36 @@ impl<'a> Gates<'a> {
         self.journal_gate_result(request.run_id, request.now, &payload)
     }
 
+    /// Records work the coordinator is not allowed to do itself.
+    ///
+    /// It lands in the journal rather than only in the return value because the
+    /// caller that receives it has nowhere durable to put it: the coordinator
+    /// never reaches a model, so the request waits here for the surface that
+    /// does.
+    fn journal_sub_agent_request(
+        &mut self,
+        work: &SubAgentRequest,
+        now: i64,
+    ) -> Result<(), GateError> {
+        let payload = serde_json::json!({
+            "kind": work.kind.as_str(),
+            "worktree_path": work.worktree_path,
+            "branch": work.branch,
+            "detail": work.detail,
+        });
+
+        self.machines.journal(&[EventRow {
+            id: None,
+            run_id: Some(work.run_id),
+            event_type: SUB_AGENT_EVENT.to_owned(),
+            class: EventClass::Infra,
+            payload: payload.to_string(),
+            ts: now,
+        }])?;
+
+        Ok(())
+    }
+
     fn journal_gate_result(
         &mut self,
         run_id: i64,
@@ -652,6 +737,9 @@ impl<'a> Gates<'a> {
             .ok_or(GateError::NoSuchRun(run_id))
     }
 }
+
+/// The journal entry a gate's sub-agent request becomes.
+pub(crate) const SUB_AGENT_EVENT: &str = "sub_agent_requested";
 
 /// Freezes the receipt an approval over `worktree` is bound to.
 ///
