@@ -158,7 +158,17 @@ fn execute(
     runtime: &SessionRuntime,
 ) -> SessionOutcome {
     if !await_running(core, run.run_id) {
-        return SessionOutcome::Failed;
+        // This session is not going to execute the run, so a row that reached
+        // `running` just past the deadline must not be left holding a slot
+        // with nothing behind it. A run still queued has no transition out on
+        // this trigger and stays exactly where it is, which is what a launch
+        // whose admission never landed should leave behind.
+        return report(
+            core,
+            run.run_id,
+            RunTrigger::AttemptFailed,
+            SessionOutcome::Failed,
+        );
     }
 
     let introspection = introspection_factory(core, run);
