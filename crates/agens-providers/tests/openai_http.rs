@@ -745,6 +745,47 @@ fn openai_stops_retrying_a_stream_cut_at_the_attempt_budget() {
     assert_eq!(server.join(), 3);
 }
 
+/// A named `Retry-After` replaces the exponential schedule instead of being
+/// bounded by it, so the attempt budget alone said nothing about how long a
+/// request could be held: eight attempts against a provider that names the
+/// maximum delay every time is minutes, not the schedule's ninety seconds.
+///
+/// The total wait is what ends this one, well before the attempts run out.
+#[test]
+fn openai_stops_retrying_when_the_total_wait_budget_is_spent() {
+    let server = RetryResponsesServer::start(vec![
+        RetryResponse::StatusWithRetryAfter(429, "0.04"),
+        RetryResponse::StatusWithRetryAfter(429, "0.04"),
+        RetryResponse::StatusWithRetryAfter(429, "0.04"),
+        RetryResponse::StatusWithRetryAfter(429, "0.04"),
+        RetryResponse::StatusWithRetryAfter(429, "0.04"),
+        RetryResponse::StatusWithRetryAfter(429, "0.04"),
+        RetryResponse::StatusWithRetryAfter(429, "0.04"),
+        RetryResponse::StatusWithRetryAfter(429, "0.04"),
+    ]);
+    let policy = RetryPolicy::new(
+        8,
+        Duration::from_millis(10),
+        Duration::from_millis(40),
+        Duration::from_millis(40),
+        Duration::from_millis(100),
+    );
+
+    assert_eq!(
+        run_provider_with_retry_policy(
+            server.base_url(),
+            &HeadlessTurnCancellation::new(),
+            Duration::from_secs(2),
+            policy,
+            None,
+        ),
+        Err(HeadlessTurnPortError::ProviderRateLimited)
+    );
+    // Two waits of the capped 40ms fit the 100ms budget and a third does not,
+    // so the eight-attempt budget is never reached.
+    assert_eq!(server.join(), 3);
+}
+
 /// Connection failures used to be exempt from the attempt budget and retried
 /// once a second forever. An interactive turn carries no deadline of its own,
 /// so that was a spinner with no end.
@@ -1584,6 +1625,7 @@ fn brisk_retry_policy(max_attempts: usize) -> RetryPolicy {
         Duration::from_millis(10),
         Duration::from_millis(40),
         Duration::from_millis(40),
+        Duration::from_secs(60),
     )
 }
 
