@@ -6062,15 +6062,24 @@ fn journey_runs_without_any_real_credential_in_its_environment() {
     provider.write_configuration(&journey.config_home, &journey.data_directory, "");
 
     let mut command = isolated_agens_command(&journey.temporary);
-    let exported: Vec<String> = command
+    // An inherited variable is absent from `get_envs` entirely, so checking that
+    // none is set would pass on a machine that leaks one. What proves the
+    // isolation is the removal entry itself: a `None` value is the command
+    // saying it will unset that variable whatever the parent exported.
+    let mut removed: Vec<&str> = command
         .command()
         .get_envs()
         .filter_map(|(name, value)| {
-            let name = name.to_string_lossy().into_owned();
-            (value.is_some() && agens_fixtures::PROVIDER_CREDENTIAL_VARIABLES.contains(&&*name))
-                .then_some(name)
+            let name = name.to_str()?;
+            let removed = agens_fixtures::PROVIDER_CREDENTIAL_VARIABLES
+                .into_iter()
+                .find(|credential| *credential == name)?;
+            value.is_none().then_some(removed)
         })
         .collect();
+    let mut expected = Vec::from(agens_fixtures::PROVIDER_CREDENTIAL_VARIABLES);
+    removed.sort_unstable();
+    expected.sort_unstable();
     let result = command
         .current_dir(&journey.project_root)
         .args(["chat", "answer from the fake only"])
@@ -6078,9 +6087,9 @@ fn journey_runs_without_any_real_credential_in_its_environment() {
         .output()
         .expect("production binary should run the journey");
 
-    assert!(
-        exported.is_empty(),
-        "an isolated journey still exported provider credentials: {exported:?}"
+    assert_eq!(
+        removed, expected,
+        "an isolated journey must unset every provider credential variable"
     );
     assert_eq!(
         journey_stdout(&result, &provider),

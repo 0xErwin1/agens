@@ -377,9 +377,10 @@ impl ScriptedProvider {
     /// is how eleven of them drifted apart. `extra` is appended verbatim for
     /// the sections a journey adds on top, such as `[permissions]`.
     pub fn provider_configuration(&self, data_directory: &Path, extra: &str) -> String {
-        let (provider, model) = match self.dialect {
-            ScriptedDialect::Responses => ("openai-api", "openai-api/gpt-4.1"),
-            ScriptedDialect::ChatCompletions => ("moonshotai", "moonshotai/kimi-k3"),
+        let provider = self.provider_name();
+        let model = match self.dialect {
+            ScriptedDialect::Responses => "openai-api/gpt-4.1",
+            ScriptedDialect::ChatCompletions => "moonshotai/kimi-k3",
         };
 
         format!(
@@ -399,15 +400,22 @@ impl ScriptedProvider {
         )
         .expect("journey configuration should be written");
 
-        let provider = match self.dialect {
-            ScriptedDialect::Responses => "openai-api",
-            ScriptedDialect::ChatCompletions => "moonshotai",
-        };
         std::fs::write(
             config_home.join("auth.json"),
-            format!(r#"{{"{provider}": {{"api_key": "fixture"}}}}"#),
+            format!(
+                r#"{{"{}": {{"api_key": "fixture"}}}}"#,
+                self.provider_name()
+            ),
         )
         .expect("journey credentials should be written");
+    }
+
+    /// The configured provider that speaks this server's dialect.
+    fn provider_name(&self) -> &'static str {
+        match self.dialect {
+            ScriptedDialect::Responses => "openai-api",
+            ScriptedDialect::ChatCompletions => "moonshotai",
+        }
     }
 
     fn locked(&self) -> std::sync::MutexGuard<'_, ServerState> {
