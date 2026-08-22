@@ -575,6 +575,7 @@ fn an_applied_transition_writes_the_state_change_and_every_event_together() {
             }),
             worktree_status: None,
             question: None,
+            new_question: None,
             attempt: None,
             provider: None,
             events: &[
@@ -613,6 +614,7 @@ fn a_transition_against_a_state_the_run_already_left_writes_nothing() {
             }),
             worktree_status: None,
             question: None,
+            new_question: None,
             attempt: None,
             provider: None,
             events: &[event(run_id, "run_state_changed")],
@@ -679,6 +681,7 @@ fn a_transition_carries_its_attempt_question_and_provider_writes() {
                     author: QuestionAuthor::User,
                 }),
             }),
+            new_question: None,
             attempt: Some(&AttemptRow {
                 id: None,
                 run_id,
@@ -766,6 +769,7 @@ fn a_question_write_that_loses_its_race_rolls_back_the_run_state_with_it() {
                 next: QuestionState::Delivered,
                 answer: None,
             }),
+            new_question: None,
             attempt: None,
             provider: None,
             events: &[event(run_id, "run_state_changed")],
@@ -784,6 +788,166 @@ fn a_question_write_that_loses_its_race_rolls_back_the_run_state_with_it() {
     assert!(store.events_for_run(run_id).unwrap().is_empty());
 
     fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn a_recorded_checkpoint_attributes_every_finding_to_its_own_journal_entry() {
+    let directory = data_directory();
+    let mut store = ControlPlaneStore::open(&directory).unwrap();
+    let run_id = store.insert_run(&draft_run()).unwrap();
+
+    let write = store
+        .record_checkpoint(
+            &event(run_id, "checkpoint"),
+            &[
+                finding(run_id, "the header parser rejects an empty name"),
+                finding(run_id, "the caller still passes the old shape"),
+            ],
+        )
+        .unwrap();
+
+    assert_eq!(write.finding_ids.len(), 2);
+    assert_eq!(event_types(&store, run_id), vec!["checkpoint".to_owned()]);
+
+    let checkpoint_ids: Vec<Option<i64>> = store
+        .findings_for_run(run_id)
+        .unwrap()
+        .into_iter()
+        .map(|finding| finding.checkpoint_id)
+        .collect();
+
+    assert_eq!(
+        checkpoint_ids,
+        vec![Some(write.checkpoint_id), Some(write.checkpoint_id)],
+        "a finding recorded with a checkpoint has to point at it"
+    );
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+/// The journal entry and the findings are one report, so a finding the schema
+/// refuses takes the whole checkpoint with it rather than leaving an entry
+/// claiming evidence nothing recorded.
+#[test]
+fn a_checkpoint_whose_finding_is_refused_writes_no_journal_entry_either() {
+    let directory = data_directory();
+    let mut store = ControlPlaneStore::open(&directory).unwrap();
+    let run_id = store.insert_run(&draft_run()).unwrap();
+
+    let error = store
+        .record_checkpoint(
+            &event(run_id, "checkpoint"),
+            &[finding(run_id, "this one is fine"), finding(run_id, "")],
+        )
+        .unwrap_err();
+
+    assert!(!error.is_conflict(), "{error}");
+    assert!(store.events_for_run(run_id).unwrap().is_empty());
+    assert!(store.findings_for_run(run_id).unwrap().is_empty());
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn a_transition_opens_its_question_in_the_same_write_as_the_state_change() {
+    let directory = data_directory();
+    let mut store = ControlPlaneStore::open(&directory).unwrap();
+    let run_id = store
+        .insert_run(&RunRow {
+            state: RunState::Running,
+            ..draft_run()
+        })
+        .unwrap();
+
+    let outcome = store
+        .apply_transition(&TransitionWrite {
+            run_id,
+            run_state: Some(StateChange {
+                expected: RunState::Running,
+                next: RunState::AwaitingInput,
+            }),
+            worktree_status: None,
+            question: None,
+            new_question: Some(&question_in(run_id, QuestionState::Open)),
+            attempt: None,
+            provider: None,
+            events: &[event(run_id, "run_state_changed")],
+        })
+        .unwrap();
+
+    let question_id = outcome.question_id.expect("the transition opened one");
+
+    assert_eq!(
+        store.load_question(question_id).unwrap().unwrap().state,
+        QuestionState::Open
+    );
+    assert_eq!(
+        store.load_run(run_id).unwrap().unwrap().state,
+        RunState::AwaitingInput
+    );
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+/// A run that did not park leaves no question behind: an open row against a
+/// run that is still moving is an inbox entry nobody can act on.
+#[test]
+fn a_refused_transition_opens_no_question() {
+    let directory = data_directory();
+    let mut store = ControlPlaneStore::open(&directory).unwrap();
+    let run_id = store.insert_run(&draft_run()).unwrap();
+
+    let error = store
+        .apply_transition(&TransitionWrite {
+            run_id,
+            run_state: Some(StateChange {
+                expected: RunState::Running,
+                next: RunState::AwaitingInput,
+            }),
+            worktree_status: None,
+            question: None,
+            new_question: Some(&question_in(run_id, QuestionState::Open)),
+            attempt: None,
+            provider: None,
+            events: &[event(run_id, "run_state_changed")],
+        })
+        .unwrap_err();
+
+    assert!(error.is_conflict(), "{error}");
+    assert!(store.questions_for_run(run_id).unwrap().is_empty());
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+fn question_in(run_id: i64, state: QuestionState) -> QuestionRow {
+    QuestionRow {
+        id: None,
+        run_id,
+        kind: QuestionKind::Question,
+        blocked_decision: "which schema wins".to_owned(),
+        options: "[]".to_owned(),
+        recommendation: None,
+        answer: None,
+        author: None,
+        expires_at: None,
+        tree_hash: None,
+        paths_digest: None,
+        state,
+        created_at: 1_700_000_100,
+    }
+}
+
+fn finding(run_id: i64, description: &str) -> FindingRow {
+    FindingRow {
+        id: None,
+        run_id,
+        checkpoint_id: None,
+        description: description.to_owned(),
+        evidence_class: EvidenceClass::Deterministic,
+        proof_refs: "[\"cargo test -p agens-store => 0\"]".to_owned(),
+        causal_disposition: CausalDisposition::CandidateCaused,
+        created_at: 1_700_000_100,
+    }
 }
 
 fn event(run_id: i64, event_type: &str) -> EventRow {

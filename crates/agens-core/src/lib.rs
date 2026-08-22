@@ -21,6 +21,7 @@ pub mod prompt;
 pub mod prompt_memory;
 pub mod redaction;
 mod request_config;
+pub mod run_introspection;
 pub mod summary;
 
 pub use permission_precedence::{

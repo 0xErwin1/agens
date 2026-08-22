@@ -9,8 +9,8 @@
 //! replanning opens a new run that inherits the worktree and the lineage.
 
 use agens_store::{
-    AttemptRow, EventClass, ProviderRow, QuestionState, QuotaState, RetryTrigger, RunState,
-    StateChange, TransitionWrite, WorktreeStatus,
+    AttemptRow, EventClass, ProviderRow, QuestionRow, QuestionState, QuotaState, RetryTrigger,
+    RunState, StateChange, TransitionWrite, WorktreeStatus,
 };
 
 use super::{
@@ -88,6 +88,11 @@ pub enum RunGuard {
     ReportedByHarness,
     /// The named question belongs to this run and has been answered.
     AnsweredQuestion,
+    /// The coordinator reports the `ask`, and it carries the question the run
+    /// is about to park on. Without the question half a run reaches
+    /// `awaiting_input` with nothing to answer, which is a state nothing can
+    /// bring it back out of.
+    AskOpensQuestion,
     /// The provider is serving again: either its recorded reset time has
     /// passed, or the cap has already been lifted. Re-derived from the provider
     /// row rather than taken from the caller, because the timer wheel keeps no
@@ -115,6 +120,7 @@ impl RunGuard {
             Self::SchedulerAdmission => "scheduler_admission",
             Self::ReportedByHarness => "reported_by_harness",
             Self::AnsweredQuestion => "answered_question",
+            Self::AskOpensQuestion => "ask_opens_question",
             Self::QuotaResetElapsed => "quota_reset_elapsed",
             Self::RetryEligible => "retry_eligible",
             Self::BootReconciliation => "boot_reconciliation",
@@ -135,6 +141,9 @@ pub enum RunEffect {
     FreezeApprovedScope,
     /// Opens attempt N+1, with its own cost and duration.
     OpenAttempt,
+    /// Writes the durable question the run parks on. `ask` is the only way a
+    /// question comes into being: one buried in a transcript does not exist.
+    OpenQuestion,
     LaunchSession,
     /// The worker does not stay resident: an hours-long wait held in memory is
     /// state a restart cannot rebuild.
@@ -201,8 +210,12 @@ pub static RUN_TRANSITIONS: &[RunTransition] = &[
         from: RunState::Running,
         trigger: RunTrigger::Ask,
         to: RunState::AwaitingInput,
-        guard: RunGuard::ReportedByHarness,
-        effects: &[RunEffect::ReleaseSlot, RunEffect::SuspendSession],
+        guard: RunGuard::AskOpensQuestion,
+        effects: &[
+            RunEffect::OpenQuestion,
+            RunEffect::ReleaseSlot,
+            RunEffect::SuspendSession,
+        ],
         domain_event: "run_awaiting_input",
         class: EventClass::Agent,
     },
@@ -340,6 +353,8 @@ pub struct RunFacts {
     pub worktree_ready: bool,
     /// The answered question this run was blocked on.
     pub answered_question_id: Option<i64>,
+    /// The question `ask` opens, written in the same transaction as the park.
+    pub opened_question: Option<QuestionRow>,
     /// When the capped provider says it will serve again. `None` means it named
     /// no reset, so nothing can wake the parked runs on a timer.
     pub quota_reset_at: Option<i64>,
@@ -428,6 +443,11 @@ impl StateMachines {
             }),
             worktree_status: None,
             question: None,
+            new_question: transition
+                .effects
+                .contains(&RunEffect::OpenQuestion)
+                .then_some(facts.opened_question.as_ref())
+                .flatten(),
             attempt: attempt.as_ref(),
             provider: provider.as_ref(),
             events: &events,
@@ -442,6 +462,7 @@ impl StateMachines {
             domain_event: transition.domain_event,
             state_changed_event_id,
             domain_event_id,
+            opened_question_id: outcome.question_id,
         }))
     }
 
@@ -513,6 +534,26 @@ impl StateMachines {
                     }
                 }
             },
+            RunGuard::AskOpensQuestion => {
+                if facts.principal != Principal::Coordinator {
+                    return refuse(format!(
+                        "{} cannot report a run's own lifecycle facts",
+                        facts.principal.as_str()
+                    ));
+                }
+
+                match facts.opened_question.as_ref() {
+                    Some(question) if question.run_id == run_id => Ok(()),
+                    Some(question) => refuse(format!(
+                        "the question carries run {} rather than {run_id}",
+                        question.run_id
+                    )),
+                    None => refuse(
+                        "a run cannot park on awaiting_input without the question it parks on"
+                            .to_owned(),
+                    ),
+                }
+            }
             RunGuard::QuotaResetElapsed => match self.store.load_provider(provider)? {
                 Some(row) if row.quota_state == QuotaState::Ok => Ok(()),
                 Some(row) => match row.reset_at {

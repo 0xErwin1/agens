@@ -38,6 +38,7 @@ mod http_mcp;
 pub mod http_worker;
 pub mod markdown;
 mod mcp_status;
+mod run_introspection;
 mod stdio_mcp;
 mod task;
 mod working_directory;
@@ -58,6 +59,7 @@ pub use mcp_status::{
     McpLoadPhase, McpServerDescriptor, McpServerSource, McpServerStatus, McpServerTransport,
     McpStatusError, McpStatusHandle, McpStatusSnapshot,
 };
+pub use run_introspection::{AskTool, CheckpointTool};
 pub use stdio_mcp::{MAX_MCP_FRAME_BYTES, McpStdioTransport, McpStdioTransportConfig};
 pub use task::{
     TaskControlAction, TaskControlTool, TaskDeclarationRejection, TaskExecutionEvent,
@@ -6333,13 +6335,44 @@ pub fn is_session_scoped_native_tool(name: &str) -> bool {
         .any(|registered| bare == registered)
 }
 
-pub const NATIVE_TOOLS_REGISTERED_OUTSIDE_THE_CATALOG: [&str; 5] = [
+pub const NATIVE_TOOLS_REGISTERED_OUTSIDE_THE_CATALOG: [&str; 7] = [
+    "native::ask",
     "native::ask_user",
+    "native::checkpoint",
     "native::skill",
     "native::task",
     "native::task_control",
     "native::task_message",
 ];
+
+/// Native tools that report on the run the session is executing, rather than
+/// acting inside the project.
+///
+/// They stay with the thread that owns the session, for the reason
+/// [`SESSION_SCOPED_NATIVE_TOOLS`] gives and one more. A delegated child runs
+/// inside its parent's attempt and reports through the execution that launched
+/// it, so a child calling `checkpoint` would file evidence and a promised
+/// deadline against a run it does not own, and a child calling `ask` would park
+/// a session the thread that delegated to it never asked to stop. The authority
+/// to speak for the run is not inherited.
+///
+/// Enforced by absence, the same way `cd` and `worktree` are: neither name is
+/// on the surface a child is resolved against, so no declaration can reopen one
+/// and no child runtime registers it.
+pub const RUN_AUTHORITY_NATIVE_TOOLS: [&str; 2] = ["native::checkpoint", "native::ask"];
+
+/// Whether `name` is one of the natives that speak for the run. The name is
+/// reduced through [`agens_core::bare_tool_name`], so the answer cannot depend
+/// on which spelling of the tool reached it.
+#[must_use]
+pub fn is_run_authority_native_tool(name: &str) -> bool {
+    let bare = agens_core::bare_tool_name(name);
+
+    RUN_AUTHORITY_NATIVE_TOOLS
+        .iter()
+        .filter_map(|registered| registered.strip_prefix("native::"))
+        .any(|registered| bare == registered)
+}
 
 /// Canonical production catalog for the built-in project-confined tools.
 #[derive(Debug)]

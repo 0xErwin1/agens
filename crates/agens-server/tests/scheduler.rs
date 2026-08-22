@@ -16,9 +16,10 @@ use std::{
 use agens_core::SessionMetadata;
 use agens_server::{
     Admission, AdmissionFailure, Deferral, Ineligible, LaunchError, LaunchedSession, PendingRun,
-    Principal, QueueReport, RunFacts, RunLauncher, RunSession, RunTrigger, Scheduler,
-    SchedulerLimits, SchedulerLoad, SessionAdmission, SessionBudget, SessionId, SessionOutcome,
-    SessionProvider, SessionRuntime, SessionSupervisor, StateMachines, SupervisorLauncher,
+    Principal, QuestionFacts, QuestionTrigger, QueueReport, RunFacts, RunLauncher, RunSession,
+    RunTrigger, Scheduler, SchedulerLimits, SchedulerLoad, SessionAdmission, SessionBudget,
+    SessionId, SessionOutcome, SessionProvider, SessionRuntime, SessionSupervisor, StateMachines,
+    SupervisorLauncher,
 };
 use agens_store::{
     ControlPlaneStore, ProviderRow, QuestionAuthor, QuestionKind, QuestionRow, QuestionState,
@@ -99,6 +100,7 @@ impl Harness {
                     next: WorktreeStatus::Reclaimable,
                 }),
                 question: None,
+                new_question: None,
                 attempt: None,
                 provider: None,
                 events: &[],
@@ -141,28 +143,47 @@ impl Harness {
 
     /// Parks a running run on a question and answers it: the other way a run
     /// reaches the queue as resumed.
+    ///
+    /// The question is opened by the `ask` transition itself rather than
+    /// inserted beside it, because that is the only way a question comes into
+    /// being: a run cannot park on `awaiting_input` with nothing to answer.
     fn park_on_question_and_answer(&mut self, run_id: i64) {
-        self.machines
-            .apply_run(run_id, RunTrigger::Ask, &coordinator_facts())
-            .unwrap();
-
-        let question_id = self
-            .setup
-            .insert_question(&QuestionRow {
+        let parked = RunFacts {
+            opened_question: Some(QuestionRow {
                 id: None,
                 run_id,
                 kind: QuestionKind::Question,
                 blocked_decision: "which branch".to_owned(),
                 options: "[\"main\",\"next\"]".to_owned(),
                 recommendation: None,
-                answer: Some("main".to_owned()),
-                author: Some(QuestionAuthor::User),
+                answer: None,
+                author: None,
                 expires_at: None,
                 tree_hash: None,
                 paths_digest: None,
-                state: QuestionState::Answered,
+                state: QuestionState::Open,
                 created_at: NOW,
-            })
+            }),
+            ..coordinator_facts()
+        };
+        let question_id = self
+            .machines
+            .apply_run(run_id, RunTrigger::Ask, &parked)
+            .unwrap()
+            .applied()
+            .and_then(|transition| transition.opened_question_id)
+            .expect("the ask opened the question it parked on");
+
+        self.machines
+            .apply_question(
+                question_id,
+                QuestionTrigger::Answer,
+                &QuestionFacts {
+                    now: NOW,
+                    answer: Some("main".to_owned()),
+                    author: Some(QuestionAuthor::User),
+                },
+            )
             .unwrap();
 
         let answered = RunFacts {
@@ -388,6 +409,7 @@ impl RunLauncher for RecordingLauncher {
                     }),
                     worktree_status: None,
                     question: None,
+                    new_question: None,
                     attempt: None,
                     provider: None,
                     events: &[],
