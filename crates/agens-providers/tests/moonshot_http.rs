@@ -18,7 +18,7 @@ use agens_core::{
     HeadlessTurnCancellation, HeadlessTurnPortError, Message, MessagePart, ReasoningEffort,
     RequestConfig, Role, TurnEvent, TurnProvider,
 };
-use agens_providers::{MoonshotProvider, OpenAiFunctionTool, ProviderFailureDetail};
+use agens_providers::{MoonshotProvider, OpenAiFunctionTool, ProviderFailureDetail, RetryPolicy};
 use serde_json::{Value, json};
 
 const SECRET_BODY_SENTINEL: &str = "SENTINEL_REMOTE_ERROR_BODY";
@@ -277,6 +277,9 @@ fn reasoning_effort_reaches_the_wire_for_the_model_that_takes_it() {
     assert_eq!(server.take_body()["reasoning_effort"], json!("max"));
 }
 
+/// The failure is a network one rather than a protocol one: nothing the
+/// decoder read was wrong, there was simply less of it than the dialect
+/// promises. This stream already showed text, so it is not asked for again.
 #[test]
 fn a_stream_that_ends_without_a_finish_reason_fails_the_turn() {
     let server = SseServer::start(vec![sse(&[
@@ -290,7 +293,7 @@ fn a_stream_that_ends_without_a_finish_reason_fails_the_turn() {
         .block_on(provider.next_parts(&[], &cancellation))
         .expect_err("a truncated stream must not read as a complete turn");
 
-    assert_eq!(error, HeadlessTurnPortError::ProviderProtocol);
+    assert_eq!(error, HeadlessTurnPortError::ProviderNetwork);
 }
 
 #[test]
@@ -513,11 +516,118 @@ fn queued_user_messages_join_the_replayed_history() {
     assert_eq!(messages[1]["content"], json!("and also this"));
 }
 
-fn sse(chunks: &[Value]) -> String {
+/// A stream cut before anything reached the reader is a dropped connection,
+/// not a malformed response, and asking for it again costs nothing: this was
+/// the one provider that surfaced it as a failed turn instead.
+#[test]
+fn moonshot_retries_a_stream_cut_before_it_produced_output() {
+    let server = SseServer::start(vec![
+        cut_sse(&[
+            json!({"choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": null}]}),
+        ]),
+        sse(&[
+            json!({"choices": [{"index": 0, "delta": {"content": "hi"}, "finish_reason": null}]}),
+            json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+        ]),
+    ]);
+
+    let mut provider = provider(&server.address().to_string(), Vec::new())
+        .with_retry_policy(brisk_retry_policy(4));
+    let cancellation = HeadlessTurnCancellation::new();
+
+    let parts = runtime()
+        .block_on(provider.next_parts(&[], &cancellation))
+        .expect("the retried turn should complete");
+
+    assert_eq!(parts, vec![MessagePart::Text("hi".to_owned())]);
+    let _cut = server.take_body();
+    assert!(
+        server.try_take_body().is_some(),
+        "the cut stream must be asked for a second time"
+    );
+}
+
+/// The retry only holds while nothing has been shown: replaying a stream after
+/// its text reached the reader would print that text twice.
+#[test]
+fn moonshot_does_not_retry_a_stream_cut_after_it_produced_output() {
+    let server = SseServer::start(vec![
+        cut_sse(&[
+            json!({"choices": [{"index": 0, "delta": {"content": "half an answer"}, "finish_reason": null}]}),
+        ]),
+        sse(&[
+            json!({"choices": [{"index": 0, "delta": {"content": "whole"}, "finish_reason": "stop"}]}),
+        ]),
+    ]);
+
+    let mut provider = provider(&server.address().to_string(), Vec::new())
+        .with_retry_policy(brisk_retry_policy(4));
+    let cancellation = HeadlessTurnCancellation::new();
+
+    let error = runtime()
+        .block_on(provider.next_parts(&[], &cancellation))
+        .expect_err("a cut that already showed text must not be replayed");
+
+    assert_eq!(error, HeadlessTurnPortError::ProviderNetwork);
+    let _cut = server.take_body();
+    assert!(
+        server.try_take_body().is_none(),
+        "a stream that produced output must not be asked for again"
+    );
+}
+
+/// A stream cut every time still ends, and it ends against the attempt budget
+/// rather than against the reader's patience.
+#[test]
+fn moonshot_stops_retrying_a_stream_cut_at_the_attempt_budget() {
+    let cut = || {
+        cut_sse(&[
+            json!({"choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": null}]}),
+        ])
+    };
+    let server = SseServer::start(vec![cut(), cut(), cut(), cut()]);
+
+    let mut provider = provider(&server.address().to_string(), Vec::new())
+        .with_retry_policy(brisk_retry_policy(3));
+    let cancellation = HeadlessTurnCancellation::new();
+
+    let error = runtime()
+        .block_on(provider.next_parts(&[], &cancellation))
+        .expect_err("a stream cut every time must end as a network failure");
+
+    assert_eq!(error, HeadlessTurnPortError::ProviderNetwork);
+    for _ in 0..3 {
+        let _attempt = server.take_body();
+    }
+    assert!(
+        server.try_take_body().is_none(),
+        "the attempt budget bounds the retries"
+    );
+}
+
+/// A schedule short enough to sleep through in a test, with the same shape as
+/// the production one.
+fn brisk_retry_policy(max_attempts: usize) -> RetryPolicy {
+    RetryPolicy::new(
+        max_attempts,
+        Duration::from_millis(10),
+        Duration::from_millis(40),
+        Duration::from_millis(40),
+    )
+}
+
+/// A stream that ends before it says how the turn ended, which is what a
+/// connection cut mid-answer looks like from here.
+fn cut_sse(chunks: &[Value]) -> String {
     let mut body = String::new();
     for chunk in chunks {
         body.push_str(&format!("data: {chunk}\n\n"));
     }
+    body
+}
+
+fn sse(chunks: &[Value]) -> String {
+    let mut body = cut_sse(chunks);
     body.push_str("data: [DONE]\n\n");
     body
 }

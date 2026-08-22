@@ -159,6 +159,18 @@ impl CompletionsDecoder {
         self.finish_reason.as_deref() == Some("tool_calls")
     }
 
+    /// Whether the stream said how the turn ended. A body that runs out
+    /// without it was cut rather than completed.
+    pub(super) const fn saw_finish_reason(&self) -> bool {
+        self.finish_reason.is_some()
+    }
+
+    /// Whether anything the reader could already have seen was decoded, which
+    /// is what makes a failed stream unsafe to ask for again.
+    pub(super) fn produced_output(&self) -> bool {
+        !self.text.is_empty() || !self.reasoning.is_empty() || !self.calls.is_empty()
+    }
+
     /// Consumes the decoder into the parts of the turn.
     ///
     /// A stream that ends without a finish reason is an error rather than a

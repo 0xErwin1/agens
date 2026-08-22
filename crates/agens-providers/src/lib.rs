@@ -2710,18 +2710,18 @@ pub(crate) struct StreamFailure {
 }
 
 impl StreamFailure {
-    const fn new(error: HeadlessTurnPortError, surfaced_output: bool) -> Self {
+    pub(crate) const fn new(error: HeadlessTurnPortError, surfaced_output: bool) -> Self {
         Self {
             error,
             surfaced_output,
         }
     }
 
-    const fn is_resumable(self) -> bool {
+    pub(crate) const fn is_resumable(self) -> bool {
         !self.surfaced_output && matches!(self.error, HeadlessTurnPortError::ProviderNetwork)
     }
 
-    const fn into_port_error(self) -> HeadlessTurnPortError {
+    pub(crate) const fn into_port_error(self) -> HeadlessTurnPortError {
         self.error
     }
 }
