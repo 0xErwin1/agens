@@ -196,6 +196,31 @@ impl StateMachines {
         &self.store
     }
 
+    /// Journals facts that no transition carries, in one transaction and in the
+    /// order given.
+    ///
+    /// A gate's verdict is the case this exists for: it is a fact about a run
+    /// whether or not anything moved, and a refused gate moves nothing at all.
+    /// Routing it through here rather than a second store handle keeps this the
+    /// only writer of the control-plane tables, which is the property the
+    /// machines, the scheduler and the timers are built on.
+    pub fn journal(&mut self, events: &[EventRow]) -> Result<Vec<i64>, TransitionRejection> {
+        let outcome = self.store.apply_transition(&agens_store::TransitionWrite {
+            run_id: events
+                .first()
+                .and_then(|event| event.run_id)
+                .unwrap_or_default(),
+            run_state: None,
+            worktree_status: None,
+            question: None,
+            attempt: None,
+            provider: None,
+            events,
+        })?;
+
+        Ok(outcome.event_ids)
+    }
+
     fn load_run(&self, run_id: i64) -> Result<RunRow, TransitionRejection> {
         self.store
             .load_run(run_id)?
