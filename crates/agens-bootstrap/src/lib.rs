@@ -105,6 +105,26 @@ impl Clone for Bootstrap {
 }
 
 impl Bootstrap {
+    /// This configuration, for a peer session rather than for another turn of
+    /// the same one.
+    ///
+    /// [`Clone`] deliberately shares [`Self::mcp_registry`], which is what lets
+    /// a per-turn bootstrap reach the connections the session already opened
+    /// instead of reconnecting every prompt. Two independent sessions sharing
+    /// it is the same mechanism turning into a fault: every MCP tool call in
+    /// either session queues behind the one `Mutex`, and closing the registry
+    /// at the end of one session kills the servers the other is still using.
+    ///
+    /// So a caller admitting a NEW session derives it here. Everything else is
+    /// process-wide and stays shared, including the MCP status handle the
+    /// failure-visibility surfaces read.
+    pub fn for_new_session(&self) -> Self {
+        Self {
+            mcp_registry: SharedMcpRegistry::default(),
+            ..self.clone()
+        }
+    }
+
     pub fn paths(&self) -> &ConfigPaths {
         &self.paths
     }
@@ -549,8 +569,11 @@ pub fn discover_skill_catalog(
 
 #[cfg(test)]
 mod tests {
-    use super::provider_api_key;
+    use super::{HostEnvironment, provider_api_key};
     use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use agens_tools::McpRegistry;
 
     fn environment(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
         pairs
@@ -614,5 +637,49 @@ mod tests {
             provider_api_key("openai-chatgpt", Some(CREDENTIALS), &environment),
             None
         );
+    }
+
+    fn bootstrap() -> super::Bootstrap {
+        let host =
+            HostEnvironment::fixed(std::env::temp_dir(), None, BTreeMap::new(), BTreeMap::new());
+
+        super::resolve(&host).expect("an empty configuration resolves")
+    }
+
+    /// The registry two peers would share if a session were derived by cloning.
+    fn registry_of(bootstrap: &super::Bootstrap) -> Arc<std::sync::Mutex<McpRegistry>> {
+        bootstrap
+            .mcp_registry
+            .get_or_init(McpRegistry::new)
+            .expect("a fresh slot is never poisoned")
+    }
+
+    #[test]
+    fn two_sessions_derived_for_admission_never_share_one_mcp_registry() {
+        let bootstrap = bootstrap();
+
+        let first = bootstrap.for_new_session();
+        let second = bootstrap.for_new_session();
+
+        assert!(
+            !Arc::ptr_eq(&registry_of(&first), &registry_of(&second)),
+            "peers sharing one registry would queue every MCP call behind one lock \
+             and let either one's close reach the other's servers"
+        );
+        assert!(
+            !Arc::ptr_eq(&registry_of(&bootstrap), &registry_of(&first)),
+            "a derived session must not reach the registry it was derived from"
+        );
+    }
+
+    /// The other half of the contract: within one session, a per-turn clone has
+    /// to reach the connections that session already opened.
+    #[test]
+    fn a_clone_of_one_session_keeps_reaching_that_sessions_mcp_registry() {
+        let session = bootstrap().for_new_session();
+
+        let turn = session.clone();
+
+        assert!(Arc::ptr_eq(&registry_of(&session), &registry_of(&turn)));
     }
 }
