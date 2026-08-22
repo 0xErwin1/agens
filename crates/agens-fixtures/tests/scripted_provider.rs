@@ -302,6 +302,24 @@ fn a_truncated_turn_closes_the_stream_without_its_terminating_event() {
     provider.assert_script_consumed();
 }
 
+/// A cut that delivered nothing and a cut that delivered text are different
+/// outcomes for the agent — one can be sent again, the other cannot — so the
+/// fake keeps them apart on the wire.
+#[test]
+fn a_cut_stream_closes_before_any_part_reaches_the_client() {
+    let provider = ScriptedProvider::start(
+        ScriptedDialect::Responses,
+        Script::new([ScriptedTurn::cut_stream()]),
+    );
+
+    let (status, body) =
+        KeepAliveClient::connect(&provider).post("/responses", r#"{"input":"cut me early"}"#);
+
+    assert_eq!(status, "HTTP/1.1 200 OK");
+    assert_eq!(body, "");
+    provider.assert_script_consumed();
+}
+
 #[test]
 fn an_error_turn_answers_with_its_status_and_body_verbatim() {
     let provider = ScriptedProvider::start(
@@ -332,7 +350,7 @@ fn the_written_configuration_points_at_the_running_server() {
     let configuration = std::fs::read_to_string(config_home.join("config.toml"))
         .expect("journey configuration should exist");
     assert!(configuration.contains(&format!("base_url = \"{}\"", provider.base_url())));
-    assert!(configuration.contains("type = \"openai-api\""));
+    assert!(configuration.contains("model = \"openai-api/gpt-4.1\""));
     assert!(configuration.contains("[permissions]"));
     assert!(
         std::fs::read_to_string(config_home.join("auth.json"))

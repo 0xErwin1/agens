@@ -5855,6 +5855,28 @@ impl Journey {
 /// A journey fails inside a process whose only report is an exit status, so
 /// the requests are the difference between "the loop went wrong" and knowing
 /// which turn it went wrong on.
+/// Everything a journey's run recorded in its diagnostics directory.
+fn read_journey_diagnostics(data_directory: &Path) -> String {
+    let mut recorded = String::new();
+    let entries = std::fs::read_dir(data_directory.join("diagnostics"))
+        .expect("a journey run should record diagnostics");
+
+    for entry in entries {
+        let entry = entry.expect("diagnostic entry should be readable");
+        if entry
+            .metadata()
+            .expect("diagnostic metadata should be readable")
+            .is_file()
+        {
+            recorded.push_str(
+                &std::fs::read_to_string(entry.path()).expect("diagnostic should be readable"),
+            );
+        }
+    }
+
+    recorded
+}
+
 fn journey_stdout(result: &Output, provider: &ScriptedProvider) -> String {
     assert!(
         result.status.success(),
@@ -6019,17 +6041,17 @@ fn journey_delegation_serves_the_child_its_own_script_within_its_own_scope() {
     NetworkTripwire::shared().assert_no_connections();
 }
 
-/// AGN-104: a stream cut mid-turn should be retried within a visible budget
-/// rather than surfacing as a bare failure. Ignored until that budget exists;
-/// the journey is written against the behaviour AGN-104 defines so the fix can
-/// turn it on.
+/// AGN-104: a stream that ends before anything reached the person is sent
+/// again inside a budget, and the attempt is recorded against that budget.
+///
+/// The cut has to deliver nothing: a retry after the first attempt already
+/// streamed text would show that text twice, so that case stays a failure.
 #[test]
-#[ignore = "AGN-104"]
 fn journey_retry_mid_stream_resumes_within_its_budget_and_reports_the_attempt() {
     let journey = Journey::new("journey-retry-mid-stream");
     let provider = ScriptedProvider::start(
         ScriptedDialect::Responses,
-        Script::new([ScriptedTurn::truncate(), ScriptedTurn::text("recovered")]),
+        Script::new([ScriptedTurn::cut_stream(), ScriptedTurn::text("recovered")]),
     );
 
     let result = journey.chat(&provider, "answer through a cut stream", "");
@@ -6041,10 +6063,23 @@ fn journey_retry_mid_stream_resumes_within_its_budget_and_reports_the_attempt() 
         2,
         "the cut stream should cost exactly one retry"
     );
-    assert!(
-        String::from_utf8_lossy(&result.stderr).contains("retry"),
-        "the retry should be visible rather than silent: {}",
-        String::from_utf8_lossy(&result.stderr)
+    // The run recovered without saying anything to the person, which is the
+    // point of a budget. What has to be visible is the attempt itself, and for
+    // a headless run that is the diagnostics record: a retry that is not
+    // counted against a named budget cannot be reported by any surface.
+    let scheduled = read_journey_diagnostics(&journey.data_directory);
+    let scheduled: Vec<serde_json::Value> = scheduled
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("a diagnostic line should be JSON"))
+        .filter(|record: &serde_json::Value| record["event"] == "retry_scheduled")
+        .collect();
+    assert_eq!(scheduled.len(), 1, "the cut cost exactly one retry");
+    assert_eq!(scheduled[0]["class"], "network");
+    assert_eq!(scheduled[0]["attempt"], 1);
+    assert_eq!(
+        scheduled[0]["max_attempts"], 8,
+        "the retry must name the budget it counts against, or no surface can \
+         report how much of it is left"
     );
     NetworkTripwire::shared().assert_no_connections();
 }

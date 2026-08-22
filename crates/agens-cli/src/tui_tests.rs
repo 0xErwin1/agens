@@ -74,7 +74,7 @@ fn journey_render_paints_a_scripted_turn_into_a_stable_frame() {
             (
                 config_home.join("config.toml"),
                 format!(
-                    "[provider]\ntype = \"openai-api\"\nmodel = \"openai-api/gpt-4.1\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n",
+                    "[provider]\nmodel = \"openai-api/gpt-4.1\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n",
                     provider.base_url(),
                     data_directory.display()
                 ),
@@ -92,7 +92,7 @@ fn journey_render_paints_a_scripted_turn_into_a_stable_frame() {
         cancellation: Arc::new(Mutex::new(None)),
     });
 
-    configure_tui_project_identity(&mut tui, &bootstrap);
+    configure_tui_project_identity(&mut tui, &session, &bootstrap);
     tui.set_presentation("openai-api", "gpt-4.1", "new session");
     let router = TuiRuntimeRouter::new(
         bootstrap.clone(),

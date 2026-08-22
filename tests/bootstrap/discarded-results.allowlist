@@ -26,6 +26,7 @@ crates/agens-fixtures/src/scripted_provider.rs	let _ = writer.shutdown(Shutdown:
 crates/agens-fixtures/src/scripted_provider.rs	let _ = worker.join();	secondary_cleanup
 crates/agens-fixtures/src/scripted_provider.rs	let _ = stream.shutdown(Shutdown::Both);	secondary_cleanup
 crates/agens-fixtures/src/scripted_provider.rs	let _ = stream.shutdown(Shutdown::Both);	secondary_cleanup
+crates/agens-fixtures/src/scripted_provider.rs	let _ = stream.shutdown(Shutdown::Both);	secondary_cleanup
 crates/agens-fixtures/src/scripted_provider.rs	let _ = stream.write_all(bytes);	closed_channel
 crates/agens-fixtures/src/scripted_provider.rs	let _ = stream.flush();	closed_channel
 crates/agens-providers/src/chatgpt_login.rs	let _ = (options.open_browser)(authorization_url.as_str());	best_effort_observability

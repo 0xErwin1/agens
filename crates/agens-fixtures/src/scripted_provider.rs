@@ -62,6 +62,13 @@ pub enum ScriptedTurn {
     /// The endpoint starts streaming a text answer and closes the connection
     /// mid-stream, without a terminating event.
     Truncate,
+    /// The endpoint opens the stream and closes it before any part reaches the
+    /// client.
+    ///
+    /// Distinct from `Truncate` because the difference decides what the agent
+    /// may do next: a cut that delivered nothing can be sent again, and one
+    /// that already streamed text cannot without showing that text twice.
+    CutStream,
     /// Verbatim HTTP response bytes, for a shape the typed turns do not model.
     Raw { response: String },
 }
@@ -100,9 +107,14 @@ impl ScriptedTurn {
         Self::Stall { duration }
     }
 
-    /// A stream cut before its terminating event.
+    /// A stream cut before its terminating event, after partial output.
     pub fn truncate() -> Self {
         Self::Truncate
+    }
+
+    /// A stream cut before anything reached the client.
+    pub fn cut_stream() -> Self {
+        Self::CutStream
     }
 
     /// Verbatim response bytes.
@@ -120,6 +132,7 @@ impl ScriptedTurn {
             Self::Error { status, .. } => format!("error {status}"),
             Self::Stall { duration } => format!("stall {duration:?}"),
             Self::Truncate => "truncate".to_owned(),
+            Self::CutStream => "cut stream".to_owned(),
             Self::Raw { .. } => "raw response".to_owned(),
         }
     }
@@ -377,14 +390,15 @@ impl ScriptedProvider {
     /// is how eleven of them drifted apart. `extra` is appended verbatim for
     /// the sections a journey adds on top, such as `[permissions]`.
     pub fn provider_configuration(&self, data_directory: &Path, extra: &str) -> String {
-        let provider = self.provider_name();
+        // The provider is named by the model identifier and nowhere else, so a
+        // scripted journey names it the same way a real configuration does.
         let model = match self.dialect {
             ScriptedDialect::Responses => "openai-api/gpt-4.1",
             ScriptedDialect::ChatCompletions => "moonshotai/kimi-k3",
         };
 
         format!(
-            "[provider]\ntype = \"{provider}\"\nmodel = \"{model}\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n{extra}",
+            "[provider]\nmodel = \"{model}\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n{extra}",
             self.base_url(),
             data_directory.display(),
         )
@@ -609,6 +623,11 @@ fn write_turn(stream: &mut TcpStream, dialect: ScriptedDialect, turn: &ScriptedT
                 }
             };
             write_all(stream, partial.as_bytes());
+            let _ = stream.shutdown(Shutdown::Both);
+            false
+        }
+        ScriptedTurn::CutStream => {
+            write_all(stream, STREAM_HEADERS_CLOSE);
             let _ = stream.shutdown(Shutdown::Both);
             false
         }
