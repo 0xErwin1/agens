@@ -1,5 +1,5 @@
 use agens_core::IntraTurnInputSource;
-use agens_store::{DirectiveGrain, DirectiveStore, DirectiveTarget};
+use agens_store::{DirectiveGrain, DirectiveKind, DirectiveStore, DirectiveTarget};
 
 struct Temporary {
     path: std::path::PathBuf,
@@ -325,4 +325,52 @@ fn the_child_inbox_reads_only_what_names_that_child() {
     assert_eq!(drained.len(), 1);
     assert_eq!(drained[0].text, "narrow the search");
     assert_eq!(drained[0].source, IntraTurnInputSource::Supervisor);
+}
+
+#[test]
+fn a_queued_row_records_what_kind_of_message_it_is() {
+    let (temporary, mut store) = store("kind");
+
+    store
+        .enqueue(
+            &DirectiveTarget::Session(9),
+            IntraTurnInputSource::Supervisor,
+            DirectiveGrain::Turn,
+            "change the approach",
+        )
+        .unwrap();
+    store
+        .enqueue_kind(
+            &DirectiveTarget::Session(9),
+            DirectiveKind::Continue,
+            IntraTurnInputSource::Supervisor,
+            DirectiveGrain::Turn,
+            "continue",
+        )
+        .unwrap();
+    store
+        .enqueue_kind(
+            &DirectiveTarget::Session(9),
+            DirectiveKind::Answer,
+            IntraTurnInputSource::Human,
+            DirectiveGrain::ToolCall,
+            "use the second option",
+        )
+        .unwrap();
+    let database_path = store.database_path();
+    drop(store);
+
+    let connection = rusqlite::Connection::open(database_path).unwrap();
+    let mut statement = connection
+        .prepare("SELECT kind FROM directives ORDER BY id")
+        .unwrap();
+    let kinds = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+
+    assert_eq!(kinds, vec!["directive", "continue", "answer"]);
+
+    drop(temporary);
 }

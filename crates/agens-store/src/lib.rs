@@ -10,14 +10,22 @@ use agens_core::{
 };
 use rusqlite::{Connection, Transaction, TransactionBehavior, params};
 
+mod control_plane;
 mod database;
 mod directives;
 mod fact_store;
 mod media;
 mod prompt_memory;
 mod session_writer;
+pub use control_plane::{
+    AttemptOutcome, AttemptRow, CausalDisposition, ControlPlaneError, ControlPlaneStore,
+    EventClass, EventRow, EvidenceClass, FindingRow, ProviderRow, QuestionAuthor, QuestionKind,
+    QuestionRow, QuestionState, QuotaState, RetryTrigger, RunHealthRow, RunRow, RunState,
+    WorktreeStatus,
+};
 pub use directives::{
-    DirectiveGrain, DirectiveInbox, DirectiveStore, DirectiveStoreError, DirectiveTarget,
+    DirectiveGrain, DirectiveInbox, DirectiveKind, DirectiveStore, DirectiveStoreError,
+    DirectiveTarget,
 };
 pub use fact_store::{ToolFactStore, ToolFactStoreError};
 pub use media::{
