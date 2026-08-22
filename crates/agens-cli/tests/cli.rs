@@ -1,13 +1,11 @@
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpListener;
+use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -2204,7 +2202,7 @@ fn production_task_cancellation_prevents_parent_continuation_and_persists_emitte
     )
     .expect("subagent definition should be written");
 
-    let mut server = TaskStalledOpenAiMockServer::start(Duration::from_secs(1));
+    let mut server = TaskStalledOpenAiMockServer::start();
     std::fs::write(
         config_home.join("config.toml"),
         format!(
@@ -3717,12 +3715,16 @@ fn production_binary_sanitizes_remote_response_headers_and_body() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(output.status.code(), Some(1));
-    assert_diagnostic_error_text(&diagnostics, "error: provider: provider service failed\n");
-    for secret in [
-        "SENTINEL_OPENAI_API_KEY",
-        "SENTINEL_REMOTE_ERROR_HEADER",
-        "SENTINEL_REMOTE_ERROR_BODY",
-    ] {
+    // The remote body is a message, not a credential: it reaches stderr as the
+    // recorded failure detail, exactly as the ChatGPT matrix beside this pins,
+    // while the credential and the remote header never do and none of the three
+    // reach the diagnostics file.
+    assert_diagnostic_error_with_detail_text(
+        &diagnostics,
+        "error: provider: provider service failed\n",
+        "HTTP 500 rejected model \"test-model\"\nSENTINEL_REMOTE_ERROR_BODY\n",
+    );
+    for secret in ["SENTINEL_OPENAI_API_KEY", "SENTINEL_REMOTE_ERROR_HEADER"] {
         assert!(!diagnostics.contains(secret), "diagnostics leaked {secret}");
     }
     assert_diagnostics_have_no_sentinels(
@@ -5182,9 +5184,11 @@ impl Drop for TemporaryDirectory {
     }
 }
 
+/// A `/responses` endpoint that answers one turn and reports the credential
+/// the run authenticated with.
 struct OpenAiMockServer {
-    address: std::net::SocketAddr,
-    worker: thread::JoinHandle<()>,
+    provider: ScriptedProvider,
+    expected_authorization: String,
 }
 
 struct ScriptedOpenAiResponse {
@@ -5302,307 +5306,174 @@ fn model_visible_fragment(fragment: &str) -> String {
 
 impl OpenAiMockServer {
     fn start_with_api_key(api_key: &str) -> Self {
-        let expected_authorization = format!("authorization: Bearer {api_key}\r\n");
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("mock server should bind");
-        let address = listener
-            .local_addr()
-            .expect("mock server should have an address");
-        let worker = thread::spawn(move || {
-            let (stream, _) = listener
-                .accept()
-                .expect("mock server should accept a request");
-            let mut reader = BufReader::new(stream.try_clone().expect("stream should clone"));
-            let mut request = String::new();
-            reader
-                .read_line(&mut request)
-                .expect("request line should be readable");
-            assert_eq!(request, "POST /responses HTTP/1.1\r\n");
-
-            let mut authorization = String::new();
-            loop {
-                let mut header = String::new();
-                reader
-                    .read_line(&mut header)
-                    .expect("header should be readable");
-                if header == "\r\n" {
-                    break;
-                }
-                if header.to_ascii_lowercase().starts_with("authorization:") {
-                    authorization = header;
-                }
-            }
-            assert_eq!(authorization, expected_authorization);
-
-            let mut stream = stream;
-            stream
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello from OpenAI\"}\n\ndata: {\"type\":\"response.completed\"}\n\n")
-                .expect("mock response should be written");
-        });
-
-        Self { address, worker }
+        Self {
+            provider: ScriptedProvider::start(
+                ScriptedDialect::Responses,
+                Script::new([ScriptedTurn::text("Hello from OpenAI")]),
+            ),
+            expected_authorization: format!("Bearer {api_key}"),
+        }
     }
 
     fn base_url(&self) -> String {
-        format!("http://{}", self.address)
+        self.provider.base_url()
     }
 
     fn join(self) {
-        self.worker.join().expect("mock server should finish");
+        let requests = self.provider.wait_for_requests(1);
+        self.provider.assert_script_consumed();
+        assert_eq!(requests[0].target(), "/responses");
+        assert_eq!(
+            requests[0].header("authorization"),
+            Some(self.expected_authorization.as_str())
+        );
     }
 }
 
 struct StalledOpenAiMockServer {
-    address: std::net::SocketAddr,
-    observed_request: mpsc::Receiver<()>,
-    worker: thread::JoinHandle<()>,
+    provider: ScriptedProvider,
 }
 
+/// The same, one level down: the parent delegates and the child's turn is the
+/// one left hanging.
 struct TaskStalledOpenAiMockServer {
-    address: std::net::SocketAddr,
-    observed_child_request: mpsc::Receiver<()>,
-    worker: thread::JoinHandle<()>,
+    provider: ScriptedProvider,
 }
 
 impl StalledOpenAiMockServer {
     fn start() -> Self {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("mock server should bind");
-        let address = listener
-            .local_addr()
-            .expect("mock server should have an address");
-        let (observed_sender, observed_request) = mpsc::channel();
-        let worker = thread::spawn(move || {
-            let (stream, _) = listener
-                .accept()
-                .expect("mock server should accept a request");
-            read_openai_request(&stream);
-            observed_sender
-                .send(())
-                .expect("test should receive the request observation");
-            stream
-                .set_read_timeout(Some(Duration::from_secs(1)))
-                .expect("client-close timeout should be configured");
-            let mut byte = [0_u8; 1];
-            let _ = std::io::Read::read(
-                &mut stream.try_clone().expect("stream should clone"),
-                &mut byte,
-            );
-        });
-
         Self {
-            address,
-            observed_request,
-            worker,
+            provider: ScriptedProvider::start(
+                ScriptedDialect::Responses,
+                Script::new([ScriptedTurn::stall(STALLED_TURN)]),
+            ),
         }
     }
 
     fn base_url(&self) -> String {
-        format!("http://{}", self.address)
+        self.provider.base_url()
     }
 
     fn wait_for_request(&mut self) {
-        self.observed_request
-            .recv_timeout(Duration::from_secs(5))
-            .expect("production request should reach the local server");
+        let requests = self.provider.wait_for_requests(1);
+        assert!(
+            matches!(requests[0].target(), "/responses" | "/codex/responses"),
+            "unexpected stalled target: {}",
+            requests[0].target()
+        );
     }
 
     fn join(self) {
-        self.worker.join().expect("mock server should finish");
+        self.provider.assert_script_consumed();
     }
 }
 
 impl TaskStalledOpenAiMockServer {
-    fn start(stall_timeout: Duration) -> Self {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("mock server should bind");
-        let address = listener
-            .local_addr()
-            .expect("mock server should have an address");
-        let (observed_sender, observed_child_request) = mpsc::channel();
-        let worker = thread::spawn(move || {
-            let (mut parent, _) = listener
-                .accept()
-                .expect("mock server should accept the parent request");
-            let parent_body = read_openai_request_body(&parent);
-            assert!(parent_body.contains("parent task"));
-            parent
-                .write_all(
-                    native_tool_call_response(
-                        "task-cancel",
-                        "task",
-                        r#"{"agent":"reviewer","description":"child cancellation request"}"#,
-                    )
-                    .as_bytes(),
-                )
-                .expect("parent response should be written");
-            drop(parent);
-
-            let (child, _) = listener
-                .accept()
-                .expect("mock server should accept the child request");
-            let child_body = read_openai_request_body(&child);
-            observed_sender
-                .send(())
-                .expect("test should receive the child request observation");
-            // The reviewer agent declares no `permissions:`, so it inherits the
-            // parent's full native surface (write/bash/webfetch included) unlike
-            // `explore`, which narrows explicitly. It also carries `task`: a
-            // child may delegate one level further, and the chain stops at the
-            // grandchild — which this request cannot observe, so the depth limit
-            // itself is pinned in `delegation_reaches_a_grandchild_and_stops_there`.
-            for forbidden in ["parent task cancellation", "mcp"] {
-                assert!(
-                    !child_body.contains(forbidden),
-                    "child request leaked {forbidden:?}: {child_body}"
-                );
-            }
-            for expected in ["write", "bash", "webfetch", "\"name\":\"task\""] {
-                assert!(
-                    child_body.contains(expected),
-                    "child request should inherit the parent's full native surface, missing {expected:?}: {child_body}"
-                );
-            }
-            assert_eq!(
-                child_body.matches("\"name\":\"task_control\"").count(),
-                1,
-                "the child's own execution-scoped task_control must not be joined by \
-                 the main-scoped one: {child_body}"
-            );
-            child
-                .set_read_timeout(Some(stall_timeout))
-                .expect("child close timeout should be configured");
-            let mut byte = [0_u8; 1];
-            let _ = std::io::Read::read(
-                &mut child.try_clone().expect("child stream should clone"),
-                &mut byte,
-            );
-
-            listener
-                .set_nonblocking(true)
-                .expect("mock server should enable continuation probe");
-            let deadline = std::time::Instant::now() + Duration::from_millis(250);
-            while std::time::Instant::now() < deadline {
-                match listener.accept() {
-                    Ok(_) => panic!("parent continued after child cancellation"),
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(5));
-                    }
-                    Err(error) => panic!("mock server probe failed: {error}"),
-                }
-            }
-        });
-
+    fn start() -> Self {
         Self {
-            address,
-            observed_child_request,
-            worker,
+            provider: ScriptedProvider::start(
+                ScriptedDialect::Responses,
+                Script::new([ScriptedTurn::raw(native_tool_call_response(
+                    "task-cancel",
+                    "task",
+                    r#"{"agent":"reviewer","description":"child cancellation request"}"#,
+                ))])
+                .with_child(
+                    "child cancellation request",
+                    [ScriptedTurn::stall(STALLED_TURN)],
+                ),
+            ),
         }
     }
 
     fn base_url(&self) -> String {
-        format!("http://{}", self.address)
+        self.provider.base_url()
     }
 
     fn wait_for_child_request(&mut self) {
-        self.observed_child_request
-            .recv_timeout(Duration::from_secs(5))
-            .expect("production child request should reach the local server");
+        self.provider.wait_for_requests(2);
     }
 
+    /// Checks the delegation the parent sent and the scope the child ran in.
+    ///
+    /// The reviewer agent declares no `permissions:`, so it inherits the
+    /// parent's full native surface (write/bash/webfetch included) unlike
+    /// `explore`, which narrows explicitly. It also carries `task`: a child may
+    /// delegate one level further, and the chain stops at the grandchild —
+    /// which this request cannot observe, so the depth limit itself is pinned
+    /// in `delegation_reaches_a_grandchild_and_stops_there`.
     fn join(self) {
-        self.worker.join().expect("mock server should finish");
+        let requests = self.provider.requests();
+        // A parent that continued past the cancelled child would have sent a
+        // third request, and the fake would have recorded it as unscripted.
+        self.provider.assert_script_consumed();
+        assert!(requests[0].body().contains("parent task"));
+
+        let child = requests[1].body();
+        assert!(
+            requests[1].is_child(),
+            "the child ran its own turn: {child}"
+        );
+        for forbidden in ["parent task cancellation", "mcp"] {
+            assert!(
+                !child.contains(forbidden),
+                "child request leaked {forbidden:?}: {child}"
+            );
+        }
+        for expected in ["write", "bash", "webfetch", "\"name\":\"task\""] {
+            assert!(
+                child.contains(expected),
+                "child request should inherit the parent's full native surface, missing {expected:?}: {child}"
+            );
+        }
+        assert_eq!(
+            child.matches("\"name\":\"task_control\"").count(),
+            1,
+            "the child's own execution-scoped task_control must not be joined by \
+             the main-scoped one: {child}"
+        );
     }
 }
 
 struct ErrorOpenAiMockServer {
-    address: std::net::SocketAddr,
-    worker: thread::JoinHandle<()>,
+    provider: ScriptedProvider,
 }
 
 impl ErrorOpenAiMockServer {
     fn start() -> Self {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("mock server should bind");
-        let address = listener
-            .local_addr()
-            .expect("mock server should have an address");
-        let worker = thread::spawn(move || {
-            let (mut stream, _) = listener
-                .accept()
-                .expect("mock server should accept a request");
-            read_openai_request(&stream);
-            stream
-                .write_all(
-                    b"HTTP/1.1 500 Internal Server Error\r\nX-Remote-Secret: SENTINEL_REMOTE_ERROR_HEADER\r\nContent-Length: 26\r\nConnection: close\r\n\r\nSENTINEL_REMOTE_ERROR_BODY",
-                )
-                .expect("error response should be written");
-        });
-
-        Self { address, worker }
+        Self {
+            provider: ScriptedProvider::start(
+                ScriptedDialect::Responses,
+                // A server failure is transient, so the run spends its whole
+                // retry budget against an endpoint that keeps failing.
+                Script::new(std::iter::repeat_n(
+                    ScriptedTurn::raw(concat!(
+                        "HTTP/1.1 500 Internal Server Error\r\n",
+                        "X-Remote-Secret: SENTINEL_REMOTE_ERROR_HEADER\r\n",
+                        "Content-Length: 26\r\nConnection: close\r\n\r\n",
+                        "SENTINEL_REMOTE_ERROR_BODY"
+                    )),
+                    3,
+                )),
+            ),
+        }
     }
 
     fn base_url(&self) -> String {
-        format!("http://{}", self.address)
+        self.provider.base_url()
     }
 
     fn join(self) {
-        self.worker.join().expect("mock server should finish");
+        let requests = self.provider.wait_for_requests(3);
+        self.provider.assert_script_consumed();
+        assert_eq!(requests[0].target(), "/responses");
     }
 }
 
-fn read_openai_request(stream: &std::net::TcpStream) {
-    let mut reader = BufReader::new(stream.try_clone().expect("stream should clone"));
-    let mut request = String::new();
-    reader
-        .read_line(&mut request)
-        .expect("request line should be readable");
-    assert!(
-        request == "POST /responses HTTP/1.1\r\n"
-            || request == "POST /codex/responses HTTP/1.1\r\n"
-    );
-
-    loop {
-        let mut header = String::new();
-        reader
-            .read_line(&mut header)
-            .expect("header should be readable");
-        if header == "\r\n" {
-            return;
-        }
-    }
-}
-
-fn read_openai_request_body(stream: &std::net::TcpStream) -> String {
-    let mut reader = BufReader::new(stream.try_clone().expect("stream should clone"));
-    let mut request = String::new();
-    reader
-        .read_line(&mut request)
-        .expect("request line should be readable");
-    assert!(
-        request == "POST /responses HTTP/1.1\r\n"
-            || request == "POST /codex/responses HTTP/1.1\r\n"
-    );
-
-    let mut content_length = None;
-    loop {
-        let mut header = String::new();
-        reader
-            .read_line(&mut header)
-            .expect("header should be readable");
-        if header == "\r\n" {
-            break;
-        }
-        if let Some(value) = header.strip_prefix("content-length: ") {
-            content_length = Some(
-                value
-                    .trim()
-                    .parse::<usize>()
-                    .expect("content length should be numeric"),
-            );
-        }
-    }
-
-    let mut body = vec![0_u8; content_length.expect("request should include content length")];
-    std::io::Read::read_exact(&mut reader, &mut body).expect("request body should be readable");
-    String::from_utf8(body).expect("request body should be UTF-8")
-}
+/// How long a stalled endpoint holds a turn open. The run under test
+/// interrupts it well before this; the bound only keeps a run that never
+/// interrupts from hanging the suite.
+const STALLED_TURN: Duration = Duration::from_secs(5);
 
 fn native_tool_call_response(call_id: &str, name: &str, arguments: &str) -> String {
     format!(
