@@ -2,7 +2,7 @@ use agens_core::compaction::CompactionBudget;
 use agens_core::{Message, MessagePart, Role, SessionMetadata};
 use agens_diagnostics::{CompactionReason, SafeDiagnosticStore};
 use agens_providers::DiagnosticRef;
-use agens_session::compaction::{CompactionFailure, CompactionSummarizer, compact_session};
+use agens_session::compaction::{CompactionFailure, CompactionSummarizer, SessionCompactor};
 use agens_store::{CompactionStore, SessionStore};
 
 struct Temporary(std::path::PathBuf);
@@ -134,17 +134,14 @@ fn a_compaction_replaces_the_head_records_it_and_announces_both_ends() {
     let diagnostics = SafeDiagnosticStore::with_capture(temporary.0.clone(), true);
     let messages = history();
 
-    let compacted = compact_session(
-        &mut store,
-        &diagnostics,
-        &reference(),
-        SESSION,
-        &messages,
-        tiny_budget(),
-        CompactionReason::Overflow,
-        &Fixed("what happened earlier"),
-    )
-    .expect("the history is compactable");
+    let compacted = SessionCompactor::new(&mut store, &diagnostics, &reference(), SESSION)
+        .compact(
+            &messages,
+            tiny_budget(),
+            CompactionReason::Overflow,
+            &Fixed("what happened earlier"),
+        )
+        .expect("the history is compactable");
 
     assert!(compacted.messages.len() < messages.len());
     assert_eq!(compacted.messages[0].role, Role::System);
@@ -178,17 +175,14 @@ fn a_failed_summarizing_call_changes_nothing() {
     let diagnostics = SafeDiagnosticStore::with_capture(temporary.0.clone(), true);
     let messages = history();
 
-    let failure = compact_session(
-        &mut store,
-        &diagnostics,
-        &reference(),
-        SESSION,
-        &messages,
-        tiny_budget(),
-        CompactionReason::Overflow,
-        &Failing,
-    )
-    .expect_err("a refused summary refuses the compaction");
+    let failure = SessionCompactor::new(&mut store, &diagnostics, &reference(), SESSION)
+        .compact(
+            &messages,
+            tiny_budget(),
+            CompactionReason::Overflow,
+            &Failing,
+        )
+        .expect_err("a refused summary refuses the compaction");
 
     assert_eq!(
         failure,
@@ -211,17 +205,14 @@ fn an_empty_summary_refuses_the_compaction_and_records_nothing() {
     let diagnostics = SafeDiagnosticStore::with_capture(temporary.0.clone(), true);
     let messages = history();
 
-    let failure = compact_session(
-        &mut store,
-        &diagnostics,
-        &reference(),
-        SESSION,
-        &messages,
-        tiny_budget(),
-        CompactionReason::Overflow,
-        &Fixed("   \n  "),
-    )
-    .expect_err("an empty summary refuses the compaction");
+    let failure = SessionCompactor::new(&mut store, &diagnostics, &reference(), SESSION)
+        .compact(
+            &messages,
+            tiny_budget(),
+            CompactionReason::Overflow,
+            &Fixed("   \n  "),
+        )
+        .expect_err("an empty summary refuses the compaction");
 
     assert!(matches!(failure, CompactionFailure::Summary(_)));
     assert_eq!(store.latest(SESSION).expect("the record is readable"), None);
@@ -236,30 +227,24 @@ fn a_second_compaction_folds_the_first_summary_into_its_prompt() {
     let mut store = CompactionStore::open(&temporary.0).expect("the compaction store opens");
     let diagnostics = SafeDiagnosticStore::with_capture(temporary.0.clone(), true);
 
-    compact_session(
-        &mut store,
-        &diagnostics,
-        &reference(),
-        SESSION,
-        &history(),
-        tiny_budget(),
-        CompactionReason::Overflow,
-        &Fixed("what happened earlier"),
-    )
-    .expect("the first compaction succeeds");
+    SessionCompactor::new(&mut store, &diagnostics, &reference(), SESSION)
+        .compact(
+            &history(),
+            tiny_budget(),
+            CompactionReason::Overflow,
+            &Fixed("what happened earlier"),
+        )
+        .expect("the first compaction succeeds");
 
     let recording = Recording(std::cell::RefCell::new(Vec::new()));
-    compact_session(
-        &mut store,
-        &diagnostics,
-        &reference(),
-        SESSION,
-        &history(),
-        tiny_budget(),
-        CompactionReason::Threshold,
-        &recording,
-    )
-    .expect("the second compaction succeeds");
+    SessionCompactor::new(&mut store, &diagnostics, &reference(), SESSION)
+        .compact(
+            &history(),
+            tiny_budget(),
+            CompactionReason::Threshold,
+            &recording,
+        )
+        .expect("the second compaction succeeds");
 
     let prompts = recording.0.borrow();
     assert_eq!(prompts.len(), 1);

@@ -15,7 +15,9 @@ use agens_core::Message;
 use agens_core::compaction::{
     CompactionBudget, CompactionError, CompactionSummary, apply_compaction, plan_compaction,
 };
-use agens_diagnostics::{CompactionReason, CompactionRecord, SafeDiagnosticStore, SessionLifecycle};
+use agens_diagnostics::{
+    CompactionReason, CompactionRecord, SafeDiagnosticStore, SessionLifecycle,
+};
 use agens_providers::{DiagnosticRef, ProviderDiagnosticScope};
 use agens_store::{CompactionStore, CompactionStoreError};
 
@@ -88,79 +90,97 @@ pub struct CompactedHistory {
     pub entry: i64,
 }
 
-/// Compacts one session's history.
+/// One session's compaction path, holding what every compaction of it needs.
 ///
-/// `reference` and `diagnostics` carry the observability: a compaction moves the
-/// thread under a reader's feet, and a jump nothing announced reads as the
-/// session having lost its place.
-pub fn compact_session(
-    store: &mut CompactionStore,
-    diagnostics: &SafeDiagnosticStore,
-    reference: &DiagnosticRef,
+/// `diagnostics` and `reference` are here rather than passed per call because a
+/// compaction moves the thread under a reader's feet, and a jump nothing
+/// announced reads as the session having lost its place.
+pub struct SessionCompactor<'a> {
+    store: &'a mut CompactionStore,
+    diagnostics: &'a SafeDiagnosticStore,
+    reference: &'a DiagnosticRef,
     session_id: i64,
-    messages: &[Message],
-    budget: CompactionBudget,
-    reason: CompactionReason,
-    summarizer: &dyn CompactionSummarizer,
-) -> Result<CompactedHistory, CompactionFailure> {
-    diagnostics.record_session_lifecycle(
-        reference,
-        ProviderDiagnosticScope::Parent,
-        SessionLifecycle::CompactionStarted { reason },
-    );
-
-    let result = run(store, session_id, messages, budget, summarizer);
-
-    let record = match &result {
-        Ok(compacted) => CompactionRecord::Compacted {
-            summarized: compacted.summarized,
-            kept: compacted.kept,
-        },
-        Err(failure) => CompactionRecord::Refused {
-            reason: failure.recorded_reason(),
-        },
-    };
-    diagnostics.record_session_lifecycle(
-        reference,
-        ProviderDiagnosticScope::Parent,
-        SessionLifecycle::CompactionEnded { outcome: record },
-    );
-
-    result
 }
 
-fn run(
-    store: &mut CompactionStore,
-    session_id: i64,
-    messages: &[Message],
-    budget: CompactionBudget,
-    summarizer: &dyn CompactionSummarizer,
-) -> Result<CompactedHistory, CompactionFailure> {
-    let plan = plan_compaction(messages, budget).map_err(CompactionFailure::Plan)?;
-
-    let previous = store
-        .latest(session_id)
-        .map_err(CompactionFailure::Store)?
-        .map(|entry| entry.summary);
-
-    let text = summarizer
-        .summarize(&plan.prompt(previous.as_deref()))
-        .map_err(CompactionFailure::Summarizer)?;
-    let summary = CompactionSummary::new(text).map_err(CompactionFailure::Summary)?;
-
-    let entry = store
-        .append(
+impl<'a> SessionCompactor<'a> {
+    pub fn new(
+        store: &'a mut CompactionStore,
+        diagnostics: &'a SafeDiagnosticStore,
+        reference: &'a DiagnosticRef,
+        session_id: i64,
+    ) -> Self {
+        Self {
+            store,
+            diagnostics,
+            reference,
             session_id,
-            summary.as_str(),
-            plan.first_kept() as i64,
-        )
-        .map_err(CompactionFailure::Store)?;
+        }
+    }
 
-    Ok(CompactedHistory {
-        messages: apply_compaction(messages, &plan, &summary),
-        summary: summary.as_str().to_owned(),
-        summarized: plan.first_kept() - plan.pinned(),
-        kept: messages.len() - plan.first_kept(),
-        entry,
-    })
+    /// Compacts `messages`, announcing both ends of the attempt.
+    pub fn compact(
+        &mut self,
+        messages: &[Message],
+        budget: CompactionBudget,
+        reason: CompactionReason,
+        summarizer: &dyn CompactionSummarizer,
+    ) -> Result<CompactedHistory, CompactionFailure> {
+        self.record(SessionLifecycle::CompactionStarted { reason });
+
+        let result = self.run(messages, budget, summarizer);
+
+        let outcome = match &result {
+            Ok(compacted) => CompactionRecord::Compacted {
+                summarized: compacted.summarized,
+                kept: compacted.kept,
+            },
+            Err(failure) => CompactionRecord::Refused {
+                reason: failure.recorded_reason(),
+            },
+        };
+        self.record(SessionLifecycle::CompactionEnded { outcome });
+
+        result
+    }
+
+    fn record(&self, event: SessionLifecycle<'_>) {
+        self.diagnostics.record_session_lifecycle(
+            self.reference,
+            ProviderDiagnosticScope::Parent,
+            event,
+        );
+    }
+
+    fn run(
+        &mut self,
+        messages: &[Message],
+        budget: CompactionBudget,
+        summarizer: &dyn CompactionSummarizer,
+    ) -> Result<CompactedHistory, CompactionFailure> {
+        let plan = plan_compaction(messages, budget).map_err(CompactionFailure::Plan)?;
+
+        let previous = self
+            .store
+            .latest(self.session_id)
+            .map_err(CompactionFailure::Store)?
+            .map(|entry| entry.summary);
+
+        let text = summarizer
+            .summarize(&plan.prompt(previous.as_deref()))
+            .map_err(CompactionFailure::Summarizer)?;
+        let summary = CompactionSummary::new(text).map_err(CompactionFailure::Summary)?;
+
+        let entry = self
+            .store
+            .append(self.session_id, summary.as_str(), plan.first_kept() as i64)
+            .map_err(CompactionFailure::Store)?;
+
+        Ok(CompactedHistory {
+            messages: apply_compaction(messages, &plan, &summary),
+            summary: summary.as_str().to_owned(),
+            summarized: plan.first_kept() - plan.pinned(),
+            kept: messages.len() - plan.first_kept(),
+            entry,
+        })
+    }
 }

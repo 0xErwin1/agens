@@ -120,6 +120,7 @@ jq -e '
     "agens-session": [
       "agens-bootstrap",
       "agens-core",
+      "agens-diagnostics",
       "agens-error",
       "agens-fixtures",
       "agens-models",

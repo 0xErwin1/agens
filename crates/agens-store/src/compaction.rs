@@ -94,7 +94,9 @@ impl CompactionStore {
         first_kept_message_index: i64,
     ) -> Result<i64, CompactionStoreError> {
         if summary.trim().is_empty() {
-            return Err(CompactionStoreError::detail("a compaction carries no summary"));
+            return Err(CompactionStoreError::detail(
+                "a compaction carries no summary",
+            ));
         }
 
         self.connection
@@ -102,12 +104,7 @@ impl CompactionStore {
                 "INSERT INTO session_compactions
                      (session_id, summary, first_kept_message_index, created_at)
                  VALUES (?1, ?2, ?3, ?4)",
-                params![
-                    session_id,
-                    summary,
-                    first_kept_message_index,
-                    timestamp()
-                ],
+                params![session_id, summary, first_kept_message_index, timestamp()],
             )
             .map_err(|error| {
                 CompactionStoreError::operation("append", &self.database_path, error)

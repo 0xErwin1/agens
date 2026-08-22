@@ -22,15 +22,11 @@
 //! messages, so the model treats it as a document to summarize instead of a
 //! conversation to continue.
 
+use crate::summary::RunSummary;
+use crate::summary::render::{
+    MAX_TOOL_RESULT_CHARS, TranscriptEntry, render_compaction_summary, render_flat_transcript,
+};
 use crate::{Message, MessagePart, Role};
-
-/// How much of a single tool result survives into the transcript.
-///
-/// Tool output is what actually fills a context window — a `read` of a large
-/// file or a `bash` invocation with a verbose command dwarfs every message
-/// around it — and a summary does not need the body to record what the call
-/// established.
-pub const TOOL_OUTPUT_MAX_CHARS: usize = 2_000;
 
 /// The default budget, in estimated tokens, for the tail kept verbatim.
 pub const DEFAULT_KEEP_RECENT_TOKENS: usize = 8_000;
@@ -54,9 +50,15 @@ fn message_tokens(message: &Message) -> usize {
             MessagePart::ToolCall { name, input, .. } => {
                 estimated_tokens(name) + estimated_tokens(input)
             }
-            MessagePart::ToolResult { content, .. } => {
-                estimated_tokens(&content[..content.len().min(TOOL_OUTPUT_MAX_CHARS)])
-            }
+            // Measured at the length the transcript will actually carry: a
+            // budget that counted the untruncated body would summarize far
+            // more of the history than the overflow required.
+            MessagePart::ToolResult { content, .. } => estimated_tokens(
+                content
+                    .char_indices()
+                    .nth(MAX_TOOL_RESULT_CHARS)
+                    .map_or(content.as_str(), |(boundary, _)| &content[..boundary]),
+            ),
             MessagePart::Media { mime, .. } => estimated_tokens(mime),
         })
         .sum()
@@ -108,10 +110,11 @@ impl std::error::Error for CompactionError {}
 
 /// The summary text a compaction writes into the history.
 ///
-/// The structured schema behind a summary, and the serializer that renders it,
-/// belong to the summary format work; this newtype is the whole interface this
-/// module needs from it — the rendered text, proven non-empty once, at the
-/// boundary. A richer summary type converts into this by serializing itself.
+/// The schema behind a summary belongs to [`crate::summary`]; this newtype is
+/// the whole interface this module needs from it — the rendered text, proven
+/// non-empty once, at the boundary. [`Self::from_run_summary`] is the typed
+/// path; [`Self::new`] takes text a model returned before anything has parsed
+/// it into sections.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompactionSummary(String);
 
@@ -124,6 +127,12 @@ impl CompactionSummary {
             return Err(CompactionError::EmptySummary);
         }
         Ok(Self(text))
+    }
+
+    /// Renders an assembled summary under the compaction projection, which is
+    /// the one that keeps every section.
+    pub fn from_run_summary(summary: &RunSummary) -> Result<Self, CompactionError> {
+        Self::new(render_compaction_summary(summary))
     }
 
     pub fn as_str(&self) -> &str {
@@ -140,7 +149,7 @@ impl CompactionSummary {
 pub struct CompactionPlan {
     pinned: usize,
     first_kept: usize,
-    transcript: String,
+    entries: Vec<TranscriptEntry>,
 }
 
 impl CompactionPlan {
@@ -155,9 +164,14 @@ impl CompactionPlan {
         self.pinned
     }
 
-    /// The flat transcript of the stretch being summarized.
-    pub fn transcript(&self) -> &str {
-        &self.transcript
+    /// The stretch being summarized, as transcript entries.
+    pub fn entries(&self) -> &[TranscriptEntry] {
+        &self.entries
+    }
+
+    /// The flat transcript of that stretch, as the summarizing model reads it.
+    pub fn transcript(&self) -> String {
+        render_flat_transcript(&self.entries)
     }
 
     /// The prompt handed to the summarizing model.
@@ -177,15 +191,15 @@ impl CompactionPlan {
             prompt.push_str(
                 "\nAn earlier stretch of this session was already summarized. Fold the \
                  summary below into your answer so the result covers the session from \
-                 its start.\n\n<previous_summary>\n",
+                 its start.\n\n# Previous Summary\n\n",
             );
             prompt.push_str(previous);
-            prompt.push_str("\n</previous_summary>\n");
+            prompt.push('\n');
         }
 
-        prompt.push_str("\n<transcript>\n");
-        prompt.push_str(&self.transcript);
-        prompt.push_str("\n</transcript>\n");
+        prompt.push_str("\n# Transcript\n\n");
+        prompt.push_str(&self.transcript());
+        prompt.push('\n');
         prompt
     }
 }
@@ -221,7 +235,7 @@ pub fn plan_compaction(
     Ok(CompactionPlan {
         pinned,
         first_kept: pinned + cut,
-        transcript: serialize_transcript(&body[..cut]),
+        entries: transcript_entries(&body[..cut]),
     })
 }
 
@@ -262,73 +276,53 @@ fn next_balanced_boundary(messages: &[Message], from: usize) -> Option<usize> {
     open.is_empty().then_some(messages.len())
 }
 
-/// Renders messages as a flat transcript.
+/// Turns messages into the transcript entries the summary schema renders.
 ///
-/// Not a message list: handed back as messages, a model reads the stretch as a
-/// conversation it is expected to continue rather than a document it is
-/// expected to summarize.
-pub fn serialize_transcript(messages: &[Message]) -> String {
-    let mut transcript = String::new();
+/// The schema knows three speakers and the runtime knows five, so the two it
+/// does not carry are folded into the reader's side with their role named in
+/// the text. Naming it keeps a system instruction or a supervisor's
+/// intervention from reading as something the person typed, which is the one
+/// confusion that would change what the summary says happened.
+///
+/// A tool call and its result arrive as separate entries because they are
+/// separate messages, and the cut has already guaranteed both are on the same
+/// side of it.
+pub fn transcript_entries(messages: &[Message]) -> Vec<TranscriptEntry> {
+    let mut entries = Vec::new();
     for message in messages {
-        transcript.push('[');
-        transcript.push_str(role_label(message.role));
-        transcript.push_str("]\n");
         for part in &message.parts {
-            match part {
-                MessagePart::Text(text) => {
-                    transcript.push_str(text);
-                    transcript.push('\n');
-                }
+            let entry = match part {
+                MessagePart::Text(text) => speaker_entry(message.role, text.clone()),
                 MessagePart::Reasoning(text) => {
-                    transcript.push_str("(reasoning) ");
-                    transcript.push_str(text);
-                    transcript.push('\n');
+                    TranscriptEntry::Assistant(format!("(reasoning) {text}"))
                 }
                 MessagePart::ToolCall { name, input, .. } => {
-                    transcript.push_str("call ");
-                    transcript.push_str(name);
-                    transcript.push('(');
-                    transcript.push_str(&bounded_tool_output(input));
-                    transcript.push_str(")\n");
+                    TranscriptEntry::Assistant(format!("call {name}({input})"))
                 }
                 MessagePart::ToolResult {
                     content, is_error, ..
-                } => {
-                    transcript.push_str(if *is_error { "error " } else { "result " });
-                    transcript.push_str(&bounded_tool_output(content));
-                    transcript.push('\n');
-                }
+                } => TranscriptEntry::ToolResult(if *is_error {
+                    format!("(error) {content}")
+                } else {
+                    content.clone()
+                }),
                 MessagePart::Media { mime, .. } => {
-                    transcript.push_str("media ");
-                    transcript.push_str(mime);
-                    transcript.push('\n');
+                    speaker_entry(message.role, format!("(media {mime})"))
                 }
-            }
+            };
+            entries.push(entry);
         }
-        transcript.push('\n');
     }
-    transcript
+    entries
 }
 
-fn bounded_tool_output(value: &str) -> String {
-    if value.len() <= TOOL_OUTPUT_MAX_CHARS {
-        return value.to_owned();
-    }
-
-    let mut end = TOOL_OUTPUT_MAX_CHARS;
-    while !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}… [{} bytes omitted]", &value[..end], value.len() - end)
-}
-
-const fn role_label(role: Role) -> &'static str {
+fn speaker_entry(role: Role, text: String) -> TranscriptEntry {
     match role {
-        Role::System => "system",
-        Role::User => "user",
-        Role::Assistant => "assistant",
-        Role::Tool => "tool",
-        Role::Supervisor => "supervisor",
+        Role::Assistant => TranscriptEntry::Assistant(text),
+        Role::Tool => TranscriptEntry::ToolResult(text),
+        Role::User => TranscriptEntry::User(text),
+        Role::System => TranscriptEntry::User(format!("(system) {text}")),
+        Role::Supervisor => TranscriptEntry::User(format!("(supervisor) {text}")),
     }
 }
 
@@ -500,13 +494,45 @@ mod tests {
     }
 
     #[test]
-    fn a_transcript_bounds_tool_output_and_keeps_its_own_shape() {
-        let body = "x".repeat(TOOL_OUTPUT_MAX_CHARS * 2);
-        let transcript = serialize_transcript(&[result("call-1", &body)]);
+    fn a_transcript_carries_each_speaker_and_bounds_tool_output() {
+        let body = "x".repeat(MAX_TOOL_RESULT_CHARS * 2);
+        let transcript = render_flat_transcript(&transcript_entries(&[
+            text(Role::User, "the question"),
+            call("call-1"),
+            result("call-1", &body),
+        ]));
 
-        assert!(transcript.starts_with("[tool]\n"));
-        assert!(transcript.contains("bytes omitted"));
+        assert!(transcript.contains("[User]: the question"));
+        assert!(transcript.contains("[Assistant]: call read("));
+        assert!(transcript.contains("characters omitted"));
         assert!(transcript.len() < body.len());
+    }
+
+    /// A system instruction or a supervisor's intervention reaching the
+    /// summarizing model as a plain user message would be summarized as
+    /// something the person asked for.
+    #[test]
+    fn a_speaker_the_transcript_schema_lacks_is_named_rather_than_dropped() {
+        let transcript = render_flat_transcript(&transcript_entries(&[
+            text(Role::System, "the instructions"),
+            text(Role::Supervisor, "the intervention"),
+        ]));
+
+        assert!(transcript.contains("(system) the instructions"));
+        assert!(transcript.contains("(supervisor) the intervention"));
+    }
+
+    #[test]
+    fn an_assembled_summary_renders_into_the_history_through_the_shared_schema() {
+        let mut assembled = RunSummary::default();
+        assembled.set_critical_context(crate::summary::CriticalContext::narrated(
+            "the part a model wrote",
+        ));
+
+        let summary =
+            CompactionSummary::from_run_summary(&assembled).expect("an assembled summary is text");
+
+        assert!(summary.as_str().contains("the part a model wrote"));
     }
 
     #[test]
@@ -521,6 +547,6 @@ mod tests {
         let prompt = plan.prompt(Some("what came before"));
 
         assert!(prompt.contains("what came before"));
-        assert!(prompt.contains("<transcript>"));
+        assert!(prompt.contains("# Transcript"));
     }
 }
