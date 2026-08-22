@@ -518,7 +518,8 @@ impl ControlPlaneStore {
     ///
     /// The daemon is one process per machine serving N projects, so the queue
     /// the scheduler admits from spans repositories: a ceiling expressed in
-    /// slots is a ceiling on the machine, not on one checkout.
+    /// slots is a ceiling on the machine, not on one checkout. The timer
+    /// wheel's parked-run sweep reads it for the same reason.
     pub fn runs_in_state(&self, state: RunState) -> Result<Vec<RunRow>> {
         self.load_all(
             "load runs in state",
@@ -553,6 +554,18 @@ impl ControlPlaneStore {
             "load events",
             &format!("{EVENT_SELECT} WHERE run_id = ?1 ORDER BY id"),
             params![run_id],
+        )
+    }
+
+    /// One run's journal filtered to a single entry type, in commit order.
+    ///
+    /// The last row is the most recent occurrence, which is how the timer wheel
+    /// finds the checkpoint a run is currently measured against.
+    pub fn events_of_type_for_run(&self, run_id: i64, event_type: &str) -> Result<Vec<EventRow>> {
+        self.load_all(
+            "load events of type",
+            &format!("{EVENT_SELECT} WHERE run_id = ?1 AND type = ?2 ORDER BY id"),
+            params![run_id, event_type],
         )
     }
 
@@ -593,6 +606,22 @@ impl ControlPlaneStore {
             "load questions",
             &format!("{QUESTION_SELECT} WHERE run_id = ?1 ORDER BY id"),
             params![run_id],
+        )
+    }
+
+    /// Questions whose expiry has arrived and that can still be voided.
+    ///
+    /// `delivered` is excluded because it is settled, and a row without an
+    /// expiry never appears: an open question with no deadline waits for a
+    /// person for as long as it takes.
+    pub fn questions_past_expiry(&self, now: i64) -> Result<Vec<QuestionRow>> {
+        self.load_all(
+            "load questions past expiry",
+            &format!(
+                "{QUESTION_SELECT} WHERE expires_at IS NOT NULL AND expires_at <= ?1
+                 AND state IN ('open', 'answered') ORDER BY id"
+            ),
+            params![now],
         )
     }
 
@@ -637,6 +666,22 @@ impl ControlPlaneStore {
             "load provider",
             &format!("{PROVIDER_SELECT} WHERE provider = ?1"),
             params![provider],
+        )
+    }
+
+    /// Providers whose cap has a reset time that has arrived.
+    ///
+    /// A capped provider that named no reset is deliberately absent: nothing
+    /// can wake its parked runs on a timer, and it takes a fresh report from
+    /// the provider to lift.
+    pub fn providers_due(&self, now: i64) -> Result<Vec<ProviderRow>> {
+        self.load_all(
+            "load providers due",
+            &format!(
+                "{PROVIDER_SELECT} WHERE quota_state = 'capped'
+                 AND reset_at IS NOT NULL AND reset_at <= ?1 ORDER BY provider"
+            ),
+            params![now],
         )
     }
 
