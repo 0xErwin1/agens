@@ -14,6 +14,7 @@ use globset::{GlobBuilder, GlobMatcher};
 
 pub mod ask_user;
 pub mod compaction;
+pub mod mcp_failure;
 mod permission_precedence;
 mod permission_target;
 pub mod prompt;

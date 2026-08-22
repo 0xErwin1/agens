@@ -418,6 +418,106 @@ fn registry_notices_a_stdio_server_that_died_between_calls() {
     }
 }
 
+/// The reported case: several consecutive calls to a server that dies under
+/// every one of them, each answered in milliseconds with the same opaque
+/// phrase. The reconnect keeps working — the registry rebuilds the connection
+/// and spends a second attempt on it — but the server dies again, and what a
+/// reader gets back now names why.
+#[test]
+fn registry_names_the_cause_when_a_stdio_server_dies_under_every_call() {
+    let command = PathBuf::from(env!("CARGO_BIN_EXE_fake-mcp-child"));
+    let project_root = std::env::current_dir().unwrap();
+
+    let mut registry = agens_tools::McpRegistry::new();
+    registry
+        .configure_server(
+            "engram",
+            move || {
+                McpStdioTransport::spawn(McpStdioTransportConfig {
+                    command: command.clone(),
+                    args: vec!["call-crash".into()],
+                    environment: BTreeMap::new(),
+                    project_root: project_root.clone(),
+                })
+                .map(|transport| Box::new(transport) as Box<dyn McpTransport>)
+            },
+            McpTimeouts::new(
+                Duration::from_secs(2),
+                Duration::from_secs(2),
+                Duration::from_secs(2),
+            )
+            .unwrap(),
+            McpLimits::new(4, 4).unwrap(),
+        )
+        .unwrap();
+    assert!(!registry.discover_server("engram").is_failed());
+
+    for _ in 0..3 {
+        let error = registry
+            .call_tool(
+                "engram::first",
+                json!({}),
+                &agens_tools::ToolExecutionContext::with_timeout(Duration::from_secs(4)),
+            )
+            .expect_err("a server that dies under the call cannot answer it");
+
+        assert_eq!(
+            error.to_string(),
+            "extension: mcp tool infrastructure failure: transport: call failed"
+        );
+    }
+}
+
+/// A server that is gone for good: the process died and nothing can start it
+/// again. It fails as fast as a dead connection does, and used to be
+/// indistinguishable from every other infrastructure failure.
+#[test]
+fn registry_names_a_server_that_could_not_be_restarted() {
+    let command = PathBuf::from(env!("CARGO_BIN_EXE_fake-mcp-child"));
+    let project_root = std::env::current_dir().unwrap();
+    let spawned = Arc::new(AtomicUsize::new(0));
+
+    let mut registry = agens_tools::McpRegistry::new();
+    registry
+        .configure_server(
+            "engram",
+            move || {
+                if spawned.fetch_add(1, Ordering::Relaxed) > 0 {
+                    return Err(McpTransportError::Transport("spawn refused".into()));
+                }
+                McpStdioTransport::spawn(McpStdioTransportConfig {
+                    command: command.clone(),
+                    args: vec!["call-crash".into()],
+                    environment: BTreeMap::new(),
+                    project_root: project_root.clone(),
+                })
+                .map(|transport| Box::new(transport) as Box<dyn McpTransport>)
+            },
+            McpTimeouts::new(
+                Duration::from_secs(2),
+                Duration::from_secs(2),
+                Duration::from_secs(2),
+            )
+            .unwrap(),
+            McpLimits::new(4, 4).unwrap(),
+        )
+        .unwrap();
+    assert!(!registry.discover_server("engram").is_failed());
+
+    let error = registry
+        .call_tool(
+            "engram::first",
+            json!({}),
+            &agens_tools::ToolExecutionContext::with_timeout(Duration::from_secs(4)),
+        )
+        .expect_err("a server that cannot be restarted cannot answer");
+
+    assert_eq!(
+        error.to_string(),
+        "extension: mcp tool infrastructure failure: transport: server did not restart"
+    );
+}
+
 /// A reconnect a call triggers spends that call's budget: a connect timeout
 /// plus one list timeout per page. It used to run under the handle the
 /// registry holds for the life of the daemon, so neither the user's Esc nor

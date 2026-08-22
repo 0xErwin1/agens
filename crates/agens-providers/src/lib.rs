@@ -315,6 +315,8 @@ pub enum ProviderDiagnosticComponent {
     Agent,
     /// The session's own lifecycle, as opposed to one provider call inside it.
     Session,
+    /// An MCP server, as opposed to the tool call that reached it.
+    Mcp,
 }
 
 impl ProviderDiagnosticComponent {
@@ -326,6 +328,7 @@ impl ProviderDiagnosticComponent {
             Self::OauthRefresh => "oauth_refresh",
             Self::Subagent => "subagent",
             Self::Agent => "agent",
+            Self::Mcp => "mcp",
         }
     }
 }

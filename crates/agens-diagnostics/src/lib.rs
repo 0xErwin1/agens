@@ -90,6 +90,19 @@ pub enum SessionLifecycle<'a> {
         tool: &'a str,
         class: ProviderDiagnosticClass,
     },
+    /// A tool call that broke on the MCP connection rather than on its own
+    /// arguments.
+    ///
+    /// Recorded under the `mcp` component, not `session`: a supervisor reading
+    /// this file to decide whether to restart a server needs the failures of
+    /// that server separable from every other tool failure in the turn. The
+    /// cause is a phrase agens authored from the transport error's category,
+    /// so no server text, host path, or call argument travels with it.
+    McpToolFailed {
+        tool: &'a str,
+        class: ProviderDiagnosticClass,
+        cause: &'a str,
+    },
     /// The session cannot proceed until someone decides. This is the one state
     /// an external observer cannot infer from anything else: the process is
     /// alive, spending nothing, and making no progress.
@@ -176,12 +189,24 @@ impl SessionLifecycle<'_> {
                 ProviderDiagnosticKind::TurnStarted
             }
             Self::TurnEnded { .. } => ProviderDiagnosticKind::TurnEnded,
-            Self::ToolFailed { .. } => ProviderDiagnosticKind::ToolFailed,
+            Self::ToolFailed { .. } | Self::McpToolFailed { .. } => {
+                ProviderDiagnosticKind::ToolFailed
+            }
             Self::PermissionBlocked { .. } => ProviderDiagnosticKind::PermissionBlocked,
             Self::WorkingDirectoryChanged { .. } => ProviderDiagnosticKind::WorkingDirectoryChanged,
             Self::ContextExhausted { .. } => ProviderDiagnosticKind::ContextExhausted,
             Self::CompactionStarted { .. } => ProviderDiagnosticKind::CompactionStarted,
             Self::CompactionEnded { .. } => ProviderDiagnosticKind::CompactionEnded,
+        }
+    }
+
+    /// Which component a lifecycle line is attributed to. Everything the
+    /// session itself does belongs to `session`; a failure of a server the
+    /// session merely called belongs to that server's own component.
+    const fn component(self) -> ProviderDiagnosticComponent {
+        match self {
+            Self::McpToolFailed { .. } => ProviderDiagnosticComponent::Mcp,
+            _ => ProviderDiagnosticComponent::Session,
         }
     }
 
@@ -196,6 +221,9 @@ impl SessionLifecycle<'_> {
             Self::TurnEnded { outcome } => serde_json::json!({ "outcome": outcome.as_str() }),
             Self::ToolFailed { tool, class } => {
                 serde_json::json!({ "tool": tool, "class": class.as_str() })
+            }
+            Self::McpToolFailed { tool, class, cause } => {
+                serde_json::json!({ "tool": tool, "class": class.as_str(), "cause": cause })
             }
             Self::PermissionBlocked { tool, access } => {
                 serde_json::json!({ "tool": tool, "access": access })
@@ -472,7 +500,7 @@ fn session_lifecycle_json_line(
         "timestamp_ms": u64::try_from(timestamp_ms).unwrap_or(u64::MAX),
         "reference": reference.as_str(),
         "scope": scope.as_str(),
-        "component": ProviderDiagnosticComponent::Session.as_str(),
+        "component": event.component().as_str(),
         "event": event.kind().as_str(),
     });
     if let (Some(line), Some(detail)) = (line.as_object_mut(), event.detail().as_object()) {
@@ -1270,6 +1298,41 @@ mod tests {
             recorded[2]
         );
         assert_eq!(recorded[3]["outcome"], "failed");
+
+        std::fs::remove_dir_all(&temporary).ok();
+    }
+
+    /// A broken MCP server is the session's problem but not the session's
+    /// fault, and a supervisor deciding whether to restart one needs those
+    /// failures separable from every other tool failure in the turn.
+    #[test]
+    fn an_mcp_failure_is_recorded_under_its_own_component_with_its_cause() {
+        let temporary = std::env::temp_dir().join(format!(
+            "agens-diagnostic-mcp-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::remove_dir_all(&temporary).ok();
+        std::fs::create_dir_all(&temporary).expect("test data directory should be creatable");
+
+        let store = SafeDiagnosticStore::with_capture(temporary.clone(), true);
+        store.record_session_lifecycle(
+            &DiagnosticRef::new("beef1234".to_owned()).unwrap(),
+            ProviderDiagnosticScope::Parent,
+            SessionLifecycle::McpToolFailed {
+                tool: "engram::mem_save",
+                class: ProviderDiagnosticClass::Network,
+                cause: "transport: server did not restart",
+            },
+        );
+
+        let recorded = recorded_lines(&temporary);
+
+        assert_eq!(recorded[0]["component"], "mcp");
+        assert_eq!(recorded[0]["event"], "tool_failed");
+        assert_eq!(recorded[0]["tool"], "engram::mem_save");
+        assert_eq!(recorded[0]["class"], "network");
+        assert_eq!(recorded[0]["cause"], "transport: server did not restart");
 
         std::fs::remove_dir_all(&temporary).ok();
     }

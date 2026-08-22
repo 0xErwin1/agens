@@ -5,6 +5,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
+use agens_core::mcp_failure::McpFailure;
 use agens_core::redaction::{bounded_detail, redact_absolute_paths, redact_credential_values};
 use agens_core::{
     HeadlessToolCall, HeadlessToolDispatcher, HeadlessToolOutput, HeadlessTurnCancellation,
@@ -131,13 +132,28 @@ fn headless_execution_result(
         Err(agens_core::Error::Tool(message)) if message == "mcp operation timed out" => {
             Ok(HeadlessToolOutput::failure("tool operation timed out"))
         }
-        Err(agens_core::Error::Extension(message))
-            if message == "mcp tool infrastructure failure" =>
-        {
-            Ok(HeadlessToolOutput::failure("tool infrastructure failure"))
-        }
+        Err(agens_core::Error::Extension(message)) => mcp_infrastructure_tool_result(&message)
+            .map_or_else(
+                || Err(headless_tool_error(agens_core::Error::Extension(message))),
+                |content| Ok(HeadlessToolOutput::failure(content)),
+            ),
         Err(error) => Err(headless_tool_error(error)),
     }
+}
+
+/// The model-visible result for an MCP infrastructure failure, or `None` when
+/// the message is not one.
+///
+/// The cause travels inside the message rather than through a separate
+/// channel, so the model, the terminal transcript and the diagnostics record
+/// all read the same agens-authored phrase. A failure that arrives without a
+/// recognized cause still answers with the fixed text callers already handle.
+fn mcp_infrastructure_tool_result(message: &str) -> Option<String> {
+    if message == agens_core::mcp_failure::FIXED_ERROR_MESSAGE {
+        return Some(agens_core::mcp_failure::FIXED_TOOL_RESULT.to_owned());
+    }
+
+    McpFailure::from_error_message(message).map(|failure| failure.tool_result())
 }
 
 fn headless_tool_error(error: agens_core::Error) -> HeadlessTurnPortError {
@@ -163,6 +179,21 @@ mod tests {
             (
                 agens_core::Error::Extension("mcp tool infrastructure failure".into()),
                 "tool infrastructure failure",
+            ),
+            // The cause reaches the model instead of being collapsed into the
+            // fixed phrase, which is the whole difference between a model that
+            // can react to a dead server and one that cannot.
+            (
+                agens_core::Error::Extension(
+                    "mcp tool infrastructure failure: transport: server did not restart".into(),
+                ),
+                "tool infrastructure failure: transport: server did not restart",
+            ),
+            (
+                agens_core::Error::Extension(
+                    "mcp tool infrastructure failure: protocol: server response rejected".into(),
+                ),
+                "tool infrastructure failure: protocol: server response rejected",
             ),
         ] {
             let converted = headless_execution_result(Err(error))

@@ -124,6 +124,7 @@ fn safe_diagnostic_entry(value: &serde_json::Value, relative_path: &str) -> Opti
             "subagent",
             "agent",
             "session",
+            "mcp",
         ],
     )?;
     let event = allowlisted_diagnostic_value(
@@ -441,6 +442,7 @@ mod tests {
                 ProviderDiagnosticComponent::Subagent => component.as_str(),
                 ProviderDiagnosticComponent::Agent => component.as_str(),
                 ProviderDiagnosticComponent::Session => component.as_str(),
+                ProviderDiagnosticComponent::Mcp => component.as_str(),
             }
         }
 
@@ -451,6 +453,7 @@ mod tests {
             ProviderDiagnosticComponent::Subagent,
             ProviderDiagnosticComponent::Agent,
             ProviderDiagnosticComponent::Session,
+            ProviderDiagnosticComponent::Mcp,
         ] {
             let component_str = component_as_str(component);
             assert!(

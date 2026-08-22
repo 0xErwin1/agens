@@ -16,6 +16,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use agens_core::mcp_failure::{McpFailure, McpFailureClass};
 use agens_core::{
     EditMagnitude, Error, FactPath, HeadlessTaskTerminal, HeadlessTurnCancellationAdapter,
     PermissionAuthority, PermissionDecision, PermissionPolicy, PermissionReach,
@@ -2857,7 +2858,18 @@ impl McpRegistry {
                     // the call that actually failed, rather than the connect
                     // attempt made trying to recover from it.
                     self.record_runtime_failure(&server_name, &error);
-                    return Err(mcp_call_error(error));
+                    // Distinct from the call's own failure: the connection was
+                    // gone and could not be rebuilt, which is the difference
+                    // between a server that dropped one call and a server that
+                    // is no longer there at all.
+                    return Err(McpFailure::new(
+                        McpFailureClass::Transport,
+                        "server did not restart",
+                    )
+                    .map_or_else(
+                        || mcp_call_error(error),
+                        |failure| Error::Extension(failure.error_message()),
+                    ));
                 }
                 match self.dispatch(&server_name, &metadata.tool_name, arguments, context) {
                     Ok(output) => Ok(output),
@@ -3149,9 +3161,38 @@ fn mcp_call_error(error: McpTransportError) -> Error {
         | McpTransportError::Protocol(_)
         | McpTransportError::Transport(_)
         | McpTransportError::HttpStatus(_) => {
-            Error::Extension("mcp tool infrastructure failure".into())
+            Error::Extension(mcp_call_failure(&error).map_or_else(
+                || agens_core::mcp_failure::FIXED_ERROR_MESSAGE.to_owned(),
+                |failure| failure.error_message(),
+            ))
         }
     }
+}
+
+/// The cause of a failed call, in the vocabulary every reader downstream
+/// shares.
+///
+/// Built from the transport error's own category rather than from its message:
+/// a `Transport` error carries text agens did not author, and the model-visible
+/// result and the diagnostics record are both sinks that text may not reach.
+fn mcp_call_failure(error: &McpTransportError) -> Option<McpFailure> {
+    let (class, detail) = match error {
+        McpTransportError::RetriesExhausted => (
+            McpFailureClass::RetriesExhausted,
+            "server did not respond".to_owned(),
+        ),
+        McpTransportError::Protocol(_) => (
+            McpFailureClass::Protocol,
+            "server response rejected".to_owned(),
+        ),
+        McpTransportError::HttpStatus(status) => {
+            (McpFailureClass::HttpStatus, format!("http status {status}"))
+        }
+        McpTransportError::Transport(_) => (McpFailureClass::Transport, "call failed".to_owned()),
+        McpTransportError::Cancelled | McpTransportError::TimedOut => return None,
+    };
+
+    McpFailure::new(class, &detail)
 }
 
 const MCP_DUPLICATE_TOOL_NAMES_REASON: &str = "protocol: duplicate tool names";
@@ -3599,7 +3640,10 @@ fn terminal_mcp_error(error: &Error) -> bool {
     match error {
         Error::Cancelled => true,
         Error::Tool(message) => message == "mcp operation timed out",
-        Error::Extension(message) => message == "mcp tool infrastructure failure",
+        Error::Extension(message) => {
+            message == agens_core::mcp_failure::FIXED_ERROR_MESSAGE
+                || McpFailure::from_error_message(message).is_some()
+        }
         _ => false,
     }
 }

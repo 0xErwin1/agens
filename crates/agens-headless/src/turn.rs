@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use agens_core::compaction::CompactionBudget;
+use agens_core::mcp_failure::{McpFailure, McpFailureClass};
 use agens_core::{
     BeginSessionAttemptError, HeadlessTurnCancellation, HeadlessTurnError, Message, MessagePart,
     PermissionMode, PermissionSession, Role, TurnEvent, TurnProgressSink, TurnProvider,
@@ -404,6 +405,72 @@ const fn tool_fact_name(facts: &agens_core::ToolResultFacts) -> &'static str {
         agens_core::ToolResultFacts::Read { .. } => "read",
         agens_core::ToolResultFacts::Search { .. } => "search",
         _ => "unknown",
+    }
+}
+
+/// Records an MCP infrastructure failure as its own diagnostics event.
+///
+/// Before this, an MCP server that died mid-session left nothing in the
+/// diagnostics file at all: the failure reached the model as one fixed phrase
+/// and reached supervision not at all, so a session stalled on a dead server
+/// looked exactly like one whose tools were merely failing.
+///
+/// The tool name is remembered from the request that opened the call, because
+/// a tool result carries only the call id, and an MCP failure reports no facts
+/// to name the tool from.
+fn record_mcp_tool_failure(
+    store: &SafeDiagnosticStore,
+    reference: &DiagnosticRef,
+    called_tool_names: &Mutex<BTreeMap<String, String>>,
+    event: &TurnEvent,
+) {
+    match event {
+        TurnEvent::ToolCallRequested { id, name, .. } => {
+            if let Ok(mut names) = called_tool_names.lock() {
+                names.insert(id.clone(), name.clone());
+            }
+        }
+        TurnEvent::ToolResult(MessagePart::ToolResult {
+            tool_call_id,
+            content,
+            is_error,
+        }) => {
+            let name = called_tool_names
+                .lock()
+                .ok()
+                .and_then(|mut names| names.remove(tool_call_id));
+            let Some(failure) = (*is_error)
+                .then(|| McpFailure::from_tool_result(content))
+                .flatten()
+            else {
+                return;
+            };
+
+            store.record_session_lifecycle(
+                reference,
+                ProviderDiagnosticScope::Parent,
+                SessionLifecycle::McpToolFailed {
+                    tool: name.as_deref().unwrap_or("unknown"),
+                    class: mcp_failure_class(failure.class()),
+                    cause: &failure.cause(),
+                },
+            );
+        }
+        _ => {}
+    }
+}
+
+/// The MCP cause in the closed vocabulary the diagnostics file's `class` field
+/// already uses. The finer-grained MCP class stays readable in `cause`, so
+/// nothing is lost by mapping onto a field every reader of this file already
+/// understands.
+const fn mcp_failure_class(class: McpFailureClass) -> ProviderDiagnosticClass {
+    match class {
+        McpFailureClass::Transport | McpFailureClass::RetriesExhausted => {
+            ProviderDiagnosticClass::Network
+        }
+        McpFailureClass::Protocol => ProviderDiagnosticClass::Protocol,
+        McpFailureClass::HttpStatus => ProviderDiagnosticClass::Server,
     }
 }
 
@@ -1019,12 +1086,23 @@ where
             let lifecycle_store = diagnostic_store(context.bootstrap);
             let lifecycle_reference = prompt_diagnostic_reference.clone();
             let accepted_partial_events = Arc::clone(&runtime_partial_events);
+            // An MCP failure reports no facts, so the only place the call's
+            // name and its outcome meet is here: the name arrives with the
+            // request and the cause with the result.
+            let called_tool_names: Arc<Mutex<BTreeMap<String, String>>> =
+                Arc::new(Mutex::new(BTreeMap::new()));
             let headless_progress: TurnProgressSink = Arc::new(move |event: TurnEvent| {
                 if !matches!(event, TurnEvent::ProviderPart(_) | TurnEvent::Usage(_))
                     && let Ok(mut events) = accepted_partial_events.lock()
                 {
                     events.observe(event.clone());
                 }
+                record_mcp_tool_failure(
+                    &lifecycle_store,
+                    &lifecycle_reference,
+                    &called_tool_names,
+                    &event,
+                );
                 if let TurnEvent::ToolResultFacts { identity, facts } = &event {
                     record_tool_result_fact(&fact_store, identity, facts);
                     if let Some(class) = tool_failure_class(facts) {
