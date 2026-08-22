@@ -332,6 +332,7 @@ mod tests {
                 "https://user:SENTINEL_URL_SECRET@example.test/path?token=SENTINEL_TOKEN".into(),
             access: agens_core::ToolAccess::ReadOnly,
             reason: "permission policy requires confirmation".into(),
+            denylist: None,
         });
 
         assert!(prompt.contains("Permission required for webfetch"));
@@ -346,6 +347,7 @@ mod tests {
                 "https://user:SENTINEL_URL_SECRET@example.test?token=SENTINEL_TOKEN#fragment".into(),
             access: agens_core::ToolAccess::ReadOnly,
             reason: "permission policy requires confirmation".into(),
+            denylist: None,
         });
 
         assert!(prompt.contains("https://example.test/"));
@@ -359,6 +361,7 @@ mod tests {
             target_identifier: r#"{"url":"https://example.test","token":"SENTINEL_JSON"}"#.into(),
             access: agens_core::ToolAccess::ReadOnly,
             reason: "permission policy requires confirmation".into(),
+            denylist: None,
         });
 
         assert!(prompt.contains("Target: [redacted]"));

@@ -19,6 +19,12 @@
 //!   the session, because an answer is queued while the run is parked and the
 //!   session that will read it has not started yet.
 //!
+//! And one thing bound to its dispatcher rather than to the session: the hard
+//! denylist of [`agens_core::denylist`], measured against that worktree. A call
+//! it names never runs and never reaches a terminal that is not there; it
+//! becomes a durable question and the run parks on it, through the same `ask`
+//! path the worker's own tool uses.
+//!
 //! One admission is one turn. A turn is already the whole agent loop — the
 //! model keeps calling tools until it stops — so the session ends when the loop
 //! does, and what happened to the run is read off the control plane rather than
@@ -31,8 +37,9 @@ use std::time::{Duration, Instant};
 
 use agens_bootstrap::Bootstrap;
 use agens_core::{
-    HeadlessTurnCancellation, HeadlessTurnPortError, PermissionMode, SessionMetadata,
-    run_introspection::WORKER_CHECKPOINT_PROMPT,
+    DenylistClass, HeadlessTurnCancellation, HeadlessTurnPortError, PermissionMode,
+    SessionMetadata,
+    run_introspection::{Ask, AskOption, WORKER_CHECKPOINT_PROMPT},
 };
 use agens_headless::{
     HeadlessChatRequest, RunExecution, run_production_headless_chat_executing_run,
@@ -131,23 +138,95 @@ impl SessionProvider for WorkerProvider {
     }
 }
 
-/// A daemon has nobody at a terminal, so a permission question that reached one
-/// is denied for this call alone.
+/// What a permission question does in a daemon, where nobody is at a terminal.
 ///
-/// Denied rather than allowed: the rules the operator configured are what a
-/// worker runs under, and a prompt is by definition something they did not
-/// decide in advance. Widening that is level-3 escalation, which is its own
-/// piece of work and needs a person's authorization to exist at all.
-struct UnattendedPrompter;
+/// Two answers, decided by whether the call was stopped by the hard denylist:
+///
+/// - **An ordinary confirmation is denied for this call alone.** The rules the
+///   operator configured are what a worker runs under, and a prompt is by
+///   definition something they did not decide in advance.
+/// - **A denylisted call parks the run.** The act is one nobody inside the
+///   session may authorize, so it becomes a durable question, the run moves to
+///   `awaiting_input`, and the turn ends without the call running. The answer
+///   reaches the run's next attempt through its mailbox, the same way every
+///   other answer does.
+struct UnattendedPrompter {
+    introspection: agens_tool_runtime::runtime::RunIntrospectionFactory,
+}
 
 impl PermissionPrompter for UnattendedPrompter {
     fn prompt(
         &mut self,
-        _context: &PermissionPromptContext,
+        context: &PermissionPromptContext,
         _cancellation: &HeadlessTurnCancellation,
     ) -> Result<PermissionPromptAnswer, HeadlessTurnPortError> {
-        Ok(PermissionPromptAnswer::DenyOnce)
+        let Some(class) = context.denylist else {
+            return Ok(PermissionPromptAnswer::DenyOnce);
+        };
+
+        // A question that could not be opened leaves the call exactly where an
+        // unanswerable prompt leaves it, rather than letting it through.
+        match self.park(context, class) {
+            Ok(()) => Ok(PermissionPromptAnswer::Cancel),
+            Err(()) => Ok(PermissionPromptAnswer::DenyOnce),
+        }
     }
+}
+
+impl UnattendedPrompter {
+    fn park(&self, context: &PermissionPromptContext, class: DenylistClass) -> Result<(), ()> {
+        let ask = denylist_question(context, class).map_err(|_| ())?;
+
+        (self.introspection)().ask(&ask).map(|_| ()).map_err(|_| ())
+    }
+}
+
+/// The question a denylisted call becomes.
+///
+/// The options are what a person can actually do about it, and authorizing the
+/// call is not among them: the run is not waiting on this tool call, it is
+/// ending the turn and coming back to a fresh one, where nothing carries an
+/// authorization for a call that no longer exists. What an answer decides is
+/// how the run reaches its definition of done without taking the act itself.
+fn denylist_question(
+    context: &PermissionPromptContext,
+    class: DenylistClass,
+) -> Result<Ask, agens_core::run_introspection::AskError> {
+    let tool = agens_core::bare_tool_name(&context.tool_identity);
+    let target = agens_permissions::sanitize_permission_target(
+        &context.tool_identity,
+        &context.target_identifier,
+    );
+
+    Ask::new(
+        format!(
+            "This run stopped on a call that would {headline}. It called `{tool}` on `{target}`, \
+             classified `{class}`. The call did not run.",
+            headline = class.headline(),
+            class = class.id(),
+        ),
+        vec![
+            AskOption::new(
+                "refuse",
+                "Do not take this action; reach the definition of done without it",
+                Some(
+                    "The run resumes and must find another way, or report that there is none."
+                        .to_owned(),
+                ),
+            ),
+            AskOption::new(
+                "handled_outside",
+                "I will take this action myself, outside the run",
+                Some("The run resumes and treats the action as already done.".to_owned()),
+            ),
+            AskOption::new(
+                "stop",
+                "Stop the run",
+                Some("The work stops here and the action is never taken.".to_owned()),
+            ),
+        ],
+        Some("refuse".to_owned()),
+    )
 }
 
 /// Runs the turn and reports what became of the run.
@@ -172,26 +251,44 @@ fn execute(
         bootstrap,
         runtime.cancellation(),
         None,
-        Box::new(UnattendedPrompter),
+        Box::new(UnattendedPrompter {
+            introspection: introspection_factory(core, run),
+        }),
         None,
         None,
         Some(&RunExecution {
             introspection,
             mailbox: run.mailbox.clone(),
+            worktree: run.worktree.clone(),
         }),
     );
 
     match completion {
         Ok(completion) => finish(core, run.run_id, &completion.text),
+        Err(_) => stopped(core, run.run_id),
+    }
+}
+
+/// Reports a turn that did not come back with a completion.
+///
+/// Read off the run's own row for the same reason [`finish`] is: a denylisted
+/// call parks the run and then ends the turn, so the turn's error is how a
+/// successful park looks from here. A run that left `running` stopped where a
+/// transition put it, and calling that attempt a failure would both contradict
+/// the row and spend a retry the park does not cost.
+fn stopped(core: &Arc<Mutex<ApiCore>>, run_id: i64) -> SessionOutcome {
+    match state_of(core, run_id) {
         // The failure is already recorded in the run's diagnostics and in the
         // attempt the turn wrote; what the control plane needs is that this
         // attempt did not succeed.
-        Err(_) => report(
+        Some(RunState::Running) => report(
             core,
-            run.run_id,
+            run_id,
             RunTrigger::AttemptFailed,
             SessionOutcome::Failed,
         ),
+        Some(_) => SessionOutcome::Completed,
+        None => SessionOutcome::Failed,
     }
 }
 
@@ -416,11 +513,14 @@ fn request_for(
         // default and is refused — including the two the coordinator itself
         // depends on, `checkpoint` and `ask`.
         //
-        // It widens the unmatched default and nothing else. The hard safety
-        // predicates still hold, and a configured `deny` or `ask` rule still
-        // prevails, because the configured floor is governing. What would
-        // narrow this properly is the level-3 denylist, which is its own piece
-        // of work and needs a person's authorization to exist at all.
+        // It widens the unmatched default and nothing else, and by the time it
+        // is consulted there is very little left for it to widen: the hard
+        // safety predicates hold, a configured `deny` or `ask` rule prevails
+        // because the configured floor is governing, the run's worktree is a
+        // confinement floor no authorization lifts, and the level-3 denylist
+        // has already taken every act nobody inside the session may authorize
+        // away from the model. What reaches this fallback is an in-worktree,
+        // reversible, in-scope call.
         dangerously_allow_all: true,
         dangerous_mode: false,
         request_config: agens_core::RequestConfig::default(),

@@ -36,7 +36,7 @@ const ANSWER: &str = "split";
 
 static NEXT_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
 
-fn scratch() -> PathBuf {
+pub(crate) fn scratch() -> PathBuf {
     let suffix = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
     let directory =
         std::env::temp_dir().join(format!("agens-cli-worker-{}-{suffix}", std::process::id()));
@@ -64,7 +64,7 @@ fn git(directory: &Path, arguments: &[&str]) {
 
 /// A checkout with one commit, which is all a worktree needs to be created
 /// from.
-fn checkout(root: &Path) -> PathBuf {
+pub(crate) fn checkout(root: &Path) -> PathBuf {
     let checkout = root.join("repository");
     std::fs::create_dir_all(&checkout).expect("create the checkout");
 
@@ -102,7 +102,7 @@ fn script() -> Script {
     ])
 }
 
-async fn connect(socket: PathBuf) -> Channel {
+pub(crate) async fn connect(socket: PathBuf) -> Channel {
     for _ in 0..600 {
         if tokio::net::UnixStream::connect(&socket).await.is_ok() {
             let path = socket.clone();
@@ -130,7 +130,7 @@ async fn connect(socket: PathBuf) -> Channel {
 
 /// Stops the daemon however the client thread ends, so a panicking client does
 /// not leave the test hanging on a join that never comes.
-struct Stopper(HeadlessTurnCancellation);
+pub(crate) struct Stopper(pub(crate) HeadlessTurnCancellation);
 
 impl Drop for Stopper {
     fn drop(&mut self) {
@@ -149,7 +149,7 @@ async fn run_state(client: &mut FeedClient<Channel>, run_id: i64) -> String {
         .state
 }
 
-async fn await_reported_state(
+pub(crate) async fn await_reported_state(
     client: &mut FeedClient<Channel>,
     run_id: i64,
     wanted: &str,
@@ -169,7 +169,7 @@ async fn await_reported_state(
 
 /// One run's journal, for an assertion that has to say what happened instead of
 /// only that it did not.
-async fn journal_of(client: &mut FeedClient<Channel>, run_id: i64) -> Vec<String> {
+pub(crate) async fn journal_of(client: &mut FeedClient<Channel>, run_id: i64) -> Vec<String> {
     client
         .run_detail(proto::RunDetailRequest { run_id })
         .await

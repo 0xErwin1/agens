@@ -18,10 +18,10 @@ use std::{
 
 use agens_core::mcp_failure::{McpFailure, McpFailureClass};
 use agens_core::{
-    EditMagnitude, Error, FactPath, HeadlessTaskTerminal, HeadlessTurnCancellationAdapter,
-    PermissionAuthority, PermissionDecision, PermissionPolicy, PermissionReach,
-    PermissionReadFilter, PermissionRequest, PermissionSession, ProjectPermissionGrant, ToolAccess,
-    ToolOutcome, ToolResultFacts, WriteMagnitude,
+    Denylist, DenylistClass, EditMagnitude, Error, FactPath, HeadlessTaskTerminal,
+    HeadlessTurnCancellationAdapter, PermissionAuthority, PermissionDecision, PermissionPolicy,
+    PermissionReach, PermissionReadFilter, PermissionRequest, PermissionSession,
+    ProjectPermissionGrant, ToolAccess, ToolOutcome, ToolResultFacts, WriteMagnitude,
 };
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use ignore::WalkBuilder;
@@ -3886,6 +3886,12 @@ pub struct PermissionPromptContext {
     pub target_identifier: String,
     pub access: ToolAccess,
     pub reason: String,
+    /// The denylist class that stopped this call, when a denylist did.
+    ///
+    /// Typed rather than folded into `reason`, because the consumer is
+    /// mechanical: a run's prompter turns a class into a durable question and
+    /// parks the run, while an ordinary confirmation stays a confirmation.
+    pub denylist: Option<DenylistClass>,
 }
 
 impl PermissionPromptContext {
@@ -3896,6 +3902,15 @@ impl PermissionPromptContext {
             target_identifier: request.target.clone(),
             access: request.access,
             reason: "permission policy requires confirmation".into(),
+            denylist: None,
+        }
+    }
+
+    fn denylisted(request: &PermissionRequest, class: DenylistClass) -> Self {
+        Self {
+            reason: format!("this call would {}", class.headline()),
+            denylist: Some(class),
+            ..Self::from_request(request)
         }
     }
 }
@@ -4002,6 +4017,9 @@ pub struct ToolDispatcher {
     declared_mcp_servers: BTreeSet<String>,
     dispatcher_id: u64,
     next_version: u64,
+    /// The hard denylist this dispatcher evaluates every call against, when it
+    /// is serving a coordinator run. See [`Self::enforce_denylist`].
+    denylist: Option<Denylist>,
 }
 
 impl ToolDispatcher {
@@ -4021,7 +4039,25 @@ impl ToolDispatcher {
             tools: BTreeMap::new(),
             aliases: BTreeMap::new(),
             declared_mcp_servers: BTreeSet::new(),
+            denylist: None,
         }
+    }
+
+    /// Binds the hard denylist of [`agens_core::denylist`] to this dispatcher,
+    /// for a session executing a coordinator run in `worktree`.
+    ///
+    /// Held here rather than on the policy for one reason: a sub-agent this
+    /// session launches builds a policy of its own but dispatches through this
+    /// same dispatcher. A denylist a child could leave behind by constructing
+    /// its own policy would make delegation the way around it, which is exactly
+    /// the case [`DenylistClass::OutOfScope`] exists for.
+    pub fn enforce_denylist(&mut self, worktree: impl Into<std::path::PathBuf>) {
+        self.denylist = Some(Denylist::new(worktree));
+    }
+
+    #[must_use]
+    pub fn denylist(&self) -> Option<&Denylist> {
+        self.denylist.as_ref()
     }
 
     pub fn register_native(
@@ -4265,6 +4301,21 @@ impl ToolDispatcher {
             return Ok(ToolEvaluationOutcome::Denied);
         }
 
+        // Level 3, above every rule, grant, configured floor and unmatched
+        // default there is: a denylisted act is nobody's to authorize from
+        // inside the session, so the call stops here and a person answers for
+        // it. `unmatched_allow` cannot reach this, which is what keeps
+        // `dangerously_allow_all` a widening of the unmatched default alone.
+        if let Some(class) = self
+            .denylist
+            .as_ref()
+            .and_then(|denylist| denylist.classify(&prepared.permission))
+        {
+            return Ok(ToolEvaluationOutcome::PromptRequired(
+                PermissionPromptContext::denylisted(&prepared.permission, class),
+            ));
+        }
+
         let (decision, authority) = prepared.policy.evaluate_with_unmatched_authority(
             &prepared.permission,
             &prepared.grants,
@@ -4314,6 +4365,16 @@ impl ToolDispatcher {
             registered.access,
             &reach,
         );
+        // The one production site where a tool call becomes a permission
+        // request, and therefore the only place that can state whether the call
+        // leaves the worktree. Without this, `SafetyPredicate::WorktreeEscape`
+        // is a predicate nothing ever triggers.
+        let permission = match &self.denylist {
+            Some(denylist) if denylist.escapes_worktree(&permission) => {
+                permission.outside_worktree()
+            }
+            _ => permission,
+        };
         let grants = if permission.project.trim().is_empty() {
             Vec::new()
         } else {

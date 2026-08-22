@@ -14,6 +14,9 @@ use globset::{GlobBuilder, GlobMatcher};
 
 pub mod ask_user;
 pub mod compaction;
+pub mod denylist;
+#[cfg(test)]
+mod denylist_tests;
 pub mod mcp_failure;
 mod permission_precedence;
 mod permission_target;
@@ -24,6 +27,7 @@ mod request_config;
 pub mod run_introspection;
 pub mod summary;
 
+pub use denylist::{Denylist, DenylistClass};
 pub use permission_precedence::{
     declarations_deny_every_target, prevailing_decision, prevailing_rule_decision,
 };

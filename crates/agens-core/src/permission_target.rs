@@ -115,6 +115,64 @@ pub(crate) fn command_invocations(command: &str) -> Vec<Vec<String>> {
     invocations
 }
 
+/// Decomposes a shell command line into the invocations it would run, each
+/// given as its raw tokens, before any wrapper command, environment assignment
+/// or directory prefix is stripped away.
+///
+/// [`command_invocations`] answers what a rule is written against, which is why
+/// it drops the wrappers: `sudo rm x` and `rm x` are one subject to a rule
+/// naming `rm`. The denylist asks the other question — what the invocation
+/// actually does — and there the `sudo` is the answer rather than noise.
+pub(crate) fn command_invocation_tokens(command: &str) -> Vec<Vec<String>> {
+    let mut tokens = Vec::new();
+    collect_invocation_tokens(command, 0, &mut tokens);
+    tokens
+}
+
+fn collect_invocation_tokens(command: &str, depth: usize, invocations: &mut Vec<Vec<String>>) {
+    if depth > MAX_SHELL_DEPTH {
+        return;
+    }
+
+    let (segments, substitutions) = scan(command);
+
+    for segment in segments.into_iter().chain(substitutions) {
+        if invocations.len() >= MAX_INVOCATIONS {
+            return;
+        }
+
+        let written = segment.trim();
+        if written.is_empty() {
+            continue;
+        }
+
+        let tokens = tokenize(written);
+        if tokens.is_empty() {
+            continue;
+        }
+
+        if let Some(script) = shell_script(strip_prefixes(&tokens)) {
+            collect_invocation_tokens(&script, depth + 1, invocations);
+        }
+
+        invocations.push(tokens);
+    }
+}
+
+/// The tokens of one invocation with its leading environment assignments and
+/// wrapper commands removed. See [`strip_prefixes`].
+pub(crate) fn without_wrapper_prefixes(tokens: &[String]) -> &[String] {
+    strip_prefixes(tokens)
+}
+
+/// Whether a token is a leading `NAME=value` environment assignment rather than
+/// the command being run.
+pub(crate) fn is_environment_assignment(token: &str) -> bool {
+    token
+        .split_once('=')
+        .is_some_and(|(name, _)| !name.is_empty() && is_environment_name(name))
+}
+
 /// A command line long enough to exhaust these bounds is not a shape any rule
 /// is written against, so it resolves to whatever was found before the bound
 /// and is still matched whole.
@@ -316,9 +374,7 @@ fn strip_prefixes(tokens: &[String]) -> &[String] {
             return remaining;
         };
 
-        let is_assignment = first
-            .split_once('=')
-            .is_some_and(|(name, _)| !name.is_empty() && is_environment_name(name));
+        let is_assignment = is_environment_assignment(first);
         let is_wrapper = WRAPPER_COMMANDS.contains(&command_name(first));
 
         if !is_assignment && !is_wrapper {
@@ -364,7 +420,7 @@ fn normalized_form(tokens: &[String]) -> String {
 
 /// Reduces an invoked path to the command it names, so `/bin/rm` and `rm` are
 /// one subject.
-fn command_name(token: &str) -> &str {
+pub(crate) fn command_name(token: &str) -> &str {
     token.rsplit('/').next().unwrap_or(token)
 }
 
