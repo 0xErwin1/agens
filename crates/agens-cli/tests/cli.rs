@@ -1,13 +1,11 @@
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpListener;
+use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -15,6 +13,8 @@ use agens::{
     CliDependencies, ExitStatus, ModelSelection, ModelSource, bootstrap, execute, execute_os,
     execute_with_cancellation,
 };
+use agens_fixtures::{NetworkTripwire, Script, ScriptedDialect, ScriptedProvider, ScriptedTurn};
+
 use agens_core::{
     CompletedSessionTurn, HeadlessPermissionGate, HeadlessPermissionResolver, HeadlessToolCall,
     HeadlessToolDispatcher, HeadlessToolOutput, HeadlessTurnCancellation, HeadlessTurnPortError,
@@ -2113,7 +2113,7 @@ fn unavailable_explicit_child_model_runs_on_the_parent_model_and_is_diagnosed_on
     let data_directory = temporary.path().join("data");
     std::fs::create_dir_all(project_root.join(".git")).expect("project marker should exist");
     std::fs::create_dir_all(&config_home).expect("config directory should exist");
-    let server = BoundedScriptedOpenAiMockServer::start(vec![
+    let server = ScriptedNativeOpenAiMockServer::start(vec![
         ScriptedOpenAiResponse {
             required_body_fragments: vec!["parent unavailable child".into(), "task".into()],
             response: native_tool_call_response(
@@ -2210,7 +2210,7 @@ fn production_task_cancellation_prevents_parent_continuation_and_persists_emitte
     )
     .expect("subagent definition should be written");
 
-    let mut server = TaskStalledOpenAiMockServer::start(Duration::from_secs(1));
+    let mut server = TaskStalledOpenAiMockServer::start();
     std::fs::write(
         config_home.join("config.toml"),
         format!(
@@ -2306,7 +2306,7 @@ fn production_task_provider_failure_is_sanitized_and_returns_control_to_the_pare
         required_body_fragments: vec!["task: provider failure".into()],
         response: text_response("parent recovered from child provider failure"),
     });
-    let server = BoundedScriptedOpenAiMockServer::start(responses);
+    let server = ScriptedNativeOpenAiMockServer::start(responses);
     std::fs::write(
         config_home.join("config.toml"),
         format!(
@@ -2498,6 +2498,11 @@ fn production_binary_rejects_missing_malformed_and_incomplete_chatgpt_credential
 
 #[test]
 fn production_binary_maps_chatgpt_provider_and_auth_failures_without_leaking_credentials() {
+    // Every case answers once. A transient status is retried against the whole
+    // provider budget, and tying this script's length to that budget would pay
+    // its backoff in the gate for a test that is about status mapping. Budget
+    // exhaustion is covered in `agens-providers`, where the schedule can be
+    // compressed.
     for (name, response, expected_exit, expected_stderr, expected_detail) in [
         (
             "forbidden",
@@ -2601,7 +2606,7 @@ fn production_binary_maps_chatgpt_provider_and_auth_failures_without_leaking_cre
         );
         assert!(data_directory.join("agens.db").is_file(), "{name}");
 
-        server.join();
+        server.join_spending_retries();
     }
 }
 
@@ -3358,7 +3363,7 @@ fn production_binary_denies_native_write_in_chat_mode_even_with_temporary_bypass
     std::fs::create_dir_all(project_root.join(".git")).expect("project marker should exist");
     std::fs::create_dir_all(&config_home).expect("config directory should exist");
     let protected = project_root.join("SENTINEL_CHAT_WRITE.txt");
-    let server = BoundedScriptedOpenAiMockServer::start(vec![
+    let server = ScriptedNativeOpenAiMockServer::start(vec![
         ScriptedOpenAiResponse {
             required_body_fragments: vec!["native::write".to_owned()],
             response: native_tool_call_response(
@@ -3437,7 +3442,7 @@ fn production_binary_rejects_duplicate_and_mismatched_tool_call_protocol_items_b
         std::fs::create_dir_all(project_root.join(".git")).expect("project marker should exist");
         std::fs::create_dir_all(&config_home).expect("config directory should exist");
         let side_effect = project_root.join("should-not-exist");
-        let server = BoundedScriptedOpenAiMockServer::start(vec![ScriptedOpenAiResponse {
+        let server = ScriptedNativeOpenAiMockServer::start(vec![ScriptedOpenAiResponse {
             required_body_fragments: vec!["native::write".to_owned()],
             response,
         }]);
@@ -3491,7 +3496,7 @@ fn production_binary_cancellation_kills_native_bash_descendants_without_continui
         "bash -c 'sleep 30 & descendant=$!; printf \"%s %s\\n\" \"$$\" \"$descendant\" > \"$1\"; : > \"$2\"; wait' bash {:?} {:?} & wait",
         process_marker, ready_marker
     );
-    let server = BoundedScriptedOpenAiMockServer::start(vec![ScriptedOpenAiResponse {
+    let server = ScriptedNativeOpenAiMockServer::start(vec![ScriptedOpenAiResponse {
         required_body_fragments: vec!["native::bash".to_owned()],
         response: native_tool_call_response(
             "call_bash_cancel",
@@ -3580,7 +3585,7 @@ fn production_binary_rejects_replayed_native_call_id_without_second_execution() 
         "native::write",
         r#"{"path":"execution-count","content":"second execution"}"#,
     );
-    let server = BoundedScriptedOpenAiMockServer::start(vec![
+    let server = ScriptedNativeOpenAiMockServer::start(vec![
         ScriptedOpenAiResponse {
             required_body_fragments: vec!["native::write".to_owned()],
             response: initial_call,
@@ -3908,7 +3913,7 @@ fn production_binary_cancels_configured_mcp_call_without_continuing_or_persistin
     std::fs::create_dir_all(project_root.join(".git")).expect("project marker should exist");
     std::fs::create_dir_all(&config_home).expect("config directory should exist");
 
-    let server = BoundedScriptedOpenAiMockServer::start(vec![ScriptedOpenAiResponse {
+    let server = ScriptedNativeOpenAiMockServer::start(vec![ScriptedOpenAiResponse {
         required_body_fragments: vec!["files::first".to_owned()],
         response: native_tool_call_response("call_mcp_cancel", "files::first", r#"{}"#),
     }]);
@@ -4338,7 +4343,7 @@ fn production_binary_recovers_from_mcp_infrastructure_failures_and_persists_comp
         std::fs::create_dir_all(project_root.join(".git")).expect("project marker should exist");
         std::fs::create_dir_all(&config_home).expect("config directory should exist");
 
-        let server = BoundedScriptedOpenAiMockServer::start(vec![
+        let server = ScriptedNativeOpenAiMockServer::start(vec![
             ScriptedOpenAiResponse {
                 required_body_fragments: vec!["files::first".to_owned()],
                 response: native_tool_call_response(
@@ -4595,7 +4600,7 @@ fn production_binary_enforces_mcp_permission_matrix_and_executes_allowed_calls_o
             required_body_fragments: vec![tool.to_owned()],
             response: native_tool_call_response("call_mcp_permission", tool, arguments),
         };
-        let server = BoundedScriptedOpenAiMockServer::start(if persists {
+        let server = ScriptedNativeOpenAiMockServer::start(if persists {
             vec![
                 first_response,
                 ScriptedOpenAiResponse {
@@ -4738,7 +4743,7 @@ fn production_binary_fails_closed_for_mcp_duplicate_replay_and_mismatched_call_i
         let call_marker = temporary.path().join("mcp-call-count");
         std::fs::create_dir_all(project_root.join(".git")).expect("project marker should exist");
         std::fs::create_dir_all(&config_home).expect("config directory should exist");
-        let server = BoundedScriptedOpenAiMockServer::start(responses);
+        let server = ScriptedNativeOpenAiMockServer::start(responses);
         std::fs::write(
             config_home.join("config.toml"),
             format!(
@@ -5131,6 +5136,20 @@ fn isolated_agens_command(temporary: &TemporaryDirectory) -> IsolatedAgensComman
         .env("XDG_CONFIG_HOME", xdg_config_home)
         .env("XDG_DATA_HOME", xdg_data_home)
         .env("AGENS_CONFIG_HOME", agens_config_home);
+
+    // Isolating the configuration roots leaves the inherited environment
+    // untouched, so a developer machine with a real key exported still lets a
+    // run authenticate for real. Removing the credentials and routing every
+    // non-loopback request into a tripwire is what makes "this test cannot
+    // reach a real provider" true rather than assumed. A test that needs a key
+    // sets its own afterwards, and that value wins.
+    for variable in agens_fixtures::PROVIDER_CREDENTIAL_VARIABLES {
+        command.env_remove(variable);
+    }
+    for (variable, value) in agens_fixtures::NetworkTripwire::shared().environment() {
+        command.env(variable, value);
+    }
+
     IsolatedAgensCommand { command }
 }
 
@@ -5164,9 +5183,11 @@ impl Drop for TemporaryDirectory {
     }
 }
 
+/// A `/responses` endpoint that answers one turn and reports the credential
+/// the run authenticated with.
 struct OpenAiMockServer {
-    address: std::net::SocketAddr,
-    worker: thread::JoinHandle<()>,
+    provider: ScriptedProvider,
+    expected_authorization: String,
 }
 
 struct ScriptedOpenAiResponse {
@@ -5174,149 +5195,119 @@ struct ScriptedOpenAiResponse {
     response: String,
 }
 
+/// A scripted `/responses` endpoint over the shared journey fake.
+///
+/// The fragment expectations are checked in `join`, against the request each
+/// scripted round actually answered, rather than inside the server thread: a
+/// mismatch is then the test's own failure with the whole conversation in
+/// hand, not an opaque worker panic.
 struct ScriptedNativeOpenAiMockServer {
-    address: std::net::SocketAddr,
-    worker: thread::JoinHandle<()>,
-}
-
-struct BoundedScriptedOpenAiMockServer {
-    address: std::net::SocketAddr,
-    worker: thread::JoinHandle<()>,
+    provider: ScriptedProvider,
+    expectations: Vec<Vec<String>>,
 }
 
 impl ScriptedNativeOpenAiMockServer {
     fn start(responses: Vec<ScriptedOpenAiResponse>) -> Self {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("mock server should bind");
-        let address = listener
-            .local_addr()
-            .expect("mock server should have an address");
-        let worker = thread::spawn(move || {
-            for scripted in responses {
-                let (mut stream, _) = listener
-                    .accept()
-                    .expect("mock server should accept a request");
-                let body = read_openai_request_body(&stream);
-                for fragment in scripted.required_body_fragments {
-                    if fragment == "@all-tools-non-strict" {
-                        let payload: serde_json::Value = serde_json::from_str(&body)
-                            .expect("production provider payload should be JSON");
-                        let tools = payload["tools"]
-                            .as_array()
-                            .expect("production provider should advertise tools");
-                        assert!(
-                            !tools.is_empty(),
-                            "production provider should advertise tools"
-                        );
-                        for tool in tools {
-                            assert_eq!(tool["type"], "function");
-                            assert_eq!(tool["strict"], false, "tool was strict: {tool}");
-                            assert!(tool["name"].as_str().is_some_and(|name| !name.is_empty()));
-                            assert!(
-                                tool["description"]
-                                    .as_str()
-                                    .is_some_and(|description| !description.is_empty())
-                            );
-                            assert_eq!(tool["parameters"]["type"], "object");
-                        }
-                        continue;
-                    }
-                    if let Some(forbidden) = fragment.strip_prefix('!') {
-                        assert!(
-                            !body.contains(forbidden),
-                            "request body leaked {forbidden:?}: {body}"
-                        );
-                        continue;
-                    }
-                    if let Some(once) = fragment.strip_prefix("@once:") {
-                        let visible = model_visible_fragment(once);
-                        let occurrences = body.matches(&visible).count();
-                        assert_eq!(
-                            occurrences, 1,
-                            "request body should contain {visible:?} exactly once, found {occurrences}: {body}"
-                        );
-                        continue;
-                    }
-                    let visible = model_visible_fragment(&fragment);
-                    assert!(
-                        body.contains(&visible),
-                        "request body should contain {visible:?}: {body}"
-                    );
-                }
-                stream
-                    .write_all(scripted.response.as_bytes())
-                    .expect("scripted response should be written");
-            }
-        });
+        let mut expectations = Vec::with_capacity(responses.len());
+        let mut turns = Vec::with_capacity(responses.len());
+        for scripted in responses {
+            expectations.push(scripted.required_body_fragments);
+            turns.push(ScriptedTurn::raw(scripted.response));
+        }
 
-        Self { address, worker }
+        Self {
+            provider: ScriptedProvider::start(ScriptedDialect::Responses, Script::new(turns)),
+            expectations,
+        }
     }
 
     fn base_url(&self) -> String {
-        format!("http://{}", self.address)
+        self.provider.base_url()
     }
 
     fn join(self) {
-        self.worker.join().expect("mock server should finish");
+        self.finish(true);
+    }
+
+    /// Like [`Self::join`], for a run whose retry budget deliberately outlives
+    /// the script.
+    ///
+    /// Tying a script's length to the provider's retry budget would pay that
+    /// budget's backoff in the gate, so the attempts after the last scripted
+    /// round reach a socket this fixture answers by closing — which is what
+    /// the endpoint being gone looks like, and what those tests then assert on.
+    fn join_spending_retries(self) {
+        self.finish(false);
+    }
+
+    fn finish(self, script_must_be_consumed: bool) {
+        let requests = self.provider.wait_for_requests(self.expectations.len());
+        if script_must_be_consumed {
+            // An unscripted request is what the bounded variant of this server
+            // used to look for by waiting a quarter of a second after the last
+            // scripted round. The fake records it instead, and every caller
+            // joins after the run has already exited, so the same guarantee
+            // costs no wall clock.
+            self.provider.assert_script_consumed();
+        }
+
+        for (round, (fragments, request)) in self.expectations.iter().zip(&requests).enumerate() {
+            assert_scripted_request_fragments(round, request.body(), fragments);
+        }
     }
 }
 
-impl BoundedScriptedOpenAiMockServer {
-    fn start(responses: Vec<ScriptedOpenAiResponse>) -> Self {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("mock server should bind");
-        let address = listener
-            .local_addr()
-            .expect("mock server should have an address");
-        let worker = thread::spawn(move || {
-            for scripted in responses {
-                let (mut stream, _) = listener
-                    .accept()
-                    .expect("mock server should accept a request");
-                let body = read_openai_request_body(&stream);
-                for fragment in scripted.required_body_fragments {
-                    if let Some(forbidden) = fragment.strip_prefix('!') {
-                        assert!(
-                            !body.contains(forbidden),
-                            "request body leaked {forbidden:?}: {body}"
-                        );
-                        continue;
-                    }
-                    let visible = model_visible_fragment(&fragment);
-                    assert!(
-                        body.contains(&visible),
-                        "request body should contain {visible:?}: {body}"
-                    );
-                }
-                stream
-                    .write_all(scripted.response.as_bytes())
-                    .expect("scripted response should be written");
+/// Checks one scripted round's expectations against the request it answered.
+///
+/// A bare fragment must appear, `!` requires its absence, `@once:` pins a
+/// single occurrence, and `@all-tools-non-strict` checks the declared tool
+/// surface as a whole.
+fn assert_scripted_request_fragments(round: usize, body: &str, fragments: &[String]) {
+    for fragment in fragments {
+        if fragment == "@all-tools-non-strict" {
+            let payload: serde_json::Value =
+                serde_json::from_str(body).expect("production provider payload should be JSON");
+            let tools = payload["tools"]
+                .as_array()
+                .expect("production provider should advertise tools");
+            assert!(
+                !tools.is_empty(),
+                "production provider should advertise tools"
+            );
+            for tool in tools {
+                assert_eq!(tool["type"], "function");
+                assert_eq!(tool["strict"], false, "tool was strict: {tool}");
+                assert!(tool["name"].as_str().is_some_and(|name| !name.is_empty()));
+                assert!(
+                    tool["description"]
+                        .as_str()
+                        .is_some_and(|description| !description.is_empty())
+                );
+                assert_eq!(tool["parameters"]["type"], "object");
             }
-
-            listener
-                .set_nonblocking(true)
-                .expect("mock server should enable bounded probe mode");
-            let deadline = std::time::Instant::now() + Duration::from_millis(250);
-            while std::time::Instant::now() < deadline {
-                match listener.accept() {
-                    Ok((_stream, _)) => {
-                        panic!("unexpected provider continuation request");
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(5));
-                    }
-                    Err(error) => panic!("mock server probe failed: {error}"),
-                }
-            }
-        });
-
-        Self { address, worker }
-    }
-
-    fn base_url(&self) -> String {
-        format!("http://{}", self.address)
-    }
-
-    fn join(self) {
-        self.worker.join().expect("mock server should finish");
+            continue;
+        }
+        if let Some(forbidden) = fragment.strip_prefix('!') {
+            assert!(
+                !body.contains(forbidden),
+                "round {round} request body leaked {forbidden:?}: {body}"
+            );
+            continue;
+        }
+        if let Some(once) = fragment.strip_prefix("@once:") {
+            let visible = model_visible_fragment(once);
+            let occurrences = body.matches(&visible).count();
+            assert_eq!(
+                occurrences, 1,
+                "round {round} request body should contain {visible:?} exactly once, found {occurrences}: {body}"
+            );
+            continue;
+        }
+        let visible = model_visible_fragment(fragment);
+        assert!(
+            body.contains(&visible),
+            "round {round} request body should contain {visible:?}: {body}"
+        );
     }
 }
 
@@ -5332,307 +5323,171 @@ fn model_visible_fragment(fragment: &str) -> String {
 
 impl OpenAiMockServer {
     fn start_with_api_key(api_key: &str) -> Self {
-        let expected_authorization = format!("authorization: Bearer {api_key}\r\n");
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("mock server should bind");
-        let address = listener
-            .local_addr()
-            .expect("mock server should have an address");
-        let worker = thread::spawn(move || {
-            let (stream, _) = listener
-                .accept()
-                .expect("mock server should accept a request");
-            let mut reader = BufReader::new(stream.try_clone().expect("stream should clone"));
-            let mut request = String::new();
-            reader
-                .read_line(&mut request)
-                .expect("request line should be readable");
-            assert_eq!(request, "POST /responses HTTP/1.1\r\n");
-
-            let mut authorization = String::new();
-            loop {
-                let mut header = String::new();
-                reader
-                    .read_line(&mut header)
-                    .expect("header should be readable");
-                if header == "\r\n" {
-                    break;
-                }
-                if header.to_ascii_lowercase().starts_with("authorization:") {
-                    authorization = header;
-                }
-            }
-            assert_eq!(authorization, expected_authorization);
-
-            let mut stream = stream;
-            stream
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello from OpenAI\"}\n\ndata: {\"type\":\"response.completed\"}\n\n")
-                .expect("mock response should be written");
-        });
-
-        Self { address, worker }
+        Self {
+            provider: ScriptedProvider::start(
+                ScriptedDialect::Responses,
+                Script::new([ScriptedTurn::text("Hello from OpenAI")]),
+            ),
+            expected_authorization: format!("Bearer {api_key}"),
+        }
     }
 
     fn base_url(&self) -> String {
-        format!("http://{}", self.address)
+        self.provider.base_url()
     }
 
     fn join(self) {
-        self.worker.join().expect("mock server should finish");
+        let requests = self.provider.wait_for_requests(1);
+        self.provider.assert_script_consumed();
+        assert_eq!(requests[0].target(), "/responses");
+        assert_eq!(
+            requests[0].header("authorization"),
+            Some(self.expected_authorization.as_str())
+        );
     }
 }
 
 struct StalledOpenAiMockServer {
-    address: std::net::SocketAddr,
-    observed_request: mpsc::Receiver<()>,
-    worker: thread::JoinHandle<()>,
+    provider: ScriptedProvider,
 }
 
+/// The same, one level down: the parent delegates and the child's turn is the
+/// one left hanging.
 struct TaskStalledOpenAiMockServer {
-    address: std::net::SocketAddr,
-    observed_child_request: mpsc::Receiver<()>,
-    worker: thread::JoinHandle<()>,
+    provider: ScriptedProvider,
 }
 
 impl StalledOpenAiMockServer {
     fn start() -> Self {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("mock server should bind");
-        let address = listener
-            .local_addr()
-            .expect("mock server should have an address");
-        let (observed_sender, observed_request) = mpsc::channel();
-        let worker = thread::spawn(move || {
-            let (stream, _) = listener
-                .accept()
-                .expect("mock server should accept a request");
-            read_openai_request(&stream);
-            observed_sender
-                .send(())
-                .expect("test should receive the request observation");
-            stream
-                .set_read_timeout(Some(Duration::from_secs(1)))
-                .expect("client-close timeout should be configured");
-            let mut byte = [0_u8; 1];
-            let _ = std::io::Read::read(
-                &mut stream.try_clone().expect("stream should clone"),
-                &mut byte,
-            );
-        });
-
         Self {
-            address,
-            observed_request,
-            worker,
+            provider: ScriptedProvider::start(
+                ScriptedDialect::Responses,
+                Script::new([ScriptedTurn::stall(STALLED_TURN)]),
+            ),
         }
     }
 
     fn base_url(&self) -> String {
-        format!("http://{}", self.address)
+        self.provider.base_url()
     }
 
     fn wait_for_request(&mut self) {
-        self.observed_request
-            .recv_timeout(Duration::from_secs(5))
-            .expect("production request should reach the local server");
+        let requests = self.provider.wait_for_requests(1);
+        assert!(
+            matches!(requests[0].target(), "/responses" | "/codex/responses"),
+            "unexpected stalled target: {}",
+            requests[0].target()
+        );
     }
 
     fn join(self) {
-        self.worker.join().expect("mock server should finish");
+        self.provider.assert_script_consumed();
     }
 }
 
 impl TaskStalledOpenAiMockServer {
-    fn start(stall_timeout: Duration) -> Self {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("mock server should bind");
-        let address = listener
-            .local_addr()
-            .expect("mock server should have an address");
-        let (observed_sender, observed_child_request) = mpsc::channel();
-        let worker = thread::spawn(move || {
-            let (mut parent, _) = listener
-                .accept()
-                .expect("mock server should accept the parent request");
-            let parent_body = read_openai_request_body(&parent);
-            assert!(parent_body.contains("parent task"));
-            parent
-                .write_all(
-                    native_tool_call_response(
-                        "task-cancel",
-                        "task",
-                        r#"{"agent":"reviewer","description":"child cancellation request"}"#,
-                    )
-                    .as_bytes(),
-                )
-                .expect("parent response should be written");
-            drop(parent);
-
-            let (child, _) = listener
-                .accept()
-                .expect("mock server should accept the child request");
-            let child_body = read_openai_request_body(&child);
-            observed_sender
-                .send(())
-                .expect("test should receive the child request observation");
-            // The reviewer agent declares no `permissions:`, so it inherits the
-            // parent's full native surface (write/bash/webfetch included) unlike
-            // `explore`, which narrows explicitly. It also carries `task`: a
-            // child may delegate one level further, and the chain stops at the
-            // grandchild — which this request cannot observe, so the depth limit
-            // itself is pinned in `delegation_reaches_a_grandchild_and_stops_there`.
-            for forbidden in ["parent task cancellation", "mcp"] {
-                assert!(
-                    !child_body.contains(forbidden),
-                    "child request leaked {forbidden:?}: {child_body}"
-                );
-            }
-            for expected in ["write", "bash", "webfetch", "\"name\":\"task\""] {
-                assert!(
-                    child_body.contains(expected),
-                    "child request should inherit the parent's full native surface, missing {expected:?}: {child_body}"
-                );
-            }
-            assert_eq!(
-                child_body.matches("\"name\":\"task_control\"").count(),
-                1,
-                "the child's own execution-scoped task_control must not be joined by \
-                 the main-scoped one: {child_body}"
-            );
-            child
-                .set_read_timeout(Some(stall_timeout))
-                .expect("child close timeout should be configured");
-            let mut byte = [0_u8; 1];
-            let _ = std::io::Read::read(
-                &mut child.try_clone().expect("child stream should clone"),
-                &mut byte,
-            );
-
-            listener
-                .set_nonblocking(true)
-                .expect("mock server should enable continuation probe");
-            let deadline = std::time::Instant::now() + Duration::from_millis(250);
-            while std::time::Instant::now() < deadline {
-                match listener.accept() {
-                    Ok(_) => panic!("parent continued after child cancellation"),
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(5));
-                    }
-                    Err(error) => panic!("mock server probe failed: {error}"),
-                }
-            }
-        });
-
+    fn start() -> Self {
         Self {
-            address,
-            observed_child_request,
-            worker,
+            provider: ScriptedProvider::start(
+                ScriptedDialect::Responses,
+                Script::new([ScriptedTurn::raw(native_tool_call_response(
+                    "task-cancel",
+                    "task",
+                    r#"{"agent":"reviewer","description":"child cancellation request"}"#,
+                ))])
+                .with_child(
+                    "child cancellation request",
+                    [ScriptedTurn::stall(STALLED_TURN)],
+                ),
+            ),
         }
     }
 
     fn base_url(&self) -> String {
-        format!("http://{}", self.address)
+        self.provider.base_url()
     }
 
     fn wait_for_child_request(&mut self) {
-        self.observed_child_request
-            .recv_timeout(Duration::from_secs(5))
-            .expect("production child request should reach the local server");
+        self.provider.wait_for_requests(2);
     }
 
+    /// Checks the delegation the parent sent and the scope the child ran in.
+    ///
+    /// The reviewer agent declares no `permissions:`, so it inherits the
+    /// parent's full native surface (write/bash/webfetch included) unlike
+    /// `explore`, which narrows explicitly. It also carries `task`: a child may
+    /// delegate one level further, and the chain stops at the grandchild —
+    /// which this request cannot observe, so the depth limit itself is pinned
+    /// in `delegation_reaches_a_grandchild_and_stops_there`.
     fn join(self) {
-        self.worker.join().expect("mock server should finish");
+        let requests = self.provider.requests();
+        // A parent that continued past the cancelled child would have sent a
+        // third request, and the fake would have recorded it as unscripted.
+        self.provider.assert_script_consumed();
+        assert!(requests[0].body().contains("parent task"));
+
+        let child = requests[1].body();
+        assert!(
+            requests[1].is_child(),
+            "the child ran its own turn: {child}"
+        );
+        for forbidden in ["parent task cancellation", "mcp"] {
+            assert!(
+                !child.contains(forbidden),
+                "child request leaked {forbidden:?}: {child}"
+            );
+        }
+        for expected in ["write", "bash", "webfetch", "\"name\":\"task\""] {
+            assert!(
+                child.contains(expected),
+                "child request should inherit the parent's full native surface, missing {expected:?}: {child}"
+            );
+        }
+        assert_eq!(
+            child.matches("\"name\":\"task_control\"").count(),
+            1,
+            "the child's own execution-scoped task_control must not be joined by \
+             the main-scoped one: {child}"
+        );
     }
 }
 
 struct ErrorOpenAiMockServer {
-    address: std::net::SocketAddr,
-    worker: thread::JoinHandle<()>,
+    provider: ScriptedProvider,
 }
 
 impl ErrorOpenAiMockServer {
     fn start() -> Self {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("mock server should bind");
-        let address = listener
-            .local_addr()
-            .expect("mock server should have an address");
-        let worker = thread::spawn(move || {
-            let (mut stream, _) = listener
-                .accept()
-                .expect("mock server should accept a request");
-            read_openai_request(&stream);
-            stream
-                .write_all(
-                    b"HTTP/1.1 500 Internal Server Error\r\nX-Remote-Secret: SENTINEL_REMOTE_ERROR_HEADER\r\nContent-Length: 26\r\nConnection: close\r\n\r\nSENTINEL_REMOTE_ERROR_BODY",
-                )
-                .expect("error response should be written");
-        });
-
-        Self { address, worker }
+        Self {
+            provider: ScriptedProvider::start(
+                ScriptedDialect::Responses,
+                Script::new([ScriptedTurn::raw(concat!(
+                    "HTTP/1.1 500 Internal Server Error\r\n",
+                    "X-Remote-Secret: SENTINEL_REMOTE_ERROR_HEADER\r\n",
+                    "Content-Length: 26\r\nConnection: close\r\n\r\n",
+                    "SENTINEL_REMOTE_ERROR_BODY"
+                ))]),
+            ),
+        }
     }
 
     fn base_url(&self) -> String {
-        format!("http://{}", self.address)
+        self.provider.base_url()
     }
 
     fn join(self) {
-        self.worker.join().expect("mock server should finish");
+        let requests = self.provider.wait_for_requests(1);
+        // The remaining attempts of the run's retry budget reach a socket this
+        // fixture answers by closing, which is what the endpoint being gone
+        // looks like and what this test's expected diagnostic describes.
+        assert_eq!(requests[0].target(), "/responses");
     }
 }
 
-fn read_openai_request(stream: &std::net::TcpStream) {
-    let mut reader = BufReader::new(stream.try_clone().expect("stream should clone"));
-    let mut request = String::new();
-    reader
-        .read_line(&mut request)
-        .expect("request line should be readable");
-    assert!(
-        request == "POST /responses HTTP/1.1\r\n"
-            || request == "POST /codex/responses HTTP/1.1\r\n"
-    );
-
-    loop {
-        let mut header = String::new();
-        reader
-            .read_line(&mut header)
-            .expect("header should be readable");
-        if header == "\r\n" {
-            return;
-        }
-    }
-}
-
-fn read_openai_request_body(stream: &std::net::TcpStream) -> String {
-    let mut reader = BufReader::new(stream.try_clone().expect("stream should clone"));
-    let mut request = String::new();
-    reader
-        .read_line(&mut request)
-        .expect("request line should be readable");
-    assert!(
-        request == "POST /responses HTTP/1.1\r\n"
-            || request == "POST /codex/responses HTTP/1.1\r\n"
-    );
-
-    let mut content_length = None;
-    loop {
-        let mut header = String::new();
-        reader
-            .read_line(&mut header)
-            .expect("header should be readable");
-        if header == "\r\n" {
-            break;
-        }
-        if let Some(value) = header.strip_prefix("content-length: ") {
-            content_length = Some(
-                value
-                    .trim()
-                    .parse::<usize>()
-                    .expect("content length should be numeric"),
-            );
-        }
-    }
-
-    let mut body = vec![0_u8; content_length.expect("request should include content length")];
-    std::io::Read::read_exact(&mut reader, &mut body).expect("request body should be readable");
-    String::from_utf8(body).expect("request body should be UTF-8")
-}
+/// How long a stalled endpoint holds a turn open. The run under test
+/// interrupts it well before this; the bound only keeps a run that never
+/// interrupts from hanging the suite.
+const STALLED_TURN: Duration = Duration::from_secs(5);
 
 fn native_tool_call_response(call_id: &str, name: &str, arguments: &str) -> String {
     format!(
@@ -5954,4 +5809,341 @@ fn assert_sqlite_has_interrupted_turn(database: &std::path::Path) {
         .expect("interrupted attempt should be queryable");
 
     assert_eq!(counts, (1, 0, 1, 2));
+}
+
+// Journeys: the whole loop against a scripted model.
+//
+// Everything below runs the production binary against `ScriptedProvider`, so
+// the turn machinery, the tools, the session store and the process boundary
+// are all real and only the model is a fixture. Each journey asserts on the
+// requests the agent sent, not only on what it printed, and finishes by
+// checking that the script was consumed and that nothing left the fake.
+
+/// A journey's isolated project, configuration and data roots.
+struct Journey {
+    temporary: TemporaryDirectory,
+    project_root: PathBuf,
+    config_home: PathBuf,
+    data_directory: PathBuf,
+}
+
+impl Journey {
+    fn new(name: &str) -> Self {
+        let temporary = TemporaryDirectory::new(name);
+        let project_root = temporary.path().join("project");
+        let config_home = temporary.path().join("config");
+        let data_directory = temporary.path().join("data");
+
+        std::fs::create_dir_all(project_root.join(".git")).expect("project marker should exist");
+        std::fs::create_dir_all(&config_home).expect("config directory should exist");
+
+        Self {
+            temporary,
+            project_root,
+            config_home,
+            data_directory,
+        }
+    }
+
+    fn write_project_file(&self, name: &str, contents: &str) {
+        std::fs::write(self.project_root.join(name), contents)
+            .expect("journey project file should be written");
+    }
+
+    /// Runs `agens chat <prompt>` against the scripted provider.
+    fn chat(&self, provider: &ScriptedProvider, prompt: &str, extra_configuration: &str) -> Output {
+        provider.write_configuration(&self.config_home, &self.data_directory, extra_configuration);
+
+        isolated_agens_command(&self.temporary)
+            .current_dir(&self.project_root)
+            .args(["chat", prompt])
+            .env("AGENS_CONFIG_HOME", &self.config_home)
+            .output()
+            .expect("production binary should run the journey")
+    }
+}
+
+/// The journey's stdout, reporting the run's own output and the conversation
+/// the scripted provider observed when it failed.
+///
+/// A journey fails inside a process whose only report is an exit status, so
+/// the requests are the difference between "the loop went wrong" and knowing
+/// which turn it went wrong on.
+/// Everything a journey's run recorded in its diagnostics directory.
+fn read_journey_diagnostics(data_directory: &Path) -> String {
+    let mut recorded = String::new();
+    let entries = std::fs::read_dir(data_directory.join("diagnostics"))
+        .expect("a journey run should record diagnostics");
+
+    for entry in entries {
+        let entry = entry.expect("diagnostic entry should be readable");
+        if entry
+            .metadata()
+            .expect("diagnostic metadata should be readable")
+            .is_file()
+        {
+            recorded.push_str(
+                &std::fs::read_to_string(entry.path()).expect("diagnostic should be readable"),
+            );
+        }
+    }
+
+    recorded
+}
+
+fn journey_stdout(result: &Output, provider: &ScriptedProvider) -> String {
+    assert!(
+        result.status.success(),
+        "journey failed: {}{}\nobserved conversation: {:#?}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr),
+        provider
+            .requests()
+            .iter()
+            .map(|request| {
+                (
+                    if request.is_child() { "child" } else { "main" },
+                    request.body().chars().take(240).collect::<String>(),
+                )
+            })
+            .collect::<Vec<_>>()
+    );
+
+    String::from_utf8_lossy(&result.stdout).into_owned()
+}
+
+#[test]
+fn journey_tool_loop_returns_the_tool_result_to_the_model_and_closes() {
+    let journey = Journey::new("journey-tool-loop");
+    journey.write_project_file("notes.md", "the note the model asked for");
+    let provider = ScriptedProvider::start(
+        ScriptedDialect::Responses,
+        Script::new([
+            ScriptedTurn::tool_call("call-read", "read", r#"{"path":"notes.md"}"#),
+            ScriptedTurn::text("summarised"),
+        ]),
+    );
+
+    let result = journey.chat(
+        &provider,
+        "summarise the notes",
+        "\n[permissions]\nallow = [\"read(*)\"]\n",
+    );
+
+    assert_eq!(journey_stdout(&result, &provider), "summarised\n");
+    provider.assert_script_consumed();
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2, "a tool loop is two requests");
+    assert!(
+        requests[1].body().contains("the note the model asked for"),
+        "the tool result should reach the model: {}",
+        requests[1].body()
+    );
+    assert!(
+        requests[1].body().contains("call-read"),
+        "the tool result should be tied to the call it answers: {}",
+        requests[1].body()
+    );
+    NetworkTripwire::shared().assert_no_connections();
+}
+
+/// AGN-102: a failure the model cannot read is a failure it cannot recover
+/// from, so the tool's own text has to survive to the next request rather than
+/// being flattened into a generic "tool failed".
+#[test]
+fn journey_tool_failure_reaches_the_model_with_the_failure_text_intact() {
+    let journey = Journey::new("journey-tool-failure");
+    let provider = ScriptedProvider::start(
+        ScriptedDialect::Responses,
+        Script::new([
+            ScriptedTurn::tool_call("call-missing", "read", r#"{"path":"absent.md"}"#),
+            ScriptedTurn::text("reported the failure"),
+        ]),
+    );
+
+    let result = journey.chat(
+        &provider,
+        "read a file that is not there",
+        "\n[permissions]\nallow = [\"read(*)\"]\n",
+    );
+
+    assert_eq!(journey_stdout(&result, &provider), "reported the failure\n");
+    provider.assert_script_consumed();
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    let failure = requests[1].json()["input"][0]["output"]
+        .as_str()
+        .expect("the continuation should carry the tool result")
+        .to_owned();
+    assert_eq!(
+        failure, "read: file not found",
+        "the tool's own failure text should reach the model, naming both the \
+         operation and the reason, rather than a flattened generic failure"
+    );
+    NetworkTripwire::shared().assert_no_connections();
+}
+
+/// AGN-105: a delegated child runs its own conversation, and the point of the
+/// journey is that the child's scope is its own — it neither inherits the
+/// parent's prompt nor widens past the toolset its agent declares.
+#[test]
+fn journey_delegation_serves_the_child_its_own_script_within_its_own_scope() {
+    let journey = Journey::new("journey-delegation");
+    journey.write_project_file("notes.md", "the note the child read");
+    std::fs::create_dir_all(journey.config_home.join("agents"))
+        .expect("agents directory should exist");
+    std::fs::write(
+        journey.config_home.join("agents/reviewer.md"),
+        "---\nname: reviewer\ndescription: Review implementation\nmode: subagent\nmodel: gpt-4o\npermissions: []\n---\nYou are the isolated reviewer.\n",
+    )
+    .expect("subagent definition should be written");
+
+    let provider = ScriptedProvider::start(
+        ScriptedDialect::Responses,
+        Script::new([
+            ScriptedTurn::tool_call(
+                "call-task",
+                "task",
+                r#"{"agent":"reviewer","description":"child request"}"#,
+            ),
+            ScriptedTurn::text("parent answer"),
+        ])
+        .with_child(
+            "child request",
+            [
+                ScriptedTurn::tool_call("call-child-read", "read", r#"{"path":"notes.md"}"#),
+                ScriptedTurn::text("child answer"),
+            ],
+        ),
+    );
+
+    let result = journey.chat(
+        &provider,
+        "parent request",
+        "\n[permissions]\nallow = [\"task(reviewer)\", \"read(*)\"]\n",
+    );
+
+    assert_eq!(journey_stdout(&result, &provider), "parent answer\n");
+    provider.assert_script_consumed();
+
+    let child_requests = provider.child_requests();
+    assert_eq!(
+        child_requests.len(),
+        2,
+        "the child ran its own two-turn loop"
+    );
+    let opening = child_requests[0].body();
+    assert!(
+        opening.contains("You are the isolated reviewer."),
+        "the child should run under its own agent's prompt: {opening}"
+    );
+    assert!(
+        !opening.contains("parent request"),
+        "the child should not inherit the parent's prompt: {opening}"
+    );
+    assert!(
+        !opening.contains("\"name\":\"mcp"),
+        "the child should not reach the parent's MCP surface: {opening}"
+    );
+    assert!(
+        child_requests[1].body().contains("the note the child read"),
+        "the child's own tool result should reach it: {}",
+        child_requests[1].body()
+    );
+    NetworkTripwire::shared().assert_no_connections();
+}
+
+/// AGN-104: a stream that ends before anything reached the person is sent
+/// again inside a budget, and the attempt is recorded against that budget.
+///
+/// The cut has to deliver nothing: a retry after the first attempt already
+/// streamed text would show that text twice, so that case stays a failure.
+#[test]
+fn journey_retry_mid_stream_resumes_within_its_budget_and_reports_the_attempt() {
+    let journey = Journey::new("journey-retry-mid-stream");
+    let provider = ScriptedProvider::start(
+        ScriptedDialect::Responses,
+        Script::new([ScriptedTurn::cut_stream(), ScriptedTurn::text("recovered")]),
+    );
+
+    let result = journey.chat(&provider, "answer through a cut stream", "");
+
+    assert_eq!(journey_stdout(&result, &provider), "recovered\n");
+    provider.assert_script_consumed();
+    assert_eq!(
+        provider.requests().len(),
+        2,
+        "the cut stream should cost exactly one retry"
+    );
+    // The run recovered without saying anything to the person, which is the
+    // point of a budget. What has to be visible is the attempt itself, and for
+    // a headless run that is the diagnostics record: a retry that is not
+    // counted against a named budget cannot be reported by any surface.
+    let scheduled = read_journey_diagnostics(&journey.data_directory);
+    let scheduled: Vec<serde_json::Value> = scheduled
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("a diagnostic line should be JSON"))
+        .filter(|record: &serde_json::Value| record["event"] == "retry_scheduled")
+        .collect();
+    assert_eq!(scheduled.len(), 1, "the cut cost exactly one retry");
+    assert_eq!(scheduled[0]["class"], "network");
+    assert_eq!(scheduled[0]["attempt"], 1);
+    assert_eq!(
+        scheduled[0]["max_attempts"], 8,
+        "the retry must name the budget it counts against, or no surface can \
+         report how much of it is left"
+    );
+    NetworkTripwire::shared().assert_no_connections();
+}
+
+/// A journey run with the credential variables still exported is a journey
+/// that can bill a real provider, so the isolation itself is asserted rather
+/// than assumed.
+#[test]
+fn journey_runs_without_any_real_credential_in_its_environment() {
+    let journey = Journey::new("journey-credential-isolation");
+    let provider = ScriptedProvider::start(
+        ScriptedDialect::Responses,
+        Script::new([ScriptedTurn::text("answered from the fake")]),
+    );
+    provider.write_configuration(&journey.config_home, &journey.data_directory, "");
+
+    let mut command = isolated_agens_command(&journey.temporary);
+    // An inherited variable is absent from `get_envs` entirely, so checking that
+    // none is set would pass on a machine that leaks one. What proves the
+    // isolation is the removal entry itself: a `None` value is the command
+    // saying it will unset that variable whatever the parent exported.
+    let mut removed: Vec<&str> = command
+        .command()
+        .get_envs()
+        .filter_map(|(name, value)| {
+            let name = name.to_str()?;
+            let removed = agens_fixtures::PROVIDER_CREDENTIAL_VARIABLES
+                .into_iter()
+                .find(|credential| *credential == name)?;
+            value.is_none().then_some(removed)
+        })
+        .collect();
+    let mut expected = Vec::from(agens_fixtures::PROVIDER_CREDENTIAL_VARIABLES);
+    removed.sort_unstable();
+    expected.sort_unstable();
+    let result = command
+        .current_dir(&journey.project_root)
+        .args(["chat", "answer from the fake only"])
+        .env("AGENS_CONFIG_HOME", &journey.config_home)
+        .output()
+        .expect("production binary should run the journey");
+
+    assert_eq!(
+        removed, expected,
+        "an isolated journey must unset every provider credential variable"
+    );
+    assert_eq!(
+        journey_stdout(&result, &provider),
+        "answered from the fake\n"
+    );
+    provider.assert_script_consumed();
+    NetworkTripwire::shared().assert_no_connections();
 }

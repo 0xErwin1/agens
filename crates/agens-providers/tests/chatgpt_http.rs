@@ -1,6 +1,6 @@
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::io::Write;
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -12,6 +12,14 @@ use agens_core::{
     Error, HeadlessTurnCancellation, HeadlessTurnPortError, Message, MessagePart, RequestConfig,
     Role, TurnEvent, TurnProgressSink, TurnProvider, Usage,
 };
+mod support;
+
+use support::{
+    ObservedRequest, ScriptedResponse, ScriptedServer, accept_until_stopped,
+    bind_pollable_listener, hold_address_until_stopped, hold_connection_until_stopped,
+    read_request, wait_for_client_close, write_json, write_sse, write_status_with_secrets,
+};
+
 use agens_providers::{
     ChatGptResponsesProvider, OpenAiFunctionTool, ProgressAwareProvider, ProviderDiagnosticClass,
     ProviderDiagnosticKind, ProviderDiagnosticScope, ProviderDiagnostics, ProviderFailureDetail,
@@ -298,7 +306,7 @@ fn subscription_transport_retries_network_and_server_failures_then_succeeds() {
     let credentials = write_credentials(&directory);
     let server = ScriptedServer::start(vec![
         ScriptedResponse::Disconnect,
-        ScriptedResponse::Status(500),
+        secret_status(500),
         ScriptedResponse::Sse(completed_text_sse("recovered")),
     ]);
     let mut recovered_provider = provider(&credentials, &server.responses_base_url());
@@ -657,7 +665,7 @@ fn subscription_transport_refreshes_once_after_401_then_retries_responses_once()
     let directory = temporary_directory("401-refresh");
     let credentials = write_credentials(&directory);
     let server = ScriptedServer::start(vec![
-        ScriptedResponse::Status(401),
+        secret_status(401),
         ScriptedResponse::Json(
             200,
             r#"{"access_token":"header.eyJleHAiOjE4OTM0NTYwMDB9.signature"}"#.to_owned(),
@@ -761,7 +769,7 @@ fn subscription_transport_reloads_a_rotated_access_token_after_401_without_refre
     let directory = temporary_directory("401-reload");
     let credentials = write_credentials(&directory);
     let server = ScriptedServer::start(vec![
-        ScriptedResponse::Status(401),
+        secret_status(401),
         ScriptedResponse::Sse(completed_text_sse("reloaded")),
     ]);
     let mut provider = ChatGptResponsesProvider::from_credentials_with_timeout_and_auth_url(
@@ -804,12 +812,12 @@ fn subscription_transport_stops_after_a_second_401() {
     let directory = temporary_directory("second-401");
     let credentials = write_credentials(&directory);
     let server = ScriptedServer::start(vec![
-        ScriptedResponse::Status(401),
+        secret_status(401),
         ScriptedResponse::Json(
             200,
             r#"{"access_token":"header.eyJleHAiOjE4OTM0NTYwMDB9.signature"}"#.to_owned(),
         ),
-        ScriptedResponse::Status(401),
+        secret_status(401),
     ]);
     let mut provider = ChatGptResponsesProvider::from_credentials_with_timeout_and_auth_url(
         &credentials,
@@ -2594,21 +2602,6 @@ enum ServerBehavior {
     WaitForClientClose,
 }
 
-struct ObservedRequest {
-    path: String,
-    headers: Vec<(String, String)>,
-    body: Value,
-    raw_body: String,
-}
-
-impl ObservedRequest {
-    fn header(&self, name: &str) -> Option<&str> {
-        self.headers
-            .iter()
-            .find_map(|(candidate, value)| (candidate == name).then_some(value.as_str()))
-    }
-}
-
 struct LocalServer {
     address: std::net::SocketAddr,
     observed_request: Option<mpsc::Receiver<ObservedRequest>>,
@@ -2760,85 +2753,6 @@ impl ControlledOAuthServer {
     }
 }
 
-enum ScriptedResponse {
-    Disconnect,
-    Status(u16),
-    Json(u16, String),
-    Raw(u16, String),
-    Sse(String),
-    WaitForClientClose,
-}
-
-struct ScriptedServer {
-    address: std::net::SocketAddr,
-    observed_requests: Arc<AtomicUsize>,
-    stop: Arc<AtomicBool>,
-    worker: thread::JoinHandle<Vec<ObservedRequest>>,
-}
-
-impl ScriptedServer {
-    fn start(responses: Vec<ScriptedResponse>) -> Self {
-        let (listener, address) = bind_pollable_listener();
-        let observed_requests = Arc::new(AtomicUsize::new(0));
-        let stop = Arc::new(AtomicBool::new(false));
-        let worker_observed = Arc::clone(&observed_requests);
-        let worker_stop = Arc::clone(&stop);
-        let worker = thread::spawn(move || {
-            let mut requests = Vec::with_capacity(responses.len());
-            for response in responses {
-                let Some(mut stream) = accept_until_stopped(&listener, &worker_stop) else {
-                    break;
-                };
-                // Every scripted round answers a request the provider is expected to
-                // complete, so a connection without one is a failure of the round, not
-                // an accepted outcome: the request counts these tests assert on would
-                // otherwise quietly drop it.
-                requests.push(read_request(&stream).expect(
-                    "scripted server should receive a complete request for every scripted round",
-                ));
-                worker_observed.store(requests.len(), Ordering::Release);
-                match response {
-                    ScriptedResponse::Disconnect => {}
-                    ScriptedResponse::Status(status) => write_status(&mut stream, status),
-                    ScriptedResponse::Json(status, body) => write_json(&mut stream, status, &body),
-                    ScriptedResponse::Raw(status, body) => write_raw(&mut stream, status, &body),
-                    ScriptedResponse::Sse(events) => write_sse(&mut stream, &events),
-                    ScriptedResponse::WaitForClientClose => wait_for_client_close(&stream),
-                }
-            }
-            hold_address_until_stopped(&listener, &worker_stop);
-
-            requests
-        });
-
-        Self {
-            address,
-            observed_requests,
-            stop,
-            worker,
-        }
-    }
-
-    fn responses_base_url(&self) -> String {
-        format!("http://{}/backend-api/codex", self.address)
-    }
-
-    fn oauth_url(&self) -> String {
-        format!("http://{}/oauth/token", self.address)
-    }
-
-    /// Counts the scripted rounds whose request the server has already read, so a test
-    /// can stop the provider once the round it means to stop is actually in flight.
-    fn observed_requests(&self) -> Arc<AtomicUsize> {
-        Arc::clone(&self.observed_requests)
-    }
-
-    fn join(self) -> Vec<ObservedRequest> {
-        self.stop.store(true, Ordering::Release);
-        self.worker.join().expect("scripted server should finish")
-    }
-}
-
 impl LocalServer {
     fn start(behavior: ServerBehavior) -> Self {
         let (listener, address) = bind_pollable_listener();
@@ -2859,7 +2773,12 @@ impl LocalServer {
             }
 
             match behavior {
-                ServerBehavior::Status(status) => write_status(&mut stream, status),
+                ServerBehavior::Status(status) => write_status_with_secrets(
+                    &mut stream,
+                    status,
+                    SECRET_HEADER_SENTINEL,
+                    SECRET_BODY_SENTINEL,
+                ),
                 ServerBehavior::ErrorThenWait(status, body) => {
                     stream
                         .write_all(
@@ -2906,200 +2825,12 @@ impl LocalServer {
     }
 }
 
-/// Binds a listener whose accept loop can be polled, so a worker never parks in a
-/// blocking `accept` a client under test may never reach.
-fn bind_pollable_listener() -> (TcpListener, std::net::SocketAddr) {
-    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("server should bind");
-    listener
-        .set_nonblocking(true)
-        .expect("listener should be nonblocking");
-    let address = listener
-        .local_addr()
-        .expect("server address should be available");
-
-    (listener, address)
-}
-
-/// Waits for one connection while honoring the stop flag, so `join` terminates even
-/// when the client was cancelled or timed out before it opened a socket at all.
-fn accept_until_stopped(listener: &TcpListener, stop: &AtomicBool) -> Option<TcpStream> {
-    while !stop.load(Ordering::Acquire) {
-        match listener.accept() {
-            Ok((stream, _)) => return Some(stream),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(1));
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(_) => return None,
-        }
+/// A bare status whose header and body carry this suite's sentinels, so every
+/// scripted failure is also a check that neither reaches a user-visible surface.
+fn secret_status(status: u16) -> ScriptedResponse {
+    ScriptedResponse::StatusWithSecrets {
+        status,
+        header_secret: SECRET_HEADER_SENTINEL.to_owned(),
+        body_secret: SECRET_BODY_SENTINEL.to_owned(),
     }
-
-    None
-}
-
-/// Keeps the fixture's port bound until the test releases it, closing anything that
-/// arrives once the scripted exchanges are done.
-///
-/// A worker that returned as soon as it had served its script dropped the listener while
-/// the provider under test could still be retrying against that address, so the kernel
-/// handed the port to whatever bound next — including another fixture in another test,
-/// whose canned status then answered this test's retry. Closing late arrivals rather
-/// than leaving them outstanding keeps those retries as fast as the refused connections
-/// they used to be.
-fn hold_address_until_stopped(listener: &TcpListener, stop: &AtomicBool) {
-    while let Some(stream) = accept_until_stopped(listener, stop) {
-        drop(stream);
-    }
-}
-
-/// Leaves one connection outstanding until the test releases it, for a fixture whose
-/// scenario is a request that never gets an answer.
-fn hold_connection_until_stopped(stop: &AtomicBool) {
-    while !stop.load(Ordering::Acquire) {
-        thread::sleep(Duration::from_millis(1));
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum RequestArrival {
-    Complete,
-    ClientCut,
-}
-
-/// A line the client never terminated — an empty read, a partial line, or a reset —
-/// means the connection was cut; anything that arrived whole is the client's own
-/// output and stays subject to the assertions on it.
-fn read_line_or_cut(reader: &mut BufReader<TcpStream>, line: &mut String) -> RequestArrival {
-    match reader.read_line(line) {
-        Ok(_) if line.ends_with('\n') => RequestArrival::Complete,
-        Ok(_) => RequestArrival::ClientCut,
-        Err(error) if is_client_cut(&error) => RequestArrival::ClientCut,
-        Err(error) => panic!("request should be readable: {error}"),
-    }
-}
-
-fn is_client_cut(error: &std::io::Error) -> bool {
-    matches!(
-        error.kind(),
-        std::io::ErrorKind::UnexpectedEof
-            | std::io::ErrorKind::ConnectionReset
-            | std::io::ErrorKind::ConnectionAborted
-            | std::io::ErrorKind::BrokenPipe
-    )
-}
-
-/// Reads a request, reporting `None` when the client cut the connection before it was
-/// complete.
-///
-/// `accept` returns as soon as the kernel completes the handshake, so a client that is
-/// cancelled or times out before writing leaves a connection with nothing on it. A
-/// request that does arrive stays fully asserted; each caller decides whether a missing
-/// one is an expected outcome of its scenario or a failure it must report.
-fn read_request(stream: &TcpStream) -> Option<ObservedRequest> {
-    let mut reader = BufReader::new(stream.try_clone().expect("stream should clone"));
-    let mut request_line = String::new();
-    if read_line_or_cut(&mut reader, &mut request_line) == RequestArrival::ClientCut {
-        return None;
-    }
-    let path = request_line
-        .split_whitespace()
-        .nth(1)
-        .expect("request line should contain a path")
-        .to_owned();
-
-    let mut headers = Vec::new();
-    let mut content_length = None;
-    loop {
-        let mut header = String::new();
-        if read_line_or_cut(&mut reader, &mut header) == RequestArrival::ClientCut {
-            return None;
-        }
-        if header == "\r\n" {
-            break;
-        }
-        let (name, value) = header
-            .trim_end()
-            .split_once(": ")
-            .expect("header should be well formed");
-        if name.eq_ignore_ascii_case("content-length") {
-            content_length = Some(
-                value
-                    .parse::<usize>()
-                    .expect("content length should be numeric"),
-            );
-        }
-        headers.push((name.to_ascii_lowercase(), value.to_owned()));
-    }
-
-    let mut body = vec![0; content_length.expect("request should have a content length")];
-    match reader.read_exact(&mut body) {
-        Ok(()) => {}
-        Err(error) if is_client_cut(&error) => return None,
-        Err(error) => panic!("body should be readable: {error}"),
-    }
-
-    Some(ObservedRequest {
-        path,
-        headers,
-        body: serde_json::from_slice(&body).unwrap_or(Value::Null),
-        raw_body: String::from_utf8(body).expect("body should be UTF-8"),
-    })
-}
-
-fn write_status(stream: &mut TcpStream, status: u16) {
-    stream
-        .write_all(
-            format!(
-                "HTTP/1.1 {status} Test\r\nX-Secret: {SECRET_HEADER_SENTINEL}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{SECRET_BODY_SENTINEL}",
-                SECRET_BODY_SENTINEL.len()
-            )
-            .as_bytes(),
-        )
-        .expect("status response should be written");
-}
-
-fn write_sse(stream: &mut TcpStream, events: &str) {
-    stream
-        .write_all(
-            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
-        )
-        .expect("SSE headers should be written");
-    stream
-        .write_all(events.as_bytes())
-        .expect("SSE body should be written");
-}
-
-fn write_json(stream: &mut TcpStream, status: u16, body: &str) {
-    stream
-        .write_all(
-            format!(
-                "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            )
-            .as_bytes(),
-        )
-        .expect("JSON response should be written");
-}
-
-fn write_raw(stream: &mut TcpStream, status: u16, body: &str) {
-    stream
-        .write_all(
-            format!(
-                "HTTP/1.1 {status} Test\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            )
-            .as_bytes(),
-        )
-        .expect("raw response should be written");
-}
-
-fn wait_for_client_close(stream: &TcpStream) {
-    stream
-        .set_read_timeout(Some(Duration::from_millis(500)))
-        .expect("read timeout should be configured");
-    let mut byte = [0_u8; 1];
-    let _ = stream
-        .try_clone()
-        .expect("stream should clone")
-        .read(&mut byte);
 }

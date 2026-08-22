@@ -13,6 +13,7 @@ use agens_agents::ensure_active_agent_runtime;
 use agens_bootstrap::Bootstrap;
 use agens_core::HeadlessTurnCancellation;
 use agens_fixtures::{
+    Script, ScriptedDialect, ScriptedProvider, ScriptedTurn,
     session_bootstrap as tui_session_bootstrap,
     session_bootstrap_for_provider as tui_session_bootstrap_for_provider,
     session_directory as tui_session_directory,
@@ -29,15 +30,127 @@ use agens_tui_app::engine::{
 };
 use agens_tui_app::models::seed_remembered_tui_selection;
 use agens_tui_app::resume::resume_tui_session;
-use agens_tui_app::router::TuiRuntimeRouter;
+use agens_tui_app::router::{TuiRuntimeRouter, tui_provider_outcome};
 use agens_tui_app::test_support::{
-    persist_tui_session, persist_tui_session_metadata, render_tui_test_backend,
+    enter_tui_input, persist_tui_session, persist_tui_session_metadata, render_tui_test_backend,
     rotation_dispatcher, tui_project,
 };
 
 use crate::CliDependencies;
 use crate::commands::chat::{chat_args_with_prompt, chat_request};
 use crate::deps::bootstrap;
+
+/// AGN-106: what the terminal actually paints after a fixed scripted turn.
+///
+/// The turn is real down to the socket and only the model is a fixture, so the
+/// frame this pins is the frame a person would see. A direct row comparison
+/// rather than a snapshot library: the point is that a density or hierarchy
+/// change has to be looked at, and an inline expectation is what makes that
+/// unavoidable in review.
+#[test]
+fn journey_render_paints_a_scripted_turn_into_a_stable_frame() {
+    let temporary = tui_session_directory("journey-render");
+    let provider = ScriptedProvider::start(
+        ScriptedDialect::Responses,
+        Script::new([ScriptedTurn::text("the scripted answer")]),
+    );
+    let config_home = temporary.join("config");
+    let data_directory = temporary.join("data");
+    std::fs::create_dir_all(&config_home).expect("config directory should exist");
+    std::fs::write(
+        config_home.join("auth.json"),
+        r#"{"openai-api":{"api_key":"fixture"}}"#,
+    )
+    .expect("credentials should be written");
+
+    let dependencies = CliDependencies::for_test(
+        temporary.join("project"),
+        Some(temporary.join("home")),
+        BTreeMap::from([(
+            "AGENS_CONFIG_HOME".to_owned(),
+            config_home.display().to_string(),
+        )]),
+        BTreeMap::from([
+            (
+                config_home.join("config.toml"),
+                format!(
+                    "[provider]\nmodel = \"openai-api/gpt-4.1\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n",
+                    provider.base_url(),
+                    data_directory.display()
+                ),
+            ),
+            (
+                config_home.join("auth.json"),
+                r#"{"openai-api":{"api_key":"fixture"}}"#.to_owned(),
+            ),
+        ]),
+    );
+    let bootstrap = bootstrap(&dependencies).expect("production bootstrap should be valid");
+    let session = Arc::new(Mutex::new(SessionContext::fresh()));
+    let cancellation = HeadlessTurnCancellation::new();
+    let mut tui = Tui::new(ProductionTuiEngine {
+        cancellation: Arc::new(Mutex::new(None)),
+    });
+
+    configure_tui_project_identity(&mut tui, &session, &bootstrap);
+    tui.set_presentation("openai-api", "gpt-4.1", "new session");
+    let router = TuiRuntimeRouter::new(
+        bootstrap.clone(),
+        Arc::clone(&session),
+        Arc::new(Mutex::new(None)),
+        Arc::new(CommandCatalog::default()),
+        Arc::new(SkillCatalog::default()),
+    );
+    let input = enter_tui_input(&mut tui, "render this");
+    let prompt = tui
+        .apply_submission_outcome(router.route(input))
+        .expect("a plain prompt should reach the provider");
+    let answer = run_tui_prompt(&bootstrap, &prompt, &cancellation, &session, None)
+        .expect("the scripted turn should complete");
+    tui.finish_provider_turn(tui_provider_outcome(Ok(answer)));
+
+    let frame = render_tui_test_backend(&tui, 80, 12);
+    // The elapsed time is the one cell that a second run is allowed to differ
+    // on, so it is the one cell this replaces before comparing.
+    let rows: Vec<String> = frame
+        .chars()
+        .collect::<Vec<_>>()
+        .chunks(80)
+        .map(|row| {
+            let row: String = row.iter().collect();
+            let row = row.trim_end();
+            match row.split_once("│ ") {
+                Some((indent, elapsed)) if elapsed.ends_with("ms") => {
+                    format!("{indent}│ <elapsed>")
+                }
+                _ => row.to_owned(),
+            }
+        })
+        .collect();
+
+    assert_eq!(
+        rows,
+        [
+            "─".repeat(76),
+            "   ┃❯ render this".to_owned(),
+            String::new(),
+            "    ● the scripted answer".to_owned(),
+            String::new(),
+            "      │ <elapsed>".to_owned(),
+            String::new(),
+            String::new(),
+            format!("    ┌{}┐", "─".repeat(70)),
+            format!("    │{}│", " ".repeat(70)),
+            format!(
+                "    └{}─ gpt-4.1 · ctx — · /t/a/project · ask ┘",
+                "─".repeat(31)
+            ),
+            "     Esc:normal  ^?:shortcuts".to_owned(),
+        ]
+    );
+    provider.assert_script_consumed();
+    std::fs::remove_dir_all(&temporary).expect("temporary files should be removed");
+}
 
 fn remember(bootstrap: &Bootstrap, model: &str, effort: Option<agens_core::ReasoningEffort>) {
     PreferenceStore::open(bootstrap.data_directory())
@@ -434,56 +547,14 @@ fn run_tui_model_effort_provider_case(
     std::fs::create_dir_all(project_root.join(".git")).expect("project marker should be created");
     std::fs::create_dir_all(&config_home).expect("config directory should be created");
 
-    let listener =
-        std::net::TcpListener::bind(("127.0.0.1", 0)).expect("mock provider should bind");
-    let address = listener
-        .local_addr()
-        .expect("mock provider should have an address");
-    let expected_path = match provider_type {
-        "openai-chatgpt" => "POST /codex/responses HTTP/1.1\r\n",
-        _ => "POST /responses HTTP/1.1\r\n",
+    let provider = ScriptedProvider::start(
+        ScriptedDialect::Responses,
+        Script::new([ScriptedTurn::text("selected answer")]),
+    );
+    let expected_target = match provider_type {
+        "openai-chatgpt" => "/codex/responses",
+        _ => "/responses",
     };
-    let worker = std::thread::spawn(move || {
-        use std::io::{BufRead, BufReader, Write};
-
-        let (mut stream, _) = listener
-            .accept()
-            .expect("mock provider should accept the selected request");
-        let mut reader = BufReader::new(stream.try_clone().expect("stream should clone"));
-        let mut request_line = String::new();
-        reader
-            .read_line(&mut request_line)
-            .expect("request line should be readable");
-        assert_eq!(request_line, expected_path);
-
-        let mut content_length = None;
-        loop {
-            let mut header = String::new();
-            reader
-                .read_line(&mut header)
-                .expect("request header should be readable");
-            if header == "\r\n" {
-                break;
-            }
-            if let Some(value) = header.to_ascii_lowercase().strip_prefix("content-length: ") {
-                content_length = Some(
-                    value
-                        .trim()
-                        .parse::<usize>()
-                        .expect("content length should be numeric"),
-                );
-            }
-        }
-
-        let mut body = vec![0_u8; content_length.expect("request should include content length")];
-        std::io::Read::read_exact(&mut reader, &mut body).expect("request body should be readable");
-        stream
-            .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"selected answer\"}\n\ndata: {\"type\":\"response.completed\"}\n\n")
-            .expect("mock response should be written");
-
-        serde_json::from_slice::<serde_json::Value>(&body)
-            .expect("provider request should be valid JSON")
-    });
 
     if provider_type == "openai-chatgpt" {
         std::fs::write(
@@ -512,7 +583,8 @@ fn run_tui_model_effort_provider_case(
         BTreeMap::from([(
             config_home.join("config.toml"),
             format!(
-                "[provider]\nmodel = \"{provider_type}/gpt-4.1\"\nbase_url = \"http://{address}\"\n\n[options]\ndata_dir = \"{}\"\n",
+                "[provider]\nmodel = \"{provider_type}/gpt-4.1\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n",
+                provider.base_url(),
                 data_directory.display()
             ),
         )]),
@@ -638,7 +710,10 @@ fn run_tui_model_effort_provider_case(
     assert!(reopened_selection.metadata_known());
     assert_eq!(reopened_selection.reasoning_effort(), Some("max"));
 
-    let request = worker.join().expect("mock provider should finish");
+    let requests = provider.wait_for_requests(1);
+    provider.assert_script_consumed();
+    assert_eq!(requests[0].target(), expected_target);
     std::fs::remove_dir_all(temporary).expect("temporary files should be removed");
-    request
+
+    requests[0].json()
 }
