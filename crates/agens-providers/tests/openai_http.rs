@@ -1,11 +1,18 @@
 use std::collections::VecDeque;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
+
+mod support;
+
+use support::{
+    RequestArrival, SSE_HEADERS, accept_until_stopped, bind_pollable_listener, read_request,
+    read_request_head, wait_for_client_close, write_sse_headers, write_to_possibly_gone_client,
+};
 
 use agens_core::{
     HeadlessTurnCancellation, HeadlessTurnPortError, MessagePart, RequestConfig, TurnEvent,
@@ -1626,7 +1633,7 @@ impl RetryResponsesServer {
                     return;
                 };
 
-                if read_request(&stream) == RequestArrival::ClientCut {
+                if read_request_head(&stream, "/responses") == RequestArrival::ClientCut {
                     continue;
                 }
 
@@ -1697,7 +1704,7 @@ impl LocalResponsesServer {
                 return;
             };
 
-            if read_request(&stream) == RequestArrival::ClientCut {
+            if read_request_head(&stream, "/responses") == RequestArrival::ClientCut {
                 return;
             }
 
@@ -1764,7 +1771,7 @@ impl LocalResponsesServer {
                 return;
             };
 
-            if read_request(&stream) == RequestArrival::ClientCut {
+            if read_request_head(&stream, "/responses") == RequestArrival::ClientCut {
                 return;
             }
 
@@ -1886,7 +1893,7 @@ impl LocalResponsesServer {
                 let Some(mut stream) = accept_until_stopped(&listener, &worker_stop) else {
                     return;
                 };
-                let Some(body) = read_request_body(&stream) else {
+                let Some(body) = read_responses_request_body(&stream) else {
                     continue;
                 };
 
@@ -1922,7 +1929,7 @@ impl LocalResponsesServer {
                 let Some(mut stream) = accept_until_stopped(&listener, &worker_stop) else {
                     return;
                 };
-                let Some(body) = read_request_body(&stream) else {
+                let Some(body) = read_responses_request_body(&stream) else {
                     continue;
                 };
 
@@ -1940,7 +1947,7 @@ impl LocalResponsesServer {
             let Some(mut stream) = accept_until_stopped(&listener, &worker_stop) else {
                 return;
             };
-            let Some(body) = read_request_body(&stream) else {
+            let Some(body) = read_responses_request_body(&stream) else {
                 return;
             };
 
@@ -2036,169 +2043,11 @@ impl ResourceSnapshot {
     }
 }
 
-/// Binds a listener whose accept loop can be polled, so a worker never parks in a
-/// blocking `accept` a client under test may never reach.
-fn bind_pollable_listener() -> (TcpListener, std::net::SocketAddr) {
-    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("server should bind");
-    listener
-        .set_nonblocking(true)
-        .expect("listener should be nonblocking");
-    let address = listener
-        .local_addr()
-        .expect("server address should be available");
-
-    (listener, address)
-}
-
-/// Waits for one connection while honoring the stop flag, so `join` terminates even
-/// when the client was cancelled or timed out before it opened a socket at all.
-fn accept_until_stopped(listener: &TcpListener, stop: &AtomicBool) -> Option<TcpStream> {
-    while !stop.load(Ordering::Acquire) {
-        match listener.accept() {
-            Ok((stream, _)) => return Some(stream),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(1));
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(_) => return None,
-        }
-    }
-
-    None
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum RequestArrival {
-    Complete,
-    ClientCut,
-}
-
-/// Reads a request head, reporting whether the client actually sent one.
-///
-/// `accept` returns as soon as the kernel completes the handshake, so a client that
-/// is cancelled or times out before writing leaves a connection with nothing on it;
-/// that is an expected outcome of the cancellation tests, not a fixture failure. A
-/// request that does arrive complete is still asserted to be the one under test.
-fn read_request(stream: &TcpStream) -> RequestArrival {
-    let mut reader = BufReader::new(stream.try_clone().expect("stream should clone"));
-
-    if read_request_line(&mut reader) == RequestArrival::ClientCut {
-        return RequestArrival::ClientCut;
-    }
-
-    loop {
-        let mut header = String::new();
-        if read_line_or_cut(&mut reader, &mut header) == RequestArrival::ClientCut {
-            return RequestArrival::ClientCut;
-        }
-        if header == "\r\n" {
-            return RequestArrival::Complete;
-        }
-    }
-}
-
-/// Reads a request head plus its JSON body, yielding `None` when the client cut the
+/// The JSON body of a `/responses` request, or `None` when the client cut the
 /// connection before the request was complete.
-fn read_request_body(stream: &TcpStream) -> Option<serde_json::Value> {
-    let mut reader = BufReader::new(stream.try_clone().expect("stream should clone"));
-
-    if read_request_line(&mut reader) == RequestArrival::ClientCut {
-        return None;
-    }
-
-    let mut content_length = None;
-    loop {
-        let mut header = String::new();
-        if read_line_or_cut(&mut reader, &mut header) == RequestArrival::ClientCut {
-            return None;
-        }
-        if header == "\r\n" {
-            break;
-        }
-        if let Some(value) = header.strip_prefix("content-length: ") {
-            content_length = Some(
-                value
-                    .trim()
-                    .parse::<usize>()
-                    .expect("content length should be numeric"),
-            );
-        }
-    }
-
-    let mut body = vec![0; content_length.expect("request should include a content length")];
-    match reader.read_exact(&mut body) {
-        Ok(()) => {}
-        Err(error) if is_client_cut(&error) => return None,
-        Err(error) => panic!("request body should be readable: {error}"),
-    }
-
-    Some(serde_json::from_slice(&body).expect("request body should be JSON"))
-}
-
-fn read_request_line(reader: &mut BufReader<TcpStream>) -> RequestArrival {
-    let mut request_line = String::new();
-    if read_line_or_cut(reader, &mut request_line) == RequestArrival::ClientCut {
-        return RequestArrival::ClientCut;
-    }
-    assert_eq!(request_line, "POST /responses HTTP/1.1\r\n");
-
-    RequestArrival::Complete
-}
-
-/// A line the client never terminated — an empty read, a partial line, or a reset —
-/// means the connection was cut; anything that arrived whole is the client's own
-/// output and stays subject to the assertions above.
-fn read_line_or_cut(reader: &mut BufReader<TcpStream>, line: &mut String) -> RequestArrival {
-    match reader.read_line(line) {
-        Ok(_) if line.ends_with('\n') => RequestArrival::Complete,
-        Ok(_) => RequestArrival::ClientCut,
-        Err(error) if is_client_cut(&error) => RequestArrival::ClientCut,
-        Err(error) => panic!("request should be readable: {error}"),
-    }
-}
-
-fn is_client_cut(error: &std::io::Error) -> bool {
-    matches!(
-        error.kind(),
-        std::io::ErrorKind::UnexpectedEof
-            | std::io::ErrorKind::ConnectionReset
-            | std::io::ErrorKind::ConnectionAborted
-            | std::io::ErrorKind::BrokenPipe
-    )
-}
-
-const SSE_HEADERS: &[u8] =
-    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
-
-fn write_sse_headers(stream: &mut TcpStream) {
-    stream
-        .write_all(SSE_HEADERS)
-        .expect("SSE headers should be written");
-}
-
-/// Writes a response the client may already have abandoned.
-///
-/// These fixtures answer requests that the cancellation, deadline and frame-cap tests are
-/// deliberately racing against, so the client can be gone before the response leaves the
-/// server; that is the outcome under test, not a fixture failure, and it is the write-side
-/// counterpart of `is_client_cut` on the read side. Every caller reports its request
-/// unconditionally, so bytes that never land change neither what a test observes nor what
-/// `join` counts.
-fn write_to_possibly_gone_client(stream: &mut TcpStream, bytes: &[u8]) {
-    match stream.write_all(bytes) {
-        Ok(()) => {}
-        Err(error) if is_client_cut(&error) => {}
-        Err(error) => panic!("response should be writable: {error}"),
-    }
-}
-
-fn wait_for_client_close(stream: &TcpStream) {
-    stream
-        .set_read_timeout(Some(Duration::from_millis(500)))
-        .expect("server read timeout should be configured");
-    let mut byte = [0_u8; 1];
-    let _ = stream
-        .try_clone()
-        .expect("stream should clone")
-        .read(&mut byte);
+fn read_responses_request_body(stream: &TcpStream) -> Option<serde_json::Value> {
+    read_request(stream).map(|request| {
+        assert_eq!(request.path, "/responses");
+        request.body
+    })
 }

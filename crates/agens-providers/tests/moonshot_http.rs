@@ -1,15 +1,18 @@
 //! Moonshot provider behaviour against a local HTTP server.
 //!
-//! The server is hand-rolled rather than shared with the responses-API tests
-//! beside it: the two agree on framing and disagree on every byte inside a
-//! frame, so sharing would mean parameterizing a harness the other provider
-//! already relies on.
+//! The endpoint is the suite's shared support server, scripted with chat
+//! completion streams: the two providers agree on framing and disagree on every
+//! byte inside a frame, so what is shared is accepting, reading and shutting
+//! down the socket, and what stays here is the framing itself.
 
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::sync::mpsc;
+use std::cell::Cell;
+use std::net::TcpListener;
 use std::thread;
 use std::time::Duration;
+
+mod support;
+
+use support::{ScriptedResponse, ScriptedServer};
 
 use agens_core::{
     HeadlessTurnCancellation, HeadlessTurnPortError, Message, MessagePart, ReasoningEffort,
@@ -59,7 +62,7 @@ fn a_streamed_turn_yields_reasoning_then_text_and_reports_usage() {
         json!({"choices": [], "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7}}),
     ])]);
 
-    let mut provider = provider(&server.address.to_string(), Vec::new());
+    let mut provider = provider(&server.address().to_string(), Vec::new());
     let cancellation = HeadlessTurnCancellation::new();
 
     let parts = runtime()
@@ -97,7 +100,7 @@ fn a_tool_call_turn_replays_its_results_in_the_next_request() {
         ]),
     ]);
 
-    let mut provider = provider(&server.address.to_string(), vec![weather_tool()]);
+    let mut provider = provider(&server.address().to_string(), vec![weather_tool()]);
     let cancellation = HeadlessTurnCancellation::new();
     let runtime = runtime();
 
@@ -164,7 +167,7 @@ fn queue_user_messages_during_awaiting_tool_results_place_user_after_tool_result
         ]),
     ]);
 
-    let mut provider = provider(&server.address.to_string(), vec![weather_tool()]);
+    let mut provider = provider(&server.address().to_string(), vec![weather_tool()]);
     let cancellation = HeadlessTurnCancellation::new();
     let runtime = runtime();
 
@@ -227,7 +230,7 @@ fn partial_tool_results_fail_without_a_second_http_request() {
         json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}),
     ])]);
 
-    let mut provider = provider(&server.address.to_string(), vec![weather_tool()]);
+    let mut provider = provider(&server.address().to_string(), vec![weather_tool()]);
     let cancellation = HeadlessTurnCancellation::new();
     let runtime = runtime();
 
@@ -261,7 +264,7 @@ fn reasoning_effort_reaches_the_wire_for_the_model_that_takes_it() {
         json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
     ])]);
 
-    let mut provider = provider(&server.address.to_string(), Vec::new()).with_request_config(
+    let mut provider = provider(&server.address().to_string(), Vec::new()).with_request_config(
         RequestConfig::with_reasoning_effort(ReasoningEffort::Max.as_str())
             .expect("max is a valid effort"),
     );
@@ -280,7 +283,7 @@ fn a_stream_that_ends_without_a_finish_reason_fails_the_turn() {
         json!({"choices": [{"index": 0, "delta": {"content": "partial"}, "finish_reason": null}]}),
     ])]);
 
-    let mut provider = provider(&server.address.to_string(), Vec::new());
+    let mut provider = provider(&server.address().to_string(), Vec::new());
     let cancellation = HeadlessTurnCancellation::new();
 
     let error = runtime()
@@ -297,7 +300,7 @@ fn a_context_overflow_rejection_is_classified_as_a_context_error() {
         r#"{"error":{"message":"Your request exceeded model token limit: 262144","type":"invalid_request_error"}}"#,
     );
 
-    let mut provider = provider(&server.address.to_string(), Vec::new());
+    let mut provider = provider(&server.address().to_string(), Vec::new());
     let cancellation = HeadlessTurnCancellation::new();
 
     let error = runtime()
@@ -311,7 +314,7 @@ fn a_context_overflow_rejection_is_classified_as_a_context_error() {
 fn an_unauthorized_response_is_classified_as_authentication() {
     let server = ErrorServer::start(401, r#"{"error":{"message":"invalid key"}}"#);
 
-    let mut provider = provider(&server.address.to_string(), Vec::new());
+    let mut provider = provider(&server.address().to_string(), Vec::new());
     let cancellation = HeadlessTurnCancellation::new();
 
     let error = runtime()
@@ -332,7 +335,7 @@ fn a_rejected_request_never_leaks_its_body_into_the_error() {
         ),
     );
 
-    let mut provider = provider(&server.address.to_string(), Vec::new());
+    let mut provider = provider(&server.address().to_string(), Vec::new());
     let cancellation = HeadlessTurnCancellation::new();
 
     let error = runtime()
@@ -355,7 +358,7 @@ fn a_rejected_request_records_body_status_and_model_for_a_user_visible_sink() {
     let failure_detail = ProviderFailureDetail::new();
     let mut provider = MoonshotProvider::from_api_key_with_tools_and_timeout(
         "test-key".to_owned(),
-        Some(&format!("http://{}/v1", server.address)),
+        Some(&format!("http://{}/v1", server.address())),
         "kimi-missing".to_owned(),
         "hello".to_owned(),
         Vec::new(),
@@ -396,7 +399,7 @@ fn each_continuation_round_starts_from_a_clean_failure_detail_handle() {
     let failure_detail = ProviderFailureDetail::new();
     let mut provider = MoonshotProvider::from_api_key_with_tools_and_timeout(
         "test-key".to_owned(),
-        Some(&format!("http://{}/v1", server.address)),
+        Some(&format!("http://{}/v1", server.address())),
         "kimi-k3".to_owned(),
         "hello".to_owned(),
         vec![weather_tool()],
@@ -430,7 +433,7 @@ fn a_cancelled_turn_reports_cancellation_rather_than_a_provider_failure() {
         json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
     ])]);
 
-    let mut provider = provider(&server.address.to_string(), Vec::new());
+    let mut provider = provider(&server.address().to_string(), Vec::new());
     let cancellation = HeadlessTurnCancellation::new();
     cancellation.cancel();
 
@@ -489,7 +492,7 @@ fn queued_user_messages_join_the_replayed_history() {
         json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
     ])]);
 
-    let mut provider = provider(&server.address.to_string(), Vec::new());
+    let mut provider = provider(&server.address().to_string(), Vec::new());
     provider
         .queue_user_messages(vec![Message {
             role: Role::User,
@@ -519,101 +522,59 @@ fn sse(chunks: &[Value]) -> String {
     body
 }
 
-fn read_request(stream: &TcpStream) -> Value {
-    let mut reader = BufReader::new(stream);
-    let mut length = 0;
-
-    loop {
-        let mut line = String::new();
-        if reader.read_line(&mut line).unwrap_or(0) == 0 {
-            break;
-        }
-        if line == "\r\n" {
-            break;
-        }
-        if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
-            length = value.trim().parse().unwrap_or(0);
-        }
-    }
-
-    let mut body = vec![0; length];
-    reader.read_exact(&mut body).expect("request body is read");
-    serde_json::from_slice(&body).expect("request body is JSON")
-}
-
+/// A local endpoint scripted with one chat-completion stream per turn.
+///
+/// The shared support server answers the rounds and captures the requests; this
+/// only remembers which of them the test has already looked at.
 struct SseServer {
-    address: std::net::SocketAddr,
-    bodies: mpsc::Receiver<Value>,
-    _worker: thread::JoinHandle<()>,
+    inner: ScriptedServer,
+    taken: Cell<usize>,
 }
 
 impl SseServer {
     fn start(responses: Vec<String>) -> Self {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("server should bind");
-        let address = listener.local_addr().expect("address should be available");
-        let (sender, bodies) = mpsc::channel();
-
-        let worker = thread::spawn(move || {
-            for response in responses {
-                let (mut stream, _) = listener.accept().expect("server should accept a request");
-                let body = read_request(&stream);
-                sender.send(body).expect("test should receive the body");
-
-                let head = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    response.len()
-                );
-                stream.write_all(head.as_bytes()).expect("head is written");
-                stream
-                    .write_all(response.as_bytes())
-                    .expect("body is written");
-            }
-        });
-
         Self {
-            address,
-            bodies,
-            _worker: worker,
+            inner: ScriptedServer::start(
+                responses.into_iter().map(ScriptedResponse::Sse).collect(),
+            ),
+            taken: Cell::new(0),
         }
+    }
+
+    fn address(&self) -> std::net::SocketAddr {
+        self.inner.address()
     }
 
     fn take_body(&self) -> Value {
-        self.bodies
-            .recv_timeout(Duration::from_secs(5))
-            .expect("server should observe a request")
+        let index = self.taken.get();
+        self.taken.set(index + 1);
+
+        self.inner.wait_for_request(index).body
     }
 
     fn try_take_body(&self) -> Option<Value> {
-        self.bodies.try_recv().ok()
+        let index = self.taken.get();
+        self.inner.request(index).inspect(|_| {
+            self.taken.set(index + 1);
+        })?;
+
+        self.inner.request(index).map(|request| request.body)
     }
 }
 
+/// A local endpoint that rejects every turn with the same status and body.
 struct ErrorServer {
-    address: std::net::SocketAddr,
-    _worker: thread::JoinHandle<()>,
+    inner: ScriptedServer,
 }
 
 impl ErrorServer {
-    fn start(status: u16, body: &'static str) -> Self {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("server should bind");
-        let address = listener.local_addr().expect("address should be available");
-
-        let worker = thread::spawn(move || {
-            while let Ok((mut stream, _)) = listener.accept() {
-                read_request(&stream);
-                let response = format!(
-                    "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                if stream.write_all(response.as_bytes()).is_err() {
-                    break;
-                }
-            }
-        });
-
+    fn start(status: u16, body: &str) -> Self {
         Self {
-            address,
-            _worker: worker,
+            inner: ScriptedServer::start(vec![ScriptedResponse::Json(status, body.to_owned())]),
         }
+    }
+
+    fn address(&self) -> std::net::SocketAddr {
+        self.inner.address()
     }
 }
