@@ -89,17 +89,20 @@ pub struct WorktreeDerivation {
 
 /// Git derivation and disposal of a run's worktree.
 ///
-/// [`crate::Gates`] does not satisfy this and is not meant to: `reclaim` is a
-/// complete operation that derives, journals its verdict and applies the
-/// worktree transition itself, it needs a target ref this port has no reason to
-/// carry, and it has no manual-disposition path at all. Which of the two owns
-/// the reclaim sweep once the daemon is wired is a composition question, and it
-/// comes with the one below.
+/// **This is a seam, not a second gate.** [`crate::Gates`] owns the pre-merge
+/// and reclaim sweeps: it derives, journals its verdict, spends the
+/// authorization and applies the worktree transition itself. This port owns
+/// none of that. It answers what git says and disposes of a directory once the
+/// core has already moved the row, which is what the core's own operations —
+/// `cleaning`, and freezing an approval's receipt — need and all they need.
 ///
-/// Both [`crate::Gates`] and the API core take [`crate::StateMachines`] by
-/// value, because each is the sole writer of the tables it moves. A daemon can
-/// build one of them, not both, so wiring them together settles that ownership
-/// first.
+/// The ownership question the two used to share is settled: the API core owns
+/// [`crate::StateMachines`], and the gates borrow them from it for the span of
+/// one sweep through `ApiCore::machines_mut`. There is one owner and one
+/// writer, so the daemon runs both without building a second control plane.
+/// Both reach git through the same `SessionWorktrees` derivation, so the
+/// receipt this port freezes and the one the gate re-derives cannot disagree
+/// about what a digest of one worktree is.
 pub trait WorktreeGate: Send + Sync {
     fn derive(&self, run: &RunRow) -> Result<WorktreeDerivation, PortError>;
 

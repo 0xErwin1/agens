@@ -10,11 +10,15 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::atomic::{AtomicUsize, Ordering},
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 use agens_server::{
-    GateRefusal, Gates, MergePath, PreMergeRequest, PreMergeVerdict, Receipt, ReclaimRequest,
-    ReclaimVerdict, StateMachines, SubAgentKind, freeze_receipt,
+    ApiCore, AuthorizeMerge, Coordinator, CoordinatorSettings, GateRefusal, Gates, LaunchError,
+    MergeAuthorization, MergePath, PreMergeRequest, PreMergeVerdict, Principal, Receipt,
+    ReclaimRequest, ReclaimVerdict, RunWorkerFactory, SessionSupervisor, StateMachines,
+    SubAgentKind, freeze_receipt,
 };
 use agens_store::{
     AttemptOutcome, AttemptRow, ControlPlaneStore, QuestionAuthor, QuestionKind, QuestionRow,
@@ -810,4 +814,141 @@ fn a_worktree_outside_the_data_directory_is_refused_rather_than_derived_from() {
         error.to_string().contains("worktree path"),
         "the refusal names the path, got {error}"
     );
+}
+/// How long an assertion waits for a sweep that runs on its own interval.
+const PATIENCE: Duration = Duration::from_secs(20);
+
+/// The daemon composed over a real repository, with nothing to launch.
+///
+/// The worker factory is the seam the composition root leaves open, and no run
+/// here ever reaches the queue, so a factory that refuses is the honest one: a
+/// launch would mean the sweep moved a run it has no business moving.
+fn no_worker() -> RunWorkerFactory {
+    Arc::new(|_launch: &agens_server::RunLaunch<'_>| {
+        Err(LaunchError("this test launches no worker".to_owned()))
+    }) as RunWorkerFactory
+}
+
+/// The run's worktree status, read through the core the daemon runs against.
+fn worktree_status_of(core: &Mutex<ApiCore>, run_id: i64) -> Option<agens_store::WorktreeStatus> {
+    core.lock()
+        .expect("the core is readable")
+        .machines()
+        .store()
+        .load_run(run_id)
+        .expect("load run")
+        .expect("the run exists")
+        .worktree_status
+}
+
+/// Waits for the sweep to release the worktree, and says what it found if it
+/// never did.
+fn await_reclaimed(core: &Mutex<ApiCore>, run_id: i64) -> Option<agens_store::WorktreeStatus> {
+    let deadline = Instant::now() + PATIENCE;
+
+    loop {
+        let status = worktree_status_of(core, run_id);
+
+        if status == Some(agens_store::WorktreeStatus::Reclaimable) || Instant::now() >= deadline {
+            return status;
+        }
+
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// The whole of what this task exists for: a finished run whose merge the user
+/// authorized lands and lets its worktree go, with nobody calling a gate by
+/// hand.
+#[test]
+fn the_daemon_merges_an_authorized_run_and_releases_its_worktree() {
+    let fixture = Fixture::new();
+    fixture.commit("feature.txt", "work\n");
+
+    let run_id = fixture
+        .store()
+        .insert_run(&fixture.run(GENESIS))
+        .expect("insert run");
+
+    // The supervisor is the daemon's in production. Here it only has to exist:
+    // the sweep starts no session, and no run of this test ever queues.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("build a runtime");
+    let supervisor = SessionSupervisor::new(runtime.handle().clone());
+
+    let coordinator = Coordinator::start(
+        &fixture.data_directory,
+        &CoordinatorSettings {
+            main_ref: "main".to_owned(),
+            heartbeat: Duration::from_millis(25),
+            gates_sweep: Duration::from_millis(50),
+            ..CoordinatorSettings::default()
+        },
+        supervisor,
+        no_worker(),
+    )
+    .expect("the coordinator composes");
+    let core = coordinator.core();
+
+    let authorized = core
+        .lock()
+        .expect("the core is writable")
+        .authorize_merge(
+            Principal::User,
+            &AuthorizeMerge {
+                subject: MergeAuthorization::ForRun {
+                    run_id,
+                    expires_at: None,
+                },
+                answer: "merge".to_owned(),
+                now: now(),
+            },
+        )
+        .expect("the user authorizes the merge");
+
+    let status = await_reclaimed(&core, run_id);
+
+    let landed = git(&fixture.checkout, &["log", "--oneline", "main"])
+        .lines()
+        .count();
+    let approval = core
+        .lock()
+        .expect("the core is readable")
+        .machines()
+        .store()
+        .load_question(authorized.question_id)
+        .expect("load approval")
+        .expect("the approval exists")
+        .state;
+
+    coordinator.stop();
+    runtime.shutdown_timeout(Duration::ZERO);
+
+    assert_eq!(
+        status,
+        Some(agens_store::WorktreeStatus::Reclaimable),
+        "the sweep releases the worktree of a run whose merge it landed"
+    );
+    assert_eq!(
+        landed, 3,
+        "main carries the branch's commit and the merge commit"
+    );
+    assert_eq!(
+        approval,
+        QuestionState::Delivered,
+        "the merge spent the authorization it went through"
+    );
+}
+
+/// Epoch seconds, as the daemon's own loops read them. The gate compares an
+/// approval's expiry against this, so a fixed constant would be an approval
+/// expired since 2023.
+fn now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX)
+        })
 }
