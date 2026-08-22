@@ -113,23 +113,6 @@ pub struct RunLaunch<'a> {
 pub type RunWorkerFactory =
     Arc<dyn Fn(&RunLaunch<'_>) -> Result<RunSession, LaunchError> + Send + Sync>;
 
-/// A daemon with no worker surface behind it.
-///
-/// Every other piece of the coordinator is composed and running; what is absent
-/// is the harness that executes a run, and nothing yet creates the runs or the
-/// worktrees such a harness would need. Refusing by name is what keeps that
-/// visible: a factory that returned a session doing nothing would report an
-/// admitted run that was never executed.
-#[must_use]
-pub fn unwired_worker() -> RunWorkerFactory {
-    Arc::new(|launch| {
-        Err(LaunchError(format!(
-            "no run worker is wired into this daemon, so run {} cannot be executed",
-            launch.run_id
-        )))
-    })
-}
-
 /// Why the coordinator could not be composed.
 #[derive(Debug)]
 pub struct CoordinatorError(String);

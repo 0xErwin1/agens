@@ -27,16 +27,16 @@ use agens_core::HeadlessTurnCancellation;
 
 pub use api::{
     AdmissionState, AnswerQuestion, AnsweredQuestion, ApiCore, ApiError, ApprovePlan,
-    AuthorizeMerge, CleaningAction, CleaningDisposition, Delivery, DeliveryGrain, DeliveryPayload,
-    DeliveryQueue, DetailQuestionRefusal, EventFeed, EventFilter, InboxItem, InboxView,
-    OPERATION_AUTHORIZATION, Operation, OperationAuthorization, PortError, Ports, RetryRequest,
-    RunRef, RunSummary, RunView, SchedulerPort, SessionControl, StopRequest, StopScope,
-    Subscription, TakeoverHandle, TreeSnapshot, WorktreeDerivation, WorktreeGate,
-    praetor_may_answer,
+    AuthorizeMerge, CleaningAction, CleaningDisposition, CreateRun, CreatedRun, Delivery,
+    DeliveryGrain, DeliveryPayload, DeliveryQueue, DetailQuestionRefusal, EventFeed, EventFilter,
+    InboxItem, InboxView, OPERATION_AUTHORIZATION, Operation, OperationAuthorization, PortError,
+    Ports, ProvisionedWorktree, RepositoryIdentity, RetryRequest, RunRef, RunSummary, RunView,
+    SchedulerPort, SessionControl, StopRequest, StopScope, Subscription, TakeoverHandle,
+    TreeSnapshot, WorktreeDerivation, WorktreeGate, WorktreeRequest, praetor_may_answer,
 };
 pub use blocking::{BlockingBoundary, BlockingError};
 pub use coordinator::{
-    Coordinator, CoordinatorError, CoordinatorSettings, RunLaunch, RunWorkerFactory, unwired_worker,
+    Coordinator, CoordinatorError, CoordinatorSettings, RunLaunch, RunWorkerFactory,
 };
 pub use fsm::{
     AppliedQuestionTransition, AppliedRunTransition, AppliedTransition, AppliedWorktreeTransition,

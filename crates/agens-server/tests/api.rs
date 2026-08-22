@@ -15,11 +15,11 @@ use std::{
 
 use agens_server::{
     AnswerQuestion, ApiCore, ApiError, ApprovePlan, AuthorizeMerge, CleaningAction,
-    CleaningDisposition, Delivery, DeliveryGrain, DeliveryPayload, DeliveryQueue,
+    CleaningDisposition, CreateRun, Delivery, DeliveryGrain, DeliveryPayload, DeliveryQueue,
     DetailQuestionRefusal, EventFeed, EventFilter, OPERATION_AUTHORIZATION, Operation, PortError,
-    Ports, Principal, RetryRequest, RunRef, SchedulerPort, SessionControl, StateMachines,
-    StopRequest, StopScope, Subscription, TakeoverHandle, TransitionRejection, WorktreeDerivation,
-    WorktreeGate, praetor_may_answer,
+    Ports, Principal, ProvisionedWorktree, RepositoryIdentity, RetryRequest, RunRef, SchedulerPort,
+    SessionControl, StateMachines, StopRequest, StopScope, Subscription, TakeoverHandle,
+    TransitionRejection, WorktreeDerivation, WorktreeGate, WorktreeRequest, praetor_may_answer,
 };
 use agens_store::{
     ControlPlaneStore, QuestionAuthor, QuestionKind, QuestionRow, QuestionState, RetryTrigger,
@@ -65,6 +65,8 @@ impl SchedulerPort for RecordingScheduler {
 struct RecordingWorktrees {
     derivation: WorktreeDerivation,
     removed: Mutex<Vec<i64>>,
+    /// Every worktree the core asked for, by the name it asked under.
+    provisioned: Mutex<Vec<String>>,
 }
 
 impl RecordingWorktrees {
@@ -77,6 +79,7 @@ impl RecordingWorktrees {
                 paths_digest: "d1ge57".repeat(6),
             },
             removed: Mutex::new(Vec::new()),
+            provisioned: Mutex::new(Vec::new()),
         }
     }
 }
@@ -89,6 +92,27 @@ impl WorktreeGate for RecordingWorktrees {
     fn remove(&self, run: &RunRow) -> Result<(), PortError> {
         self.removed.lock().unwrap().push(run.id.unwrap());
         Ok(())
+    }
+
+    fn identify(&self, _repository: &std::path::Path) -> Result<RepositoryIdentity, PortError> {
+        Ok(RepositoryIdentity {
+            repo_id: REPO.to_owned(),
+            remote_url: Some("git@github.com:agens/agens.git".to_owned()),
+        })
+    }
+
+    fn provision(&self, request: &WorktreeRequest<'_>) -> Result<ProvisionedWorktree, PortError> {
+        self.provisioned
+            .lock()
+            .unwrap()
+            .push(request.name.to_owned());
+
+        Ok(ProvisionedWorktree {
+            path: std::path::PathBuf::from("/worktrees")
+                .join(request.repo_id)
+                .join(request.name),
+            hook_failures: Vec::new(),
+        })
     }
 }
 
@@ -283,6 +307,7 @@ fn unauthorized(error: &ApiError) -> (Operation, Principal, bool) {
 }
 
 const EVERY_OPERATION: &[Operation] = &[
+    Operation::CreateRun,
     Operation::ApprovePlan,
     Operation::AnswerQuestion,
     Operation::AuthorizeMerge,
@@ -322,6 +347,7 @@ fn the_table_grants_exactly_what_the_design_says_it_grants() {
     // Spelled out rather than derived, so widening anybody's authority has to
     // be written down twice: once in the table and once here.
     const EXPECTED: &[(Operation, &[Principal])] = &[
+        (Operation::CreateRun, &[Principal::User, Principal::Praetor]),
         (Operation::ApprovePlan, &[Principal::User]),
         (
             Operation::AnswerQuestion,
@@ -1295,4 +1321,128 @@ fn the_read_plane_never_writes() {
 
     assert_eq!(harness.run_state(run_id), RunState::Queued);
     assert!(harness.event_types(run_id).is_empty());
+}
+
+fn create_run() -> CreateRun {
+    CreateRun {
+        repo_root: std::path::PathBuf::from("/home/dev/agens"),
+        task: "the worker harness".to_owned(),
+        scope: "crates/agens-cli/src/worker".to_owned(),
+        dod: "a run executes against the scripted provider".to_owned(),
+        external_ref: Some("agens/AGN-181".to_owned()),
+        parent_run_id: None,
+        dep_run_id: None,
+        provider: "openai-api".to_owned(),
+        priority: 5,
+        budget_tokens: None,
+        start_point: "HEAD".to_owned(),
+        now: NOW,
+    }
+}
+
+#[test]
+fn a_created_run_is_a_proposal_with_a_worktree_of_its_own() {
+    let mut harness = Harness::build(store(), RecordingWorktrees::new(false, true));
+
+    let created = harness
+        .core
+        .create_run(Principal::User, &create_run())
+        .unwrap();
+
+    let run = harness
+        .core
+        .machines()
+        .store()
+        .load_run(created.run_id)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(
+        run.state,
+        RunState::Draft,
+        "creating proposes an execution; only the user's approval queues it"
+    );
+    assert_eq!(run.repo_id, REPO, "the repository's identity is derived");
+    assert_eq!(
+        run.worktree_status,
+        Some(WorktreeStatus::Active),
+        "the run has a worktree the scheduler can admit it into"
+    );
+    assert_eq!(
+        run.worktree_path.as_deref(),
+        Some(created.worktree_path.display().to_string().as_str())
+    );
+    assert_eq!(
+        harness.worktrees.provisioned.lock().unwrap().len(),
+        1,
+        "exactly one worktree is provisioned for one run"
+    );
+    assert_eq!(
+        harness.event_types(created.run_id),
+        vec!["run_created".to_owned()],
+        "a run that exists says so in the journal"
+    );
+    assert!(
+        harness.scheduler.queue_changed.lock().unwrap().is_empty(),
+        "a draft is not queued, so admission has no occasion to look"
+    );
+}
+
+#[test]
+fn a_created_run_reaches_the_queue_only_through_approval() {
+    let mut harness = Harness::build(store(), RecordingWorktrees::new(false, true));
+
+    let created = harness
+        .core
+        .create_run(Principal::Praetor, &create_run())
+        .unwrap();
+
+    assert_eq!(harness.run_state(created.run_id), RunState::Draft);
+
+    harness
+        .core
+        .approve_plan(
+            Principal::User,
+            &ApprovePlan {
+                run_id: created.run_id,
+                now: NOW,
+            },
+        )
+        .unwrap();
+
+    assert_eq!(harness.run_state(created.run_id), RunState::Queued);
+    assert_eq!(
+        *harness.scheduler.queue_changed.lock().unwrap(),
+        vec![created.run_id]
+    );
+}
+
+#[test]
+fn a_run_with_no_scope_or_definition_of_done_is_refused_before_any_worktree_exists() {
+    let mut harness = Harness::build(store(), RecordingWorktrees::new(false, true));
+
+    let error = harness
+        .core
+        .create_run(
+            Principal::User,
+            &CreateRun {
+                scope: "   ".to_owned(),
+                dod: String::new(),
+                ..create_run()
+            },
+        )
+        .unwrap_err();
+
+    match error {
+        ApiError::Unauthorized { reason, .. } => assert_eq!(
+            reason, "a run needs a scope, a definition of done",
+            "the refusal names every field that was missing"
+        ),
+        other => panic!("a run nothing could measure is refused: {other:?}"),
+    }
+
+    assert!(
+        harness.worktrees.provisioned.lock().unwrap().is_empty(),
+        "nothing is created on disk for a run that was never accepted"
+    );
 }

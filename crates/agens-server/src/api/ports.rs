@@ -10,6 +10,7 @@
 //! whose effects could not be performed is reported, not swallowed.
 
 use std::fmt;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
 
 use agens_store::{EventClass, EventRow, RunRow};
@@ -105,6 +106,58 @@ pub trait WorktreeGate: Send + Sync {
     /// Removes the worktree directory. Called only behind a transition that
     /// already moved the row to `cleaned`.
     fn remove(&self, run: &RunRow) -> Result<(), PortError>;
+
+    /// The identity of the repository a run is being created against.
+    ///
+    /// Derived rather than taken from the request: a caller that named its own
+    /// would decide which repository's runs, events and questions its work is
+    /// grouped with, and the grouping is the coordinator's.
+    fn identify(&self, repository: &Path) -> Result<RepositoryIdentity, PortError>;
+
+    /// Creates the worktree a new run works in and applies the repository's own
+    /// provisioning contract to it.
+    ///
+    /// The two halves are one port call because a worktree git created and the
+    /// contract did not reach is not a worktree a run can start in, and undoing
+    /// the first half is this port's business rather than its caller's.
+    fn provision(&self, request: &WorktreeRequest<'_>) -> Result<ProvisionedWorktree, PortError>;
+}
+
+/// One repository, as the control plane groups by it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RepositoryIdentity {
+    /// The fingerprint every worktree of this repository shares. Never joined
+    /// with a session's confinement root, which is per worktree on purpose.
+    pub repo_id: String,
+    /// Persisted beside the fingerprint so a changed origin is diagnosable
+    /// rather than only orphaning rows.
+    pub remote_url: Option<String>,
+}
+
+/// The worktree one new run is asking for.
+#[derive(Clone, Copy, Debug)]
+pub struct WorktreeRequest<'a> {
+    /// The checkout it is created from, and the only source files are copied
+    /// out of.
+    pub repository: &'a Path,
+    pub repo_id: &'a str,
+    /// The directory name under this repository's worktrees, and the segment a
+    /// person reads when they `cd` into it.
+    pub name: &'a str,
+    pub branch: &'a str,
+    /// The commit the branch starts from.
+    pub start_point: &'a str,
+}
+
+/// A worktree that exists on disk and has had its contract applied.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProvisionedWorktree {
+    pub path: PathBuf,
+    /// Every provisioning hook that did not succeed and was continued past.
+    /// A non-empty list means the run starts in an environment that is not what
+    /// the repository declared, so the worker has to be told rather than left
+    /// to discover it.
+    pub hook_failures: Vec<String>,
 }
 
 /// Which edge of the worker's execution a delivery waits for.

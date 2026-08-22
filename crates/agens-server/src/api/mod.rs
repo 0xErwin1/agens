@@ -20,6 +20,7 @@
 mod authorization;
 mod feed;
 mod ports;
+mod runs;
 mod team;
 
 use std::sync::Arc;
@@ -35,9 +36,10 @@ pub use authorization::{
 pub use feed::{InboxItem, InboxView, RunSummary, RunView, TreeSnapshot};
 pub use ports::{
     Delivery, DeliveryGrain, DeliveryPayload, DeliveryQueue, EventFeed, EventFilter, PortError,
-    SchedulerPort, SessionControl, StopScope, Subscription, TakeoverHandle, WorktreeDerivation,
-    WorktreeGate,
+    ProvisionedWorktree, RepositoryIdentity, SchedulerPort, SessionControl, StopScope,
+    Subscription, TakeoverHandle, WorktreeDerivation, WorktreeGate, WorktreeRequest,
 };
+pub use runs::{CreateRun, CreatedRun};
 pub use team::{
     AdmissionState, AnswerQuestion, AnsweredQuestion, ApprovePlan, AuthorizeMerge, CleaningAction,
     CleaningDisposition, RetryRequest, RunRef, StopRequest,

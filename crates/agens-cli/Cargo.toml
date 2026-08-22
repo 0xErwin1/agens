@@ -56,3 +56,6 @@ agens-tui-app = { path = "../agens-tui-app", features = ["test-support"] }
 agens-tool-runtime = { path = "../agens-tool-runtime", features = ["probe"] }
 ratatui = "0.30.2"
 rusqlite = { version = "0.40.1", features = ["bundled"] }
+tonic = { version = "0.14", default-features = false, features = ["transport", "router", "codegen"] }
+tower = { version = "0.5.3", features = ["util"] }
+hyper-util = "0.1.20"

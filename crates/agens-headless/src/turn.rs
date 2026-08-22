@@ -22,7 +22,8 @@ use agens_providers::{
     ProviderDiagnosticScope, ProviderFailureDetail,
 };
 use agens_store::{
-    CompactionStore, DirectiveInbox, PermissionGrantStore, SessionStore, ToolFactStore, open_media,
+    CompactionStore, DirectiveInbox, DirectiveTarget, PermissionGrantStore, SessionStore,
+    ToolFactStore, open_media,
 };
 use agens_tools::{
     EffectiveCapabilitySet, McpErrorCategory, McpLifecycleState, McpLoadPhase, McpStatusHandle,
@@ -54,11 +55,13 @@ use agens_session::provider::{
 };
 use agens_session::turns::{
     completed_session_turn_from_events_with_media, completed_session_turn_with_media,
-    drain_turn_directive_messages, next_session_metadata,
+    drain_turn_directives_for, next_session_metadata,
 };
 use agens_tool_runtime::block_on_headless_turn;
 use agens_tool_runtime::child::TaskMailboxProvider;
-use agens_tool_runtime::runtime::production_tool_runtime_for_parent_with_cancellation;
+use agens_tool_runtime::runtime::{
+    RunIntrospectionFactory, production_tool_runtime_for_parent_executing_run,
+};
 use agens_tool_runtime::task::ProductionTuiTaskRuntime;
 
 #[derive(Default)]
@@ -94,6 +97,23 @@ impl PartialTurnRecorder {
     }
 }
 
+/// What makes a turn part of a coordinator run rather than an ordinary chat.
+///
+/// Two things, and both of them are addressing: the introspection surface
+/// `checkpoint` and `ask` are registered against, and the queue this turn
+/// drains. The rest of a run's session is an ordinary session, which is the
+/// point — a worker is a peer that happens to be executing a run.
+#[derive(Clone)]
+pub struct RunExecution {
+    /// Builds one introspection port per tool that needs one. Supplied only for
+    /// a parent turn: a sub-agent inherits neither tool, by absence.
+    pub introspection: RunIntrospectionFactory,
+    /// The name this run's queued deliveries are addressed under. It outlives
+    /// the session, because an answer is queued while the run is parked and no
+    /// session is executing it.
+    pub mailbox: String,
+}
+
 struct HeadlessProviderContext<'a> {
     bootstrap: &'a Bootstrap,
     /// The provider this turn resolved from its own model, rather than a
@@ -106,6 +126,8 @@ struct HeadlessProviderContext<'a> {
     diagnostic_reference: &'a str,
     include_system_prompt: bool,
     failure_detail: ProviderFailureDetail,
+    /// The run this turn is executing, when it is executing one.
+    run: Option<&'a RunExecution>,
 }
 
 /// The provider this turn speaks to, chosen by the model it was given.
@@ -139,6 +161,33 @@ const fn provider_authentication_message(provider: ProviderKind) -> &'static str
 }
 
 pub fn run_production_headless_chat_with_progress(
+    request: HeadlessChatRequest,
+    bootstrap: &Bootstrap,
+    cancellation: &HeadlessTurnCancellation,
+    progress: Option<&TurnProgressSink>,
+    prompter: Box<dyn PermissionPrompter>,
+    task_runtime: Option<&ProductionTuiTaskRuntime>,
+    operation_reference: Option<&str>,
+) -> Result<HeadlessChatCompletion, HeadlessChatFailure> {
+    run_production_headless_chat_executing_run(
+        request,
+        bootstrap,
+        cancellation,
+        progress,
+        prompter,
+        task_runtime,
+        operation_reference,
+        None,
+    )
+}
+
+/// The same turn, for a session executing a coordinator run.
+///
+/// Kept as a separate entry point rather than a field on the request: the
+/// factory is a live handle onto the daemon's service core, and the request is
+/// a comparable, cloneable value that a retry boundary copies.
+#[allow(clippy::too_many_arguments)]
+pub fn run_production_headless_chat_executing_run(
     mut request: HeadlessChatRequest,
     bootstrap: &Bootstrap,
     cancellation: &HeadlessTurnCancellation,
@@ -146,6 +195,7 @@ pub fn run_production_headless_chat_with_progress(
     prompter: Box<dyn PermissionPrompter>,
     task_runtime: Option<&ProductionTuiTaskRuntime>,
     operation_reference: Option<&str>,
+    run: Option<&RunExecution>,
 ) -> Result<HeadlessChatCompletion, HeadlessChatFailure> {
     agens_callcount::note_provider_runtime_build();
 
@@ -234,6 +284,7 @@ pub fn run_production_headless_chat_with_progress(
                     diagnostic_reference: &diagnostic_reference,
                     include_system_prompt: true,
                     failure_detail: failure_detail.clone(),
+                    run,
                 },
                 move |model, messages, tools, request_config, media_blobs| {
                     build_openai_provider_with_media(
@@ -277,6 +328,7 @@ pub fn run_production_headless_chat_with_progress(
                     diagnostic_reference: &diagnostic_reference,
                     include_system_prompt: true,
                     failure_detail: failure_detail.clone(),
+                    run,
                 },
                 move |model, messages, tools, request_config, media_blobs| {
                     MoonshotProvider::from_api_key_with_messages_and_tools_and_timeout(
@@ -325,6 +377,7 @@ pub fn run_production_headless_chat_with_progress(
                     diagnostic_reference: &diagnostic_reference,
                     include_system_prompt: false,
                     failure_detail: failure_detail.clone(),
+                    run,
                 },
                 move |model, messages, tools, request_config, media_blobs| {
                     build_chatgpt_provider_with_media(
@@ -885,6 +938,17 @@ fn compact_overflowing_history(
         .map(|compacted| compacted.messages)
 }
 
+/// Which queue this turn drains, at both grains.
+///
+/// A run's session reads the run's mailbox and not its own: the two deliveries
+/// that exist — an answer and a directive — are addressed to the run, and a run
+/// outlives any one session executing it.
+fn mailbox_of(run: Option<&RunExecution>, session_id: i64) -> DirectiveTarget {
+    run.map_or(DirectiveTarget::Session(session_id), |run| {
+        DirectiveTarget::Child(run.mailbox.clone())
+    })
+}
+
 fn run_production_headless_chat_with_provider<P>(
     request: HeadlessChatRequest,
     context: HeadlessProviderContext<'_>,
@@ -920,7 +984,7 @@ where
             Arc::clone(&task_runtime.dispatcher),
         ),
         None => {
-            let runtime = production_tool_runtime_for_parent_with_cancellation(
+            let runtime = production_tool_runtime_for_parent_executing_run(
                 context.bootstrap,
                 project_root,
                 request.skills.as_deref(),
@@ -928,6 +992,9 @@ where
                 request.request_config.clone(),
                 Some(context.diagnostic_reference.to_owned()),
                 context.cancellation.adapter_view().cancellation_handle(),
+                context
+                    .run
+                    .map(|run| std::sync::Arc::clone(&run.introspection)),
             )?;
             // Discovery for this turn's own registry has already run
             // synchronously inside `production_tool_runtime_for_parent`, so
@@ -1064,9 +1131,9 @@ where
             // Recorded before the provider even runs: the drain marks these
             // delivered, so a turn that stops early still has to persist them
             // or the queue has consumed a message no history carries.
-            let directives = drain_turn_directive_messages(
+            let directives = drain_turn_directives_for(
                 context.bootstrap.data_directory(),
-                attempt_key.session_id(),
+                &mailbox_of(context.run, attempt_key.session_id()),
             )?;
             if let Ok(mut delivered) = runtime_directives.lock() {
                 delivered.clone_from(&directives);
@@ -1159,9 +1226,9 @@ where
             cancellation_result(context.cancellation)?;
             // The queue is scoped to this session, so the turn only ever
             // collects what was addressed to it.
-            let mut inbox = DirectiveInbox::for_session(
+            let mut inbox = DirectiveInbox::for_target(
                 context.bootstrap.data_directory(),
-                attempt_key.session_id(),
+                mailbox_of(context.run, attempt_key.session_id()),
             );
             let max_iterations =
                 effective_max_iterations(request.max_iterations, context.bootstrap.max_iterations);

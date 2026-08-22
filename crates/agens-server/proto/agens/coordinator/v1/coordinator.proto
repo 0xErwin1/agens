@@ -31,6 +31,39 @@ message Ack {
   Transition transition = 1;
 }
 
+// A proposed execution, and the repository it is proposed against.
+//
+// The repository's identity is not here: the coordinator derives it from the
+// checkout, because a client that named its own would decide which repository's
+// runs its work is grouped with.
+message CreateRunRequest {
+  // The checkout the run's worktree is created from.
+  string repo_root = 1;
+  string task = 2;
+  string scope = 3;
+  string dod = 4;
+  // Provenance of an imported task. Never followed back to its source.
+  optional string external_ref = 5;
+  // The run this one replans, inheriting its lineage.
+  optional int64 parent_run_id = 6;
+  // The run whose work has to land before this one is eligible.
+  optional int64 dep_run_id = 7;
+  string provider = 8;
+  int64 priority = 9;
+  optional int64 budget_tokens = 10;
+  // The commit the run's branch starts from. Empty means the checkout's HEAD.
+  string start_point = 11;
+}
+
+message CreateRunResponse {
+  int64 run_id = 1;
+  string repo_id = 2;
+  string worktree_path = 3;
+  // Provisioning hooks that failed and were continued past: the run starts in
+  // an environment that is not what the repository declared.
+  repeated string hook_failures = 4;
+}
+
 message ApprovePlanRequest {
   int64 run_id = 1;
 }
@@ -111,6 +144,9 @@ message AdmissionState {
 
 // The operations that move the control plane.
 service Team {
+  // Creates a proposed execution in `draft` and provisions its worktree. The
+  // run reaches the queue only through ApprovePlan, which is the user's alone.
+  rpc CreateRun(CreateRunRequest) returns (CreateRunResponse);
   rpc ApprovePlan(ApprovePlanRequest) returns (Ack);
   rpc AnswerQuestion(AnswerQuestionRequest) returns (AnswerAck);
   rpc AuthorizeMerge(AuthorizeMergeRequest) returns (Ack);

@@ -19,6 +19,7 @@ use crate::fsm::Principal;
 /// The Team plane moves the control plane; the Feed plane only reads it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Operation {
+    CreateRun,
     ApprovePlan,
     AnswerQuestion,
     AuthorizeMerge,
@@ -38,6 +39,7 @@ impl Operation {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::CreateRun => "create_run",
             Self::ApprovePlan => "approve_plan",
             Self::AnswerQuestion => "answer_question",
             Self::AuthorizeMerge => "authorize_merge",
@@ -90,6 +92,12 @@ const USER_AND_PRAETOR: &[Principal] = &[Principal::User, Principal::Praetor];
 /// machines directly and need no client surface; letting it in here would give
 /// anything able to claim that principal a path around the user's authority.
 pub static OPERATION_AUTHORIZATION: &[OperationAuthorization] = &[
+    OperationAuthorization {
+        operation: Operation::CreateRun,
+        principals: USER_AND_PRAETOR,
+        rationale: "proposing an execution is planning, and it authorizes nothing on its own: \
+                    the run lands in draft and only the user's approval queues it",
+    },
     OperationAuthorization {
         operation: Operation::ApprovePlan,
         principals: USER_ONLY,

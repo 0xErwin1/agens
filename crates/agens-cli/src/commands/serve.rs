@@ -6,15 +6,17 @@
 //!
 //! The daemon is composed by `agens-server`, not here. What this supplies is the
 //! configuration the operator wrote and the worker factory, which is the seam a
-//! run's session is built from — and which no surface fills in yet, so it
-//! refuses by name rather than pretending to execute a run.
+//! run's session is built from: everything a worker is made of is knowledge of
+//! models, prompts, skills and worktrees, and the control plane deliberately
+//! has none of it.
 
 use agens_config::TeamSettings;
 use agens_core::HeadlessTurnCancellation;
-use agens_server::{CoordinatorSettings, ServerError, TimerSettings, unwired_worker};
+use agens_server::{CoordinatorSettings, ServerError, TimerSettings};
 
 use crate::CliDependencies;
 use crate::deps::bootstrap;
+use crate::worker::run_worker;
 use agens_error::CliError;
 
 pub(crate) fn run_serve(
@@ -34,7 +36,7 @@ pub(crate) fn run_serve(
     let shutdown = agens_server::serve_until_shutdown(
         bootstrap.data_directory(),
         &settings,
-        unwired_worker(),
+        run_worker(&bootstrap),
         // The unix socket alone. A loopback listener is a second address to
         // reach the control plane on, and nothing asks for one yet.
         None,

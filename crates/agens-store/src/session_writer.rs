@@ -484,6 +484,37 @@ impl SessionStore {
         Ok(AttemptFinishOutcome::Finished)
     }
 
+    /// Opens the durable session row a caller needs before it has anything to
+    /// persist against it, returning its id.
+    ///
+    /// The coordinator is the caller this exists for: a run's attempt row
+    /// carries the session that executed it as a foreign key, and the attempt
+    /// is written by the admission transition, which happens before the worker
+    /// has taken its first turn. Every other caller lets
+    /// [`Self::begin_session_attempt`] create the row on the way past.
+    pub fn open_session(&mut self, metadata: &SessionMetadata) -> Result<i64, SessionStoreError> {
+        validate_attempt_metadata(metadata).map_err(|_| {
+            SessionStoreError::operation(
+                "validate session metadata",
+                &self.database_path,
+                "session metadata is invalid",
+            )
+        })?;
+
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| {
+                SessionStoreError::operation("open session", &self.database_path, error)
+            })?;
+        let session_id = insert_attempt_session(&transaction, &self.database_path, metadata)?;
+        transaction.commit().map_err(|error| {
+            SessionStoreError::operation("open session", &self.database_path, error)
+        })?;
+
+        Ok(session_id)
+    }
+
     pub fn list_sessions(&self) -> Result<Vec<SessionMetadata>, SessionStoreError> {
         let mut statement = self
             .connection
