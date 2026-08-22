@@ -6,6 +6,7 @@
 //! scheduler and the timers, and none of that belongs to a command surface.
 
 mod blocking;
+mod fsm;
 mod instance;
 mod sessions;
 
@@ -15,6 +16,14 @@ use std::path::Path;
 use agens_core::HeadlessTurnCancellation;
 
 pub use blocking::{BlockingBoundary, BlockingError};
+pub use fsm::{
+    AppliedQuestionTransition, AppliedRunTransition, AppliedTransition, AppliedWorktreeTransition,
+    Principal, QUESTION_TRANSITIONS, QuestionEffect, QuestionFacts, QuestionGuard,
+    QuestionTransition, QuestionTrigger, RUN_TRANSITIONS, RunEffect, RunFacts, RunGuard,
+    RunTransition, RunTrigger, StateMachines, TransitionOutcome, TransitionRejection,
+    WORKTREE_TRANSITIONS, WorktreeEffect, WorktreeFacts, WorktreeGuard, WorktreeTransition,
+    WorktreeTrigger,
+};
 pub use instance::{ServeInstance, ServeInstanceError};
 pub use sessions::{
     SessionAdmission, SessionBudget, SessionBudgetHandle, SessionId, SessionLimits, SessionOutcome,
