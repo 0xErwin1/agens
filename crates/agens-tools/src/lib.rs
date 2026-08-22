@@ -39,6 +39,7 @@ pub mod markdown;
 mod mcp_status;
 mod stdio_mcp;
 mod task;
+mod worktrees;
 
 pub use agens_core::{TaskProviderFailure, TaskSkillRejection};
 pub use agents::{
@@ -63,6 +64,7 @@ pub use task::{
     TaskRunContext, TaskRunner, TaskRunnerError, TaskSkill, TaskTerminalState, TaskTool,
     TaskTurnRequest, TaskTurnResult,
 };
+pub use worktrees::{SessionWorktrees, WorktreeError, WorktreeStatus};
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;

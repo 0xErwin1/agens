@@ -4,7 +4,7 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-use agens_server::SessionWorktrees;
+use agens_tools::SessionWorktrees;
 
 static NEXT_REPOSITORY: AtomicUsize = AtomicUsize::new(0);
 
@@ -18,7 +18,7 @@ impl Repository {
     fn new() -> Self {
         let suffix = NEXT_REPOSITORY.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!(
-            "agens-server-worktrees-{}-{suffix}",
+            "agens-tools-worktrees-{}-{suffix}",
             std::process::id()
         ));
         let checkout = root.join("repository");
