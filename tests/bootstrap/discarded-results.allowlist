@@ -180,3 +180,5 @@ crates/agens-tui-app/src/resume.rs	let _ = selector.apply_reasoning_effort(effor
 crates/agens-tui-app/src/router/provider.rs	let _ = progress.send(event);	closed_channel
 crates/agens-server/src/coordinator/mod.rs	let _ = handle.join();	secondary_cleanup
 crates/agens-server/src/coordinator/mod.rs	let _ = ingest.drain_available(&reports);	documented_no_op
+crates/agens-server/src/api/runs.rs	let _ = self.ports.worktrees.remove(&row);	secondary_cleanup
+crates/agens-server/src/api/runs.rs	let _ = self.machines.journal(&[EventRow {	documented_no_op
