@@ -384,7 +384,7 @@ fn bash_reserves_metadata_and_both_streams_after_lossy_utf8_expansion() {
 #[test]
 fn catalog_preserves_the_bounded_bash_result_without_generic_truncation() {
     let root = project_root();
-    let catalog = NativeToolCatalog::new(NativeTools::open(&root).unwrap());
+    let mut catalog = NativeToolCatalog::new(NativeTools::open(&root).unwrap());
     let output = catalog
         .execute(
             "native::bash",
@@ -513,12 +513,14 @@ fn bash_killed_by_a_signal_reports_exit_code_none() {
 #[test]
 fn catalog_returns_turn_cancellation_as_a_runtime_error() {
     let root = project_root();
-    let catalog = Arc::new(NativeToolCatalog::new(NativeTools::open(&root).unwrap()));
+    let catalog = Arc::new(Mutex::new(NativeToolCatalog::new(
+        NativeTools::open(&root).unwrap(),
+    )));
     let cancelled = Arc::new(AtomicBool::new(false));
     let request_catalog = Arc::clone(&catalog);
     let request_cancellation = Arc::clone(&cancelled);
     let request = thread::spawn(move || {
-        request_catalog.execute(
+        request_catalog.lock().expect("catalog lock").execute(
             "native::bash",
             json!({"command": "sleep 1"}),
             &ToolExecutionContext::new(request_cancellation, Duration::from_secs(2)),
@@ -534,7 +536,7 @@ fn catalog_returns_turn_cancellation_as_a_runtime_error() {
 #[test]
 fn catalog_reports_malformed_and_empty_bash_input_as_tool_errors() {
     let root = project_root();
-    let catalog = NativeToolCatalog::new(NativeTools::open(&root).unwrap());
+    let mut catalog = NativeToolCatalog::new(NativeTools::open(&root).unwrap());
     let context = ToolExecutionContext::with_timeout(Duration::from_secs(1));
 
     assert_eq!(
@@ -554,7 +556,7 @@ fn catalog_reports_malformed_and_empty_bash_input_as_tool_errors() {
 #[test]
 fn catalog_validates_the_optional_bash_timeout_override() {
     let root = project_root();
-    let catalog = NativeToolCatalog::new(NativeTools::open(&root).unwrap());
+    let mut catalog = NativeToolCatalog::new(NativeTools::open(&root).unwrap());
     let metadata = NativeToolCatalog::metadata();
     let bash = metadata
         .iter()
@@ -578,7 +580,7 @@ fn catalog_validates_the_optional_bash_timeout_override() {
 #[test]
 fn catalog_applies_a_positive_bash_timeout_override() {
     let root = project_root();
-    let catalog = NativeToolCatalog::new(NativeTools::open(&root).unwrap());
+    let mut catalog = NativeToolCatalog::new(NativeTools::open(&root).unwrap());
 
     assert_eq!(
         catalog
@@ -601,7 +603,7 @@ fn catalog_falls_back_to_the_configured_bash_timeout() {
         bash_timeout: Duration::from_millis(25),
         ..NativeToolLimits::default()
     };
-    let catalog = NativeToolCatalog::new(NativeTools::open_with_limits(&root, limits).unwrap());
+    let mut catalog = NativeToolCatalog::new(NativeTools::open_with_limits(&root, limits).unwrap());
 
     assert_eq!(
         catalog
@@ -841,7 +843,7 @@ fn exact_edit_fails_closed_for_nonregular_and_linked_targets() {
 fn catalog_dispatches_the_separate_edit_schema() {
     let root = project_root();
     fs::write(root.join("notes.txt"), "before").unwrap();
-    let catalog = NativeToolCatalog::new(NativeTools::open(&root).unwrap());
+    let mut catalog = NativeToolCatalog::new(NativeTools::open(&root).unwrap());
     let metadata = NativeToolCatalog::metadata();
     let edit = metadata
         .iter()
@@ -879,7 +881,7 @@ fn catalog_dispatches_the_separate_edit_schema() {
 fn native_catalog_preserves_edit_facts() {
     let root = project_root();
     fs::write(root.join("notes.txt"), "before").unwrap();
-    let catalog = NativeToolCatalog::new(NativeTools::open(&root).unwrap());
+    let mut catalog = NativeToolCatalog::new(NativeTools::open(&root).unwrap());
 
     let output = catalog
         .execute(
@@ -1085,9 +1087,9 @@ fn final_symlink_replacement_never_redirects_a_write_outside_the_project() {
 #[test]
 fn catalog_exposes_strict_schemas_and_cancellation_suppresses_bash_output() {
     let root = project_root();
-    let catalog = NativeToolCatalog::new(NativeTools::open(&root).unwrap());
+    let mut catalog = NativeToolCatalog::new(NativeTools::open(&root).unwrap());
     let metadata = NativeToolCatalog::metadata();
-    assert_eq!(metadata.len(), 10);
+    assert_eq!(metadata.len(), 12);
     assert!(metadata.iter().all(|tool| {
         tool.qualified_name.starts_with("native::")
             && tool.input_schema["type"] == "object"
@@ -1419,10 +1421,10 @@ fn glob_and_list_enforce_the_exact_default_entry_cap() {
 fn catalog_dispatches_grep_and_glob_with_their_own_schemas() {
     let root = project_root();
     fs::write(root.join("notes.txt"), "needle\n").unwrap();
-    let catalog = NativeToolCatalog::new(NativeTools::open(&root).unwrap());
+    let mut catalog = NativeToolCatalog::new(NativeTools::open(&root).unwrap());
     let metadata = NativeToolCatalog::metadata();
 
-    assert_eq!(metadata.len(), 10);
+    assert_eq!(metadata.len(), 12);
     let grep = metadata
         .iter()
         .find(|tool| tool.qualified_name == "native::grep")
@@ -1743,10 +1745,14 @@ fn webfetch_rejects_six_redirects_and_cancels_delayed_headers_and_bodies() {
             }
         });
         let cancelled = Arc::clone(&cancellation);
-        let catalog = Arc::new(NativeToolCatalog::new(NativeTools::open(&root).unwrap()));
+        let catalog = Arc::new(Mutex::new(NativeToolCatalog::new(
+            NativeTools::open(&root).unwrap(),
+        )));
         let request_catalog = Arc::clone(&catalog);
         let request = thread::spawn(move || {
             request_catalog
+                .lock()
+                .expect("catalog lock")
                 .execute(
                     "native::webfetch",
                     json!({"url": url}),

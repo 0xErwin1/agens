@@ -23,6 +23,11 @@ pub struct SessionContext {
     /// `None` for a session that has not been created yet; see
     /// [`crate::session::root::resolve_tui_session_root`] for the fallback that applies then.
     pub confinement_root: Option<std::path::PathBuf>,
+    /// Where this session's tools are working, once a tool moved them out of
+    /// the confinement root. `None` means the root itself. A tool runtime is
+    /// built again for every turn, so this is what carries the move from one
+    /// turn to the next; see [`crate::root::resolve_tui_working_directory`].
+    pub working_directory: Option<std::path::PathBuf>,
     pub messages: Vec<Message>,
     /// The turns this session can take back. Undone turns leave their messages
     /// in `messages` and are excluded by [`SessionContext::live_messages`]
@@ -350,6 +355,7 @@ impl SessionContext {
             identifier: Some(identifier),
             metadata: Some(metadata),
             confinement_root: Some(confinement_root),
+            working_directory: None,
             messages,
             undo: crate::undo::UndoHistory::default(),
             expanded_prompt: None,
@@ -388,6 +394,7 @@ impl SessionContext {
             identifier: Some(identifier),
             metadata: Some(metadata),
             confinement_root: Some(confinement_root),
+            working_directory: None,
             messages,
             undo: crate::undo::UndoHistory::default(),
             expanded_prompt: None,

@@ -5,7 +5,7 @@
 //! large or cold repository takes far longer than a frame, so it must never be
 //! something the renderer waits for.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -16,18 +16,29 @@ use agens_tui::{RepositoryProbe, RepositoryStatus};
 /// How often the working tree is re-read.
 const REFRESH_INTERVAL: Duration = Duration::from_secs(3);
 
+/// Where the next reading is collected from, asked again every cycle so the
+/// branch on screen belongs to the directory the session is actually in.
+pub type RepositoryDirectory = Arc<dyn Fn() -> PathBuf + Send + Sync>;
+
 /// Starts the collector for `root` and returns the probe the TUI reads.
+pub fn start_repository_probe(root: &Path) -> RepositoryProbe {
+    let root = root.to_path_buf();
+
+    start_repository_probe_following(Arc::new(move || root.clone()))
+}
+
+/// Starts a collector that re-reads `directory` every cycle, and returns the
+/// probe the TUI reads.
 ///
 /// The thread outlives nothing: it is detached and stops mattering when the
 /// process ends. It holds no lock while running git.
-pub fn start_repository_probe(root: &Path) -> RepositoryProbe {
+pub fn start_repository_probe_following(directory: RepositoryDirectory) -> RepositoryProbe {
     let cell: Arc<Mutex<Option<RepositoryStatus>>> = Arc::new(Mutex::new(None));
-    let root = root.to_path_buf();
 
     let writer = Arc::clone(&cell);
     thread::spawn(move || {
         loop {
-            let status = collect(&root);
+            let status = collect(&directory());
             if let Ok(mut cell) = writer.lock() {
                 *cell = status;
             }

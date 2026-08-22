@@ -39,6 +39,8 @@ pub mod markdown;
 mod mcp_status;
 mod stdio_mcp;
 mod task;
+mod working_directory;
+mod worktrees;
 
 pub use agens_core::{TaskProviderFailure, TaskSkillRejection};
 pub use agents::{
@@ -63,6 +65,8 @@ pub use task::{
     TaskRunContext, TaskRunner, TaskRunnerError, TaskSkill, TaskTerminalState, TaskTool,
     TaskTurnRequest, TaskTurnResult,
 };
+pub use working_directory::{WorkingDirectory, WorkingDirectoryObserver};
+pub use worktrees::{SessionWorktrees, WorktreeError, WorktreeStatus};
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
@@ -4410,9 +4414,30 @@ impl BashInput {
     }
 }
 
+/// Where one session's worktrees live, and what to call the repository they
+/// belong to.
+#[derive(Debug)]
+struct ConfiguredWorktrees {
+    worktrees: SessionWorktrees,
+    repository_id: String,
+    /// This repository's session-worktree directory. Reachable as a whole, so
+    /// a worktree an earlier session created is somewhere this one may return
+    /// to.
+    home: PathBuf,
+}
+
 #[derive(Debug)]
 pub struct NativeTools {
+    /// Where the session is working: what a relative path resolves against,
+    /// what a command runs in, and what a confined open starts from. This
+    /// moves; `session_root` does not.
     project_root: PathBuf,
+    /// The root the session was opened on. Every directory the session may
+    /// move to lies under this one or under its own worktree home, so moving
+    /// is bounded by the same rule a path is.
+    session_root: PathBuf,
+    worktrees: Option<ConfiguredWorktrees>,
+    published_directory: Option<WorkingDirectory>,
     limits: NativeToolLimits,
     webfetch: Mutex<WebfetchState>,
     #[cfg(unix)]
@@ -4440,9 +4465,149 @@ impl NativeTools {
             #[cfg(unix)]
             project_root_dir: fs::File::open(&project_root)
                 .map_err(|error| Error::Tool(format!("cannot open project root: {error}")))?,
+            session_root: project_root.clone(),
             project_root,
+            worktrees: None,
+            published_directory: None,
             limits,
             webfetch: Mutex::new(WebfetchState::default()),
+        })
+    }
+
+    /// Lets this session create worktrees under `worktrees`, and reach the
+    /// ones already there, for the repository named by `repository_id`.
+    pub fn with_worktrees(
+        mut self,
+        worktrees: SessionWorktrees,
+        repository_id: impl Into<String>,
+    ) -> Result<Self, Error> {
+        let repository_id = repository_id.into();
+        let home = worktrees
+            .repository_directory(&repository_id)
+            .map_err(|error| Error::Tool(error.to_string()))?;
+
+        self.worktrees = Some(ConfiguredWorktrees {
+            worktrees,
+            repository_id,
+            home,
+        });
+        Ok(self)
+    }
+
+    /// Publishes every later move to `directory`, so a surface can report
+    /// where the session is without asking the tools.
+    pub fn with_published_directory(mut self, directory: WorkingDirectory) -> Self {
+        self.published_directory = Some(directory);
+        self
+    }
+
+    /// Where the session is working right now.
+    pub fn working_directory(&self) -> &Path {
+        &self.project_root
+    }
+
+    /// Moves the session to `path`, so later calls resolve against it.
+    ///
+    /// `path` is read the way every other tool path is: relative to where the
+    /// session is now, or absolute. What it may name is wider than a file
+    /// path's confinement by exactly one thing, this session's own worktree
+    /// home, because a worktree the session creates is useless if the session
+    /// cannot work in it.
+    pub fn change_directory(&mut self, path: &Path) -> Result<ToolOutput, Error> {
+        if path.as_os_str().is_empty() {
+            return Ok(ToolOutput::failure("cd: path is required"));
+        }
+
+        let requested = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.project_root.join(path)
+        };
+
+        let Ok(target) = fs::canonicalize(&requested) else {
+            return Ok(ToolOutput::failure("cd: no such directory"));
+        };
+
+        if !target.is_dir() {
+            return Ok(ToolOutput::failure("cd: not a directory"));
+        }
+
+        if !self.is_reachable(&target) {
+            return Ok(ToolOutput::failure(
+                "cd: outside the session root and its worktrees",
+            ));
+        }
+
+        self.enter(target)
+    }
+
+    /// Creates `branch` in a worktree named `name` and moves the session into
+    /// it, so the work the model asked for starts where it asked for it.
+    pub fn create_worktree(
+        &mut self,
+        name: &str,
+        branch: &str,
+        start_point: &str,
+    ) -> Result<ToolOutput, Error> {
+        let Some(configured) = self.worktrees.as_ref() else {
+            return Ok(ToolOutput::failure(
+                "worktree: session worktrees are unavailable",
+            ));
+        };
+
+        let created = configured.worktrees.create(
+            &self.session_root,
+            &configured.repository_id,
+            name,
+            branch,
+            start_point,
+        );
+        let path = match created {
+            Ok(path) => path,
+            Err(error) => return Ok(ToolOutput::failure(format!("worktree: {error}"))),
+        };
+
+        let Ok(path) = fs::canonicalize(&path) else {
+            return Ok(ToolOutput::failure(
+                "worktree: the created worktree is unreadable",
+            ));
+        };
+
+        self.enter(path)
+    }
+
+    /// Opens `target` as the directory the session works in.
+    fn enter(&mut self, target: PathBuf) -> Result<ToolOutput, Error> {
+        #[cfg(unix)]
+        {
+            let Ok(opened) = fs::File::open(&target) else {
+                return Ok(ToolOutput::failure("cd: the directory cannot be opened"));
+            };
+            self.project_root_dir = opened;
+        }
+
+        self.project_root = target;
+        if let Some(published) = self.published_directory.as_ref() {
+            published.moved_to(&self.project_root);
+        }
+
+        Ok(ToolOutput::success(format!(
+            "working directory: {}",
+            self.project_root.display()
+        )))
+    }
+
+    /// Whether the session may work in `directory`, which must already be
+    /// resolved.
+    fn is_reachable(&self, directory: &Path) -> bool {
+        if directory.starts_with(&self.session_root) {
+            return true;
+        }
+
+        self.worktrees.as_ref().is_some_and(|configured| {
+            let home =
+                fs::canonicalize(&configured.home).unwrap_or_else(|_| configured.home.clone());
+            directory.starts_with(&home)
         })
     }
 
@@ -5725,6 +5890,27 @@ fn visible_html_text(html: &str) -> String {
 /// against "the native tools" resolves it against a surface these belong to. A
 /// name left out survives as a pattern that never matches a dispatcher
 /// identity: the rule reads as enforced and decides nothing.
+/// Native tools that move the session itself rather than act inside it.
+///
+/// A delegated child runs its own tools on its own root and reports through
+/// the execution that launched it, so a child holding these would move a
+/// directory the thread that delegated to it never asked to move, and would
+/// move it where none of the session's surfaces can see. They stay with the
+/// thread that owns the session.
+pub const SESSION_SCOPED_NATIVE_TOOLS: [&str; 2] = ["native::cd", "native::worktree"];
+
+/// Whether `name` is one of the natives that only the session's own thread
+/// holds. The name is reduced through [`agens_core::bare_tool_name`], so the
+/// answer cannot depend on which spelling of the tool reached it.
+pub fn is_session_scoped_native_tool(name: &str) -> bool {
+    let bare = agens_core::bare_tool_name(name);
+
+    SESSION_SCOPED_NATIVE_TOOLS
+        .iter()
+        .filter_map(|registered| registered.strip_prefix("native::"))
+        .any(|registered| bare == registered)
+}
+
 pub const NATIVE_TOOLS_REGISTERED_OUTSIDE_THE_CATALOG: [&str; 5] = [
     "native::ask_user",
     "native::skill",
@@ -5801,6 +5987,18 @@ impl NativeToolCatalog {
                 serde_json::json!({"type":"object","additionalProperties":false,"required":["operation"],"properties":{"operation":{"type":"string","enum":["status","diff","log","branch_merged","merge_base"]},"base":{"type":"string"},"head":{"type":"string"},"staged":{"type":"boolean"},"limit":{"type":"integer","minimum":1}}}),
             ),
             native_metadata(
+                "native::cd",
+                "Move the session's working directory, so later calls resolve relative paths and run commands there. Accepts a path under the session root, or a worktree this session can reach.",
+                ToolAccess::Write,
+                serde_json::json!({"type":"object","additionalProperties":false,"required":["path"],"properties":{"path":{"type":"string"}}}),
+            ),
+            native_metadata(
+                "native::worktree",
+                "Create a git worktree for this session on a new branch and move the session into it. Branch defaults to the worktree name and start point to HEAD.",
+                ToolAccess::Write,
+                serde_json::json!({"type":"object","additionalProperties":false,"required":["name"],"properties":{"name":{"type":"string"},"branch":{"type":"string"},"start_point":{"type":"string"}}}),
+            ),
+            native_metadata(
                 "native::webfetch",
                 "Fetch an HTTP or HTTPS URL without credentials",
                 ToolAccess::ReadOnly,
@@ -5810,7 +6008,7 @@ impl NativeToolCatalog {
     }
 
     pub fn execute(
-        &self,
+        &mut self,
         name: &str,
         arguments: Value,
         context: &ToolExecutionContext,
@@ -5868,6 +6066,20 @@ impl NativeToolCatalog {
                 self.tools.grep_with_context(input, Some(context))?
             }
             "native::glob" => self.tools.glob(GlobInput::new(string("pattern")?))?,
+            "native::cd" => self.tools.change_directory(Path::new(string("path")?))?,
+            "native::worktree" => {
+                let name = string("name")?;
+                let branch = arguments
+                    .get("branch")
+                    .and_then(Value::as_str)
+                    .unwrap_or(name);
+                let start_point = arguments
+                    .get("start_point")
+                    .and_then(Value::as_str)
+                    .unwrap_or("HEAD");
+
+                self.tools.create_worktree(name, branch, start_point)?
+            }
             "native::git_read" => {
                 let Some(operation) = GitReadOperation::parse(string("operation")?) else {
                     return Ok(ToolOutput::failure("git_read: unknown operation"));
@@ -6705,7 +6917,7 @@ mod native_tool_tests {
     fn bash_rejects_timeout_above_max() {
         let root = project_root();
         let tools = NativeTools::open(&root).unwrap();
-        let catalog = NativeToolCatalog::new(tools);
+        let mut catalog = NativeToolCatalog::new(tools);
         let context = ToolExecutionContext::with_timeout(Duration::from_secs(60));
 
         let result = catalog.execute(
@@ -6725,7 +6937,7 @@ mod native_tool_tests {
     fn bash_accepts_timeout_up_to_max() {
         let root = project_root();
         let tools = NativeTools::open(&root).unwrap();
-        let catalog = NativeToolCatalog::new(tools);
+        let mut catalog = NativeToolCatalog::new(tools);
         let context = ToolExecutionContext::with_timeout(Duration::from_secs(60));
 
         let result = catalog.execute(
@@ -6951,9 +7163,9 @@ mod native_tool_tests {
         )
         .unwrap();
 
-        let catalog = NativeToolCatalog::new(NativeTools::open(&root).unwrap());
+        let mut catalog = NativeToolCatalog::new(NativeTools::open(&root).unwrap());
         let context = ToolExecutionContext::with_timeout(Duration::from_secs(1));
-        let read = |arguments| catalog.execute("native::read", arguments, &context);
+        let mut read = |arguments| catalog.execute("native::read", arguments, &context);
 
         assert_eq!(
             read(serde_json::json!({"path":"AGENTS.md","limit":200}))

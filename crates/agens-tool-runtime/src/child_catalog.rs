@@ -125,12 +125,21 @@ pub struct ChildToolSurface {
 /// engram::mem_search` rejected as exceeding a surface that simply had not
 /// been told about it yet, so an agent could hold every remote tool or none,
 /// but never the ones it named.
+/// The catalog a delegated child is resolved against: every native tool
+/// except the ones that move the session itself.
+fn child_native_metadata() -> Vec<NativeToolMetadata> {
+    NativeToolCatalog::metadata()
+        .into_iter()
+        .filter(|entry| !agens_tools::is_session_scoped_native_tool(&entry.qualified_name))
+        .collect()
+}
+
 pub fn resolve_child_surface(
     parent_rules: &[PermissionRule],
     declarations: &[PermissionRule],
     remote_tools: &[String],
 ) -> Result<ChildToolSurface, ChildSurfaceRejection> {
-    let metadata = NativeToolCatalog::metadata();
+    let metadata = child_native_metadata();
     let surface = metadata
         .iter()
         .map(|entry| entry.qualified_name.as_str())
@@ -349,11 +358,23 @@ mod tests {
 
         assert_eq!(
             tool_names(&surface),
-            NativeToolCatalog::metadata()
+            child_native_metadata()
                 .into_iter()
                 .map(|entry| entry.qualified_name)
                 .collect::<Vec<_>>()
         );
+    }
+
+    /// Moving the session is the session's own decision. A child that could
+    /// move it would move a directory the delegating thread never named, and
+    /// would move it where that thread's footer and audit log cannot follow.
+    #[test]
+    fn a_child_never_holds_the_tools_that_move_the_session() {
+        let surface = resolve_child_surface(&[], &[], &[]).unwrap();
+
+        for tool in agens_tools::SESSION_SCOPED_NATIVE_TOOLS {
+            assert!(!tool_names(&surface).contains(&tool.to_owned()));
+        }
     }
 
     #[test]
@@ -364,7 +385,7 @@ mod tests {
         assert!(!tool_names(&surface).contains(&"native::bash".to_owned()));
         assert_eq!(
             tool_names(&surface).len(),
-            NativeToolCatalog::metadata().len() - 1
+            child_native_metadata().len() - 1
         );
     }
 
@@ -427,7 +448,7 @@ mod tests {
 
                 assert_eq!(
                     tool_names(&surface).len(),
-                    NativeToolCatalog::metadata().len(),
+                    child_native_metadata().len(),
                     "{decision:?} {tool} matches no native tool and must omit none"
                 );
                 assert!(

@@ -424,7 +424,11 @@ mod tests {
             &known_bootstrap,
             &SessionContext::fresh(),
         ));
-        configure_tui_project_identity(&mut known_tui, &known_bootstrap);
+        configure_tui_project_identity(
+            &mut known_tui,
+            &Arc::new(Mutex::new(SessionContext::fresh())),
+            &known_bootstrap,
+        );
         let known = render_tui_test_backend(&known_tui, 140, 14);
 
         assert!(known.contains("gpt-5.6-sol (medium) ·   0%"), "{known:?}");

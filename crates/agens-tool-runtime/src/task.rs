@@ -102,6 +102,7 @@ pub fn production_tui_task_runtime_with_cancellation(
         parent_request_config,
         Some(model_resolution_reference),
         ask_user,
+        None,
         discovery_cancellation,
     )
 }
@@ -146,6 +147,7 @@ pub fn production_tui_task_runtime_with_runner_and_parent_config(
         parent_request_config,
         model_resolution_reference,
         ask_user,
+        None,
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     )
 }
@@ -160,6 +162,7 @@ pub fn production_tui_task_runtime_with_runner_parent_config_and_cancellation(
     parent_request_config: agens_core::RequestConfig,
     model_resolution_reference: Option<String>,
     ask_user: Box<dyn AskUserPort>,
+    working_directory: Option<agens_tools::WorkingDirectory>,
     discovery_cancellation: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<ProductionTuiTaskRuntime, CliError> {
     let bypass = task_runner.bypass();
@@ -181,6 +184,7 @@ pub fn production_tui_task_runtime_with_runner_parent_config_and_cancellation(
         model_resolution_reference,
         task_runner,
         ask_user,
+        working_directory,
         discovery_cancellation,
     )?;
     let project = project_root.display().to_string();

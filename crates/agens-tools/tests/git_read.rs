@@ -360,7 +360,7 @@ fn catalog_exposes_git_read_as_a_read_only_tool_with_an_enumerated_operation() {
 #[test]
 fn catalog_dispatches_git_read_and_rejects_an_unknown_operation() {
     let root = repository();
-    let catalog = NativeToolCatalog::new(NativeTools::open(&root).unwrap());
+    let mut catalog = NativeToolCatalog::new(NativeTools::open(&root).unwrap());
     let context = ToolExecutionContext::with_timeout(Duration::from_secs(5));
 
     let status = catalog
