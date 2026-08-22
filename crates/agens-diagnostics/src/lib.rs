@@ -113,6 +113,60 @@ pub enum SessionLifecycle<'a> {
     WorkingDirectoryChanged {
         directory: &'a str,
     },
+    /// The provider refused the request because the history no longer fits the
+    /// model's window.
+    ///
+    /// Recorded as its own fact rather than left inside a generic provider
+    /// failure, for the same reason a quota limit carries its reset time: a
+    /// supervisor can act on an exhausted window — it is unblocked by a
+    /// compaction — and cannot act on an opaque rejection. Nothing else a
+    /// provider rejects has an unblocking action attached to it.
+    ContextExhausted {
+        model: &'a str,
+    },
+    CompactionStarted {
+        reason: CompactionReason,
+    },
+    /// How a compaction ended, including every way it declined to happen.
+    ///
+    /// A refusal is recorded, not swallowed: a compaction that did not run
+    /// leaves the history exactly as it was, and a reader watching the thread
+    /// jump would otherwise have no way to learn that the recovery it was
+    /// counting on never took place.
+    CompactionEnded {
+        outcome: CompactionRecord,
+    },
+}
+
+/// What asked for a compaction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompactionReason {
+    /// A person asked for it.
+    Manual,
+    /// The history crossed the configured share of the window.
+    Threshold,
+    /// The provider already refused the request.
+    Overflow,
+}
+
+impl CompactionReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::Threshold => "threshold",
+            Self::Overflow => "overflow",
+        }
+    }
+}
+
+/// How a compaction ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompactionRecord {
+    /// The history was replaced. `summarized` counts the messages the summary
+    /// stands for and `kept` the ones that survived verbatim.
+    Compacted { summarized: usize, kept: usize },
+    /// Nothing was replaced. `reason` names which refusal applied.
+    Refused { reason: &'static str },
 }
 
 impl SessionLifecycle<'_> {
@@ -125,6 +179,9 @@ impl SessionLifecycle<'_> {
             Self::ToolFailed { .. } => ProviderDiagnosticKind::ToolFailed,
             Self::PermissionBlocked { .. } => ProviderDiagnosticKind::PermissionBlocked,
             Self::WorkingDirectoryChanged { .. } => ProviderDiagnosticKind::WorkingDirectoryChanged,
+            Self::ContextExhausted { .. } => ProviderDiagnosticKind::ContextExhausted,
+            Self::CompactionStarted { .. } => ProviderDiagnosticKind::CompactionStarted,
+            Self::CompactionEnded { .. } => ProviderDiagnosticKind::CompactionEnded,
         }
     }
 
@@ -146,6 +203,20 @@ impl SessionLifecycle<'_> {
             Self::WorkingDirectoryChanged { directory } => {
                 serde_json::json!({ "directory": directory })
             }
+            Self::ContextExhausted { model } => serde_json::json!({ "model": model }),
+            Self::CompactionStarted { reason } => {
+                serde_json::json!({ "reason": reason.as_str() })
+            }
+            Self::CompactionEnded { outcome } => match outcome {
+                CompactionRecord::Compacted { summarized, kept } => serde_json::json!({
+                    "outcome": "compacted",
+                    "summarized": summarized,
+                    "kept": kept,
+                }),
+                CompactionRecord::Refused { reason } => {
+                    serde_json::json!({ "outcome": "refused", "reason": reason })
+                }
+            },
         }
     }
 }
@@ -1228,6 +1299,82 @@ mod tests {
 
         assert_eq!(recorded[0]["event"], "working_directory_changed");
         assert_eq!(recorded[0]["directory"], "/data/worktrees/repo/feature");
+
+        std::fs::remove_dir_all(&temporary).ok();
+    }
+
+    /// An exhausted window and the compaction that answers it are the one
+    /// failure a supervisor can unblock without a person, so both the fact and
+    /// what the recovery did with it are recorded — including a recovery that
+    /// declined to run and left the history untouched.
+    #[test]
+    fn an_exhausted_context_and_its_compaction_are_recorded_as_typed_events() {
+        let temporary = std::env::temp_dir().join(format!(
+            "agens-diagnostic-compaction-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::remove_dir_all(&temporary).ok();
+        std::fs::create_dir_all(&temporary).expect("test data directory should be creatable");
+
+        let store = SafeDiagnosticStore::with_capture(temporary.clone(), true);
+        let reference = DiagnosticRef::new("beef0001".to_owned()).unwrap();
+        store.record_session_lifecycle(
+            &reference,
+            ProviderDiagnosticScope::Parent,
+            SessionLifecycle::ContextExhausted {
+                model: "moonshotai/kimi-k3",
+            },
+        );
+        store.record_session_lifecycle(
+            &reference,
+            ProviderDiagnosticScope::Parent,
+            SessionLifecycle::CompactionStarted {
+                reason: CompactionReason::Overflow,
+            },
+        );
+        store.record_session_lifecycle(
+            &reference,
+            ProviderDiagnosticScope::Parent,
+            SessionLifecycle::CompactionEnded {
+                outcome: CompactionRecord::Compacted {
+                    summarized: 12,
+                    kept: 3,
+                },
+            },
+        );
+        store.record_session_lifecycle(
+            &reference,
+            ProviderDiagnosticScope::Parent,
+            SessionLifecycle::CompactionEnded {
+                outcome: CompactionRecord::Refused {
+                    reason: "summary was empty",
+                },
+            },
+        );
+
+        let recorded = recorded_lines(&temporary);
+        let events: Vec<&str> = recorded
+            .iter()
+            .filter_map(|line| line["event"].as_str())
+            .collect();
+
+        assert_eq!(
+            events,
+            vec![
+                "context_exhausted",
+                "compaction_started",
+                "compaction_ended",
+                "compaction_ended"
+            ]
+        );
+        assert_eq!(recorded[0]["model"], "moonshotai/kimi-k3");
+        assert_eq!(recorded[1]["reason"], "overflow");
+        assert_eq!(recorded[2]["outcome"], "compacted");
+        assert_eq!(recorded[2]["summarized"], 12);
+        assert_eq!(recorded[2]["kept"], 3);
+        assert_eq!(recorded[3]["outcome"], "refused");
+        assert_eq!(recorded[3]["reason"], "summary was empty");
 
         std::fs::remove_dir_all(&temporary).ok();
     }

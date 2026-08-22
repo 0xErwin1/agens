@@ -144,6 +144,9 @@ fn safe_diagnostic_entry(value: &serde_json::Value, relative_path: &str) -> Opti
             "tool_failed",
             "permission_blocked",
             "working_directory_changed",
+            "context_exhausted",
+            "compaction_started",
+            "compaction_ended",
         ],
     )?;
     let attempt = object

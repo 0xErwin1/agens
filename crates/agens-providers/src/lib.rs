@@ -346,6 +346,9 @@ pub enum ProviderDiagnosticKind {
     ToolFailed,
     PermissionBlocked,
     WorkingDirectoryChanged,
+    ContextExhausted,
+    CompactionStarted,
+    CompactionEnded,
 }
 
 impl ProviderDiagnosticKind {
@@ -365,6 +368,9 @@ impl ProviderDiagnosticKind {
             Self::ToolFailed => "tool_failed",
             Self::PermissionBlocked => "permission_blocked",
             Self::WorkingDirectoryChanged => "working_directory_changed",
+            Self::ContextExhausted => "context_exhausted",
+            Self::CompactionStarted => "compaction_started",
+            Self::CompactionEnded => "compaction_ended",
         }
     }
 }
