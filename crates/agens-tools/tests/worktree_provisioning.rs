@@ -28,6 +28,8 @@ struct Repository {
     root: PathBuf,
     checkout: PathBuf,
     data_directory: PathBuf,
+    /// The environment names a hook of this repository may export.
+    exports: Vec<String>,
 }
 
 impl Repository {
@@ -56,7 +58,14 @@ impl Repository {
             root,
             checkout,
             data_directory,
+            exports: Vec::new(),
         }
+    }
+
+    /// Grants these exported names, the way an operator's policy does.
+    fn exporting(mut self, names: &[&str]) -> Self {
+        self.exports = names.iter().map(|name| (*name).to_owned()).collect();
+        self
     }
 
     fn write(&self, relative: &str, contents: &str) {
@@ -91,15 +100,17 @@ impl Repository {
         &self,
         decisions: &dyn ProvisioningDecisions,
     ) -> Result<ProvisioningOutcome, ProvisioningError> {
-        WorktreeProvisioner::new(self.worktrees()).provision(
-            &ProvisioningRequest {
-                repository: &self.checkout,
-                repository_id: REPOSITORY_ID,
-                name: WORKTREE_NAME,
-                branch: BRANCH,
-            },
-            decisions,
-        )
+        WorktreeProvisioner::new(self.worktrees())
+            .with_export_allowlist(self.exports.clone())
+            .provision(
+                &ProvisioningRequest {
+                    repository: &self.checkout,
+                    repository_id: REPOSITORY_ID,
+                    name: WORKTREE_NAME,
+                    branch: BRANCH,
+                },
+                decisions,
+            )
     }
 }
 
@@ -421,7 +432,7 @@ command = ["/bin/sh", "-c", "printf 'ran\n' > ran.txt"]
 
 #[test]
 fn a_hook_inherits_the_environment_and_what_an_earlier_hook_exported() {
-    let repository = Repository::new();
+    let repository = Repository::new().exporting(&["CARGO_TARGET_DIR"]);
     repository.declare(
         r#"
 [[hooks]]
@@ -452,8 +463,69 @@ command = ["/bin/sh", "-c", "printf '%s|%s\n' \"$CARGO_TARGET_DIR\" \"$AGENS_PRO
     assert_eq!(
         report.environment,
         BTreeMap::from([("CARGO_TARGET_DIR".to_owned(), "/shared/target".to_owned())]),
-        "what the hooks exported is handed to the worker session"
+        "an allowed export reaches the hooks that follow it"
     );
+    assert!(report.dropped_exports.is_empty());
+}
+
+#[test]
+fn an_export_the_caller_never_allowed_is_dropped_rather_than_inherited() {
+    let repository = Repository::new().exporting(&["CARGO_TARGET_DIR"]);
+    repository.declare(
+        r#"
+[[hooks]]
+name = "export"
+command = ["/bin/sh", "-c", "printf 'PATH=/tmp/hostile\nLD_PRELOAD=/tmp/hostile.so\nCARGO_TARGET_DIR=/shared/target\n' >> \"$AGENS_WORKTREE_ENV\""]
+
+[[hooks]]
+name = "observe"
+command = ["/bin/sh", "-c", "printf '%s|%s\n' \"$LD_PRELOAD\" \"$CARGO_TARGET_DIR\" > observed.txt"]
+"#,
+    );
+
+    let worktree = repository.create_worktree();
+    let report = applied(repository.provision(&Permissive::new()));
+
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
+    assert_eq!(
+        report.environment,
+        BTreeMap::from([("CARGO_TARGET_DIR".to_owned(), "/shared/target".to_owned())]),
+        "only the granted name survives"
+    );
+    assert_eq!(
+        report.dropped_exports,
+        vec!["LD_PRELOAD".to_owned(), "PATH".to_owned()],
+        "what was refused is reported rather than silently discarded"
+    );
+    assert_eq!(
+        std::fs::read_to_string(worktree.join("observed.txt")).expect("hook output"),
+        "|/shared/target
+",
+        "a refused export never reaches the hook that follows, so it cannot decide \
+         what that hook runs"
+    );
+}
+
+#[test]
+fn an_allowlist_entry_ending_in_a_star_admits_every_name_under_that_prefix() {
+    let repository = Repository::new().exporting(&["AGENS_RUN_*"]);
+    repository.declare(
+        r#"
+[[hooks]]
+name = "export"
+command = ["/bin/sh", "-c", "printf 'AGENS_RUN_MODE=fast\nAGENS_RUNTIME=other\n' >> \"$AGENS_WORKTREE_ENV\""]
+"#,
+    );
+
+    repository.create_worktree();
+    let report = applied(repository.provision(&Permissive::new()));
+
+    assert_eq!(
+        report.environment,
+        BTreeMap::from([("AGENS_RUN_MODE".to_owned(), "fast".to_owned())]),
+        "the prefix is a whole prefix, not a substring"
+    );
+    assert_eq!(report.dropped_exports, vec!["AGENS_RUNTIME".to_owned()]);
 }
 
 #[test]
