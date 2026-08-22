@@ -62,6 +62,10 @@ pub enum NativePermissionTarget {
     Pattern(String),
     Operation(String),
     Url(String),
+    /// A single name a call is known by rather than a path it opens: the
+    /// worktree a session asks for. It never escapes its own directory, so a
+    /// rule naming it decides that worktree and nothing else.
+    Name(String),
     /// A content search, which two arguments describe at once: the pattern it
     /// is named by, and the path deciding which files it reads. Both are kept,
     /// because either one alone is enough to reach a file's contents and a rule
@@ -111,6 +115,8 @@ impl NativePermissionTarget {
             "native::read" | "native::write" | "native::edit" | "native::list"
             | "native::search" => field("path").map(Self::Path),
             "native::glob" => field("pattern").map(Self::Pattern),
+            "native::cd" => field("path").map(Self::Path),
+            "native::worktree" => field("name").map(Self::Name),
             "native::git_read" => field("operation").map(Self::Operation),
             "native::grep" => {
                 let path = arguments
@@ -132,6 +138,7 @@ impl NativePermissionTarget {
             | Self::Pattern(value)
             | Self::Operation(value)
             | Self::Url(value)
+            | Self::Name(value)
             | Self::Search { pattern: value, .. } => value,
         }
     }
@@ -155,7 +162,8 @@ impl NativePermissionTarget {
             | Self::Path(_)
             | Self::Pattern(_)
             | Self::Operation(_)
-            | Self::Url(_) => Vec::new(),
+            | Self::Url(_)
+            | Self::Name(_) => Vec::new(),
         }
     }
 }

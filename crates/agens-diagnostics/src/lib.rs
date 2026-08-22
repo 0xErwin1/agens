@@ -103,6 +103,16 @@ pub enum SessionLifecycle<'a> {
         tool: &'a str,
         access: &'a str,
     },
+    /// A tool moved the session out of the directory it was working in.
+    ///
+    /// The directory is recorded, unlike a permission target, because it is
+    /// the whole of the event: a supervisor reading this file to find out
+    /// where a session is working learns nothing from the fact that it moved.
+    /// It names a directory the session was already confined to, and carries
+    /// no argument the caller composed.
+    WorkingDirectoryChanged {
+        directory: &'a str,
+    },
 }
 
 impl SessionLifecycle<'_> {
@@ -114,6 +124,7 @@ impl SessionLifecycle<'_> {
             Self::TurnEnded { .. } => ProviderDiagnosticKind::TurnEnded,
             Self::ToolFailed { .. } => ProviderDiagnosticKind::ToolFailed,
             Self::PermissionBlocked { .. } => ProviderDiagnosticKind::PermissionBlocked,
+            Self::WorkingDirectoryChanged { .. } => ProviderDiagnosticKind::WorkingDirectoryChanged,
         }
     }
 
@@ -131,6 +142,9 @@ impl SessionLifecycle<'_> {
             }
             Self::PermissionBlocked { tool, access } => {
                 serde_json::json!({ "tool": tool, "access": access })
+            }
+            Self::WorkingDirectoryChanged { directory } => {
+                serde_json::json!({ "directory": directory })
             }
         }
     }
@@ -1185,6 +1199,35 @@ mod tests {
             recorded[2]
         );
         assert_eq!(recorded[3]["outcome"], "failed");
+
+        std::fs::remove_dir_all(&temporary).ok();
+    }
+
+    /// Where a session is working is a question a supervisor answers from this
+    /// file, so the move that changes the answer has to be in it.
+    #[test]
+    fn a_move_out_of_the_session_root_is_recorded_with_the_directory() {
+        let temporary = std::env::temp_dir().join(format!(
+            "agens-diagnostic-working-directory-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::remove_dir_all(&temporary).ok();
+        std::fs::create_dir_all(&temporary).expect("test data directory should be creatable");
+
+        let store = SafeDiagnosticStore::with_capture(temporary.clone(), true);
+        store.record_session_lifecycle(
+            &DiagnosticRef::new("d4c3b2a1".to_owned()).unwrap(),
+            ProviderDiagnosticScope::Parent,
+            SessionLifecycle::WorkingDirectoryChanged {
+                directory: "/data/worktrees/repo/feature",
+            },
+        );
+
+        let recorded = recorded_lines(&temporary);
+
+        assert_eq!(recorded[0]["event"], "working_directory_changed");
+        assert_eq!(recorded[0]["directory"], "/data/worktrees/repo/feature");
 
         std::fs::remove_dir_all(&temporary).ok();
     }

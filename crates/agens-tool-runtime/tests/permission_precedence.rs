@@ -3135,7 +3135,7 @@ fn every_tool_this_table_says_asks_per_file_withholds_a_denied_file() {
     let project_root = temporary.join("project");
     worktree_holding_a_denied_secret(&project_root, &temporary.join("git"));
 
-    let catalog = NativeToolCatalog::new(
+    let mut catalog = NativeToolCatalog::new(
         NativeTools::open(&project_root).expect("the probe worktree must open as a project root"),
     );
 
@@ -3384,7 +3384,7 @@ fn the_rules_decide_every_file_a_grep_walks_before_its_own_filter_decides_what_r
     let project_root = temporary.join("project");
     worktree_holding_a_denied_secret(&project_root, &temporary.join("git"));
 
-    let catalog = NativeToolCatalog::new(
+    let mut catalog = NativeToolCatalog::new(
         NativeTools::open(&project_root).expect("the probe worktree must open as a project root"),
     );
     let (policy, identity) =

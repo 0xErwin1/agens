@@ -1166,6 +1166,12 @@ pub struct ViewState<'a> {
 /// Reads the already-collected repository state. Never blocks.
 pub type RepositoryProbe = Arc<dyn Fn() -> Option<RepositoryStatus> + Send + Sync>;
 
+/// Reads the directory the session's tools are working in. Never blocks.
+///
+/// The footer names a location, and a tool call can move the session out of
+/// the root it started in, so the location is polled rather than set once.
+pub type WorkingDirectoryProbe = Arc<dyn Fn() -> Option<String> + Send + Sync>;
+
 /// How often the footer picks up a new repository reading.
 const REPOSITORY_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
@@ -6230,6 +6236,7 @@ pub struct Tui<E> {
     repository: Option<RepositoryStatus>,
     repository_probe: Option<RepositoryProbe>,
     repository_polled_at: Option<Duration>,
+    working_directory_probe: Option<WorkingDirectoryProbe>,
     turn_state: Option<TurnState>,
     /// Whether the visible failure of the current turn is the projection's own
     /// placeholder, still waiting to be replaced by the real cause.
@@ -6348,6 +6355,7 @@ where
             repository: None,
             repository_probe: None,
             repository_polled_at: None,
+            working_directory_probe: None,
             turn_state: None,
             placeholder_failure: false,
             active_tool: None,
@@ -6612,6 +6620,7 @@ where
     pub fn tick(&mut self, now: Duration) {
         self.now = now;
         self.poll_repository(now);
+        self.poll_working_directory();
         if self.quit_armed_until.is_some_and(|until| now >= until) {
             self.quit_armed_until = None;
         }
@@ -6761,6 +6770,15 @@ where
         self.repository_probe = Some(probe);
     }
 
+    /// Installs the source the footer reads the session's location from, so a
+    /// tool call that moved the session moves the footer with it.
+    pub fn set_working_directory_probe(&mut self, probe: WorkingDirectoryProbe) {
+        if let Some(directory) = probe() {
+            self.project = directory;
+        }
+        self.working_directory_probe = Some(probe);
+    }
+
     fn poll_repository(&mut self, now: Duration) {
         let Some(probe) = self.repository_probe.as_ref() else {
             return;
@@ -6773,6 +6791,18 @@ where
         }
         self.repository_polled_at = Some(now);
         self.repository = probe();
+    }
+
+    /// Reads the session's location on every tick. Unlike the repository
+    /// reading, which is collected by shelling out to git, this one is a read
+    /// of state the tools already wrote, so it costs nothing to keep current.
+    fn poll_working_directory(&mut self) {
+        let Some(probe) = self.working_directory_probe.as_ref() else {
+            return;
+        };
+        if let Some(directory) = probe() {
+            self.project = directory;
+        }
     }
 
     /// Sets the dangerous-mode state displayed for the next submitted turn.

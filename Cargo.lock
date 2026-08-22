@@ -280,6 +280,7 @@ dependencies = [
  "agens-store",
  "agens-tools",
  "serde_json",
+ "sha2",
  "tokio",
 ]
 

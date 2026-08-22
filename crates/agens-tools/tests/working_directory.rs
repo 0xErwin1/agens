@@ -13,8 +13,10 @@ use std::{
 };
 
 use agens_tools::{
-    BashInput, ListDirectoryInput, NativeTools, ReadFileInput, SessionWorktrees, WorkingDirectory,
+    BashInput, ListDirectoryInput, NativeToolCatalog, NativeTools, ReadFileInput, SessionWorktrees,
+    ToolExecutionContext, WorkingDirectory,
 };
+use serde_json::json;
 
 static NEXT_ROOT: AtomicUsize = AtomicUsize::new(0);
 
@@ -281,4 +283,78 @@ fn a_refused_move_publishes_nothing() {
 
     assert!(refused.is_error);
     assert_eq!(directory.current(), fixture.repository());
+}
+
+/// Budget for a catalog call that has to run to completion; the timeout paths
+/// are proven elsewhere, so this only has to exceed the real cost.
+const COMPLETION_BUDGET: Duration = Duration::from_secs(60);
+
+#[test]
+fn the_catalog_advertises_moving_and_worktree_creation() {
+    let names = NativeToolCatalog::metadata()
+        .into_iter()
+        .map(|metadata| metadata.qualified_name)
+        .collect::<Vec<_>>();
+
+    assert!(names.contains(&"native::cd".to_owned()));
+    assert!(names.contains(&"native::worktree".to_owned()));
+}
+
+#[test]
+fn a_catalog_call_moves_the_session_for_every_later_call() {
+    let fixture = Fixture::new();
+    let mut catalog = NativeToolCatalog::new(fixture.tools());
+    let context = ToolExecutionContext::with_timeout(COMPLETION_BUDGET);
+
+    let moved = catalog
+        .execute("native::cd", json!({ "path": "nested" }), &context)
+        .unwrap();
+    assert!(!moved.is_error, "{}", moved.content);
+
+    let read = catalog
+        .execute("native::read", json!({ "path": "inner.txt" }), &context)
+        .unwrap();
+    assert!(!read.is_error, "{}", read.content);
+    assert!(read.content.contains("inner file"));
+}
+
+#[test]
+fn a_catalog_worktree_call_leaves_the_session_inside_the_worktree() {
+    let fixture = Fixture::new();
+    let mut catalog = NativeToolCatalog::new(fixture.tools());
+    let context = ToolExecutionContext::with_timeout(COMPLETION_BUDGET);
+
+    let created = catalog
+        .execute(
+            "native::worktree",
+            json!({ "name": "feature", "branch": "feature-branch" }),
+            &context,
+        )
+        .unwrap();
+
+    assert!(!created.is_error, "{}", created.content);
+    assert!(
+        created
+            .content
+            .contains(&fixture.data_directory().display().to_string()),
+        "{}",
+        created.content
+    );
+}
+
+#[test]
+fn a_catalog_move_outside_the_session_root_is_refused() {
+    let fixture = Fixture::new();
+    let mut catalog = NativeToolCatalog::new(fixture.tools());
+    let context = ToolExecutionContext::with_timeout(COMPLETION_BUDGET);
+
+    let refused = catalog
+        .execute(
+            "native::cd",
+            json!({ "path": fixture.elsewhere().display().to_string() }),
+            &context,
+        )
+        .unwrap();
+
+    assert!(refused.is_error, "{}", refused.content);
 }

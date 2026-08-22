@@ -10,8 +10,9 @@ use agens_config::{SubagentSettings, ToolLimitSettings};
 use agens_core::ask_user::{AskUserPort, UnavailableAskUserPort};
 use agens_providers::OpenAiFunctionTool;
 use agens_tools::{
-    AskUserTool, NativeToolCatalog, NativeTools, SkillCatalog, SkillResourceTool, TaskControlTool,
-    TaskExecutionRegistry, TaskMessageSource, TaskMessageTool, TaskRunner, ToolDispatcher,
+    AskUserTool, NativeToolCatalog, NativeTools, SessionWorktrees, SkillCatalog, SkillResourceTool,
+    TaskControlTool, TaskExecutionRegistry, TaskMessageSource, TaskMessageTool, TaskRunner,
+    ToolDispatcher, WorkingDirectory,
 };
 
 use crate::mcp::{
@@ -56,6 +57,51 @@ pub fn open_native_tools(
 ) -> Result<NativeTools, CliError> {
     NativeTools::open_with_limits(project_root, native_tool_limits(settings))
         .map_err(|_| CliError::configuration("native tools are unavailable"))
+}
+
+/// Opens the session's own native tools: confined to `project_root`, able to
+/// create worktrees for it, and reopened wherever the session was left.
+///
+/// A tool runtime is built again for every turn, so the directory the session
+/// moved to has to be re-entered here, or the session walks back to its root
+/// between one prompt and the next.
+fn open_session_native_tools(
+    bootstrap: &Bootstrap,
+    project_root: &Path,
+    settings: ToolLimitSettings,
+    working_directory: Option<WorkingDirectory>,
+) -> Result<NativeTools, CliError> {
+    let mut tools = open_native_tools(project_root, settings)?
+        .with_worktrees(
+            SessionWorktrees::new(bootstrap.data_directory()),
+            session_worktree_repository_id(project_root),
+        )
+        .map_err(|_| CliError::configuration("session worktrees are unavailable"))?;
+
+    if let Some(working_directory) = working_directory {
+        let resumed = working_directory.current();
+        if resumed != project_root {
+            // A directory that is gone, or no longer reachable, leaves the
+            // session at its root rather than failing the turn.
+            let _ = tools.change_directory(&resumed);
+        }
+        tools = tools.with_published_directory(working_directory);
+    }
+
+    Ok(tools)
+}
+
+/// A stable, file-name-safe name for one project's session worktrees, so two
+/// projects never share a worktree directory and the same project always
+/// finds its own.
+fn session_worktree_repository_id(project_root: &Path) -> String {
+    use sha2::{Digest, Sha256};
+
+    Sha256::digest(project_root.display().to_string().as_bytes())
+        .iter()
+        .take(16)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 pub fn production_tool_runtime(
@@ -108,6 +154,7 @@ pub fn production_tool_runtime_for_parent_with_cancellation(
         model_resolution_reference,
         ProductionTaskRunner::new(bootstrap.clone(), project_root.to_path_buf()),
         Box::new(UnavailableAskUserPort),
+        None,
         discovery_cancellation,
     )
 }
@@ -170,6 +217,7 @@ pub fn production_tool_runtime_with_discovery_cancellation<R: TaskRunner>(
     model_resolution_reference: Option<String>,
     task_runner: R,
     ask_user: Box<dyn AskUserPort>,
+    working_directory: Option<WorkingDirectory>,
     discovery_cancellation: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<(Vec<OpenAiFunctionTool>, SharedToolDispatcher), CliError> {
     production_tool_runtime_inner(
@@ -181,6 +229,7 @@ pub fn production_tool_runtime_with_discovery_cancellation<R: TaskRunner>(
         model_resolution_reference,
         task_runner,
         ask_user,
+        working_directory,
         discovery_cancellation,
     )
 }
@@ -209,6 +258,7 @@ pub fn production_tool_runtime_with_parent_task_runner_and_ask_user<R: TaskRunne
         model_resolution_reference,
         task_runner,
         ask_user,
+        None,
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     )
 }
@@ -223,14 +273,19 @@ fn production_tool_runtime_inner<R: TaskRunner>(
     model_resolution_reference: Option<String>,
     mut task_runner: R,
     ask_user: Box<dyn AskUserPort>,
+    working_directory: Option<WorkingDirectory>,
     discovery_cancellation: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<(Vec<OpenAiFunctionTool>, SharedToolDispatcher), CliError> {
     agens_callcount::note_tool_runtime_build();
 
-    let native_catalog = Arc::new(Mutex::new(NativeToolCatalog::new(open_native_tools(
-        project_root,
-        bootstrap.tool_limits(),
-    )?)));
+    let native_catalog = Arc::new(Mutex::new(NativeToolCatalog::new(
+        open_session_native_tools(
+            bootstrap,
+            project_root,
+            bootstrap.tool_limits(),
+            working_directory,
+        )?,
+    )));
     let mcp_registry = Arc::new(Mutex::new(load_configured_mcp_registry(
         bootstrap,
         project_root,
@@ -644,6 +699,70 @@ mod tests {
         session_bootstrap_for_provider as tui_session_bootstrap_for_provider,
         session_directory as tui_session_directory,
     };
+
+    /// A turn's runtime is built from scratch, so where the session was left
+    /// has to be re-entered when the next one opens. Without this the model
+    /// would have to move again after every prompt.
+    #[test]
+    fn a_session_reopens_in_the_directory_its_last_turn_left_it_in() {
+        let temporary = tui_session_directory("session-working-directory");
+        let bootstrap = tui_session_bootstrap(&temporary, &[]);
+        let project_root = temporary.join("project");
+        let nested = project_root.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("inner.txt"), "inner file").unwrap();
+
+        let directory = agens_tools::WorkingDirectory::new(&nested);
+        let tools = open_session_native_tools(
+            &bootstrap,
+            &project_root,
+            bootstrap.tool_limits(),
+            Some(directory),
+        )
+        .expect("the session's tools must open");
+
+        assert_eq!(
+            tools.working_directory(),
+            std::fs::canonicalize(&nested).unwrap()
+        );
+    }
+
+    /// A directory the session can no longer reach is not a reason to fail the
+    /// turn: the session opens at its root and the model can look again.
+    #[test]
+    fn a_directory_that_went_away_leaves_the_session_at_its_root() {
+        let temporary = tui_session_directory("session-working-directory-gone");
+        let bootstrap = tui_session_bootstrap(&temporary, &[]);
+        let project_root = temporary.join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+
+        let directory = agens_tools::WorkingDirectory::new(project_root.join("removed"));
+        let tools = open_session_native_tools(
+            &bootstrap,
+            &project_root,
+            bootstrap.tool_limits(),
+            Some(directory),
+        )
+        .expect("the session's tools must open");
+
+        assert_eq!(
+            tools.working_directory(),
+            std::fs::canonicalize(&project_root).unwrap()
+        );
+    }
+
+    #[test]
+    fn two_projects_never_share_a_session_worktree_directory() {
+        let one = session_worktree_repository_id(Path::new("/projects/agens"));
+        let another = session_worktree_repository_id(Path::new("/projects/other"));
+
+        assert_ne!(one, another);
+        assert_eq!(
+            one,
+            session_worktree_repository_id(Path::new("/projects/agens"))
+        );
+        assert!(one.chars().all(|character| character.is_ascii_hexdigit()));
+    }
 
     #[test]
     fn configured_tool_limits_reach_the_native_tool_runtime() {

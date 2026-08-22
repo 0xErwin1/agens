@@ -259,7 +259,11 @@ fn production_tui_project_identity_uses_the_canonical_current_project_for_new_an
         cancellation: Arc::new(Mutex::new(None)),
     });
 
-    configure_tui_project_identity(&mut tui, &project_bootstrap);
+    configure_tui_project_identity(
+        &mut tui,
+        &Arc::new(Mutex::new(SessionContext::fresh())),
+        &project_bootstrap,
+    );
     assert_eq!(tui.view().project, project);
     tui.set_presentation("openai-api", "gpt-4.1", "new session");
     let new_session_header = render_tui_test_backend(&tui, 120, 24);
@@ -310,7 +314,11 @@ fn production_tui_project_identity_uses_the_canonical_current_project_for_new_an
         cancellation: Arc::new(Mutex::new(None)),
     });
 
-    configure_tui_project_identity(&mut fallback_tui, &no_project_bootstrap);
+    configure_tui_project_identity(
+        &mut fallback_tui,
+        &Arc::new(Mutex::new(SessionContext::fresh())),
+        &no_project_bootstrap,
+    );
     assert_eq!(fallback_tui.view().project, expected_fallback_project);
     let fallback_render = render_tui_test_backend(&fallback_tui, 120, 24);
     // Project basename lives in the operational footer (not "project …" header chrome).

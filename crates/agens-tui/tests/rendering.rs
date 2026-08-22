@@ -6053,6 +6053,46 @@ fn the_transcript_greys_run_from_prose_to_tool_header_to_tool_output() {
     );
 }
 
+/// The session can be moved into a worktree by a tool call, and the footer is
+/// the only thing on screen that says where the work is happening.
+#[test]
+fn the_footer_follows_the_directory_the_session_moved_to() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(160, 14)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.apply_presentation(TuiPresentation::new(
+        "openai-api",
+        "gpt-5.6-sol",
+        "session #1",
+    ));
+    tui.set_project("/home/iperez/dev/personal/agens");
+
+    let moved = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let probe_moved = std::sync::Arc::clone(&moved);
+    tui.set_working_directory_probe(std::sync::Arc::new(move || {
+        Some(
+            if probe_moved.load(std::sync::atomic::Ordering::Relaxed) {
+                "/home/iperez/.local/share/agens/worktrees/repo/feature"
+            } else {
+                "/home/iperez/dev/personal/agens"
+            }
+            .to_owned(),
+        )
+    }));
+
+    renderer.render(tui.view()).unwrap();
+    assert!(rendered_text(&renderer).contains("/agens"));
+
+    moved.store(true, std::sync::atomic::Ordering::Relaxed);
+    tui.tick(std::time::Duration::from_millis(500));
+    renderer.render(tui.view()).unwrap();
+
+    assert!(
+        rendered_text(&renderer).contains("/feature"),
+        "{:?}",
+        rendered_text(&renderer)
+    );
+}
+
 #[test]
 fn the_footer_answers_its_questions_at_every_real_terminal_width() {
     for width in [80_u16, 120, 200] {

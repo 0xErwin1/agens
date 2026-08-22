@@ -338,6 +338,7 @@ pub enum ProviderDiagnosticKind {
     TurnEnded,
     ToolFailed,
     PermissionBlocked,
+    WorkingDirectoryChanged,
 }
 
 impl ProviderDiagnosticKind {
@@ -356,6 +357,7 @@ impl ProviderDiagnosticKind {
             Self::TurnEnded => "turn_ended",
             Self::ToolFailed => "tool_failed",
             Self::PermissionBlocked => "permission_blocked",
+            Self::WorkingDirectoryChanged => "working_directory_changed",
         }
     }
 }

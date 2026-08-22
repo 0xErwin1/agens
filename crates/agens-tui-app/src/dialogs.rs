@@ -143,6 +143,7 @@ fn safe_diagnostic_entry(value: &serde_json::Value, relative_path: &str) -> Opti
             "turn_ended",
             "tool_failed",
             "permission_blocked",
+            "working_directory_changed",
         ],
     )?;
     let attempt = object

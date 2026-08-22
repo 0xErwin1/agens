@@ -26,7 +26,7 @@ use crate::models::seed_remembered_tui_selection;
 use crate::permission_prompt::TtyPermissionPrompter;
 use crate::permission_prompt::TuiPermissionPrompter;
 use crate::permission_prompt::production_tui_permission_bridge;
-use crate::repository::start_repository_probe;
+use crate::repository::start_repository_probe_following;
 use crate::resume::{ResumedTuiSession, resume_tui_session, resumed_subagent_cards};
 use crate::router::{TuiRuntimeRouter, tui_provider_outcome};
 use crate::turn::{complete_tui_turn, tui_session_presentation};
@@ -156,7 +156,7 @@ pub fn run_production_tui_with_profile_store(
     };
     let mut tui = Tui::new(engine);
     install_prompt_memory_from_store(&mut tui, bootstrap.data_directory());
-    configure_tui_project_identity(&mut tui, bootstrap);
+    configure_tui_project_identity(&mut tui, &session, bootstrap);
     tui.set_collapse_thinking(bootstrap.collapse_thinking);
     if let Some(identifier) = resume {
         // The catalog this parameter would otherwise select is instead rediscovered below, once
@@ -325,6 +325,22 @@ pub fn run_production_tui_with_profile_store(
             if let Ok(metrics) = metrics.lock() {
                 metrics.publish_mcp_connecting_notices();
             }
+            let session_working_directory = match router
+                .session
+                .lock()
+                .map_err(|_| CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable"))
+                .and_then(|context| {
+                    agens_session::root::resolve_tui_working_directory(&context, &runtime_bootstrap)
+                }) {
+                Ok(directory) => directory,
+                Err(error) => return tui_provider_outcome(Err(error)),
+            };
+            let published_directory = agens_tools::WorkingDirectory::new(session_working_directory)
+                .with_observer(session_working_directory_observer(
+                    &router.session,
+                    &runtime_bootstrap,
+                    &task_diagnostic_reference,
+                ));
             let discovery_cancellation = turn_cancellation.adapter_view().cancellation_handle();
             let selected_origin = origin_launches_selected_subagent(origin);
             let mut selected_runtime = if selected_origin {
@@ -429,6 +445,7 @@ pub fn run_production_tui_with_profile_store(
                             task_parent_request_config.clone(),
                             Some(task_diagnostic_reference.clone()),
                             Box::new(TuiAskUserPort(submit_ask_user_bridge.clone(), None)),
+                            Some(published_directory.clone()),
                             Arc::clone(&discovery_cancellation),
                         )?;
                     ensure_active_agent_runtime(
@@ -880,16 +897,66 @@ fn counted_skills_sharing(count: usize) -> String {
     }
 }
 
-/// Labels the TUI header with the process's own current project, before any session has been
-/// created or resumed. Purely a display convenience, not a confinement decision, so it is one of
-/// the few sites allowed to read the process-wide discovered root directly.
-pub fn configure_tui_project_identity(tui: &mut Tui<ProductionTuiEngine>, bootstrap: &Bootstrap) {
-    if let Some(root) =
+/// Records a move out of the session's working directory: on the session, so
+/// the next turn's runtime reopens there, and in this run's diagnostics, so a
+/// supervisor reading them learns where the session went.
+fn session_working_directory_observer(
+    session: &Arc<Mutex<SessionContext>>,
+    bootstrap: &Bootstrap,
+    reference: &str,
+) -> agens_tools::WorkingDirectoryObserver {
+    let session = Arc::clone(session);
+    let bootstrap = bootstrap.clone();
+    let reference = reference.to_owned();
+
+    Arc::new(move |directory: &std::path::Path| {
+        if let Ok(mut context) = session.lock() {
+            context.working_directory = Some(directory.to_path_buf());
+        }
+
+        agens_diagnostics::record_session_lifecycle(
+            &bootstrap,
+            &reference,
+            agens_providers::ProviderDiagnosticScope::Parent,
+            agens_diagnostics::SessionLifecycle::WorkingDirectoryChanged {
+                directory: &directory.display().to_string(),
+            },
+        );
+    })
+}
+
+/// Labels the TUI header with the directory `session` is working in, falling back to the
+/// process's own current project before any session has been created or resumed. Purely a
+/// display convenience, not a confinement decision, so it is one of the few sites allowed to
+/// read the process-wide discovered root directly.
+///
+/// Both the location and the branch beside it are read again on the tick rather than set once:
+/// a tool call can move the session into a worktree, and a footer still naming the root would
+/// be reporting a directory nothing is happening in.
+pub fn configure_tui_project_identity(
+    tui: &mut Tui<ProductionTuiEngine>,
+    session: &Arc<Mutex<SessionContext>>,
+    bootstrap: &Bootstrap,
+) {
+    let Some(root) =
         agens_bootstrap::session_root::SessionRoot::discover_for_new_session(bootstrap)
-    {
-        tui.set_project(root.path().display().to_string());
-        tui.set_repository_probe(start_repository_probe(root.path()));
-    }
+    else {
+        return;
+    };
+
+    let session = Arc::clone(session);
+    let root = root.into_path_buf();
+    let directory: crate::repository::RepositoryDirectory = Arc::new(move || {
+        session
+            .lock()
+            .ok()
+            .and_then(|context| context.working_directory.clone())
+            .unwrap_or_else(|| root.clone())
+    });
+
+    let reported = Arc::clone(&directory);
+    tui.set_working_directory_probe(Arc::new(move || Some(reported().display().to_string())));
+    tui.set_repository_probe(start_repository_probe_following(directory));
 }
 
 #[cfg(test)]

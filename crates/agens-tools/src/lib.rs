@@ -5890,6 +5890,27 @@ fn visible_html_text(html: &str) -> String {
 /// against "the native tools" resolves it against a surface these belong to. A
 /// name left out survives as a pattern that never matches a dispatcher
 /// identity: the rule reads as enforced and decides nothing.
+/// Native tools that move the session itself rather than act inside it.
+///
+/// A delegated child runs its own tools on its own root and reports through
+/// the execution that launched it, so a child holding these would move a
+/// directory the thread that delegated to it never asked to move, and would
+/// move it where none of the session's surfaces can see. They stay with the
+/// thread that owns the session.
+pub const SESSION_SCOPED_NATIVE_TOOLS: [&str; 2] = ["native::cd", "native::worktree"];
+
+/// Whether `name` is one of the natives that only the session's own thread
+/// holds. The name is reduced through [`agens_core::bare_tool_name`], so the
+/// answer cannot depend on which spelling of the tool reached it.
+pub fn is_session_scoped_native_tool(name: &str) -> bool {
+    let bare = agens_core::bare_tool_name(name);
+
+    SESSION_SCOPED_NATIVE_TOOLS
+        .iter()
+        .filter_map(|registered| registered.strip_prefix("native::"))
+        .any(|registered| bare == registered)
+}
+
 pub const NATIVE_TOOLS_REGISTERED_OUTSIDE_THE_CATALOG: [&str; 5] = [
     "native::ask_user",
     "native::skill",
@@ -5966,6 +5987,18 @@ impl NativeToolCatalog {
                 serde_json::json!({"type":"object","additionalProperties":false,"required":["operation"],"properties":{"operation":{"type":"string","enum":["status","diff","log","branch_merged","merge_base"]},"base":{"type":"string"},"head":{"type":"string"},"staged":{"type":"boolean"},"limit":{"type":"integer","minimum":1}}}),
             ),
             native_metadata(
+                "native::cd",
+                "Move the session's working directory, so later calls resolve relative paths and run commands there. Accepts a path under the session root, or a worktree this session can reach.",
+                ToolAccess::Write,
+                serde_json::json!({"type":"object","additionalProperties":false,"required":["path"],"properties":{"path":{"type":"string"}}}),
+            ),
+            native_metadata(
+                "native::worktree",
+                "Create a git worktree for this session on a new branch and move the session into it. Branch defaults to the worktree name and start point to HEAD.",
+                ToolAccess::Write,
+                serde_json::json!({"type":"object","additionalProperties":false,"required":["name"],"properties":{"name":{"type":"string"},"branch":{"type":"string"},"start_point":{"type":"string"}}}),
+            ),
+            native_metadata(
                 "native::webfetch",
                 "Fetch an HTTP or HTTPS URL without credentials",
                 ToolAccess::ReadOnly,
@@ -5975,7 +6008,7 @@ impl NativeToolCatalog {
     }
 
     pub fn execute(
-        &self,
+        &mut self,
         name: &str,
         arguments: Value,
         context: &ToolExecutionContext,
@@ -6033,6 +6066,20 @@ impl NativeToolCatalog {
                 self.tools.grep_with_context(input, Some(context))?
             }
             "native::glob" => self.tools.glob(GlobInput::new(string("pattern")?))?,
+            "native::cd" => self.tools.change_directory(Path::new(string("path")?))?,
+            "native::worktree" => {
+                let name = string("name")?;
+                let branch = arguments
+                    .get("branch")
+                    .and_then(Value::as_str)
+                    .unwrap_or(name);
+                let start_point = arguments
+                    .get("start_point")
+                    .and_then(Value::as_str)
+                    .unwrap_or("HEAD");
+
+                self.tools.create_worktree(name, branch, start_point)?
+            }
             "native::git_read" => {
                 let Some(operation) = GitReadOperation::parse(string("operation")?) else {
                     return Ok(ToolOutput::failure("git_read: unknown operation"));
@@ -6870,7 +6917,7 @@ mod native_tool_tests {
     fn bash_rejects_timeout_above_max() {
         let root = project_root();
         let tools = NativeTools::open(&root).unwrap();
-        let catalog = NativeToolCatalog::new(tools);
+        let mut catalog = NativeToolCatalog::new(tools);
         let context = ToolExecutionContext::with_timeout(Duration::from_secs(60));
 
         let result = catalog.execute(
@@ -6890,7 +6937,7 @@ mod native_tool_tests {
     fn bash_accepts_timeout_up_to_max() {
         let root = project_root();
         let tools = NativeTools::open(&root).unwrap();
-        let catalog = NativeToolCatalog::new(tools);
+        let mut catalog = NativeToolCatalog::new(tools);
         let context = ToolExecutionContext::with_timeout(Duration::from_secs(60));
 
         let result = catalog.execute(
@@ -7116,9 +7163,9 @@ mod native_tool_tests {
         )
         .unwrap();
 
-        let catalog = NativeToolCatalog::new(NativeTools::open(&root).unwrap());
+        let mut catalog = NativeToolCatalog::new(NativeTools::open(&root).unwrap());
         let context = ToolExecutionContext::with_timeout(Duration::from_secs(1));
-        let read = |arguments| catalog.execute("native::read", arguments, &context);
+        let mut read = |arguments| catalog.execute("native::read", arguments, &context);
 
         assert_eq!(
             read(serde_json::json!({"path":"AGENTS.md","limit":200}))
