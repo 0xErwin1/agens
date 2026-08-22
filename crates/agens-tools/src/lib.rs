@@ -2308,6 +2308,17 @@ pub trait McpTransport: Send {
         context: &McpOperationContext,
     ) -> Result<(), McpTransportError>;
     fn close(&mut self, context: &McpOperationContext) -> Result<(), McpTransportError>;
+
+    /// Whether this transport can still carry a request.
+    ///
+    /// Answering without a round trip is the point: a per-call ping costs
+    /// every tool call a full exchange, while a transport that owns a process
+    /// or a stream usually knows locally that it is gone. A transport with no
+    /// such signal keeps the default and lets the call itself surface the
+    /// failure, which the caller then recovers from by reconnecting.
+    fn is_alive(&mut self) -> bool {
+        true
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2769,21 +2780,86 @@ impl McpRegistry {
             .cloned()
             .ok_or_else(|| Error::Tool("unknown MCP tool".into()))?;
         let server_name = metadata.server_name.clone();
-        let result = {
-            let client = self
-                .clients
-                .get_mut(&server_name)
-                .ok_or_else(|| Error::Tool("unavailable MCP tool".into()))?;
-            client.call(&metadata.tool_name, arguments, context)
-        };
-        match result {
+
+        // A connection this registry has held since an earlier turn can be
+        // gone without anything having asked it: the process exited, the
+        // stream was retired. Noticing before the call keeps the model from
+        // paying for a round trip that was never going to arrive.
+        if !self.server_is_alive(&server_name) {
+            self.reconnect(&server_name);
+        }
+
+        match self.dispatch(
+            &server_name,
+            &metadata.tool_name,
+            arguments.clone(),
+            context,
+        ) {
             Ok(output) => Ok(output),
             Err(McpTransportError::Cancelled) => Err(Error::Cancelled),
+            Err(error) if is_recoverable_call_failure(&error) => {
+                if !self.reconnect(&server_name) {
+                    // Recorded after the failed reconnect so the status keeps
+                    // the call that actually failed, rather than the connect
+                    // attempt made trying to recover from it.
+                    self.record_runtime_failure(&server_name, &error);
+                    return Err(mcp_call_error(error));
+                }
+                match self.dispatch(&server_name, &metadata.tool_name, arguments, context) {
+                    Ok(output) => Ok(output),
+                    Err(McpTransportError::Cancelled) => Err(Error::Cancelled),
+                    Err(error) => {
+                        self.record_runtime_failure(&server_name, &error);
+                        Err(mcp_call_error(error))
+                    }
+                }
+            }
             Err(error) => {
                 self.record_runtime_failure(&server_name, &error);
                 Err(mcp_call_error(error))
             }
         }
+    }
+
+    fn dispatch(
+        &mut self,
+        server_name: &str,
+        tool_name: &str,
+        arguments: Value,
+        context: &ToolExecutionContext,
+    ) -> Result<ToolOutput, McpTransportError> {
+        let client = self
+            .clients
+            .get_mut(server_name)
+            .ok_or_else(|| McpTransportError::Transport("MCP server is not connected".into()))?;
+        client.call(tool_name, arguments, context)
+    }
+
+    /// Whether this server still holds a connection that can carry a call.
+    ///
+    /// A server with no client at all counts as alive: it has nothing to
+    /// reconnect, and the call fails with `unavailable MCP tool` as before.
+    fn server_is_alive(&mut self, server_name: &str) -> bool {
+        self.clients
+            .get_mut(server_name)
+            .is_none_or(|client| client.is_alive())
+    }
+
+    /// Rebuilds this server's connection in place and reports whether it came
+    /// back.
+    ///
+    /// The dead client is dropped first so `reload_server` never reports the
+    /// failure as `Degraded` on the strength of a connection that no longer
+    /// works, and so a successful reload leaves the status handle at `Ready`
+    /// rather than stranding a server that recovered on a stale error.
+    fn reconnect(&mut self, server_name: &str) -> bool {
+        if self.closed || !self.configured.contains_key(server_name) {
+            return false;
+        }
+        if let Some(mut client) = self.clients.remove(server_name) {
+            client.close();
+        }
+        !self.reload_server(server_name).is_failed()
     }
 
     /// Records a post-discovery liveness failure without treating a tool
@@ -2888,7 +2964,15 @@ impl McpRegistry {
                         message: message.clone(),
                     },
                 );
-                let degraded = self.clients.contains_key(server_name);
+                // A server keeps the tools a successful discovery registered
+                // even once its connection is gone, and those tools are what
+                // `degraded` means: still callable once it reconnects, as
+                // against a server that never got that far.
+                let degraded = self.clients.contains_key(server_name)
+                    || self
+                        .tools
+                        .values()
+                        .any(|tool| tool.server_name == *server_name);
                 let (category, phase) =
                     failure.unwrap_or((McpErrorCategory::Unavailable, McpLoadPhase::Connect));
                 self.status.update(server_name, |status| {
@@ -2922,6 +3006,8 @@ trait McpCallable: Send {
         context: &ToolExecutionContext,
     ) -> Result<ToolOutput, McpTransportError>;
 
+    fn is_alive(&mut self) -> bool;
+
     fn close(&mut self);
 }
 
@@ -2945,6 +3031,10 @@ impl McpTransport for Box<dyn McpTransport> {
     fn close(&mut self, context: &McpOperationContext) -> Result<(), McpTransportError> {
         (**self).close(context)
     }
+
+    fn is_alive(&mut self) -> bool {
+        (**self).is_alive()
+    }
 }
 
 impl<T: McpTransport> McpCallable for McpClient<T> {
@@ -2957,9 +3047,26 @@ impl<T: McpTransport> McpCallable for McpClient<T> {
         self.call_tool_with_context(tool_name, arguments, &context.mcp_context())
     }
 
+    fn is_alive(&mut self) -> bool {
+        self.transport.is_alive()
+    }
+
     fn close(&mut self) {
         Self::close(self);
     }
+}
+
+/// Whether a failed tool call is worth one transparent reconnect.
+///
+/// Only failures of the connection qualify. A protocol error is the server
+/// answering badly, not the connection being gone, and reconnecting would
+/// replay a call that fails the same way. Cancellation and timeouts belong to
+/// the caller's budget, and retrying either would spend it twice.
+fn is_recoverable_call_failure(error: &McpTransportError) -> bool {
+    matches!(
+        error,
+        McpTransportError::Transport(_) | McpTransportError::RetriesExhausted
+    )
 }
 
 fn mcp_call_error(error: McpTransportError) -> Error {

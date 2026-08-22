@@ -29,6 +29,7 @@ struct LocalTransport {
     closed: Arc<AtomicBool>,
     cancelled: Arc<AtomicUsize>,
     delay: Duration,
+    alive: Arc<AtomicBool>,
 }
 
 impl LocalTransport {
@@ -41,6 +42,7 @@ impl LocalTransport {
             closed: Arc::new(AtomicBool::new(false)),
             cancelled: Arc::new(AtomicUsize::new(0)),
             delay: Duration::ZERO,
+            alive: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -81,6 +83,10 @@ impl McpTransport for LocalTransport {
     ) -> Result<(), McpTransportError> {
         self.requests.lock().unwrap().push(request);
         context.check()
+    }
+
+    fn is_alive(&mut self) -> bool {
+        self.alive.load(Ordering::Acquire)
     }
 
     fn close(&mut self, context: &McpOperationContext) -> Result<(), McpTransportError> {
@@ -819,6 +825,7 @@ fn configured_servers_load_lazily_retry_only_on_reload_and_keep_working_tools() 
                         closed: Arc::new(AtomicBool::new(false)),
                         cancelled: Arc::clone(&first_close_count_factory),
                         delay: Duration::ZERO,
+                        alive: Arc::new(AtomicBool::new(true)),
                     };
                     Ok(Box::new(transport) as Box<dyn McpTransport>)
                 }
@@ -837,6 +844,7 @@ fn configured_servers_load_lazily_retry_only_on_reload_and_keep_working_tools() 
                     closed: Arc::new(AtomicBool::new(false)),
                     cancelled: Arc::clone(&replacement_close_count_factory),
                     delay: Duration::ZERO,
+                    alive: Arc::new(AtomicBool::new(true)),
                 }) as Box<dyn McpTransport>),
             },
             timeouts(),

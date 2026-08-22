@@ -68,6 +68,16 @@ fn main() {
         let Some(id) = request.get("id").cloned() else {
             continue;
         };
+        // Crashes on the first tool call of the first process to run, so a
+        // client that rebuilds the connection reaches a server that answers.
+        if mode == "call-crash-once" && request.get("method") == Some(&json!("tools/call")) {
+            let marker = std::env::var_os("FAKE_MCP_CRASH_MARKER")
+                .expect("call-crash-once needs a marker path");
+            if !std::path::Path::new(&marker).exists() {
+                std::fs::write(&marker, "crashed").expect("crash marker should be recorded");
+                std::process::exit(9);
+            }
+        }
         if mode == "crash"
             || (mode == "call-crash" && request.get("method") == Some(&json!("tools/call")))
         {

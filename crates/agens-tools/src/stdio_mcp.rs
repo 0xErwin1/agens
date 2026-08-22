@@ -331,6 +331,24 @@ impl McpTransport for McpStdioTransport {
     fn close(&mut self, _: &McpOperationContext) -> Result<(), McpTransportError> {
         self.terminate()
     }
+
+    /// Answers from what this process already knows: whether the child is
+    /// still running, and whether the stream it speaks over was retired.
+    ///
+    /// No request is sent, so the check costs nothing a caller has to wait
+    /// for. A lock this process cannot take, or a child that has exited,
+    /// both count as gone.
+    fn is_alive(&mut self) -> bool {
+        if self.desynchronized.load(Ordering::Acquire) {
+            return false;
+        }
+        let Ok(mut child) = self.child.lock() else {
+            return false;
+        };
+        child
+            .as_mut()
+            .is_some_and(|child| matches!(child.try_wait(), Ok(None)))
+    }
 }
 
 impl Drop for McpStdioTransport {
