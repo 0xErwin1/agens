@@ -15,8 +15,8 @@ use agens_core::run_introspection::{
 };
 use agens_server::{
     ApiCore, CHECKPOINT_EVENT, CheckpointClaim, Delivery, DeliveryQueue, EventFeed, EventFilter,
-    PortError, Ports, ReportedCheckpoint, RunIntrospection, SchedulerPort, SessionControl,
-    ProvisionedWorktree, RepositoryIdentity, StateMachines, StopScope, Subscription,
+    PortError, Ports, ProvisionedWorktree, ReportedCheckpoint, RepositoryIdentity,
+    RunIntrospection, SchedulerPort, SessionControl, StateMachines, StopScope, Subscription,
     TakeoverHandle, TimerSettings, TimerWheel, WorktreeDerivation, WorktreeGate, WorktreeRequest,
 };
 use agens_store::{ControlPlaneStore, QuestionKind, QuestionState, RunRow, RunState};

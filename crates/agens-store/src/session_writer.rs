@@ -492,10 +492,7 @@ impl SessionStore {
     /// is written by the admission transition, which happens before the worker
     /// has taken its first turn. Every other caller lets
     /// [`Self::begin_session_attempt`] create the row on the way past.
-    pub fn open_session(
-        &mut self,
-        metadata: &SessionMetadata,
-    ) -> Result<i64, SessionStoreError> {
+    pub fn open_session(&mut self, metadata: &SessionMetadata) -> Result<i64, SessionStoreError> {
         validate_attempt_metadata(metadata).map_err(|_| {
             SessionStoreError::operation(
                 "validate session metadata",

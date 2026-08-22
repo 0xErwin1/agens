@@ -30,6 +30,7 @@ mod tui;
 mod tui_tests;
 #[cfg(test)]
 mod turns_tests;
+mod worker;
 
 use tui::run_tui;
 

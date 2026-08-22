@@ -347,10 +347,7 @@ fn the_table_grants_exactly_what_the_design_says_it_grants() {
     // Spelled out rather than derived, so widening anybody's authority has to
     // be written down twice: once in the table and once here.
     const EXPECTED: &[(Operation, &[Principal])] = &[
-        (
-            Operation::CreateRun,
-            &[Principal::User, Principal::Praetor],
-        ),
+        (Operation::CreateRun, &[Principal::User, Principal::Praetor]),
         (Operation::ApprovePlan, &[Principal::User]),
         (
             Operation::AnswerQuestion,

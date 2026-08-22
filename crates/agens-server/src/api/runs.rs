@@ -162,13 +162,7 @@ impl ApiCore {
     /// The journal entry that says the run exists, carrying what a reader
     /// cannot recover from the row: which branch the worktree is on, and
     /// whether the environment it starts in is the declared one.
-    fn journal_creation(
-        &mut self,
-        run_id: i64,
-        branch: &str,
-        hook_failures: &[String],
-        now: i64,
-    ) {
+    fn journal_creation(&mut self, run_id: i64, branch: &str, hook_failures: &[String], now: i64) {
         let payload = serde_json::json!({
             "branch": branch,
             "hook_failures": hook_failures,

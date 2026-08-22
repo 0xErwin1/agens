@@ -36,8 +36,8 @@ pub use authorization::{
 pub use feed::{InboxItem, InboxView, RunSummary, RunView, TreeSnapshot};
 pub use ports::{
     Delivery, DeliveryGrain, DeliveryPayload, DeliveryQueue, EventFeed, EventFilter, PortError,
-    ProvisionedWorktree, RepositoryIdentity, SchedulerPort, SessionControl, StopScope, Subscription,
-    TakeoverHandle, WorktreeDerivation, WorktreeGate, WorktreeRequest,
+    ProvisionedWorktree, RepositoryIdentity, SchedulerPort, SessionControl, StopScope,
+    Subscription, TakeoverHandle, WorktreeDerivation, WorktreeGate, WorktreeRequest,
 };
 pub use runs::{CreateRun, CreatedRun};
 pub use team::{

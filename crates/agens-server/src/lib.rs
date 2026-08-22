@@ -36,7 +36,7 @@ pub use api::{
 };
 pub use blocking::{BlockingBoundary, BlockingError};
 pub use coordinator::{
-    Coordinator, CoordinatorError, CoordinatorSettings, RunLaunch, RunWorkerFactory, unwired_worker,
+    Coordinator, CoordinatorError, CoordinatorSettings, RunLaunch, RunWorkerFactory,
 };
 pub use fsm::{
     AppliedQuestionTransition, AppliedRunTransition, AppliedTransition, AppliedWorktreeTransition,
