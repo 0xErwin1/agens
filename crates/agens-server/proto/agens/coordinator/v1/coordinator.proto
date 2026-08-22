@@ -1,0 +1,299 @@
+syntax = "proto3";
+
+// The coordinator's client wire.
+//
+// Two planes that do not mix. `Team` moves the control plane on the user's
+// authority; `Feed` only reads it. Neither carries an authorization surface of
+// its own: the server's core decides what a principal reaches, and a facade is
+// a transport that picks one.
+//
+// Lifecycle states, event classes and question kinds travel as the strings the
+// control plane already stores them as, rather than as protobuf enums mirroring
+// them. The vocabulary has one definition — the store's — and a second copy on
+// the wire is a copy that can drift out of step with the rows it names.
+//
+// Chat with Praetor is deliberately absent. It is the one operation of the
+// design's Team sketch with nothing behind it yet, and a stub that accepts a
+// stream and answers nothing is a worse contract than an absent method.
+package agens.coordinator.v1;
+
+// One state machine transition, as the caller sees it.
+message Transition {
+  // False when the row already held the state the trigger leads to. Cancelling
+  // twice reports this rather than failing.
+  bool applied = 1;
+  // Empty when nothing was applied.
+  string from = 2;
+  string to = 3;
+}
+
+message Ack {
+  Transition transition = 1;
+}
+
+message ApprovePlanRequest {
+  int64 run_id = 1;
+}
+
+message AnswerQuestionRequest {
+  int64 question_id = 1;
+  string answer = 2;
+}
+
+// A question answered, and the run it unblocked when it blocked one.
+message AnswerAck {
+  int64 run_id = 1;
+  Transition question = 2;
+  // Absent when the run was not parked on this question.
+  Transition run = 3;
+}
+
+message AuthorizeMergeRequest {
+  int64 question_id = 1;
+  // Recorded with the grant: whose authority a merge carried cannot be
+  // reconstructed afterwards.
+  string answer = 2;
+}
+
+message CancelRunRequest {
+  int64 run_id = 1;
+}
+
+message RetryRequest {
+  int64 run_id = 1;
+  string guidance = 2;
+  // How many chargeable attempts this run gets.
+  int64 retry_budget = 3;
+}
+
+message CleaningRequest {
+  int64 run_id = 1;
+  // "reclaim" releases a worktree already shown to be merged; "dispose" throws
+  // away an active one, and only a person's confirmation reaches it.
+  string disposition = 2;
+  // Set only by a client relaying that confirmation.
+  bool confirmed = 3;
+}
+
+message TakeoverRequest {
+  int64 run_id = 1;
+}
+
+// Where the run's live session is.
+//
+// The design sketched this as a stream of session IO. It is a handle instead,
+// because the daemon has no session IO surface to stream yet, and a stream that
+// never yields is a worse contract than a handle that says where to attach.
+message TakeoverResponse {
+  int64 run_id = 1;
+  int64 session_id = 2;
+}
+
+message PauseAdmissionsRequest {
+  bool paused = 1;
+}
+
+message StopRequest {
+  oneof scope {
+    int64 run_id = 1;
+    string repo_id = 2;
+    // Every session on this machine. Set it to true; false names no scope and
+    // is refused.
+    bool machine = 3;
+  }
+}
+
+message AdmissionState {
+  bool paused = 1;
+  bool previously_paused = 2;
+  bool changed = 3;
+}
+
+// The operations that move the control plane.
+service Team {
+  rpc ApprovePlan(ApprovePlanRequest) returns (Ack);
+  rpc AnswerQuestion(AnswerQuestionRequest) returns (AnswerAck);
+  rpc AuthorizeMerge(AuthorizeMergeRequest) returns (Ack);
+  rpc CancelRun(CancelRunRequest) returns (Ack);
+  rpc Retry(RetryRequest) returns (Ack);
+  rpc Cleaning(CleaningRequest) returns (Ack);
+  rpc Takeover(TakeoverRequest) returns (TakeoverResponse);
+  rpc PauseAdmissions(PauseAdmissionsRequest) returns (AdmissionState);
+  rpc Stop(StopRequest) returns (AdmissionState);
+}
+
+// One entry of the coordinator's append-only journal.
+message Event {
+  int64 id = 1;
+  // Absent for a fact that belongs to no run, such as a provider's quota
+  // resetting.
+  optional int64 run_id = 2;
+  string type = 3;
+  // "agent" or "infra".
+  string class = 4;
+  string payload = 5;
+  int64 ts = 6;
+}
+
+// What a subscriber wants to see.
+//
+// The repository is part of the filter because one daemon serves N projects, so
+// an unfiltered stream would carry another repository's runs.
+message EventFilter {
+  optional string repo_id = 1;
+  optional int64 run_id = 2;
+  // Empty means every class.
+  repeated string classes = 3;
+}
+
+message TreeRequest {
+  // Required. One daemon serves N projects, so a tree without a repository
+  // would hand a client another project's runs.
+  string repo_id = 1;
+}
+
+// One run as the tree shows it.
+//
+// Identity here is the project and the branch, never the path: the worktree
+// path is a copyable datum of the detail view, not how a run is recognized.
+message RunSummary {
+  int64 run_id = 1;
+  string task = 2;
+  string state = 3;
+  int64 priority = 4;
+  string provider = 5;
+  optional string worktree_status = 6;
+  optional int64 parent_run_id = 7;
+  // Provenance of an imported task, never followed back to its source.
+  optional string external_ref = 8;
+  int64 created_at = 9;
+}
+
+message TreeSnapshot {
+  string repo_id = 1;
+  repeated RunSummary runs = 2;
+}
+
+message RunDetailRequest {
+  int64 run_id = 1;
+}
+
+message Run {
+  int64 run_id = 1;
+  string repo_id = 2;
+  string repo_root = 3;
+  optional string remote_url = 4;
+  optional string external_ref = 5;
+  optional int64 parent_run_id = 6;
+  string task = 7;
+  string scope = 8;
+  string dod = 9;
+  // JSON array, absent until the first checkpoint carrying a diff freezes it.
+  optional string genesis_paths = 10;
+  string state = 11;
+  int64 priority = 12;
+  optional int64 dep_run_id = 13;
+  string provider = 14;
+  optional int64 budget_tokens = 15;
+  optional string worktree_path = 16;
+  optional string worktree_status = 17;
+  int64 created_at = 18;
+  optional string result = 19;
+}
+
+// One try at a run, with its own cost and duration.
+message Attempt {
+  int64 attempt_id = 1;
+  int64 run_id = 2;
+  int64 n = 3;
+  optional int64 session_id = 4;
+  optional int64 session_attempt_id = 5;
+  int64 started_at = 6;
+  optional int64 ended_at = 7;
+  optional string outcome = 8;
+  optional string retry_trigger = 9;
+  optional int64 tokens = 10;
+  // Cost in millionths of a currency unit, never a float.
+  optional int64 cost_micros = 11;
+}
+
+message Question {
+  int64 question_id = 1;
+  int64 run_id = 2;
+  // "question" or "approval".
+  string kind = 3;
+  string blocked_decision = 4;
+  // JSON array of the options offered.
+  string options = 5;
+  optional string recommendation = 6;
+  optional string answer = 7;
+  optional string author = 8;
+  optional int64 expires_at = 9;
+  // The receipt an approval binds to: the bytes the user approved, not the run.
+  optional string tree_hash = 10;
+  optional string paths_digest = 11;
+  string state = 12;
+  int64 created_at = 13;
+}
+
+message Finding {
+  int64 finding_id = 1;
+  int64 run_id = 2;
+  optional int64 checkpoint_id = 3;
+  string description = 4;
+  // "deterministic", "inferential" or "insufficient". Only the first credits
+  // progress.
+  string evidence_class = 5;
+  // JSON array of references to whatever backs the claim.
+  string proof_refs = 6;
+  string causal_disposition = 7;
+  int64 created_at = 8;
+}
+
+message RunHealth {
+  int64 run_id = 1;
+  optional int64 last_progress_turn = 2;
+  int64 noop_turns = 3;
+  optional string failing_test_signature = 4;
+  int64 tokens_since_progress = 5;
+  int64 updated_at = 6;
+}
+
+message RunView {
+  Run run = 1;
+  repeated Attempt attempts = 2;
+  repeated Question questions = 3;
+  repeated Finding findings = 4;
+  repeated Event events = 5;
+  // Absent until ingest has something to derive it from.
+  optional RunHealth health = 6;
+}
+
+message InboxRequest {
+  string repo_id = 1;
+}
+
+message InboxItem {
+  int64 run_id = 1;
+  int64 question_id = 2;
+  string kind = 3;
+  string blocked_decision = 4;
+  string options = 5;
+  optional string recommendation = 6;
+  optional int64 expires_at = 7;
+  int64 created_at = 8;
+}
+
+message InboxView {
+  string repo_id = 1;
+  repeated InboxItem items = 2;
+}
+
+// The read plane. Nothing here writes, so a reader cannot see a state that
+// never happened and cannot cause one either.
+service Feed {
+  rpc Subscribe(EventFilter) returns (stream Event);
+  rpc Tree(TreeRequest) returns (TreeSnapshot);
+  rpc RunDetail(RunDetailRequest) returns (RunView);
+  rpc Inbox(InboxRequest) returns (InboxView);
+}
