@@ -29,6 +29,7 @@ struct LocalTransport {
     closed: Arc<AtomicBool>,
     cancelled: Arc<AtomicUsize>,
     delay: Duration,
+    alive: Arc<AtomicBool>,
 }
 
 impl LocalTransport {
@@ -41,6 +42,7 @@ impl LocalTransport {
             closed: Arc::new(AtomicBool::new(false)),
             cancelled: Arc::new(AtomicUsize::new(0)),
             delay: Duration::ZERO,
+            alive: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -81,6 +83,10 @@ impl McpTransport for LocalTransport {
     ) -> Result<(), McpTransportError> {
         self.requests.lock().unwrap().push(request);
         context.check()
+    }
+
+    fn is_alive(&mut self) -> bool {
+        self.alive.load(Ordering::Acquire)
     }
 
     fn close(&mut self, context: &McpOperationContext) -> Result<(), McpTransportError> {
@@ -819,6 +825,7 @@ fn configured_servers_load_lazily_retry_only_on_reload_and_keep_working_tools() 
                         closed: Arc::new(AtomicBool::new(false)),
                         cancelled: Arc::clone(&first_close_count_factory),
                         delay: Duration::ZERO,
+                        alive: Arc::new(AtomicBool::new(true)),
                     };
                     Ok(Box::new(transport) as Box<dyn McpTransport>)
                 }
@@ -837,6 +844,7 @@ fn configured_servers_load_lazily_retry_only_on_reload_and_keep_working_tools() 
                     closed: Arc::new(AtomicBool::new(false)),
                     cancelled: Arc::clone(&replacement_close_count_factory),
                     delay: Duration::ZERO,
+                    alive: Arc::new(AtomicBool::new(true)),
                 }) as Box<dyn McpTransport>),
             },
             timeouts(),
@@ -1771,7 +1779,7 @@ fn legacy_sse_transport_bounds_framing_and_waits_interruptibly() {
     let address = listener.local_addr().unwrap();
     let server = thread::spawn(move || {
         let (mut stream, _) = accept_http_request(&listener);
-        let body = vec![b'x'; 1024 * 1024 + 1];
+        let body = vec![b'x'; agens_tools::MAX_MCP_FRAME_BYTES + 1];
         write!(
             stream,
             "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\nevent: message\ndata: "
@@ -1969,7 +1977,7 @@ fn http_transport_retries_only_transient_statuses_and_reports_exhaustion() {
 }
 
 #[test]
-fn http_transport_rejects_responses_larger_than_one_mib() {
+fn http_transport_rejects_responses_larger_than_the_frame_ceiling() {
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let address = listener.local_addr().unwrap();
     let server = thread::spawn(move || {
@@ -1982,7 +1990,7 @@ fn http_transport_rejects_responses_larger_than_one_mib() {
                 break;
             }
         }
-        let body = vec![b'x'; 1024 * 1024 + 1];
+        let body = vec![b'x'; agens_tools::MAX_MCP_FRAME_BYTES + 1];
         write!(
             stream,
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -2150,6 +2158,45 @@ fn http_transport_never_retries_protocol_errors_and_accepts_exactly_one_mib() {
     server.join().unwrap();
 }
 
+/// A streamable-HTTP server may emit notifications on the same response body,
+/// ahead of the answer. Taking the first `data:` line meant a progress
+/// notification broke the very call it was reporting on.
+#[test]
+fn http_transport_reads_past_notifications_ahead_of_the_response() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = accept_http_request(&listener);
+        let mut body =
+            br#"data: {"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info"}}
+"#
+            .to_vec();
+        body.extend_from_slice(
+            br#"data: {"jsonrpc":"2.0","method":"notifications/progress","params":{"progress":1}}
+"#,
+        );
+        body.extend_from_slice(b"data: ");
+        body.extend_from_slice(&initialized_body());
+        body.extend_from_slice(b"\n\n");
+        respond(
+            &mut stream,
+            "200 OK",
+            &body,
+            "Content-Type: text/event-stream\r\n",
+        );
+    });
+    let mut transport =
+        McpHttpTransport::new(format!("http://{address}/mcp"), Default::default(), 0).unwrap();
+
+    let result = transport.execute(
+        McpRequest::Initialize(initialize()),
+        &McpOperationContext::new(Arc::new(AtomicBool::new(false)), Duration::from_secs(2)),
+    );
+
+    assert_eq!(result, Ok(initialized()));
+    server.join().unwrap();
+}
+
 #[test]
 fn http_transport_sends_the_streamable_http_accept_header_on_every_post() {
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -2308,7 +2355,7 @@ fn connect_accepts_any_supported_protocol_version_and_rejects_an_unsupported_one
     }
 
     let transport = LocalTransport::with_responses([Ok(McpResponse::Initialized(
-        McpInitializeResult::new("2024-11-05", json!({"tools": {}})),
+        McpInitializeResult::new("2023-01-01", json!({"tools": {}})),
     ))]);
     let mut client = McpClient::new(transport, timeouts(), limits());
     assert_eq!(

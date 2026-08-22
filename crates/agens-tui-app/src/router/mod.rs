@@ -134,9 +134,21 @@ impl TuiRuntimeRouter {
         let mcp_status = McpStatusHandle::default();
         bootstrap.mcp_status = mcp_status.clone();
 
-        let registry = load_configured_mcp_registry(&bootstrap, project_root);
+        // The same registry every turn discovers through, not a second one.
+        // The router used to build its own, so `/mcp reload` reconnected
+        // servers in a registry no turn ever read and left the reloaded
+        // processes running as duplicates for the life of the app.
+        let registry = bootstrap
+            .mcp_registry
+            .get_or_init(|| load_configured_mcp_registry(&bootstrap, project_root))
+            .unwrap_or_else(|| {
+                Arc::new(Mutex::new(load_configured_mcp_registry(
+                    &bootstrap,
+                    project_root,
+                )))
+            });
         let mcp_runtime = Arc::new(Mutex::new(ProductionMcpRuntime {
-            registry: Arc::new(Mutex::new(registry)),
+            registry,
             dispatcher: Arc::new(Mutex::new(ToolDispatcher::new())),
         }));
         Self {

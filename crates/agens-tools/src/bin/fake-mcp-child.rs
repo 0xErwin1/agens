@@ -68,6 +68,16 @@ fn main() {
         let Some(id) = request.get("id").cloned() else {
             continue;
         };
+        // Crashes on the first tool call of the first process to run, so a
+        // client that rebuilds the connection reaches a server that answers.
+        if mode == "call-crash-once" && request.get("method") == Some(&json!("tools/call")) {
+            let marker = std::env::var_os("FAKE_MCP_CRASH_MARKER")
+                .expect("call-crash-once needs a marker path");
+            if !std::path::Path::new(&marker).exists() {
+                std::fs::write(&marker, "crashed").expect("crash marker should be recorded");
+                std::process::exit(9);
+            }
+        }
         if mode == "crash"
             || (mode == "call-crash" && request.get("method") == Some(&json!("tools/call")))
         {
@@ -104,14 +114,44 @@ fn main() {
             continue;
         }
         if mode == "oversize" {
-            let _ = writeln!(stdout, "{}", "x".repeat(1024 * 1024 + 1));
+            let _ = writeln!(
+                stdout,
+                "{}",
+                "x".repeat(agens_tools::MAX_MCP_FRAME_BYTES + 1)
+            );
             let _ = stdout.flush();
             continue;
         }
         if mode == "unterminated-oversize" {
-            let _ = stdout.write_all(&vec![b'x'; 1024 * 1024 + 1]);
+            let _ = stdout.write_all(&vec![b'x'; agens_tools::MAX_MCP_FRAME_BYTES + 1]);
             let _ = stdout.flush();
             continue;
+        }
+        if mode == "notify" {
+            let _ = writeln!(
+                stdout,
+                "{}",
+                json!({"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info","data":"working"}})
+            );
+            let _ = writeln!(
+                stdout,
+                "{}",
+                json!({"jsonrpc":"2.0","method":"notifications/tools/list_changed"})
+            );
+            // A request the server makes of this client, numbered in the
+            // server's own sequence so it collides with the pending id.
+            let _ = writeln!(
+                stdout,
+                "{}",
+                json!({"jsonrpc":"2.0","id":1,"method":"roots/list","params":{}})
+            );
+            // An answer to a request this client already gave up on.
+            let _ = writeln!(
+                stdout,
+                "{}",
+                json!({"jsonrpc":"2.0","id":0,"result":{"content":[{"type":"text","text":"stale"}]}})
+            );
+            let _ = stdout.flush();
         }
         let response_id = if mode == "id-mismatch" {
             json!(999)
@@ -120,11 +160,16 @@ fn main() {
         };
         let response = match request.get("method").and_then(Value::as_str) {
             Some("initialize") => {
+                let protocol_version = if mode == "legacy-protocol" {
+                    "2024-11-05"
+                } else {
+                    agens_tools::MCP_PROTOCOL_VERSION
+                };
                 json!({
                     "jsonrpc": "2.0",
                     "id": response_id,
                     "result": {
-                        "protocolVersion": agens_tools::MCP_PROTOCOL_VERSION,
+                        "protocolVersion": protocol_version,
                         "capabilities": {"tools": {}},
                     },
                 })
@@ -140,6 +185,25 @@ fn main() {
             }
             Some("tools/list") => {
                 json!({"jsonrpc":"2.0","id":response_id,"result":{"tools":[{"name":"second","description":"Write the fake MCP fixture","inputSchema":{"type":"object"}}]}})
+            }
+            Some("tools/call") if mode == "call-image" => {
+                json!({"jsonrpc":"2.0","id":response_id,"result":{"content":[
+                    {"type":"text","text":"here is the screenshot"},
+                    {"type":"image","data":"aGVsbG8=","mimeType":"image/png"},
+                    {"type":"audio","data":"aGVsbG8=","mimeType":"audio/wav"},
+                    {"type":"resource","resource":{"uri":"file:///a.txt","mimeType":"text/plain","text":"embedded"}},
+                    {"type":"resource","resource":{"uri":"file:///a.bin","mimeType":"application/octet-stream","blob":"aGVsbG8="}}
+                ]}})
+            }
+            Some("tools/call") if mode == "call-structured" => {
+                json!({"jsonrpc":"2.0","id":response_id,"result":{"structuredContent":{"answer":42}}})
+            }
+            Some("tools/call") if mode == "call-empty" => {
+                json!({"jsonrpc":"2.0","id":response_id,"result":{}})
+            }
+            Some("tools/call") if mode == "call-oversize" => {
+                let text = "x".repeat(256 * 1024);
+                json!({"jsonrpc":"2.0","id":response_id,"result":{"content":[{"type":"text","text":text}]}})
             }
             Some("tools/call") if mode == "call-error" => {
                 let text = std::env::var("FAKE_MCP_TOOL_ERROR_SECRET")
