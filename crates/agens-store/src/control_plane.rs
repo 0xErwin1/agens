@@ -439,6 +439,34 @@ pub struct TransitionOutcome {
     pub attempt_id: Option<i64>,
 }
 
+/// Everything one ingested harness fact writes.
+///
+/// The journal entries and the health snapshot they were derived from land
+/// together for the same reason a transition's state change and its events do:
+/// a journal that recorded a fact whose consequence was never applied, or a
+/// health row that moved with nothing behind it, are both worse than the write
+/// being refused.
+pub struct IngestWrite<'a> {
+    pub run_id: i64,
+    pub health: &'a RunHealthRow,
+    /// The JSON array to freeze `runs.genesis_paths` with. The write is
+    /// conditional on the column still being NULL, so the first checkpoint with
+    /// a diff wins and no later one moves it.
+    pub freeze_genesis_paths: Option<&'a str>,
+    pub events: &'a [EventRow],
+}
+
+/// What one ingested fact wrote.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IngestOutcome {
+    /// Journal ids in the order the events were given.
+    pub event_ids: Vec<i64>,
+    /// Whether this write is the one that froze the run's genesis paths. False
+    /// when a freeze was offered and the column already held one, which is a
+    /// no-op rather than a conflict.
+    pub genesis_paths_frozen: bool,
+}
+
 /// The control plane's own connection to the shared `agens.db` file.
 pub struct ControlPlaneStore {
     database_path: PathBuf,
@@ -631,30 +659,9 @@ impl ControlPlaneStore {
     /// snapshot. Derived state has no history worth keeping: it is recomputable
     /// from the journal and the evidence ledger.
     pub fn record_run_health(&mut self, health: &RunHealthRow) -> Result<()> {
-        self.connection
-            .execute(
-                "INSERT INTO run_health (
-                     run_id, last_progress_turn, noop_turns, failing_test_signature,
-                     tokens_since_progress, updated_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                 ON CONFLICT(run_id) DO UPDATE SET
-                     last_progress_turn = excluded.last_progress_turn,
-                     noop_turns = excluded.noop_turns,
-                     failing_test_signature = excluded.failing_test_signature,
-                     tokens_since_progress = excluded.tokens_since_progress,
-                     updated_at = excluded.updated_at",
-                params![
-                    health.run_id,
-                    health.last_progress_turn,
-                    health.noop_turns,
-                    health.failing_test_signature,
-                    health.tokens_since_progress,
-                    health.updated_at,
-                ],
-            )
-            .map_err(|error| {
-                ControlPlaneError::operation("record run health", &self.database_path, error)
-            })?;
+        record_run_health_row(&self.connection, health).map_err(|error| {
+            ControlPlaneError::operation("record run health", &self.database_path, error)
+        })?;
 
         Ok(())
     }
@@ -665,6 +672,84 @@ impl ControlPlaneStore {
             &format!("{RUN_HEALTH_SELECT} WHERE run_id = ?1"),
             params![run_id],
         )
+    }
+
+    /// Every path this run's attempts actually touched, as the harness's
+    /// evidence ledger recorded them, sorted and deduplicated.
+    ///
+    /// A touch is a write or an edit that ran to completion. Reads, searches
+    /// and commands report no filesystem effect, and a failed or denied call
+    /// left none, so none of them can name a path the run is responsible for.
+    ///
+    /// The join is `attempts.session_attempt_id`, which is the only bridge
+    /// between a logical attempt of a run and the physical execution the ledger
+    /// is keyed by.
+    pub fn touched_paths_for_run(&self, run_id: i64) -> Result<Vec<String>> {
+        const OPERATION: &str = "load touched paths";
+
+        let mut prepared = self
+            .connection
+            .prepare(
+                "SELECT DISTINCT facts.path
+                 FROM tool_result_facts AS facts
+                 JOIN attempts ON attempts.session_attempt_id = facts.attempt_id
+                 WHERE attempts.run_id = ?1
+                   AND facts.path IS NOT NULL
+                   AND facts.outcome = 'succeeded'
+                   AND facts.tool IN ('write', 'edit')
+                 ORDER BY facts.path",
+            )
+            .map_err(|error| ControlPlaneError::operation(OPERATION, &self.database_path, error))?;
+
+        let paths = prepared
+            .query_map(params![run_id], |row| row.get::<_, String>(0))
+            .map_err(|error| ControlPlaneError::operation(OPERATION, &self.database_path, error))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|error| ControlPlaneError::operation(OPERATION, &self.database_path, error))?;
+
+        Ok(paths)
+    }
+
+    /// Applies one ingested harness fact: the health snapshot it recomputed,
+    /// the first freeze of the run's genesis paths when this fact is the one
+    /// that earns it, and the journal entries that record the fact and whatever
+    /// the detectors made of it.
+    pub fn apply_ingest(&mut self, write: &IngestWrite<'_>) -> Result<IngestOutcome> {
+        const OPERATION: &str = "apply ingest";
+
+        let path = self.database_path.clone();
+        let failure =
+            |error: rusqlite::Error| ControlPlaneError::operation(OPERATION, &path, error);
+
+        let transaction = self.connection.transaction().map_err(failure)?;
+
+        let genesis_paths_frozen = match write.freeze_genesis_paths {
+            Some(paths) => {
+                transaction
+                    .execute(
+                        "UPDATE runs SET genesis_paths = ?1
+                         WHERE id = ?2 AND genesis_paths IS NULL",
+                        params![paths, write.run_id],
+                    )
+                    .map_err(failure)?
+                    == 1
+            }
+            None => false,
+        };
+
+        record_run_health_row(&transaction, write.health).map_err(failure)?;
+
+        let mut event_ids = Vec::with_capacity(write.events.len());
+        for event in write.events {
+            event_ids.push(append_event_row(&transaction, event).map_err(failure)?);
+        }
+
+        transaction.commit().map_err(failure)?;
+
+        Ok(IngestOutcome {
+            event_ids,
+            genesis_paths_frozen,
+        })
     }
 
     /// Applies one state machine transition: the conditional state changes, the
@@ -858,6 +943,32 @@ fn append_event_row(connection: &Connection, event: &EventRow) -> rusqlite::Resu
     )?;
 
     Ok(connection.last_insert_rowid())
+}
+
+fn record_run_health_row(
+    connection: &Connection,
+    health: &RunHealthRow,
+) -> rusqlite::Result<usize> {
+    connection.execute(
+        "INSERT INTO run_health (
+             run_id, last_progress_turn, noop_turns, failing_test_signature,
+             tokens_since_progress, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(run_id) DO UPDATE SET
+             last_progress_turn = excluded.last_progress_turn,
+             noop_turns = excluded.noop_turns,
+             failing_test_signature = excluded.failing_test_signature,
+             tokens_since_progress = excluded.tokens_since_progress,
+             updated_at = excluded.updated_at",
+        params![
+            health.run_id,
+            health.last_progress_turn,
+            health.noop_turns,
+            health.failing_test_signature,
+            health.tokens_since_progress,
+            health.updated_at,
+        ],
+    )
 }
 
 fn record_provider_row(connection: &Connection, provider: &ProviderRow) -> rusqlite::Result<usize> {
