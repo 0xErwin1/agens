@@ -88,9 +88,15 @@ pub enum RunGuard {
     ReportedByHarness,
     /// The named question belongs to this run and has been answered.
     AnsweredQuestion,
-    /// The provider's recorded reset time has passed. Re-derived from the
-    /// provider row rather than taken from the caller, because the timer wheel
-    /// keeps no state of its own.
+    /// The provider is serving again: either its recorded reset time has
+    /// passed, or the cap has already been lifted. Re-derived from the provider
+    /// row rather than taken from the caller, because the timer wheel keeps no
+    /// state of its own.
+    ///
+    /// The second half is what lets one elapsed reset wake every run parked on
+    /// that provider. The first of them clears the cap as its effect, so a
+    /// guard that only accepted a pending reset time would strand every
+    /// remaining run in `awaiting_quota` with nothing left to wake it.
     QuotaResetElapsed,
     /// Guidance, a worktree still `active`, and retry budget left. The worktree
     /// half is the one that matters: what already landed is not retried, it is
@@ -508,6 +514,7 @@ impl StateMachines {
                 }
             },
             RunGuard::QuotaResetElapsed => match self.store.load_provider(provider)? {
+                Some(row) if row.quota_state == QuotaState::Ok => Ok(()),
                 Some(row) => match row.reset_at {
                     Some(reset_at) if reset_at <= facts.now => Ok(()),
                     Some(reset_at) => refuse(format!(

@@ -1232,3 +1232,61 @@ fn a_run_does_not_resume_on_a_question_that_is_still_open_or_belongs_elsewhere()
 
     fs::remove_dir_all(directory).unwrap();
 }
+
+#[test]
+fn every_run_parked_on_one_provider_wakes_once_its_cap_is_lifted() {
+    let directory = data_directory();
+    let mut store = ControlPlaneStore::open(&directory).unwrap();
+    let first = store
+        .insert_run(&run_in(
+            RunState::AwaitingQuota,
+            Some(WorktreeStatus::Active),
+        ))
+        .unwrap();
+    let second = store
+        .insert_run(&run_in(
+            RunState::AwaitingQuota,
+            Some(WorktreeStatus::Active),
+        ))
+        .unwrap();
+    store
+        .record_provider(&ProviderRow {
+            provider: "anthropic".to_owned(),
+            quota_state: QuotaState::Capped,
+            reset_at: Some(NOW),
+            updated_at: NOW - 3600,
+        })
+        .unwrap();
+    let mut machines = StateMachines::new(store);
+
+    let facts = RunFacts {
+        now: NOW,
+        ..RunFacts::default()
+    };
+
+    machines
+        .apply_run(first, RunTrigger::QuotaReset, &facts)
+        .unwrap();
+
+    assert_eq!(
+        machines
+            .store()
+            .load_provider("anthropic")
+            .unwrap()
+            .unwrap()
+            .reset_at,
+        None,
+        "the first run out lifts the cap, leaving no reset time behind it"
+    );
+
+    machines
+        .apply_run(second, RunTrigger::QuotaReset, &facts)
+        .unwrap();
+
+    assert_eq!(
+        machines.store().load_run(second).unwrap().unwrap().state,
+        RunState::Queued
+    );
+
+    fs::remove_dir_all(directory).unwrap();
+}
