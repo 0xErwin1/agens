@@ -1015,9 +1015,65 @@ async fn read_safe_context_error(
         return Ok(false);
     };
     let error = body.get("error").unwrap_or(&body);
-    Ok(["code", "type"]
+    if ["code", "type"]
         .into_iter()
-        .any(|field| error.get(field).and_then(Value::as_str) == Some("context_length_exceeded")))
+        .filter_map(|field| error.get(field).and_then(Value::as_str))
+        .any(is_context_overflow_code)
+    {
+        return Ok(true);
+    }
+
+    Ok(error
+        .get("message")
+        .and_then(Value::as_str)
+        .is_some_and(is_context_overflow_message))
+}
+
+/// Error codes that name a context overflow exactly.
+///
+/// Matched whole, never as a substring: a provider that answers
+/// `context_length_exceeded_extra` is reporting something else, and treating it
+/// as an overflow would send the runtime compacting a history that was never
+/// too long.
+const CONTEXT_OVERFLOW_CODES: [&str; 3] = [
+    "context_length_exceeded",
+    "request_too_large",
+    "string_above_max_length",
+];
+
+/// Phrases that name a context overflow in prose.
+///
+/// Several providers report the overflow only in the error's message: Anthropic
+/// and Bedrock carry a generic validation code, and Ollama and Gemini carry no
+/// code at all. Matching a single OpenAI code leaves every one of them
+/// classified as a plain rejection, which is the silent failure this list
+/// removes.
+///
+/// Matched against the error object's own `message` field rather than the raw
+/// body, because the body can echo the request that caused it and a prompt
+/// containing one of these phrases would otherwise forge the verdict. The cost
+/// of a false positive is one wasted compaction, not a wrong answer, so the
+/// list errs towards recognising an overflow.
+const CONTEXT_OVERFLOW_MESSAGE_MARKERS: [&str; 8] = [
+    "context length exceeded",
+    "context_length_exceeded",
+    "maximum context length",
+    "input is too long for the model",
+    "prompt is too long",
+    "input exceeds the maximum number of tokens",
+    "input token count exceeds the maximum number of input tokens",
+    "request too large",
+];
+
+fn is_context_overflow_code(value: &str) -> bool {
+    CONTEXT_OVERFLOW_CODES.contains(&value)
+}
+
+fn is_context_overflow_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    CONTEXT_OVERFLOW_MESSAGE_MARKERS
+        .iter()
+        .any(|marker| message.contains(marker))
 }
 
 impl ChatGptResponsesProvider {
@@ -2860,11 +2916,12 @@ async fn read_safe_chatgpt_error(
         .find_map(safe_remote_error))
 }
 
+/// The subscription backend is one known service rather than the open set the
+/// API transport talks to, so its codes stay an exact allowlist and its prose
+/// is never consulted: the body it returns echoes the request, and a prompt is
+/// the one thing that must not be able to decide how a failure is classified.
 fn safe_remote_error(value: &str) -> Option<SafeRemoteError> {
-    match value {
-        "context_length_exceeded" => Some(SafeRemoteError::ContextLengthExceeded),
-        _ => None,
-    }
+    is_context_overflow_code(value).then_some(SafeRemoteError::ContextLengthExceeded)
 }
 
 fn stop_before_mapping(
