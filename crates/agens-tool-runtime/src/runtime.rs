@@ -8,11 +8,12 @@ use std::sync::{Arc, Mutex};
 
 use agens_config::{SubagentSettings, ToolLimitSettings};
 use agens_core::ask_user::{AskUserPort, UnavailableAskUserPort};
+use agens_core::run_introspection::RunIntrospectionPort;
 use agens_providers::OpenAiFunctionTool;
 use agens_tools::{
-    AskUserTool, NativeToolCatalog, NativeTools, SessionWorktrees, SkillCatalog, SkillResourceTool,
-    TaskControlTool, TaskExecutionRegistry, TaskMessageSource, TaskMessageTool, TaskRunner,
-    ToolDispatcher, WorkingDirectory,
+    AskTool, AskUserTool, CheckpointTool, NativeToolCatalog, NativeTools, SessionWorktrees,
+    SkillCatalog, SkillResourceTool, TaskControlTool, TaskExecutionRegistry, TaskMessageSource,
+    TaskMessageTool, TaskRunner, ToolDispatcher, WorkingDirectory,
 };
 
 use crate::mcp::{
@@ -271,6 +272,7 @@ pub fn production_tool_runtime_with_discovery_cancellation<R: TaskRunner>(
         ask_user,
         working_directory,
         discovery_cancellation,
+        None,
     )
 }
 
@@ -300,6 +302,53 @@ pub fn production_tool_runtime_with_parent_task_runner_and_ask_user<R: TaskRunne
         ask_user,
         None,
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        None,
+    )
+}
+
+/// Builds one introspection port per tool that needs one.
+///
+/// A factory rather than a port, because `checkpoint` and `ask` are two tools
+/// and a boxed trait object cannot be handed to both. The daemon's own port is
+/// a handle to the shared state machines plus the run and attempt it is bound
+/// to, so building a second one costs nothing.
+pub type RunIntrospectionFactory = Arc<dyn Fn() -> Box<dyn RunIntrospectionPort> + Send + Sync>;
+
+/// Same as [`production_tool_runtime_with_discovery_cancellation`], plus the
+/// two tools a session executing a coordinator run reports through.
+///
+/// They are registered only when a factory is supplied, and every other caller
+/// supplies none. An ordinary chat has no run to checkpoint against and no run
+/// to park, so offering a model two tools whose every call answers "this
+/// session is not executing a run" would spend context on a surface that
+/// cannot work. That is the opposite of the `ask_user` case, where the tool is
+/// meaningful everywhere and only its surface may be missing.
+#[allow(clippy::too_many_arguments)]
+pub fn production_tool_runtime_with_run_introspection<R: TaskRunner>(
+    bootstrap: &Bootstrap,
+    project_root: &Path,
+    skills: Option<&SkillCatalog>,
+    parent_model: String,
+    parent_request_config: agens_core::RequestConfig,
+    model_resolution_reference: Option<String>,
+    task_runner: R,
+    ask_user: Box<dyn AskUserPort>,
+    working_directory: Option<WorkingDirectory>,
+    discovery_cancellation: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    run_introspection: Option<RunIntrospectionFactory>,
+) -> Result<(Vec<OpenAiFunctionTool>, SharedToolDispatcher), CliError> {
+    production_tool_runtime_inner(
+        bootstrap,
+        project_root,
+        skills,
+        parent_model,
+        parent_request_config,
+        model_resolution_reference,
+        task_runner,
+        ask_user,
+        working_directory,
+        discovery_cancellation,
+        run_introspection,
     )
 }
 
@@ -315,6 +364,7 @@ fn production_tool_runtime_inner<R: TaskRunner>(
     ask_user: Box<dyn AskUserPort>,
     working_directory: Option<WorkingDirectory>,
     discovery_cancellation: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    run_introspection: Option<RunIntrospectionFactory>,
 ) -> Result<(Vec<OpenAiFunctionTool>, SharedToolDispatcher), CliError> {
     agens_callcount::note_tool_runtime_build();
 
@@ -411,6 +461,47 @@ fn production_tool_runtime_inner<R: TaskRunner>(
             AskUserTool::new(ask_user),
         )
         .map_err(|_| CliError::configuration("tool catalog is invalid"))?;
+
+    if let Some(build) = run_introspection {
+        provider_tools.insert(
+            "checkpoint".into(),
+            OpenAiFunctionTool::new(
+                "checkpoint",
+                // The tool's description IS the worker's instruction about what
+                // a checkpoint costs. Carrying it here rather than only in a
+                // system prompt puts it beside the schema it describes, and in
+                // front of the one reader who has to act on it.
+                agens_core::run_introspection::WORKER_CHECKPOINT_PROMPT,
+                CheckpointTool::input_schema(),
+            )
+            .map_err(|_| CliError::configuration("checkpoint tool is unavailable"))?,
+        );
+        dispatcher
+            .register_native(
+                "native::checkpoint",
+                agens_core::ToolAccess::Write,
+                CheckpointTool::new(build()),
+            )
+            .map_err(|_| CliError::configuration("tool catalog is invalid"))?;
+
+        provider_tools.insert(
+            "ask".into(),
+            OpenAiFunctionTool::new(
+                "ask",
+                "Raise the one decision this run cannot make on its own, with the options it is \
+                 choosing between. The run parks until the question is answered",
+                AskTool::input_schema(),
+            )
+            .map_err(|_| CliError::configuration("ask tool is unavailable"))?,
+        );
+        dispatcher
+            .register_native(
+                "native::ask",
+                agens_core::ToolAccess::Write,
+                AskTool::new(build()),
+            )
+            .map_err(|_| CliError::configuration("tool catalog is invalid"))?;
+    }
 
     register_production_task_tool(
         bootstrap,

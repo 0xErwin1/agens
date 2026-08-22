@@ -1952,6 +1952,27 @@ const TOOL_SURFACE: &[SurfaceEntry] = &[
         unbound: None,
         matched_as: None,
     },
+    // The two introspection tools are named by nothing but themselves: a
+    // checkpoint's claims and a question's options are content, not a target a
+    // rule could usefully match, so both are decided on the tool name alone.
+    SurfaceEntry {
+        tool: "native::checkpoint",
+        returns_file_contents: false,
+        decided_on_its_target: false,
+        decided_per_file: None,
+        partly_reached: None,
+        unbound: None,
+        matched_as: None,
+    },
+    SurfaceEntry {
+        tool: "native::ask",
+        returns_file_contents: false,
+        decided_on_its_target: false,
+        decided_per_file: None,
+        partly_reached: None,
+        unbound: None,
+        matched_as: None,
+    },
     // Registered directly on the primary path, beside the catalog rather than
     // out of it.
     SurfaceEntry {
@@ -2050,6 +2071,40 @@ fn registered_parent_natives(label: &str, agents: &[(&str, &str)]) -> Vec<String
         &project_root,
         Some(&agens_tools::SkillCatalog::default()),
         InertTaskRunner,
+    )
+    .expect("the parent runtime must build");
+
+    let registered = sorted_native_names(&[parent]);
+    fs::remove_dir_all(temporary).unwrap();
+
+    registered
+}
+
+/// The parent's natives when the session is executing a coordinator run.
+///
+/// The two introspection tools are registered only for such a session, so the
+/// surface every list is resolved against has to include one that is. Without
+/// this the pair would be absent from the probe, and a rule naming `checkpoint`
+/// or `ask` would read as enforced while matching no dispatcher identity.
+fn registered_parent_natives_executing_a_run() -> Vec<String> {
+    let temporary = agens_fixtures::session_directory("registered-native-surface-run");
+    let bootstrap = agens_fixtures::session_bootstrap(&temporary, &[]);
+    let project_root = agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap);
+
+    let (_, parent) = agens_tool_runtime::runtime::production_tool_runtime_with_run_introspection(
+        &bootstrap,
+        &project_root,
+        Some(&agens_tools::SkillCatalog::default()),
+        "gpt-5.5".to_owned(),
+        agens_core::RequestConfig::default(),
+        None,
+        InertTaskRunner,
+        Box::new(agens_core::ask_user::UnavailableAskUserPort),
+        None,
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        Some(Arc::new(|| {
+            Box::new(agens_core::run_introspection::UnavailableRunIntrospectionPort)
+        })),
     )
     .expect("the parent runtime must build");
 
@@ -2166,6 +2221,7 @@ fn registered_native_surface() -> Vec<String> {
             "registered-native-surface-no-subagent",
             &AGENTS_WITHOUT_A_SUBAGENT,
         ))
+        .chain(registered_parent_natives_executing_a_run())
         .chain(registered_child_natives())
         .collect::<Vec<_>>();
     registered.sort_unstable();
@@ -2227,7 +2283,7 @@ fn every_native_registered_beside_the_catalog_is_named_by_the_list_that_resolves
 /// The access class each native registered beside the catalog is registered
 /// under, and what that class decides.
 ///
-/// These five have no catalog entry to be compared against: each declares its
+/// These seven have no catalog entry to be compared against: each declares its
 /// access at its own registration site, and until it is written down somewhere
 /// that declaration answers to nothing.
 ///
@@ -2247,13 +2303,20 @@ fn every_native_registered_beside_the_catalog_is_named_by_the_list_that_resolves
 /// own rules leave reachable, so eight at most and six at least. It excludes
 /// `native::webfetch` precisely because that tool is `ReadOnly` and the class
 /// is the wrong predicate for it.
-const ACCESS_OF_THE_NATIVES_REGISTERED_BESIDE_THE_CATALOG: [(&str, ToolAccess); 5] = [
+const ACCESS_OF_THE_NATIVES_REGISTERED_BESIDE_THE_CATALOG: [(&str, ToolAccess); 7] = [
+    // Files a durable question against the run and parks it. It writes control
+    // plane rows and suspends a session, which is as far from read-only as a
+    // tool gets, and chat mode has no run to park in the first place.
+    ("native::ask", ToolAccess::Write),
     // Puts a question on an interactive surface and returns the answer given
     // there, touching neither the worktree nor the network. The class is
     // load-bearing rather than incidental: a chat-mode turn is exactly the turn
     // that has to be able to ask, and `Write` would have the hard-safety
     // predicate refuse it there above every rule.
     ("native::ask_user", ToolAccess::ReadOnly),
+    // Writes a journal entry and a finding per claim. Nothing it writes is in
+    // the project, but it is durable state the run is measured on.
+    ("native::checkpoint", ToolAccess::Write),
     // Returns a skill's own installed files and changes nothing.
     ("native::skill", ToolAccess::ReadOnly),
     // Runs a whole turn on a surface of its own, whose calls write; a class
@@ -3563,13 +3626,27 @@ fn production_parent_natives() -> &'static [(String, ToolAccess)] {
         let bootstrap = agens_fixtures::session_bootstrap(&temporary, &[]);
         let project_root = agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap);
 
-        let (_, parent) = agens_tool_runtime::runtime::production_tool_runtime_with_task_runner(
-            &bootstrap,
-            &project_root,
-            Some(&agens_tools::SkillCatalog::default()),
-            InertTaskRunner,
-        )
-        .expect("the parent runtime must build");
+        // Built as a session executing a coordinator run, because the probe
+        // has to mirror the widest surface production registers: the two
+        // introspection tools are absent from every other configuration, and a
+        // probe without them would classify a surface no session has.
+        let (_, parent) =
+            agens_tool_runtime::runtime::production_tool_runtime_with_run_introspection(
+                &bootstrap,
+                &project_root,
+                Some(&agens_tools::SkillCatalog::default()),
+                "gpt-5.5".to_owned(),
+                agens_core::RequestConfig::default(),
+                None,
+                InertTaskRunner,
+                Box::new(agens_core::ask_user::UnavailableAskUserPort),
+                None,
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                Some(Arc::new(|| {
+                    Box::new(agens_core::run_introspection::UnavailableRunIntrospectionPort)
+                })),
+            )
+            .expect("the parent runtime must build");
 
         let parent = parent.lock().expect("dispatcher must be available");
         let mut surface = parent

@@ -81,6 +81,15 @@ impl ChildSurfaceRejection {
 /// subagent that hits a real fork in the work has the same standing to ask the
 /// person as the thread that delegated to it. Withholding it did not make a
 /// child safer, it made it guess.
+///
+/// [`agens_tools::RUN_AUTHORITY_NATIVE_TOOLS`] are deliberately absent, and
+/// `native::ask` is the one to be careful about: it is a different tool from
+/// `native::ask_user` despite the name. `ask_user` puts a question on a
+/// surface a person is already watching and returns their answer to the caller
+/// that asked. `ask` files a durable question against the coordinator's run and
+/// parks that run until somebody answers. A child holding the first is a child
+/// that can stop guessing; a child holding the second could suspend a session
+/// it does not own.
 pub const CHILD_NON_CATALOG_TOOLS: [&str; 4] = [
     "native::ask_user",
     "native::skill",
@@ -374,6 +383,53 @@ mod tests {
 
         for tool in agens_tools::SESSION_SCOPED_NATIVE_TOOLS {
             assert!(!tool_names(&surface).contains(&tool.to_owned()));
+        }
+    }
+
+    /// Speaking for the run is the run-owning session's alone, by the same
+    /// mechanism: absent from the surface, so no declaration can name it and no
+    /// child runtime registers it.
+    #[test]
+    fn a_child_never_holds_the_tools_that_speak_for_the_run() {
+        let surface = resolve_child_surface(&[], &[], &[]).unwrap();
+
+        for tool in agens_tools::RUN_AUTHORITY_NATIVE_TOOLS {
+            assert!(
+                !tool_names(&surface).contains(&tool.to_owned()),
+                "{tool} reached a delegated child's catalog"
+            );
+            assert!(
+                !CHILD_NON_CATALOG_TOOLS.contains(&tool),
+                "{tool} is registered beside the catalog for a child"
+            );
+        }
+    }
+
+    /// The one that is easy to get wrong: `ask_user` and `ask` are different
+    /// tools, and only the first is a child's.
+    #[test]
+    fn a_child_keeps_ask_user_while_losing_ask() {
+        let surface = resolve_child_surface(&[], &[], &[]).unwrap();
+
+        assert!(surface.coordination_tools.contains(&"native::ask_user"));
+        assert!(!surface.coordination_tools.contains(&"native::ask"));
+    }
+
+    /// A declaration cannot reopen what the surface never offered: the rejection
+    /// is a hard error rather than a clamp, so an agent definition asking for
+    /// `ask` fails loudly instead of running without it.
+    #[test]
+    fn a_declaration_cannot_grant_a_child_the_tools_that_speak_for_the_run() {
+        for tool in ["checkpoint", "ask"] {
+            let rejection =
+                resolve_child_surface(&[], &[rule(PermissionDecision::Allow, tool)], &[])
+                    .unwrap_err();
+
+            assert_eq!(
+                rejection.reason,
+                TaskDeclarationRejection::ExceedsParentSurface,
+                "{tool} was granted to a child by declaration"
+            );
         }
     }
 
