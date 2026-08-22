@@ -709,7 +709,7 @@ fn receipt_holds(frozen: &Receipt, derived: &Receipt, merged: bool) -> bool {
 }
 
 /// The receipt a derivation implies.
-fn receipt_of(derivation: &GateDerivation) -> Receipt {
+pub(crate) fn receipt_of(derivation: &GateDerivation) -> Receipt {
     Receipt {
         tree_hash: derivation.head_tree.clone(),
         paths_digest: paths_digest(&derivation.changed_paths),

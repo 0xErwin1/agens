@@ -13,6 +13,7 @@ pub mod grpc;
 mod ingest;
 mod instance;
 mod introspection;
+mod ports;
 mod scheduler;
 mod sessions;
 mod timers;
@@ -53,6 +54,9 @@ pub use ingest::{
 };
 pub use instance::{ServeInstance, ServeInstanceError};
 pub use introspection::{Clock, RunIntrospection};
+pub use ports::{
+    Admissions, GitWorktreeGate, JournalFeed, RunDeliveries, SupervisedSessions, run_mailbox,
+};
 pub use scheduler::{
     Admission, AdmissionFailure, Candidate, Deferral, Ineligible, LaunchError, LaunchedSession,
     PendingRun, Queue, QueueReport, RunLauncher, RunSession, Scheduler, SchedulerError,

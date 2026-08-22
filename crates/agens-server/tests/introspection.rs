@@ -496,7 +496,12 @@ fn ask_opens_a_durable_question_and_parks_the_run_on_it() {
         ])
     );
     assert_eq!(
-        core.machines().store().load_run(run_id).unwrap().unwrap().state,
+        core.machines()
+            .store()
+            .load_run(run_id)
+            .unwrap()
+            .unwrap()
+            .state,
         RunState::AwaitingInput
     );
     assert_eq!(
@@ -542,10 +547,21 @@ fn a_refused_ask_writes_no_question() {
             .is_empty()
     );
     assert_eq!(
-        core.machines().store().load_run(run_id).unwrap().unwrap().state,
+        core.machines()
+            .store()
+            .load_run(run_id)
+            .unwrap()
+            .unwrap()
+            .state,
         RunState::Queued
     );
-    assert!(core.machines().store().events_for_run(run_id).unwrap().is_empty());
+    assert!(
+        core.machines()
+            .store()
+            .events_for_run(run_id)
+            .unwrap()
+            .is_empty()
+    );
 
     drop(core);
     fs::remove_dir_all(directory).unwrap();
