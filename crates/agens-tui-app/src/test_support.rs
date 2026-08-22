@@ -519,7 +519,7 @@ pub fn tui_session_bootstrap_with_global_bypass(temporary: &Path, enabled: bool)
     files.insert(
         config_home.join("config.toml"),
         format!(
-            "[provider]\ntype = \"openai-api\"\nmodel = \"gpt-4.1\"\n\n[options]\ndata_dir = \"{}\"\n\n[agent]\nbypass_permission_prompts = {enabled}\n",
+            "[provider]\nmodel = \"openai-api/gpt-4.1\"\n\n[options]\ndata_dir = \"{}\"\n\n[agent]\nbypass_permission_prompts = {enabled}\n",
             temporary.join("data").display()
         ),
     );

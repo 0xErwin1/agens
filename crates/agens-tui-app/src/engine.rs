@@ -942,9 +942,8 @@ mod tests {
         let bootstrap = bootstrap_from_configuration(
             label,
             Some(
-                "[provider]\ntype = \"openai-chatgpt\"\n\
-                 [agent]\ndefault_agent = \"primary\"\n\
-                 [agents.primary]\nmodel = \"gpt-5.6-sol\"\neffort = \"high\"\n",
+                "[agent]\ndefault_agent = \"primary\"\n\
+                 [agents.primary]\nmodel = \"openai-chatgpt/gpt-5.6-sol\"\neffort = \"high\"\n",
             ),
             None,
         );
@@ -980,9 +979,8 @@ mod tests {
         let bootstrap = bootstrap_from_configuration(
             label,
             Some(
-                "[provider]\ntype = \"openai-chatgpt\"\n\
-                 [agent]\ndefault_agent = \"primary\"\n\
-                 [agents.primary]\nmodel = \"gpt-5.6-sol\"\neffort = \"high\"\n",
+                "[agent]\ndefault_agent = \"primary\"\n\
+                 [agents.primary]\nmodel = \"openai-chatgpt/gpt-5.6-sol\"\neffort = \"high\"\n",
             ),
             None,
         );

@@ -1,19 +1,21 @@
 //! Connecting, disconnecting and reconciling the provider a session speaks
 //! through.
 
-use agens_session::model::{effective_model, resolved_provider};
-use std::fs;
+use agens_session::model::{configured_provider, effective_model, resolved_provider};
 
 use agens_core::{HeadlessTurnCancellation, HeadlessTurnError};
 use agens_providers::chatgpt_login::LoginCancellation;
 use agens_tui::TuiRouteProgress;
 
-use crate::models::{apply_tui_model, apply_tui_selection};
+use crate::models::{apply_tui_model, apply_tui_selection, select_tui_model};
 use agens_auth::{ChatGptAuthFlow, ChatGptAuthProgress};
-use agens_bootstrap::{Bootstrap, ProviderSource, resolve_provider_type};
+use agens_bootstrap::Bootstrap;
 use agens_error::CliError;
 use agens_models::ModelSelection;
-use agens_session::provider::{ProviderKind, snapshot_chatgpt_credentials};
+use agens_session::provider::{
+    ProviderKind, bootstrap_authentication, resolve_provider_for_model,
+    snapshot_chatgpt_credentials,
+};
 
 use super::{AuthRouteError, TuiRuntimeRouter};
 
@@ -107,33 +109,43 @@ impl TuiRuntimeRouter {
         }
     }
 
+    /// Realigns the session's provider after signing in to or out of ChatGPT.
+    ///
+    /// Signing in reaches a provider, it does not choose one: a session already
+    /// speaking through a provider it or its configuration named keeps it.
+    /// Signing out only invalidates ChatGPT, so a session on ChatGPT has to fall
+    /// back to whatever the configured model resolves to without it.
     pub(super) fn reconcile_provider(&self, connected: bool) -> Result<(), CliError> {
         let bootstrap = self.bootstrap()?;
-        match bootstrap.provider_source {
-            ProviderSource::Auto => {
-                let provider = if connected {
-                    "openai-chatgpt".to_owned()
-                } else {
-                    let credentials = fs::read_to_string(&bootstrap.paths.credentials).ok();
-                    resolve_provider_type(
-                        None,
-                        credentials.as_deref(),
-                        &(self.credentials.environment)(),
-                    )?
-                    .ok_or_else(|| {
-                        CliError::authentication(
-                            "ChatGPT credentials are unavailable; run /connect",
-                        )
-                    })?
-                };
-                self.apply_provider(&bootstrap, &provider)?;
+        let session_provider = self
+            .session
+            .lock()
+            .map_err(|_| CliError::storage("TUI session is unavailable"))?
+            .provider;
+
+        let named = session_provider
+            .or_else(|| configured_provider(&bootstrap))
+            .filter(|provider| connected || *provider != ProviderKind::OpenAiChatGpt);
+
+        let provider = match named {
+            Some(named) => named,
+            None if connected => ProviderKind::OpenAiChatGpt,
+            None => {
+                match resolve_provider_for_model(
+                    bootstrap.model(),
+                    &bootstrap_authentication(&bootstrap),
+                ) {
+                    Ok(resolved) => resolved.provider,
+                    // Signing out worked; there is simply nothing left to speak
+                    // through. The session records that rather than failing the
+                    // command, and the next turn reports it where it can be
+                    // acted on.
+                    Err(_) => return self.mark_chatgpt_unavailable(),
+                }
             }
-            ProviderSource::ExplicitChatGpt if connected => {
-                self.apply_provider(&bootstrap, "openai-chatgpt")?;
-            }
-            ProviderSource::ExplicitChatGpt => self.mark_chatgpt_unavailable()?,
-            ProviderSource::ExplicitOther => {}
-        }
+        };
+
+        self.apply_provider(&bootstrap, provider.identifier())?;
         Ok(())
     }
 
@@ -146,6 +158,29 @@ impl TuiRuntimeRouter {
         context.chatgpt_unavailable = true;
         context.active_agent = None;
         Ok(())
+    }
+
+    /// `/model <identifier>`, where the identifier may name its own provider.
+    ///
+    /// A prefix routes through the provider switch rather than straight to the
+    /// selection, so naming another provider's model goes through the same
+    /// credential check the picker does instead of around it.
+    pub(super) fn select_model_command(
+        &self,
+        bootstrap: &Bootstrap,
+        command: &str,
+    ) -> Result<String, CliError> {
+        let requested = command.strip_prefix("/model").unwrap_or_default().trim();
+        let named = requested
+            .split_once('/')
+            .and_then(|(prefix, model)| Some((ProviderKind::parse(prefix)?, model)));
+
+        match named {
+            Some((provider, model)) => {
+                self.apply_provider_model(bootstrap, provider.identifier(), model)
+            }
+            None => select_tui_model(bootstrap, command, &self.session),
+        }
     }
 
     /// Selects a model that may belong to a provider other than the active one.

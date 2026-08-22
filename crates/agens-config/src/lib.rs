@@ -440,16 +440,10 @@ pub const SETTINGS: &[SettingSpec] = &[
         doc: "Directory holding sessions and permission grants.",
     },
     SettingSpec {
-        path: "provider.type",
-        kind: UNBOUNDED_TEXT,
-        default: SettingValue::Absent,
-        doc: "Provider to use; resolved from credentials when absent.",
-    },
-    SettingSpec {
         path: "provider.model",
         kind: UNBOUNDED_TEXT,
         default: SettingValue::Absent,
-        doc: "Model identifier requested from the provider.",
+        doc: "Model to request, optionally qualified as \"provider/model\".",
     },
     SettingSpec {
         path: "provider.base_url",
@@ -616,6 +610,19 @@ pub const SETTINGS: &[SettingSpec] = &[
 pub struct ConfigValidationError {
     field: String,
     detail: Option<String>,
+    /// Whether this rejection is a key the catalog used to hold.
+    ///
+    /// Its field and detail are catalog constants rather than anything the
+    /// document carried, so a caller that otherwise reduces a validation failure
+    /// to "configuration is invalid" can repeat this one verbatim: an existing
+    /// configuration cannot act on a rejection that never names the key.
+    retired: bool,
+}
+
+impl ConfigValidationError {
+    pub const fn retired(&self) -> bool {
+        self.retired
+    }
 }
 
 impl fmt::Display for ConfigValidationError {
@@ -902,6 +909,8 @@ pub fn starter_document() -> String {
 }
 
 pub fn validate_toml_document(document: &toml::Table) -> Result<(), ConfigValidationError> {
+    reject_retired_settings(document)?;
+
     let mut root_tables = catalog_tables();
     root_tables.extend_from_slice(&["agents", "mcp", "permissions"]);
     reject_unknown_fields(document, "", &root_tables)?;
@@ -922,6 +931,31 @@ pub fn validate_toml_document(document: &toml::Table) -> Result<(), ConfigValida
     )?;
     agent_profiles::validate_agent_profiles(document)?;
     validate_mcp(document)
+}
+
+/// Keys the catalog used to hold, rejected by name so an existing file gets the
+/// replacement instead of an anonymous "unknown field".
+const RETIRED_SETTINGS: [(&str, &str, &str); 1] = [(
+    "provider",
+    "type",
+    "the provider now comes from the model; qualify provider.model as \"provider/model\"",
+)];
+
+fn reject_retired_settings(document: &toml::Table) -> Result<(), ConfigValidationError> {
+    for (table, field, replacement) in RETIRED_SETTINGS {
+        let present = document
+            .get(table)
+            .and_then(toml::Value::as_table)
+            .is_some_and(|values| values.contains_key(field));
+
+        if present {
+            let mut error = invalid_field_with_detail(table, field, replacement);
+            error.retired = true;
+            return Err(error);
+        }
+    }
+
+    Ok(())
 }
 
 fn catalog_tables() -> Vec<&'static str> {
@@ -1515,6 +1549,7 @@ fn invalid_field(path: &str, field: &str) -> ConfigValidationError {
     ConfigValidationError {
         field,
         detail: None,
+        retired: false,
     }
 }
 

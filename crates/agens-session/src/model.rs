@@ -4,10 +4,10 @@
 //! the answer: a headless turn and a rendered header ask the same question.
 
 use agens_bootstrap::Bootstrap;
-use agens_models::{ModelSelection, ModelSource};
+use agens_models::{ModelSelection, ModelSource, QualifiedModel};
 
 use crate::context::SessionContext;
-use crate::provider::ProviderKind;
+use crate::provider::{ProviderKind, bootstrap_authentication, resolve_provider_for_model};
 
 pub fn current_provider(bootstrap: &Bootstrap, context: &SessionContext) -> Option<ProviderKind> {
     if context.chatgpt_unavailable {
@@ -22,9 +22,18 @@ pub fn current_provider(bootstrap: &Bootstrap, context: &SessionContext) -> Opti
     {
         return None;
     }
-    context
-        .provider
-        .or_else(|| bootstrap.provider_type().and_then(ProviderKind::parse))
+    context.provider.or_else(|| configured_provider(bootstrap))
+}
+
+/// The provider the run's own configured model resolves to, for a session that
+/// has not named one of its own yet.
+///
+/// Nothing declares a provider any more, so this is the only thing left that can
+/// say which one a fresh session starts on.
+pub fn configured_provider(bootstrap: &Bootstrap) -> Option<ProviderKind> {
+    resolve_provider_for_model(bootstrap.model(), &bootstrap_authentication(bootstrap))
+        .ok()
+        .map(|resolved| resolved.provider)
 }
 
 /// The provider a session falls back to once [`current_provider`] declines to
@@ -34,7 +43,16 @@ pub fn resolved_provider(bootstrap: &Bootstrap, context: &SessionContext) -> Pro
     current_provider(bootstrap, context).unwrap_or(ProviderKind::OpenAiApi)
 }
 
+/// The bare model identifier this session speaks through.
+///
+/// Bare, not qualified: the provider is answered by [`current_provider`], and
+/// everything downstream — the provider's own API, a catalog lookup, a rendered
+/// header — wants the identifier without a prefix in front of it.
 pub fn effective_model(bootstrap: &Bootstrap, context: &SessionContext) -> String {
+    let configured = bootstrap
+        .model()
+        .and_then(|model| QualifiedModel::parse(model).ok());
+
     context
         .selection
         .as_ref()
@@ -45,7 +63,7 @@ pub fn effective_model(bootstrap: &Bootstrap, context: &SessionContext) -> Strin
                 .as_ref()
                 .and_then(|metadata| metadata.model_id.as_deref())
         })
-        .or_else(|| bootstrap.model())
+        .or_else(|| configured.as_ref().map(QualifiedModel::model))
         .unwrap_or_else(|| resolved_provider(bootstrap, context).default_model())
         .to_owned()
 }

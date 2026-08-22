@@ -7,7 +7,7 @@ use agens_tui::{TuiPresentation, TuiRouteCancellation, TuiSubmissionOutcome};
 
 use crate::engine::{seed_fresh_tui_context, write_through_bypass_permission_prompts};
 use crate::files::{ingest_tui_media_path, resolve_attach_path};
-use crate::models::{select_tui_effort, select_tui_model};
+use crate::models::select_tui_effort;
 use crate::resume::{commit_tui_session_resume, resume_tui_session};
 use crate::turn::tui_session_presentation;
 use crate::undo::{
@@ -16,6 +16,7 @@ use crate::undo::{
 use agens_agents::select_subagent;
 use agens_bootstrap::Bootstrap;
 use agens_error::{CliError, ExitStatus};
+use agens_models::QualifiedModel;
 use agens_session::context::reset_session;
 use agens_session::provider::ProviderKind;
 use agens_session::undo::{
@@ -165,7 +166,7 @@ impl TuiRuntimeRouter {
             "/subagents" => TuiSubmissionOutcome::TranscriptDialog,
             "/model" => self.open_dialog("model")?,
             command if command.starts_with("/model ") => TuiSubmissionOutcome::ContextChanged {
-                message: select_tui_model(&bootstrap, command, &self.session)?,
+                message: self.select_model_command(&bootstrap, command)?,
                 presentation: self.presentation()?,
             },
             "/effort" => self.open_dialog("effort")?,
@@ -420,13 +421,36 @@ impl TuiRuntimeRouter {
         }
         let provider = current_provider(&bootstrap, &context)
             .ok_or_else(|| CliError::configuration("TUI provider is unavailable"))?;
-        if let Some(selection) = &context.selection {
-            bootstrap.model = Some(selection.model().to_owned());
-        }
+        let selected = context
+            .selection
+            .as_ref()
+            .map(|selection| selection.model().to_owned());
         drop(context);
 
-        bootstrap.provider_type = Some(provider.identifier().into());
-        bootstrap.api_key = match provider {
+        // The model is the only carrier of provider identity a turn resolves
+        // from, so the session's own choice has to travel qualified: a bare
+        // identifier two authenticated providers serve would be rejected as
+        // ambiguous even though the session already knows which one it means.
+        let model = selected
+            .or_else(|| {
+                bootstrap
+                    .model()
+                    .and_then(|model| QualifiedModel::parse(model).ok())
+                    // A configured model belonging to another provider says
+                    // nothing about what this one serves, so the session falls
+                    // back to that provider's default instead of asking it for
+                    // an identifier out of someone else's catalog.
+                    .filter(|parsed| {
+                        parsed
+                            .source()
+                            .is_none_or(|source| ProviderKind::for_source(source) == provider)
+                    })
+                    .map(|parsed| parsed.model().to_owned())
+            })
+            .unwrap_or_else(|| provider.default_model().to_owned());
+        bootstrap.model = Some(format!("{}/{model}", provider.identifier()));
+
+        match provider {
             ProviderKind::OpenAiChatGpt => {
                 if !self
                     .credentials
@@ -437,19 +461,21 @@ impl TuiRuntimeRouter {
                         "ChatGPT credentials are unavailable or invalid; run /connect",
                     ));
                 }
-                None
             }
-            ProviderKind::OpenAiApi | ProviderKind::Moonshot => Some(
-                self.credentials
+            ProviderKind::OpenAiApi | ProviderKind::Moonshot => {
+                if self
+                    .credentials
                     .provider_api_key(&bootstrap.paths.credentials, provider)
-                    .ok_or_else(|| {
-                        CliError::authentication(format!(
-                            "{} authentication is unavailable",
-                            provider.label()
-                        ))
-                    })?,
-            ),
-        };
+                    .is_none()
+                {
+                    return Err(CliError::authentication(format!(
+                        "{} authentication is unavailable",
+                        provider.label()
+                    )));
+                }
+            }
+        }
+
         Ok(bootstrap)
     }
 

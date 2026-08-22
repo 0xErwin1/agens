@@ -14,9 +14,9 @@ debug = true
 # data_dir = "${XDG_DATA_HOME:-~/.local/share}/agens"
 
 [provider]
-# Use "openai-api" instead when authenticating with OPENAI_API_KEY.
-type = "openai-chatgpt"
-model = "gpt-5.5"
+# The prefix names the provider. A bare "gpt-5.5" works too, but only while
+# exactly one authenticated provider serves it.
+model = "openai-chatgpt/gpt-5.5"
 # base_url = "https://api.openai.com/v1"
 
 [agent]

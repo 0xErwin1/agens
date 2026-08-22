@@ -24,19 +24,11 @@ use agens_tools::{McpStatusHandle, McpStdioTransport, McpStdioTransportConfig};
 
 use agens_error::CliError;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum ProviderSource {
-    Auto,
-    ExplicitChatGpt,
-    ExplicitOther,
-}
 pub struct Bootstrap {
     pub paths: ConfigPaths,
     pub global_loaded: bool,
     pub project_loaded: bool,
     pub model: Option<String>,
-    pub provider_type: Option<String>,
-    pub provider_source: ProviderSource,
     pub max_iterations: Option<usize>,
     pub parallel_tool_calls: bool,
     pub collapse_thinking: bool,
@@ -47,7 +39,6 @@ pub struct Bootstrap {
     pub subagent_limits: SubagentSettings,
     pub mcp_defaults: McpDefaultSettings,
     pub settings: ResolvedSettings,
-    pub api_key: Option<String>,
     /// The environment this run resolved against, retained so a per-provider
     /// credential lookup answers the same way `resolve` did instead of reading
     /// the real process environment behind an injected host's back.
@@ -83,8 +74,6 @@ impl Clone for Bootstrap {
             global_loaded: self.global_loaded,
             project_loaded: self.project_loaded,
             model: self.model.clone(),
-            provider_type: self.provider_type.clone(),
-            provider_source: self.provider_source,
             max_iterations: self.max_iterations,
             parallel_tool_calls: self.parallel_tool_calls,
             collapse_thinking: self.collapse_thinking,
@@ -95,7 +84,6 @@ impl Clone for Bootstrap {
             subagent_limits: self.subagent_limits,
             mcp_defaults: self.mcp_defaults,
             settings: self.settings.clone(),
-            api_key: self.api_key.clone(),
             environment: self.environment.clone(),
             data_directory: self.data_directory.clone(),
             project_root: self.project_root.clone(),
@@ -156,10 +144,6 @@ impl Bootstrap {
         self.model.as_deref()
     }
 
-    pub fn provider_type(&self) -> Option<&str> {
-        self.provider_type.as_deref()
-    }
-
     /// The environment this run resolved against, for a credential lookup that
     /// must answer identically to `resolve` under an injected host.
     pub fn credential_environment(&self) -> BTreeMap<String, String> {
@@ -168,9 +152,9 @@ impl Bootstrap {
 
     /// One provider's API key, resolved the way this run's own credentials were.
     ///
-    /// Separate from [`Self::api_key`], which holds a single provider's key: a
-    /// turn now picks its provider from the model it was given, so any of them
-    /// may need authenticating within the same run.
+    /// Per provider rather than one key for the whole run: a turn picks its
+    /// provider from the model it was given, so any of them may need
+    /// authenticating within the same run.
     pub fn api_key_for(&self, provider: &str) -> Option<String> {
         let credentials = (self.config_reader)(&self.paths.credentials).ok().flatten();
 
@@ -272,18 +256,10 @@ pub fn resolve(host: &HostEnvironment) -> Result<Bootstrap, CliError> {
     let mcp_defaults = McpDefaultSettings::from(&settings);
     let mcp_servers = mcp_servers_with_defaults(&document, mcp_defaults)
         .map_err(|_| CliError::configuration("MCP server configuration is invalid"))?;
-    let credentials = (host.read_file)(&paths.credentials)?;
-    let configured_provider = settings.text("provider.type").map(ToOwned::to_owned);
-    let provider_source = match configured_provider.as_deref() {
-        None => ProviderSource::Auto,
-        Some("openai-chatgpt") => ProviderSource::ExplicitChatGpt,
-        Some(_) => ProviderSource::ExplicitOther,
-    };
-    let provider_type =
-        resolve_provider_type(configured_provider, credentials.as_deref(), &environment)?;
-    let api_key = provider_type
-        .as_deref()
-        .and_then(|provider| provider_api_key(provider, credentials.as_deref(), &environment));
+    // Read for its error alone. Credentials are resolved per provider from here
+    // on, and that lookup cannot report a failure, so an unreadable file would
+    // otherwise surface much later as "no provider has usable credentials".
+    (host.read_file)(&paths.credentials)?;
 
     let model = settings
         .text("provider.model")
@@ -292,9 +268,7 @@ pub fn resolve(host: &HostEnvironment) -> Result<Bootstrap, CliError> {
 
     Ok(Bootstrap {
         model,
-        provider_type,
         environment: environment.clone(),
-        provider_source,
         max_iterations: settings
             .integer("agent.max_iterations")
             .and_then(|value| usize::try_from(value).ok())
@@ -312,7 +286,6 @@ pub fn resolve(host: &HostEnvironment) -> Result<Bootstrap, CliError> {
         subagent_limits: SubagentSettings::from(&settings),
         mcp_defaults,
         settings,
-        api_key,
         data_directory: data_directory(&document, home_directory.as_deref(), &environment),
         project_root,
         mcp_servers,
@@ -371,8 +344,13 @@ fn load_toml(
 
     let document = parse_toml_document(&contents)
         .map_err(|_| CliError::configuration(format!("{scope} configuration is invalid")))?;
-    validate_toml_document(&document)
-        .map_err(|_| CliError::configuration(format!("{scope} configuration is invalid")))?;
+    validate_toml_document(&document).map_err(|error| {
+        if error.retired() {
+            CliError::configuration(format!("{scope} configuration: {error}"))
+        } else {
+            CliError::configuration(format!("{scope} configuration is invalid"))
+        }
+    })?;
 
     Ok((document, true))
 }
@@ -468,30 +446,6 @@ fn stored_api_key(credentials: Option<&str>, provider: &str) -> Option<String> {
         })
 }
 
-/// Resolves which provider a run speaks to: the configured value when there is
-/// one, otherwise whichever provider the available credentials imply.
-///
-/// An unrecognized configured value is an error rather than a fallback. Guessing
-/// here would send the run, and the spend that follows it, to a provider the
-/// user did not name.
-pub fn resolve_provider_type(
-    configured: Option<String>,
-    credentials: Option<&str>,
-    environment: &BTreeMap<String, String>,
-) -> Result<Option<String>, CliError> {
-    if let Some(configured) = configured {
-        return if agens_models::KNOWN_PROVIDER_TYPES.contains(&configured.as_str()) {
-            Ok(Some(configured))
-        } else {
-            Err(CliError::configuration(
-                agens_models::unknown_provider_message(Some(&configured)),
-            ))
-        };
-    }
-
-    Ok(sniff_provider_type(credentials, environment))
-}
-
 /// Validates `provider.model` without reducing it.
 ///
 /// The identifier now carries the provider, so the `provider/model` form has to
@@ -501,36 +455,6 @@ fn resolve_configured_model(model: &str) -> Result<String, CliError> {
     agens_models::QualifiedModel::parse(model)
         .map(|parsed| parsed.to_string())
         .map_err(|message| CliError::configuration(format!("provider.model: {message}")))
-}
-
-fn sniff_provider_type(
-    credentials: Option<&str>,
-    environment: &BTreeMap<String, String>,
-) -> Option<String> {
-    let credentials =
-        credentials.and_then(|contents| serde_json::from_str::<serde_json::Value>(contents).ok());
-    let chatgpt = credentials
-        .as_ref()
-        .and_then(|credentials| credentials.get("openai-chatgpt"));
-    if chatgpt.is_some_and(|entry| {
-        ["access_token", "refresh_token", "account_id", "expires_at"]
-            .iter()
-            .all(|field| {
-                entry
-                    .get(*field)
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|value| !value.is_empty())
-            })
-    }) {
-        return Some("openai-chatgpt".to_owned());
-    }
-    let stored = credentials.as_ref().map(ToString::to_string);
-    API_KEY_ENVIRONMENT
-        .iter()
-        .find(|(identifier, _)| {
-            provider_api_key(identifier, stored.as_deref(), environment).is_some()
-        })
-        .map(|(identifier, _)| (*identifier).to_owned())
 }
 
 /// The OpenAI API key, resolved through [`provider_api_key`] so it cannot drift
@@ -615,7 +539,7 @@ pub fn discover_skill_catalog(
 
 #[cfg(test)]
 mod tests {
-    use super::{provider_api_key, resolve_provider_type};
+    use super::provider_api_key;
     use std::collections::BTreeMap;
 
     fn environment(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
@@ -679,66 +603,6 @@ mod tests {
         assert_eq!(
             provider_api_key("openai-chatgpt", Some(CREDENTIALS), &environment),
             None
-        );
-    }
-
-    #[test]
-    fn configured_provider_type_accepts_every_known_identifier() {
-        let environment = environment(&[]);
-
-        for identifier in ["openai-api", "openai-chatgpt", "moonshotai"] {
-            assert_eq!(
-                resolve_provider_type(Some(identifier.to_owned()), None, &environment)
-                    .expect("known provider type is accepted"),
-                Some(identifier.to_owned())
-            );
-        }
-    }
-
-    #[test]
-    fn an_unknown_configured_provider_type_is_rejected_by_name() {
-        let environment = environment(&[]);
-
-        let error = resolve_provider_type(Some("moonshot".to_owned()), None, &environment)
-            .expect_err("an unknown provider type must not resolve");
-        let message = error.to_string();
-
-        assert!(message.contains("moonshot"), "{message}");
-        assert!(message.contains("moonshotai"), "{message}");
-        assert!(message.contains("openai-api"), "{message}");
-        assert!(message.contains("openai-chatgpt"), "{message}");
-    }
-
-    #[test]
-    fn an_absent_provider_type_still_sniffs_credentials() {
-        let moonshot_only = environment(&[("MOONSHOT_API_KEY", "env-moonshot")]);
-        assert_eq!(
-            resolve_provider_type(None, None, &moonshot_only).expect("sniffing does not fail"),
-            Some("moonshotai".to_owned())
-        );
-
-        let openai_only = environment(&[("OPENAI_API_KEY", "env-openai")]);
-        assert_eq!(
-            resolve_provider_type(None, None, &openai_only).expect("sniffing does not fail"),
-            Some("openai-api".to_owned())
-        );
-
-        assert_eq!(
-            resolve_provider_type(None, None, &environment(&[])).expect("sniffing does not fail"),
-            None
-        );
-    }
-
-    #[test]
-    fn credential_sniffing_prefers_openai_over_moonshot() {
-        let both = environment(&[
-            ("OPENAI_API_KEY", "env-openai"),
-            ("MOONSHOT_API_KEY", "env-moonshot"),
-        ]);
-
-        assert_eq!(
-            resolve_provider_type(None, None, &both).expect("sniffing does not fail"),
-            Some("openai-api".to_owned())
         );
     }
 }

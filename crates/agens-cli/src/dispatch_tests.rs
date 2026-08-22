@@ -363,7 +363,7 @@ fn u15_c1c_backgrounded_success_skips_the_parent_provider_and_history_path() {
             "reviewer",
             "review task",
             agens_tui::TuiExecutionState::ForegroundRunning,
-            Some("gpt-4.1"),
+            Some("openai-api/gpt-4.1"),
             None,
         ))
     );

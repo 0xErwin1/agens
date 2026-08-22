@@ -14,7 +14,7 @@ use agens_core::{
 use agens_error::CliError;
 use agens_session::context::AgentRotationError;
 use agens_session::context::SessionContext;
-use agens_session::provider::ProviderKind;
+use agens_session::model::current_provider;
 use agens_tools::{AgentCatalog, AgentModelValidator};
 
 pub fn select_subagent(
@@ -47,11 +47,7 @@ pub fn subagent_catalog(
     bootstrap: &Bootstrap,
     context: &SessionContext,
 ) -> Result<impl Iterator<Item = AgentDefinition>, CliError> {
-    if bootstrap
-        .provider_type()
-        .and_then(ProviderKind::parse)
-        .is_none()
-    {
+    if current_provider(bootstrap, context).is_none() {
         return Ok(Vec::new().into_iter());
     }
 

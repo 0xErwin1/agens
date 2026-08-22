@@ -485,8 +485,8 @@ fn project_mcp_is_rejected_before_its_command_substitution_runs() {
 }
 
 #[test]
-fn explicit_provider_selection_overrides_credential_inference() {
-    let temporary = TemporaryDirectory::new("explicit-provider-selection");
+fn a_retired_provider_type_is_rejected_by_name_with_its_replacement() {
+    let temporary = TemporaryDirectory::new("retired-provider-type");
     let config_home = temporary.path().join("config");
     let project_root = temporary.path().join("project");
     let dependencies = CliDependencies::for_test(
@@ -508,10 +508,13 @@ fn explicit_provider_selection_overrides_credential_inference() {
         ]),
     );
 
-    let bootstrap = bootstrap(&dependencies).expect("explicit provider should bootstrap");
+    let Err(error) = bootstrap(&dependencies) else {
+        panic!("a retired setting must not bootstrap");
+    };
+    let message = error.to_string();
 
-    assert_eq!(bootstrap.provider_type(), Some("openai-chatgpt"));
-    assert_eq!(bootstrap.model(), None);
+    assert!(message.contains("provider.type"), "{message}");
+    assert!(message.contains("provider/model"), "{message}");
 }
 
 #[test]
@@ -577,7 +580,7 @@ fn models_lists_the_bundled_snapshot_deterministically() {
     assert_eq!(first.status, ExitStatus::Success);
     assert_eq!(
         first.stdout,
-        "ID\tNAME\tCONTEXT\tPRICE\ngpt-4.1\tGPT-4.1\t1047576\t$2.00/$8.00\ngpt-4.1-mini\tGPT-4.1 mini\t1047576\t$0.40/$1.60\ngpt-4.1-nano\tGPT-4.1 nano\t1047576\t$0.10/$0.40\ngpt-4o\tGPT-4o\t128000\t$2.50/$10.00\ngpt-4o-mini\tGPT-4o mini\t128000\t$0.15/$0.60\no3\to3\t200000\t$2.00/$8.00\no4-mini\to4-mini\t200000\t$1.10/$4.40\n"
+        "ID\tNAME\tCONTEXT\tPRICE\nopenai-api/gpt-4.1\tGPT-4.1\t1047576\t$2.00/$8.00\nopenai-api/gpt-4.1-mini\tGPT-4.1 mini\t1047576\t$0.40/$1.60\nopenai-api/gpt-4.1-nano\tGPT-4.1 nano\t1047576\t$0.10/$0.40\nopenai-api/gpt-4o\tGPT-4o\t128000\t$2.50/$10.00\nopenai-api/gpt-4o-mini\tGPT-4o mini\t128000\t$0.15/$0.60\nopenai-api/gpt-5.5\tGPT-5.5\t272000\t-/-\nopenai-api/gpt-5.6\tGPT-5.6 (Sol alias)\t1050000\t-/-\nopenai-api/gpt-5.6-luna\tGPT-5.6 Luna\t1050000\t-/-\nopenai-api/gpt-5.6-sol\tGPT-5.6 Sol\t1050000\t-/-\nopenai-api/gpt-5.6-terra\tGPT-5.6 Terra\t1050000\t-/-\nopenai-api/o3\to3\t200000\t$2.00/$8.00\nopenai-api/o4-mini\to4-mini\t200000\t$1.10/$4.40\nopenai-chatgpt/gpt-5.3-codex-spark\tGPT-5.3 Codex Spark\t128000\t-/-\nopenai-chatgpt/gpt-5.4\tGPT-5.4\t272000\t-/-\nopenai-chatgpt/gpt-5.4-mini\tGPT-5.4 mini\t272000\t-/-\nopenai-chatgpt/gpt-5.5\tGPT-5.5\t272000\t-/-\nopenai-chatgpt/gpt-5.6\tGPT-5.6 (Sol alias)\t1050000\t-/-\nopenai-chatgpt/gpt-5.6-luna\tGPT-5.6 Luna\t1050000\t-/-\nopenai-chatgpt/gpt-5.6-sol\tGPT-5.6 Sol\t1050000\t-/-\nopenai-chatgpt/gpt-5.6-terra\tGPT-5.6 Terra\t1050000\t-/-\nmoonshotai/kimi-k2.6\t-\t262144\t-/-\nmoonshotai/kimi-k2.7-code\t-\t262144\t-/-\nmoonshotai/kimi-k2.7-code-highspeed\t-\t262144\t-/-\nmoonshotai/kimi-k3\t-\t1048576\t-/-\n"
     );
     assert_eq!(first.stderr, "");
     assert_eq!(second.status, ExitStatus::Success);
@@ -1640,7 +1643,7 @@ fn production_binary_runs_configured_openai_responses_transport_and_persists_the
     std::fs::write(
         config_home.join("config.toml"),
         format!(
-            "[provider]\ntype = \"openai-api\"\nmodel = \"openai-api/test-model\"\nbase_url = \"{}\"\n\n[agent]\nparallel_tool_calls = false\n\n[options]\ndata_dir = \"{}\"\n",
+            "[provider]\nmodel = \"openai-api/test-model\"\nbase_url = \"{}\"\n\n[agent]\nparallel_tool_calls = false\n\n[options]\ndata_dir = \"{}\"\n",
             server.base_url(),
             data_directory.display(),
         ),
@@ -1746,7 +1749,7 @@ fn production_task_consolidates_durable_sessions_catalog_skills_and_isolation() 
     std::fs::write(
         config_home.join("config.toml"),
         format!(
-            "[provider]\ntype = \"openai-api\"\nmodel = \"openai-api/gpt-4.1\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[permissions]\nallow = [\"task(reviewer)\"]\n",
+            "[provider]\nmodel = \"openai-api/gpt-4.1\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[permissions]\nallow = [\"task(reviewer)\"]\n",
             server.base_url(),
             data_directory.display(),
         ),
@@ -1867,7 +1870,7 @@ fn built_in_explore_inherits_the_effective_openai_parent_model_without_agent_fil
     std::fs::write(
         config_home.join("config.toml"),
         format!(
-            "[provider]\ntype = \"openai-api\"\nmodel = \"openai-api/gpt-4.1\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[permissions]\nallow = [\"task(explore)\"]\n",
+            "[provider]\nmodel = \"openai-api/gpt-4.1\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[permissions]\nallow = [\"task(explore)\"]\n",
             server.base_url(),
             data_directory.display(),
         ),
@@ -1944,7 +1947,7 @@ fn agents_md_instructions_reach_both_the_parent_and_a_subagents_request_body_end
     std::fs::write(
         config_home.join("config.toml"),
         format!(
-            "[provider]\ntype = \"openai-chatgpt\"\nmodel = \"openai-chatgpt/gpt-5.4\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[permissions]\nallow = [\"task(general)\"]\n",
+            "[provider]\nmodel = \"openai-chatgpt/gpt-5.4\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[permissions]\nallow = [\"task(general)\"]\n",
             server.base_url(),
             data_directory.display(),
         ),
@@ -2007,7 +2010,7 @@ fn explicit_task_model_selects_a_second_available_openai_model() {
     std::fs::write(
         config_home.join("config.toml"),
         format!(
-            "[provider]\ntype = \"openai-api\"\nmodel = \"openai-api/gpt-4.1\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[permissions]\nallow = [\"task(explore)\"]\n",
+            "[provider]\nmodel = \"openai-api/gpt-4.1\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[permissions]\nallow = [\"task(explore)\"]\n",
             server.base_url(),
             data_directory.display(),
         ),
@@ -2075,7 +2078,7 @@ fn built_in_general_inherits_the_effective_chatgpt_parent_model_without_agent_fi
     std::fs::write(
         config_home.join("config.toml"),
         format!(
-            "[provider]\ntype = \"openai-chatgpt\"\nmodel = \"openai-chatgpt/gpt-5.4\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[permissions]\nallow = [\"task(general)\"]\n",
+            "[provider]\nmodel = \"openai-chatgpt/gpt-5.4\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[permissions]\nallow = [\"task(general)\"]\n",
             server.base_url(),
             data_directory.display(),
         ),
@@ -2129,7 +2132,7 @@ fn unavailable_explicit_child_model_is_diagnosed_once_without_a_child_provider_r
     std::fs::write(
         config_home.join("config.toml"),
         format!(
-            "[provider]\ntype = \"openai-chatgpt\"\nmodel = \"openai-chatgpt/gpt-5.5\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[permissions]\nallow = [\"task(explore)\"]\n",
+            "[provider]\nmodel = \"openai-chatgpt/gpt-5.5\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[permissions]\nallow = [\"task(explore)\"]\n",
             server.base_url(),
             data_directory.display(),
         ),
@@ -2203,7 +2206,7 @@ fn production_task_cancellation_prevents_parent_continuation_and_persists_emitte
     std::fs::write(
         config_home.join("config.toml"),
         format!(
-            "[provider]\ntype = \"openai-api\"\nmodel = \"openai-api/gpt-4.1\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[permissions]\nallow = [\"task(reviewer)\"]\n",
+            "[provider]\nmodel = \"openai-api/gpt-4.1\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[permissions]\nallow = [\"task(reviewer)\"]\n",
             server.base_url(),
             data_directory.display(),
         ),
@@ -2288,7 +2291,7 @@ fn production_task_provider_failure_is_sanitized_and_returns_control_to_the_pare
     std::fs::write(
         config_home.join("config.toml"),
         format!(
-            "[provider]\ntype = \"openai-api\"\nmodel = \"openai-api/gpt-4.1\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[permissions]\nallow = [\"task(reviewer)\"]\n",
+            "[provider]\nmodel = \"openai-api/gpt-4.1\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[permissions]\nallow = [\"task(reviewer)\"]\n",
             server.base_url(),
             data_directory.display(),
         ),
@@ -2345,7 +2348,7 @@ fn production_binary_runs_chatgpt_subscription_without_an_api_key_and_persists_t
     std::fs::write(
         config_home.join("config.toml"),
         format!(
-            "[provider]\ntype = \"openai-chatgpt\"\nmodel = \"openai-chatgpt/test-model\"\nbase_url = \"{}\"\n\n[agent]\nparallel_tool_calls = true\n\n[options]\ndata_dir = \"{}\"\n",
+            "[provider]\nmodel = \"openai-chatgpt/test-model\"\nbase_url = \"{}\"\n\n[agent]\nparallel_tool_calls = true\n\n[options]\ndata_dir = \"{}\"\n",
             server.base_url(),
             data_directory.display(),
         ),
@@ -2443,7 +2446,7 @@ fn production_binary_rejects_missing_malformed_and_incomplete_chatgpt_credential
         std::fs::write(
             config_home.join("config.toml"),
             format!(
-                "[provider]\ntype = \"openai-chatgpt\"\nmodel = \"openai-chatgpt/test-model\"\n\n[options]\ndata_dir = \"{}\"\n",
+                "[provider]\nmodel = \"openai-chatgpt/test-model\"\n\n[options]\ndata_dir = \"{}\"\n",
                 data_directory.display(),
             ),
         )
@@ -2524,7 +2527,7 @@ fn production_binary_maps_chatgpt_provider_and_auth_failures_without_leaking_cre
         std::fs::write(
             config_home.join("config.toml"),
             format!(
-                "[provider]\ntype = \"openai-chatgpt\"\nmodel = \"openai-chatgpt/test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n",
+                "[provider]\nmodel = \"openai-chatgpt/test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n",
                 server.base_url(),
                 data_directory.display(),
             ),
@@ -2627,7 +2630,7 @@ fn production_binary_replays_chatgpt_native_and_mcp_tool_results_once() {
         std::fs::write(
             config_home.join("config.toml"),
             format!(
-                "[provider]\ntype = \"openai-chatgpt\"\nmodel = \"openai-chatgpt/test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n{setup}",
+                "[provider]\nmodel = \"openai-chatgpt/test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n{setup}",
                 server.base_url(),
                 data_directory.display(),
             ),
@@ -2686,7 +2689,7 @@ fn production_binary_cancels_chatgpt_subscription_without_persisting_a_turn() {
     std::fs::write(
         config_home.join("config.toml"),
         format!(
-            "[provider]\ntype = \"openai-chatgpt\"\nmodel = \"openai-chatgpt/test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n",
+            "[provider]\nmodel = \"openai-chatgpt/test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n",
             server.base_url(),
             data_directory.display(),
         ),
@@ -2771,7 +2774,7 @@ fn production_binary_executes_allowed_native_read_then_continues_and_persists() 
     std::fs::write(
         config_home.join("config.toml"),
         format!(
-            "[provider]\ntype = \"openai-api\"\nmodel = \"openai-api/test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[permissions]\nallow = [\"read(notes.md)\"]\n",
+            "[provider]\nmodel = \"openai-api/test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[permissions]\nallow = [\"read(notes.md)\"]\n",
             server.base_url(),
             data_directory.display(),
         ),
@@ -2850,7 +2853,7 @@ fn production_binary_persists_an_empty_native_search_result() {
     std::fs::write(
         config_home.join("config.toml"),
         format!(
-            "[provider]\ntype = \"openai-api\"\nmodel = \"openai-api/test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n",
+            "[provider]\nmodel = \"openai-api/test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n",
             server.base_url(),
             data_directory.display(),
         ),
@@ -2963,7 +2966,7 @@ fn production_binary_applies_static_exact_and_glob_allows_to_native_list_and_sea
         std::fs::write(
             config_home.join("config.toml"),
             format!(
-                "[provider]\ntype = \"openai-api\"\nmodel = \"openai-api/test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[permissions]\nallow = [{rule:?}]\n",
+                "[provider]\nmodel = \"openai-api/test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[permissions]\nallow = [{rule:?}]\n",
                 server.base_url(),
                 data_directory.display(),
             ),
@@ -3056,7 +3059,7 @@ fn production_binary_static_glob_denies_native_list_and_search_without_execution
         std::fs::write(
             config_home.join("config.toml"),
             format!(
-                "[provider]\ntype = \"openai-api\"\nmodel = \"openai-api/test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[permissions]\ndeny = [{rule:?}]\n",
+                "[provider]\nmodel = \"openai-api/test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[permissions]\ndeny = [{rule:?}]\n",
                 server.base_url(),
                 data_directory.display(),
             ),
@@ -3132,7 +3135,7 @@ fn production_binary_denies_unrelated_static_list_and_search_targets_and_continu
         std::fs::write(
             config_home.join("config.toml"),
             format!(
-                "[provider]\ntype = \"openai-api\"\nmodel = \"openai-api/test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[permissions]\nallow = [{rule:?}]\n",
+                "[provider]\nmodel = \"openai-api/test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[permissions]\nallow = [{rule:?}]\n",
                 server.base_url(),
                 data_directory.display(),
             ),
@@ -3207,7 +3210,7 @@ fn production_binary_denies_native_read_without_side_effect_and_continues_safely
     std::fs::write(
         config_home.join("config.toml"),
         format!(
-            "[provider]\ntype = \"openai-api\"\nmodel = \"openai-api/test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[permissions]\ndeny = [\"read(SENTINEL_DENIED_INPUT.txt)\"]\n",
+            "[provider]\nmodel = \"openai-api/test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[permissions]\ndeny = [\"read(SENTINEL_DENIED_INPUT.txt)\"]\n",
             server.base_url(),
             data_directory.display(),
         ),
@@ -3275,7 +3278,7 @@ fn production_binary_denies_unresolved_native_call_without_dispatching_and_conti
     std::fs::write(
         config_home.join("config.toml"),
         format!(
-            "[provider]\ntype = \"openai-api\"\nmodel = \"openai-api/test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n",
+            "[provider]\nmodel = \"openai-api/test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n",
             server.base_url(),
             data_directory.display(),
         ),
@@ -3356,7 +3359,7 @@ fn production_binary_denies_native_write_in_chat_mode_even_with_temporary_bypass
     std::fs::write(
         config_home.join("config.toml"),
         format!(
-            "[provider]\ntype = \"openai-api\"\nmodel = \"openai-api/test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n",
+            "[provider]\nmodel = \"openai-api/test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n",
             server.base_url(),
             data_directory.display(),
         ),
@@ -3422,7 +3425,7 @@ fn production_binary_rejects_duplicate_and_mismatched_tool_call_protocol_items_b
         std::fs::write(
             config_home.join("config.toml"),
             format!(
-                "[provider]\ntype = \"openai-api\"\nmodel = \"openai-api/test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n",
+                "[provider]\nmodel = \"openai-api/test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n",
                 server.base_url(),
                 data_directory.display(),
             ),
@@ -3480,7 +3483,7 @@ fn production_binary_cancellation_kills_native_bash_descendants_without_continui
     std::fs::write(
         config_home.join("config.toml"),
         format!(
-            "[provider]\ntype = \"openai-api\"\nmodel = \"openai-api/test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[permissions]\nallow = [\"bash(*)\"]\n",
+            "[provider]\nmodel = \"openai-api/test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[permissions]\nallow = [\"bash(*)\"]\n",
             server.base_url(),
             data_directory.display(),
         ),
@@ -3574,7 +3577,7 @@ fn production_binary_rejects_replayed_native_call_id_without_second_execution() 
     std::fs::write(
         config_home.join("config.toml"),
         format!(
-            "[provider]\ntype = \"openai-api\"\nmodel = \"openai-api/test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[permissions]\nallow = [\"write(execution-count)\"]\n",
+            "[provider]\nmodel = \"openai-api/test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[permissions]\nallow = [\"write(execution-count)\"]\n",
             server.base_url(),
             data_directory.display(),
         ),
@@ -3618,7 +3621,7 @@ fn production_binary_cancellation_has_deterministic_output_exit_and_no_persisten
     std::fs::write(
         config_home.join("config.toml"),
         format!(
-            "[provider]\ntype = \"openai-api\"\nmodel = \"openai-api/test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n",
+            "[provider]\nmodel = \"openai-api/test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n",
             server.base_url(),
             data_directory.display(),
         ),
@@ -3671,7 +3674,7 @@ fn production_binary_sanitizes_remote_response_headers_and_body() {
     std::fs::write(
         config_home.join("config.toml"),
         format!(
-            "[provider]\ntype = \"openai-api\"\nmodel = \"openai-api/test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n",
+            "[provider]\nmodel = \"openai-api/test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n",
             server.base_url(),
             data_directory.display(),
         ),
@@ -3744,7 +3747,7 @@ fn production_binary_sanitizes_config_and_store_error_sources() {
     std::fs::write(
         store_config_home.join("config.toml"),
         format!(
-            "[provider]\ntype = \"openai-api\"\nmodel = \"openai-api/test-model\"\nbase_url = \"http://127.0.0.1:1\"\n\n[options]\ndata_dir = \"{}\"\n",
+            "[provider]\nmodel = \"openai-api/test-model\"\nbase_url = \"http://127.0.0.1:1\"\n\n[options]\ndata_dir = \"{}\"\n",
             store_path.display()
         ),
     )
@@ -3796,7 +3799,7 @@ fn production_binary_composes_configured_mcp_tools_with_native_catalog_and_persi
     std::fs::write(
         config_home.join("config.toml"),
         format!(
-            "[provider]\ntype = \"openai-api\"\nmodel = \"openai-api/test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[mcp.broken]\ntransport = \"stdio\"\ncommand = \"{}\"\nargs = [\"malformed\"]\ntimeout_ms = 1000\n[mcp.broken.env]\nFAKE_MCP_PROTOCOL_SECRET = \"SENTINEL_MCP_PROTOCOL\"\nFAKE_MCP_STDERR_SECRET = \"SENTINEL_MCP_STDERR\"\n\n[mcp.crashed]\ntransport = \"stdio\"\ncommand = \"{}\"\nargs = [\"crash\"]\ntimeout_ms = 1000\n[mcp.crashed.env]\nFAKE_MCP_TRANSPORT_SECRET = \"SENTINEL_MCP_TRANSPORT\"\n\n[mcp.files]\ntransport = \"stdio\"\ncommand = \"{}\"\nargs = [\"success\"]\ntimeout_ms = 1000\n",
+            "[provider]\nmodel = \"openai-api/test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[mcp.broken]\ntransport = \"stdio\"\ncommand = \"{}\"\nargs = [\"malformed\"]\ntimeout_ms = 1000\n[mcp.broken.env]\nFAKE_MCP_PROTOCOL_SECRET = \"SENTINEL_MCP_PROTOCOL\"\nFAKE_MCP_STDERR_SECRET = \"SENTINEL_MCP_STDERR\"\n\n[mcp.crashed]\ntransport = \"stdio\"\ncommand = \"{}\"\nargs = [\"crash\"]\ntimeout_ms = 1000\n[mcp.crashed.env]\nFAKE_MCP_TRANSPORT_SECRET = \"SENTINEL_MCP_TRANSPORT\"\n\n[mcp.files]\ntransport = \"stdio\"\ncommand = \"{}\"\nargs = [\"success\"]\ntimeout_ms = 1000\n",
             server.base_url(),
             data_directory.display(),
             env!("CARGO_BIN_EXE_agens-cli-fake-mcp-child"),
@@ -3893,7 +3896,7 @@ fn production_binary_cancels_configured_mcp_call_without_continuing_or_persistin
     std::fs::write(
         config_home.join("config.toml"),
         format!(
-            "[provider]\ntype = \"openai-api\"\nmodel = \"openai-api/test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[mcp.files]\ntransport = \"stdio\"\ncommand = \"{}\"\nargs = [\"call-sleep\"]\ntimeout_ms = 1000\n[mcp.files.env]\nFAKE_MCP_CALL_READY = \"{}\"\n",
+            "[provider]\nmodel = \"openai-api/test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[mcp.files]\ntransport = \"stdio\"\ncommand = \"{}\"\nargs = [\"call-sleep\"]\ntimeout_ms = 1000\n[mcp.files.env]\nFAKE_MCP_CALL_READY = \"{}\"\n",
             server.base_url(),
             data_directory.display(),
             env!("CARGO_BIN_EXE_agens-cli-fake-mcp-child"),
@@ -3973,7 +3976,7 @@ fn production_binary_persists_model_visible_mcp_arguments_without_transport_secr
     std::fs::write(
         config_home.join("config.toml"),
         format!(
-            "[provider]\ntype = \"openai-api\"\nmodel = \"openai-api/test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[mcp.files]\ntransport = \"stdio\"\ncommand = \"{}\"\nargs = [\"call-error\"]\ntimeout_ms = 1000\n[mcp.files.env]\nFAKE_MCP_TOOL_ERROR_SECRET = \"SENTINEL_MCP_REMOTE_BODY\"\nFAKE_MCP_STDERR_SECRET = \"SENTINEL_MCP_STDERR\"\n",
+            "[provider]\nmodel = \"openai-api/test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[mcp.files]\ntransport = \"stdio\"\ncommand = \"{}\"\nargs = [\"call-error\"]\ntimeout_ms = 1000\n[mcp.files.env]\nFAKE_MCP_TOOL_ERROR_SECRET = \"SENTINEL_MCP_REMOTE_BODY\"\nFAKE_MCP_STDERR_SECRET = \"SENTINEL_MCP_STDERR\"\n",
             server.base_url(),
             data_directory.display(),
             env!("CARGO_BIN_EXE_agens-cli-fake-mcp-child"),
@@ -4063,7 +4066,7 @@ fn production_binary_persists_model_visible_native_arguments_and_tool_failure_ou
     std::fs::write(
         config_home.join("config.toml"),
         format!(
-            "[provider]\ntype = \"openai-api\"\nmodel = \"openai-api/test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[permissions]\nallow = [\"bash(*)\"]\n",
+            "[provider]\nmodel = \"openai-api/test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[permissions]\nallow = [\"bash(*)\"]\n",
             server.base_url(),
             data_directory.display(),
         ),
@@ -4147,7 +4150,7 @@ fn production_binary_records_a_completed_native_call_in_the_evidence_ledger() {
     std::fs::write(
         config_home.join("config.toml"),
         format!(
-            "[provider]\ntype = \"openai-api\"\nmodel = \"openai-api/test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[permissions]\nallow = [\"bash(*)\"]\n",
+            "[provider]\nmodel = \"openai-api/test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[permissions]\nallow = [\"bash(*)\"]\n",
             server.base_url(),
             data_directory.display(),
         ),
@@ -4250,7 +4253,7 @@ fn production_binary_records_each_sessions_own_identity_in_the_evidence_ledger()
     std::fs::write(
         config_home.join("config.toml"),
         format!(
-            "[provider]\ntype = \"openai-api\"\nmodel = \"openai-api/test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[permissions]\nallow = [\"bash(*)\"]\n",
+            "[provider]\nmodel = \"openai-api/test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[permissions]\nallow = [\"bash(*)\"]\n",
             server.base_url(),
             data_directory.display(),
         ),
@@ -4338,7 +4341,7 @@ fn production_binary_recovers_from_mcp_infrastructure_failures_and_persists_comp
         std::fs::write(
             config_home.join("config.toml"),
             format!(
-                "[provider]\ntype = \"openai-api\"\nmodel = \"openai-api/test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[mcp.files]\ntransport = \"stdio\"\ncommand = \"{}\"\nargs = [{mode:?}]\ntimeout_ms = {timeout_ms}\n[mcp.files.env]\nFAKE_MCP_TRANSPORT_SECRET = \"SENTINEL_MCP_TRANSPORT\"\nFAKE_MCP_STDERR_SECRET = \"SENTINEL_MCP_STDERR\"\n",
+                "[provider]\nmodel = \"openai-api/test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[mcp.files]\ntransport = \"stdio\"\ncommand = \"{}\"\nargs = [{mode:?}]\ntimeout_ms = {timeout_ms}\n[mcp.files.env]\nFAKE_MCP_TRANSPORT_SECRET = \"SENTINEL_MCP_TRANSPORT\"\nFAKE_MCP_STDERR_SECRET = \"SENTINEL_MCP_STDERR\"\n",
                 server.base_url(),
                 data_directory.display(),
                 env!("CARGO_BIN_EXE_agens-cli-fake-mcp-child"),
@@ -4458,7 +4461,7 @@ fn production_binary_static_deny_blocks_mcp_write_without_a_child_call() {
     std::fs::write(
         config_home.join("config.toml"),
         format!(
-            "[provider]\ntype = \"openai-api\"\nmodel = \"openai-api/test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[permissions]\ndeny = [\"files_second(*)\"]\n\n[mcp.files]\ntransport = \"stdio\"\ncommand = \"{}\"\nargs = [\"success\"]\ntimeout_ms = 1000\n[mcp.files.env]\nFAKE_MCP_CALL_READY = \"{}\"\n",
+            "[provider]\nmodel = \"openai-api/test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[permissions]\ndeny = [\"files_second(*)\"]\n\n[mcp.files]\ntransport = \"stdio\"\ncommand = \"{}\"\nargs = [\"success\"]\ntimeout_ms = 1000\n[mcp.files.env]\nFAKE_MCP_CALL_READY = \"{}\"\n",
             server.base_url(),
             data_directory.display(),
             env!("CARGO_BIN_EXE_agens-cli-fake-mcp-child"),
@@ -4596,7 +4599,7 @@ fn production_binary_enforces_mcp_permission_matrix_and_executes_allowed_calls_o
         std::fs::write(
             config_home.join("config.toml"),
             format!(
-                "[provider]\ntype = \"openai-api\"\nmodel = \"openai-api/test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n{permissions}\n[mcp.files]\ntransport = \"stdio\"\ncommand = \"{}\"\nargs = [\"success\"]\ntimeout_ms = 1000\n[mcp.files.env]\nFAKE_MCP_CALL_READY = \"{}\"\n",
+                "[provider]\nmodel = \"openai-api/test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n{permissions}\n[mcp.files]\ntransport = \"stdio\"\ncommand = \"{}\"\nargs = [\"success\"]\ntimeout_ms = 1000\n[mcp.files.env]\nFAKE_MCP_CALL_READY = \"{}\"\n",
                 server.base_url(),
                 data_directory.display(),
                 env!("CARGO_BIN_EXE_agens-cli-fake-mcp-child"),
@@ -4720,7 +4723,7 @@ fn production_binary_fails_closed_for_mcp_duplicate_replay_and_mismatched_call_i
         std::fs::write(
             config_home.join("config.toml"),
             format!(
-                "[provider]\ntype = \"openai-api\"\nmodel = \"openai-api/test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[mcp.files]\ntransport = \"stdio\"\ncommand = \"{}\"\nargs = [\"success\"]\ntimeout_ms = 1000\n[mcp.files.env]\nFAKE_MCP_CALL_READY = \"{}\"\n",
+                "[provider]\nmodel = \"openai-api/test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[mcp.files]\ntransport = \"stdio\"\ncommand = \"{}\"\nargs = [\"success\"]\ntimeout_ms = 1000\n[mcp.files.env]\nFAKE_MCP_CALL_READY = \"{}\"\n",
                 server.base_url(),
                 data_directory.display(),
                 env!("CARGO_BIN_EXE_agens-cli-fake-mcp-child"),

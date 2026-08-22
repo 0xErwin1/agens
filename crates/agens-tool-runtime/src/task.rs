@@ -22,12 +22,12 @@ use agens_bootstrap::Bootstrap;
 use agens_diagnostics::{next_diagnostic_reference, record_subagent_model_unavailable};
 use agens_dispatch::{AuthorizedNativeTaskRuntime, ProductionToolDispatcher};
 use agens_error::CliError;
-use agens_models::{default_model, unknown_provider_message};
 use agens_permissions::PermissionPrompter;
 use agens_permissions::{
     ProductionPermissionGate, ProductionPermissionResolver, ProductionPromptAuthorization,
     SharedToolDispatcher, permission_policy,
 };
+use agens_session::provider::{bootstrap_authentication, resolve_provider_for_model};
 
 pub struct ProductionTuiTaskRuntime {
     pub provider_tools: Vec<OpenAiFunctionTool>,
@@ -166,11 +166,11 @@ pub fn production_tui_task_runtime_with_runner_parent_config_and_cancellation(
     let task_registry = task_runner.execution_registry().unwrap_or_default();
     let parent_model = match bootstrap.model() {
         Some(model) => model.to_owned(),
-        None => default_model(bootstrap.provider_type())
-            .ok_or_else(|| {
-                CliError::configuration(unknown_provider_message(bootstrap.provider_type()))
-            })?
-            .to_owned(),
+        None => {
+            resolve_provider_for_model(None, &bootstrap_authentication(bootstrap))
+                .map_err(|error| CliError::configuration(error.message()))?
+                .model
+        }
     };
     let (provider_tools, dispatcher) = production_tool_runtime_with_discovery_cancellation(
         bootstrap,
@@ -484,7 +484,7 @@ mod tests {
         let bootstrap = bootstrap_from_configuration(
             "task-agent-profiles",
             Some(
-                "[provider]\ntype = \"openai-api\"\nmodel = \"gpt-4.1\"\n\n[agents.explore]\nmodel = \"global-model\"\n\n[agents.general]\neffort = \"low\"\n",
+                "[provider]\nmodel = \"openai-api/gpt-4.1\"\n\n[agents.explore]\nmodel = \"global-model\"\n\n[agents.general]\neffort = \"low\"\n",
             ),
             Some("[agents.explore]\nmodel = \"project-model\"\neffort = \"max\"\n"),
         );

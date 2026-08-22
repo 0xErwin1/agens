@@ -1,11 +1,17 @@
-//! The `models` command: lists the bundled model catalog.
+//! The `models` command: lists every provider's bundled model catalog.
 
 use agens_error::CliError;
 
+/// Every provider rather than one, because nothing declares a provider any more:
+/// the listing has to show which one serves each model for the identifier it
+/// prints to be usable.
 pub(crate) fn run_models() -> Result<String, CliError> {
-    agens_models::bundled_openai_models()
-        .map(|models| agens_models::format_models(&models))
-        .map_err(|_| CliError::unavailable("model registry is unavailable"))
+    let catalog = agens_models::every_source_models();
+    if catalog.is_empty() {
+        return Err(CliError::unavailable("model registry is unavailable"));
+    }
+
+    Ok(agens_models::format_qualified_models(&catalog))
 }
 
 #[cfg(test)]
@@ -18,7 +24,7 @@ mod tests {
     use crate::{CliDependencies, ExitStatus, execute_strings};
 
     #[test]
-    fn models_command_uses_the_bundled_registry() {
+    fn models_command_lists_every_provider_under_its_qualified_identifier() {
         let result = execute_strings(
             vec!["models".to_owned()],
             &CliDependencies::for_test(
@@ -31,9 +37,31 @@ mod tests {
         );
 
         assert_eq!(result.status, ExitStatus::Success);
-        assert_eq!(
-            result.stdout,
-            "ID\tNAME\tCONTEXT\tPRICE\ngpt-4.1\tGPT-4.1\t1047576\t$2.00/$8.00\ngpt-4.1-mini\tGPT-4.1 mini\t1047576\t$0.40/$1.60\ngpt-4.1-nano\tGPT-4.1 nano\t1047576\t$0.10/$0.40\ngpt-4o\tGPT-4o\t128000\t$2.50/$10.00\ngpt-4o-mini\tGPT-4o mini\t128000\t$0.15/$0.60\no3\to3\t200000\t$2.00/$8.00\no4-mini\to4-mini\t200000\t$1.10/$4.40\n"
+        assert!(
+            result.stdout.starts_with("ID\tNAME\tCONTEXT\tPRICE\n"),
+            "{:?}",
+            result.stdout
+        );
+        assert!(
+            result
+                .stdout
+                .contains("openai-api/gpt-4.1\tGPT-4.1\t1047576\t$2.00/$8.00\n"),
+            "{:?}",
+            result.stdout
+        );
+        // A model only one provider serves and one two providers serve are both
+        // listed under the provider that offers them, never bare.
+        for expected in [
+            "moonshotai/kimi-k3\t",
+            "openai-chatgpt/gpt-5.5\t",
+            "openai-api/gpt-5.5\t",
+        ] {
+            assert!(result.stdout.contains(expected), "{:?}", result.stdout);
+        }
+        assert!(
+            !result.stdout.contains("\ngpt-4.1\t"),
+            "{:?}",
+            result.stdout
         );
     }
 }
