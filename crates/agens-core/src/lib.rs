@@ -1918,7 +1918,6 @@ pub enum HeadlessTurnError {
     /// the runtime's budget, not the model's context window: reporting it as
     /// context sends the reader to shorten a prompt that was never the problem.
     ProviderHistoryBudget,
-    /// The turn kept calling tools past the round limit without finishing.
     ProviderRateLimited,
     ProviderServer,
     ProviderNetwork,
@@ -1928,6 +1927,8 @@ pub enum HeadlessTurnError {
     PermissionRequired,
     Tool,
     Store,
+    /// The turn kept calling tools past the round limit without finishing.
+    /// This is the runtime's own cap, unrelated to what the model can hold.
     MaxIterations,
     State,
     TaskTerminal(HeadlessTaskTerminal),

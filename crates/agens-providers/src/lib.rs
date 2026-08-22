@@ -7,7 +7,7 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
 mod moonshot;
@@ -28,11 +28,7 @@ use time::format_description::well_known::Rfc3339;
 const CHATGPT_PROVIDER_ID: &str = "openai-chatgpt";
 const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const HTTP_CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(5);
-const MAX_HTTP_STATUS_ATTEMPTS: usize = 3;
-const HTTP_RETRY_FIRST_DELAY: Duration = Duration::from_millis(250);
-const HTTP_RETRY_SECOND_DELAY: Duration = Duration::from_secs(1);
-const HTTP_RETRY_MAX_JITTER: u64 = 100;
-const HTTP_RETRY_AFTER_CAP: Duration = Duration::from_secs(5);
+const HTTP_RETRY_MAX_JITTER: u64 = 250;
 pub const DEFAULT_PROVIDER_REQUEST_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// Bounds how long a response may stay silent before its first body byte.
 ///
@@ -98,6 +94,7 @@ pub struct OpenAiResponsesProvider {
     parallel_tool_calls: bool,
     client: reqwest::Client,
     operation_timeout: Duration,
+    retry_policy: RetryPolicy,
     state: ContinuationState,
     seen_response_ids: BTreeSet<String>,
     seen_item_ids: BTreeSet<String>,
@@ -122,6 +119,7 @@ pub struct ChatGptResponsesProvider {
     session_id: String,
     client: reqwest::Client,
     operation_timeout: Duration,
+    retry_policy: RetryPolicy,
     tools: Vec<OpenAiFunctionTool>,
     parallel_tool_calls: bool,
     state: ChatGptContinuationState,
@@ -190,6 +188,7 @@ pub struct ProviderDiagnostics {
     reference: DiagnosticRef,
     scope: ProviderDiagnosticScope,
     sink: ProviderDiagnosticSink,
+    max_attempts: u8,
 }
 
 impl ProviderDiagnostics {
@@ -202,7 +201,17 @@ impl ProviderDiagnostics {
             reference: DiagnosticRef::new(reference.into())?,
             scope,
             sink,
+            max_attempts: attempt_budget(RetryPolicy::default().max_attempts()),
         })
+    }
+
+    /// Adopts the attempt budget of the provider this handle was attached to,
+    /// so `attempt n of m` counts against the schedule actually in force
+    /// rather than against the default one.
+    #[must_use]
+    fn with_max_attempts(mut self, max_attempts: usize) -> Self {
+        self.max_attempts = attempt_budget(max_attempts);
+        self
     }
 
     fn emit(
@@ -220,17 +229,15 @@ impl ProviderDiagnostics {
             component,
             event,
             attempt: u8::try_from(attempt).unwrap_or(u8::MAX),
-            max_attempts: if !matches!(
+            max_attempts: if matches!(
                 event,
                 ProviderDiagnosticKind::Attempt
                     | ProviderDiagnosticKind::RetryScheduled
                     | ProviderDiagnosticKind::Terminal
-            ) || class == Some(ProviderDiagnosticClass::Network)
-                || attempt > 3
-            {
-                0
+            ) {
+                self.max_attempts
             } else {
-                MAX_HTTP_STATUS_ATTEMPTS as u8
+                0
             },
             delay_ms: delay.map(|delay| u64::try_from(delay.as_millis()).unwrap_or(u64::MAX)),
             status,
@@ -661,11 +668,18 @@ impl OpenAiResponsesProvider {
             }]),
             tools,
             parallel_tool_calls: true,
+            // The read timeout is what bounds a stream that stops mid-body.
+            // Without it a server that opened a response and then went silent
+            // held `chunk()` open forever, and an interactive turn carries no
+            // deadline of its own, so the session stayed "running" until
+            // somebody cancelled it by hand.
             client: reqwest::Client::builder()
                 .connect_timeout(request_timeout)
+                .read_timeout(request_timeout)
                 .build()
                 .map_err(|_| Error::Provider("OpenAI HTTP client is unavailable".into()))?,
             operation_timeout: DEFAULT_PROVIDER_REQUEST_TIMEOUT,
+            retry_policy: RetryPolicy::default(),
             state: ContinuationState::Initial,
             seen_response_ids: BTreeSet::new(),
             seen_item_ids: BTreeSet::new(),
@@ -735,7 +749,15 @@ impl OpenAiResponsesProvider {
     }
 
     pub fn with_diagnostics(mut self, diagnostics: ProviderDiagnostics) -> Self {
-        self.diagnostics = Some(diagnostics);
+        self.diagnostics = Some(diagnostics.with_max_attempts(self.retry_policy.max_attempts()));
+        self
+    }
+
+    pub fn with_retry_policy(mut self, retry_policy: RetryPolicy) -> Self {
+        self.retry_policy = retry_policy;
+        self.diagnostics = self
+            .diagnostics
+            .map(|diagnostics| diagnostics.with_max_attempts(retry_policy.max_attempts()));
         self
     }
 
@@ -754,10 +776,11 @@ impl OpenAiResponsesProvider {
         payload: Value,
         cancellation: &HeadlessTurnCancellation,
     ) -> Result<DecodedResponse, HeadlessTurnPortError> {
+        let policy = self.retry_policy;
         let mut attempt = 0;
         let mut last_transient_status = None;
         let mut saw_request_timeout = false;
-        let response = loop {
+        loop {
             stop_before_mapping(cancellation)?;
             if let Some(diagnostics) = &self.diagnostics {
                 diagnostics.emit(
@@ -793,15 +816,19 @@ impl OpenAiResponsesProvider {
                         attempt,
                         last_transient_status,
                         saw_request_timeout,
+                        policy,
                     ) {
                         wait_for_http_retry(
                             cancellation,
                             attempt,
                             None,
-                            self.diagnostics.as_ref(),
-                            ProviderDiagnosticComponent::Responses,
-                            ProviderDiagnosticClass::Network,
-                            None,
+                            ScheduledRetry {
+                                diagnostics: self.diagnostics.as_ref(),
+                                component: ProviderDiagnosticComponent::Responses,
+                                class: ProviderDiagnosticClass::Network,
+                                status: None,
+                                policy,
+                            },
                         )
                         .await?;
                         attempt += 1;
@@ -824,76 +851,99 @@ impl OpenAiResponsesProvider {
                 }
             };
             let status = response.status().as_u16();
-            if is_transient_http_status(status) && attempt + 1 < MAX_HTTP_STATUS_ATTEMPTS {
+            if is_transient_http_status(status) && policy.has_attempt_after(attempt) {
                 last_transient_status = Some(status);
-                let retry_after = retry_after_from_headers(response.headers());
+                let retry_after = retry_after_from_headers(response.headers(), policy);
                 drop(response);
                 wait_for_http_retry(
                     cancellation,
                     attempt,
                     retry_after,
-                    self.diagnostics.as_ref(),
-                    ProviderDiagnosticComponent::Responses,
-                    diagnostic_class_for_status(status, false),
-                    Some(status),
+                    ScheduledRetry {
+                        diagnostics: self.diagnostics.as_ref(),
+                        component: ProviderDiagnosticComponent::Responses,
+                        class: diagnostic_class_for_status(status, false),
+                        status: Some(status),
+                        policy,
+                    },
                 )
                 .await?;
                 attempt += 1;
                 continue;
             }
-            break response;
-        };
 
-        stop_before_mapping(cancellation)?;
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            if let Some(failure_detail) = &self.failure_detail {
-                failure_detail.record(&format!("HTTP {status} rejected model \"{}\"", self.model));
+            stop_before_mapping(cancellation)?;
+            if !response.status().is_success() {
+                if let Some(failure_detail) = &self.failure_detail {
+                    failure_detail
+                        .record(&format!("HTTP {status} rejected model \"{}\"", self.model));
+                }
+                let context_exceeded = read_safe_openai_context_error(
+                    response,
+                    cancellation,
+                    self.failure_detail.as_ref(),
+                )
+                .await?;
+                if let Some(diagnostics) = &self.diagnostics {
+                    diagnostics.emit(
+                        ProviderDiagnosticComponent::Responses,
+                        ProviderDiagnosticKind::Terminal,
+                        attempt + 1,
+                        None,
+                        Some(status),
+                        Some(diagnostic_class_for_status(status, context_exceeded)),
+                    );
+                }
+                return Err(classify_openai_response_status(status, context_exceeded));
             }
-            let context_exceeded = read_safe_openai_context_error(
+
+            let result = decode_http_response_stream(
                 response,
                 cancellation,
+                false,
+                self.progress.as_ref(),
+                HeadlessTurnPortError::ProviderProtocol,
+                false,
                 self.failure_detail.as_ref(),
             )
-            .await?;
+            .await;
+            if let Err(failure) = &result
+                && failure.is_resumable()
+                && policy.has_attempt_after(attempt)
+            {
+                wait_for_http_retry(
+                    cancellation,
+                    attempt,
+                    None,
+                    ScheduledRetry {
+                        diagnostics: self.diagnostics.as_ref(),
+                        component: ProviderDiagnosticComponent::Responses,
+                        class: ProviderDiagnosticClass::Network,
+                        status: None,
+                        policy,
+                    },
+                )
+                .await?;
+                attempt += 1;
+                continue;
+            }
+            let result = result.map_err(StreamFailure::into_port_error);
             if let Some(diagnostics) = &self.diagnostics {
                 diagnostics.emit(
                     ProviderDiagnosticComponent::Responses,
                     ProviderDiagnosticKind::Terminal,
                     attempt + 1,
                     None,
-                    Some(status),
-                    Some(diagnostic_class_for_status(status, context_exceeded)),
+                    None,
+                    result
+                        .as_ref()
+                        .err()
+                        .copied()
+                        .map(diagnostic_class_for_port_error),
                 );
             }
-            return Err(classify_openai_response_status(status, context_exceeded));
+            return result;
         }
-
-        let result = decode_http_response_stream(
-            response,
-            cancellation,
-            false,
-            self.progress.as_ref(),
-            HeadlessTurnPortError::ProviderProtocol,
-            false,
-            self.failure_detail.as_ref(),
-        )
-        .await;
-        if let Some(diagnostics) = &self.diagnostics {
-            diagnostics.emit(
-                ProviderDiagnosticComponent::Responses,
-                ProviderDiagnosticKind::Terminal,
-                attempt + 1,
-                None,
-                None,
-                result
-                    .as_ref()
-                    .err()
-                    .copied()
-                    .map(diagnostic_class_for_port_error),
-            );
-        }
-        result
     }
 }
 
@@ -1076,6 +1126,7 @@ impl ChatGptResponsesProvider {
                 .build()
                 .map_err(|_| Error::Provider("ChatGPT HTTP client is unavailable".into()))?,
             operation_timeout: DEFAULT_PROVIDER_REQUEST_TIMEOUT,
+            retry_policy: RetryPolicy::default(),
             tools,
             parallel_tool_calls: true,
             state: ChatGptContinuationState::Initial,
@@ -1157,7 +1208,15 @@ impl ChatGptResponsesProvider {
     }
 
     pub fn with_diagnostics(mut self, diagnostics: ProviderDiagnostics) -> Self {
-        self.diagnostics = Some(diagnostics);
+        self.diagnostics = Some(diagnostics.with_max_attempts(self.retry_policy.max_attempts()));
+        self
+    }
+
+    pub fn with_retry_policy(mut self, retry_policy: RetryPolicy) -> Self {
+        self.retry_policy = retry_policy;
+        self.diagnostics = self
+            .diagnostics
+            .map(|diagnostics| diagnostics.with_max_attempts(retry_policy.max_attempts()));
         self
     }
 
@@ -1176,10 +1235,11 @@ impl ChatGptResponsesProvider {
         payload: Value,
         cancellation: &HeadlessTurnCancellation,
     ) -> Result<DecodedResponse, ChatGptResponseError> {
+        let policy = self.retry_policy;
         let mut attempt = 0;
         let mut last_transient_status = None;
         let mut saw_request_timeout = false;
-        let response = loop {
+        loop {
             stop_before_mapping(cancellation).map_err(ChatGptResponseError::Other)?;
             if let Some(diagnostics) = &self.diagnostics {
                 diagnostics.emit(
@@ -1223,15 +1283,19 @@ impl ChatGptResponsesProvider {
                         attempt,
                         last_transient_status,
                         saw_request_timeout,
+                        policy,
                     ) {
                         wait_for_http_retry(
                             cancellation,
                             attempt,
                             None,
-                            self.diagnostics.as_ref(),
-                            ProviderDiagnosticComponent::Responses,
-                            ProviderDiagnosticClass::Network,
-                            None,
+                            ScheduledRetry {
+                                diagnostics: self.diagnostics.as_ref(),
+                                component: ProviderDiagnosticComponent::Responses,
+                                class: ProviderDiagnosticClass::Network,
+                                status: None,
+                                policy,
+                            },
                         )
                         .await
                         .map_err(ChatGptResponseError::Other)?;
@@ -1261,97 +1325,126 @@ impl ChatGptResponsesProvider {
                 }
             };
             let status = response.status().as_u16();
-            if is_transient_http_status(status) && attempt + 1 < MAX_HTTP_STATUS_ATTEMPTS {
+            if is_transient_http_status(status) && policy.has_attempt_after(attempt) {
                 last_transient_status = Some(status);
-                let retry_after = retry_after_from_headers(response.headers());
+                let retry_after = retry_after_from_headers(response.headers(), policy);
                 drop(response);
                 wait_for_http_retry(
                     cancellation,
                     attempt,
                     retry_after,
-                    self.diagnostics.as_ref(),
-                    ProviderDiagnosticComponent::Responses,
-                    diagnostic_class_for_status(status, false),
-                    Some(status),
+                    ScheduledRetry {
+                        diagnostics: self.diagnostics.as_ref(),
+                        component: ProviderDiagnosticComponent::Responses,
+                        class: diagnostic_class_for_status(status, false),
+                        status: Some(status),
+                        policy,
+                    },
                 )
                 .await
                 .map_err(ChatGptResponseError::Other)?;
                 attempt += 1;
                 continue;
             }
-            break response;
-        };
 
-        stop_before_mapping(cancellation).map_err(ChatGptResponseError::Other)?;
-        let status = response.status().as_u16();
-        if !response.status().is_success() {
-            if let Some(failure_detail) = &self.failure_detail {
-                failure_detail.record(&format!("HTTP {status} rejected model \"{}\"", self.model));
+            stop_before_mapping(cancellation).map_err(ChatGptResponseError::Other)?;
+            if !response.status().is_success() {
+                if let Some(failure_detail) = &self.failure_detail {
+                    failure_detail
+                        .record(&format!("HTTP {status} rejected model \"{}\"", self.model));
+                }
+                let safe_error =
+                    read_safe_chatgpt_error(response, cancellation, self.failure_detail.as_ref())
+                        .await
+                        .map_err(ChatGptResponseError::Other)?;
+                if let Some(diagnostics) = &self.diagnostics {
+                    diagnostics.emit(
+                        ProviderDiagnosticComponent::Responses,
+                        ProviderDiagnosticKind::Terminal,
+                        attempt + 1,
+                        None,
+                        Some(status),
+                        Some(diagnostic_class_for_status(
+                            status,
+                            safe_error == Some(SafeRemoteError::ContextLengthExceeded),
+                        )),
+                    );
+                }
+                return Err(match status {
+                    401 | 403 => ChatGptResponseError::Authentication(status),
+                    429 => ChatGptResponseError::RateLimited,
+                    500..=599 => ChatGptResponseError::Server,
+                    400..=499 if safe_error == Some(SafeRemoteError::ContextLengthExceeded) => {
+                        ChatGptResponseError::Other(HeadlessTurnPortError::ProviderContext)
+                    }
+                    400..=499 => ChatGptResponseError::Rejected,
+                    _ => ChatGptResponseError::Protocol,
+                });
             }
-            let safe_error =
-                read_safe_chatgpt_error(response, cancellation, self.failure_detail.as_ref())
-                    .await
-                    .map_err(ChatGptResponseError::Other)?;
+
+            let decoded = decode_http_response_stream(
+                response,
+                cancellation,
+                true,
+                self.progress.as_ref(),
+                HeadlessTurnPortError::ProviderProtocol,
+                true,
+                self.failure_detail.as_ref(),
+            )
+            .await;
+            if let Err(failure) = &decoded
+                && failure.is_resumable()
+                && policy.has_attempt_after(attempt)
+            {
+                wait_for_http_retry(
+                    cancellation,
+                    attempt,
+                    None,
+                    ScheduledRetry {
+                        diagnostics: self.diagnostics.as_ref(),
+                        component: ProviderDiagnosticComponent::Responses,
+                        class: ProviderDiagnosticClass::Network,
+                        status: None,
+                        policy,
+                    },
+                )
+                .await
+                .map_err(ChatGptResponseError::Other)?;
+                attempt += 1;
+                continue;
+            }
+            // A dropped connection is not the decoder's fault. Folding every
+            // stream failure but cancellation into `Protocol` reported a lost
+            // network as "ChatGPT response protocol failed" and logged it as a
+            // protocol class, which is the one class no retry logic can act on.
+            let result = decoded.map_err(|failure| match failure.into_port_error() {
+                error @ (HeadlessTurnPortError::Cancelled
+                | HeadlessTurnPortError::TimedOut
+                | HeadlessTurnPortError::ProviderNetwork) => ChatGptResponseError::Other(error),
+                _ => ChatGptResponseError::Protocol,
+            });
             if let Some(diagnostics) = &self.diagnostics {
+                let class = result.as_ref().err().map(|error| match error {
+                    ChatGptResponseError::Other(error) => diagnostic_class_for_port_error(*error),
+                    ChatGptResponseError::Authentication(_) => {
+                        ProviderDiagnosticClass::Authentication
+                    }
+                    ChatGptResponseError::Rejected => ProviderDiagnosticClass::Rejected,
+                    ChatGptResponseError::RateLimited => ProviderDiagnosticClass::RateLimited,
+                    ChatGptResponseError::Server => ProviderDiagnosticClass::Server,
+                    ChatGptResponseError::Protocol => ProviderDiagnosticClass::Protocol,
+                });
                 diagnostics.emit(
                     ProviderDiagnosticComponent::Responses,
                     ProviderDiagnosticKind::Terminal,
                     attempt + 1,
                     None,
-                    Some(status),
-                    Some(diagnostic_class_for_status(
-                        status,
-                        safe_error == Some(SafeRemoteError::ContextLengthExceeded),
-                    )),
+                    None,
+                    class,
                 );
             }
-            return Err(match status {
-                401 | 403 => ChatGptResponseError::Authentication(status),
-                429 => ChatGptResponseError::RateLimited,
-                500..=599 => ChatGptResponseError::Server,
-                400..=499 if safe_error == Some(SafeRemoteError::ContextLengthExceeded) => {
-                    ChatGptResponseError::Other(HeadlessTurnPortError::ProviderContext)
-                }
-                400..=499 => ChatGptResponseError::Rejected,
-                _ => ChatGptResponseError::Protocol,
-            });
+            return result;
         }
-
-        let result = decode_http_response_stream(
-            response,
-            cancellation,
-            true,
-            self.progress.as_ref(),
-            HeadlessTurnPortError::ProviderProtocol,
-            true,
-            self.failure_detail.as_ref(),
-        )
-        .await
-        .map_err(|error| match error {
-            HeadlessTurnPortError::Cancelled | HeadlessTurnPortError::TimedOut => {
-                ChatGptResponseError::Other(error)
-            }
-            _ => ChatGptResponseError::Protocol,
-        });
-        if let Some(diagnostics) = &self.diagnostics {
-            let class = result.as_ref().err().map(|error| match error {
-                ChatGptResponseError::Other(error) => diagnostic_class_for_port_error(*error),
-                ChatGptResponseError::Authentication(_) => ProviderDiagnosticClass::Authentication,
-                ChatGptResponseError::Rejected => ProviderDiagnosticClass::Rejected,
-                ChatGptResponseError::RateLimited => ProviderDiagnosticClass::RateLimited,
-                ChatGptResponseError::Server => ProviderDiagnosticClass::Server,
-                ChatGptResponseError::Protocol => ProviderDiagnosticClass::Protocol,
-            });
-            diagnostics.emit(
-                ProviderDiagnosticComponent::Responses,
-                ProviderDiagnosticKind::Terminal,
-                attempt + 1,
-                None,
-                None,
-                class,
-            );
-        }
-        result
     }
 
     async fn refresh_if_needed(
@@ -1423,6 +1516,7 @@ impl ChatGptResponsesProvider {
             .append_pair("grant_type", "refresh_token")
             .append_pair("refresh_token", refresh_token)
             .finish();
+        let policy = self.retry_policy;
         let mut attempt = 0;
         let mut last_transient_status = None;
         let mut saw_request_timeout = false;
@@ -1464,15 +1558,19 @@ impl ChatGptResponsesProvider {
                         attempt,
                         last_transient_status,
                         saw_request_timeout,
+                        policy,
                     ) {
                         wait_for_http_retry(
                             cancellation,
                             attempt,
                             None,
-                            self.diagnostics.as_ref(),
-                            ProviderDiagnosticComponent::OauthRefresh,
-                            ProviderDiagnosticClass::Network,
-                            None,
+                            ScheduledRetry {
+                                diagnostics: self.diagnostics.as_ref(),
+                                component: ProviderDiagnosticComponent::OauthRefresh,
+                                class: ProviderDiagnosticClass::Network,
+                                status: None,
+                                policy,
+                            },
                         )
                         .await?;
                         attempt += 1;
@@ -1482,18 +1580,21 @@ impl ChatGptResponsesProvider {
                 }
             };
             let status = response.status().as_u16();
-            if is_transient_http_status(status) && attempt + 1 < MAX_HTTP_STATUS_ATTEMPTS {
+            if is_transient_http_status(status) && policy.has_attempt_after(attempt) {
                 last_transient_status = Some(status);
-                let retry_after = retry_after_from_headers(response.headers());
+                let retry_after = retry_after_from_headers(response.headers(), policy);
                 drop(response);
                 wait_for_http_retry(
                     cancellation,
                     attempt,
                     retry_after,
-                    self.diagnostics.as_ref(),
-                    ProviderDiagnosticComponent::OauthRefresh,
-                    diagnostic_class_for_status(status, false),
-                    Some(status),
+                    ScheduledRetry {
+                        diagnostics: self.diagnostics.as_ref(),
+                        component: ProviderDiagnosticComponent::OauthRefresh,
+                        class: diagnostic_class_for_status(status, false),
+                        status: Some(status),
+                        policy,
+                    },
                 )
                 .await?;
                 attempt += 1;
@@ -1635,6 +1736,70 @@ impl ChatGptResponsesProvider {
     }
 }
 
+/// The budget one request may spend retrying a transient failure.
+///
+/// Held as a value rather than as constants so a test can compress the
+/// schedule. The production budget is measured in tens of seconds, which is
+/// the point of it: a rate-limit burst or a short upstream outage outlives any
+/// budget small enough for a test suite to sleep through.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RetryPolicy {
+    max_attempts: usize,
+    base_delay: Duration,
+    max_delay: Duration,
+    retry_after_cap: Duration,
+}
+
+impl RetryPolicy {
+    /// Panics when `max_attempts` is zero: a budget of no attempts describes a
+    /// request that is never sent, which no caller can want.
+    pub const fn new(
+        max_attempts: usize,
+        base_delay: Duration,
+        max_delay: Duration,
+        retry_after_cap: Duration,
+    ) -> Self {
+        assert!(max_attempts > 0, "a request needs at least one attempt");
+        Self {
+            max_attempts,
+            base_delay,
+            max_delay,
+            retry_after_cap,
+        }
+    }
+
+    pub const fn max_attempts(self) -> usize {
+        self.max_attempts
+    }
+
+    const fn has_attempt_after(self, attempt: usize) -> bool {
+        attempt + 1 < self.max_attempts
+    }
+}
+
+impl Default for RetryPolicy {
+    /// Doubling from one second to a thirty-second ceiling over eight
+    /// attempts: about a hundred seconds of transient failure a turn absorbs
+    /// without the user seeing it fail. The previous schedule spent under two
+    /// seconds, which is shorter than most of the waits a provider asks for.
+    fn default() -> Self {
+        Self::new(
+            8,
+            Duration::from_secs(1),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+        )
+    }
+}
+
+/// Narrows an attempt budget to what a diagnostic event can carry. A budget
+/// beyond `u8::MAX` is reported as unknown rather than as a wrong ceiling: a
+/// reader comparing `attempt` against a clamped maximum would watch the count
+/// pass it.
+fn attempt_budget(max_attempts: usize) -> u8 {
+    u8::try_from(max_attempts).unwrap_or(0)
+}
+
 fn is_transient_http_status(status: u16) -> bool {
     status == 408 || status == 429 || (500..=599).contains(&status)
 }
@@ -1650,14 +1815,25 @@ fn is_transient_transport_error(error: &reqwest::Error) -> bool {
     error.is_connect() || error.is_request()
 }
 
+/// Decides whether a transport failure earns another attempt.
+///
+/// Connection failures used to be exempt from the attempt budget: a host that
+/// never answered was retried roughly once a second forever, and the only
+/// surface that said so was the diagnostics file. An interactive turn has no
+/// deadline of its own, so a dropped VPN became a spinner that outlived the
+/// user's patience. Every class now spends the same budget.
 fn should_retry_transport_error(
     error: &reqwest::Error,
     attempt: usize,
     last_transient_status: Option<u16>,
     saw_request_timeout: bool,
+    policy: RetryPolicy,
 ) -> bool {
+    if !policy.has_attempt_after(attempt) {
+        return false;
+    }
     if error.is_timeout() {
-        return attempt + 1 < MAX_HTTP_STATUS_ATTEMPTS;
+        return true;
     }
     !saw_request_timeout && last_transient_status.is_none() && is_transient_transport_error(error)
 }
@@ -1702,29 +1878,93 @@ fn diagnostic_class_for_port_error(error: HeadlessTurnPortError) -> ProviderDiag
     }
 }
 
-fn parse_retry_after(value: Option<&str>) -> Option<Duration> {
-    let seconds = value?.trim().parse::<u64>().ok()?;
-    Some(Duration::from_secs(seconds).min(HTTP_RETRY_AFTER_CAP))
+/// The date format `Retry-After` is specified to carry.
+///
+/// RFC 9110 requires IMF-fixdate from every sender, so the two obsolete
+/// formats a recipient may still accept are not parsed here: a value in either
+/// falls back to the exponential schedule, the same outcome as a response that
+/// named no delay at all.
+const IMF_FIXDATE: &str =
+    "[weekday repr:short], [day] [month repr:short] [year] [hour]:[minute]:[second] GMT";
+
+fn imf_fixdate_format() -> &'static [time::format_description::BorrowedFormatItem<'static>] {
+    static FORMAT: OnceLock<Vec<time::format_description::BorrowedFormatItem<'static>>> =
+        OnceLock::new();
+    FORMAT.get_or_init(|| {
+        time::format_description::parse_borrowed::<2>(IMF_FIXDATE)
+            .expect("the IMF-fixdate format description is valid")
+    })
 }
 
-fn retry_after_from_headers(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
-    parse_retry_after(
+/// Reads a `Retry-After` value in any of the forms a provider actually sends.
+///
+/// Whole seconds, fractional seconds and an HTTP date all occur, and the
+/// previous parser accepted only the first: a `429` answered with
+/// `Retry-After: 0.5`, or with a date, was indistinguishable from one that
+/// named no delay, so the client waited its own backoff and asked again on its
+/// own schedule instead of the one it was given.
+///
+/// A non-positive delay yields `None` rather than zero. A date already in the
+/// past says nothing about when the next attempt should go out, and honouring
+/// it literally would spend the whole attempt budget in one burst.
+fn parse_retry_after(value: Option<&str>, now: SystemTime, cap: Duration) -> Option<Duration> {
+    let value = value?.trim();
+
+    let delay = match value.parse::<f64>() {
+        Ok(seconds) => Duration::try_from_secs_f64(seconds).ok()?,
+        Err(_) => SystemTime::from(
+            time::PrimitiveDateTime::parse(value, imf_fixdate_format())
+                .ok()?
+                .assume_utc(),
+        )
+        .duration_since(now)
+        .ok()?,
+    };
+
+    (!delay.is_zero()).then(|| delay.min(cap))
+}
+
+/// Reads `retry-after-ms`, the millisecond header OpenAI sends beside the
+/// standard one. It wins when both are present: it is the more precise of the
+/// two, and a provider that sends it means it.
+fn parse_retry_after_ms(value: Option<&str>, cap: Duration) -> Option<Duration> {
+    let milliseconds = value?.trim().parse::<f64>().ok()?;
+    let delay = Duration::try_from_secs_f64(milliseconds / 1000.0).ok()?;
+
+    (!delay.is_zero()).then(|| delay.min(cap))
+}
+
+fn retry_after_from_headers(
+    headers: &reqwest::header::HeaderMap,
+    policy: RetryPolicy,
+) -> Option<Duration> {
+    let header = |name: &str| {
         headers
-            .get(reqwest::header::RETRY_AFTER)
-            .and_then(|value| value.to_str().ok()),
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+    };
+
+    parse_retry_after_ms(header("retry-after-ms").as_deref(), policy.retry_after_cap).or_else(
+        || {
+            parse_retry_after(
+                header("retry-after").as_deref(),
+                SystemTime::now(),
+                policy.retry_after_cap,
+            )
+        },
     )
 }
 
-fn http_retry_delay(retry: usize, retry_after: Option<Duration>) -> Duration {
+fn http_retry_delay(retry: usize, retry_after: Option<Duration>, policy: RetryPolicy) -> Duration {
     if let Some(retry_after) = retry_after {
         return retry_after;
     }
 
-    let base = if retry == 0 {
-        HTTP_RETRY_FIRST_DELAY
-    } else {
-        HTTP_RETRY_SECOND_DELAY
-    };
+    let base = policy
+        .base_delay
+        .saturating_mul(1u32 << retry.min(16))
+        .min(policy.max_delay);
     let sequence = RETRY_JITTER_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let jitter = Duration::from_millis(
         (sequence.wrapping_mul(17) + retry as u64 * 13) % (HTTP_RETRY_MAX_JITTER + 1),
@@ -1732,20 +1972,35 @@ fn http_retry_delay(retry: usize, retry_after: Option<Duration>) -> Duration {
     base.saturating_add(jitter)
 }
 
+/// What a scheduled retry needs to record itself: where it came from, why, and
+/// against which budget it counts.
+pub(crate) struct ScheduledRetry<'a> {
+    pub(crate) diagnostics: Option<&'a ProviderDiagnostics>,
+    pub(crate) component: ProviderDiagnosticComponent,
+    pub(crate) class: ProviderDiagnosticClass,
+    pub(crate) status: Option<u16>,
+    pub(crate) policy: RetryPolicy,
+}
+
 async fn wait_for_http_retry(
     cancellation: &HeadlessTurnCancellation,
     retry: usize,
     retry_after: Option<Duration>,
-    diagnostics: Option<&ProviderDiagnostics>,
-    component: ProviderDiagnosticComponent,
-    class: ProviderDiagnosticClass,
-    status: Option<u16>,
+    scheduled: ScheduledRetry<'_>,
 ) -> Result<(), HeadlessTurnPortError> {
+    let ScheduledRetry {
+        diagnostics,
+        component,
+        class,
+        status,
+        policy,
+    } = scheduled;
+
     if let Err(error) = stop_before_mapping(cancellation) {
         emit_retry_terminal(diagnostics, component, retry, status, error);
         return Err(error);
     }
-    let delay = http_retry_delay(retry, retry_after);
+    let delay = http_retry_delay(retry, retry_after, policy);
     if let Some(diagnostics) = diagnostics {
         diagnostics.emit(
             component,
@@ -2355,6 +2610,37 @@ fn bounded_tool_output(content: &str) -> String {
     bounded_detail(content, MAX_TOOL_OUTPUT_CHARS)
 }
 
+/// A response stream that failed after its headers were accepted.
+///
+/// It carries whether the request may simply be sent again. Re-sending is only
+/// honest while nothing has reached the user: the decoded parts are handed to
+/// the progress sink as they arrive, so a second attempt after the first has
+/// streamed text would append that text twice. A cut that happens before any
+/// part is decoded costs nothing to repeat, and that is the shape almost every
+/// truncated stream takes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StreamFailure {
+    error: HeadlessTurnPortError,
+    surfaced_output: bool,
+}
+
+impl StreamFailure {
+    const fn new(error: HeadlessTurnPortError, surfaced_output: bool) -> Self {
+        Self {
+            error,
+            surfaced_output,
+        }
+    }
+
+    const fn is_resumable(self) -> bool {
+        !self.surfaced_output && matches!(self.error, HeadlessTurnPortError::ProviderNetwork)
+    }
+
+    const fn into_port_error(self) -> HeadlessTurnPortError {
+        self.error
+    }
+}
+
 /// Classifies a failed body read while a response stream is still open.
 ///
 /// A stalled or dropped connection is a transport fault, not a malformed
@@ -2398,43 +2684,93 @@ async fn decode_http_response_stream(
     protocol_failure: HeadlessTurnPortError,
     finish_on_terminal: bool,
     failure_detail: Option<&ProviderFailureDetail>,
-) -> Result<DecodedResponse, HeadlessTurnPortError> {
+) -> Result<DecodedResponse, StreamFailure> {
     let mut decoder =
         OpenAiResponseDecoder::new(require_encrypted_reasoning, failure_detail.cloned());
     let mut frame = Vec::new();
+    // A reader that does not finish on the terminal event carries a rejected
+    // frame to the end of the body rather than failing on it, so by the time
+    // the stream runs out the rejection is the only thing separating a
+    // malformed response from a truncated one.
+    let mut rejected_frame = false;
+
+    // Every exit has to report whether the decoder produced anything, and a
+    // helper closure cannot: it would hold `decoder` borrowed across the code
+    // that decodes into it.
+    macro_rules! fail {
+        ($error:expr) => {
+            return Err(StreamFailure::new($error, !decoder.parts.is_empty()))
+        };
+    }
 
     loop {
         let next_chunk = tokio::select! {
             chunk = response.chunk() => {
-                stop_before_mapping(cancellation)?;
-                chunk.map_err(|error| stream_read_failure(&error, protocol_failure))?
+                if let Err(stop) = stop_before_mapping(cancellation) {
+                    fail!(stop);
+                }
+                match chunk {
+                    Ok(chunk) => chunk,
+                    Err(error) => fail!(stream_read_failure(&error, protocol_failure)),
+                }
             }
-            stop = wait_for_stop(cancellation) => return Err(stop),
+            stop = wait_for_stop(cancellation) => fail!(stop),
         };
         let Some(chunk) = next_chunk else {
-            let completed = decoder.finish();
-            stop_before_mapping(cancellation)?;
-            return completed.map_err(|_| protocol_failure);
+            if let Err(stop) = stop_before_mapping(cancellation) {
+                fail!(stop);
+            }
+            let surfaced_output = !decoder.parts.is_empty();
+            return decoder.finish().map_err(|_| {
+                // A body that runs out before its terminal event was cut, not
+                // malformed: nothing the decoder read was wrong, there was
+                // simply less of it than the protocol promises. Calling that a
+                // protocol failure both blamed the decoder and made the one
+                // recoverable stream fault indistinguishable from the fatal
+                // ones.
+                let error = if rejected_frame {
+                    protocol_failure
+                } else {
+                    HeadlessTurnPortError::ProviderNetwork
+                };
+                StreamFailure::new(error, surfaced_output)
+            });
         };
 
         for byte in chunk {
             if byte == b'\n' {
                 let processed = process_sse_frame(&mut decoder, &mut frame, progress);
-                stop_before_mapping(cancellation)?;
-                if finish_on_terminal && processed.map_err(|_| protocol_failure)? {
-                    return decoder.finish().map_err(|_| protocol_failure);
+                if let Err(stop) = stop_before_mapping(cancellation) {
+                    fail!(stop);
                 }
-                continue;
+                match processed {
+                    Ok(terminal) if finish_on_terminal && terminal => {
+                        let surfaced_output = !decoder.parts.is_empty();
+                        return decoder
+                            .finish()
+                            .map_err(|_| StreamFailure::new(protocol_failure, surfaced_output));
+                    }
+                    Ok(_) => continue,
+                    Err(()) if finish_on_terminal => fail!(protocol_failure),
+                    Err(()) => {
+                        rejected_frame = true;
+                        continue;
+                    }
+                }
             }
 
             if frame.len() == MAX_SSE_FRAME_BYTES {
-                stop_before_mapping(cancellation)?;
-                return Err(protocol_failure);
+                if let Err(stop) = stop_before_mapping(cancellation) {
+                    fail!(stop);
+                }
+                fail!(protocol_failure);
             }
             frame.push(byte);
         }
 
-        stop_before_mapping(cancellation)?;
+        if let Err(stop) = stop_before_mapping(cancellation) {
+            fail!(stop);
+        }
     }
 }
 
@@ -4315,29 +4651,116 @@ mod tests {
         assert!(validate_chatgpt_replay_history(&[oversized]).is_err());
     }
 
+    /// The schedule is what decides whether a rate-limit burst outlives the
+    /// turn, so it is asserted as a whole rather than at its first two steps:
+    /// every delay doubles, the ceiling holds, and jitter never escapes the
+    /// step it belongs to.
     #[test]
-    fn retry_backoff_uses_practical_bounded_delays() {
-        for _ in 0..32 {
-            let first = http_retry_delay(0, None);
-            assert!(first >= Duration::from_millis(250));
-            assert!(first <= Duration::from_millis(350));
+    fn retry_backoff_doubles_up_to_its_ceiling() {
+        let policy = RetryPolicy::default();
+        let expected = [1, 2, 4, 8, 16, 30, 30];
+        let mut total = Duration::ZERO;
 
-            let second = http_retry_delay(1, None);
-            assert!(second >= Duration::from_secs(1));
-            assert!(second <= Duration::from_millis(1_100));
+        for (retry, seconds) in expected.into_iter().enumerate() {
+            for _ in 0..8 {
+                let delay = http_retry_delay(retry, None, policy);
+                assert!(delay >= Duration::from_secs(seconds), "{retry}: {delay:?}");
+                assert!(
+                    delay
+                        <= Duration::from_secs(seconds)
+                            + Duration::from_millis(HTTP_RETRY_MAX_JITTER),
+                    "{retry}: {delay:?}"
+                );
+            }
+            total += Duration::from_secs(seconds);
         }
+
+        assert_eq!(policy.max_attempts(), expected.len() + 1);
+        assert!(total >= Duration::from_secs(90), "{total:?}");
     }
 
     #[test]
-    fn numeric_retry_after_is_capped_and_invalid_values_are_ignored() {
-        assert_eq!(parse_retry_after(Some("2")), Some(Duration::from_secs(2)));
-        assert_eq!(parse_retry_after(Some("12")), Some(Duration::from_secs(5)));
-        assert_eq!(parse_retry_after(Some("1.5")), None);
+    fn a_retry_after_delay_replaces_the_backoff_it_was_sent_instead_of() {
+        let policy = RetryPolicy::default();
+
         assert_eq!(
-            parse_retry_after(Some("Wed, 21 Oct 2015 07:28:00 GMT")),
-            None
+            http_retry_delay(3, Some(Duration::from_secs(7)), policy),
+            Duration::from_secs(7)
         );
-        assert_eq!(parse_retry_after(None), None);
+    }
+
+    #[test]
+    fn retry_after_is_read_as_seconds_fractions_or_an_http_date() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_445_412_480);
+        let cap = Duration::from_secs(60);
+        let read = |value: &str| parse_retry_after(Some(value), now, cap);
+
+        assert_eq!(read("2"), Some(Duration::from_secs(2)));
+        assert_eq!(read("  2  "), Some(Duration::from_secs(2)));
+        assert_eq!(read("1.5"), Some(Duration::from_millis(1_500)));
+        assert_eq!(read("0.25"), Some(Duration::from_millis(250)));
+        assert_eq!(
+            read("Wed, 21 Oct 2015 07:29:00 GMT"),
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(
+            read("Wed, 21 Oct 2015 07:28:30 GMT"),
+            Some(Duration::from_secs(30))
+        );
+    }
+
+    /// A cap the client applies is the one thing standing between a provider's
+    /// `Retry-After` and a turn that sits still for an hour.
+    #[test]
+    fn an_oversized_retry_after_is_capped_and_a_useless_one_is_ignored() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_445_412_480);
+        let cap = Duration::from_secs(60);
+        let read = |value: Option<&str>| parse_retry_after(value, now, cap);
+
+        assert_eq!(read(Some("3600")), Some(cap));
+        assert_eq!(read(Some("Wed, 21 Oct 2015 08:28:00 GMT")), Some(cap));
+        assert_eq!(read(Some("Wed, 21 Oct 2015 07:27:00 GMT")), None);
+        assert_eq!(read(Some("0")), None);
+        assert_eq!(read(Some("-5")), None);
+        assert_eq!(read(Some("soon")), None);
+        assert_eq!(read(Some("")), None);
+        assert_eq!(read(None), None);
+    }
+
+    #[test]
+    fn retry_after_ms_is_read_in_milliseconds_and_capped() {
+        let cap = Duration::from_secs(60);
+
+        assert_eq!(
+            parse_retry_after_ms(Some("1500"), cap),
+            Some(Duration::from_millis(1_500))
+        );
+        assert_eq!(parse_retry_after_ms(Some("120000"), cap), Some(cap));
+        assert_eq!(parse_retry_after_ms(Some("0"), cap), None);
+        assert_eq!(parse_retry_after_ms(Some("later"), cap), None);
+        assert_eq!(parse_retry_after_ms(None, cap), None);
+    }
+
+    /// `retry-after-ms` wins because it is the more precise of the two, and a
+    /// provider that sends both means the finer one.
+    #[test]
+    fn the_millisecond_header_wins_over_the_second_one() {
+        let policy = RetryPolicy::default();
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("retry-after", "30".parse().expect("header value is valid"));
+        assert_eq!(
+            retry_after_from_headers(&headers, policy),
+            Some(Duration::from_secs(30))
+        );
+
+        headers.insert(
+            "retry-after-ms",
+            "1500".parse().expect("header value is valid"),
+        );
+        assert_eq!(
+            retry_after_from_headers(&headers, policy),
+            Some(Duration::from_millis(1_500))
+        );
     }
 
     #[test]
@@ -4395,6 +4818,7 @@ mod tests {
             session_id: String::new(),
             client: reqwest::Client::new(),
             operation_timeout: Duration::from_secs(1),
+            retry_policy: RetryPolicy::default(),
             tools: Vec::new(),
             parallel_tool_calls: false,
             state: ChatGptContinuationState::Initial,
