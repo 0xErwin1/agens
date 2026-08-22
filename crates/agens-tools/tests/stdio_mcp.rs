@@ -285,6 +285,31 @@ fn stdio_transport_keeps_the_server_after_a_cancelled_call() {
     );
 }
 
+/// JSON-RPC requires the id to come back with its type intact, and servers
+/// send `"3"` for our `3` anyway. The digits identify the request, so the
+/// string form of a number this client sent is read as that number; a string
+/// that is not one of its numbers still answers nothing it sent.
+#[test]
+fn stdio_transport_accepts_a_response_id_a_server_stringified() {
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let mut stringified = client("id-string", OVER_ANY_FRAMING_COST);
+    stringified.connect(initialize(), &cancellation).unwrap();
+    assert_eq!(stringified.list_tools(&cancellation).unwrap().len(), 2);
+    assert_eq!(
+        stringified
+            .call_tool("first", json!({}), &cancellation)
+            .unwrap()
+            .content,
+        "tool succeeded"
+    );
+
+    let mut foreign = client("id-text", OVER_ANY_FRAMING_COST);
+    assert!(matches!(
+        foreign.call_tool("first", json!({}), &cancellation),
+        Err(McpTransportError::Protocol(_))
+    ));
+}
+
 /// A stdio server that dies mid-turn used to leave the registry holding a dead
 /// client and a `Ready` status, with `/mcp reload` explicitly skipping it: the
 /// only exit was restarting agens. The registry now rebuilds the connection in

@@ -156,10 +156,13 @@ fn main() {
             );
             let _ = stdout.flush();
         }
-        let response_id = if mode == "id-mismatch" {
-            json!(999)
-        } else {
-            id
+        let response_id = match mode.as_str() {
+            "id-mismatch" => json!(999),
+            // The id this client sent, echoed back as a string: out of spec,
+            // and what several real servers do.
+            "id-string" => json!(id.to_string()),
+            "id-text" => json!("not-a-number"),
+            _ => id,
         };
         let response = match request.get("method").and_then(Value::as_str) {
             Some("initialize") => {
