@@ -20,8 +20,8 @@ mod prompt_memory;
 mod session_writer;
 pub use compaction::{CompactionStore, CompactionStoreError, StoredCompaction};
 pub use control_plane::{
-    AttemptOutcome, AttemptRow, CausalDisposition, ControlPlaneError, ControlPlaneStore,
-    EventClass, EventRow, EvidenceClass, FindingRow, ProviderRow, QuestionAnswer, QuestionAuthor,
+    AttemptOutcome, AttemptRow, CausalDisposition, CheckpointWrite, ControlPlaneError,
+    ControlPlaneStore, EventClass, EventRow, EvidenceClass, FindingRow, ProviderRow, QuestionAnswer, QuestionAuthor,
     QuestionChange, QuestionKind, QuestionRow, QuestionState, QuotaState, RetryTrigger,
     RunHealthRow, RunRow, RunState, StateChange, TransitionOutcome, TransitionWrite,
     WorktreeStatus,
