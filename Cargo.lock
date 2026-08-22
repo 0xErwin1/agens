@@ -225,6 +225,7 @@ dependencies = [
  "agens-core",
  "agens-store",
  "libc",
+ "rusqlite",
  "serde_json",
  "tokio",
 ]

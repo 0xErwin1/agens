@@ -7,6 +7,7 @@
 
 mod blocking;
 mod fsm;
+mod ingest;
 mod instance;
 mod sessions;
 
@@ -23,6 +24,11 @@ pub use fsm::{
     RunTransition, RunTrigger, StateMachines, TransitionOutcome, TransitionRejection,
     WORKTREE_TRANSITIONS, WorktreeEffect, WorktreeFacts, WorktreeGuard, WorktreeTransition,
     WorktreeTrigger,
+};
+pub use ingest::{
+    AcceptedFact, CheckpointClaim, CheckpointStanding, DrainedFact, FactReceiver, FactSender,
+    HealthSignal, HealthThresholds, Ingest, IngestFact, IngestRejection, LostReason,
+    ReportedCheckpoint, ReportedFact, channel as ingest_channel, detect_worker_lost,
 };
 pub use instance::{ServeInstance, ServeInstanceError};
 pub use sessions::{
