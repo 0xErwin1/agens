@@ -15,7 +15,7 @@ use std::{
 use agens_core::HeadlessTurnCancellation;
 use agens_server::{
     Daemon, SessionAdmission, SessionBudget, SessionId, SessionOutcome, SessionProvider,
-    SessionRuntime, SessionState, SessionSupervisor,
+    SessionRuntime, SessionShutdown, SessionState, SessionSupervisor,
 };
 
 static NEXT_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
@@ -97,7 +97,7 @@ fn wait_until(mut condition: impl FnMut() -> bool, what: &str) {
 struct RunningDaemon {
     sessions: SessionSupervisor,
     shutdown: HeadlessTurnCancellation,
-    daemon: Option<thread::JoinHandle<()>>,
+    daemon: Option<thread::JoinHandle<SessionShutdown>>,
     directory: PathBuf,
 }
 
@@ -130,7 +130,12 @@ impl Drop for RunningDaemon {
     fn drop(&mut self) {
         self.shutdown.cancel();
         if let Some(daemon) = self.daemon.take() {
-            daemon.join().unwrap();
+            let shutdown = daemon.join().unwrap();
+            assert!(
+                shutdown.is_clean(),
+                "the daemon left sessions behind: {:?}",
+                shutdown.abandoned
+            );
         }
         let _ = fs::remove_dir_all(&self.directory);
     }
@@ -254,7 +259,10 @@ fn shutdown_cancels_every_live_session() {
 
     let running = thread::spawn(move || daemon.run_until_shutdown(&daemon_shutdown));
     shutdown.cancel();
-    running.join().unwrap();
+    let report = running.join().unwrap();
+
+    assert!(report.is_clean(), "a session outlived the daemon's wait");
+    assert_eq!(report.stopped, vec![SessionId::new(1), SessionId::new(2)]);
 
     for session in [1, 2] {
         assert_eq!(
@@ -305,5 +313,38 @@ fn a_session_that_panics_is_recorded_as_failed_and_its_peer_keeps_running() {
     wait_until(
         || daemon.state(3) == SessionState::Finished(SessionOutcome::Cancelled),
         "the surviving session to end",
+    );
+}
+
+/// `release` had no production caller, which is how the registry came to grow
+/// for the life of the daemon. A finished session has to leave it.
+#[test]
+fn a_session_that_ran_to_completion_is_released_from_the_registry() {
+    let daemon = RunningDaemon::start();
+    let live_providers = Arc::new(AtomicUsize::new(0));
+
+    daemon
+        .sessions
+        .start(admission(21, "model-a", &live_providers), |_| {
+            SessionOutcome::Completed
+        })
+        .unwrap();
+    wait_until(
+        || daemon.state(21) == SessionState::Finished(SessionOutcome::Completed),
+        "the session to end",
+    );
+
+    daemon
+        .sessions
+        .registry()
+        .release(SessionId::new(21))
+        .unwrap();
+
+    assert!(daemon.sessions.status(SessionId::new(21)).is_none());
+    assert!(daemon.sessions.list().is_empty());
+    assert_eq!(
+        live_providers.load(Ordering::Acquire),
+        0,
+        "a provider client outlived the session that owned it"
     );
 }
