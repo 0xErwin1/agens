@@ -13,3 +13,4 @@ agens-bootstrap = { path = "../agens-bootstrap" }
 agens-error = { path = "../agens-error" }
 agens-models = { path = "../agens-models" }
 agens-tools = { path = "../agens-tools" }
+serde_json = "1"
