@@ -20,6 +20,10 @@ use serde_json::json;
 /// assert which failure a mode produces rather than how long it takes.
 const OVER_ANY_FRAMING_COST: Duration = Duration::from_secs(30);
 
+/// Long enough that a reconnect running to its own budget is unmistakable
+/// next to one that stops at the caller's cancellation.
+const RECONNECT_BUDGET: Duration = Duration::from_secs(10);
+
 fn transport(mode: &str) -> McpStdioTransport {
     McpStdioTransport::spawn(McpStdioTransportConfig {
         command: PathBuf::from(env!("CARGO_BIN_EXE_fake-mcp-child")),
@@ -249,6 +253,63 @@ fn stdio_transport_survives_a_protocol_irregularity_on_a_tool_call() {
     );
 }
 
+/// Cancelling a call used to cost the whole server: the pending id was
+/// abandoned by killing the process group, so the next call paid a full
+/// reconnect for a process that was still perfectly able to answer. The id is
+/// abandoned on its own now.
+#[test]
+fn stdio_transport_keeps_the_server_after_a_cancelled_call() {
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let mut client = client("call-slow-once", OVER_ANY_FRAMING_COST);
+    client.connect(initialize(), &cancellation).unwrap();
+
+    let signal = Arc::clone(&cancellation);
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(10));
+        signal.store(true, Ordering::Release);
+    });
+    assert_eq!(
+        client.call_tool("first", json!({}), &cancellation),
+        Err(McpTransportError::Cancelled)
+    );
+
+    // The same process, reached over the same pipe: the answer to the
+    // abandoned id is walked past rather than mistaken for this one.
+    cancellation.store(false, Ordering::Release);
+    assert_eq!(
+        client
+            .call_tool("first", json!({}), &cancellation)
+            .unwrap()
+            .content,
+        "tool succeeded"
+    );
+}
+
+/// JSON-RPC requires the id to come back with its type intact, and servers
+/// send `"3"` for our `3` anyway. The digits identify the request, so the
+/// string form of a number this client sent is read as that number; a string
+/// that is not one of its numbers still answers nothing it sent.
+#[test]
+fn stdio_transport_accepts_a_response_id_a_server_stringified() {
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let mut stringified = client("id-string", OVER_ANY_FRAMING_COST);
+    stringified.connect(initialize(), &cancellation).unwrap();
+    assert_eq!(stringified.list_tools(&cancellation).unwrap().len(), 2);
+    assert_eq!(
+        stringified
+            .call_tool("first", json!({}), &cancellation)
+            .unwrap()
+            .content,
+        "tool succeeded"
+    );
+
+    let mut foreign = client("id-text", OVER_ANY_FRAMING_COST);
+    assert!(matches!(
+        foreign.call_tool("first", json!({}), &cancellation),
+        Err(McpTransportError::Protocol(_))
+    ));
+}
+
 /// A stdio server that dies mid-turn used to leave the registry holding a dead
 /// client and a `Ready` status, with `/mcp reload` explicitly skipping it: the
 /// only exit was restarting agens. The registry now rebuilds the connection in
@@ -355,6 +416,65 @@ fn registry_notices_a_stdio_server_that_died_between_calls() {
             "tool succeeded"
         );
     }
+}
+
+/// A reconnect a call triggers spends that call's budget: a connect timeout
+/// plus one list timeout per page. It used to run under the handle the
+/// registry holds for the life of the daemon, so neither the user's Esc nor
+/// the tool deadline reached it.
+#[test]
+fn registry_reconnect_answers_to_the_cancellation_of_the_call_that_triggered_it() {
+    let command = PathBuf::from(env!("CARGO_BIN_EXE_fake-mcp-child"));
+    let project_root = std::env::current_dir().unwrap();
+    let spawned = Arc::new(AtomicUsize::new(0));
+
+    let mut registry = agens_tools::McpRegistry::new();
+    registry
+        .configure_server(
+            "files",
+            move || {
+                // The first process answers discovery and dies on the call
+                // that follows it; the one the reconnect starts holds
+                // `initialize` far past every budget in this test.
+                let mode = if spawned.fetch_add(1, Ordering::Relaxed) == 0 {
+                    "call-crash"
+                } else {
+                    "sleep"
+                };
+                McpStdioTransport::spawn(McpStdioTransportConfig {
+                    command: command.clone(),
+                    args: vec![mode.into()],
+                    environment: BTreeMap::new(),
+                    project_root: project_root.clone(),
+                })
+                .map(|transport| Box::new(transport) as Box<dyn McpTransport>)
+            },
+            McpTimeouts::new(RECONNECT_BUDGET, RECONNECT_BUDGET, Duration::from_secs(2)).unwrap(),
+            McpLimits::new(4, 4).unwrap(),
+        )
+        .unwrap();
+    assert!(!registry.discover_server("files").is_failed());
+
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let signal = Arc::clone(&cancellation);
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(50));
+        signal.store(true, Ordering::Release);
+    });
+
+    let started = Instant::now();
+    let result = registry.call_tool(
+        "files::first",
+        json!({}),
+        &agens_tools::ToolExecutionContext::new(Arc::clone(&cancellation), OVER_ANY_FRAMING_COST),
+    );
+
+    assert!(result.is_err());
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < RECONNECT_BUDGET / 2,
+        "the reconnect ran to its own budget instead of stopping at the cancellation: {elapsed:?}"
+    );
 }
 
 #[test]
@@ -588,6 +708,14 @@ fn stdio_transport_reaps_process_group_descendants_after_timeout_cancellation_an
             ),
             "{mode}: {result:?}"
         );
+        if cancel {
+            // Cancelling abandons the pending id, not the process group: the
+            // server is still there for the next call, and its descendant
+            // goes when the transport itself does.
+            let mut transport = client.into_transport();
+            assert!(transport.is_alive(), "{mode}");
+            drop(transport);
+        }
         assert_no_orphan(descendant, mode);
     }
 }

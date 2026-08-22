@@ -59,6 +59,9 @@ fn main() {
 
     let stdin = io::stdin();
     let mut stdout = io::stdout();
+    // Held across iterations so a mode can make only the first tool call slow
+    // and answer the rest at once, from the same process.
+    let mut slow_call_pending = mode == "call-slow-once";
     for line in stdin.lock().lines() {
         let request: Value =
             match line.and_then(|line| serde_json::from_str(&line).map_err(io::Error::other)) {
@@ -153,10 +156,13 @@ fn main() {
             );
             let _ = stdout.flush();
         }
-        let response_id = if mode == "id-mismatch" {
-            json!(999)
-        } else {
-            id
+        let response_id = match mode.as_str() {
+            "id-mismatch" => json!(999),
+            // The id this client sent, echoed back as a string: out of spec,
+            // and what several real servers do.
+            "id-string" => json!(id.to_string()),
+            "id-text" => json!("not-a-number"),
+            _ => id,
         };
         let response = match request.get("method").and_then(Value::as_str) {
             Some("initialize") => {
@@ -222,6 +228,10 @@ fn main() {
                 }
                 if mode == "call-sleep" {
                     std::thread::sleep(std::time::Duration::from_secs(5));
+                }
+                if slow_call_pending {
+                    slow_call_pending = false;
+                    std::thread::sleep(std::time::Duration::from_millis(300));
                 }
                 json!({"jsonrpc":"2.0","id":response_id,"result":{"content":[{"type":"text","text":"tool succeeded"}]}})
             }

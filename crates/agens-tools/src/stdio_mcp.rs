@@ -32,9 +32,10 @@ const MIN_CONFIGURED_SECRET_CHARS: usize = 8;
 ///
 /// This is a memory ceiling, not the model's budget: a legitimate result can
 /// be megabytes (a base64 screenshot, a whole file), and what actually reaches
-/// the model is truncated later by `map_call_result`. A frame past this
-/// ceiling is drained to its newline so the stream stays aligned, and the call
-/// fails as a protocol irregularity without taking the server down with it.
+/// the model is truncated later by `map_call_result`. Draining a frame past
+/// this ceiling would mean blocking on bytes this client has already decided
+/// not to keep, and they may never end in a newline at all, so the call fails
+/// as a protocol irregularity and the stream is retired instead.
 pub const MAX_MCP_FRAME_BYTES: usize = 8 * 1024 * 1024;
 const MAX_STDERR_BYTES: usize = 64 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(2);
@@ -234,15 +235,11 @@ impl McpStdioTransport {
                         }
                         return result;
                     }
-                    Err(primary) => {
-                        let _ = self.terminate();
-                        return Err(primary);
-                    }
+                    Err(primary) => return self.give_up(primary),
                 },
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     if let Err(primary) = context.check() {
-                        let _ = self.terminate();
-                        return Err(primary);
+                        return self.give_up(primary);
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -252,6 +249,24 @@ impl McpStdioTransport {
                 }
             }
         }
+    }
+
+    /// Ends a request whose caller stopped waiting for it.
+    ///
+    /// Cancellation abandons the pending id and nothing else. The server is
+    /// healthy and will answer, and `frame_routing` walks past every id below
+    /// the pending one, so the next call reaches the same process instead of
+    /// paying for a reconnect nobody needed.
+    ///
+    /// A deadline is different evidence: the server did not answer inside its
+    /// budget. Abandoning that id would leave the reader holding the stdout
+    /// lock for every later call while `is_alive` still reports a healthy
+    /// server, so nothing would ever rebuild the connection. The process goes.
+    fn give_up<T>(&self, primary: McpTransportError) -> Result<T, McpTransportError> {
+        if matches!(primary, McpTransportError::TimedOut) {
+            let _ = self.terminate();
+        }
+        Err(primary)
     }
 
     fn write_frame(
@@ -431,11 +446,26 @@ fn frame_routing(frame: &Value, expected_id: u64) -> FrameRouting {
     }
     match object.get("id") {
         None | Some(Value::Null) => FrameRouting::Skipped,
-        Some(id) => match id.as_u64() {
+        Some(id) => match response_id(id) {
             Some(id) if id == expected_id => FrameRouting::Response,
             Some(id) if id < expected_id => FrameRouting::Skipped,
             _ => FrameRouting::Invalid,
         },
+    }
+}
+
+/// Reads the id of a response frame in the numbering this client sent.
+///
+/// JSON-RPC requires a server to echo the id it was given, unchanged and with
+/// its type intact, so `"3"` for our `3` is out of spec. Servers send it
+/// anyway, and the digits identify the request past any doubt, so the string
+/// form of a number this client sent counts as that number. An id that is
+/// neither answers no request of ours.
+fn response_id(id: &Value) -> Option<u64> {
+    match id {
+        Value::Number(_) => id.as_u64(),
+        Value::String(text) => text.parse().ok(),
+        _ => None,
     }
 }
 
@@ -514,8 +544,7 @@ fn wait_for_write(
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 if let Err(primary) = context.check() {
-                    let _ = transport.terminate();
-                    return Err(primary);
+                    return transport.give_up(primary);
                 }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -536,7 +565,7 @@ pub(crate) fn parse_response(
         .as_object()
         .ok_or_else(|| McpTransportError::Protocol("MCP response must be an object".into()))?;
     if object.get("jsonrpc") != Some(&Value::String("2.0".into()))
-        || object.get("id").and_then(Value::as_u64) != Some(expected_id)
+        || object.get("id").and_then(response_id) != Some(expected_id)
     {
         return Err(McpTransportError::Protocol(
             "MCP response id does not match request".into(),
