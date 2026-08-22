@@ -26,6 +26,7 @@ crates/agens-providers/src/chatgpt_login.rs	let _ = stream.flush();	best_effort_
 crates/agens-providers/src/lib.rs	let _ = fs::remove_file(&temporary_path);	secondary_cleanup
 crates/agens-server/src/instance.rs	let _ = fs::remove_file(&self.socket_path);	secondary_cleanup
 crates/agens-server/src/instance.rs	let _ = &self.lock;	documented_no_op
+crates/agens-server/src/sessions.rs	let _ = worker.await;	secondary_cleanup
 crates/agens-session/src/undo.rs	let _ = WorkspaceSnapshots::prune_orphans(bootstrap.data_directory());	secondary_cleanup
 crates/agens-snapshot/src/lib.rs	let _ = std::fs::remove_dir_all(&staging);	secondary_cleanup
 crates/agens-snapshot/src/lib.rs	let _ = std::fs::remove_dir_all(&staging);	secondary_cleanup
