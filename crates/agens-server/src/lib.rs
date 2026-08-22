@@ -8,6 +8,7 @@
 mod blocking;
 mod fsm;
 mod instance;
+mod scheduler;
 mod sessions;
 
 use std::os::unix::net::UnixListener;
@@ -25,6 +26,11 @@ pub use fsm::{
     WorktreeTrigger,
 };
 pub use instance::{ServeInstance, ServeInstanceError};
+pub use scheduler::{
+    Admission, AdmissionFailure, Candidate, Deferral, Ineligible, LaunchError, LaunchedSession,
+    PendingRun, Queue, QueueReport, RunLauncher, RunSession, Scheduler, SchedulerError,
+    SchedulerLimits, SchedulerLoad, SupervisorLauncher,
+};
 pub use sessions::{
     SessionAdmission, SessionBudget, SessionBudgetHandle, SessionId, SessionLimits, SessionOutcome,
     SessionProvider, SessionRegistry, SessionRegistryError, SessionRuntime, SessionShutdown,
