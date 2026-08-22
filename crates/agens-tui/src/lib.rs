@@ -35,7 +35,7 @@ pub use terminal::{
     PendingPermissions, PermissionReply, TerminalControl, TerminalModeGuard, TerminalOperation,
     teardown,
 };
-pub use widgets::{ColorLevel, DisplayMode, UnicodeLevel};
+pub use widgets::{ColorLevel, DisplayMode, UnicodeLevel, abbreviate_path};
 
 use std::{
     borrow::Cow,
@@ -6314,21 +6314,9 @@ where
             busy_policy_routing: false,
             surface_focus: SurfaceFocus::Composer,
             queue_selected: None,
-            hyperlinks: widgets::hyperlinks_enabled(),
-            color_level: widgets::detect_color_level(
-                std::env::var("NO_COLOR").ok().as_deref(),
-                std::env::var("AGENS_COLOR").ok().as_deref(),
-                std::env::var("COLORTERM").ok().as_deref(),
-                std::env::var("TERM").ok().as_deref(),
-            ),
-            unicode_level: widgets::detect_unicode_level(
-                std::env::var("AGENS_GLYPHS").ok().as_deref(),
-                std::env::var("LC_ALL")
-                    .or_else(|_| std::env::var("LC_CTYPE"))
-                    .or_else(|_| std::env::var("LANG"))
-                    .ok()
-                    .as_deref(),
-            ),
+            hyperlinks: true,
+            color_level: widgets::ColorLevel::default(),
+            unicode_level: widgets::UnicodeLevel::default(),
             input: String::new(),
             input_cursor: 0,
             media_chips: Vec::new(),
@@ -6351,7 +6339,7 @@ where
             context_window: None,
             session: "new session".to_owned(),
             project: "agens".to_owned(),
-            home: std::env::var("HOME").ok().filter(|home| !home.is_empty()),
+            home: None,
             repository: None,
             repository_probe: None,
             repository_polled_at: None,
@@ -6530,20 +6518,57 @@ where
         self.refresh_file_picker();
     }
 
-    /// Overrides the terminal hyperlink capability detected at construction.
+    /// States the terminal hyperlink capability.
     ///
-    /// The environment is the right source for a real session and the wrong one
-    /// for a test, which must be able to state the answer rather than inherit
-    /// whatever `TERM` the runner happened to export.
+    /// A constructed TUI assumes a capable terminal rather than reading one out
+    /// of the environment, so a frame a test renders is the same frame on every
+    /// machine. [`Tui::adopt_environment`] is what a real session calls to
+    /// replace those assumptions with what the attached terminal actually says.
     pub fn set_hyperlinks(&mut self, enabled: bool) {
         self.hyperlinks = enabled;
     }
 
-    /// Overrides the terminal colour and glyph capabilities detected at
-    /// construction, for the same reason [`Tui::set_hyperlinks`] exists.
+    /// States the terminal colour and glyph capabilities, for the same reason
+    /// [`Tui::set_hyperlinks`] exists.
     pub fn set_capabilities(&mut self, color: widgets::ColorLevel, unicode: widgets::UnicodeLevel) {
         self.color_level = color;
         self.unicode_level = unicode;
+    }
+
+    /// States the home directory the footer abbreviates project paths against.
+    ///
+    /// `None` leaves every path spelled out in full.
+    pub fn set_home(&mut self, home: Option<String>) {
+        self.home = home.filter(|home| !home.is_empty());
+    }
+
+    /// Replaces the constructed assumptions about the terminal with what the
+    /// process environment claims: colour depth, glyph repertoire, hyperlink
+    /// support and the home directory paths are abbreviated against.
+    ///
+    /// The composition root of a real session calls this once. Nothing else
+    /// should: a surface that read the environment on its own would render a
+    /// different frame for every `TERM`, `COLORTERM` and `HOME` a runner
+    /// happens to export, which is exactly what a rendering test cannot have.
+    pub fn adopt_environment(&mut self) {
+        self.set_hyperlinks(widgets::hyperlinks_enabled());
+        self.set_capabilities(
+            widgets::detect_color_level(
+                std::env::var("NO_COLOR").ok().as_deref(),
+                std::env::var("AGENS_COLOR").ok().as_deref(),
+                std::env::var("COLORTERM").ok().as_deref(),
+                std::env::var("TERM").ok().as_deref(),
+            ),
+            widgets::detect_unicode_level(
+                std::env::var("AGENS_GLYPHS").ok().as_deref(),
+                std::env::var("LC_ALL")
+                    .or_else(|_| std::env::var("LC_CTYPE"))
+                    .or_else(|_| std::env::var("LANG"))
+                    .ok()
+                    .as_deref(),
+            ),
+        );
+        self.set_home(std::env::var("HOME").ok());
     }
 
     pub fn set_collapse_thinking(&mut self, collapse: bool) {

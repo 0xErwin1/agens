@@ -155,6 +155,7 @@ pub fn run_production_tui_with_profile_store(
         cancellation: Arc::clone(&cancellation),
     };
     let mut tui = Tui::new(engine);
+    tui.adopt_environment();
     install_prompt_memory_from_store(&mut tui, bootstrap.data_directory());
     configure_tui_project_identity(&mut tui, &session, bootstrap);
     tui.set_collapse_thinking(bootstrap.collapse_thinking);
