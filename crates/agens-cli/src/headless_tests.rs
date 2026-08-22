@@ -8,6 +8,8 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
+use agens_fixtures::{Script, ScriptedDialect, ScriptedProvider, ScriptedTurn};
+
 use agens_core::IntraTurnInputSource;
 use agens_core::TurnEvent;
 use agens_core::{
@@ -839,51 +841,11 @@ fn production_headless_turn_persists_the_turn_directives_it_delivered_before_the
     std::fs::create_dir_all(project_root.join(".git")).expect("project marker should be created");
     std::fs::create_dir_all(&config_home).expect("config directory should be created");
 
-    let listener =
-        std::net::TcpListener::bind(("127.0.0.1", 0)).expect("mock provider should bind");
-    let address = listener
-        .local_addr()
-        .expect("mock provider should have an address");
-    let worker = std::thread::spawn(move || {
-        use std::io::{BufRead, BufReader, Write};
-
-        let (mut stream, _) = listener
-            .accept()
-            .expect("mock provider should accept the directive request");
-        let mut reader = BufReader::new(stream.try_clone().expect("stream should clone"));
-        let mut request_line = String::new();
-        reader
-            .read_line(&mut request_line)
-            .expect("request line should be readable");
-
-        let mut content_length = None;
-        loop {
-            let mut header = String::new();
-            reader
-                .read_line(&mut header)
-                .expect("request header should be readable");
-            if header == "\r\n" {
-                break;
-            }
-            if let Some(value) = header.strip_prefix("content-length: ") {
-                content_length = Some(
-                    value
-                        .trim()
-                        .parse::<usize>()
-                        .expect("content length should be numeric"),
-                );
-            }
-        }
-
-        let mut body = vec![0_u8; content_length.expect("request should include content length")];
-        std::io::Read::read_exact(&mut reader, &mut body).expect("request body should be readable");
-        stream
-            .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"replanned\"}\n\ndata: {\"type\":\"response.completed\"}\n\n")
-            .expect("mock response should be written");
-
-        serde_json::from_slice::<serde_json::Value>(&body)
-            .expect("directive provider request should be valid JSON")
-    });
+    let provider = ScriptedProvider::start(
+        ScriptedDialect::Responses,
+        Script::new([ScriptedTurn::text("replanned")]),
+    );
+    let base_url = provider.base_url();
 
     let dependencies = CliDependencies::for_test(
         project_root.clone(),
@@ -899,7 +861,7 @@ fn production_headless_turn_persists_the_turn_directives_it_delivered_before_the
             (
                 config_home.join("config.toml"),
                 format!(
-                    "[provider]\nmodel = \"openai-api/gpt-4.1\"\nbase_url = \"http://{address}\"\n\n[options]\ndata_dir = \"{}\"\n",
+                    "[provider]\nmodel = \"openai-api/gpt-4.1\"\nbase_url = \"{base_url}\"\n\n[options]\ndata_dir = \"{}\"\n",
                     data_directory.display()
                 ),
             ),
@@ -1008,7 +970,10 @@ fn production_headless_turn_persists_the_turn_directives_it_delivered_before_the
     )
     .expect("directive turn should complete");
 
-    let provider_request = worker.join().expect("mock provider should finish");
+    let requests = provider.wait_for_requests(1);
+    provider.assert_script_consumed();
+    assert_eq!(requests[0].target(), "/responses");
+    let provider_request = requests[0].json();
     assert_eq!(
         provider_request["input"],
         serde_json::json!([
@@ -1075,52 +1040,11 @@ fn production_resumed_headless_turn_replays_typed_history_and_appends_to_the_sam
     )
     .expect("reviewer agent should be written");
 
-    let listener =
-        std::net::TcpListener::bind(("127.0.0.1", 0)).expect("mock provider should bind");
-    let address = listener
-        .local_addr()
-        .expect("mock provider should have an address");
-    let worker = std::thread::spawn(move || {
-        use std::io::{BufRead, BufReader, Write};
-
-        let (mut stream, _) = listener
-            .accept()
-            .expect("mock provider should accept the resumed request");
-        let mut reader = BufReader::new(stream.try_clone().expect("stream should clone"));
-        let mut request_line = String::new();
-        reader
-            .read_line(&mut request_line)
-            .expect("request line should be readable");
-        assert_eq!(request_line, "POST /responses HTTP/1.1\r\n");
-
-        let mut content_length = None;
-        loop {
-            let mut header = String::new();
-            reader
-                .read_line(&mut header)
-                .expect("request header should be readable");
-            if header == "\r\n" {
-                break;
-            }
-            if let Some(value) = header.strip_prefix("content-length: ") {
-                content_length = Some(
-                    value
-                        .trim()
-                        .parse::<usize>()
-                        .expect("content length should be numeric"),
-                );
-            }
-        }
-
-        let mut body = vec![0_u8; content_length.expect("request should include content length")];
-        std::io::Read::read_exact(&mut reader, &mut body).expect("request body should be readable");
-        stream
-            .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"second answer\"}\n\ndata: {\"type\":\"response.completed\"}\n\n")
-            .expect("mock response should be written");
-
-        serde_json::from_slice::<serde_json::Value>(&body)
-            .expect("resumed provider request should be valid JSON")
-    });
+    let provider = ScriptedProvider::start(
+        ScriptedDialect::Responses,
+        Script::new([ScriptedTurn::text("second answer")]),
+    );
+    let base_url = provider.base_url();
 
     let dependencies = CliDependencies::for_test(
         project_root.clone(),
@@ -1136,7 +1060,7 @@ fn production_resumed_headless_turn_replays_typed_history_and_appends_to_the_sam
             (
                 config_home.join("config.toml"),
                 format!(
-                    "[provider]\nmodel = \"openai-api/gpt-4.1\"\nbase_url = \"http://{address}\"\n\n[options]\ndata_dir = \"{}\"\n",
+                    "[provider]\nmodel = \"openai-api/gpt-4.1\"\nbase_url = \"{base_url}\"\n\n[options]\ndata_dir = \"{}\"\n",
                     data_directory.display()
                 ),
             ),
@@ -1244,7 +1168,10 @@ fn production_resumed_headless_turn_replays_typed_history_and_appends_to_the_sam
         None,
     )
     .expect("resumed production turn should complete");
-    let provider_request = worker.join().expect("mock provider should finish");
+    let requests = provider.wait_for_requests(1);
+    provider.assert_script_consumed();
+    assert_eq!(requests[0].target(), "/responses");
+    let provider_request = requests[0].json();
     let reopened = SessionStore::open(&data_directory)
         .expect("session store should reopen")
         .load_session_for_resume(1)

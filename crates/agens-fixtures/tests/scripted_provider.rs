@@ -34,8 +34,21 @@ impl KeepAliveClient {
         }
     }
 
-    /// Sends one request and returns the response's status line and body.
-    fn post(&mut self, target: &str, body: &str) -> (String, String) {
+    /// Sends one request and asserts the server closed without answering.
+    fn post_expecting_no_reply(&mut self, target: &str, body: &str) {
+        self.write_request(target, body);
+
+        let mut status_line = String::new();
+        assert_eq!(
+            self.reader
+                .read_line(&mut status_line)
+                .expect("the closed connection should read cleanly"),
+            0,
+            "an unscripted request should get no reply at all, got {status_line:?}"
+        );
+    }
+
+    fn write_request(&mut self, target: &str, body: &str) {
         self.writer
             .write_all(
                 format!(
@@ -45,6 +58,11 @@ impl KeepAliveClient {
                 .as_bytes(),
             )
             .expect("client request should be written");
+    }
+
+    /// Sends one request and returns the response's status line and body.
+    fn post(&mut self, target: &str, body: &str) -> (String, String) {
+        self.write_request(target, body);
 
         let mut status_line = String::new();
         self.reader
@@ -260,9 +278,9 @@ fn a_loop_that_runs_past_the_script_is_reported_rather_than_answered() {
 
     let mut client = KeepAliveClient::connect(&provider);
     client.post("/responses", r#"{"input":"first"}"#);
-    let (status, _) = client.post("/responses", r#"{"input":"one too many"}"#);
+    client.post_expecting_no_reply("/responses", r#"{"input":"one too many"}"#);
 
-    assert_eq!(status, "HTTP/1.1 500 Scripted");
+    provider.wait_for_requests(2);
     provider.assert_script_consumed();
 }
 

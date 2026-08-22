@@ -440,12 +440,14 @@ fn serve_connection(
             return;
         };
 
-        let turn = take_turn(state, &request);
-        let Some(turn) = turn else {
-            write_all(
-                &mut writer,
-                b"HTTP/1.1 500 Scripted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-            );
+        // A request the script does not cover gets no reply at all, only a
+        // closed connection. Answering it with a status of the server's own
+        // invention would put a turn the test never wrote into the run's
+        // outcome, which is exactly what a scripted model exists to prevent;
+        // the request is still recorded, so `assert_script_consumed` reports
+        // it.
+        let Some(turn) = take_turn(state, &request) else {
+            let _ = writer.shutdown(Shutdown::Both);
             return;
         };
 

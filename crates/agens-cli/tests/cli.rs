@@ -2117,7 +2117,7 @@ fn unavailable_explicit_child_model_is_diagnosed_once_without_a_child_provider_r
     let data_directory = temporary.path().join("data");
     std::fs::create_dir_all(project_root.join(".git")).expect("project marker should exist");
     std::fs::create_dir_all(&config_home).expect("config directory should exist");
-    let server = BoundedScriptedOpenAiMockServer::start(vec![
+    let server = ScriptedNativeOpenAiMockServer::start(vec![
         ScriptedOpenAiResponse {
             required_body_fragments: vec!["parent unavailable child".into(), "task".into()],
             response: native_tool_call_response(
@@ -2294,7 +2294,7 @@ fn production_task_provider_failure_is_sanitized_and_returns_control_to_the_pare
         required_body_fragments: vec!["task: provider failure".into()],
         response: text_response("parent recovered from child provider failure"),
     });
-    let server = BoundedScriptedOpenAiMockServer::start(responses);
+    let server = ScriptedNativeOpenAiMockServer::start(responses);
     std::fs::write(
         config_home.join("config.toml"),
         format!(
@@ -2486,9 +2486,17 @@ fn production_binary_rejects_missing_malformed_and_incomplete_chatgpt_credential
 
 #[test]
 fn production_binary_maps_chatgpt_provider_and_auth_failures_without_leaking_credentials() {
-    for (name, response, expected_exit, expected_stderr, expected_detail) in [
+    // `rounds` is how many times the endpoint answers, not how many failures
+    // the case has: a transient status is attempted three times, and a server
+    // that answers only once leaves the remaining attempts to a socket that is
+    // no longer there. That is also why the transient cases record the remote
+    // detail — the run reaches its retry budget against an endpoint that kept
+    // answering, instead of ending on a transport error with nothing to
+    // report.
+    for (name, rounds, response, expected_exit, expected_stderr, expected_detail) in [
         (
             "forbidden",
+            1,
             "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned(),
             Some(4),
             "error: auth: provider credentials are unavailable or invalid\n",
@@ -2496,6 +2504,7 @@ fn production_binary_maps_chatgpt_provider_and_auth_failures_without_leaking_cre
         ),
         (
             "rejected",
+            1,
             "HTTP/1.1 422 Unprocessable Content\r\nContent-Length: 27\r\nConnection: close\r\n\r\nSENTINEL_CHATGPT_ERROR_BODY".to_owned(),
             Some(1),
             "error: provider: provider request was rejected\n",
@@ -2503,20 +2512,23 @@ fn production_binary_maps_chatgpt_provider_and_auth_failures_without_leaking_cre
         ),
         (
             "rate limit",
+            3,
             "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 27\r\nConnection: close\r\n\r\nSENTINEL_CHATGPT_ERROR_BODY".to_owned(),
             Some(1),
             "error: provider: provider request was rate limited\n",
-            None,
+            Some("HTTP 429 rejected model \"test-model\"\nSENTINEL_CHATGPT_ERROR_BODY"),
         ),
         (
             "server failure",
+            3,
             "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 27\r\nConnection: close\r\n\r\nSENTINEL_CHATGPT_ERROR_BODY".to_owned(),
             Some(1),
             "error: provider: provider service failed\n",
-            None,
+            Some("HTTP 500 rejected model \"test-model\"\nSENTINEL_CHATGPT_ERROR_BODY"),
         ),
         (
             "protocol failure",
+            1,
             sse_response(&[r#"{"type":"response.incomplete","response":{"error":{"message":"SENTINEL_CHATGPT_ERROR_BODY"}}}"#]),
             Some(1),
             "error: provider: provider response protocol failed\n",
@@ -2527,10 +2539,14 @@ fn production_binary_maps_chatgpt_provider_and_auth_failures_without_leaking_cre
         let config_home = temporary.path().join("config");
         let data_directory = temporary.path().join("data");
         std::fs::create_dir_all(&config_home).expect("config directory should exist");
-        let server = ScriptedNativeOpenAiMockServer::start(vec![ScriptedOpenAiResponse {
-            required_body_fragments: vec!["\"store\":false".to_owned()],
-            response,
-        }]);
+        let server = ScriptedNativeOpenAiMockServer::start(
+            std::iter::repeat_n(response, rounds)
+                .map(|response| ScriptedOpenAiResponse {
+                    required_body_fragments: vec!["\"store\":false".to_owned()],
+                    response,
+                })
+                .collect(),
+        );
         std::fs::write(
             config_home.join("config.toml"),
             format!(
@@ -3346,7 +3362,7 @@ fn production_binary_denies_native_write_in_chat_mode_even_with_temporary_bypass
     std::fs::create_dir_all(project_root.join(".git")).expect("project marker should exist");
     std::fs::create_dir_all(&config_home).expect("config directory should exist");
     let protected = project_root.join("SENTINEL_CHAT_WRITE.txt");
-    let server = BoundedScriptedOpenAiMockServer::start(vec![
+    let server = ScriptedNativeOpenAiMockServer::start(vec![
         ScriptedOpenAiResponse {
             required_body_fragments: vec!["native::write".to_owned()],
             response: native_tool_call_response(
@@ -3425,7 +3441,7 @@ fn production_binary_rejects_duplicate_and_mismatched_tool_call_protocol_items_b
         std::fs::create_dir_all(project_root.join(".git")).expect("project marker should exist");
         std::fs::create_dir_all(&config_home).expect("config directory should exist");
         let side_effect = project_root.join("should-not-exist");
-        let server = BoundedScriptedOpenAiMockServer::start(vec![ScriptedOpenAiResponse {
+        let server = ScriptedNativeOpenAiMockServer::start(vec![ScriptedOpenAiResponse {
             required_body_fragments: vec!["native::write".to_owned()],
             response,
         }]);
@@ -3479,7 +3495,7 @@ fn production_binary_cancellation_kills_native_bash_descendants_without_continui
         "bash -c 'sleep 30 & descendant=$!; printf \"%s %s\\n\" \"$$\" \"$descendant\" > \"$1\"; : > \"$2\"; wait' bash {:?} {:?} & wait",
         process_marker, ready_marker
     );
-    let server = BoundedScriptedOpenAiMockServer::start(vec![ScriptedOpenAiResponse {
+    let server = ScriptedNativeOpenAiMockServer::start(vec![ScriptedOpenAiResponse {
         required_body_fragments: vec!["native::bash".to_owned()],
         response: native_tool_call_response(
             "call_bash_cancel",
@@ -3568,7 +3584,7 @@ fn production_binary_rejects_replayed_native_call_id_without_second_execution() 
         "native::write",
         r#"{"path":"execution-count","content":"second execution"}"#,
     );
-    let server = BoundedScriptedOpenAiMockServer::start(vec![
+    let server = ScriptedNativeOpenAiMockServer::start(vec![
         ScriptedOpenAiResponse {
             required_body_fragments: vec!["native::write".to_owned()],
             response: initial_call,
@@ -3896,7 +3912,7 @@ fn production_binary_cancels_configured_mcp_call_without_continuing_or_persistin
     std::fs::create_dir_all(project_root.join(".git")).expect("project marker should exist");
     std::fs::create_dir_all(&config_home).expect("config directory should exist");
 
-    let server = BoundedScriptedOpenAiMockServer::start(vec![ScriptedOpenAiResponse {
+    let server = ScriptedNativeOpenAiMockServer::start(vec![ScriptedOpenAiResponse {
         required_body_fragments: vec!["files::first".to_owned()],
         response: native_tool_call_response("call_mcp_cancel", "files::first", r#"{}"#),
     }]);
@@ -4326,7 +4342,7 @@ fn production_binary_recovers_from_mcp_infrastructure_failures_and_persists_comp
         std::fs::create_dir_all(project_root.join(".git")).expect("project marker should exist");
         std::fs::create_dir_all(&config_home).expect("config directory should exist");
 
-        let server = BoundedScriptedOpenAiMockServer::start(vec![
+        let server = ScriptedNativeOpenAiMockServer::start(vec![
             ScriptedOpenAiResponse {
                 required_body_fragments: vec!["files::first".to_owned()],
                 response: native_tool_call_response(
@@ -4583,7 +4599,7 @@ fn production_binary_enforces_mcp_permission_matrix_and_executes_allowed_calls_o
             required_body_fragments: vec![tool.to_owned()],
             response: native_tool_call_response("call_mcp_permission", tool, arguments),
         };
-        let server = BoundedScriptedOpenAiMockServer::start(if persists {
+        let server = ScriptedNativeOpenAiMockServer::start(if persists {
             vec![
                 first_response,
                 ScriptedOpenAiResponse {
@@ -4726,7 +4742,7 @@ fn production_binary_fails_closed_for_mcp_duplicate_replay_and_mismatched_call_i
         let call_marker = temporary.path().join("mcp-call-count");
         std::fs::create_dir_all(project_root.join(".git")).expect("project marker should exist");
         std::fs::create_dir_all(&config_home).expect("config directory should exist");
-        let server = BoundedScriptedOpenAiMockServer::start(responses);
+        let server = ScriptedNativeOpenAiMockServer::start(responses);
         std::fs::write(
             config_home.join("config.toml"),
             format!(
@@ -5176,149 +5192,101 @@ struct ScriptedOpenAiResponse {
     response: String,
 }
 
+/// A scripted `/responses` endpoint over the shared journey fake.
+///
+/// The fragment expectations are checked in `join`, against the request each
+/// scripted round actually answered, rather than inside the server thread: a
+/// mismatch is then the test's own failure with the whole conversation in
+/// hand, not an opaque worker panic.
 struct ScriptedNativeOpenAiMockServer {
-    address: std::net::SocketAddr,
-    worker: thread::JoinHandle<()>,
-}
-
-struct BoundedScriptedOpenAiMockServer {
-    address: std::net::SocketAddr,
-    worker: thread::JoinHandle<()>,
+    provider: ScriptedProvider,
+    expectations: Vec<Vec<String>>,
 }
 
 impl ScriptedNativeOpenAiMockServer {
     fn start(responses: Vec<ScriptedOpenAiResponse>) -> Self {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("mock server should bind");
-        let address = listener
-            .local_addr()
-            .expect("mock server should have an address");
-        let worker = thread::spawn(move || {
-            for scripted in responses {
-                let (mut stream, _) = listener
-                    .accept()
-                    .expect("mock server should accept a request");
-                let body = read_openai_request_body(&stream);
-                for fragment in scripted.required_body_fragments {
-                    if fragment == "@all-tools-non-strict" {
-                        let payload: serde_json::Value = serde_json::from_str(&body)
-                            .expect("production provider payload should be JSON");
-                        let tools = payload["tools"]
-                            .as_array()
-                            .expect("production provider should advertise tools");
-                        assert!(
-                            !tools.is_empty(),
-                            "production provider should advertise tools"
-                        );
-                        for tool in tools {
-                            assert_eq!(tool["type"], "function");
-                            assert_eq!(tool["strict"], false, "tool was strict: {tool}");
-                            assert!(tool["name"].as_str().is_some_and(|name| !name.is_empty()));
-                            assert!(
-                                tool["description"]
-                                    .as_str()
-                                    .is_some_and(|description| !description.is_empty())
-                            );
-                            assert_eq!(tool["parameters"]["type"], "object");
-                        }
-                        continue;
-                    }
-                    if let Some(forbidden) = fragment.strip_prefix('!') {
-                        assert!(
-                            !body.contains(forbidden),
-                            "request body leaked {forbidden:?}: {body}"
-                        );
-                        continue;
-                    }
-                    if let Some(once) = fragment.strip_prefix("@once:") {
-                        let visible = model_visible_fragment(once);
-                        let occurrences = body.matches(&visible).count();
-                        assert_eq!(
-                            occurrences, 1,
-                            "request body should contain {visible:?} exactly once, found {occurrences}: {body}"
-                        );
-                        continue;
-                    }
-                    let visible = model_visible_fragment(&fragment);
-                    assert!(
-                        body.contains(&visible),
-                        "request body should contain {visible:?}: {body}"
-                    );
-                }
-                stream
-                    .write_all(scripted.response.as_bytes())
-                    .expect("scripted response should be written");
-            }
-        });
+        let mut expectations = Vec::with_capacity(responses.len());
+        let mut turns = Vec::with_capacity(responses.len());
+        for scripted in responses {
+            expectations.push(scripted.required_body_fragments);
+            turns.push(ScriptedTurn::raw(scripted.response));
+        }
 
-        Self { address, worker }
+        Self {
+            provider: ScriptedProvider::start(ScriptedDialect::Responses, Script::new(turns)),
+            expectations,
+        }
     }
 
     fn base_url(&self) -> String {
-        format!("http://{}", self.address)
+        self.provider.base_url()
     }
 
     fn join(self) {
-        self.worker.join().expect("mock server should finish");
+        let requests = self.provider.wait_for_requests(self.expectations.len());
+        // An unscripted request is what the bounded variant of this server used
+        // to look for by waiting a quarter of a second after the last scripted
+        // round. The fake records it instead, and every caller joins after the
+        // run has already exited, so the same guarantee costs no wall clock.
+        self.provider.assert_script_consumed();
+
+        for (round, (fragments, request)) in self.expectations.iter().zip(&requests).enumerate() {
+            assert_scripted_request_fragments(round, request.body(), fragments);
+        }
     }
 }
 
-impl BoundedScriptedOpenAiMockServer {
-    fn start(responses: Vec<ScriptedOpenAiResponse>) -> Self {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("mock server should bind");
-        let address = listener
-            .local_addr()
-            .expect("mock server should have an address");
-        let worker = thread::spawn(move || {
-            for scripted in responses {
-                let (mut stream, _) = listener
-                    .accept()
-                    .expect("mock server should accept a request");
-                let body = read_openai_request_body(&stream);
-                for fragment in scripted.required_body_fragments {
-                    if let Some(forbidden) = fragment.strip_prefix('!') {
-                        assert!(
-                            !body.contains(forbidden),
-                            "request body leaked {forbidden:?}: {body}"
-                        );
-                        continue;
-                    }
-                    let visible = model_visible_fragment(&fragment);
-                    assert!(
-                        body.contains(&visible),
-                        "request body should contain {visible:?}: {body}"
-                    );
-                }
-                stream
-                    .write_all(scripted.response.as_bytes())
-                    .expect("scripted response should be written");
+/// Checks one scripted round's expectations against the request it answered.
+///
+/// A bare fragment must appear, `!` requires its absence, `@once:` pins a
+/// single occurrence, and `@all-tools-non-strict` checks the declared tool
+/// surface as a whole.
+fn assert_scripted_request_fragments(round: usize, body: &str, fragments: &[String]) {
+    for fragment in fragments {
+        if fragment == "@all-tools-non-strict" {
+            let payload: serde_json::Value =
+                serde_json::from_str(body).expect("production provider payload should be JSON");
+            let tools = payload["tools"]
+                .as_array()
+                .expect("production provider should advertise tools");
+            assert!(
+                !tools.is_empty(),
+                "production provider should advertise tools"
+            );
+            for tool in tools {
+                assert_eq!(tool["type"], "function");
+                assert_eq!(tool["strict"], false, "tool was strict: {tool}");
+                assert!(tool["name"].as_str().is_some_and(|name| !name.is_empty()));
+                assert!(
+                    tool["description"]
+                        .as_str()
+                        .is_some_and(|description| !description.is_empty())
+                );
+                assert_eq!(tool["parameters"]["type"], "object");
             }
-
-            listener
-                .set_nonblocking(true)
-                .expect("mock server should enable bounded probe mode");
-            let deadline = std::time::Instant::now() + Duration::from_millis(250);
-            while std::time::Instant::now() < deadline {
-                match listener.accept() {
-                    Ok((_stream, _)) => {
-                        panic!("unexpected provider continuation request");
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(5));
-                    }
-                    Err(error) => panic!("mock server probe failed: {error}"),
-                }
-            }
-        });
-
-        Self { address, worker }
-    }
-
-    fn base_url(&self) -> String {
-        format!("http://{}", self.address)
-    }
-
-    fn join(self) {
-        self.worker.join().expect("mock server should finish");
+            continue;
+        }
+        if let Some(forbidden) = fragment.strip_prefix('!') {
+            assert!(
+                !body.contains(forbidden),
+                "round {round} request body leaked {forbidden:?}: {body}"
+            );
+            continue;
+        }
+        if let Some(once) = fragment.strip_prefix("@once:") {
+            let visible = model_visible_fragment(once);
+            let occurrences = body.matches(&visible).count();
+            assert_eq!(
+                occurrences, 1,
+                "round {round} request body should contain {visible:?} exactly once, found {occurrences}: {body}"
+            );
+            continue;
+        }
+        let visible = model_visible_fragment(fragment);
+        assert!(
+            body.contains(&visible),
+            "round {round} request body should contain {visible:?}: {body}"
+        );
     }
 }
 

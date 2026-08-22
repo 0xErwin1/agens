@@ -13,6 +13,7 @@ use agens_agents::ensure_active_agent_runtime;
 use agens_bootstrap::Bootstrap;
 use agens_core::HeadlessTurnCancellation;
 use agens_fixtures::{
+    Script, ScriptedDialect, ScriptedProvider, ScriptedTurn,
     session_bootstrap as tui_session_bootstrap,
     session_bootstrap_for_provider as tui_session_bootstrap_for_provider,
     session_directory as tui_session_directory,
@@ -434,56 +435,14 @@ fn run_tui_model_effort_provider_case(
     std::fs::create_dir_all(project_root.join(".git")).expect("project marker should be created");
     std::fs::create_dir_all(&config_home).expect("config directory should be created");
 
-    let listener =
-        std::net::TcpListener::bind(("127.0.0.1", 0)).expect("mock provider should bind");
-    let address = listener
-        .local_addr()
-        .expect("mock provider should have an address");
-    let expected_path = match provider_type {
-        "openai-chatgpt" => "POST /codex/responses HTTP/1.1\r\n",
-        _ => "POST /responses HTTP/1.1\r\n",
+    let provider = ScriptedProvider::start(
+        ScriptedDialect::Responses,
+        Script::new([ScriptedTurn::text("selected answer")]),
+    );
+    let expected_target = match provider_type {
+        "openai-chatgpt" => "/codex/responses",
+        _ => "/responses",
     };
-    let worker = std::thread::spawn(move || {
-        use std::io::{BufRead, BufReader, Write};
-
-        let (mut stream, _) = listener
-            .accept()
-            .expect("mock provider should accept the selected request");
-        let mut reader = BufReader::new(stream.try_clone().expect("stream should clone"));
-        let mut request_line = String::new();
-        reader
-            .read_line(&mut request_line)
-            .expect("request line should be readable");
-        assert_eq!(request_line, expected_path);
-
-        let mut content_length = None;
-        loop {
-            let mut header = String::new();
-            reader
-                .read_line(&mut header)
-                .expect("request header should be readable");
-            if header == "\r\n" {
-                break;
-            }
-            if let Some(value) = header.to_ascii_lowercase().strip_prefix("content-length: ") {
-                content_length = Some(
-                    value
-                        .trim()
-                        .parse::<usize>()
-                        .expect("content length should be numeric"),
-                );
-            }
-        }
-
-        let mut body = vec![0_u8; content_length.expect("request should include content length")];
-        std::io::Read::read_exact(&mut reader, &mut body).expect("request body should be readable");
-        stream
-            .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"selected answer\"}\n\ndata: {\"type\":\"response.completed\"}\n\n")
-            .expect("mock response should be written");
-
-        serde_json::from_slice::<serde_json::Value>(&body)
-            .expect("provider request should be valid JSON")
-    });
 
     if provider_type == "openai-chatgpt" {
         std::fs::write(
@@ -512,7 +471,8 @@ fn run_tui_model_effort_provider_case(
         BTreeMap::from([(
             config_home.join("config.toml"),
             format!(
-                "[provider]\nmodel = \"{provider_type}/gpt-4.1\"\nbase_url = \"http://{address}\"\n\n[options]\ndata_dir = \"{}\"\n",
+                "[provider]\nmodel = \"{provider_type}/gpt-4.1\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n",
+                provider.base_url(),
                 data_directory.display()
             ),
         )]),
@@ -638,7 +598,10 @@ fn run_tui_model_effort_provider_case(
     assert!(reopened_selection.metadata_known());
     assert_eq!(reopened_selection.reasoning_effort(), Some("max"));
 
-    let request = worker.join().expect("mock provider should finish");
+    let requests = provider.wait_for_requests(1);
+    provider.assert_script_consumed();
+    assert_eq!(requests[0].target(), expected_target);
     std::fs::remove_dir_all(temporary).expect("temporary files should be removed");
-    request
+
+    requests[0].json()
 }
