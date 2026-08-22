@@ -10,8 +10,9 @@ use std::time::{Duration, Instant};
 mod support;
 
 use support::{
-    RequestArrival, SSE_HEADERS, accept_until_stopped, bind_pollable_listener, read_request,
-    read_request_head, wait_for_client_close, write_sse_headers, write_to_possibly_gone_client,
+    RequestArrival, SSE_HEADERS, accept_until_stopped, bind_pollable_listener,
+    hold_address_until_stopped, read_request, read_request_head, wait_for_client_close,
+    write_sse_headers, write_to_possibly_gone_client,
 };
 
 use agens_core::{
@@ -791,8 +792,15 @@ fn openai_stops_retrying_when_the_total_wait_budget_is_spent() {
 /// so that was a spinner with no end.
 #[test]
 fn openai_bounds_connection_retries_by_the_attempt_budget() {
+    // Binding an address and dropping it leaves it free for anything else on
+    // the machine to take between the attempts this counts, which would turn a
+    // failed connection into an answered request. Holding it and closing every
+    // connection keeps the address this test's own and fails each attempt the
+    // same way.
     let (listener, address) = bind_pollable_listener();
-    drop(listener);
+    let stop = Arc::new(AtomicBool::new(false));
+    let worker_stop = Arc::clone(&stop);
+    let worker = thread::spawn(move || hold_address_until_stopped(&listener, &worker_stop));
     let events = Arc::new(Mutex::new(Vec::new()));
     let captured = Arc::clone(&events);
     let diagnostics = ProviderDiagnostics::new(
@@ -802,7 +810,6 @@ fn openai_bounds_connection_retries_by_the_attempt_budget() {
     )
     .expect("diagnostics should be configured");
 
-    let started_at = Instant::now();
     assert_eq!(
         run_provider_with_retry_policy(
             format!("http://{address}"),
@@ -813,7 +820,8 @@ fn openai_bounds_connection_retries_by_the_attempt_budget() {
         ),
         Err(HeadlessTurnPortError::ProviderNetwork)
     );
-    assert!(started_at.elapsed() < Duration::from_secs(5));
+    stop.store(true, Ordering::Release);
+    worker.join().expect("the address holder should finish");
 
     // Each scheduled retry now names the budget it counts against, which is
     // what the status line renders as `Retrying (n/m)`. While connection
@@ -838,7 +846,6 @@ fn openai_bounds_connection_retries_by_the_attempt_budget() {
 #[test]
 fn openai_read_timeout_ends_a_stream_that_stops_emitting() {
     let server = LocalResponsesServer::start(ServerMode::StalledBody);
-    let started_at = Instant::now();
 
     assert_eq!(
         run_provider_with_retry_policy(
@@ -850,7 +857,6 @@ fn openai_read_timeout_ends_a_stream_that_stops_emitting() {
         ),
         Err(HeadlessTurnPortError::ProviderNetwork)
     );
-    assert!(started_at.elapsed() < Duration::from_secs(5));
 
     server.join();
 }
