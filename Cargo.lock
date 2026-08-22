@@ -223,7 +223,9 @@ name = "agens-server"
 version = "0.1.0"
 dependencies = [
  "agens-core",
+ "agens-store",
  "libc",
+ "serde_json",
  "tokio",
 ]
 

@@ -70,7 +70,7 @@ by which of these sentences it fits, not by which directory is convenient.
 - `agens-config` is a leaf crate for configuration and credential compatibility.
 - Provider, tool, and store crates may depend on `agens-core` and `agens-config` where required.
 - `agens-tui` depends on `agens-bus`, `agens-core` and `agens-perf`, and remains a surface adapter.
-- `agens-server` depends on `agens-core` only. It owns the daemon: the single-instance runtime today, and the coordinator, its state machines, the scheduler and the timers as they land. None of that belongs to a command surface, so `serve` stays a thin adapter over this crate.
+- `agens-server` depends on `agens-core` and `agens-store`. It owns the daemon: the single-instance runtime, the coordinator's state machines, and the scheduler and timers as they land. None of that belongs to a command surface, so `serve` stays a thin adapter over this crate. The store dependency is the coordinator's: its state machines are the sole writer of the control-plane tables, and every transition they apply is a conditional state change plus its journal entries in one transaction. Reaching that through a port would put the transaction boundary on the wrong side of the seam, and copying the SQL into the daemon would give the control plane a second writer.
 - `agens-cli` is the composition root and the sole shipped binary crate. `agens-tui` also carries `agens-perf-audit`, a development binary that only exists behind a non-default feature.
 
 ## Surfaces and logic

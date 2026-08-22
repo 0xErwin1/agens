@@ -115,7 +115,8 @@ jq -e '
       "agens-core"
     ],
     "agens-server": [
-      "agens-core"
+      "agens-core",
+      "agens-store"
     ],
     "agens-session": [
       "agens-bootstrap",
