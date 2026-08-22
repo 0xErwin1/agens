@@ -331,7 +331,11 @@ const SEPARATOR: &str = " · ";
 /// prefix collapses to `~` and intermediate components shrink to their first
 /// character before anything is dropped outright. Truncating from the left
 /// instead would spend the budget on the part that says the least.
-fn abbreviate_path(path: &str, home: Option<&str>) -> String {
+///
+/// Public because a caller that pins a whole frame has to be able to predict
+/// this rather than restate it: the project root a test runs under is chosen by
+/// the machine, so the footer text it produces can only be derived.
+pub fn abbreviate_path(path: &str, home: Option<&str>) -> String {
     let trimmed = path.trim_end_matches('/');
     if trimmed.is_empty() {
         return String::new();

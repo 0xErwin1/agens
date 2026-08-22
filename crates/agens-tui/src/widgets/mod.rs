@@ -20,6 +20,7 @@ pub use capability::{ColorLevel, UnicodeLevel};
 pub(crate) use capability::{Glyph, detect_color_level, detect_unicode_level, quantize_buffer};
 pub use expand::DisplayMode;
 pub(crate) use expand::{ExpandMode, ExpandableBody};
+pub use footer::abbreviate_path;
 pub(crate) use footer::{FooterContext, MIN_BORDER_METRICS_WIDTH, MetricFooter};
 pub(crate) use glyph::StatusGlyph;
 pub(crate) use hyperlink::{apply_hyperlinks, hyperlinks_enabled};

@@ -109,6 +109,17 @@ fn journey_render_paints_a_scripted_turn_into_a_stable_frame() {
         .expect("the scripted turn should complete");
     tui.finish_provider_turn(tui_provider_outcome(Ok(answer)));
 
+    // The project root is wherever the runner puts its temporary files, so the
+    // footer text it abbreviates to is derived from the same root the surface
+    // reads rather than spelled out for one machine's layout.
+    let root = agens_bootstrap::session_root::SessionRoot::discover_for_new_session(&bootstrap)
+        .expect("the fixture project should be discoverable as a session root")
+        .into_path_buf();
+    let footer_tail = format!(
+        "─ gpt-4.1 · ctx — · {} · ask ",
+        agens_tui::abbreviate_path(&root.display().to_string(), None)
+    );
+
     let frame = render_tui_test_backend(&tui, 80, 12);
     // The elapsed time is the one cell that a second run is allowed to differ
     // on, so it is the one cell this replaces before comparing.
@@ -142,8 +153,8 @@ fn journey_render_paints_a_scripted_turn_into_a_stable_frame() {
             format!("    ┌{}┐", "─".repeat(70)),
             format!("    │{}│", " ".repeat(70)),
             format!(
-                "    └{}─ gpt-4.1 · ctx — · /t/a/project · ask ┘",
-                "─".repeat(31)
+                "    └{}{footer_tail}┘",
+                "─".repeat(70 - footer_tail.chars().count())
             ),
             "     Esc:normal  ^?:shortcuts".to_owned(),
         ]

@@ -879,6 +879,7 @@ fn footer_keeps_five_fields_and_usage_across_submission_start() {
             .with_context_window(Some(200_000)),
     );
     tui.set_project("/home/iperez/dev/personal/agens");
+    tui.set_home(Some("/home/iperez".to_owned()));
 
     renderer.render(tui.view()).unwrap();
     let before_usage = rendered_text(&renderer);
