@@ -26,7 +26,8 @@ use agens_store::{
     QuestionState,
 };
 
-use crate::fsm::{Principal, RunFacts, RunTrigger, StateMachines, TransitionRejection};
+use crate::api::ApiCore;
+use crate::fsm::{Principal, RunFacts, RunTrigger, TransitionRejection};
 use crate::ingest::CheckpointClaim;
 use crate::timers::CHECKPOINT_EVENT;
 
@@ -35,12 +36,12 @@ pub type Clock = Arc<dyn Fn() -> i64 + Send + Sync>;
 
 /// One run's introspection surface, bound to the attempt that is executing it.
 ///
-/// It holds the machines rather than the store because the store is theirs, and
-/// it holds the run and attempt identity rather than taking them per call: a
-/// worker cannot name a run it is not executing, so there is no argument for it
-/// to get wrong.
+/// It reaches the machines through the service core because the core owns them,
+/// and it holds the run and attempt identity rather than taking them per call:
+/// a worker cannot name a run it is not executing, so there is no argument for
+/// it to get wrong.
 pub struct RunIntrospection {
-    machines: Arc<Mutex<StateMachines>>,
+    core: Arc<Mutex<ApiCore>>,
     run_id: i64,
     /// The physical execution this checkpoint was reported from. Written into
     /// the journal entry because it is the key half the evidence ledger is
@@ -53,9 +54,9 @@ pub struct RunIntrospection {
 
 impl RunIntrospection {
     #[must_use]
-    pub fn new(machines: Arc<Mutex<StateMachines>>, run_id: i64, clock: Clock) -> Self {
+    pub fn new(core: Arc<Mutex<ApiCore>>, run_id: i64, clock: Clock) -> Self {
         Self {
-            machines,
+            core,
             run_id,
             session_id: None,
             session_attempt_id: None,
@@ -178,8 +179,13 @@ impl RunIntrospection {
         }
     }
 
-    fn machines(&self) -> Result<std::sync::MutexGuard<'_, StateMachines>, RunIntrospectionError> {
-        self.machines
+    /// The service core, locked for the span of one write.
+    ///
+    /// A poisoned lock is refused rather than recovered: the core's invariants
+    /// were established by an operation that did not finish, and a worker's
+    /// report is not the place to decide they still hold.
+    fn core(&self) -> Result<std::sync::MutexGuard<'_, ApiCore>, RunIntrospectionError> {
+        self.core
             .lock()
             .map_err(|_| RunIntrospectionError::Unavailable)
     }
@@ -195,7 +201,8 @@ impl RunIntrospectionPort for RunIntrospection {
         let findings = self.finding_rows(checkpoint, now);
 
         let write = self
-            .machines()?
+            .core()?
+            .machines_mut()
             .record_checkpoint(&event, &findings)
             .map_err(refused)?;
 
@@ -211,7 +218,8 @@ impl RunIntrospectionPort for RunIntrospection {
         let question = self.question_row(ask, now);
 
         let outcome = self
-            .machines()?
+            .core()?
+            .machines_mut()
             .apply_run(
                 self.run_id,
                 RunTrigger::Ask,

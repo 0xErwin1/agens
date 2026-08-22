@@ -124,7 +124,7 @@ impl Drop for Fixture {
 /// bound to the bytes that commit produced.
 struct Gated {
     fixture: Fixture,
-    gates: Gates,
+    machines: StateMachines,
     run_id: i64,
     approval_id: i64,
 }
@@ -151,11 +151,17 @@ impl Gated {
             .expect("insert approval");
 
         Self {
-            gates: Gates::new(StateMachines::new(store), fixture.worktrees()),
+            machines: StateMachines::new(store),
             fixture,
             run_id,
             approval_id,
         }
+    }
+
+    /// The gates for the span of one call, borrowing the machines this fixture
+    /// owns the way the daemon borrows the ones its core owns.
+    fn gates(&mut self) -> Gates<'_> {
+        Gates::new(&mut self.machines, self.fixture.worktrees())
     }
 
     fn request(&self, path: MergePath) -> PreMergeRequest {
@@ -172,22 +178,21 @@ impl Gated {
     fn pre_merge(&mut self, path: MergePath) -> PreMergeVerdict {
         let request = self.request(path);
 
-        self.gates.pre_merge(&request).expect("gate runs")
+        self.gates().pre_merge(&request).expect("gate runs")
     }
 
     fn reclaim(&mut self) -> ReclaimVerdict {
-        self.gates
-            .reclaim(&ReclaimRequest {
-                run_id: self.run_id,
-                main_ref: "main".to_owned(),
-                now: NOW,
-            })
-            .expect("reclaim runs")
+        let request = ReclaimRequest {
+            run_id: self.run_id,
+            main_ref: "main".to_owned(),
+            now: NOW,
+        };
+
+        self.gates().reclaim(&request).expect("reclaim runs")
     }
 
     fn events(&self) -> Vec<String> {
-        self.gates
-            .machines()
+        self.machines
             .store()
             .events_for_run(self.run_id)
             .expect("read events")
@@ -197,8 +202,7 @@ impl Gated {
     }
 
     fn worktree_status(&self) -> Option<WorktreeStatus> {
-        self.gates
-            .machines()
+        self.machines
             .store()
             .load_run(self.run_id)
             .expect("load run")
@@ -388,7 +392,7 @@ fn an_approval_belonging_to_another_run_is_not_an_approval_for_this_one() {
         ..gated.request(MergePath::Integrate)
     };
 
-    let verdict = gated.gates.pre_merge(&request).expect("gate runs");
+    let verdict = gated.gates().pre_merge(&request).expect("gate runs");
 
     assert_eq!(refusal(verdict), GateRefusal::ApprovalMissing);
 }
@@ -509,7 +513,8 @@ fn a_genesis_directory_covers_the_files_under_it() {
             None,
         ))
         .expect("insert approval");
-    let mut gates = Gates::new(StateMachines::new(store), fixture.worktrees());
+    let mut machines = StateMachines::new(store);
+    let mut gates = Gates::new(&mut machines, fixture.worktrees());
 
     let verdict = gates
         .pre_merge(&PreMergeRequest {
@@ -547,7 +552,8 @@ fn a_genesis_path_never_covers_the_directory_beside_it() {
             None,
         ))
         .expect("insert approval");
-    let mut gates = Gates::new(StateMachines::new(store), fixture.worktrees());
+    let mut machines = StateMachines::new(store);
+    let mut gates = Gates::new(&mut machines, fixture.worktrees());
 
     let verdict = gates
         .pre_merge(&PreMergeRequest {
@@ -723,7 +729,8 @@ fn a_worktree_outside_the_data_directory_is_refused_rather_than_derived_from() {
             ..fixture.run(None)
         })
         .expect("insert run");
-    let mut gates = Gates::new(StateMachines::new(store), fixture.worktrees());
+    let mut machines = StateMachines::new(store);
+    let mut gates = Gates::new(&mut machines, fixture.worktrees());
 
     let error = gates
         .reclaim(&ReclaimRequest {

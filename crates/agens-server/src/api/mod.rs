@@ -147,6 +147,15 @@ impl ApiCore {
         &self.machines
     }
 
+    /// The state machines, for the coordinator's own writers: the scheduler's
+    /// tick, the timer wheel, the gates and the worker's introspection. The
+    /// core is their single owner, so each of them borrows through here rather
+    /// than holding a second handle on the same tables.
+    #[must_use]
+    pub const fn machines_mut(&mut self) -> &mut StateMachines {
+        &mut self.machines
+    }
+
     #[must_use]
     pub const fn ports(&self) -> &Ports {
         &self.ports
