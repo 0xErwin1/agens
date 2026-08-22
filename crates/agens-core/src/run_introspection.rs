@@ -39,8 +39,11 @@ pub const MAX_ASK_OPTION_LABEL_CHARS: usize = 512;
 pub const MAX_ASK_RECOMMENDATION_CHARS: usize = 1_024;
 pub const MAX_ASK_CHARS: usize = 16 * 1_024;
 
-/// The text a team-mode worker's prompt carries about what a checkpoint costs
-/// and what it buys.
+/// What a worker is told a checkpoint costs and what it buys.
+///
+/// It is carried as the `checkpoint` tool's own description, which is where the
+/// worker actually reads it, and it is exported so a team-mode worker's system
+/// prompt can repeat it when there is one to repeat it in.
 ///
 /// It states the mechanical consequence rather than asking for rigour in the
 /// abstract, because the consequence is what is actually implemented: run
