@@ -16,6 +16,15 @@ use std::{
 const LOCK_FILE: &str = "serve.lock";
 const SOCKET_FILE: &str = "serve.sock";
 
+/// Where a client attaches to the daemon of one data directory.
+///
+/// Derived rather than reported, so a client that wants to reach a daemon does
+/// not need the daemon to tell it where it is listening.
+#[must_use]
+pub fn socket_path(data_directory: &Path) -> PathBuf {
+    data_directory.join(SOCKET_FILE)
+}
+
 #[derive(Debug)]
 pub enum ServeInstanceError {
     /// Another daemon holds the lock. Reported as its own variant because the
@@ -58,7 +67,7 @@ impl ServeInstance {
 
         take_exclusive_lock(&lock)?;
 
-        let socket_path = data_directory.join(SOCKET_FILE);
+        let socket_path = socket_path(data_directory);
         remove_stale_socket(&socket_path)?;
 
         Ok(Self { lock, socket_path })

@@ -596,6 +596,35 @@ impl ControlPlaneStore {
         })
     }
 
+    /// The journal after `after_id`, oldest first and at most `limit` entries.
+    ///
+    /// Every run's, because the live fan-out serves subscribers with different
+    /// filters and one watermark over the whole journal is what keeps them
+    /// reading the same sequence. `id` is assigned in commit order by a single
+    /// writer, so the last id a reader saw is the whole of its position.
+    pub fn events_after(&self, after_id: i64, limit: usize) -> Result<Vec<EventRow>> {
+        self.load_all(
+            "load events after",
+            &format!("{EVENT_SELECT} WHERE id > ?1 ORDER BY id LIMIT ?2"),
+            params![after_id, i64::try_from(limit).unwrap_or(i64::MAX)],
+        )
+    }
+
+    /// The id of the newest journal entry, or zero when nothing is journaled.
+    ///
+    /// A subscriber starts from here: the fan-out is live rather than a replay,
+    /// and handing a new subscriber the whole history would make the stream's
+    /// first moments unbounded.
+    pub fn latest_event_id(&self) -> Result<i64> {
+        self.connection
+            .query_row("SELECT COALESCE(MAX(id), 0) FROM events", [], |row| {
+                row.get(0)
+            })
+            .map_err(|error| {
+                ControlPlaneError::operation("read journal head", &self.database_path, error)
+            })
+    }
+
     /// One run's journal in commit order.
     pub fn events_for_run(&self, run_id: i64) -> Result<Vec<EventRow>> {
         self.load_all(

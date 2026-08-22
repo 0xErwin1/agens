@@ -14,8 +14,10 @@ use agens_core::run_introspection::{
     RunIntrospectionError, RunIntrospectionPort,
 };
 use agens_server::{
-    CHECKPOINT_EVENT, CheckpointClaim, ReportedCheckpoint, RunIntrospection, StateMachines,
-    TimerSettings, TimerWheel,
+    ApiCore, CHECKPOINT_EVENT, CheckpointClaim, Delivery, DeliveryQueue, EventFeed, EventFilter,
+    PortError, Ports, ReportedCheckpoint, RunIntrospection, SchedulerPort, SessionControl,
+    StateMachines, StopScope, Subscription, TakeoverHandle, TimerSettings, TimerWheel,
+    WorktreeDerivation, WorktreeGate,
 };
 use agens_store::{ControlPlaneStore, QuestionKind, QuestionState, RunRow, RunState};
 
@@ -57,23 +59,95 @@ fn run_in(state: RunState) -> RunRow {
     }
 }
 
+/// Ports nothing in this file reaches.
+///
+/// A worker's checkpoint and its question are written through the state
+/// machines alone: neither declares an effect outside the transaction, so a
+/// port that answered anything here would be answering a call that never
+/// happens.
+struct Unreached;
+
+impl SchedulerPort for Unreached {
+    fn admissions_paused(&self) -> bool {
+        false
+    }
+
+    fn set_admissions_paused(&self, _paused: bool) -> Result<bool, PortError> {
+        Err(unreached("scheduler"))
+    }
+
+    fn queue_changed(&self, _run_id: i64) {}
+}
+
+impl WorktreeGate for Unreached {
+    fn derive(&self, _run: &RunRow) -> Result<WorktreeDerivation, PortError> {
+        Err(unreached("worktrees"))
+    }
+
+    fn remove(&self, _run: &RunRow) -> Result<(), PortError> {
+        Err(unreached("worktrees"))
+    }
+}
+
+impl DeliveryQueue for Unreached {
+    fn enqueue(&self, _delivery: &Delivery) -> Result<(), PortError> {
+        Err(unreached("delivery"))
+    }
+}
+
+impl SessionControl for Unreached {
+    fn cancel(&self, _run_id: i64) -> Result<(), PortError> {
+        Err(unreached("sessions"))
+    }
+
+    fn take_over(&self, _run_id: i64) -> Result<TakeoverHandle, PortError> {
+        Err(unreached("sessions"))
+    }
+
+    fn stop(&self, _scope: &StopScope) -> Result<(), PortError> {
+        Err(unreached("sessions"))
+    }
+}
+
+impl EventFeed for Unreached {
+    fn subscribe(&self, _filter: &EventFilter) -> Result<Subscription, PortError> {
+        Err(unreached("feed"))
+    }
+}
+
+fn unreached(port: &'static str) -> PortError {
+    PortError::new(port, "no introspection write reaches a port")
+}
+
+fn ports() -> Ports {
+    let unreached = Arc::new(Unreached);
+
+    Ports {
+        scheduler: Arc::clone(&unreached) as Arc<dyn SchedulerPort>,
+        worktrees: Arc::clone(&unreached) as Arc<dyn WorktreeGate>,
+        delivery: Arc::clone(&unreached) as Arc<dyn DeliveryQueue>,
+        sessions: Arc::clone(&unreached) as Arc<dyn SessionControl>,
+        feed: unreached as Arc<dyn EventFeed>,
+    }
+}
+
 /// A run in `state`, its machines, and the introspection surface bound to it.
 fn fixture(
     state: RunState,
 ) -> (
     std::path::PathBuf,
-    Arc<Mutex<StateMachines>>,
+    Arc<Mutex<ApiCore>>,
     i64,
     RunIntrospection,
 ) {
     let directory = data_directory();
     let mut store = ControlPlaneStore::open(&directory).unwrap();
     let run_id = store.insert_run(&run_in(state)).unwrap();
-    let machines = Arc::new(Mutex::new(StateMachines::new(store)));
-    let introspection = RunIntrospection::new(Arc::clone(&machines), run_id, Arc::new(|| NOW))
+    let core = Arc::new(Mutex::new(ApiCore::new(StateMachines::new(store), ports())));
+    let introspection = RunIntrospection::new(Arc::clone(&core), run_id, Arc::new(|| NOW))
         .for_attempt(Some(11), Some(22));
 
-    (directory, machines, run_id, introspection)
+    (directory, core, run_id, introspection)
 }
 
 fn claim(description: &str, class: EvidenceClass, proofs: &[&str]) -> EvidenceClaim {
@@ -98,10 +172,11 @@ fn checkpoint(claims: Vec<EvidenceClaim>, touched_paths: Vec<String>) -> Checkpo
     .expect("the checkpoint is valid")
 }
 
-fn payload(machines: &Arc<Mutex<StateMachines>>, run_id: i64) -> serde_json::Value {
-    let event = machines
+fn payload(core: &Arc<Mutex<ApiCore>>, run_id: i64) -> serde_json::Value {
+    let event = core
         .lock()
         .unwrap()
+        .machines()
         .store()
         .events_for_run(run_id)
         .unwrap()
@@ -114,7 +189,7 @@ fn payload(machines: &Arc<Mutex<StateMachines>>, run_id: i64) -> serde_json::Val
 
 #[test]
 fn a_checkpoint_journals_one_entry_and_a_finding_for_every_claim() {
-    let (directory, machines, run_id, mut introspection) = fixture(RunState::Running);
+    let (directory, core, run_id, mut introspection) = fixture(RunState::Running);
 
     let receipt = introspection
         .checkpoint(&checkpoint(
@@ -137,8 +212,8 @@ fn a_checkpoint_journals_one_entry_and_a_finding_for_every_claim() {
     assert_eq!(receipt.finding_ids.len(), 2);
     assert!(receipt.credited_progress);
 
-    let machines = machines.lock().unwrap();
-    let findings = machines.store().findings_for_run(run_id).unwrap();
+    let core = core.lock().unwrap();
+    let findings = core.machines().store().findings_for_run(run_id).unwrap();
 
     assert_eq!(
         findings
@@ -166,7 +241,7 @@ fn a_checkpoint_journals_one_entry_and_a_finding_for_every_claim() {
         "[\"cargo test -p agens-core rejects_empty_header => 0\"]"
     );
 
-    drop(machines);
+    drop(core);
     fs::remove_dir_all(directory).unwrap();
 }
 
@@ -174,7 +249,7 @@ fn a_checkpoint_journals_one_entry_and_a_finding_for_every_claim() {
 /// the payload rather than left for a reader to recompute from the findings.
 #[test]
 fn the_journal_payload_carries_the_evidence_classes_run_health_consumes() {
-    let (directory, machines, run_id, mut introspection) = fixture(RunState::Running);
+    let (directory, core, run_id, mut introspection) = fixture(RunState::Running);
 
     introspection
         .checkpoint(&checkpoint(
@@ -187,7 +262,7 @@ fn the_journal_payload_carries_the_evidence_classes_run_health_consumes() {
         ))
         .expect("a running run accepts a checkpoint");
 
-    let payload = payload(&machines, run_id);
+    let payload = payload(&core, run_id);
 
     assert_eq!(payload["credits_progress"], serde_json::json!(true));
     assert_eq!(
@@ -212,7 +287,7 @@ fn the_journal_payload_carries_the_evidence_classes_run_health_consumes() {
 /// correlate.
 #[test]
 fn the_journal_payload_correlates_the_diff_with_the_attempt_that_produced_it() {
-    let (directory, machines, run_id, mut introspection) = fixture(RunState::Running);
+    let (directory, core, run_id, mut introspection) = fixture(RunState::Running);
 
     introspection
         .checkpoint(&checkpoint(
@@ -221,7 +296,7 @@ fn the_journal_payload_correlates_the_diff_with_the_attempt_that_produced_it() {
         ))
         .expect("a running run accepts a checkpoint");
 
-    let payload = payload(&machines, run_id);
+    let payload = payload(&core, run_id);
 
     assert_eq!(payload["carries_diff"], serde_json::json!(true));
     assert_eq!(
@@ -238,7 +313,7 @@ fn the_journal_payload_correlates_the_diff_with_the_attempt_that_produced_it() {
 
 #[test]
 fn a_checkpoint_without_a_proved_claim_credits_no_progress() {
-    let (directory, machines, run_id, mut introspection) = fixture(RunState::Running);
+    let (directory, core, run_id, mut introspection) = fixture(RunState::Running);
 
     let receipt = introspection
         .checkpoint(&checkpoint(
@@ -252,7 +327,7 @@ fn a_checkpoint_without_a_proved_claim_credits_no_progress() {
 
     assert!(!receipt.credited_progress);
     assert_eq!(
-        payload(&machines, run_id)["credits_progress"],
+        payload(&core, run_id)["credits_progress"],
         serde_json::json!(false)
     );
 
@@ -262,16 +337,16 @@ fn a_checkpoint_without_a_proved_claim_credits_no_progress() {
 /// A checkpoint reports; it does not move the run. The worker keeps working.
 #[test]
 fn a_checkpoint_leaves_the_run_where_it_was() {
-    let (directory, machines, run_id, mut introspection) = fixture(RunState::Running);
+    let (directory, core, run_id, mut introspection) = fixture(RunState::Running);
 
     introspection
         .checkpoint(&checkpoint(Vec::new(), Vec::new()))
         .expect("a running run accepts a checkpoint");
 
     assert_eq!(
-        machines
-            .lock()
+        core.lock()
             .unwrap()
+            .machines()
             .store()
             .load_run(run_id)
             .unwrap()
@@ -289,7 +364,7 @@ fn a_checkpoint_leaves_the_run_where_it_was() {
 /// be reported overdue.
 #[test]
 fn the_deadline_a_checkpoint_declares_is_the_one_the_timer_wheel_holds_it_to() {
-    let (directory, machines, run_id, mut introspection) = fixture(RunState::Running);
+    let (directory, core, run_id, mut introspection) = fixture(RunState::Running);
 
     let receipt = introspection
         .checkpoint(&checkpoint(Vec::new(), Vec::new()))
@@ -297,14 +372,14 @@ fn the_deadline_a_checkpoint_declares_is_the_one_the_timer_wheel_holds_it_to() {
 
     let (wheel, clock) = TimerWheel::with_manual_clock_for_test(TimerSettings::default(), NOW);
 
-    let tick = wheel.tick(&mut machines.lock().unwrap()).unwrap();
+    let tick = wheel.tick(core.lock().unwrap().machines_mut()).unwrap();
     assert!(
         tick.overdue_checkpoints.is_empty(),
         "a promise that has not come due yet is not overdue: {tick:?}"
     );
 
     clock.set(NOW + 100_000);
-    let tick = wheel.tick(&mut machines.lock().unwrap()).unwrap();
+    let tick = wheel.tick(core.lock().unwrap().machines_mut()).unwrap();
 
     assert_eq!(
         tick.overdue_checkpoints
@@ -395,14 +470,15 @@ fn ask() -> Ask {
 
 #[test]
 fn ask_opens_a_durable_question_and_parks_the_run_on_it() {
-    let (directory, machines, run_id, mut introspection) = fixture(RunState::Running);
+    let (directory, core, run_id, mut introspection) = fixture(RunState::Running);
 
     let receipt = introspection.ask(&ask()).expect("a running run can ask");
 
     assert_eq!(receipt.run_id, run_id);
 
-    let machines = machines.lock().unwrap();
-    let question = machines
+    let core = core.lock().unwrap();
+    let question = core
+        .machines()
         .store()
         .load_question(receipt.question_id)
         .unwrap()
@@ -420,11 +496,16 @@ fn ask_opens_a_durable_question_and_parks_the_run_on_it() {
         ])
     );
     assert_eq!(
-        machines.store().load_run(run_id).unwrap().unwrap().state,
+        core.machines()
+            .store()
+            .load_run(run_id)
+            .unwrap()
+            .unwrap()
+            .state,
         RunState::AwaitingInput
     );
     assert_eq!(
-        machines
+        core.machines()
             .store()
             .events_for_run(run_id)
             .unwrap()
@@ -438,7 +519,7 @@ fn ask_opens_a_durable_question_and_parks_the_run_on_it() {
         "no transition is silent"
     );
 
-    drop(machines);
+    drop(core);
     fs::remove_dir_all(directory).unwrap();
 }
 
@@ -447,7 +528,7 @@ fn ask_opens_a_durable_question_and_parks_the_run_on_it() {
 /// on is an inbox entry that cannot be acted on.
 #[test]
 fn a_refused_ask_writes_no_question() {
-    let (directory, machines, run_id, mut introspection) = fixture(RunState::Queued);
+    let (directory, core, run_id, mut introspection) = fixture(RunState::Queued);
 
     let error = introspection.ask(&ask()).unwrap_err();
 
@@ -456,21 +537,32 @@ fn a_refused_ask_writes_no_question() {
         "{error:?}"
     );
 
-    let machines = machines.lock().unwrap();
+    let core = core.lock().unwrap();
 
     assert!(
-        machines
+        core.machines()
             .store()
             .questions_for_run(run_id)
             .unwrap()
             .is_empty()
     );
     assert_eq!(
-        machines.store().load_run(run_id).unwrap().unwrap().state,
+        core.machines()
+            .store()
+            .load_run(run_id)
+            .unwrap()
+            .unwrap()
+            .state,
         RunState::Queued
     );
-    assert!(machines.store().events_for_run(run_id).unwrap().is_empty());
+    assert!(
+        core.machines()
+            .store()
+            .events_for_run(run_id)
+            .unwrap()
+            .is_empty()
+    );
 
-    drop(machines);
+    drop(core);
     fs::remove_dir_all(directory).unwrap();
 }

@@ -261,17 +261,18 @@ impl From<TransitionRejection> for GateError {
 
 /// The two git gates over one control plane.
 ///
-/// It holds the state machines rather than a store handle of its own: a gate
-/// both journals its verdict and moves a worktree, and routing both through the
-/// machines keeps them the only writer of the control-plane tables.
-pub struct Gates {
-    machines: StateMachines,
+/// It borrows the state machines rather than owning them: the API core is their
+/// single owner, and a daemon that let the gates own a second copy would have
+/// two writers of the same tables. A gate is therefore built for the span of
+/// the sweep it runs, from `ApiCore::machines_mut`.
+pub struct Gates<'a> {
+    machines: &'a mut StateMachines,
     worktrees: SessionWorktrees,
 }
 
-impl Gates {
+impl<'a> Gates<'a> {
     #[must_use]
-    pub const fn new(machines: StateMachines, worktrees: SessionWorktrees) -> Self {
+    pub const fn new(machines: &'a mut StateMachines, worktrees: SessionWorktrees) -> Self {
         Self {
             machines,
             worktrees,
@@ -282,12 +283,12 @@ impl Gates {
     /// apply.
     #[must_use]
     pub const fn machines(&self) -> &StateMachines {
-        &self.machines
+        self.machines
     }
 
     #[must_use]
     pub const fn machines_mut(&mut self) -> &mut StateMachines {
-        &mut self.machines
+        self.machines
     }
 
     /// Freezes the receipt an approval is bound to.
@@ -708,7 +709,7 @@ fn receipt_holds(frozen: &Receipt, derived: &Receipt, merged: bool) -> bool {
 }
 
 /// The receipt a derivation implies.
-fn receipt_of(derivation: &GateDerivation) -> Receipt {
+pub(crate) fn receipt_of(derivation: &GateDerivation) -> Receipt {
     Receipt {
         tree_hash: derivation.head_tree.clone(),
         paths_digest: paths_digest(&derivation.changed_paths),
