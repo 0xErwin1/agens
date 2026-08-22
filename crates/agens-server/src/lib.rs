@@ -5,6 +5,7 @@
 //! CLI on purpose — the daemon owns the coordinator, its state machines, the
 //! scheduler and the timers, and none of that belongs to a command surface.
 
+mod api;
 mod blocking;
 mod fsm;
 mod instance;
@@ -15,6 +16,14 @@ use std::path::Path;
 
 use agens_core::HeadlessTurnCancellation;
 
+pub use api::{
+    AdmissionState, AnswerQuestion, AnsweredQuestion, ApiCore, ApiError, ApprovePlan,
+    AuthorizeMerge, CleaningAction, CleaningDisposition, Delivery, DeliveryGrain, DeliveryPayload,
+    DeliveryQueue, DetailQuestionRefusal, EventFeed, EventFilter, InboxItem, InboxView,
+    OPERATION_AUTHORIZATION, Operation, OperationAuthorization, PortError, Ports, RetryRequest,
+    RunRef, RunSummary, RunView, Scheduler, SessionControl, StopRequest, StopScope, Subscription,
+    TakeoverHandle, TreeSnapshot, WorktreeDerivation, WorktreeGate, praetor_may_answer,
+};
 pub use blocking::{BlockingBoundary, BlockingError};
 pub use fsm::{
     AppliedQuestionTransition, AppliedRunTransition, AppliedTransition, AppliedWorktreeTransition,

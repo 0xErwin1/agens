@@ -196,6 +196,17 @@ impl StateMachines {
         &self.store
     }
 
+    /// Appends one entry to the journal without moving anything.
+    ///
+    /// Narrow on purpose. The control plane has one writer, so a component that
+    /// has to record a fact of its own — the API core recording a refusal it
+    /// did not act on — needs a way through this handle rather than a second
+    /// connection. It cannot change a state, so the invariant that only a
+    /// guarded transition moves a row still holds.
+    pub fn journal(&mut self, event: &EventRow) -> Result<i64, TransitionRejection> {
+        Ok(self.store.append_event(event)?)
+    }
+
     fn load_run(&self, run_id: i64) -> Result<RunRow, TransitionRejection> {
         self.store
             .load_run(run_id)?
