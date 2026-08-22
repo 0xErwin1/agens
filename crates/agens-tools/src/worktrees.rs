@@ -37,7 +37,7 @@ const DEFAULT_WORKTREE_GIT_TIMEOUT: Duration = Duration::from_secs(120);
 /// substitute the commit the worktree is created from. Content filters
 /// configured inside the repository still run, so the tool's own description
 /// says the checkout executes what the repository configures.
-const HARDENING_ARGUMENTS: [&str; 9] = [
+pub(crate) const HARDENING_ARGUMENTS: [&str; 9] = [
     "--no-pager",
     "--no-replace-objects",
     "--no-optional-locks",
@@ -149,6 +149,45 @@ impl SessionWorktrees {
         Ok(WorktreeStatus { merged, dirty })
     }
 
+    /// Force-removes a session worktree together with the branch it was
+    /// created on.
+    ///
+    /// This is the exit for a worktree whose creation never completed: nothing
+    /// in it is the user's yet, so the untracked files provisioning may have
+    /// copied are not a reason to refuse. Use [`Self::remove`] for a worktree
+    /// that has been handed to a session.
+    pub fn discard(
+        &self,
+        repository: &Path,
+        repository_id: &str,
+        name: &str,
+        branch: &str,
+    ) -> Result<(), WorktreeError> {
+        validate_component(repository_id, "repository id")?;
+        validate_component(name, "worktree name")?;
+        validate_git_argument(branch, "branch")?;
+
+        let path = self.worktree_path(repository_id, name);
+        self.ensure_present(&path)?;
+        self.run_checked(
+            repository,
+            "worktree remove",
+            &[
+                "worktree".into(),
+                "remove".into(),
+                "--force".into(),
+                path.into_os_string(),
+            ],
+        )?;
+        self.run_checked(
+            repository,
+            "branch delete",
+            &["branch".into(), "-D".into(), branch.into()],
+        )?;
+
+        Ok(())
+    }
+
     /// Removes a clean session worktree while leaving its branch intact.
     pub fn remove(
         &self,
@@ -210,6 +249,15 @@ impl SessionWorktrees {
         )?;
 
         Ok(String::from_utf8_lossy(&output).trim().to_owned())
+    }
+
+    /// Where one named worktree lives, once its components are known to be
+    /// safe.
+    pub fn path(&self, repository_id: &str, name: &str) -> Result<PathBuf, WorktreeError> {
+        validate_component(repository_id, "repository id")?;
+        validate_component(name, "worktree name")?;
+
+        Ok(self.worktree_path(repository_id, name))
     }
 
     /// Where one repository's session worktrees live, once `repository_id` is
