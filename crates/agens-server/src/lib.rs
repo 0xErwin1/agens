@@ -8,6 +8,7 @@
 mod blocking;
 mod fsm;
 mod gates;
+mod ingest;
 mod instance;
 mod scheduler;
 mod sessions;
@@ -30,6 +31,11 @@ pub use fsm::{
 pub use gates::{
     GateError, GateRefusal, Gates, MergePath, PreMergeRequest, PreMergeVerdict, Receipt,
     ReclaimRequest, ReclaimVerdict, SubAgentKind, SubAgentRequest, freeze_receipt,
+};
+pub use ingest::{
+    AcceptedFact, CheckpointClaim, CheckpointStanding, DrainedFact, FactReceiver, FactSender,
+    HealthSignal, HealthThresholds, Ingest, IngestFact, IngestRejection, LostReason,
+    ReportedCheckpoint, ReportedFact, channel as ingest_channel, detect_worker_lost,
 };
 pub use instance::{ServeInstance, ServeInstanceError};
 pub use scheduler::{

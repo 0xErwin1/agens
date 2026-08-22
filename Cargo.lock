@@ -226,6 +226,7 @@ dependencies = [
  "agens-store",
  "agens-tools",
  "libc",
+ "rusqlite",
  "serde_json",
  "sha2",
  "tokio",
