@@ -5,8 +5,9 @@ use std::{
 
 use agens_store::{
     AttemptOutcome, AttemptRow, CausalDisposition, ControlPlaneStore, EventClass, EventRow,
-    EvidenceClass, FindingRow, ProviderRow, QuestionAuthor, QuestionKind, QuestionRow,
-    QuestionState, QuotaState, RetryTrigger, RunHealthRow, RunRow, RunState, WorktreeStatus,
+    EvidenceClass, FindingRow, ProviderRow, QuestionAnswer, QuestionAuthor, QuestionChange,
+    QuestionKind, QuestionRow, QuestionState, QuotaState, RetryTrigger, RunHealthRow, RunRow,
+    RunState, StateChange, TransitionWrite, WorktreeStatus,
 };
 use rusqlite::Connection;
 
@@ -557,4 +558,250 @@ fn deleting_a_run_takes_its_journal_and_health_with_it() {
     assert_eq!(store.load_run_health(run_id).unwrap(), None);
 
     fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn an_applied_transition_writes_the_state_change_and_every_event_together() {
+    let directory = data_directory();
+    let mut store = ControlPlaneStore::open(&directory).unwrap();
+    let run_id = store.insert_run(&draft_run()).unwrap();
+
+    let outcome = store
+        .apply_transition(&TransitionWrite {
+            run_id,
+            run_state: Some(StateChange {
+                expected: RunState::Draft,
+                next: RunState::Queued,
+            }),
+            worktree_status: None,
+            question: None,
+            attempt: None,
+            provider: None,
+            events: &[
+                event(run_id, "run_state_changed"),
+                event(run_id, "run_approved"),
+            ],
+        })
+        .unwrap();
+
+    assert_eq!(outcome.event_ids.len(), 2);
+    assert_eq!(outcome.attempt_id, None);
+    assert_eq!(
+        store.load_run(run_id).unwrap().unwrap().state,
+        RunState::Queued
+    );
+    assert_eq!(
+        event_types(&store, run_id),
+        vec!["run_state_changed".to_owned(), "run_approved".to_owned()]
+    );
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn a_transition_against_a_state_the_run_already_left_writes_nothing() {
+    let directory = data_directory();
+    let mut store = ControlPlaneStore::open(&directory).unwrap();
+    let run_id = store.insert_run(&draft_run()).unwrap();
+
+    let error = store
+        .apply_transition(&TransitionWrite {
+            run_id,
+            run_state: Some(StateChange {
+                expected: RunState::Running,
+                next: RunState::Done,
+            }),
+            worktree_status: None,
+            question: None,
+            attempt: None,
+            provider: None,
+            events: &[event(run_id, "run_state_changed")],
+        })
+        .unwrap_err();
+
+    assert!(error.is_conflict(), "{error}");
+    assert_eq!(
+        store.load_run(run_id).unwrap().unwrap().state,
+        RunState::Draft
+    );
+    assert!(store.events_for_run(run_id).unwrap().is_empty());
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn a_transition_carries_its_attempt_question_and_provider_writes() {
+    let directory = data_directory();
+    let mut store = ControlPlaneStore::open(&directory).unwrap();
+    let run_id = store
+        .insert_run(&RunRow {
+            state: RunState::AwaitingInput,
+            worktree_path: Some("/data/worktrees/agens-a1b2c3d4/run-1".to_owned()),
+            worktree_status: Some(WorktreeStatus::Active),
+            ..draft_run()
+        })
+        .unwrap();
+    let question_id = store
+        .insert_question(&QuestionRow {
+            id: None,
+            run_id,
+            kind: QuestionKind::Question,
+            blocked_decision: "which crate owns the deriver".to_owned(),
+            options: "[\"store\",\"server\"]".to_owned(),
+            recommendation: None,
+            answer: None,
+            author: None,
+            expires_at: None,
+            tree_hash: None,
+            paths_digest: None,
+            state: QuestionState::Open,
+            created_at: 1_700_000_050,
+        })
+        .unwrap();
+
+    let outcome = store
+        .apply_transition(&TransitionWrite {
+            run_id,
+            run_state: Some(StateChange {
+                expected: RunState::AwaitingInput,
+                next: RunState::Queued,
+            }),
+            worktree_status: Some(StateChange {
+                expected: WorktreeStatus::Active,
+                next: WorktreeStatus::Reclaimable,
+            }),
+            question: Some(QuestionChange {
+                question_id,
+                expected: QuestionState::Open,
+                next: QuestionState::Answered,
+                answer: Some(QuestionAnswer {
+                    answer: "server".to_owned(),
+                    author: QuestionAuthor::User,
+                }),
+            }),
+            attempt: Some(&AttemptRow {
+                id: None,
+                run_id,
+                n: 1,
+                session_id: None,
+                session_attempt_id: None,
+                started_at: 1_700_000_100,
+                ended_at: None,
+                outcome: None,
+                retry_trigger: Some(RetryTrigger::User),
+                tokens: None,
+                cost_micros: None,
+            }),
+            provider: Some(&ProviderRow {
+                provider: "anthropic".to_owned(),
+                quota_state: QuotaState::Ok,
+                reset_at: None,
+                updated_at: 1_700_000_100,
+            }),
+            events: &[event(run_id, "run_state_changed")],
+        })
+        .unwrap();
+
+    assert!(outcome.attempt_id.is_some());
+    let question = store.load_question(question_id).unwrap().unwrap();
+    assert_eq!(question.state, QuestionState::Answered);
+    assert_eq!(question.answer.as_deref(), Some("server"));
+    assert_eq!(question.author, Some(QuestionAuthor::User));
+    assert_eq!(
+        store.load_run(run_id).unwrap().unwrap().worktree_status,
+        Some(WorktreeStatus::Reclaimable)
+    );
+    assert_eq!(store.attempts_for_run(run_id).unwrap().len(), 1);
+    assert_eq!(
+        store
+            .load_provider("anthropic")
+            .unwrap()
+            .unwrap()
+            .quota_state,
+        QuotaState::Ok
+    );
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn a_question_write_that_loses_its_race_rolls_back_the_run_state_with_it() {
+    let directory = data_directory();
+    let mut store = ControlPlaneStore::open(&directory).unwrap();
+    let run_id = store
+        .insert_run(&RunRow {
+            state: RunState::AwaitingInput,
+            ..draft_run()
+        })
+        .unwrap();
+    let question_id = store
+        .insert_question(&QuestionRow {
+            id: None,
+            run_id,
+            kind: QuestionKind::Question,
+            blocked_decision: "which crate owns the deriver".to_owned(),
+            options: "[\"store\",\"server\"]".to_owned(),
+            recommendation: None,
+            answer: None,
+            author: None,
+            expires_at: None,
+            tree_hash: None,
+            paths_digest: None,
+            state: QuestionState::Open,
+            created_at: 1_700_000_050,
+        })
+        .unwrap();
+
+    let error = store
+        .apply_transition(&TransitionWrite {
+            run_id,
+            run_state: Some(StateChange {
+                expected: RunState::AwaitingInput,
+                next: RunState::Queued,
+            }),
+            worktree_status: None,
+            question: Some(QuestionChange {
+                question_id,
+                expected: QuestionState::Answered,
+                next: QuestionState::Delivered,
+                answer: None,
+            }),
+            attempt: None,
+            provider: None,
+            events: &[event(run_id, "run_state_changed")],
+        })
+        .unwrap_err();
+
+    assert!(error.is_conflict(), "{error}");
+    assert_eq!(
+        store.load_run(run_id).unwrap().unwrap().state,
+        RunState::AwaitingInput
+    );
+    assert_eq!(
+        store.load_question(question_id).unwrap().unwrap().state,
+        QuestionState::Open
+    );
+    assert!(store.events_for_run(run_id).unwrap().is_empty());
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+fn event(run_id: i64, event_type: &str) -> EventRow {
+    EventRow {
+        id: None,
+        run_id: Some(run_id),
+        event_type: event_type.to_owned(),
+        class: EventClass::Infra,
+        payload: "{}".to_owned(),
+        ts: 1_700_000_100,
+    }
+}
+
+fn event_types(store: &ControlPlaneStore, run_id: i64) -> Vec<String> {
+    store
+        .events_for_run(run_id)
+        .unwrap()
+        .into_iter()
+        .map(|event| event.event_type)
+        .collect()
 }

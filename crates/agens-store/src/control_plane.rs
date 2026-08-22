@@ -188,23 +188,43 @@ sql_enum! {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ControlPlaneError {
     message: String,
+    /// Set when a conditional write matched no row, which is the one failure a
+    /// caller can act on: the row moved, so its decision was made against state
+    /// that no longer holds and has to be taken again.
+    conflict: bool,
 }
 
 impl ControlPlaneError {
     fn operation(operation: &str, path: &Path, error: impl fmt::Display) -> Self {
         Self {
             message: format!("control plane {operation} at {}: {error}", path.display()),
+            conflict: false,
         }
     }
 
     fn detail(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            conflict: false,
+        }
+    }
+
+    fn conflict(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            conflict: true,
         }
     }
 
     fn from_database(error: database::DatabaseError) -> Self {
         Self::operation(error.operation(), error.path(), error.detail())
+    }
+
+    /// Whether the write was refused because the row no longer held the state
+    /// the caller expected. Nothing was written when this is true.
+    #[must_use]
+    pub const fn is_conflict(&self) -> bool {
+        self.conflict
     }
 }
 
@@ -367,6 +387,58 @@ pub struct RunHealthRow {
     pub updated_at: i64,
 }
 
+/// A conditional state change. The write lands only while the row still holds
+/// `expected`, so a caller that decided against a stale read is refused rather
+/// than allowed to overwrite whoever moved it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StateChange<T> {
+    pub expected: T,
+    pub next: T,
+}
+
+/// The answer half of a question's move out of `open`: nothing is answered
+/// anonymously, so the two travel together.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QuestionAnswer {
+    pub answer: String,
+    pub author: QuestionAuthor,
+}
+
+/// One question's conditional move, with the answer it carries when it has one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QuestionChange {
+    pub question_id: i64,
+    pub expected: QuestionState,
+    pub next: QuestionState,
+    pub answer: Option<QuestionAnswer>,
+}
+
+/// Everything one applied transition writes.
+///
+/// It is one struct rather than a call per table because a state change and the
+/// events that announce it have to land or fail together: a journal that
+/// recorded a move the row never made, or a row that moved with nothing in the
+/// journal, are both worse than the transition being refused.
+pub struct TransitionWrite<'a> {
+    pub run_id: i64,
+    pub run_state: Option<StateChange<RunState>>,
+    pub worktree_status: Option<StateChange<WorktreeStatus>>,
+    pub question: Option<QuestionChange>,
+    /// A new attempt row opened by this transition.
+    pub attempt: Option<&'a AttemptRow>,
+    /// The provider's quota state as this transition leaves it.
+    pub provider: Option<&'a ProviderRow>,
+    pub events: &'a [EventRow],
+}
+
+/// What one applied transition wrote.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TransitionOutcome {
+    /// Journal ids in the order the events were given.
+    pub event_ids: Vec<i64>,
+    pub attempt_id: Option<i64>,
+}
+
 /// The control plane's own connection to the shared `agens.db` file.
 pub struct ControlPlaneStore {
     database_path: PathBuf,
@@ -443,25 +515,9 @@ impl ControlPlaneStore {
     }
 
     pub fn insert_attempt(&mut self, attempt: &AttemptRow) -> Result<i64> {
-        self.insert(
-            "insert attempt",
-            "INSERT INTO attempts (
-                 run_id, n, session_id, session_attempt_id, started_at, ended_at, outcome,
-                 retry_trigger, tokens, cost_micros
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            params![
-                attempt.run_id,
-                attempt.n,
-                attempt.session_id,
-                attempt.session_attempt_id,
-                attempt.started_at,
-                attempt.ended_at,
-                attempt.outcome.map(AttemptOutcome::as_str),
-                attempt.retry_trigger.map(RetryTrigger::as_str),
-                attempt.tokens,
-                attempt.cost_micros,
-            ],
-        )
+        insert_attempt_row(&self.connection, attempt).map_err(|error| {
+            ControlPlaneError::operation("insert attempt", &self.database_path, error)
+        })
     }
 
     pub fn attempts_for_run(&self, run_id: i64) -> Result<Vec<AttemptRow>> {
@@ -473,18 +529,9 @@ impl ControlPlaneStore {
     }
 
     pub fn append_event(&mut self, event: &EventRow) -> Result<i64> {
-        self.insert(
-            "append event",
-            "INSERT INTO events (run_id, type, class, payload, ts)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                event.run_id,
-                event.event_type,
-                event.class.as_str(),
-                event.payload,
-                event.ts,
-            ],
-        )
+        append_event_row(&self.connection, event).map_err(|error| {
+            ControlPlaneError::operation("append event", &self.database_path, error)
+        })
     }
 
     /// One run's journal in commit order.
@@ -565,24 +612,9 @@ impl ControlPlaneStore {
 
     /// Records a provider's quota state, replacing whatever was known before.
     pub fn record_provider(&mut self, provider: &ProviderRow) -> Result<()> {
-        self.connection
-            .execute(
-                "INSERT INTO providers (provider, quota_state, reset_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT(provider) DO UPDATE SET
-                     quota_state = excluded.quota_state,
-                     reset_at = excluded.reset_at,
-                     updated_at = excluded.updated_at",
-                params![
-                    provider.provider,
-                    provider.quota_state.as_str(),
-                    provider.reset_at,
-                    provider.updated_at,
-                ],
-            )
-            .map_err(|error| {
-                ControlPlaneError::operation("record provider", &self.database_path, error)
-            })?;
+        record_provider_row(&self.connection, provider).map_err(|error| {
+            ControlPlaneError::operation("record provider", &self.database_path, error)
+        })?;
 
         Ok(())
     }
@@ -635,6 +667,115 @@ impl ControlPlaneStore {
         )
     }
 
+    /// Applies one state machine transition: the conditional state changes, the
+    /// rows the transition's effects add, and the journal entries that announce
+    /// it, in a single transaction.
+    ///
+    /// Every state change is conditional on the state the caller read. A caller
+    /// that lost the race is told so through [`ControlPlaneError::is_conflict`]
+    /// and nothing at all is written, which is what keeps a stale decision from
+    /// forcing a state the guard was never evaluated against.
+    pub fn apply_transition(&mut self, write: &TransitionWrite<'_>) -> Result<TransitionOutcome> {
+        const OPERATION: &str = "apply transition";
+
+        let path = self.database_path.clone();
+        let failure =
+            |error: rusqlite::Error| ControlPlaneError::operation(OPERATION, &path, error);
+
+        let transaction = self.connection.transaction().map_err(failure)?;
+
+        if let Some(change) = &write.run_state {
+            let updated = transaction
+                .execute(
+                    "UPDATE runs SET state = ?1 WHERE id = ?2 AND state = ?3",
+                    params![change.next.as_str(), write.run_id, change.expected.as_str()],
+                )
+                .map_err(failure)?;
+
+            if updated != 1 {
+                return Err(ControlPlaneError::conflict(format!(
+                    "run {} is no longer {}",
+                    write.run_id,
+                    change.expected.as_str()
+                )));
+            }
+        }
+
+        if let Some(change) = &write.worktree_status {
+            let updated = transaction
+                .execute(
+                    "UPDATE runs SET worktree_status = ?1 WHERE id = ?2 AND worktree_status = ?3",
+                    params![change.next.as_str(), write.run_id, change.expected.as_str()],
+                )
+                .map_err(failure)?;
+
+            if updated != 1 {
+                return Err(ControlPlaneError::conflict(format!(
+                    "worktree of run {} is no longer {}",
+                    write.run_id,
+                    change.expected.as_str()
+                )));
+            }
+        }
+
+        if let Some(change) = &write.question {
+            let updated = match &change.answer {
+                Some(answer) => transaction.execute(
+                    "UPDATE questions SET state = ?1, answer = ?2, author = ?3
+                     WHERE id = ?4 AND run_id = ?5 AND state = ?6",
+                    params![
+                        change.next.as_str(),
+                        answer.answer,
+                        answer.author.as_str(),
+                        change.question_id,
+                        write.run_id,
+                        change.expected.as_str(),
+                    ],
+                ),
+                None => transaction.execute(
+                    "UPDATE questions SET state = ?1 WHERE id = ?2 AND run_id = ?3 AND state = ?4",
+                    params![
+                        change.next.as_str(),
+                        change.question_id,
+                        write.run_id,
+                        change.expected.as_str(),
+                    ],
+                ),
+            }
+            .map_err(failure)?;
+
+            if updated != 1 {
+                return Err(ControlPlaneError::conflict(format!(
+                    "question {} of run {} is no longer {}",
+                    change.question_id,
+                    write.run_id,
+                    change.expected.as_str()
+                )));
+            }
+        }
+
+        let attempt_id = match write.attempt {
+            Some(attempt) => Some(insert_attempt_row(&transaction, attempt).map_err(failure)?),
+            None => None,
+        };
+
+        if let Some(provider) = write.provider {
+            record_provider_row(&transaction, provider).map_err(failure)?;
+        }
+
+        let mut event_ids = Vec::with_capacity(write.events.len());
+        for event in write.events {
+            event_ids.push(append_event_row(&transaction, event).map_err(failure)?);
+        }
+
+        transaction.commit().map_err(failure)?;
+
+        Ok(TransitionOutcome {
+            event_ids,
+            attempt_id,
+        })
+    }
+
     fn insert(
         &self,
         operation: &str,
@@ -676,6 +817,64 @@ impl ControlPlaneStore {
 
         rows.into_iter().collect()
     }
+}
+
+/// Writes each of these rows against a plain connection or a transaction, so a
+/// single write and the same write inside an applied transition go through one
+/// statement rather than two that can drift.
+fn insert_attempt_row(connection: &Connection, attempt: &AttemptRow) -> rusqlite::Result<i64> {
+    connection.execute(
+        "INSERT INTO attempts (
+             run_id, n, session_id, session_attempt_id, started_at, ended_at, outcome,
+             retry_trigger, tokens, cost_micros
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![
+            attempt.run_id,
+            attempt.n,
+            attempt.session_id,
+            attempt.session_attempt_id,
+            attempt.started_at,
+            attempt.ended_at,
+            attempt.outcome.map(AttemptOutcome::as_str),
+            attempt.retry_trigger.map(RetryTrigger::as_str),
+            attempt.tokens,
+            attempt.cost_micros,
+        ],
+    )?;
+
+    Ok(connection.last_insert_rowid())
+}
+
+fn append_event_row(connection: &Connection, event: &EventRow) -> rusqlite::Result<i64> {
+    connection.execute(
+        "INSERT INTO events (run_id, type, class, payload, ts) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            event.run_id,
+            event.event_type,
+            event.class.as_str(),
+            event.payload,
+            event.ts,
+        ],
+    )?;
+
+    Ok(connection.last_insert_rowid())
+}
+
+fn record_provider_row(connection: &Connection, provider: &ProviderRow) -> rusqlite::Result<usize> {
+    connection.execute(
+        "INSERT INTO providers (provider, quota_state, reset_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(provider) DO UPDATE SET
+             quota_state = excluded.quota_state,
+             reset_at = excluded.reset_at,
+             updated_at = excluded.updated_at",
+        params![
+            provider.provider,
+            provider.quota_state.as_str(),
+            provider.reset_at,
+            provider.updated_at,
+        ],
+    )
 }
 
 /// Reads one row of a table into its typed struct.
