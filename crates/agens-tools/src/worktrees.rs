@@ -251,6 +251,53 @@ impl SessionWorktrees {
         Ok(String::from_utf8_lossy(&output).trim().to_owned())
     }
 
+    /// The two values a repository's identity is derived from: the git common
+    /// directory every one of its worktrees shares, and the URL of its
+    /// `origin` when it has one.
+    ///
+    /// Both are read here rather than by whoever derives the identity, so a
+    /// caller never reaches git outside this module's hardened invocation. The
+    /// derivation itself belongs to the control plane, which is what the
+    /// identity means something to.
+    pub fn repository_identity(
+        &self,
+        repository: &Path,
+    ) -> Result<RepositoryIdentity, WorktreeError> {
+        let common_directory = self.run_checked(
+            repository,
+            "rev-parse",
+            &[
+                "rev-parse".into(),
+                "--path-format=absolute".into(),
+                "--git-common-dir".into(),
+            ],
+        )?;
+
+        // A repository with no `origin` is identified by its common directory
+        // alone. Two clones of the same upstream with no remote configured are
+        // then distinct repositories, which is the correct reading: without an
+        // origin there is no evidence that they are the same one.
+        let origin = self.run_git(
+            repository,
+            &["remote".into(), "get-url".into(), "origin".into()],
+        )?;
+        let remote_url = origin
+            .success
+            .then(|| {
+                String::from_utf8_lossy(&origin.output.stdout)
+                    .trim()
+                    .to_owned()
+            })
+            .filter(|url| !url.is_empty());
+
+        Ok(RepositoryIdentity {
+            common_directory: PathBuf::from(
+                String::from_utf8_lossy(&common_directory).trim().to_owned(),
+            ),
+            remote_url,
+        })
+    }
+
     /// Where one named worktree lives, once its components are known to be
     /// safe.
     pub fn path(&self, repository_id: &str, name: &str) -> Result<PathBuf, WorktreeError> {
@@ -598,6 +645,17 @@ impl GitOutcome {
                 .to_owned(),
         }
     }
+}
+
+/// What a repository's identity is derived from.
+///
+/// Every worktree of a repository shares both, and only `--show-toplevel`
+/// separates them — which is exactly why these two are the identity for
+/// grouping and the path is the identity for confinement.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RepositoryIdentity {
+    pub common_directory: PathBuf,
+    pub remote_url: Option<String>,
 }
 
 /// Everything a coordinator gate re-derives from git in one pass.

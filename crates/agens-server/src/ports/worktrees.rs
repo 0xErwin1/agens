@@ -15,10 +15,22 @@
 use std::path::{Path, PathBuf};
 
 use agens_store::RunRow;
-use agens_tools::SessionWorktrees;
+use agens_tools::{
+    HookAuthorization, HookAuthorizationRequest, HookFailure, HookFailureResponse,
+    ProvisioningDecisions, ProvisioningOutcome, ProvisioningRequest, SessionWorktrees,
+    WorktreeProvisioner,
+};
 
-use crate::api::{PortError, WorktreeDerivation, WorktreeGate};
+use crate::api::{
+    PortError, ProvisionedWorktree, RepositoryIdentity, WorktreeDerivation, WorktreeGate,
+    WorktreeRequest,
+};
 use crate::gates::receipt_of;
+
+/// How many hexadecimal characters of the repository digest the fingerprint
+/// keeps. Sixteen, as the design fixes it: enough that two repositories on one
+/// machine never collide, short enough to read in a path and a log line.
+const FINGERPRINT_CHARS: usize = 16;
 
 /// Git derivation and disposal over the daemon's own worktree service.
 pub struct GitWorktreeGate {
@@ -59,6 +71,91 @@ impl WorktreeGate for GitWorktreeGate {
         })
     }
 
+    /// The fingerprint every worktree of one repository shares.
+    ///
+    /// Derived from the git common directory and the `origin` URL, which is
+    /// what a worktree shares with its checkout: only `--show-toplevel`
+    /// separates the two, and that is the identity confinement uses, not this
+    /// one.
+    fn identify(&self, repository: &Path) -> Result<RepositoryIdentity, PortError> {
+        use sha2::{Digest, Sha256};
+
+        let identity = self
+            .worktrees
+            .repository_identity(repository)
+            .map_err(|error| PortError::new("worktrees", error.to_string()))?;
+
+        let mut digest = Sha256::new();
+        digest.update(identity.common_directory.display().to_string().as_bytes());
+        if let Some(remote_url) = &identity.remote_url {
+            digest.update([0x1f]);
+            digest.update(remote_url.as_bytes());
+        }
+
+        let repo_id = digest
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+            .chars()
+            .take(FINGERPRINT_CHARS)
+            .collect();
+
+        Ok(RepositoryIdentity {
+            repo_id,
+            remote_url: identity.remote_url,
+        })
+    }
+
+    fn provision(&self, request: &WorktreeRequest<'_>) -> Result<ProvisionedWorktree, PortError> {
+        let path = self
+            .worktrees
+            .create(
+                request.repository,
+                request.repo_id,
+                request.name,
+                request.branch,
+                request.start_point,
+            )
+            .map_err(|error| PortError::new("worktrees", error.to_string()))?;
+
+        let outcome = WorktreeProvisioner::new(self.worktrees.clone())
+            .provision(
+                &ProvisioningRequest {
+                    repository: request.repository,
+                    repository_id: request.repo_id,
+                    name: request.name,
+                    branch: request.branch,
+                },
+                &CoordinatorProvisioning,
+            )
+            .map_err(|error| PortError::new("worktrees", error.to_string()))?;
+
+        match outcome {
+            ProvisioningOutcome::NotDeclared => Ok(ProvisionedWorktree {
+                path,
+                hook_failures: Vec::new(),
+            }),
+            ProvisioningOutcome::Applied(report) => Ok(ProvisionedWorktree {
+                path,
+                hook_failures: report
+                    .failures
+                    .iter()
+                    .map(|failure| format!("{}: {}", failure.name, failure.output))
+                    .collect(),
+            }),
+            // The worktree and its branch are already gone, so the run has
+            // nothing to be created against.
+            ProvisioningOutcome::Aborted(failure) => Err(PortError::new(
+                "worktrees",
+                format!(
+                    "the repository's provisioning hook {} did not succeed: {}",
+                    failure.name, failure.output
+                ),
+            )),
+        }
+    }
+
     fn remove(&self, run: &RunRow) -> Result<(), PortError> {
         let path = worktree_path(run)?;
         let name = path
@@ -80,4 +177,24 @@ fn worktree_path(run: &RunRow) -> Result<PathBuf, PortError> {
         .filter(|path| !path.is_empty())
         .map(PathBuf::from)
         .ok_or_else(|| PortError::new("worktrees", "the run records no worktree"))
+}
+
+/// The two decisions provisioning refuses to make for itself, as the daemon
+/// answers them.
+///
+/// Hooks are allowed because a repository declares its contract in its own
+/// tree, and there is nobody at a terminal for a daemon to ask. A failure is
+/// continued past rather than aborted on, because a worktree thrown away over
+/// one hook costs the run everything and tells the worker nothing: the failure
+/// travels to it instead.
+struct CoordinatorProvisioning;
+
+impl ProvisioningDecisions for CoordinatorProvisioning {
+    fn authorize(&self, _request: &HookAuthorizationRequest<'_>) -> HookAuthorization {
+        HookAuthorization::Allow
+    }
+
+    fn on_hook_failure(&self, _failure: &HookFailure) -> HookFailureResponse {
+        HookFailureResponse::Continue
+    }
 }

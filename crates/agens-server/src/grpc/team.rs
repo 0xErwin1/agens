@@ -11,8 +11,8 @@ use tonic::{Request, Response, Status};
 use super::proto::team_server::Team;
 use super::{CoreHandle, convert, proto};
 use crate::api::{
-    AnswerQuestion, ApprovePlan, AuthorizeMerge, CleaningAction, CleaningDisposition, RetryRequest,
-    RunRef, StopRequest, StopScope,
+    AnswerQuestion, ApprovePlan, AuthorizeMerge, CleaningAction, CleaningDisposition, CreateRun,
+    RetryRequest, RunRef, StopRequest, StopScope,
 };
 
 /// The Team service, bound to one principal for its whole life.
@@ -59,8 +59,59 @@ fn stop_scope(request: proto::StopRequest) -> Result<StopScope, Status> {
     }
 }
 
+/// The commit a run's branch starts from.
+///
+/// An empty field means the checkout's own `HEAD`, which is what a client that
+/// has nothing particular in mind wants. It is spelled out here rather than in
+/// the core, because a default is a wire convenience and the core takes what it
+/// is given.
+fn start_point(named: &str) -> String {
+    if named.trim().is_empty() {
+        "HEAD".to_owned()
+    } else {
+        named.to_owned()
+    }
+}
+
 #[tonic::async_trait]
 impl Team for TeamFacade {
+    async fn create_run(
+        &self,
+        request: Request<proto::CreateRunRequest>,
+    ) -> Result<Response<proto::CreateRunResponse>, Status> {
+        let request = request.into_inner();
+
+        let created = self
+            .core
+            .call(move |core, principal, now| {
+                core.create_run(
+                    principal,
+                    &CreateRun {
+                        repo_root: std::path::PathBuf::from(request.repo_root),
+                        task: request.task,
+                        scope: request.scope,
+                        dod: request.dod,
+                        external_ref: request.external_ref,
+                        parent_run_id: request.parent_run_id,
+                        dep_run_id: request.dep_run_id,
+                        provider: request.provider,
+                        priority: request.priority,
+                        budget_tokens: request.budget_tokens,
+                        start_point: start_point(&request.start_point),
+                        now,
+                    },
+                )
+            })
+            .await?;
+
+        Ok(Response::new(proto::CreateRunResponse {
+            run_id: created.run_id,
+            repo_id: created.repo_id,
+            worktree_path: created.worktree_path.display().to_string(),
+            hook_failures: created.hook_failures,
+        }))
+    }
+
     async fn approve_plan(
         &self,
         request: Request<proto::ApprovePlanRequest>,

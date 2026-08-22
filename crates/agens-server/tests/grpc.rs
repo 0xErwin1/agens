@@ -21,9 +21,9 @@ use agens_core::HeadlessTurnCancellation;
 use agens_server::grpc::proto::{self, feed_client::FeedClient, team_client::TeamClient};
 use agens_server::{
     ApiCore, BlockingBoundary, CoreHandle, Delivery, DeliveryQueue, EventFeed, EventFilter,
-    FacadeBinding, FeedFacade, PortError, Ports, Principal, SchedulerPort, SessionControl,
-    StateMachines, StopScope, Subscription, TakeoverHandle, TeamFacade, WorktreeDerivation,
-    WorktreeGate,
+    FacadeBinding, FeedFacade, PortError, Ports, Principal, ProvisionedWorktree,
+    RepositoryIdentity, SchedulerPort, SessionControl, StateMachines, StopScope, Subscription,
+    TakeoverHandle, TeamFacade, WorktreeDerivation, WorktreeGate, WorktreeRequest,
 };
 use agens_store::{
     ControlPlaneStore, EventClass, EventRow, QuestionKind, QuestionRow, QuestionState, RunRow,
@@ -84,6 +84,20 @@ impl WorktreeGate for StubWorktrees {
 
     fn remove(&self, _run: &RunRow) -> Result<(), PortError> {
         Ok(())
+    }
+
+    fn identify(&self, _repository: &std::path::Path) -> Result<RepositoryIdentity, PortError> {
+        Ok(RepositoryIdentity {
+            repo_id: "a1b2c3d4e5f60718".to_owned(),
+            remote_url: None,
+        })
+    }
+
+    fn provision(&self, request: &WorktreeRequest<'_>) -> Result<ProvisionedWorktree, PortError> {
+        Ok(ProvisionedWorktree {
+            path: std::path::PathBuf::from("/worktrees").join(request.name),
+            hook_failures: Vec::new(),
+        })
     }
 }
 

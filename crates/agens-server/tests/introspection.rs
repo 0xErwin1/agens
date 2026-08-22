@@ -16,8 +16,8 @@ use agens_core::run_introspection::{
 use agens_server::{
     ApiCore, CHECKPOINT_EVENT, CheckpointClaim, Delivery, DeliveryQueue, EventFeed, EventFilter,
     PortError, Ports, ReportedCheckpoint, RunIntrospection, SchedulerPort, SessionControl,
-    StateMachines, StopScope, Subscription, TakeoverHandle, TimerSettings, TimerWheel,
-    WorktreeDerivation, WorktreeGate,
+    ProvisionedWorktree, RepositoryIdentity, StateMachines, StopScope, Subscription,
+    TakeoverHandle, TimerSettings, TimerWheel, WorktreeDerivation, WorktreeGate, WorktreeRequest,
 };
 use agens_store::{ControlPlaneStore, QuestionKind, QuestionState, RunRow, RunState};
 
@@ -85,6 +85,14 @@ impl WorktreeGate for Unreached {
     }
 
     fn remove(&self, _run: &RunRow) -> Result<(), PortError> {
+        Err(unreached("worktrees"))
+    }
+
+    fn identify(&self, _repository: &std::path::Path) -> Result<RepositoryIdentity, PortError> {
+        Err(unreached("worktrees"))
+    }
+
+    fn provision(&self, _request: &WorktreeRequest<'_>) -> Result<ProvisionedWorktree, PortError> {
         Err(unreached("worktrees"))
     }
 }

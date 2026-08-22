@@ -76,7 +76,8 @@ pub use worktree_provisioning::{
     ProvisioningOutcome, ProvisioningReport, ProvisioningRequest, WorktreeProvisioner,
 };
 pub use worktrees::{
-    GateDerivation, MergeOutcome, SessionWorktrees, WorktreeError, WorktreeStatus,
+    GateDerivation, MergeOutcome, RepositoryIdentity, SessionWorktrees, WorktreeError,
+    WorktreeStatus,
 };
 
 #[cfg(unix)]

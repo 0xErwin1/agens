@@ -200,6 +200,17 @@ impl StateMachines {
         &self.store
     }
 
+    /// Opens a new run row and returns its id.
+    ///
+    /// Not a transition: there is no row to move yet, and no guard to run
+    /// against a state that does not exist. It goes through the machines all
+    /// the same, because they are the single writer of the control-plane
+    /// tables — a second handle used only for inserts would be a second writer
+    /// no matter how narrow its use.
+    pub fn open_run(&mut self, run: &RunRow) -> Result<i64, agens_store::ControlPlaneError> {
+        self.store.insert_run(run)
+    }
+
     /// Journals facts that no transition carries, in one transaction and in the
     /// order given.
     ///
