@@ -180,9 +180,12 @@ enum Lane {
 /// delegated child session gets instead.
 ///
 /// A child starts a conversation of its own, seeded with the delegation
-/// prompt. The server recognises it by that prompt appearing in the request
-/// body, exactly as the agent would have to send it, and serves the child lane
-/// from then on.
+/// prompt, and the server recognises that opening request by the prompt
+/// appearing in its body. Its continuations are recognised by the response
+/// they follow: the `/responses` dialect replaces the history with a
+/// `previous_response_id`, so the delegation prompt is in the opening request
+/// only, and routing by the marker alone would send a child's second turn back
+/// to the main script.
 #[derive(Clone, Debug, Default)]
 pub struct Script {
     main: Vec<ScriptedTurn>,
@@ -226,6 +229,10 @@ struct ServerState {
     child_marker: Option<String>,
     child: VecDeque<ScriptedTurn>,
     requests: Vec<ObservedRequest>,
+    /// The lane each response identifier this server issued belongs to, so a
+    /// continuation that carries only `previous_response_id` still lands in
+    /// the conversation it continues.
+    response_lanes: std::collections::HashMap<String, Lane>,
     /// Requests that arrived after the relevant lane's script ran out. A test
     /// reads this as a failure rather than the server inventing a turn.
     unscripted: Vec<String>,
@@ -248,6 +255,7 @@ impl ScriptedProvider {
             child_marker: script.child_marker,
             child: script.child.into(),
             requests: Vec::new(),
+            response_lanes: std::collections::HashMap::new(),
             unscripted: Vec::new(),
         }));
         let stop = Arc::new(AtomicBool::new(false));
@@ -487,10 +495,15 @@ fn read_request(
     let mut state = state
         .lock()
         .expect("scripted provider state should not be poisoned");
-    let lane = match state.child_marker.as_deref() {
-        Some(marker) if body.contains(marker) => Lane::Child,
-        _ => Lane::Main,
-    };
+    let lane = continued_lane(&state.response_lanes, &body)
+        .or_else(|| {
+            state
+                .child_marker
+                .as_deref()
+                .filter(|marker| body.contains(marker))
+                .map(|_| Lane::Child)
+        })
+        .unwrap_or(Lane::Main);
     let request = ObservedRequest {
         method,
         target,
@@ -501,6 +514,20 @@ fn read_request(
     state.requests.push(request.clone());
 
     Some(request)
+}
+
+/// The lane a request continues, when it names a response this server issued.
+fn continued_lane(
+    response_lanes: &std::collections::HashMap<String, Lane>,
+    body: &str,
+) -> Option<Lane> {
+    let previous = serde_json::from_str::<serde_json::Value>(body)
+        .ok()?
+        .get("previous_response_id")?
+        .as_str()?
+        .to_owned();
+
+    response_lanes.get(&previous).copied()
 }
 
 /// Pops the next turn for the request's lane, recording an exhausted lane
@@ -514,6 +541,11 @@ fn take_turn(state: &Mutex<ServerState>, request: &ObservedRequest) -> Option<Sc
         Lane::Main => state.main.pop_front(),
         Lane::Child => state.child.pop_front(),
     };
+    if let Some(ScriptedTurn::ToolCall { call_id, .. }) = &turn {
+        state
+            .response_lanes
+            .insert(format!("response_{call_id}"), request.lane);
+    }
     if turn.is_none() {
         let lane = request.lane;
         state

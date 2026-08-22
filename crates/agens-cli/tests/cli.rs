@@ -15,6 +15,8 @@ use agens::{
     CliDependencies, ExitStatus, ModelSelection, ModelSource, bootstrap, execute, execute_os,
     execute_with_cancellation,
 };
+use agens_fixtures::{NetworkTripwire, Script, ScriptedDialect, ScriptedProvider, ScriptedTurn};
+
 use agens_core::{
     CompletedSessionTurn, HeadlessPermissionGate, HeadlessPermissionResolver, HeadlessToolCall,
     HeadlessToolDispatcher, HeadlessToolOutput, HeadlessTurnCancellation, HeadlessTurnPortError,
@@ -5117,6 +5119,20 @@ fn isolated_agens_command(temporary: &TemporaryDirectory) -> IsolatedAgensComman
         .env("XDG_CONFIG_HOME", xdg_config_home)
         .env("XDG_DATA_HOME", xdg_data_home)
         .env("AGENS_CONFIG_HOME", agens_config_home);
+
+    // Isolating the configuration roots leaves the inherited environment
+    // untouched, so a developer machine with a real key exported still lets a
+    // run authenticate for real. Removing the credentials and routing every
+    // non-loopback request into a tripwire is what makes "this test cannot
+    // reach a real provider" true rather than assumed. A test that needs a key
+    // sets its own afterwards, and that value wins.
+    for variable in agens_fixtures::PROVIDER_CREDENTIAL_VARIABLES {
+        command.env_remove(variable);
+    }
+    for (variable, value) in agens_fixtures::NetworkTripwire::shared().environment() {
+        command.env(variable, value);
+    }
+
     IsolatedAgensCommand { command }
 }
 
@@ -5940,4 +5956,297 @@ fn assert_sqlite_has_interrupted_turn(database: &std::path::Path) {
         .expect("interrupted attempt should be queryable");
 
     assert_eq!(counts, (1, 0, 1, 2));
+}
+
+// Journeys: the whole loop against a scripted model.
+//
+// Everything below runs the production binary against `ScriptedProvider`, so
+// the turn machinery, the tools, the session store and the process boundary
+// are all real and only the model is a fixture. Each journey asserts on the
+// requests the agent sent, not only on what it printed, and finishes by
+// checking that the script was consumed and that nothing left the fake.
+
+/// A journey's isolated project, configuration and data roots.
+struct Journey {
+    temporary: TemporaryDirectory,
+    project_root: PathBuf,
+    config_home: PathBuf,
+    data_directory: PathBuf,
+}
+
+impl Journey {
+    fn new(name: &str) -> Self {
+        let temporary = TemporaryDirectory::new(name);
+        let project_root = temporary.path().join("project");
+        let config_home = temporary.path().join("config");
+        let data_directory = temporary.path().join("data");
+
+        std::fs::create_dir_all(project_root.join(".git")).expect("project marker should exist");
+        std::fs::create_dir_all(&config_home).expect("config directory should exist");
+
+        Self {
+            temporary,
+            project_root,
+            config_home,
+            data_directory,
+        }
+    }
+
+    fn write_project_file(&self, name: &str, contents: &str) {
+        std::fs::write(self.project_root.join(name), contents)
+            .expect("journey project file should be written");
+    }
+
+    /// Runs `agens chat <prompt>` against the scripted provider.
+    fn chat(&self, provider: &ScriptedProvider, prompt: &str, extra_configuration: &str) -> Output {
+        provider.write_configuration(&self.config_home, &self.data_directory, extra_configuration);
+
+        isolated_agens_command(&self.temporary)
+            .current_dir(&self.project_root)
+            .args(["chat", prompt])
+            .env("AGENS_CONFIG_HOME", &self.config_home)
+            .output()
+            .expect("production binary should run the journey")
+    }
+}
+
+/// The journey's stdout, reporting the run's own output and the conversation
+/// the scripted provider observed when it failed.
+///
+/// A journey fails inside a process whose only report is an exit status, so
+/// the requests are the difference between "the loop went wrong" and knowing
+/// which turn it went wrong on.
+fn journey_stdout(result: &Output, provider: &ScriptedProvider) -> String {
+    assert!(
+        result.status.success(),
+        "journey failed: {}{}\nobserved conversation: {:#?}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr),
+        provider
+            .requests()
+            .iter()
+            .map(|request| {
+                (
+                    if request.is_child() { "child" } else { "main" },
+                    request.body().chars().take(240).collect::<String>(),
+                )
+            })
+            .collect::<Vec<_>>()
+    );
+
+    String::from_utf8_lossy(&result.stdout).into_owned()
+}
+
+#[test]
+fn journey_tool_loop_returns_the_tool_result_to_the_model_and_closes() {
+    let journey = Journey::new("journey-tool-loop");
+    journey.write_project_file("notes.md", "the note the model asked for");
+    let provider = ScriptedProvider::start(
+        ScriptedDialect::Responses,
+        Script::new([
+            ScriptedTurn::tool_call("call-read", "read", r#"{"path":"notes.md"}"#),
+            ScriptedTurn::text("summarised"),
+        ]),
+    );
+
+    let result = journey.chat(
+        &provider,
+        "summarise the notes",
+        "\n[permissions]\nallow = [\"read(*)\"]\n",
+    );
+
+    assert_eq!(journey_stdout(&result, &provider), "summarised\n");
+    provider.assert_script_consumed();
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2, "a tool loop is two requests");
+    assert!(
+        requests[1].body().contains("the note the model asked for"),
+        "the tool result should reach the model: {}",
+        requests[1].body()
+    );
+    assert!(
+        requests[1].body().contains("call-read"),
+        "the tool result should be tied to the call it answers: {}",
+        requests[1].body()
+    );
+    NetworkTripwire::shared().assert_no_connections();
+}
+
+/// AGN-102: a failure the model cannot read is a failure it cannot recover
+/// from, so the tool's own text has to survive to the next request rather than
+/// being flattened into a generic "tool failed".
+#[test]
+fn journey_tool_failure_reaches_the_model_with_the_failure_text_intact() {
+    let journey = Journey::new("journey-tool-failure");
+    let provider = ScriptedProvider::start(
+        ScriptedDialect::Responses,
+        Script::new([
+            ScriptedTurn::tool_call("call-missing", "read", r#"{"path":"absent.md"}"#),
+            ScriptedTurn::text("reported the failure"),
+        ]),
+    );
+
+    let result = journey.chat(
+        &provider,
+        "read a file that is not there",
+        "\n[permissions]\nallow = [\"read(*)\"]\n",
+    );
+
+    assert_eq!(journey_stdout(&result, &provider), "reported the failure\n");
+    provider.assert_script_consumed();
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    let failure = requests[1].json()["input"][0]["output"]
+        .as_str()
+        .expect("the continuation should carry the tool result")
+        .to_owned();
+    assert_eq!(
+        failure, "read: file not found",
+        "the tool's own failure text should reach the model, naming both the \
+         operation and the reason, rather than a flattened generic failure"
+    );
+    NetworkTripwire::shared().assert_no_connections();
+}
+
+/// AGN-105: a delegated child runs its own conversation, and the point of the
+/// journey is that the child's scope is its own — it neither inherits the
+/// parent's prompt nor widens past the toolset its agent declares.
+#[test]
+fn journey_delegation_serves_the_child_its_own_script_within_its_own_scope() {
+    let journey = Journey::new("journey-delegation");
+    journey.write_project_file("notes.md", "the note the child read");
+    std::fs::create_dir_all(journey.config_home.join("agents"))
+        .expect("agents directory should exist");
+    std::fs::write(
+        journey.config_home.join("agents/reviewer.md"),
+        "---\nname: reviewer\ndescription: Review implementation\nmode: subagent\nmodel: gpt-4o\npermissions: []\n---\nYou are the isolated reviewer.\n",
+    )
+    .expect("subagent definition should be written");
+
+    let provider = ScriptedProvider::start(
+        ScriptedDialect::Responses,
+        Script::new([
+            ScriptedTurn::tool_call(
+                "call-task",
+                "task",
+                r#"{"agent":"reviewer","description":"child request"}"#,
+            ),
+            ScriptedTurn::text("parent answer"),
+        ])
+        .with_child(
+            "child request",
+            [
+                ScriptedTurn::tool_call("call-child-read", "read", r#"{"path":"notes.md"}"#),
+                ScriptedTurn::text("child answer"),
+            ],
+        ),
+    );
+
+    let result = journey.chat(
+        &provider,
+        "parent request",
+        "\n[permissions]\nallow = [\"task(reviewer)\", \"read(*)\"]\n",
+    );
+
+    assert_eq!(journey_stdout(&result, &provider), "parent answer\n");
+    provider.assert_script_consumed();
+
+    let child_requests = provider.child_requests();
+    assert_eq!(
+        child_requests.len(),
+        2,
+        "the child ran its own two-turn loop"
+    );
+    let opening = child_requests[0].body();
+    assert!(
+        opening.contains("You are the isolated reviewer."),
+        "the child should run under its own agent's prompt: {opening}"
+    );
+    assert!(
+        !opening.contains("parent request"),
+        "the child should not inherit the parent's prompt: {opening}"
+    );
+    assert!(
+        !opening.contains("\"name\":\"mcp"),
+        "the child should not reach the parent's MCP surface: {opening}"
+    );
+    assert!(
+        child_requests[1].body().contains("the note the child read"),
+        "the child's own tool result should reach it: {}",
+        child_requests[1].body()
+    );
+    NetworkTripwire::shared().assert_no_connections();
+}
+
+/// AGN-104: a stream cut mid-turn should be retried within a visible budget
+/// rather than surfacing as a bare failure. Ignored until that budget exists;
+/// the journey is written against the behaviour AGN-104 defines so the fix can
+/// turn it on.
+#[test]
+#[ignore = "AGN-104"]
+fn journey_retry_mid_stream_resumes_within_its_budget_and_reports_the_attempt() {
+    let journey = Journey::new("journey-retry-mid-stream");
+    let provider = ScriptedProvider::start(
+        ScriptedDialect::Responses,
+        Script::new([ScriptedTurn::truncate(), ScriptedTurn::text("recovered")]),
+    );
+
+    let result = journey.chat(&provider, "answer through a cut stream", "");
+
+    assert_eq!(journey_stdout(&result, &provider), "recovered\n");
+    provider.assert_script_consumed();
+    assert_eq!(
+        provider.requests().len(),
+        2,
+        "the cut stream should cost exactly one retry"
+    );
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("retry"),
+        "the retry should be visible rather than silent: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    NetworkTripwire::shared().assert_no_connections();
+}
+
+/// A journey run with the credential variables still exported is a journey
+/// that can bill a real provider, so the isolation itself is asserted rather
+/// than assumed.
+#[test]
+fn journey_runs_without_any_real_credential_in_its_environment() {
+    let journey = Journey::new("journey-credential-isolation");
+    let provider = ScriptedProvider::start(
+        ScriptedDialect::Responses,
+        Script::new([ScriptedTurn::text("answered from the fake")]),
+    );
+    provider.write_configuration(&journey.config_home, &journey.data_directory, "");
+
+    let mut command = isolated_agens_command(&journey.temporary);
+    let exported: Vec<String> = command
+        .command()
+        .get_envs()
+        .filter_map(|(name, value)| {
+            let name = name.to_string_lossy().into_owned();
+            (value.is_some() && agens_fixtures::PROVIDER_CREDENTIAL_VARIABLES.contains(&&*name))
+                .then_some(name)
+        })
+        .collect();
+    let result = command
+        .current_dir(&journey.project_root)
+        .args(["chat", "answer from the fake only"])
+        .env("AGENS_CONFIG_HOME", &journey.config_home)
+        .output()
+        .expect("production binary should run the journey");
+
+    assert!(
+        exported.is_empty(),
+        "an isolated journey still exported provider credentials: {exported:?}"
+    );
+    assert_eq!(
+        journey_stdout(&result, &provider),
+        "answered from the fake\n"
+    );
+    provider.assert_script_consumed();
+    NetworkTripwire::shared().assert_no_connections();
 }

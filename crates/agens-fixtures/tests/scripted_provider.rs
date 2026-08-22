@@ -196,6 +196,43 @@ fn a_request_carrying_the_delegation_marker_is_served_the_child_script() {
     provider.assert_script_consumed();
 }
 
+/// The `/responses` dialect drops the history in favour of
+/// `previous_response_id`, so a child's second turn no longer carries the
+/// delegation prompt. Routing it by the marker alone would hand it back to the
+/// main script and silently swap the two conversations.
+#[test]
+fn a_child_continuation_stays_in_the_child_script_without_repeating_the_marker() {
+    let provider = ScriptedProvider::start(
+        ScriptedDialect::Responses,
+        Script::new([ScriptedTurn::text("parent answer")]).with_child(
+            "review this",
+            [
+                ScriptedTurn::tool_call("child-read", "read", r#"{"path":"notes.md"}"#),
+                ScriptedTurn::text("child answer"),
+            ],
+        ),
+    );
+
+    let mut client = KeepAliveClient::connect(&provider);
+    client.post("/responses", r#"{"input":"review this file"}"#);
+    let (_, continuation) = client.post(
+        "/responses",
+        r#"{"previous_response_id":"response_child-read","input":[{"call_id":"child-read","output":"read"}]}"#,
+    );
+    let (_, parent) = client.post("/responses", r#"{"input":"unrelated"}"#);
+
+    assert!(
+        continuation.contains(r#""delta":"child answer""#),
+        "the continuation should stay in the child script: {continuation}"
+    );
+    assert!(
+        parent.contains(r#""delta":"parent answer""#),
+        "the main script should still be waiting for its own turn: {parent}"
+    );
+    assert_eq!(provider.child_requests().len(), 2);
+    provider.assert_script_consumed();
+}
+
 #[test]
 #[should_panic(expected = "script was not consumed")]
 fn a_loop_that_stops_early_leaves_the_script_unconsumed() {

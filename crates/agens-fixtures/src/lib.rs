@@ -7,8 +7,10 @@
 //! binary crate with them. Nothing here touches a user interface, so depending
 //! on it does not pull a surface into a logic crate's test build.
 
+pub mod network_tripwire;
 pub mod scripted_provider;
 
+pub use network_tripwire::{NetworkTripwire, PROVIDER_CREDENTIAL_VARIABLES};
 pub use scripted_provider::{
     ObservedRequest, Script, ScriptedDialect, ScriptedProvider, ScriptedTurn,
 };
