@@ -115,6 +115,11 @@ pub fn render_compaction_summary(summary: &RunSummary) -> String {
 
 /// The run report: what a reader has to act on, assembled from rows and
 /// therefore producible with every provider capped.
+///
+/// Not wired into any production surface yet: compaction reached the runtime
+/// first, and it renders through [`render_compaction_summary`]. Kept because
+/// the projection and its tests are where this report's shape is written down,
+/// and the surface that will print it needs that shape unchanged.
 #[must_use]
 pub fn render_run_report(summary: &RunSummary) -> String {
     render_sections(summary, SummaryProjection::RunReport)
@@ -128,6 +133,10 @@ pub fn render_run_report(summary: &RunSummary) -> String {
 /// three groups intact instead of dropping the two that are not done. Relevant
 /// Files is the sixth Engram heading and is deliberately absent: the paths of
 /// an ephemeral worktree are not a lesson.
+///
+/// Not wired into any production surface yet, for the same reason as
+/// [`render_run_report`]: the memory flush that would emit it is its own
+/// change, and this rendering is what it will emit.
 #[must_use]
 pub fn render_engram_session_summary(summary: &RunSummary) -> String {
     let mut rendered = String::new();

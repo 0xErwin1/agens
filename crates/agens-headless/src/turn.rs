@@ -9,16 +9,20 @@ use crate::subagents::{interrupted_turn_note, record_tool_result_fact};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
+use agens_core::compaction::CompactionBudget;
 use agens_core::{
     BeginSessionAttemptError, HeadlessTurnCancellation, HeadlessTurnError, Message, MessagePart,
-    PermissionMode, PermissionSession, TurnEvent, TurnProgressSink, run_headless_turn_with_inbox,
+    PermissionMode, PermissionSession, Role, TurnEvent, TurnProgressSink, TurnProvider,
+    run_headless_turn_with_inbox,
 };
 use agens_providers::{
     ChatGptResponsesProvider, DiagnosticRef, MediaBlobs, MoonshotProvider, OpenAiFunctionTool,
     OpenAiResponsesProvider, ProgressAwareProvider, ProviderDiagnosticClass,
     ProviderDiagnosticScope, ProviderFailureDetail,
 };
-use agens_store::{DirectiveInbox, PermissionGrantStore, SessionStore, ToolFactStore, open_media};
+use agens_store::{
+    CompactionStore, DirectiveInbox, PermissionGrantStore, SessionStore, ToolFactStore, open_media,
+};
 use agens_tools::{
     EffectiveCapabilitySet, McpErrorCategory, McpLifecycleState, McpLoadPhase, McpStatusHandle,
     TaskMessageTarget,
@@ -28,7 +32,7 @@ use agens_agents::{AgentModelCompatibility, agent_catalog};
 use agens_bootstrap::Bootstrap;
 use agens_bootstrap::effective_max_iterations;
 use agens_diagnostics::{
-    SafeDiagnosticStore, SessionLifecycle, TurnOutcome, diagnostic_store,
+    CompactionReason, SafeDiagnosticStore, SessionLifecycle, TurnOutcome, diagnostic_store,
     operation_diagnostics_with_progress, record_parent_terminal, record_session_lifecycle,
 };
 use agens_dispatch::ProductionToolDispatcher;
@@ -42,6 +46,7 @@ use agens_session::attempt::{
     run_session_attempt_lifecycle_with_terminal_writer, write_terminal_attempt,
     write_terminal_attempt_with_history,
 };
+use agens_session::compaction::{CompactionSummarizer, SessionCompactor};
 use agens_session::provider::{
     ProviderKind, ProviderResolutionError, ResolvedProvider, authenticated_sources,
     bootstrap_authentication, resolve_provider_for_model,
@@ -231,7 +236,7 @@ pub fn run_production_headless_chat_with_progress(
                 },
                 move |model, messages, tools, request_config, media_blobs| {
                     build_openai_provider_with_media(
-                        api_key,
+                        api_key.clone(),
                         base_url.as_deref(),
                         model,
                         messages,
@@ -242,7 +247,7 @@ pub fn run_production_headless_chat_with_progress(
                         provider
                             .with_parallel_tool_calls(bootstrap.parallel_tool_calls)
                             .with_request_config(request_config)
-                            .with_diagnostics(provider_diagnostics)
+                            .with_diagnostics(provider_diagnostics.clone())
                             .with_failure_detail(failure_detail.clone())
                     })
                     .map_err(|error| {
@@ -274,7 +279,7 @@ pub fn run_production_headless_chat_with_progress(
                 },
                 move |model, messages, tools, request_config, media_blobs| {
                     MoonshotProvider::from_api_key_with_messages_and_tools_and_timeout(
-                        api_key,
+                        api_key.clone(),
                         base_url.as_deref(),
                         model,
                         messages,
@@ -285,7 +290,7 @@ pub fn run_production_headless_chat_with_progress(
                         provider
                             .with_parallel_tool_calls(bootstrap.parallel_tool_calls)
                             .with_request_config(request_config)
-                            .with_diagnostics(provider_diagnostics)
+                            .with_diagnostics(provider_diagnostics.clone())
                             .with_failure_detail(failure_detail.clone())
                             .with_media_blobs(media_blobs)
                     })
@@ -325,7 +330,7 @@ pub fn run_production_headless_chat_with_progress(
                         &credentials_path,
                         base_url.as_deref(),
                         model,
-                        instructions,
+                        instructions.clone(),
                         messages,
                         tools,
                         media_blobs,
@@ -334,7 +339,7 @@ pub fn run_production_headless_chat_with_progress(
                         provider
                             .with_parallel_tool_calls(bootstrap.parallel_tool_calls)
                             .with_request_config(request_config)
-                            .with_diagnostics(provider_diagnostics)
+                            .with_diagnostics(provider_diagnostics.clone())
                             .with_failure_detail(failure_detail.clone())
                     })
                     .map_err(|error| {
@@ -724,10 +729,99 @@ fn load_media_blobs_for_request(
     Ok(blobs)
 }
 
+/// Adapts a closure into the summarizing port `agens-session` asks for.
+///
+/// The summarizing call is an ordinary request against this turn's own model,
+/// and the closure that issues it is the only part that knows how to build one.
+struct ClosureSummarizer<F>(F);
+
+impl<F> CompactionSummarizer for ClosureSummarizer<F>
+where
+    F: Fn(&str) -> Result<String, String>,
+{
+    fn summarize(&self, prompt: &str) -> Result<String, String> {
+        (self.0)(prompt)
+    }
+}
+
+/// Asks this turn's model for one summary, through a provider of its own.
+///
+/// Built without tools and driven for exactly one response: a summarizing call
+/// that could reach a tool would run one on a history the caller is in the
+/// middle of replacing.
+fn summarize_through_provider<P, F>(
+    prompt: &str,
+    build_provider: &F,
+    model: &str,
+    request_config: &agens_core::RequestConfig,
+    cancellation: &HeadlessTurnCancellation,
+) -> Result<String, String>
+where
+    P: TurnProvider,
+    F: Fn(
+        String,
+        Vec<Message>,
+        Vec<OpenAiFunctionTool>,
+        agens_core::RequestConfig,
+        MediaBlobs,
+    ) -> Result<P, CliError>,
+{
+    let mut provider = build_provider(
+        model.to_owned(),
+        vec![Message {
+            role: Role::User,
+            parts: vec![MessagePart::Text(prompt.to_owned())],
+        }],
+        Vec::new(),
+        request_config.clone(),
+        MediaBlobs::new(),
+    )
+    .map_err(|error| error.to_string())?;
+
+    let parts = block_on_headless_turn(provider.next_parts(&[], cancellation))
+        .map_err(|error| error.to_string())?
+        .map_err(|error| format!("{error:?}"))?;
+
+    Ok(parts
+        .iter()
+        .filter_map(|part| match part {
+            MessagePart::Text(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect())
+}
+
+/// Runs one compaction of a request the provider refused for context, or
+/// reports that there was nothing compaction could do.
+///
+/// A refusal is not an error the caller has to handle: the history it holds is
+/// untouched, and the reason is already on the `CompactionEnded` line the
+/// compactor writes before returning.
+fn compact_overflowing_history(
+    bootstrap: &Bootstrap,
+    reference: &DiagnosticRef,
+    session: i64,
+    history: &[Message],
+    summarizer: &dyn CompactionSummarizer,
+) -> Option<Vec<Message>> {
+    let mut store = CompactionStore::open(bootstrap.data_directory()).ok()?;
+    let diagnostics = diagnostic_store(bootstrap);
+
+    SessionCompactor::new(&mut store, &diagnostics, reference, session)
+        .compact(
+            history,
+            CompactionBudget::default(),
+            CompactionReason::Overflow,
+            summarizer,
+        )
+        .ok()
+        .map(|compacted| compacted.messages)
+}
+
 fn run_production_headless_chat_with_provider<P>(
     request: HeadlessChatRequest,
     context: HeadlessProviderContext<'_>,
-    build_provider: impl FnOnce(
+    build_provider: impl Fn(
         String,
         Vec<Message>,
         Vec<OpenAiFunctionTool>,
@@ -912,13 +1006,7 @@ where
             }
             let mut provider_request = request.clone();
             provider_request.history.extend(directives.iter().cloned());
-            let mut provider = build_provider(
-                model,
-                provider_messages(&provider_request, context.include_system_prompt),
-                provider_tools,
-                request.request_config.clone(),
-                media_blobs,
-            )?;
+            let mut history = provider_messages(&provider_request, context.include_system_prompt);
             // Live SSE already emits ProviderPart/Usage through the provider sink.
             // Headless flush_progress would re-send those and double TUI text/tools.
             let forwarded_progress = context.progress.map(|progress| {
@@ -957,18 +1045,39 @@ where
             let headless_progress = Some(&headless_progress);
             let streamed_partial_events = Arc::clone(&runtime_partial_events);
             let visible_progress = context.progress.cloned();
-            provider = provider.with_progress_sink(Arc::new(move |event| {
-                if matches!(event, TurnEvent::ProviderPart(_))
-                    && let Ok(mut events) = streamed_partial_events.lock()
-                {
-                    events.observe(event.clone());
-                }
-                if let Some(progress) = &visible_progress {
-                    progress(event);
-                }
-            }));
-            let mut provider =
-                TaskMailboxProvider::new(provider, task_registry.clone(), TaskMessageTarget::Main);
+            // Rebuilt for every request rather than installed once: a
+            // compaction retry constructs a second provider, and a sink moved
+            // into the first one is gone by then.
+            let streaming_sink = move || {
+                let events = Arc::clone(&streamed_partial_events);
+                let progress = visible_progress.clone();
+                Arc::new(move |event: TurnEvent| {
+                    if matches!(event, TurnEvent::ProviderPart(_))
+                        && let Ok(mut events) = events.lock()
+                    {
+                        events.observe(event.clone());
+                    }
+                    if let Some(progress) = &progress {
+                        progress(event);
+                    }
+                }) as TurnProgressSink
+            };
+            let build_turn_provider = |messages: Vec<Message>| {
+                build_provider(
+                    model.clone(),
+                    messages,
+                    provider_tools.clone(),
+                    request.request_config.clone(),
+                    media_blobs.clone(),
+                )
+                .map(|provider| {
+                    TaskMailboxProvider::new(
+                        provider.with_progress_sink(streaming_sink()),
+                        task_registry.clone(),
+                        TaskMessageTarget::Main,
+                    )
+                })
+            };
             cancellation_result(context.cancellation)?;
             // The queue is scoped to this session, so the turn only ever
             // collects what was addressed to it.
@@ -976,18 +1085,54 @@ where
                 context.bootstrap.data_directory(),
                 attempt_key.session_id(),
             );
-            let turn_outcome = block_on_headless_turn(run_headless_turn_with_inbox(
-                &mut provider,
-                &mut gate,
-                &mut resolver,
-                &mut dispatcher,
-                &mut repository,
-                context.cancellation,
-                effective_max_iterations(request.max_iterations, context.bootstrap.max_iterations),
-                headless_progress,
-                Some(attempt_key),
-                &mut inbox,
-            ))?;
+            let max_iterations =
+                effective_max_iterations(request.max_iterations, context.bootstrap.max_iterations);
+            let summarizer = ClosureSummarizer(|prompt: &str| {
+                summarize_through_provider(
+                    prompt,
+                    &build_provider,
+                    &model,
+                    &request.request_config,
+                    context.cancellation,
+                )
+            });
+
+            let mut compacted_once = false;
+            let turn_outcome = loop {
+                let mut provider = build_turn_provider(history.clone())?;
+                let outcome = block_on_headless_turn(run_headless_turn_with_inbox(
+                    &mut provider,
+                    &mut gate,
+                    &mut resolver,
+                    &mut dispatcher,
+                    &mut repository,
+                    context.cancellation,
+                    max_iterations,
+                    headless_progress,
+                    Some(attempt_key),
+                    &mut inbox,
+                ))?;
+
+                // One compaction per turn. A second overflow after the history
+                // has already been summarized is not a history the summary can
+                // shrink further, and retrying it forever would keep a failing
+                // turn alive at the operator's expense.
+                if compacted_once || !matches!(&outcome, Err(HeadlessTurnError::ProviderContext)) {
+                    break outcome;
+                }
+                compacted_once = true;
+
+                let Some(compacted) = compact_overflowing_history(
+                    context.bootstrap,
+                    &prompt_diagnostic_reference,
+                    attempt_key.session_id(),
+                    &history,
+                    &summarizer,
+                ) else {
+                    break outcome;
+                };
+                history = compacted;
+            };
             let snapshot = attach_recorded_failure_detail(turn_outcome, &context.failure_detail)?;
             let turn = completed_session_turn_with_media(
                 &request.prompt,
