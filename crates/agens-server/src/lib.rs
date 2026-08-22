@@ -19,8 +19,8 @@ pub use blocking::{BlockingBoundary, BlockingError};
 pub use instance::{ServeInstance, ServeInstanceError};
 pub use sessions::{
     SessionAdmission, SessionBudget, SessionBudgetHandle, SessionId, SessionLimits, SessionOutcome,
-    SessionProvider, SessionRegistry, SessionRegistryError, SessionRuntime, SessionState,
-    SessionStatus, SessionSupervisor,
+    SessionProvider, SessionRegistry, SessionRegistryError, SessionRuntime, SessionShutdown,
+    SessionState, SessionStatus, SessionSupervisor,
 };
 pub use worktrees::{SessionWorktrees, WorktreeError, WorktreeStatus};
 
@@ -38,6 +38,15 @@ pub enum ServerError {
 /// Field order is drop order: the runtime stops the sessions' work, the socket
 /// closes, and only then does the instance release the slot and remove the
 /// socket file a client could still be looking at.
+///
+/// Nothing admits a session into this daemon yet. The wire facade lands in
+/// AGN-63/64, and when it does, the one place it belongs is between accepting a
+/// client and [`SessionSupervisor::start`]: a session admitted there must be
+/// given its OWN per-session state — its own provider client, which
+/// [`SessionAdmission`] already enforces by ownership, and its own MCP
+/// connections, which `agens-bootstrap` exposes as `Bootstrap::for_new_session`.
+/// Handing a peer a bootstrap CLONE instead would put every session's MCP
+/// servers behind one lock and let one session's close reach another's.
 pub struct Daemon {
     runtime: tokio::runtime::Runtime,
     sessions: SessionSupervisor,
@@ -89,12 +98,34 @@ impl Daemon {
     }
 
     /// Parks until asked to stop, then stops every session before releasing the
-    /// slot and the socket.
-    pub fn run_until_shutdown(&self, shutdown: &HeadlessTurnCancellation) {
-        self.runtime.block_on(async {
+    /// slot and the socket, reporting any session that outlived the wait.
+    ///
+    /// Takes the daemon by value so the runtime is shut down explicitly rather
+    /// than dropped: dropping a runtime waits for its blocking tasks, and a
+    /// session that already ignored its cancellation would put the unbounded
+    /// wait straight back at the end of a shutdown that just bounded it.
+    pub fn run_until_shutdown(self, shutdown: &HeadlessTurnCancellation) -> SessionShutdown {
+        let Self {
+            runtime,
+            sessions,
+            listener,
+            instance,
+        } = self;
+
+        let report = runtime.block_on(async {
             park_until_shutdown(shutdown).await;
-            self.sessions.cancel_all_and_join().await;
+            sessions.cancel_all_and_join().await
         });
+
+        // Explicit, in the order the field declarations describe: the sessions'
+        // work stops first, the socket closes next, and the slot is the last
+        // thing released so no client can find a socket with no owner behind it.
+        runtime.shutdown_timeout(std::time::Duration::ZERO);
+        drop(sessions);
+        drop(listener);
+        drop(instance);
+
+        report
     }
 }
 
@@ -103,10 +134,8 @@ impl Daemon {
 pub fn run_until_shutdown(
     data_directory: &Path,
     shutdown: &HeadlessTurnCancellation,
-) -> Result<(), ServerError> {
-    Daemon::start(data_directory)?.run_until_shutdown(shutdown);
-
-    Ok(())
+) -> Result<SessionShutdown, ServerError> {
+    Ok(Daemon::start(data_directory)?.run_until_shutdown(shutdown))
 }
 
 /// The daemon has no admission surface of its own yet, so it parks on the shared

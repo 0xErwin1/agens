@@ -14,10 +14,15 @@
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use agens_core::HeadlessTurnCancellation;
-use tokio::{runtime::Handle, task::JoinHandle};
+use tokio::{
+    runtime::Handle,
+    task::JoinHandle,
+    time::{Instant, timeout},
+};
 
 use crate::blocking::BlockingBoundary;
 
@@ -27,6 +32,23 @@ use crate::blocking::BlockingBoundary;
 /// which order is a separate piece, and admitting without bound would let a
 /// caller exhaust the machine before that piece exists.
 const DEFAULT_MAX_LIVE_SESSIONS: usize = 8;
+
+/// How many finished sessions the registry keeps so a supervisor can still read
+/// how they ended.
+///
+/// Bounded rather than unlimited: a finished session is only useful until
+/// somebody has read its outcome, and a daemon that runs for weeks would
+/// otherwise hold every session it ever ran.
+const DEFAULT_RETAINED_FINISHED_SESSIONS: usize = 32;
+
+/// How long shutdown waits for the sessions it just cancelled.
+///
+/// A session can be inside work that does not observe cancellation — a child
+/// process with no timeout of its own, a provider call mid-flight — and the
+/// daemon still has to exit. The wait is generous enough that an ordinary
+/// session ends inside it and short enough that a stuck one does not hold the
+/// process open forever.
+const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The durable identity of a session, as stored by `agens-store`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -268,12 +290,15 @@ pub enum SessionRegistryError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SessionLimits {
     pub max_live_sessions: usize,
+    /// How many finished sessions stay listed once they have ended.
+    pub retained_finished_sessions: usize,
 }
 
 impl Default for SessionLimits {
     fn default() -> Self {
         Self {
             max_live_sessions: DEFAULT_MAX_LIVE_SESSIONS,
+            retained_finished_sessions: DEFAULT_RETAINED_FINISHED_SESSIONS,
         }
     }
 }
@@ -290,6 +315,12 @@ struct RegisteredSession {
     budget: SessionBudgetHandle,
     cancellation: HeadlessTurnCancellation,
     state: SessionState,
+    /// When this session ended, as a registry-wide sequence number.
+    ///
+    /// A sequence rather than a clock: pruning only has to know which finished
+    /// session is the oldest, and session ids are durable rather than ordered by
+    /// when the daemon happened to run them.
+    finished_at: Option<u64>,
 }
 
 impl RegisteredSession {
@@ -308,6 +339,7 @@ impl RegisteredSession {
 struct SessionRegistryState {
     sessions: BTreeMap<SessionId, RegisteredSession>,
     limits: SessionLimits,
+    ended: u64,
 }
 
 /// The queryable record of every session the daemon holds.
@@ -374,6 +406,7 @@ impl SessionRegistry {
                 budget: budget.clone(),
                 cancellation: cancellation.clone(),
                 state: SessionState::Running,
+                finished_at: None,
             },
         );
 
@@ -454,6 +487,7 @@ impl SessionRegistry {
     /// caller above it left to hand a failure to.
     fn record_end(&self, session: SessionId, outcome: SessionOutcome) -> SessionEndRecord {
         let mut state = self.locked();
+        let ended = state.ended.saturating_add(1);
         let Some(registered) = state.sessions.get_mut(&session) else {
             return SessionEndRecord::Unknown;
         };
@@ -462,6 +496,8 @@ impl SessionRegistry {
         }
 
         registered.state = SessionState::Finished(outcome);
+        registered.finished_at = Some(ended);
+        state.ended = ended;
         SessionEndRecord::Recorded
     }
 
@@ -480,11 +516,66 @@ impl SessionRegistry {
         }
     }
 
+    /// Drops the finished sessions past the retention bound, oldest first, and
+    /// reports which ones went.
+    ///
+    /// The counterpart to [`Self::release`] for the sessions nobody ever asks
+    /// about: `release` is how a supervisor says it has read an outcome, and
+    /// this is what keeps the registry bounded when no supervisor ever does.
+    /// Live sessions are never touched, and the most recent outcomes are the
+    /// ones kept, so a supervisor polling at any sane interval still sees how
+    /// the sessions it started ended.
+    pub fn prune_finished(&self) -> Vec<SessionId> {
+        let mut state = self.locked();
+        let retained = state.limits.retained_finished_sessions;
+
+        let mut finished: Vec<(u64, SessionId)> = state
+            .sessions
+            .iter()
+            .filter_map(|(session, registered)| {
+                registered.finished_at.map(|ended| (ended, *session))
+            })
+            .collect();
+        if finished.len() <= retained {
+            return Vec::new();
+        }
+
+        finished.sort_unstable();
+        finished.truncate(finished.len() - retained);
+
+        let pruned: Vec<SessionId> = finished.into_iter().map(|(_, session)| session).collect();
+        for session in &pruned {
+            state.sessions.remove(session);
+        }
+
+        pruned
+    }
+
     /// See [`SessionBudgetHandle::locked`] for why poisoning is recovered.
     fn locked(&self) -> std::sync::MutexGuard<'_, SessionRegistryState> {
         self.inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+/// What shutdown found when it stopped waiting for the sessions it cancelled.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SessionShutdown {
+    /// The sessions that ended within the deadline.
+    pub stopped: Vec<SessionId>,
+    /// The sessions still running when the deadline passed.
+    ///
+    /// Named rather than counted: the work is on the blocking pool and cannot
+    /// be interrupted from here, so all shutdown can do for the operator is say
+    /// exactly which session outlived the daemon that started it.
+    pub abandoned: Vec<SessionId>,
+}
+
+impl SessionShutdown {
+    /// Whether every cancelled session stopped before the deadline.
+    pub fn is_clean(&self) -> bool {
+        self.abandoned.is_empty()
     }
 }
 
@@ -500,6 +591,7 @@ pub struct SessionSupervisor {
     boundary: BlockingBoundary,
     handle: Handle,
     workers: Arc<Mutex<BTreeMap<SessionId, JoinHandle<()>>>>,
+    shutdown_timeout: Duration,
 }
 
 impl SessionSupervisor {
@@ -513,7 +605,16 @@ impl SessionSupervisor {
             boundary: BlockingBoundary::new(handle.clone()),
             handle,
             workers: Arc::new(Mutex::new(BTreeMap::new())),
+            shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
         }
+    }
+
+    /// How long [`Self::cancel_all_and_join`] waits before giving up on the
+    /// sessions that have not stopped.
+    #[must_use]
+    pub const fn with_shutdown_timeout(mut self, shutdown_timeout: Duration) -> Self {
+        self.shutdown_timeout = shutdown_timeout;
+        self
     }
 
     pub fn registry(&self) -> &SessionRegistry {
@@ -545,9 +646,13 @@ impl SessionSupervisor {
         let mut workers = self.locked_workers();
         // Sessions come and go for the life of the daemon, so the handles of the
         // ones that already ended are dropped here rather than accumulating
-        // until shutdown.
+        // until shutdown. The registry entries they left behind are bounded on
+        // the same beat: pruning only where sessions are admitted means the two
+        // never drift apart, and a daemon that admits nothing grows nothing.
         workers.retain(|_, worker| !worker.is_finished());
         workers.insert(session, worker);
+        drop(workers);
+        self.registry.prune_finished();
 
         Ok(session)
     }
@@ -564,21 +669,39 @@ impl SessionSupervisor {
         self.registry.cancel(session)
     }
 
-    /// Cancels every live session and waits for each to end.
+    /// Cancels every live session and waits for each to end, up to this
+    /// supervisor's shutdown timeout.
+    pub async fn cancel_all_and_join(&self) -> SessionShutdown {
+        self.cancel_all_and_join_within(self.shutdown_timeout).await
+    }
+
+    /// Cancels every live session and waits up to `timeout` in total for them
+    /// to end, reporting which ones did not.
     ///
     /// Awaited rather than aborted: a session owns a provider client and a
     /// turn's worth of work, and dropping the task mid-flight would leave both
-    /// to be cleaned up by nobody.
-    pub async fn cancel_all_and_join(&self) {
+    /// to be cleaned up by nobody. Bounded all the same, because cancellation
+    /// is cooperative: a session inside work that never looks at it would
+    /// otherwise hold the whole process open, and a daemon that cannot be
+    /// stopped is worse than one that names what it left behind.
+    pub async fn cancel_all_and_join_within(&self, timeout_after: Duration) -> SessionShutdown {
         self.registry.cancel_all();
 
         let workers = std::mem::take(&mut *self.locked_workers());
-        for (_, worker) in workers {
+        let deadline = Instant::now() + timeout_after;
+        let mut shutdown = SessionShutdown::default();
+
+        for (session, mut worker) in workers {
+            let remaining = deadline.saturating_duration_since(Instant::now());
             // A join error means the task itself ended abnormally, and by then
-            // the session's outcome is already recorded; waiting is all this
-            // owes the caller.
-            let _ = worker.await;
+            // the session's outcome is already recorded; it stopped either way.
+            match timeout(remaining, &mut worker).await {
+                Ok(_) => shutdown.stopped.push(session),
+                Err(_) => shutdown.abandoned.push(session),
+            }
         }
+
+        shutdown
     }
 
     fn locked_workers(&self) -> std::sync::MutexGuard<'_, BTreeMap<SessionId, JoinHandle<()>>> {
@@ -590,6 +713,8 @@ impl SessionSupervisor {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::mpsc;
+
     use super::*;
 
     struct StubProvider(&'static str);
@@ -686,6 +811,7 @@ mod tests {
     fn admission_stops_at_the_configured_ceiling_and_frees_up_as_sessions_end() {
         let registry = SessionRegistry::with_limits(SessionLimits {
             max_live_sessions: 2,
+            ..SessionLimits::default()
         });
         registry.admit(admission(1, "model-a")).unwrap();
         registry.admit(admission(2, "model-a")).unwrap();
@@ -851,6 +977,185 @@ mod tests {
         assert_eq!(
             runtime.budget().snapshot().max_iterations_per_turn(),
             Some(12)
+        );
+    }
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+    }
+
+    fn finish_all(registry: &SessionRegistry, sessions: impl IntoIterator<Item = i64>) {
+        for session in sessions {
+            registry
+                .finish(SessionId::new(session), SessionOutcome::Completed)
+                .unwrap();
+        }
+    }
+
+    fn listed(registry: &SessionRegistry) -> Vec<i64> {
+        registry
+            .list()
+            .into_iter()
+            .map(|status| status.session.value())
+            .collect()
+    }
+
+    #[test]
+    fn pruning_keeps_the_most_recent_outcomes_and_drops_the_rest() {
+        let registry = SessionRegistry::with_limits(SessionLimits {
+            retained_finished_sessions: 2,
+            ..SessionLimits::default()
+        });
+        for session in [1, 2, 3, 4] {
+            registry.admit(admission(session, "model-a")).unwrap();
+        }
+        // Ended out of id order on purpose: what pruning keeps is the sessions
+        // that ended last, not the ones with the highest ids.
+        finish_all(&registry, [3, 1, 4]);
+
+        assert_eq!(registry.prune_finished(), vec![SessionId::new(3)]);
+        assert_eq!(listed(&registry), vec![1, 2, 4]);
+    }
+
+    #[test]
+    fn pruning_never_touches_a_live_session() {
+        let registry = SessionRegistry::with_limits(SessionLimits {
+            retained_finished_sessions: 0,
+            ..SessionLimits::default()
+        });
+        registry.admit(admission(1, "model-a")).unwrap();
+        registry.admit(admission(2, "model-a")).unwrap();
+        finish_all(&registry, [2]);
+
+        assert_eq!(registry.prune_finished(), vec![SessionId::new(2)]);
+        assert_eq!(listed(&registry), vec![1]);
+        assert_eq!(
+            registry.status(SessionId::new(1)).unwrap().state,
+            SessionState::Running
+        );
+    }
+
+    #[test]
+    fn pruning_below_the_retention_bound_drops_nothing() {
+        let registry = SessionRegistry::with_limits(SessionLimits {
+            retained_finished_sessions: 4,
+            ..SessionLimits::default()
+        });
+        registry.admit(admission(1, "model-a")).unwrap();
+        finish_all(&registry, [1]);
+
+        assert!(registry.prune_finished().is_empty());
+        assert_eq!(listed(&registry), vec![1]);
+    }
+
+    /// The registry used to grow for the life of the daemon: `release` had no
+    /// production caller, so every session a daemon ever ran stayed listed.
+    #[test]
+    fn admitting_a_session_prunes_the_outcomes_nobody_came_back_for() {
+        let runtime = runtime();
+        let registry = SessionRegistry::with_limits(SessionLimits {
+            retained_finished_sessions: 1,
+            ..SessionLimits::default()
+        });
+        let supervisor = SessionSupervisor::with_registry(registry, runtime.handle().clone());
+
+        for session in [1, 2, 3] {
+            supervisor
+                .start(admission(session, "model-a"), |_| SessionOutcome::Completed)
+                .unwrap();
+            wait_for(&supervisor, session);
+        }
+
+        // Held open so the session whose admission triggers the pruning is
+        // still running while it happens, which is what makes the listing below
+        // the same on a loaded machine as on an idle one.
+        let (release, released) = mpsc::channel::<()>();
+        supervisor
+            .start(admission(4, "model-a"), move |_| {
+                let _ = released.recv();
+                SessionOutcome::Completed
+            })
+            .unwrap();
+
+        assert_eq!(listed(supervisor.registry()), vec![3, 4]);
+
+        drop(release);
+        wait_for(&supervisor, 4);
+    }
+
+    fn wait_for(supervisor: &SessionSupervisor, session: i64) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while supervisor
+            .status(SessionId::new(session))
+            .and_then(|status| status.state.terminal())
+            .is_none()
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for session {session} to end"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Cancellation is cooperative, so shutdown cannot assume every session
+    /// observes it. Unbounded, one session inside uncancellable work held the
+    /// whole process open.
+    #[test]
+    fn shutdown_stops_waiting_for_a_session_that_ignores_its_cancellation() {
+        let runtime = runtime();
+        let supervisor = SessionSupervisor::new(runtime.handle().clone());
+        let (release, released) = mpsc::channel::<()>();
+
+        supervisor
+            .start(admission(1, "model-a"), move |_| {
+                // Deaf to its cancellation on purpose: a child process with no
+                // timeout of its own behaves exactly like this.
+                let _ = released.recv();
+                SessionOutcome::Completed
+            })
+            .unwrap();
+        supervisor
+            .start(admission(2, "model-b"), |_| SessionOutcome::Completed)
+            .unwrap();
+        wait_for(&supervisor, 2);
+
+        let shutdown =
+            runtime.block_on(supervisor.cancel_all_and_join_within(Duration::from_millis(50)));
+
+        assert_eq!(shutdown.abandoned, vec![SessionId::new(1)]);
+        assert_eq!(shutdown.stopped, vec![SessionId::new(2)]);
+        assert!(!shutdown.is_clean());
+
+        drop(release);
+        runtime.shutdown_timeout(Duration::from_secs(5));
+    }
+
+    #[test]
+    fn shutdown_reports_clean_when_every_session_stops_in_time() {
+        let runtime = runtime();
+        let supervisor = SessionSupervisor::new(runtime.handle().clone());
+
+        supervisor
+            .start(admission(1, "model-a"), |runtime| {
+                while !runtime.cancellation().is_cancelled() {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                SessionOutcome::Cancelled
+            })
+            .unwrap();
+
+        let shutdown =
+            runtime.block_on(supervisor.cancel_all_and_join_within(Duration::from_secs(5)));
+
+        assert!(shutdown.is_clean());
+        assert_eq!(shutdown.stopped, vec![SessionId::new(1)]);
+        assert_eq!(
+            supervisor.status(SessionId::new(1)).unwrap().state,
+            SessionState::Finished(SessionOutcome::Cancelled)
         );
     }
 }

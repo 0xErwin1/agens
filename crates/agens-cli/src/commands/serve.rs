@@ -16,14 +16,28 @@ pub(crate) fn run_serve(
 ) -> Result<String, CliError> {
     let bootstrap = bootstrap(dependencies)?;
 
-    agens_server::run_until_shutdown(bootstrap.data_directory(), cancellation).map_err(
-        |error| match error {
+    let shutdown = agens_server::run_until_shutdown(bootstrap.data_directory(), cancellation)
+        .map_err(|error| match error {
             ServerError::AlreadyRunning => CliError::unavailable(
                 "a daemon is already running for this machine; attach to it instead of starting another",
             ),
             ServerError::Unavailable(_) => CliError::unavailable("the daemon is unavailable"),
-        },
-    )?;
+        })?;
 
-    Ok(String::new())
+    // A clean shutdown says nothing, so the ordinary case stays silent and the
+    // one line the operator ever sees is the one that needs acting on.
+    if shutdown.is_clean() {
+        return Ok(String::new());
+    }
+
+    let abandoned = shutdown
+        .abandoned
+        .iter()
+        .map(|session| session.value().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    Ok(format!(
+        "the daemon stopped without these sessions ending: {abandoned}"
+    ))
 }
