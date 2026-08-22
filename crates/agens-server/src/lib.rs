@@ -7,6 +7,7 @@
 
 mod blocking;
 mod instance;
+mod worktrees;
 
 use std::os::unix::net::UnixListener;
 
@@ -14,6 +15,7 @@ use agens_core::HeadlessTurnCancellation;
 
 pub use blocking::{BlockingBoundary, BlockingError};
 pub use instance::{ServeInstance, ServeInstanceError};
+pub use worktrees::{SessionWorktrees, WorktreeError, WorktreeStatus};
 
 #[derive(Debug)]
 pub enum ServerError {
