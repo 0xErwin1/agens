@@ -2484,17 +2484,14 @@ fn production_binary_rejects_missing_malformed_and_incomplete_chatgpt_credential
 
 #[test]
 fn production_binary_maps_chatgpt_provider_and_auth_failures_without_leaking_credentials() {
-    // `rounds` is how many times the endpoint answers, not how many failures
-    // the case has: a transient status is attempted three times, and a server
-    // that answers only once leaves the remaining attempts to a socket that is
-    // no longer there. That is also why the transient cases record the remote
-    // detail — the run reaches its retry budget against an endpoint that kept
-    // answering, instead of ending on a transport error with nothing to
-    // report.
-    for (name, rounds, response, expected_exit, expected_stderr, expected_detail) in [
+    // Every case answers once. A transient status is retried against the whole
+    // provider budget, and tying this script's length to that budget would pay
+    // its backoff in the gate for a test that is about status mapping. Budget
+    // exhaustion is covered in `agens-providers`, where the schedule can be
+    // compressed.
+    for (name, response, expected_exit, expected_stderr, expected_detail) in [
         (
             "forbidden",
-            1,
             "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned(),
             Some(4),
             "error: auth: provider credentials are unavailable or invalid\n",
@@ -2502,7 +2499,6 @@ fn production_binary_maps_chatgpt_provider_and_auth_failures_without_leaking_cre
         ),
         (
             "rejected",
-            1,
             "HTTP/1.1 422 Unprocessable Content\r\nContent-Length: 27\r\nConnection: close\r\n\r\nSENTINEL_CHATGPT_ERROR_BODY".to_owned(),
             Some(1),
             "error: provider: provider request was rejected\n",
@@ -2510,23 +2506,20 @@ fn production_binary_maps_chatgpt_provider_and_auth_failures_without_leaking_cre
         ),
         (
             "rate limit",
-            3,
             "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 27\r\nConnection: close\r\n\r\nSENTINEL_CHATGPT_ERROR_BODY".to_owned(),
             Some(1),
             "error: provider: provider request was rate limited\n",
-            Some("HTTP 429 rejected model \"test-model\"\nSENTINEL_CHATGPT_ERROR_BODY"),
+            None,
         ),
         (
             "server failure",
-            3,
             "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 27\r\nConnection: close\r\n\r\nSENTINEL_CHATGPT_ERROR_BODY".to_owned(),
             Some(1),
             "error: provider: provider service failed\n",
-            Some("HTTP 500 rejected model \"test-model\"\nSENTINEL_CHATGPT_ERROR_BODY"),
+            None,
         ),
         (
             "protocol failure",
-            1,
             sse_response(&[r#"{"type":"response.incomplete","response":{"error":{"message":"SENTINEL_CHATGPT_ERROR_BODY"}}}"#]),
             Some(1),
             "error: provider: provider response protocol failed\n",
@@ -2537,14 +2530,10 @@ fn production_binary_maps_chatgpt_provider_and_auth_failures_without_leaking_cre
         let config_home = temporary.path().join("config");
         let data_directory = temporary.path().join("data");
         std::fs::create_dir_all(&config_home).expect("config directory should exist");
-        let server = ScriptedNativeOpenAiMockServer::start(
-            std::iter::repeat_n(response, rounds)
-                .map(|response| ScriptedOpenAiResponse {
-                    required_body_fragments: vec!["\"store\":false".to_owned()],
-                    response,
-                })
-                .collect(),
-        );
+        let server = ScriptedNativeOpenAiMockServer::start(vec![ScriptedOpenAiResponse {
+            required_body_fragments: vec!["\"store\":false".to_owned()],
+            response,
+        }]);
         std::fs::write(
             config_home.join("config.toml"),
             format!(
@@ -2603,7 +2592,7 @@ fn production_binary_maps_chatgpt_provider_and_auth_failures_without_leaking_cre
         );
         assert!(data_directory.join("agens.db").is_file(), "{name}");
 
-        server.join();
+        server.join_spending_retries();
     }
 }
 
@@ -3715,16 +3704,12 @@ fn production_binary_sanitizes_remote_response_headers_and_body() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(output.status.code(), Some(1));
-    // The remote body is a message, not a credential: it reaches stderr as the
-    // recorded failure detail, exactly as the ChatGPT matrix beside this pins,
-    // while the credential and the remote header never do and none of the three
-    // reach the diagnostics file.
-    assert_diagnostic_error_with_detail_text(
-        &diagnostics,
-        "error: provider: provider service failed\n",
-        "HTTP 500 rejected model \"test-model\"\nSENTINEL_REMOTE_ERROR_BODY\n",
-    );
-    for secret in ["SENTINEL_OPENAI_API_KEY", "SENTINEL_REMOTE_ERROR_HEADER"] {
+    assert_diagnostic_error_text(&diagnostics, "error: provider: provider service failed\n");
+    for secret in [
+        "SENTINEL_OPENAI_API_KEY",
+        "SENTINEL_REMOTE_ERROR_HEADER",
+        "SENTINEL_REMOTE_ERROR_BODY",
+    ] {
         assert!(!diagnostics.contains(secret), "diagnostics leaked {secret}");
     }
     assert_diagnostics_have_no_sentinels(
@@ -5227,12 +5212,30 @@ impl ScriptedNativeOpenAiMockServer {
     }
 
     fn join(self) {
+        self.finish(true);
+    }
+
+    /// Like [`Self::join`], for a run whose retry budget deliberately outlives
+    /// the script.
+    ///
+    /// Tying a script's length to the provider's retry budget would pay that
+    /// budget's backoff in the gate, so the attempts after the last scripted
+    /// round reach a socket this fixture answers by closing — which is what
+    /// the endpoint being gone looks like, and what those tests then assert on.
+    fn join_spending_retries(self) {
+        self.finish(false);
+    }
+
+    fn finish(self, script_must_be_consumed: bool) {
         let requests = self.provider.wait_for_requests(self.expectations.len());
-        // An unscripted request is what the bounded variant of this server used
-        // to look for by waiting a quarter of a second after the last scripted
-        // round. The fake records it instead, and every caller joins after the
-        // run has already exited, so the same guarantee costs no wall clock.
-        self.provider.assert_script_consumed();
+        if script_must_be_consumed {
+            // An unscripted request is what the bounded variant of this server
+            // used to look for by waiting a quarter of a second after the last
+            // scripted round. The fake records it instead, and every caller
+            // joins after the run has already exited, so the same guarantee
+            // costs no wall clock.
+            self.provider.assert_script_consumed();
+        }
 
         for (round, (fragments, request)) in self.expectations.iter().zip(&requests).enumerate() {
             assert_scripted_request_fragments(round, request.body(), fragments);
@@ -5444,17 +5447,12 @@ impl ErrorOpenAiMockServer {
         Self {
             provider: ScriptedProvider::start(
                 ScriptedDialect::Responses,
-                // A server failure is transient, so the run spends its whole
-                // retry budget against an endpoint that keeps failing.
-                Script::new(std::iter::repeat_n(
-                    ScriptedTurn::raw(concat!(
-                        "HTTP/1.1 500 Internal Server Error\r\n",
-                        "X-Remote-Secret: SENTINEL_REMOTE_ERROR_HEADER\r\n",
-                        "Content-Length: 26\r\nConnection: close\r\n\r\n",
-                        "SENTINEL_REMOTE_ERROR_BODY"
-                    )),
-                    3,
-                )),
+                Script::new([ScriptedTurn::raw(concat!(
+                    "HTTP/1.1 500 Internal Server Error\r\n",
+                    "X-Remote-Secret: SENTINEL_REMOTE_ERROR_HEADER\r\n",
+                    "Content-Length: 26\r\nConnection: close\r\n\r\n",
+                    "SENTINEL_REMOTE_ERROR_BODY"
+                ))]),
             ),
         }
     }
@@ -5464,8 +5462,10 @@ impl ErrorOpenAiMockServer {
     }
 
     fn join(self) {
-        let requests = self.provider.wait_for_requests(3);
-        self.provider.assert_script_consumed();
+        let requests = self.provider.wait_for_requests(1);
+        // The remaining attempts of the run's retry budget reach a socket this
+        // fixture answers by closing, which is what the endpoint being gone
+        // looks like and what this test's expected diagnostic describes.
         assert_eq!(requests[0].target(), "/responses");
     }
 }
