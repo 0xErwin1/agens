@@ -1,13 +1,60 @@
+//! Git worktrees owned by one session.
+//!
+//! Every invocation here reaches git the way [`crate::git_read`] does: a fixed
+//! argv, an environment stripped of the variables that would redirect the
+//! command at another repository, a bounded wait, and a process group that is
+//! killed rather than left behind. The difference is that this path writes, so
+//! it also has to stop the execution git reaches through a checkout: hooks and
+//! the programs a repository can name in its own configuration.
+
 use std::{
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     path::{Component, Path, PathBuf},
-    process::{Command, Output},
+    process::{Command, Stdio},
+    thread,
+    time::{Duration, Instant},
 };
 
+use crate::{
+    CappedOutput, PROCESS_POLL_INTERVAL, ToolExecutionContext, git_read::harden_environment,
+    kill_process_group, read_capped, terminate_process_group, wait_for_readers,
+};
+
+/// How long one git invocation may run when the caller carries no deadline of
+/// its own. A checkout of a large repository is slow, a hung one is not
+/// distinguishable from it except by waiting, and the session is blocked
+/// either way.
+const DEFAULT_WORKTREE_GIT_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Options that hold each invocation to what it is supposed to do.
+///
+/// `core.hooksPath` is emptied because `worktree add` checks the new tree out
+/// and a checkout runs `post-checkout` from the repository's own hook
+/// directory. `core.fsmonitor` and `core.attributesFile` are emptied for the
+/// same reason: both name a program or a file the repository chooses, and
+/// neither is needed to create or inspect a worktree. `--no-replace-objects`
+/// keeps the earlier invocation's guarantee that a replacement ref cannot
+/// substitute the commit the worktree is created from. Content filters
+/// configured inside the repository still run, so the tool's own description
+/// says the checkout executes what the repository configures.
+const HARDENING_ARGUMENTS: [&str; 9] = [
+    "--no-pager",
+    "--no-replace-objects",
+    "--no-optional-locks",
+    "-c",
+    "core.fsmonitor=",
+    "-c",
+    "core.hooksPath=/dev/null",
+    "-c",
+    "core.attributesFile=/dev/null",
+];
+
 /// Git worktrees owned by daemon sessions under one Agens data directory.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct SessionWorktrees {
     data_directory: PathBuf,
+    timeout: Duration,
+    execution_context: Option<ToolExecutionContext>,
 }
 
 impl SessionWorktrees {
@@ -15,31 +62,49 @@ impl SessionWorktrees {
     pub fn new(data_directory: impl AsRef<Path>) -> Self {
         Self {
             data_directory: data_directory.as_ref().to_path_buf(),
+            timeout: DEFAULT_WORKTREE_GIT_TIMEOUT,
+            execution_context: None,
         }
     }
 
-    /// Creates `branch` from `start_point` at `worktrees/<repo_id>/<name>`.
+    /// Bounds every later invocation by `timeout`, never raising it above the
+    /// service's own bound.
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = self.timeout.min(timeout);
+        self
+    }
+
+    /// Makes every later invocation observe the calling tool's cancellation
+    /// and deadline, so a cancelled turn does not leave git running.
+    #[must_use]
+    pub fn with_execution_context(mut self, context: ToolExecutionContext) -> Self {
+        self.execution_context = Some(context);
+        self
+    }
+
+    /// Creates `branch` from `start_point` at `worktrees/<repository_id>/<name>`.
     pub fn create(
         &self,
         repository: &Path,
-        repo_id: &str,
+        repository_id: &str,
         name: &str,
         branch: &str,
         start_point: &str,
     ) -> Result<PathBuf, WorktreeError> {
-        validate_component(repo_id, "repository id")?;
+        validate_component(repository_id, "repository id")?;
         validate_component(name, "worktree name")?;
         validate_git_argument(branch, "branch")?;
         validate_git_argument(start_point, "start point")?;
 
-        let repository_directory = self.repository_directory_unchecked(repo_id);
+        let repository_directory = self.repository_directory_unchecked(repository_id);
         std::fs::create_dir_all(&repository_directory).map_err(|error| WorktreeError::Storage {
             action: "create worktree directory",
             detail: error.to_string(),
         })?;
 
         let path = repository_directory.join(name);
-        run_checked(
+        self.run_checked(
             repository,
             "worktree add",
             &[
@@ -58,29 +123,28 @@ impl SessionWorktrees {
     /// Re-derives ancestry and working-tree dirtiness from Git.
     pub fn status(
         &self,
-        repo_id: &str,
+        repository_id: &str,
         name: &str,
         merged_into: &str,
     ) -> Result<WorktreeStatus, WorktreeError> {
-        validate_component(repo_id, "repository id")?;
+        validate_component(repository_id, "repository id")?;
         validate_component(name, "worktree name")?;
         validate_git_argument(merged_into, "merge target")?;
 
-        let path = self.worktree_path(repo_id, name);
-        let merged = is_merged(&path, merged_into)?;
-        let dirty = !run_checked(
-            &path,
-            "status",
-            &[
-                "--no-optional-locks".into(),
-                "-c".into(),
-                "core.fsmonitor=".into(),
-                "status".into(),
-                "--porcelain=v1".into(),
-                "--untracked-files=all".into(),
-            ],
-        )?
-        .is_empty();
+        let path = self.worktree_path(repository_id, name);
+        self.ensure_present(&path)?;
+        let merged = self.is_merged(&path, merged_into)?;
+        let dirty = !self
+            .run_checked(
+                &path,
+                "status",
+                &[
+                    "status".into(),
+                    "--porcelain=v1".into(),
+                    "--untracked-files=all".into(),
+                ],
+            )?
+            .is_empty();
 
         Ok(WorktreeStatus { merged, dirty })
     }
@@ -89,14 +153,15 @@ impl SessionWorktrees {
     pub fn remove(
         &self,
         repository: &Path,
-        repo_id: &str,
+        repository_id: &str,
         name: &str,
     ) -> Result<(), WorktreeError> {
-        validate_component(repo_id, "repository id")?;
+        validate_component(repository_id, "repository id")?;
         validate_component(name, "worktree name")?;
 
-        let path = self.worktree_path(repo_id, name);
-        run_checked(
+        let path = self.worktree_path(repository_id, name);
+        self.ensure_present(&path)?;
+        self.run_checked(
             repository,
             "worktree remove",
             &["worktree".into(), "remove".into(), path.into_os_string()],
@@ -105,20 +170,205 @@ impl SessionWorktrees {
         Ok(())
     }
 
-    /// Where one repository's session worktrees live, once `repo_id` is known
-    /// to be a single path component.
-    pub fn repository_directory(&self, repo_id: &str) -> Result<PathBuf, WorktreeError> {
-        validate_component(repo_id, "repository id")?;
+    /// The names of the worktrees this repository already has on disk, so a
+    /// caller can hold a session to a budget it can count.
+    ///
+    /// A missing directory is not an error: a session that has created
+    /// nothing has no worktrees.
+    pub fn names(&self, repository_id: &str) -> Result<Vec<String>, WorktreeError> {
+        validate_component(repository_id, "repository id")?;
 
-        Ok(self.repository_directory_unchecked(repo_id))
+        let directory = self.repository_directory_unchecked(repository_id);
+        let entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => {
+                return Err(WorktreeError::Storage {
+                    action: "list worktrees",
+                    detail: error.to_string(),
+                });
+            }
+        };
+
+        let mut names: Vec<String> = entries
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .collect();
+        names.sort();
+
+        Ok(names)
     }
 
-    fn repository_directory_unchecked(&self, repo_id: &str) -> PathBuf {
-        self.data_directory.join("worktrees").join(repo_id)
+    /// The commit `repository` currently has checked out, as the target a
+    /// reclaim sweep measures a worktree's branch against.
+    pub fn head_revision(&self, repository: &Path) -> Result<String, WorktreeError> {
+        let output = self.run_checked(
+            repository,
+            "rev-parse",
+            &["rev-parse".into(), "HEAD".into()],
+        )?;
+
+        Ok(String::from_utf8_lossy(&output).trim().to_owned())
     }
 
-    fn worktree_path(&self, repo_id: &str, name: &str) -> PathBuf {
-        self.repository_directory_unchecked(repo_id).join(name)
+    /// Where one repository's session worktrees live, once `repository_id` is
+    /// known to be a single path component.
+    pub fn repository_directory(&self, repository_id: &str) -> Result<PathBuf, WorktreeError> {
+        validate_component(repository_id, "repository id")?;
+
+        Ok(self.repository_directory_unchecked(repository_id))
+    }
+
+    fn repository_directory_unchecked(&self, repository_id: &str) -> PathBuf {
+        self.data_directory.join("worktrees").join(repository_id)
+    }
+
+    fn worktree_path(&self, repository_id: &str, name: &str) -> PathBuf {
+        self.repository_directory_unchecked(repository_id)
+            .join(name)
+    }
+
+    /// Separates a worktree that is no longer there from a git that cannot be
+    /// started, which the spawn failure alone reports identically.
+    fn ensure_present(&self, path: &Path) -> Result<(), WorktreeError> {
+        if path.is_dir() {
+            Ok(())
+        } else {
+            Err(WorktreeError::Missing)
+        }
+    }
+
+    fn is_merged(&self, worktree: &Path, target: &str) -> Result<bool, WorktreeError> {
+        let outcome = self.run_git(
+            worktree,
+            &[
+                "merge-base".into(),
+                "--is-ancestor".into(),
+                "HEAD".into(),
+                target.into(),
+            ],
+        )?;
+
+        match outcome.code {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            _ => Err(outcome.failure("merge-base")),
+        }
+    }
+
+    fn run_checked(
+        &self,
+        directory: &Path,
+        operation: &'static str,
+        arguments: &[OsString],
+    ) -> Result<Vec<u8>, WorktreeError> {
+        let outcome = self.run_git(directory, arguments)?;
+        if !outcome.success {
+            return Err(outcome.failure(operation));
+        }
+
+        Ok(outcome.output.stdout)
+    }
+
+    fn run_git(
+        &self,
+        directory: &Path,
+        arguments: &[OsString],
+    ) -> Result<GitOutcome, WorktreeError> {
+        let mut command = Command::new("git");
+        command
+            .args(HARDENING_ARGUMENTS.map(OsStr::new))
+            .args(arguments)
+            .current_dir(directory)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        harden_environment(&mut command);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+
+        let Ok(mut child) = command.spawn() else {
+            return Err(WorktreeError::GitUnavailable);
+        };
+        let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
+            let _ = terminate_process_group(&mut child);
+            return Err(WorktreeError::GitUnavailable);
+        };
+        let stdout_reader = read_capped(stdout);
+        let stderr_reader = read_capped(stderr);
+        let deadline = Instant::now() + self.remaining_budget();
+
+        let status = loop {
+            let cancelled = self
+                .execution_context
+                .as_ref()
+                .is_some_and(ToolExecutionContext::is_cancelled);
+
+            if cancelled || Instant::now() >= deadline {
+                let _ = terminate_process_group(&mut child);
+                let _ = wait_for_readers(stdout_reader, stderr_reader);
+                return Err(if cancelled {
+                    WorktreeError::Cancelled
+                } else {
+                    WorktreeError::TimedOut
+                });
+            }
+
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    let _ = kill_process_group(child.id());
+                    break status;
+                }
+                Ok(None) => thread::sleep(PROCESS_POLL_INTERVAL),
+                Err(_) => {
+                    let _ = terminate_process_group(&mut child);
+                    let _ = wait_for_readers(stdout_reader, stderr_reader);
+                    return Err(WorktreeError::GitUnavailable);
+                }
+            }
+        };
+
+        let output = wait_for_readers(stdout_reader, stderr_reader)
+            .map_err(|_| WorktreeError::GitUnavailable)?;
+
+        Ok(GitOutcome {
+            success: status.success(),
+            code: status.code(),
+            output,
+        })
+    }
+
+    /// The invocation's own bound, lowered to whatever the calling tool has
+    /// left. An already-expired caller still gets one attempt at a
+    /// zero-length budget, which fails as a timeout rather than as a silent
+    /// success.
+    fn remaining_budget(&self) -> Duration {
+        match self.execution_context.as_ref() {
+            Some(context) => self.timeout.min(context.remaining().unwrap_or_default()),
+            None => self.timeout,
+        }
+    }
+}
+
+struct GitOutcome {
+    success: bool,
+    code: Option<i32>,
+    output: CappedOutput,
+}
+
+impl GitOutcome {
+    fn failure(&self, operation: &'static str) -> WorktreeError {
+        WorktreeError::Git {
+            operation,
+            detail: String::from_utf8_lossy(&self.output.stderr)
+                .trim()
+                .to_owned(),
+        }
     }
 }
 
@@ -143,8 +393,14 @@ pub enum WorktreeError {
         action: &'static str,
         detail: String,
     },
+    /// The worktree the caller named is not on disk.
+    Missing,
     /// Git could not be started.
     GitUnavailable,
+    /// Git ran longer than the invocation's budget and was killed.
+    TimedOut,
+    /// The calling turn was cancelled while git was running.
+    Cancelled,
     /// Git rejected an operation.
     Git {
         operation: &'static str,
@@ -157,7 +413,10 @@ impl std::fmt::Display for WorktreeError {
         match self {
             Self::InvalidInput { field, detail } => write!(formatter, "invalid {field}: {detail}"),
             Self::Storage { action, detail } => write!(formatter, "{action}: {detail}"),
+            Self::Missing => formatter.write_str("no such worktree"),
             Self::GitUnavailable => formatter.write_str("git is unavailable"),
+            Self::TimedOut => formatter.write_str("git timed out"),
+            Self::Cancelled => formatter.write_str("cancelled"),
             Self::Git { operation, detail } => {
                 write!(formatter, "git {operation} failed: {detail}")
             }
@@ -190,55 +449,5 @@ fn validate_git_argument(value: &str, field: &'static str) -> Result<(), Worktre
             field,
             detail: "must be non-empty and must not start with '-'",
         })
-    }
-}
-
-fn is_merged(worktree: &Path, target: &str) -> Result<bool, WorktreeError> {
-    let output = run_git(
-        worktree,
-        &[
-            "merge-base".into(),
-            "--is-ancestor".into(),
-            "HEAD".into(),
-            target.into(),
-        ],
-    )?;
-
-    match output.status.code() {
-        Some(0) => Ok(true),
-        Some(1) => Ok(false),
-        _ => Err(git_failure("merge-base", output)),
-    }
-}
-
-fn run_checked(
-    directory: &Path,
-    operation: &'static str,
-    arguments: &[OsString],
-) -> Result<Vec<u8>, WorktreeError> {
-    let output = run_git(directory, arguments)?;
-    if !output.status.success() {
-        return Err(git_failure(operation, output));
-    }
-
-    Ok(output.stdout)
-}
-
-fn run_git(directory: &Path, arguments: &[OsString]) -> Result<Output, WorktreeError> {
-    Command::new("git")
-        .args(arguments)
-        .current_dir(directory)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .env("GIT_NO_REPLACE_OBJECTS", "1")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .output()
-        .map_err(|_| WorktreeError::GitUnavailable)
-}
-
-fn git_failure(operation: &'static str, output: Output) -> WorktreeError {
-    WorktreeError::Git {
-        operation,
-        detail: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
     }
 }
