@@ -6,6 +6,7 @@
 //! attached, which is why it does not live with the CLI.
 
 pub mod attempt;
+pub mod compaction;
 pub mod context;
 pub mod model;
 pub mod provider;

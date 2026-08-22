@@ -57,7 +57,7 @@ struct Migration {
     preserved_tables: &'static [&'static str],
 }
 
-const MIGRATIONS: [Migration; 16] = [
+const MIGRATIONS: [Migration; 17] = [
     Migration {
         id: "0001_permission_grants",
         ddl: permission_grants_ddl,
@@ -143,6 +143,11 @@ const MIGRATIONS: [Migration; 16] = [
         id: "0016_directive_kind",
         ddl: directive_kind_ddl,
         preserved_tables: &["directives"],
+    },
+    Migration {
+        id: "0017_session_compactions",
+        ddl: session_compactions_ddl,
+        preserved_tables: &[],
     },
 ];
 
@@ -506,6 +511,28 @@ fn supervisor_role_ddl() -> String {
 /// `delivered_at` is set rather than the row deleted: a turn that was steered
 /// mid-flight is only explicable afterwards if the steering is still there to
 /// read.
+/// Records what a compaction replaced, without touching what it replaced.
+///
+/// Additive on purpose: the summary and the sequence of the first surviving
+/// message are enough to reconstruct the compacted history, so the session's
+/// own messages are never rewritten and a compaction stays reversible by
+/// reading past the row.
+fn session_compactions_ddl() -> String {
+    "
+    CREATE TABLE session_compactions (
+        id INTEGER PRIMARY KEY,
+        session_id INTEGER NOT NULL,
+        summary TEXT NOT NULL CHECK(summary <> ''),
+        first_kept_message_index INTEGER NOT NULL CHECK(first_kept_message_index >= 0),
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+    );
+    CREATE INDEX session_compactions_latest
+        ON session_compactions(session_id, id DESC);
+    "
+    .to_owned()
+}
+
 fn directives_ddl() -> String {
     "
     CREATE TABLE directives (

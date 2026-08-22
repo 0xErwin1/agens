@@ -10,6 +10,7 @@ use agens_core::{
 };
 use rusqlite::{Connection, Transaction, TransactionBehavior, params};
 
+mod compaction;
 mod control_plane;
 mod database;
 mod directives;
@@ -17,6 +18,7 @@ mod fact_store;
 mod media;
 mod prompt_memory;
 mod session_writer;
+pub use compaction::{CompactionStore, CompactionStoreError, StoredCompaction};
 pub use control_plane::{
     AttemptOutcome, AttemptRow, CausalDisposition, ControlPlaneError, ControlPlaneStore,
     EventClass, EventRow, EvidenceClass, FindingRow, ProviderRow, QuestionAuthor, QuestionKind,

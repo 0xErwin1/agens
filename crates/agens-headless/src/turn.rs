@@ -347,6 +347,21 @@ pub fn run_production_headless_chat_with_progress(
             )
         }
     };
+    // Recorded before the turn's own ending, because it is the reason for it:
+    // a reader following the two lines sees why the turn ended, not just that
+    // it did.
+    if let Err(failure) = &result
+        && failure.error.runtime_error() == Some(HeadlessTurnError::ProviderContext)
+    {
+        record_session_lifecycle(
+            bootstrap,
+            &diagnostic_reference,
+            ProviderDiagnosticScope::Parent,
+            SessionLifecycle::ContextExhausted {
+                model: &resolved.model,
+            },
+        );
+    }
     record_session_lifecycle(
         bootstrap,
         &diagnostic_reference,

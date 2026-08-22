@@ -326,6 +326,57 @@ fn openai_transport_uses_frozen_failure_precedence() {
     }
 }
 
+/// A provider that names the overflow in prose rather than in a code is still
+/// reporting an overflow: without this it is classified as a plain rejection,
+/// and nothing downstream can tell an exhausted context apart from a malformed
+/// request.
+#[test]
+fn context_overflow_is_recognised_across_provider_error_shapes() {
+    for (body, expected) in [
+        (
+            r#"{"error":{"code":"request_too_large","message":"too big"}}"#,
+            HeadlessTurnPortError::ProviderContext,
+        ),
+        (
+            r#"{"error":{"type":"invalid_request_error","message":"prompt is too long: 250000 tokens > 200000 maximum"}}"#,
+            HeadlessTurnPortError::ProviderContext,
+        ),
+        (
+            r#"{"error":{"type":"ValidationException","message":"Input token count exceeds the maximum number of input tokens"}}"#,
+            HeadlessTurnPortError::ProviderContext,
+        ),
+        (
+            r#"{"error":{"message":"This model's maximum context length is 128000 tokens"}}"#,
+            HeadlessTurnPortError::ProviderContext,
+        ),
+        (
+            r#"{"error":{"message":"input is too long for the model"}}"#,
+            HeadlessTurnPortError::ProviderContext,
+        ),
+        (
+            r#"{"error":{"code":"context_length_exceeded_extra","message":"something else"}}"#,
+            HeadlessTurnPortError::ProviderRejected,
+        ),
+        (
+            r#"{"error":{"code":"invalid_request","message":"the model does not exist"}}"#,
+            HeadlessTurnPortError::ProviderRejected,
+        ),
+    ] {
+        let server = LocalResponsesServer::start_error_response(400, body);
+
+        assert_eq!(
+            run_provider(
+                server.base_url(),
+                HeadlessTurnCancellation::new(),
+                Duration::from_secs(1),
+            ),
+            Err(expected),
+            "misclassified {body}",
+        );
+        server.join();
+    }
+}
+
 #[test]
 fn rejected_status_records_body_status_and_model_for_a_user_visible_sink() {
     let server = LocalResponsesServer::start_error_response(

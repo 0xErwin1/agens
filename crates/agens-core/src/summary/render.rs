@@ -101,6 +101,18 @@ pub fn render_compaction(
     )
 }
 
+/// The summary alone, under the compaction projection.
+///
+/// [`render_compaction`] renders the input a summarizing model reads; this
+/// renders the output it produced, which is what replaces the head of a
+/// history and what a later compaction folds into its own. Every section is
+/// projected, because a compacted thread is the only remaining record of what
+/// it replaced.
+#[must_use]
+pub fn render_compaction_summary(summary: &RunSummary) -> String {
+    render_sections(summary, SummaryProjection::Compaction)
+}
+
 /// The run report: what a reader has to act on, assembled from rows and
 /// therefore producible with every provider capped.
 #[must_use]

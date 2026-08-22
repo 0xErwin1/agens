@@ -54,6 +54,15 @@ pub struct CliError {
     pub message: String,
     detail: Option<String>,
     preformatted: bool,
+    /// The runtime variant this error was built from, when it was built from
+    /// one.
+    ///
+    /// Kept because the envelope erases it: `category` and `message` are what a
+    /// person reads, and two failures a caller must treat differently — a
+    /// rejected request and an exhausted context window — share a category and
+    /// differ only in prose. A supervisor deciding whether a compaction would
+    /// unblock the turn cannot make that decision on prose.
+    runtime: Option<HeadlessTurnError>,
 }
 
 impl CliError {
@@ -72,6 +81,7 @@ impl CliError {
             message: message.into(),
             detail: None,
             preformatted: true,
+            runtime: None,
         }
     }
 
@@ -175,7 +185,10 @@ impl CliError {
                 (ExitStatus::Failure, "", terminal.message())
             }
         };
-        Self::new(status, category, message)
+        Self {
+            runtime: Some(error),
+            ..Self::new(status, category, message)
+        }
     }
 
     pub fn new(status: ExitStatus, category: &'static str, message: impl Into<String>) -> Self {
@@ -185,6 +198,7 @@ impl CliError {
             message: message.into(),
             detail: None,
             preformatted: false,
+            runtime: None,
         }
     }
 
@@ -213,6 +227,12 @@ impl CliError {
 
     pub const fn is_preformatted(&self) -> bool {
         self.preformatted
+    }
+
+    /// The runtime variant behind this error, for a caller that has to act on
+    /// which failure it is rather than describe it.
+    pub const fn runtime_error(&self) -> Option<HeadlessTurnError> {
+        self.runtime
     }
 }
 
