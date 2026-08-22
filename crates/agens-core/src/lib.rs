@@ -536,6 +536,11 @@ pub enum SubagentErrorKind {
     Server,
     Tool,
     Runtime,
+    /// The turn itself succeeded and its result could not be handed on —
+    /// recorded in the session, or announced to the thread that delegated it.
+    /// Distinct from [`Self::Runtime`] because the work is not lost and
+    /// re-running it would only repeat it: what failed is delivery.
+    ResultDelivery,
 }
 
 /// How a subagent turn ended.

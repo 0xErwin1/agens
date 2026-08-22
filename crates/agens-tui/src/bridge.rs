@@ -450,6 +450,7 @@ impl SubagentErrorPresentation for SubagentErrorKind {
             Self::Server => "Subagent provider service failed.",
             Self::Tool => "Subagent tool execution failed.",
             Self::Runtime => "Subagent runtime failed.",
+            Self::ResultDelivery => "Subagent finished; its result was not delivered.",
         }
     }
 
@@ -466,6 +467,7 @@ impl SubagentErrorPresentation for SubagentErrorKind {
             Self::Server => "Retry after the provider service recovers.",
             Self::Tool => "Review the tool call and retry.",
             Self::Runtime => "Retry the subagent request or inspect diagnostics.",
+            Self::ResultDelivery => "Read the result in the subagent panel; inspect diagnostics.",
         }
     }
 }

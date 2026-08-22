@@ -104,7 +104,7 @@ impl TuiTaskLifecycleBridge {
                 let _ = events.publish(
                     TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::error(
                         id,
-                        SubagentErrorKind::Runtime,
+                        SubagentErrorKind::ResultDelivery,
                     )),
                     &BridgeCancel::new(),
                     None,
@@ -251,14 +251,22 @@ impl TuiTaskLifecycleBridge {
                             .lock()
                             .ok()
                             .and_then(|mut turns| turns.remove(&id));
-                        let persisted = matches!(event, TuiExecutionEvent::Completed { .. })
-                            && match (completed_turn, &persist_completed) {
-                                (Some(turn), Some(persist)) => persist(turn),
-                                _ => false,
-                            };
-                        notify_main_of_terminal_subagent(
-                            &registry, &events, id, &agent, fallback, persisted,
-                        );
+                        // Both of these exist to tell a parent about work it
+                        // was not waiting for. A foreground parent already
+                        // holds this result inline, so the notice asks it to
+                        // re-read what it just read and the synthetic turn
+                        // records a second copy of an exchange the real turn
+                        // is about to persist itself.
+                        if lifecycle.mode() == TaskLaunchMode::Background {
+                            let persisted = matches!(event, TuiExecutionEvent::Completed { .. })
+                                && match (completed_turn, &persist_completed) {
+                                    (Some(turn), Some(persist)) => persist(turn),
+                                    _ => false,
+                                };
+                            notify_main_of_terminal_subagent(
+                                &registry, &events, id, &agent, fallback, persisted,
+                            );
+                        }
                         return;
                     }
                 }
@@ -353,7 +361,7 @@ fn notify_main_of_terminal_subagent(
         let _ = events.publish(
             TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::error(
                 id,
-                SubagentErrorKind::Runtime,
+                SubagentErrorKind::ResultDelivery,
             )),
             &BridgeCancel::new(),
             None,

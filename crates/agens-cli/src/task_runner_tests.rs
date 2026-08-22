@@ -269,7 +269,7 @@ fn u15_a1b2_selected_launch_uses_the_registered_production_task_runner() {
 }
 
 #[test]
-fn p1c1_p1b_authorized_runner_persists_one_completed_subagent_turn() {
+fn p1c1_p1b_authorized_runner_persists_one_completed_background_subagent_turn() {
     let temporary = tui_session_directory("p1b-child-events");
     let bootstrap = tui_session_bootstrap(
         &temporary,
@@ -281,8 +281,16 @@ fn p1c1_p1b_authorized_runner_persists_one_completed_subagent_turn() {
     let probe = Arc::new(Mutex::new(Vec::new()));
     let (events, receiver) = BridgeTx::bounded(16);
     let controls = TuiTaskControls::default();
+    let mut store = SessionStore::open(bootstrap.data_directory()).unwrap();
+    let seeded = agens_tui_app::test_support::persist_tui_session(
+        &mut store,
+        &temporary.display().to_string(),
+        "subagent-persistence",
+    );
+    drop(store);
     let session = Arc::new(Mutex::new(SessionContext {
         selected_subagent: Some("reviewer".into()),
+        identifier: Some(seeded.id),
         ..SessionContext::fresh()
     }));
     let lifecycle_bridge = TuiTaskLifecycleBridge::new(events, controls)
@@ -329,7 +337,7 @@ fn p1c1_p1b_authorized_runner_persists_one_completed_subagent_turn() {
     let cancellation = HeadlessTurnCancellation::new();
 
     assert_eq!(
-        launch_selected_tui_task(&mut runtime, &session, "review task", false, &cancellation),
+        launch_selected_tui_task(&mut runtime, &session, "review task", true, &cancellation),
         Ok(TuiSelectedTaskLaunch::Dispatched)
     );
 
@@ -347,13 +355,13 @@ fn p1c1_p1b_authorized_runner_persists_one_completed_subagent_turn() {
         vec![
             TuiRuntimeEvent::TaskExecution {
                 agent: "reviewer".into(),
-                event: TuiExecutionEvent::ForegroundStarted { id: 1 },
+                event: TuiExecutionEvent::BackgroundStarted { id: 1 },
             },
             TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::started_on(
                 1,
                 "reviewer",
                 "review task",
-                agens_core::TuiExecutionState::ForegroundRunning,
+                agens_core::TuiExecutionState::BackgroundRunning,
                 Some("openai-api/gpt-4.1"),
                 None,
             )),
@@ -385,16 +393,27 @@ fn p1c1_p1b_authorized_runner_persists_one_completed_subagent_turn() {
     assert_eq!(probe.lock().unwrap().len(), 1);
     let session_id = agens_tui_app::test_support::wait_for(
         "the completed terminal to persist exactly one durable turn",
-        || session.lock().unwrap().identifier,
+        || {
+            session
+                .lock()
+                .unwrap()
+                .metadata
+                .as_ref()
+                .filter(|metadata| metadata.completed_turn_count > seeded.completed_turn_count)
+                .map(|metadata| metadata.id)
+        },
+    );
+    assert_eq!(
+        session_id, seeded.id,
+        "the subagent turn must append to the session the parent is already in"
     );
     let stored = SessionStore::open(bootstrap.data_directory())
         .unwrap()
         .load_session_for_resume(session_id)
         .unwrap();
-    assert_eq!(stored.metadata.completed_turn_count, 1);
-    assert_eq!(stored.messages.len(), 3);
+    assert_eq!(stored.metadata.completed_turn_count, 2);
     assert_eq!(
-        stored.messages[2].parts[0],
+        stored.messages.last().unwrap().parts[0],
         MessagePart::ToolResult {
             tool_call_id: "subagent:1".into(),
             content: "probe".into(),
@@ -405,8 +424,115 @@ fn p1c1_p1b_authorized_runner_persists_one_completed_subagent_turn() {
     std::fs::remove_dir_all(temporary).unwrap();
 }
 
+/// A foreground parent already holds the result inline. Persisting a synthetic
+/// copy of the exchange it is about to record itself doubles the context every
+/// later turn and every resume replays, and the mailbox notice asks the parent
+/// to re-read what it just read through `task_control action=status`, which
+/// re-emits the whole result a second time.
 #[test]
-fn failed_subagent_turn_persistence_publishes_a_runtime_error() {
+fn a_foreground_subagent_neither_persists_a_turn_nor_notifies_the_main_thread() {
+    let temporary = tui_session_directory("foreground-subagent-quiet");
+    let bootstrap = tui_session_bootstrap(
+        &temporary,
+        &[(
+            "reviewer",
+            "---\nname: reviewer\ndescription: reviewer\nmode: subagent\npermissions: []\n---\nReview work.\n",
+        )],
+    );
+    let mut store = SessionStore::open(bootstrap.data_directory()).unwrap();
+    let seeded = agens_tui_app::test_support::persist_tui_session(
+        &mut store,
+        &temporary.display().to_string(),
+        "foreground-subagent",
+    );
+    drop(store);
+    let probe = Arc::new(Mutex::new(Vec::new()));
+    let (events, receiver) = BridgeTx::bounded(16);
+    let controls = TuiTaskControls::default();
+    let session = Arc::new(Mutex::new(SessionContext {
+        selected_subagent: Some("reviewer".into()),
+        identifier: Some(seeded.id),
+        ..SessionContext::fresh()
+    }));
+    let lifecycle_bridge = TuiTaskLifecycleBridge::new(events, controls.clone())
+        .with_session_writer(bootstrap.clone(), Arc::clone(&session));
+    let mut runtime = production_tui_task_runtime_with_runner(
+        &bootstrap,
+        &agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap),
+        &SkillCatalog::default(),
+        Box::new(TuiPermissionPrompter(
+            production_tui_permission_bridge().0,
+            None,
+        )),
+        ProductionTaskRunner::with_progress_probe(
+            bootstrap.clone(),
+            agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap),
+            Arc::clone(&probe),
+            vec![TurnEvent::ProviderPart(MessagePart::Text("done".into()))],
+        )
+        .with_lifecycle_bridge(lifecycle_bridge),
+        Box::new(UnavailableAskUserPort),
+    )
+    .unwrap();
+    runtime.authorized.gate.policy = PermissionPolicy::new(
+        PermissionMode::Edit,
+        vec![PermissionRule::global(
+            PermissionDecision::Allow,
+            PermissionPattern::Exact("native::task".into()),
+            PermissionPattern::Any,
+        )],
+    );
+    let cancellation = HeadlessTurnCancellation::new();
+
+    assert_eq!(
+        launch_selected_tui_task(&mut runtime, &session, "review task", false, &cancellation),
+        Ok(TuiSelectedTaskLaunch::Dispatched)
+    );
+
+    // Drain until the terminal event, which the watcher publishes immediately
+    // before it would have persisted and notified.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut terminal_seen = false;
+    while !terminal_seen {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the foreground subagent should reach a terminal event"
+        );
+        if let Ok(event) = receiver.recv_timeout(std::time::Duration::from_millis(100))
+            && matches!(
+                event.into_parts().1,
+                TuiRuntimeEvent::TaskExecution {
+                    event: TuiExecutionEvent::Completed { .. },
+                    ..
+                }
+            )
+        {
+            terminal_seen = true;
+        }
+    }
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    let stored = SessionStore::open(bootstrap.data_directory())
+        .unwrap()
+        .load_session_for_resume(seeded.id)
+        .unwrap();
+    assert_eq!(
+        stored.metadata.completed_turn_count, seeded.completed_turn_count,
+        "a foreground subagent must not add a durable turn of its own"
+    );
+    assert!(
+        controls
+            .0
+            .drain_messages(agens_tools::TaskMessageTarget::Main)
+            .is_empty(),
+        "a foreground subagent must not queue a notice for the next main turn"
+    );
+
+    std::fs::remove_dir_all(temporary).unwrap();
+}
+
+#[test]
+fn failed_subagent_turn_persistence_reports_delivery_not_a_failed_subagent() {
     let temporary = tui_session_directory("subagent-persistence-failure");
     let bootstrap = tui_session_bootstrap(&temporary, &[]);
     std::fs::create_dir_all(bootstrap.data_directory().join("agens.db")).unwrap();
@@ -433,7 +559,10 @@ fn failed_subagent_turn_persistence_publishes_a_runtime_error() {
             .expect("persistence failure should reach the TUI bridge")
             .into_parts()
             .1,
-        TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::error(7, SubagentErrorKind::Runtime,))
+        TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::error(
+            7,
+            SubagentErrorKind::ResultDelivery,
+        ))
     );
     assert!(session.lock().unwrap().identifier.is_none());
 
