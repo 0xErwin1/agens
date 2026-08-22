@@ -23,11 +23,21 @@
 //! runtime's worker threads for the length of a query, next to the facade that
 //! is trying to answer a client.
 //!
+//! **Nothing is admitted until the state left behind has been reconciled.**
+//! [`reconcile`] runs in a fixed order before the loops start and before the
+//! surface clients attach to is up: rows the last process left `running` are
+//! interrupted, the deadlines are recomputed from the database, and the
+//! worktrees on disk are checked against the runs that claim them. Only then do
+//! the interrupted runs go back to the queue. Skipping it is what leaves four
+//! dead `running` rows holding `max_concurrent` for good.
+//!
 //! **What a run's session is made of is not decided here.** It arrives as
 //! [`RunWorkerFactory`], which is the seam [`crate::SupervisorLauncher`] was
 //! built to take: what a worker is given — its own provider client, its
 //! confinement root, its own MCP connections — belongs to the surface that
 //! knows about models, and admission must not have to know any of it.
+
+mod reconcile;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -50,6 +60,11 @@ use crate::scheduler::{
 };
 use crate::sessions::SessionSupervisor;
 use crate::timers::{TimerSettings, TimerWheel};
+
+pub use reconcile::{
+    BootReconciliation, MissingWorktree, OrphanWorktree, WORKTREE_MISSING_EVENT,
+    WORKTREE_ORPHANED_EVENT,
+};
 
 /// How often a loop looks again when nothing woke it.
 const HEARTBEAT: Duration = Duration::from_millis(250);
@@ -135,6 +150,7 @@ impl std::error::Error for CoordinatorError {}
 /// against it.
 pub struct Coordinator {
     core: Arc<Mutex<ApiCore>>,
+    reconciliation: BootReconciliation,
     admissions: Arc<Admissions>,
     facts: FactSender,
     stopping: Arc<AtomicBool>,
@@ -142,7 +158,8 @@ pub struct Coordinator {
 }
 
 impl Coordinator {
-    /// Composes the coordinator over one data directory and starts its loops.
+    /// Composes the coordinator over one data directory, reconciles the state
+    /// the last process left behind, and starts its loops.
     ///
     /// The supervisor arrives from the daemon rather than being built here: the
     /// sessions the scheduler starts and the sessions the daemon stops on its
@@ -178,6 +195,11 @@ impl Coordinator {
         let (facts, reports) = ingest_channel();
         let stopping = Arc::new(AtomicBool::new(false));
 
+        // Steps 2 to 4, before anything is ticking or serving. Nothing else
+        // holds the core yet, so the pass reads and moves the same rows the
+        // loops are about to schedule against.
+        let reconciliation = reconcile_boot(&core, data_directory, settings)?;
+
         let loops = vec![
             admission_loop(
                 data_directory,
@@ -194,13 +216,55 @@ impl Coordinator {
             publisher_loop(data_directory, settings, feed, &stopping)?,
         ];
 
-        Ok(Self {
+        let coordinator = Self {
             core,
+            reconciliation,
             admissions,
             facts,
             stopping,
             loops,
-        })
+        };
+
+        // Step 6, after the loops are up: a run coming back is something a
+        // watcher sees happen rather than finds already done. Assembled first
+        // so that a resume which cannot be applied stops the loops it would
+        // otherwise leave ticking behind a composition that failed.
+        coordinator.resume_reconciled()
+    }
+
+    /// Step 6, through the same core the loops tick against.
+    fn resume_reconciled(mut self) -> Result<Self, CoordinatorError> {
+        let resumed = match self.core.lock() {
+            Ok(mut core) => reconcile::resume_interrupted(core.machines_mut(), now())
+                .map_err(|error| CoordinatorError::opening("boot reconciliation", error)),
+            Err(_) => Err(CoordinatorError::opening(
+                "the service core",
+                "it was left poisoned",
+            )),
+        };
+
+        match resumed {
+            Ok(resumed) => {
+                if !resumed.is_empty() {
+                    self.admissions.wake();
+                }
+
+                self.reconciliation.resumed = resumed;
+
+                Ok(self)
+            }
+            Err(error) => {
+                self.stop();
+
+                Err(error)
+            }
+        }
+    }
+
+    /// What the boot pass found and did, for a caller that reports it.
+    #[must_use]
+    pub const fn reconciliation(&self) -> &BootReconciliation {
+        &self.reconciliation
     }
 
     /// The one service core, for the facade the daemon serves.
@@ -230,9 +294,35 @@ impl Coordinator {
     }
 }
 
+/// Step 1: the database, its migrations, and its integrity.
+///
+/// Refusing here rather than starting is deliberate. Every later step writes
+/// transitions into this file, and a file that failed its own check is one the
+/// coordinator cannot reconcile against without making the damage worse.
 fn open_control_plane(data_directory: &Path) -> Result<ControlPlaneStore, CoordinatorError> {
-    ControlPlaneStore::open(data_directory)
-        .map_err(|error| CoordinatorError::opening("the control plane", error))
+    let store = ControlPlaneStore::open(data_directory)
+        .map_err(|error| CoordinatorError::opening("the control plane", error))?;
+
+    store
+        .verify_integrity()
+        .map_err(|error| CoordinatorError::opening("the control plane", error))?;
+
+    Ok(store)
+}
+
+/// Steps 2 to 4, through the one core the loops will tick against.
+fn reconcile_boot(
+    core: &Arc<Mutex<ApiCore>>,
+    data_directory: &Path,
+    settings: &CoordinatorSettings,
+) -> Result<BootReconciliation, CoordinatorError> {
+    let wheel = TimerWheel::new(settings.timers);
+    let mut core = core
+        .lock()
+        .map_err(|_| CoordinatorError::opening("the service core", "it was left poisoned"))?;
+
+    reconcile::reconcile_before_surface(core.machines_mut(), data_directory, &wheel, now())
+        .map_err(|error| CoordinatorError::opening("boot reconciliation", error))
 }
 
 /// Admission: a tick when a run enters the queue, and one on every heartbeat
