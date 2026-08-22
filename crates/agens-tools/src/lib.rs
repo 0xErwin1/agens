@@ -2450,6 +2450,47 @@ pub struct McpRegistry {
     discovery_cancellation: Arc<AtomicBool>,
 }
 
+/// A registry built once and kept for as long as the session that built it.
+///
+/// A registry used to be rebuilt for every prompt, which meant connecting to
+/// every configured server before the model could start, and killing every one
+/// of them when the turn ended. With several stdio servers configured that is
+/// the dominant cost of a turn and a fresh chance to fail once per prompt,
+/// none of which buys anything: the connections are identical each time.
+///
+/// The slot is filled on first use and shared by cloning, so the per-turn
+/// bootstrap clone reaches the same connections the session already has.
+/// Everything closes when the last holder drops it, which is the end of the
+/// session rather than the end of a turn.
+#[derive(Clone, Default)]
+pub struct SharedMcpRegistry {
+    slot: Arc<Mutex<Option<Arc<Mutex<McpRegistry>>>>>,
+}
+
+impl fmt::Debug for SharedMcpRegistry {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SharedMcpRegistry")
+    }
+}
+
+impl SharedMcpRegistry {
+    /// Returns this session's registry, building it with `build` the first
+    /// time it is asked for.
+    ///
+    /// `None` only when the slot's lock is poisoned, which the caller reports
+    /// as MCP being unavailable rather than silently connecting a second set
+    /// of servers nobody would ever close.
+    pub fn get_or_init(
+        &self,
+        build: impl FnOnce() -> McpRegistry,
+    ) -> Option<Arc<Mutex<McpRegistry>>> {
+        let mut slot = self.slot.lock().ok()?;
+        Some(Arc::clone(
+            slot.get_or_insert_with(|| Arc::new(Mutex::new(build()))),
+        ))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct McpServerDiagnostic {
     pub server_name: String,

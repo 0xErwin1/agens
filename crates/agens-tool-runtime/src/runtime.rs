@@ -295,10 +295,13 @@ fn production_tool_runtime_inner<R: TaskRunner>(
             working_directory,
         )?,
     )));
-    let mcp_registry = Arc::new(Mutex::new(load_configured_mcp_registry(
-        bootstrap,
-        project_root,
-    )));
+    // The session's own registry, built here only the first time a turn asks
+    // for it. Rebuilding it per prompt reconnected every configured server
+    // before the model could start and killed them all when the turn ended.
+    let mcp_registry = bootstrap
+        .mcp_registry
+        .get_or_init(|| load_configured_mcp_registry(bootstrap, project_root))
+        .ok_or_else(|| CliError::configuration("MCP tools are unavailable"))?;
     mcp_registry
         .lock()
         .map_err(|_| CliError::configuration("MCP tools are unavailable"))?
@@ -1568,6 +1571,98 @@ mod tests {
         assert_eq!(dispatcher.canonical_identity("native::task"), None);
         drop(dispatcher);
         std::fs::remove_dir_all(override_temporary).unwrap();
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    /// A tool runtime is rebuilt for every prompt. When each rebuild also
+    /// rebuilt the registry, every configured server was reconnected before
+    /// the model could start and killed again when the turn ended: pure churn,
+    /// a fresh chance to fail once per prompt, and up to a full connect budget
+    /// of stall per server. The connection counter is the assertion.
+    #[test]
+    fn a_second_turn_reuses_the_sessions_mcp_connections() {
+        let temporary = tui_session_directory("session-mcp-reuse");
+        let bootstrap = tui_session_bootstrap(&temporary, &[]);
+        let project_root = agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap);
+
+        let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let factory_connections = Arc::clone(&connections);
+        let mut registry = agens_tools::McpRegistry::new();
+        registry
+            .configure_server(
+                "engram",
+                move || {
+                    factory_connections.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    Ok(Box::new(ScriptedTransport {
+                        responses: std::cell::RefCell::new(
+                            [
+                                agens_tools::McpResponse::Initialized(
+                                    agens_tools::McpInitializeResult::new(
+                                        agens_tools::MCP_PROTOCOL_VERSION,
+                                        serde_json::json!({"tools": {}}),
+                                    ),
+                                ),
+                                agens_tools::McpResponse::ToolsListed(
+                                    agens_tools::McpToolsPage::new(
+                                        vec![agens_tools::McpToolDefinition {
+                                            name: "mem_save".into(),
+                                            description: Some("save".into()),
+                                            input_schema: serde_json::json!({"type": "object"}),
+                                            annotations: agens_tools::McpToolAnnotations {
+                                                read_only_hint: Some(false),
+                                            },
+                                        }],
+                                        None,
+                                    ),
+                                ),
+                            ]
+                            .into(),
+                        ),
+                    }) as Box<dyn agens_tools::McpTransport>)
+                },
+                agens_tools::McpTimeouts::new(
+                    std::time::Duration::from_millis(50),
+                    std::time::Duration::from_millis(50),
+                    std::time::Duration::from_millis(50),
+                )
+                .unwrap(),
+                agens_tools::McpLimits::new(8, 16).unwrap(),
+            )
+            .expect("the probe server must configure");
+        // Seeds the session slot, so the runtime finds this registry where it
+        // would otherwise load one from the configuration.
+        bootstrap
+            .mcp_registry
+            .get_or_init(|| registry)
+            .expect("the session registry slot must be available");
+
+        for turn in 1..=3 {
+            // A clone per turn, exactly as the TUI hands one to each prompt.
+            let turn_bootstrap = bootstrap.clone();
+            let (provider_tools, dispatcher) = production_tool_runtime_for_parent(
+                &turn_bootstrap,
+                &project_root,
+                Some(&SkillCatalog::default()),
+                "gpt-4.1".to_owned(),
+                agens_core::RequestConfig::default(),
+                None,
+            )
+            .unwrap();
+
+            assert!(
+                provider_tools
+                    .iter()
+                    .any(|tool| tool.name().contains("mem_save")),
+                "turn {turn} must still be offered the server's tool"
+            );
+            assert_eq!(
+                connections.load(std::sync::atomic::Ordering::Acquire),
+                1,
+                "turn {turn} must reuse the session's connection"
+            );
+            drop(dispatcher);
+        }
 
         std::fs::remove_dir_all(temporary).unwrap();
     }

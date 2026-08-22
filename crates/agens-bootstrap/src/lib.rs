@@ -20,7 +20,7 @@ use agens_config::{
     extract_permission_rules, mcp_servers_with_defaults, merge_toml_documents, parse_toml_document,
     resolve_paths, resolve_settings, validate_toml_document,
 };
-use agens_tools::{McpStatusHandle, McpStdioTransport, McpStdioTransportConfig};
+use agens_tools::{McpStatusHandle, McpStdioTransport, McpStdioTransportConfig, SharedMcpRegistry};
 
 use agens_error::CliError;
 
@@ -55,6 +55,14 @@ pub struct Bootstrap {
     /// (`/mcp`, the TUI notice, the headless stderr line) would have nothing
     /// to observe.
     pub mcp_status: McpStatusHandle,
+    /// The MCP connections this session holds, shared by every clone of this
+    /// bootstrap so a server connects once per session rather than once per
+    /// prompt.
+    ///
+    /// Empty until the first tool runtime asks for it. A process that
+    /// bootstraps freshly — one headless turn, one CLI command — gets its own
+    /// slot and behaves exactly as before.
+    pub mcp_registry: SharedMcpRegistry,
     pub permission_rules: Vec<ConfigPermissionRule>,
     /// Re-reads a project configuration document from an arbitrary path, the same way
     /// `bootstrap()` read this process's own project config, so [`session_config::SessionConfig`]
@@ -89,6 +97,7 @@ impl Clone for Bootstrap {
             project_root: self.project_root.clone(),
             mcp_servers: self.mcp_servers.clone(),
             mcp_status: self.mcp_status.clone(),
+            mcp_registry: self.mcp_registry.clone(),
             permission_rules: self.permission_rules.clone(),
             config_reader: Arc::clone(&self.config_reader),
         }
@@ -290,6 +299,7 @@ pub fn resolve(host: &HostEnvironment) -> Result<Bootstrap, CliError> {
         project_root,
         mcp_servers,
         mcp_status: McpStatusHandle::default(),
+        mcp_registry: SharedMcpRegistry::default(),
         permission_rules,
         config_reader: Arc::clone(&host.read_file),
         paths,

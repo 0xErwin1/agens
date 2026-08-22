@@ -74,6 +74,7 @@ crates/agens-tools/src/stdio_mcp.rs	let _ = self.terminate();	secondary_cleanup
 crates/agens-tools/src/stdio_mcp.rs	let _ = self.terminate();	secondary_cleanup
 crates/agens-tools/src/stdio_mcp.rs	let _ = self.terminate();	secondary_cleanup
 crates/agens-tools/src/stdio_mcp.rs	let _ = self.terminate();	secondary_cleanup
+crates/agens-tools/src/stdio_mcp.rs	let _ = self.terminate();	secondary_cleanup
 crates/agens-tools/src/stdio_mcp.rs	let _ = request.response.send(result);	closed_channel
 crates/agens-tools/src/stdio_mcp.rs	let _ = transport.terminate();	secondary_cleanup
 crates/agens-tools/src/stdio_mcp.rs	let _ = transport.terminate();	secondary_cleanup
