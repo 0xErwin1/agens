@@ -16,3 +16,9 @@ libc = "0.2"
 serde_json = "1.0.150"
 sha2 = "0.10"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "time"] }
+
+[dev-dependencies]
+# The ingest tests seed the session rows the evidence ledger's foreign keys
+# require, which no store API exposes because nothing but a live session
+# creates them.
+rusqlite = { version = "0.40", features = ["bundled"] }
