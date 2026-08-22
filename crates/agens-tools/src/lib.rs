@@ -1707,6 +1707,13 @@ pub trait SubagentRunner: Send + 'static {
     ) -> Result<SubagentTurnResult, SubagentRunnerError>;
 }
 
+/// Not wired into any production runtime; delegation runs through [`TaskTool`].
+///
+/// Kept because it is the only place the bounded-deadline subagent contract is
+/// written down, and its tests still hold that contract. Wiring it as it
+/// stands would leak a worker on every expiry: the deadline path abandons the
+/// worker while it still holds the runner behind a mutex. Fix that before
+/// giving it a runtime, or delete both it and its tests.
 pub struct SubagentTool<R> {
     catalog: SkillCatalog,
     runner: Arc<Mutex<R>>,

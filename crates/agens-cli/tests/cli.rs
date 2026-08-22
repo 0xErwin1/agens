@@ -1985,8 +1985,6 @@ fn explicit_task_model_selects_a_second_available_openai_model() {
             required_body_fragments: vec![
                 "\"model\":\"gpt-5.6-sol\"".into(),
                 "\"model\":{\"description\":\"Omit this.".into(),
-                "\"enum\":[\"gpt-4.1\"".into(),
-                "gpt-4.1".into(),
                 "parent chooses child model".into(),
             ],
             response: native_tool_call_response(
@@ -2108,7 +2106,7 @@ fn built_in_general_inherits_the_effective_chatgpt_parent_model_without_agent_fi
 }
 
 #[test]
-fn unavailable_explicit_child_model_is_diagnosed_once_without_a_child_provider_request() {
+fn unavailable_explicit_child_model_runs_on_the_parent_model_and_is_diagnosed_once() {
     let temporary = TemporaryDirectory::new("task-model-unavailable-diagnostic");
     let project_root = temporary.path().join("project");
     let config_home = temporary.path().join("config");
@@ -2121,11 +2119,21 @@ fn unavailable_explicit_child_model_is_diagnosed_once_without_a_child_provider_r
             response: native_tool_call_response(
                 "task-unavailable",
                 "task",
-                r#"{"agent":"explore","model":"gpt-4o","description":"must not run"}"#,
+                r#"{"agent":"explore","model":"gpt-4o","description":"runs on the parent model"}"#,
             ),
         },
         ScriptedOpenAiResponse {
-            required_body_fragments: vec!["task: requested model is unavailable".into()],
+            required_body_fragments: vec![
+                "\"model\":\"gpt-5.5\"".into(),
+                "runs on the parent model".into(),
+            ],
+            response: text_response("child ran anyway"),
+        },
+        ScriptedOpenAiResponse {
+            required_body_fragments: vec![
+                "warning: agent explore requested unavailable model gpt-4o; using gpt-5.5".into(),
+                "child ran anyway".into(),
+            ],
             response: text_response("parent recovered from unavailable child"),
         },
     ]);

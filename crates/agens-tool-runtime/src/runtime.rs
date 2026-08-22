@@ -702,7 +702,6 @@ mod tests {
     };
 
     use super::*;
-    use agens_agents::task_model_catalog;
     use agens_fixtures::{
         bootstrap_from_configuration, session_bootstrap as tui_session_bootstrap,
         session_bootstrap_for_provider as tui_session_bootstrap_for_provider,
@@ -1438,9 +1437,9 @@ mod tests {
             task.parameters()["properties"]["agent"]["enum"],
             serde_json::json!(["alpha", "explore", "general", "reviewer"])
         );
-        assert_eq!(
-            task.parameters()["properties"]["model"]["enum"],
-            serde_json::json!(task_model_catalog(&bootstrap).unwrap())
+        assert!(
+            task.parameters()["properties"]["model"]["enum"].is_null(),
+            "the bundled model catalog is a snapshot, so it must not be published as a closed set"
         );
         let task_schema = task.parameters().to_string();
         assert!(task_schema.contains("Explore the codebase without modifying files"));
@@ -1492,10 +1491,12 @@ mod tests {
         }
         let mut observed = calls.lock().unwrap().clone();
         observed.sort_by(|left, right| left.0.cmp(&right.0));
+        // The unnamed dispatch lands on `general`, not on `alpha`: an omitted
+        // agent means the general-purpose one, never whichever name sorts first.
         assert_eq!(
             observed,
             vec![
-                ("alpha".to_owned(), TaskLaunchMode::Foreground),
+                ("general".to_owned(), TaskLaunchMode::Foreground),
                 ("reviewer".to_owned(), TaskLaunchMode::Background),
             ]
         );
@@ -1520,15 +1521,7 @@ mod tests {
                 task.parameters()["properties"]["agent"]["enum"],
                 serde_json::json!(["explore", "general"])
             );
-            assert_eq!(
-                task.parameters()["properties"]["model"]["enum"],
-                serde_json::json!(task_model_catalog(&bootstrap).unwrap())
-            );
-            assert!(
-                task.parameters()["properties"]["model"]["enum"]
-                    .as_array()
-                    .is_some_and(|models| !models.is_empty() && models.len() <= 256)
-            );
+            assert!(task.parameters()["properties"]["model"]["enum"].is_null());
             assert!(
                 dispatcher
                     .lock()

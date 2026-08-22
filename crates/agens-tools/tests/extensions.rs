@@ -652,7 +652,9 @@ fn task_dispatch_resolves_only_subagents_and_validated_requested_configuration()
             serde_json::json!({"agent":"worker","model":"unavailable","description":"reject model"}),
         )
         .unwrap(),
-        ToolOutput::failure("task: requested model is unavailable")
+        ToolOutput::success(
+            "warning: agent worker requested unavailable model unavailable; using parent-model\nworker:worker agent:parent-model:allowed:reject model"
+        )
     );
     assert_eq!(
         task.execute(
@@ -670,7 +672,7 @@ fn task_dispatch_resolves_only_subagents_and_validated_requested_configuration()
     );
     assert_eq!(
         TaskTool::<RecordingTaskRunner>::input_schema(),
-        serde_json::json!({"type":"object","additionalProperties":false,"required":["description"],"properties":{"agent":{"type":"string","minLength":1,"maxLength":64},"background":{"type":"boolean"},"description":{"type":"string","minLength":1,"maxLength":16384},"model":{"type":"string","minLength":1,"maxLength":64,"description":"Omit this. The agent's configured profile then decides the model, falling back to this thread's model. Send it only when the user explicitly asked for a specific model for this call: an explicit value overrides the configured profile."},"skills":{"type":"array","maxItems":128,"uniqueItems":true,"items":{"type":"string","minLength":1,"maxLength":64}}}})
+        serde_json::json!({"type":"object","additionalProperties":false,"required":["description"],"properties":{"agent":{"type":"string","minLength":1,"maxLength":64},"background":{"type":"boolean","description":"Run this call in the background and return immediately. Only background calls run concurrently: several foreground calls issued together are executed one after another."},"description":{"type":"string","minLength":1,"maxLength":16384},"model":{"type":"string","minLength":1,"maxLength":64,"description":"Omit this. The agent's configured profile then decides the model, falling back to this thread's model. Send it only when the user explicitly asked for a specific model for this call: an explicit value overrides the configured profile. A model this run cannot reach falls back to this thread's model and says so."},"skills":{"type":"array","maxItems":128,"uniqueItems":true,"items":{"type":"string","minLength":1,"maxLength":64}}}})
     );
     assert_eq!(
         task.catalog_input_schema()["properties"]["agent"]["enum"],
@@ -705,11 +707,6 @@ fn task_inherits_parent_model_and_effort_but_validates_explicit_overrides() {
         SkillCatalog::default(),
         "parent-model",
         parent_config,
-        vec![
-            "worker-model".to_owned(),
-            "parent-model".to_owned(),
-            "override-model".to_owned(),
-        ],
         TaskModels,
         CapturingTaskRunner(Arc::clone(&calls)),
     );
@@ -741,9 +738,9 @@ fn task_inherits_parent_model_and_effort_but_validates_explicit_overrides() {
             ("worker-model".to_owned(), Some(ReasoningEffort::Low)),
         ]
     );
-    assert_eq!(
-        task.catalog_input_schema()["properties"]["model"]["enum"],
-        serde_json::json!(["override-model", "parent-model", "worker-model"])
+    assert!(
+        task.catalog_input_schema()["properties"]["model"]["enum"].is_null(),
+        "the bundled catalog is a snapshot, so it must not be published as a closed set"
     );
     assert!(
         task.catalog_input_schema()["properties"]["model"]["description"]
@@ -832,11 +829,6 @@ fn task_tool_with_configured_worker_model(
         SkillCatalog::default(),
         "parent-model",
         RequestConfig::default(),
-        vec![
-            "override-model".to_owned(),
-            "parent-model".to_owned(),
-            "worker-model".to_owned(),
-        ],
         TaskModels,
         CapturingTaskRunner(calls),
     )
@@ -865,7 +857,6 @@ fn unavailable_agent_model_degrades_to_the_parent_and_records_a_diagnostic() {
         SkillCatalog::default(),
         "parent-model",
         RequestConfig::with_reasoning_effort("high").unwrap(),
-        vec!["parent-model".to_owned(), "worker-model".to_owned()],
         TaskModels,
         CapturingTaskRunner(Arc::clone(&calls)),
     )
@@ -902,43 +893,182 @@ fn unavailable_agent_model_degrades_to_the_parent_and_records_a_diagnostic() {
 }
 
 #[test]
-fn task_schema_bounds_and_sanitizes_the_effective_model_catalog() {
+fn an_oversized_result_is_truncated_with_a_visible_marker_rather_than_discarded() {
+    let mut task = task_tool(OversizedTaskRunner);
+
+    let output = task.execute(&task_context(), task_arguments()).unwrap();
+
+    assert!(
+        !output.is_error,
+        "a subagent that finished its work must not be reported as a failure"
+    );
+    assert!(output.content.starts_with(&"x".repeat(65_536)));
+    assert_eq!(
+        output.content.chars().count(),
+        65_536 + TRUNCATION_MARKER.chars().count()
+    );
+    assert!(output.content.ends_with(TRUNCATION_MARKER));
+}
+
+#[test]
+fn a_result_at_the_output_limit_carries_no_truncation_marker() {
+    let mut task = task_tool(SizedTaskRunner(65_536));
+
+    let output = task.execute(&task_context(), task_arguments()).unwrap();
+
+    assert_eq!(output, ToolOutput::success("x".repeat(65_536)));
+}
+
+#[test]
+fn a_rejected_model_is_retried_once_on_the_parent_model() {
     let temporary = TemporaryDirectory::new();
     let agents = temporary.path.join("agents");
-    let missing = temporary.path.join("missing");
     fs::create_dir_all(&agents).unwrap();
     write_agent(&agents, "worker", "worker agent", "subagent");
-    let agents = AgentCatalog::discover(&[], &agents, &missing)
+    let agents = AgentCatalog::discover(&[], &agents, &temporary.path.join("missing"))
         .unwrap()
         .catalog()
-        .clone();
-    let mut models = (0..300)
-        .map(|index| format!("model-{index:03}"))
-        .collect::<Vec<_>>();
-    models.extend([
-        "model-001".to_owned(),
-        "unsafe model".to_owned(),
-        "token=PRIVATE_MODEL_SENTINEL".to_owned(),
-        "x".repeat(65),
-    ]);
-    let task = TaskTool::from_catalogs_with_parent_config(
+        .map_agents(|agent| {
+            let mut agent = agent.clone();
+            agent.model = Some("worker-model".to_owned());
+            agent.model_source = Some(AgentModelSource::ConfiguredProfile);
+            agent
+        });
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let mut task = TaskTool::from_catalogs_with_parent_config(
         agents,
         SkillCatalog::default(),
         "parent-model",
         RequestConfig::default(),
-        models,
         TaskModels,
-        CountingTaskRunner(Arc::new(AtomicUsize::new(0))),
+        RejectingTaskRunner {
+            rejected: "worker-model".into(),
+            calls: Arc::clone(&calls),
+        },
     );
 
-    let schema = task.catalog_input_schema();
-    let model_enum = schema["properties"]["model"]["enum"]
-        .as_array()
-        .expect("model catalog should be an enum");
-    assert_eq!(model_enum.len(), 256);
-    assert_eq!(model_enum[0], "model-000");
-    assert_eq!(model_enum[255], "model-255");
-    assert!(!schema.to_string().contains("PRIVATE_MODEL_SENTINEL"));
+    let output = task
+        .execute(
+            &task_context(),
+            serde_json::json!({"agent":"worker","description":"retry"}),
+        )
+        .unwrap();
+
+    assert!(!output.is_error);
+    assert_eq!(
+        output.content,
+        "warning: the provider rejected model worker-model for agent worker; this result came from parent-model\nretried"
+    );
+    assert_eq!(
+        *calls.lock().unwrap(),
+        vec!["worker-model".to_owned(), "parent-model".to_owned()]
+    );
+}
+
+#[test]
+fn a_rejection_on_the_parent_model_itself_is_not_retried() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let mut task = task_tool(RejectingTaskRunner {
+        rejected: "parent-model".into(),
+        calls: Arc::clone(&calls),
+    });
+
+    let output = task.execute(&task_context(), task_arguments()).unwrap();
+
+    assert_eq!(
+        output,
+        ToolOutput::failure("task: provider failure [cause: request rejected]")
+    );
+    assert_eq!(*calls.lock().unwrap(), vec!["parent-model".to_owned()]);
+}
+
+#[test]
+fn an_explicit_model_this_run_cannot_reach_falls_back_instead_of_failing() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let mut task = task_tool(CapturingTaskRunner(Arc::clone(&calls)));
+
+    let output = task
+        .execute(
+            &task_context(),
+            serde_json::json!({"description":"explicit","model":"withdrawn-model"}),
+        )
+        .unwrap();
+
+    assert!(!output.is_error);
+    assert_eq!(
+        output.content,
+        "warning: agent worker requested unavailable model withdrawn-model; using parent-model\ncaptured"
+    );
+    assert_eq!(
+        calls
+            .lock()
+            .unwrap()
+            .first()
+            .map(|(model, _)| model.clone()),
+        Some("parent-model".to_owned())
+    );
+}
+
+#[test]
+fn a_task_naming_no_agent_runs_the_general_subagent_not_the_alphabetically_first_one() {
+    let temporary = TemporaryDirectory::new();
+    let agents = temporary.path.join("agents");
+    fs::create_dir_all(&agents).unwrap();
+    write_agent(&agents, "explore", "read-only exploration", "subagent");
+    write_agent(&agents, "general", "general delegated work", "subagent");
+    let agents = AgentCatalog::discover(&[], &agents, &temporary.path.join("missing"))
+        .unwrap()
+        .catalog()
+        .clone();
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let mut task = TaskTool::from_catalogs_with_parent_config(
+        agents,
+        SkillCatalog::default(),
+        "parent-model",
+        RequestConfig::default(),
+        TaskModels,
+        AgentNamingTaskRunner(Arc::clone(&observed)),
+    );
+
+    assert!(
+        !task
+            .execute(&task_context(), task_arguments())
+            .unwrap()
+            .is_error
+    );
+
+    assert_eq!(*observed.lock().unwrap(), vec!["general".to_owned()]);
+}
+
+#[test]
+fn a_task_naming_no_agent_falls_back_to_the_first_subagent_when_no_general_one_exists() {
+    let temporary = TemporaryDirectory::new();
+    let agents = temporary.path.join("agents");
+    fs::create_dir_all(&agents).unwrap();
+    write_agent(&agents, "explore", "read-only exploration", "subagent");
+    write_agent(&agents, "zeta", "last by name", "subagent");
+    let agents = AgentCatalog::discover(&[], &agents, &temporary.path.join("missing"))
+        .unwrap()
+        .catalog()
+        .clone();
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let mut task = TaskTool::from_catalogs_with_parent_config(
+        agents,
+        SkillCatalog::default(),
+        "parent-model",
+        RequestConfig::default(),
+        TaskModels,
+        AgentNamingTaskRunner(Arc::clone(&observed)),
+    );
+
+    assert!(
+        !task
+            .execute(&task_context(), task_arguments())
+            .unwrap()
+            .is_error
+    );
+
+    assert_eq!(*observed.lock().unwrap(), vec!["explore".to_owned()]);
 }
 
 #[test]
@@ -1046,10 +1176,6 @@ fn task_dispatcher_preserves_late_validation_errors_without_running_the_child() 
 
     for (arguments, expected) in [
         (
-            serde_json::json!({"agent":"worker","model":"unavailable","description":"reject model"}),
-            "task: requested model is unavailable",
-        ),
-        (
             serde_json::json!({"agent":"worker","skills":["unavailable"],"description":"reject disallowed skill"}),
             "task: requested skill is unavailable [skill: unavailable; not declared by the agent]",
         ),
@@ -1129,10 +1255,13 @@ fn task_rejects_an_oversized_unicode_result() {
         )
         .unwrap();
 
+    assert!(!output.is_error);
     assert_eq!(
-        output,
-        ToolOutput::failure("task: output exceeds configured bounds")
+        output.content.chars().count(),
+        65_536 + TRUNCATION_MARKER.chars().count(),
+        "the budget counts unicode scalars, not the bytes they encode to"
     );
+    assert!(output.content.ends_with(TRUNCATION_MARKER));
 }
 
 #[test]
@@ -2414,6 +2543,63 @@ impl TaskRunner for CapturingTaskRunner {
         ));
         Ok(TaskTurnResult {
             output: "captured".into(),
+        })
+    }
+}
+
+const TRUNCATION_MARKER: &str =
+    "\n[truncated: only the first 65536 characters of this subagent result were returned]";
+
+struct SizedTaskRunner(usize);
+
+impl TaskRunner for SizedTaskRunner {
+    fn run(
+        &self,
+        _: TaskTurnRequest,
+        _: &TaskRunContext,
+    ) -> Result<TaskTurnResult, TaskRunnerError> {
+        Ok(TaskTurnResult {
+            output: "x".repeat(self.0),
+        })
+    }
+}
+
+/// Refuses exactly one model identifier the way a provider refuses one it no
+/// longer serves, and records every model it was asked to run.
+struct RejectingTaskRunner {
+    rejected: String,
+    calls: Arc<Mutex<Vec<String>>>,
+}
+
+impl TaskRunner for RejectingTaskRunner {
+    fn run(
+        &self,
+        request: TaskTurnRequest,
+        _: &TaskRunContext,
+    ) -> Result<TaskTurnResult, TaskRunnerError> {
+        self.calls.lock().unwrap().push(request.model().to_owned());
+        if request.model() == self.rejected {
+            return Err(TaskRunnerError::ProviderFailure(
+                agens_tools::TaskProviderFailure::Rejected,
+            ));
+        }
+        Ok(TaskTurnResult {
+            output: "retried".into(),
+        })
+    }
+}
+
+struct AgentNamingTaskRunner(Arc<Mutex<Vec<String>>>);
+
+impl TaskRunner for AgentNamingTaskRunner {
+    fn run(
+        &self,
+        request: TaskTurnRequest,
+        _: &TaskRunContext,
+    ) -> Result<TaskTurnResult, TaskRunnerError> {
+        self.0.lock().unwrap().push(request.agent_name().to_owned());
+        Ok(TaskTurnResult {
+            output: "done".into(),
         })
     }
 }
