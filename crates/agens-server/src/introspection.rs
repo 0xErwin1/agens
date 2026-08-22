@@ -28,11 +28,46 @@ use agens_store::{
 
 use crate::api::ApiCore;
 use crate::fsm::{Principal, RunFacts, RunTrigger, TransitionRejection};
-use crate::ingest::CheckpointClaim;
+use crate::ingest::{
+    Attribution, CheckpointClaim, FactSender, IngestFact, ReportedCheckpoint, ReportedFact,
+};
 use crate::timers::CHECKPOINT_EVENT;
 
 /// Reads the current time as epoch seconds.
 pub type Clock = Arc<dyn Fn() -> i64 + Send + Sync>;
+
+/// Resolves the physical execution the reports are coming from.
+///
+/// A function rather than a value because the surface is built before the turn
+/// opens its session attempt: the tool runtime is constructed first, and the
+/// row the reports have to name does not exist until the turn begins. `None`
+/// means the correlation is not established, which is the one case where a
+/// report has nothing to be attributed to.
+pub type AttemptResolver = Arc<dyn Fn() -> Option<Attribution> + Send + Sync>;
+
+/// Where a checkpoint goes after the journal: the ingest channel, and the
+/// identity the fact travels under.
+///
+/// Optional on the surface because the checkpoint tool is also exercised
+/// without a coordinator behind it. What it changes is not what is written but
+/// what is derived: without it a checkpoint reaches the journal and the
+/// evidence, and run health never hears that the worker said anything.
+#[derive(Clone)]
+pub struct CheckpointReporting {
+    facts: FactSender,
+    attempt: AttemptResolver,
+}
+
+impl CheckpointReporting {
+    #[must_use]
+    pub const fn new(facts: FactSender, attempt: AttemptResolver) -> Self {
+        Self { facts, attempt }
+    }
+
+    fn attribution(&self) -> Option<Attribution> {
+        (self.attempt)()
+    }
+}
 
 /// One run's introspection surface, bound to the attempt that is executing it.
 ///
@@ -50,6 +85,7 @@ pub struct RunIntrospection {
     session_id: Option<i64>,
     session_attempt_id: Option<i64>,
     clock: Clock,
+    reporting: Option<CheckpointReporting>,
 }
 
 impl RunIntrospection {
@@ -61,7 +97,15 @@ impl RunIntrospection {
             session_id: None,
             session_attempt_id: None,
             clock,
+            reporting: None,
         }
+    }
+
+    /// Sends every checkpoint on to ingest as well as to the journal.
+    #[must_use]
+    pub fn reporting_to(mut self, reporting: CheckpointReporting) -> Self {
+        self.reporting = Some(reporting);
+        self
     }
 
     /// Names the physical execution the reports come from.
@@ -80,7 +124,12 @@ impl RunIntrospection {
         (self.clock)()
     }
 
-    fn checkpoint_event(&self, checkpoint: &Checkpoint, now: i64) -> EventRow {
+    fn checkpoint_event(
+        &self,
+        checkpoint: &Checkpoint,
+        session_attempt_id: Option<i64>,
+        now: i64,
+    ) -> EventRow {
         EventRow {
             id: None,
             run_id: Some(self.run_id),
@@ -88,7 +137,9 @@ impl RunIntrospection {
             // A checkpoint is the worker describing its own work, which is what
             // separates the agent class from the machinery around it.
             class: EventClass::Agent,
-            payload: self.checkpoint_payload(checkpoint).to_string(),
+            payload: self
+                .checkpoint_payload(checkpoint, session_attempt_id)
+                .to_string(),
             ts: now,
         }
     }
@@ -102,13 +153,17 @@ impl RunIntrospection {
     /// The worker's self-declared deadline is written as `promised_at`, which
     /// is the name the timer wheel reads it under: a checkpoint whose deadline
     /// the wheel cannot find declares no deadline at all.
-    fn checkpoint_payload(&self, checkpoint: &Checkpoint) -> serde_json::Value {
+    fn checkpoint_payload(
+        &self,
+        checkpoint: &Checkpoint,
+        session_attempt_id: Option<i64>,
+    ) -> serde_json::Value {
         let claims: Vec<serde_json::Value> = checkpoint.claims().iter().map(claim_json).collect();
 
         serde_json::json!({
             "attempt": {
                 "session_id": self.session_id,
-                "session_attempt_id": self.session_attempt_id,
+                "session_attempt_id": session_attempt_id,
             },
             "next_goal": checkpoint.next_goal(),
             "hypothesis": checkpoint.hypothesis(),
@@ -197,7 +252,18 @@ impl RunIntrospectionPort for RunIntrospection {
         checkpoint: &Checkpoint,
     ) -> Result<CheckpointReceipt, RunIntrospectionError> {
         let now = self.now();
-        let event = self.checkpoint_event(checkpoint, now);
+        // Resolved before the write so the journal entry and the fact name the
+        // same physical execution: an entry attributed to one attempt and a
+        // health signal attributed to another describe two different runs.
+        let attribution = self
+            .reporting
+            .as_ref()
+            .and_then(CheckpointReporting::attribution);
+        let session_attempt_id = self
+            .session_attempt_id
+            .or_else(|| attribution.map(|attempt| attempt.attempt_id));
+
+        let event = self.checkpoint_event(checkpoint, session_attempt_id, now);
         let findings = self.finding_rows(checkpoint, now);
 
         let write = self
@@ -205,6 +271,20 @@ impl RunIntrospectionPort for RunIntrospection {
             .machines_mut()
             .record_checkpoint(&event, &findings)
             .map_err(refused)?;
+
+        // A checkpoint that reached the journal happened, whatever ingest makes
+        // of the fact. A queue with no reader is the daemon shutting down, and
+        // failing the worker's tool call over it would turn an orderly stop
+        // into a failed attempt.
+        if let (Some(reporting), Some(attribution)) = (self.reporting.as_ref(), attribution) {
+            let _ = reporting.facts.report(ReportedFact {
+                run_id: self.run_id,
+                attempt_id: attribution.attempt_id,
+                turn: attribution.turn,
+                now,
+                fact: IngestFact::Checkpoint(reported_checkpoint(checkpoint)),
+            });
+        }
 
         Ok(CheckpointReceipt {
             checkpoint_event_id: write.checkpoint_id,
@@ -269,6 +349,25 @@ impl CheckpointClaim for EvidenceClaim {
     fn claims_progress(&self) -> bool {
         self.disposition() == agens_core::run_introspection::CausalDisposition::CandidateCaused
     }
+}
+
+/// The one claim that carries the checkpoint, as ingest reads it.
+///
+/// Health folds a checkpoint as a single claim, so a checkpoint with several
+/// is reduced to the one that decides the outcome: the first that credits
+/// progress, and otherwise the first there is. A checkpoint with no claim at
+/// all is still a checkpoint — it marks the run as having reported, and it
+/// credits nothing.
+fn reported_checkpoint(checkpoint: &Checkpoint) -> ReportedCheckpoint {
+    checkpoint
+        .claims()
+        .iter()
+        .find(|claim| claim.credits_progress())
+        .or_else(|| checkpoint.claims().first())
+        .map_or(
+            ReportedCheckpoint::new(EvidenceClass::Insufficient, false),
+            ReportedCheckpoint::from_claim,
+        )
 }
 
 fn refused(rejection: TransitionRejection) -> RunIntrospectionError {

@@ -35,6 +35,7 @@ mod tui_tests;
 #[cfg(test)]
 mod turns_tests;
 mod worker;
+mod worker_facts;
 #[cfg(test)]
 mod worker_tests;
 

@@ -46,11 +46,13 @@ use agens_headless::{
 };
 use agens_permissions::{PermissionPromptAnswer, PermissionPromptContext, PermissionPrompter};
 use agens_server::{
-    ApiCore, LaunchError, Principal, RunFacts, RunIntrospection, RunLaunch, RunSession, RunTrigger,
-    RunWorkerFactory, SessionAdmission, SessionBudget, SessionId, SessionOutcome, SessionProvider,
-    SessionRuntime,
+    ApiCore, FactSender, LaunchError, Principal, RunFacts, RunIntrospection, RunLaunch, RunSession,
+    RunTrigger, RunWorkerFactory, SessionAdmission, SessionBudget, SessionId, SessionOutcome,
+    SessionProvider, SessionRuntime,
 };
 use agens_store::{ControlPlaneStore, RunRow, RunState, SessionStore};
+
+use crate::worker_facts::WorkerFacts;
 
 /// How long the work waits for the admission transition that started it.
 ///
@@ -88,6 +90,8 @@ fn build_session(bootstrap: &Bootstrap, launch: &RunLaunch<'_>) -> Result<RunSes
         worktree,
         session,
         model: model.clone(),
+        facts: launch.facts.clone(),
+        data_directory: launch.data_directory.clone(),
     };
     let core = Arc::clone(&launch.core);
 
@@ -102,8 +106,8 @@ fn build_session(bootstrap: &Bootstrap, launch: &RunLaunch<'_>) -> Result<RunSes
         work,
         // The physical execution row is opened by the turn itself, from inside
         // the session, so the attempt the transition writes cannot name it yet.
-        // Correlating the two is what ingest attribution needs and is its own
-        // piece of work.
+        // The join is written from the turn instead, the first time it reports
+        // anything: see [`WorkerFacts`].
         session_attempt_id: None,
     })
 }
@@ -121,6 +125,10 @@ struct ExecutingRun {
     /// turn so that the attempt the admission transition wrote can name it.
     session: SessionMetadata,
     model: String,
+    /// Where this turn's facts are reported, which is the only path its
+    /// evidence has into run health.
+    facts: FactSender,
+    data_directory: PathBuf,
 }
 
 /// The provider client the registry lists this session under.
@@ -250,19 +258,27 @@ fn execute(
         );
     }
 
-    let introspection = introspection_factory(core, run);
+    let reported = WorkerFacts::new(
+        core,
+        run.facts.clone(),
+        run.run_id,
+        &run.session,
+        run.data_directory.clone(),
+    );
+    let introspection = introspection_factory(core, run, &reported);
     let request = match request_for(bootstrap, run) {
         Ok(request) => request,
         Err(_) => return SessionOutcome::Failed,
     };
 
+    let progress = reported.progress_sink();
     let completion = run_production_headless_chat_executing_run(
         request,
         bootstrap,
         runtime.cancellation(),
-        None,
+        Some(&progress),
         Box::new(UnattendedPrompter {
-            introspection: introspection_factory(core, run),
+            introspection: introspection_factory(core, run, &reported),
         }),
         None,
         None,
@@ -272,6 +288,12 @@ fn execute(
             worktree: run.worktree.clone(),
         }),
     );
+
+    // Reported for a turn that failed as well as for one that worked: a turn
+    // that spent tokens and moved nothing is exactly the shape the lost-worker
+    // detector counts, and a failure that reported no ending would leave the
+    // run looking like it is still thinking.
+    reported.report_turn_ended();
 
     match completion {
         Ok(completion) => finish(core, run.run_id, &completion.text),
@@ -361,15 +383,20 @@ fn report(
 fn introspection_factory(
     core: &Arc<Mutex<ApiCore>>,
     run: &ExecutingRun,
+    reported: &Arc<WorkerFacts>,
 ) -> agens_tool_runtime::runtime::RunIntrospectionFactory {
     let core = Arc::clone(core);
     let run_id = run.run_id;
     let session = run.session.id;
+    // The tool runtime is built before the turn opens its physical attempt, so
+    // the port carries a way to resolve it rather than the id itself.
+    let reporting = reported.checkpoint_reporting();
 
     Arc::new(move || {
         Box::new(
             RunIntrospection::new(Arc::clone(&core), run_id, Arc::new(now))
-                .for_attempt(Some(session), None),
+                .for_attempt(Some(session), None)
+                .reporting_to(reporting.clone()),
         )
     })
 }
