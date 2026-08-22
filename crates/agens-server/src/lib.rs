@@ -7,6 +7,7 @@
 
 mod api;
 mod blocking;
+mod coordinator;
 mod fsm;
 mod gates;
 pub mod grpc;
@@ -34,6 +35,9 @@ pub use api::{
     praetor_may_answer,
 };
 pub use blocking::{BlockingBoundary, BlockingError};
+pub use coordinator::{
+    Coordinator, CoordinatorError, CoordinatorSettings, RunLaunch, RunWorkerFactory, unwired_worker,
+};
 pub use fsm::{
     AppliedQuestionTransition, AppliedRunTransition, AppliedTransition, AppliedWorktreeTransition,
     Principal, QUESTION_TRANSITIONS, QuestionEffect, QuestionFacts, QuestionGuard,
@@ -161,7 +165,7 @@ impl Daemon {
     /// built its own would be a second one.
     pub fn serve_until_shutdown(
         self,
-        core: ApiCore,
+        core: Arc<Mutex<ApiCore>>,
         localhost_port: Option<u16>,
         shutdown: &HeadlessTurnCancellation,
     ) -> Result<SessionShutdown, ServerError> {
@@ -180,7 +184,6 @@ impl Daemon {
                 .map_err(|_| ServerError::Unavailable("loopback is unavailable"))?;
         }
 
-        let core = Arc::new(Mutex::new(core));
         let blocking = BlockingBoundary::new(runtime.handle().clone());
 
         let report = runtime.block_on(async {
@@ -239,6 +242,36 @@ pub fn run_until_shutdown(
     shutdown: &HeadlessTurnCancellation,
 ) -> Result<SessionShutdown, ServerError> {
     Ok(Daemon::start(data_directory)?.run_until_shutdown(shutdown))
+}
+
+/// Takes the machine's daemon slot, composes the coordinator over its data
+/// directory and serves the clients' facade until asked to stop.
+///
+/// This is the whole of what a command surface has to do to run a daemon: the
+/// pieces it is made of, and the order they are given each other in, belong to
+/// the composition root rather than to the caller.
+pub fn serve_until_shutdown(
+    data_directory: &Path,
+    settings: &CoordinatorSettings,
+    worker: RunWorkerFactory,
+    localhost_port: Option<u16>,
+    shutdown: &HeadlessTurnCancellation,
+) -> Result<SessionShutdown, ServerError> {
+    let daemon = Daemon::start(data_directory)?;
+
+    // The supervisor is the daemon's, so the sessions the scheduler starts are
+    // the ones the daemon stops on its way out.
+    let coordinator =
+        Coordinator::start(data_directory, settings, daemon.sessions().clone(), worker)
+            .map_err(|_| ServerError::Unavailable("the coordinator is unavailable"))?;
+
+    let report = daemon.serve_until_shutdown(coordinator.core(), localhost_port, shutdown);
+
+    // After the facade has stopped: nothing is admitting, ticking or publishing
+    // against a core the sessions behind it have already been stopped.
+    coordinator.stop();
+
+    report
 }
 
 /// The daemon has no admission surface of its own yet, so it parks on the shared

@@ -933,7 +933,7 @@ fn the_daemon_serves_the_facade_on_its_socket_and_on_loopback() {
     });
 
     let report = daemon
-        .serve_until_shutdown(core, Some(address.port()), &shutdown)
+        .serve_until_shutdown(Arc::new(Mutex::new(core)), Some(address.port()), &shutdown)
         .unwrap();
 
     assert!(report.is_clean());
