@@ -209,7 +209,6 @@ fn saves_then_freshly_resolves_and_delegates_the_profile_model() {
         SkillCatalog::default(),
         "session-model",
         RequestConfig::with_reasoning_effort_value(ReasoningEffort::High),
-        vec!["session-model".to_owned(), "worker-model".to_owned()],
         AnyModel,
         CapturingRunner(Arc::clone(&calls)),
     );
@@ -282,7 +281,6 @@ fn fixing_an_unavailable_stored_profile_removes_the_fallback_warning() {
             SkillCatalog::default(),
             "session-model",
             RequestConfig::with_reasoning_effort_value(ReasoningEffort::High),
-            vec!["session-model".to_owned(), "worker-model".to_owned()],
             TaskModelValidator::new(&["session-model".to_owned(), "worker-model".to_owned()]),
             CapturingRunner(Arc::clone(&calls)),
         )

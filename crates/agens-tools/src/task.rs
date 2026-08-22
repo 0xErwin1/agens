@@ -20,6 +20,8 @@ use crate::{
     ToolExecutionContext, ToolOutput, install_subagent_panic_hook,
 };
 
+/// The built-in subagent a `task` call runs as when it names none.
+const DEFAULT_TASK_AGENT: &str = "general";
 const MAX_TASK_DESCRIPTION_CHARS: usize = 16_384;
 const MAX_TASK_MODEL_CHARS: usize = 64;
 const MAX_TASK_SKILLS: usize = 128;
@@ -28,7 +30,6 @@ const DEFAULT_TASK_CHECK_INTERVAL: usize = 32;
 const MAX_TASK_OUTPUT_CHARS: usize = 65_536;
 const MAX_TASK_CONCURRENCY: usize = 4;
 const MAX_TASK_AGENT_SCHEMA_DESCRIPTION_CHARS: usize = 160;
-const MAX_TASK_MODEL_SCHEMA_ENTRIES: usize = 256;
 const TASK_RESULT_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const MAX_TASK_MESSAGES_PER_TARGET: usize = 32;
 const MAX_TASK_MESSAGE_BYTES: usize = 8 * 1024;
@@ -887,6 +888,12 @@ pub struct TaskTurnRequest {
     description: String,
     model_notice: Option<String>,
     permission_rules: Vec<PermissionRule>,
+    /// Whether `model` is this thread's own. Answered where the model is
+    /// resolved rather than by comparing identifiers later: the parent's model
+    /// and an agent's can be the same model spelled two ways, and a retry onto
+    /// a model the request already runs costs a whole child turn to change
+    /// nothing.
+    on_parent_model: bool,
 }
 
 impl TaskTurnRequest {
@@ -1100,7 +1107,6 @@ pub struct TaskTool<R> {
     skills: SkillCatalog,
     parent_model: String,
     parent_request_config: RequestConfig,
-    available_models: Vec<String>,
     model_validator: Arc<dyn AgentModelValidator + Send + Sync>,
     model_resolution_diagnostics: Option<ModelResolutionDiagnostics>,
     runner: Arc<R>,
@@ -1114,7 +1120,6 @@ impl<R> Clone for TaskTool<R> {
             skills: self.skills.clone(),
             parent_model: self.parent_model.clone(),
             parent_request_config: self.parent_request_config.clone(),
-            available_models: self.available_models.clone(),
             model_validator: Arc::clone(&self.model_validator),
             model_resolution_diagnostics: self.model_resolution_diagnostics.clone(),
             runner: Arc::clone(&self.runner),
@@ -1136,7 +1141,6 @@ impl<R: TaskRunner> TaskTool<R> {
             skills,
             parent_model,
             RequestConfig::default(),
-            Vec::new(),
             model_validator,
             runner,
         )
@@ -1147,24 +1151,15 @@ impl<R: TaskRunner> TaskTool<R> {
         skills: SkillCatalog,
         parent_model: impl Into<String>,
         parent_request_config: RequestConfig,
-        available_models: Vec<String>,
         model_validator: impl AgentModelValidator + Send + Sync + 'static,
         runner: R,
     ) -> Self {
-        let mut available_models = available_models
-            .into_iter()
-            .filter(|model| is_safe_model_identifier(model))
-            .collect::<Vec<_>>();
-        available_models.sort();
-        available_models.dedup();
-        available_models.truncate(MAX_TASK_MODEL_SCHEMA_ENTRIES);
         let registry = runner.execution_registry().unwrap_or_default();
         Self {
             agents,
             skills,
             parent_model: parent_model.into(),
             parent_request_config,
-            available_models,
             model_validator: Arc::new(model_validator),
             model_resolution_diagnostics: None,
             runner: Arc::new(runner),
@@ -1190,7 +1185,7 @@ impl<R: TaskRunner> TaskTool<R> {
     }
 
     pub fn input_schema() -> Value {
-        serde_json::json!({"type":"object","additionalProperties":false,"required":["description"],"properties":{"agent":{"type":"string","minLength":1,"maxLength":64},"background":{"type":"boolean"},"description":{"type":"string","minLength":1,"maxLength":16384},"model":{"type":"string","minLength":1,"maxLength":64,"description":"Omit this. The agent's configured profile then decides the model, falling back to this thread's model. Send it only when the user explicitly asked for a specific model for this call: an explicit value overrides the configured profile."},"skills":{"type":"array","maxItems":128,"uniqueItems":true,"items":{"type":"string","minLength":1,"maxLength":64}}}})
+        serde_json::json!({"type":"object","additionalProperties":false,"required":["description"],"properties":{"agent":{"type":"string","minLength":1,"maxLength":64},"background":{"type":"boolean","description":"Run this call in the background and return immediately. Only background calls run concurrently: several foreground calls issued together are executed one after another."},"description":{"type":"string","minLength":1,"maxLength":16384},"model":{"type":"string","minLength":1,"maxLength":64,"description":"Omit this. The agent's configured profile then decides the model, falling back to this thread's model. Send it only when the user explicitly asked for a specific model for this call: an explicit value overrides the configured profile. A model this run cannot reach falls back to this thread's model and says so."},"skills":{"type":"array","maxItems":128,"uniqueItems":true,"items":{"type":"string","minLength":1,"maxLength":64}}}})
     }
 
     pub fn catalog_input_schema(&self) -> Value {
@@ -1222,52 +1217,90 @@ impl<R: TaskRunner> TaskTool<R> {
         let agent = &mut schema["properties"]["agent"];
         agent["enum"] = Value::from(names);
         agent["description"] = Value::from(agent_description);
-        schema["properties"]["model"]["enum"] = Value::from(self.available_models.clone());
         schema
     }
 
+    /// The agent a call runs as, and which one an omitted `agent` means.
+    ///
+    /// Alphabetical order is not a default, it is an accident: it named
+    /// whichever agent sorts first regardless of what the description asked
+    /// for, and with the built-in catalog that is always the read-only
+    /// `explore`. A delegated task that has to write files then spends its
+    /// whole budget being refused. [`DEFAULT_TASK_AGENT`] is the one built-in
+    /// whose surface is not narrowed, so an unstated agent lands on the agent
+    /// that can carry any delegation rather than on the narrowest one.
     fn resolve_agent(&self, requested: Option<&str>) -> Result<&AgentDefinition, ToolOutput> {
         requested
             .and_then(|name| self.agents.agent(name))
-            .or_else(|| {
-                requested
-                    .is_none()
-                    .then(|| {
-                        self.agents
-                            .subagents()
-                            .filter(|agent| agent.mode == AgentMode::Subagent)
-                            .min_by(|left, right| left.name.cmp(&right.name))
-                    })
-                    .flatten()
-            })
+            .or_else(|| requested.is_none().then(|| self.default_agent()).flatten())
             .filter(|agent| agent.mode == AgentMode::Subagent)
             .ok_or_else(|| task_terminal(HeadlessTaskTerminal::AgentUnavailable))
+    }
+
+    fn default_agent(&self) -> Option<&AgentDefinition> {
+        let mut fallback = None;
+        for agent in self
+            .agents
+            .subagents()
+            .filter(|agent| agent.mode == AgentMode::Subagent)
+        {
+            if agent.name == DEFAULT_TASK_AGENT {
+                return Some(agent);
+            }
+            if fallback.is_none_or(|current: &AgentDefinition| agent.name < current.name) {
+                fallback = Some(agent);
+            }
+        }
+        fallback
     }
 
     fn resolve(&self, invocation: TaskInvocation) -> Result<TaskTurnRequest, ToolOutput> {
         let agent = self.resolve_agent(invocation.agent.as_deref())?;
 
-        let (model, mut request_config, model_notice) = match invocation.model {
-            Some(model) => {
-                if self.model_validator.validate_model(&model).is_err() {
-                    return Err(self.model_unavailable_output(&agent.name, &model));
-                }
-                let request_config = if model == self.parent_model {
-                    self.parent_request_config.clone()
-                } else {
-                    RequestConfig::default()
-                };
-                let notice = configuration_override_warning(agent, &model);
-                (model, request_config, notice)
+        let (model, mut request_config, model_notice, on_parent_model) = match invocation.model {
+            Some(model) if !is_safe_model_identifier(&model) => {
+                return Err(task_terminal(HeadlessTaskTerminal::InputLimit));
             }
-            None => match agent.model.clone() {
-                Some(model) if self.model_validator.validate_model(&model).is_ok() => {
+            Some(model) => {
+                // An identifier the bundled catalog does not list still runs
+                // the delegation, on this thread's own model. The catalog is a
+                // snapshot of what a provider served when it was taken, so
+                // refusing here turned a stale entry into a dead delegation
+                // the parent could only retry identically.
+                if self.model_validator.validate_model(&model).is_err() {
+                    let reference = self.record_model_unavailable(&agent.name, &model);
+                    let warning = fallback_warning(
+                        &agent.name,
+                        &model,
+                        &self.parent_model,
+                        reference.as_deref(),
+                    );
+                    (
+                        self.parent_model.clone(),
+                        self.parent_request_config.clone(),
+                        Some(warning),
+                        true,
+                    )
+                } else {
                     let request_config = if model == self.parent_model {
                         self.parent_request_config.clone()
                     } else {
                         RequestConfig::default()
                     };
-                    (model, request_config, None)
+                    let notice = configuration_override_warning(agent, &model);
+                    let on_parent_model = model == self.parent_model;
+                    (model, request_config, notice, on_parent_model)
+                }
+            }
+            None => match agent.model.clone() {
+                Some(model) if self.model_validator.validate_model(&model).is_ok() => {
+                    let on_parent_model = model == self.parent_model;
+                    let request_config = if on_parent_model {
+                        self.parent_request_config.clone()
+                    } else {
+                        RequestConfig::default()
+                    };
+                    (model, request_config, None, on_parent_model)
                 }
                 Some(model) => {
                     let reference = self.record_model_unavailable(&agent.name, &model);
@@ -1281,12 +1314,14 @@ impl<R: TaskRunner> TaskTool<R> {
                         self.parent_model.clone(),
                         self.parent_request_config.clone(),
                         Some(warning),
+                        true,
                     )
                 }
                 None => (
                     self.parent_model.clone(),
                     self.parent_request_config.clone(),
                     None,
+                    true,
                 ),
             },
         };
@@ -1305,18 +1340,8 @@ impl<R: TaskRunner> TaskTool<R> {
             description: invocation.description,
             model_notice,
             permission_rules: agent.permission_rules.clone(),
+            on_parent_model,
         })
-    }
-
-    fn model_unavailable_output(&self, agent: &str, requested_model: &str) -> ToolOutput {
-        let mut output = task_terminal(HeadlessTaskTerminal::ModelUnavailable);
-        let reference = self.record_model_unavailable(agent, requested_model);
-        if let Some(reference) = reference {
-            output.content.push_str(" [ref: ");
-            output.content.push_str(&reference);
-            output.content.push(']');
-        }
-        output
     }
 
     fn record_model_unavailable(&self, agent: &str, requested_model: &str) -> Option<String> {
@@ -1451,28 +1476,41 @@ impl<R: TaskRunner> TaskTool<R> {
         let runner = Arc::clone(&self.runner);
         let registry = self.registry.clone();
         let worker_context = context.clone();
+        let parent_model = self.parent_model.clone();
         let worker = thread::spawn(move || {
             let model_notice = request.model_notice.clone();
+            let mut retry_notice = None;
             let mut output = {
                 let _panic_hook = TaskPanicHookGuard::new();
                 let result = catch_unwind(AssertUnwindSafe(|| {
                     if let Some(output) = worker_context.terminal_output() {
-                        return Ok(output);
+                        return Ok((output, None));
                     }
-                    let result = runner.run(request, &worker_context)?;
-                    Ok(task_result_output(result, &worker_context))
+                    let (result, notice) = run_with_provider_fallback(
+                        runner.as_ref(),
+                        request,
+                        &parent_model,
+                        &worker_context,
+                    )?;
+                    Ok((task_result_output(result, &worker_context), notice))
                 }))
                 .unwrap_or(Err(TaskRunnerError::ChildFailure));
-                result.unwrap_or_else(task_error_output)
+                match result {
+                    Ok((output, notice)) => {
+                        retry_notice = notice;
+                        output
+                    }
+                    Err(error) => task_error_output(error),
+                }
             };
 
             worker_context.run_before_publication_hook();
             if let Some(cancelled) = worker_context.terminal_output() {
                 output = cancelled;
-            } else if let Some(notice) = model_notice
-                && !output.is_error
-            {
-                output.content = format!("{notice}\n{}", output.content);
+            } else if !output.is_error {
+                for notice in [model_notice, retry_notice].into_iter().flatten() {
+                    output.content = format!("{notice}\n{}", output.content);
+                }
             }
             registry.finish(execution_id, task_terminal_state(&output), output.clone());
             let _ = sender.send(output);
@@ -1559,15 +1597,78 @@ fn task_terminal_state(output: &ToolOutput) -> TaskTerminalState {
     }
 }
 
+/// Runs the delegated turn, retrying it once on the parent's own model when
+/// the provider rejects the one the request named.
+///
+/// The catalog a requested model was validated against is a snapshot of what a
+/// provider served when it was taken, not the inventory it serves now. A model
+/// that has since been withdrawn passes validation and is then refused by the
+/// backend, and the parent's usual answer to `task: provider failure [cause:
+/// rejected]` is to delegate again identically. The parent's own model is the
+/// one identifier this run has already proven the provider serves.
+fn run_with_provider_fallback<R: TaskRunner>(
+    runner: &R,
+    request: TaskTurnRequest,
+    parent_model: &str,
+    context: &TaskRunContext,
+) -> Result<(TaskTurnResult, Option<String>), TaskRunnerError> {
+    let agent = request.agent_name.clone();
+    let rejected_model = request.model.clone();
+    let mut fallback = (!request.on_parent_model).then(|| request.clone());
+
+    match runner.run(request, context) {
+        Err(TaskRunnerError::ProviderFailure(TaskProviderFailure::Rejected)) => {}
+        other => return other.map(|result| (result, None)),
+    }
+
+    // A parent that has already stopped waiting must not be charged for a
+    // second child turn.
+    let (Some(mut fallback), None) = (fallback.take(), context.terminal_output()) else {
+        return Err(TaskRunnerError::ProviderFailure(
+            TaskProviderFailure::Rejected,
+        ));
+    };
+
+    fallback.model = parent_model.to_owned();
+    let result = runner.run(fallback, context)?;
+    Ok((
+        result,
+        Some(provider_rejection_warning(
+            &agent,
+            &rejected_model,
+            parent_model,
+        )),
+    ))
+}
+
 fn task_result_output(result: TaskTurnResult, context: &TaskRunContext) -> ToolOutput {
     if let Some(output) = context.terminal_output() {
         return output;
     }
     let limits = context.registry.limits();
-    if result.output.chars().count() > limits.max_output_chars {
-        return task_terminal(HeadlessTaskTerminal::OutputLimit);
+    ToolOutput::success(bounded_task_output(result.output, limits.max_output_chars))
+}
+
+/// Keeps an oversized result instead of replacing it, and says what was cut.
+///
+/// Discarding it charged the parent for every iteration the child ran and
+/// handed back nothing it could act on, which is the one outcome worse than a
+/// partial answer. The marker is what makes the remainder safe to reason over:
+/// a silent cut reads as a complete result that simply stops.
+fn bounded_task_output(output: String, max_chars: usize) -> String {
+    if output.chars().count() <= max_chars {
+        return output;
     }
-    ToolOutput::success(result.output)
+
+    let mut bounded = output.chars().take(max_chars).collect::<String>();
+    bounded.push_str(&task_output_truncation_marker(max_chars));
+    bounded
+}
+
+fn task_output_truncation_marker(max_chars: usize) -> String {
+    format!(
+        "\n[truncated: only the first {max_chars} characters of this subagent result were returned]"
+    )
 }
 
 fn background_output(id: TaskExecutionId) -> ToolOutput {
@@ -1693,6 +1794,12 @@ fn fallback_warning(
         warning.push(']');
     }
     warning
+}
+
+fn provider_rejection_warning(agent: &str, rejected_model: &str, fallback_model: &str) -> String {
+    format!(
+        "warning: the provider rejected model {rejected_model} for agent {agent}; this result came from {fallback_model}"
+    )
 }
 
 fn is_diagnostic_reference(reference: &str) -> bool {

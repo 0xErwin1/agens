@@ -242,11 +242,49 @@ mod tests {
         );
     }
 
+    /// The watcher thread reaches this while the parent's own turn is still
+    /// running. Minting a session id here is what forked the session: the
+    /// parent turn was assembled against the metadata it captured before it
+    /// started, so it would go on to write its own row under a second id and
+    /// leave the subagent's turn alone in the first.
+    #[test]
+    fn a_subagent_turn_never_creates_the_session_it_would_be_appended_to() {
+        let temporary = tui_session_directory("subagent-persistence-without-a-session");
+        let bootstrap = tui_session_bootstrap(&temporary, &[]);
+        let session = Arc::new(Mutex::new(SessionContext::fresh()));
+
+        let persisted = persist_completed_subagent_turn(
+            &bootstrap,
+            &session,
+            CompletedSubagentTurn {
+                id: 1,
+                agent: "reviewer".into(),
+                task: "review the patch".into(),
+                final_result: "done".into(),
+                tool_uses: 1,
+            },
+        );
+
+        assert!(persisted.is_err());
+        assert!(session.lock().unwrap().identifier.is_none());
+        assert!(session.lock().unwrap().messages.is_empty());
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
     #[test]
     fn p1c1_persisted_subagent_call_ids_stay_unique_when_execution_ids_restart() {
         let temporary = tui_session_directory("subagent-call-id-uniqueness");
         let bootstrap = tui_session_bootstrap(&temporary, &[]);
+        let mut store = agens_store::SessionStore::open(bootstrap.data_directory()).unwrap();
+        let metadata = agens_tui_app::test_support::persist_tui_session(
+            &mut store,
+            &temporary.display().to_string(),
+            "call-id-uniqueness",
+        );
+        drop(store);
         let session = Arc::new(Mutex::new(SessionContext::fresh()));
+        session.lock().unwrap().identifier = Some(metadata.id);
         let turn = |final_result: &str| CompletedSubagentTurn {
             id: 1,
             agent: "reviewer".into(),
@@ -270,7 +308,11 @@ mod tests {
 
         assert_eq!(
             call_ids,
-            vec!["subagent:1".to_owned(), "subagent:2".to_owned()]
+            vec![
+                "resume-call".to_owned(),
+                "subagent:1".to_owned(),
+                "subagent:2".to_owned()
+            ]
         );
         agens_providers::encode_openai_response_request_with_messages("gpt-4.1", &messages, &[])
             .expect("a resumed subagent history must encode for the provider");

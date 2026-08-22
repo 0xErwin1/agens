@@ -353,6 +353,16 @@ fn contains_credential_marker(value: &str) -> bool {
         .any(|marker| lower.contains(marker))
 }
 
+/// Appends a finished background subagent's turn to the session the parent is
+/// running in.
+///
+/// A session that has never been written has no row to append to, and this
+/// runs on the watcher thread while the parent's own turn is still in flight:
+/// creating one here would mint a session id the parent turn does not know
+/// about, and the parent would then write its own row under a second id. The
+/// subagent's turn would be the only thing in the first one. Declining is the
+/// honest answer — the caller reports that no durable result was recorded,
+/// which is exactly what happened.
 pub fn persist_completed_subagent_turn(
     bootstrap: &Bootstrap,
     session: &Arc<Mutex<SessionContext>>,
@@ -361,6 +371,16 @@ pub fn persist_completed_subagent_turn(
     let mut context = session
         .lock()
         .map_err(|_| CliError::storage("TUI session is unavailable"))?;
+    let Some(identifier) = context.identifier else {
+        return Err(CliError::storage(
+            "this session has no persisted turn to append a subagent result to",
+        ));
+    };
+    let mut store = SessionStore::open(bootstrap.data_directory())
+        .map_err(|_| CliError::storage("sessions database is unavailable"))?;
+    let persisted = store
+        .load_session_for_resume(identifier)
+        .map_err(|_| CliError::storage("completed session could not be loaded"))?;
     let provider = context.provider.map(persisted_provider_identifier);
     let model = context
         .selection
@@ -376,22 +396,20 @@ pub fn persist_completed_subagent_turn(
         .active_agent
         .as_ref()
         .map(|agent| agent.name.as_str());
+    // The row this session already occupies, resolved from the store rather
+    // than from the in-memory context: an empty `metadata` beside a live
+    // identifier would otherwise be read as "no session yet" and mint a second
+    // one, which is the fork this guard exists to prevent.
     let metadata = next_session_metadata(
         bootstrap,
         &turn.task,
-        context.metadata.as_ref(),
+        Some(context.metadata.as_ref().unwrap_or(&persisted.metadata)),
         active_agent,
         provider,
         model,
         None,
     )?;
-    let mut store = SessionStore::open(bootstrap.data_directory())
-        .map_err(|_| CliError::storage("sessions database is unavailable"))?;
-    let persisted_history = context
-        .identifier
-        .and_then(|identifier| store.load_session_for_resume(identifier).ok())
-        .map(|session| session.messages);
-    let call_id = next_subagent_call_id(persisted_history.as_deref().unwrap_or(&context.messages));
+    let call_id = next_subagent_call_id(&persisted.messages);
     let metadata = store
         .persist_completed_session_turn(
             &metadata,

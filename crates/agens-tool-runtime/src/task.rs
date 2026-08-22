@@ -303,7 +303,6 @@ fn register_task_tool<R: TaskRunner>(
         skills.clone(),
         parent.model,
         parent.request_config,
-        available_models,
         validator,
         task_runner,
     )

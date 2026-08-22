@@ -295,10 +295,18 @@ fn p1c3_completed_background_subagent_notifies_the_next_main_turn() {
             "---\nname: reviewer\ndescription: reviewer\nmode: subagent\npermissions: []\n---\nReview work.\n",
         )],
     );
+    let mut store = agens_store::SessionStore::open(bootstrap.data_directory()).unwrap();
+    let seeded = agens_tui_app::test_support::persist_tui_session(
+        &mut store,
+        &temporary.display().to_string(),
+        "completion-notice",
+    );
+    drop(store);
     let (events, _receiver) = BridgeTx::bounded(16);
     let controls = TuiTaskControls::default();
     let session = Arc::new(Mutex::new(SessionContext {
         selected_subagent: Some("reviewer".into()),
+        identifier: Some(seeded.id),
         ..SessionContext::fresh()
     }));
     let lifecycle_bridge = TuiTaskLifecycleBridge::new(events, controls.clone())
@@ -338,7 +346,15 @@ fn p1c3_completed_background_subagent_notifies_the_next_main_turn() {
     );
     agens_tui_app::test_support::wait_for(
         "a completed background subagent to persist one durable turn",
-        || session.lock().unwrap().identifier,
+        || {
+            session
+                .lock()
+                .unwrap()
+                .metadata
+                .as_ref()
+                .filter(|metadata| metadata.completed_turn_count > seeded.completed_turn_count)
+                .map(|metadata| metadata.id)
+        },
     );
 
     let queued = Arc::new(Mutex::new(Vec::new()));
