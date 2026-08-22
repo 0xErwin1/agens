@@ -424,6 +424,14 @@ pub struct TransitionWrite<'a> {
     pub run_state: Option<StateChange<RunState>>,
     pub worktree_status: Option<StateChange<WorktreeStatus>>,
     pub question: Option<QuestionChange>,
+    /// A question this transition opens.
+    ///
+    /// It travels with the transition rather than being inserted first,
+    /// because `ask` is the pair: a run parked on `awaiting_input` with no
+    /// question row cannot be answered and cannot be resumed, and an open
+    /// question against a run that never parked is an inbox entry for work
+    /// that is still moving.
+    pub new_question: Option<&'a QuestionRow>,
     /// A new attempt row opened by this transition.
     pub attempt: Option<&'a AttemptRow>,
     /// The provider's quota state as this transition leaves it.
@@ -437,6 +445,18 @@ pub struct TransitionOutcome {
     /// Journal ids in the order the events were given.
     pub event_ids: Vec<i64>,
     pub attempt_id: Option<i64>,
+    /// The question this transition opened, when it opened one.
+    pub question_id: Option<i64>,
+}
+
+/// What one recorded checkpoint wrote.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CheckpointWrite {
+    /// The journal entry the checkpoint became. Findings point at it; there is
+    /// no separate checkpoint table.
+    pub checkpoint_id: i64,
+    /// One per claim, in the order the claims were given.
+    pub finding_ids: Vec<i64>,
 }
 
 /// The control plane's own connection to the shared `agens.db` file.
@@ -544,27 +564,9 @@ impl ControlPlaneStore {
     }
 
     pub fn insert_question(&mut self, question: &QuestionRow) -> Result<i64> {
-        self.insert(
-            "insert question",
-            "INSERT INTO questions (
-                 run_id, kind, blocked_decision, options, recommendation, answer, author,
-                 expires_at, tree_hash, paths_digest, state, created_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-            params![
-                question.run_id,
-                question.kind.as_str(),
-                question.blocked_decision,
-                question.options,
-                question.recommendation,
-                question.answer,
-                question.author.map(QuestionAuthor::as_str),
-                question.expires_at,
-                question.tree_hash,
-                question.paths_digest,
-                question.state.as_str(),
-                question.created_at,
-            ],
-        )
+        insert_question_row(&self.connection, question).map_err(|error| {
+            ControlPlaneError::operation("insert question", &self.database_path, error)
+        })
     }
 
     pub fn load_question(&self, id: i64) -> Result<Option<QuestionRow>> {
@@ -584,22 +586,9 @@ impl ControlPlaneStore {
     }
 
     pub fn insert_finding(&mut self, finding: &FindingRow) -> Result<i64> {
-        self.insert(
-            "insert finding",
-            "INSERT INTO findings (
-                 run_id, checkpoint_id, description, evidence_class, proof_refs,
-                 causal_disposition, created_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                finding.run_id,
-                finding.checkpoint_id,
-                finding.description,
-                finding.evidence_class.as_str(),
-                finding.proof_refs,
-                finding.causal_disposition.as_str(),
-                finding.created_at,
-            ],
-        )
+        insert_finding_row(&self.connection, finding).map_err(|error| {
+            ControlPlaneError::operation("insert finding", &self.database_path, error)
+        })
     }
 
     pub fn findings_for_run(&self, run_id: i64) -> Result<Vec<FindingRow>> {
@@ -754,6 +743,11 @@ impl ControlPlaneStore {
             }
         }
 
+        let question_id = match write.new_question {
+            Some(question) => Some(insert_question_row(&transaction, question).map_err(failure)?),
+            None => None,
+        };
+
         let attempt_id = match write.attempt {
             Some(attempt) => Some(insert_attempt_row(&transaction, attempt).map_err(failure)?),
             None => None,
@@ -773,6 +767,50 @@ impl ControlPlaneStore {
         Ok(TransitionOutcome {
             event_ids,
             attempt_id,
+            question_id,
+        })
+    }
+
+    /// Writes one checkpoint: its journal entry, then a finding per claim
+    /// already pointing back at it.
+    ///
+    /// One transaction, because the two halves are one report. A journal entry
+    /// with no findings behind it claims evidence that was never recorded, and
+    /// findings with a dangling `checkpoint_id` are claims nothing can be
+    /// attributed to.
+    ///
+    /// The `checkpoint_id` each row is given is this call's own event id, so
+    /// callers pass findings with that field unset rather than guessing an id
+    /// that does not exist yet.
+    pub fn record_checkpoint(
+        &mut self,
+        checkpoint: &EventRow,
+        findings: &[FindingRow],
+    ) -> Result<CheckpointWrite> {
+        const OPERATION: &str = "record checkpoint";
+
+        let path = self.database_path.clone();
+        let failure =
+            |error: rusqlite::Error| ControlPlaneError::operation(OPERATION, &path, error);
+
+        let transaction = self.connection.transaction().map_err(failure)?;
+
+        let checkpoint_id = append_event_row(&transaction, checkpoint).map_err(failure)?;
+
+        let mut finding_ids = Vec::with_capacity(findings.len());
+        for finding in findings {
+            let attributed = FindingRow {
+                checkpoint_id: Some(checkpoint_id),
+                ..finding.clone()
+            };
+            finding_ids.push(insert_finding_row(&transaction, &attributed).map_err(failure)?);
+        }
+
+        transaction.commit().map_err(failure)?;
+
+        Ok(CheckpointWrite {
+            checkpoint_id,
+            finding_ids,
         })
     }
 
@@ -839,6 +877,51 @@ fn insert_attempt_row(connection: &Connection, attempt: &AttemptRow) -> rusqlite
             attempt.retry_trigger.map(RetryTrigger::as_str),
             attempt.tokens,
             attempt.cost_micros,
+        ],
+    )?;
+
+    Ok(connection.last_insert_rowid())
+}
+
+fn insert_question_row(connection: &Connection, question: &QuestionRow) -> rusqlite::Result<i64> {
+    connection.execute(
+        "INSERT INTO questions (
+             run_id, kind, blocked_decision, options, recommendation, answer, author,
+             expires_at, tree_hash, paths_digest, state, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        params![
+            question.run_id,
+            question.kind.as_str(),
+            question.blocked_decision,
+            question.options,
+            question.recommendation,
+            question.answer,
+            question.author.map(QuestionAuthor::as_str),
+            question.expires_at,
+            question.tree_hash,
+            question.paths_digest,
+            question.state.as_str(),
+            question.created_at,
+        ],
+    )?;
+
+    Ok(connection.last_insert_rowid())
+}
+
+fn insert_finding_row(connection: &Connection, finding: &FindingRow) -> rusqlite::Result<i64> {
+    connection.execute(
+        "INSERT INTO findings (
+             run_id, checkpoint_id, description, evidence_class, proof_refs,
+             causal_disposition, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            finding.run_id,
+            finding.checkpoint_id,
+            finding.description,
+            finding.evidence_class.as_str(),
+            finding.proof_refs,
+            finding.causal_disposition.as_str(),
+            finding.created_at,
         ],
     )?;
 

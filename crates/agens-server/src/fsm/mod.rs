@@ -36,7 +36,8 @@ mod runs;
 mod worktrees;
 
 use agens_store::{
-    ControlPlaneError, ControlPlaneStore, EventClass, EventRow, QuestionRow, RunRow,
+    CheckpointWrite, ControlPlaneError, ControlPlaneStore, EventClass, EventRow, FindingRow,
+    QuestionRow, RunRow,
 };
 
 pub use questions::{
@@ -151,6 +152,9 @@ pub struct AppliedTransition<S, E: 'static> {
     pub domain_event: &'static str,
     pub state_changed_event_id: i64,
     pub domain_event_id: i64,
+    /// The question the transition opened. Only the run machine's `ask` ever
+    /// opens one; the other two machines leave it `None`.
+    pub opened_question_id: Option<i64>,
 }
 
 /// The result of asking for a transition that may already have happened.
@@ -194,6 +198,21 @@ impl StateMachines {
     #[must_use]
     pub const fn store(&self) -> &ControlPlaneStore {
         &self.store
+    }
+
+    /// Records one checkpoint: its journal entry and a finding per claim, in
+    /// one write.
+    ///
+    /// It goes through the machines rather than around them because they own
+    /// the store, but it is not a transition: a checkpoint moves no row and
+    /// runs no guard. What it writes is the journal and the evidence, which is
+    /// exactly what a run being measured is allowed to add to.
+    pub fn record_checkpoint(
+        &mut self,
+        checkpoint: &EventRow,
+        findings: &[FindingRow],
+    ) -> Result<CheckpointWrite, TransitionRejection> {
+        Ok(self.store.record_checkpoint(checkpoint, findings)?)
     }
 
     fn load_run(&self, run_id: i64) -> Result<RunRow, TransitionRejection> {
