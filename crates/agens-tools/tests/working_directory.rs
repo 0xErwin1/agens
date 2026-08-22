@@ -13,8 +13,8 @@ use std::{
 };
 
 use agens_tools::{
-    BashInput, ListDirectoryInput, NativeToolCatalog, NativeTools, ReadFileInput, SessionWorktrees,
-    ToolExecutionContext, WorkingDirectory,
+    BashInput, ListDirectoryInput, MAX_SESSION_WORKTREES, NativeToolCatalog, NativeTools,
+    ReadFileInput, SessionWorktrees, ToolExecutionContext, WorkingDirectory,
 };
 use serde_json::json;
 
@@ -339,6 +339,104 @@ fn a_catalog_worktree_call_leaves_the_session_inside_the_worktree() {
             .contains(&fixture.data_directory().display().to_string()),
         "{}",
         created.content
+    );
+}
+
+#[test]
+fn a_worktree_that_resolves_outside_the_session_does_not_move_the_session() {
+    let fixture = Fixture::new();
+    let mut tools = fixture.tools();
+    let home = fixture.data_directory().join("worktrees/fixture");
+    fs::create_dir_all(&home).expect("create the session worktree home");
+    let planted = fixture.elsewhere().join("planted");
+    fs::create_dir_all(&planted).expect("create the directory the symlink points at");
+    // git creates a worktree through a symlink whose target is an existing
+    // empty directory, so the path under the session's worktree home is not
+    // proof of where the checkout landed.
+    std::os::unix::fs::symlink(&planted, home.join("feature")).expect("plant the symlink");
+
+    let refused = tools
+        .create_worktree("feature", "feature-branch", "HEAD")
+        .unwrap();
+
+    assert!(refused.is_error, "{}", refused.content);
+    assert!(
+        refused.content.starts_with("worktree:"),
+        "{}",
+        refused.content
+    );
+    assert_eq!(
+        tools.working_directory(),
+        canonical(fixture.repository()).as_path()
+    );
+}
+
+#[test]
+fn a_session_at_its_worktree_budget_reclaims_what_is_merged_and_clean() {
+    let fixture = Fixture::new();
+    let mut tools = fixture.tools();
+
+    for index in 0..MAX_SESSION_WORKTREES {
+        let name = format!("session-{index}");
+        let created = tools
+            .create_worktree(&name, &format!("branch-{index}"), "HEAD")
+            .unwrap();
+        assert!(!created.is_error, "{}", created.content);
+    }
+
+    // Every earlier worktree is still at the commit the session root is on
+    // and carries no work, so the budget is met by reclaiming them rather
+    // than by refusing.
+    let created = tools
+        .create_worktree("session-next", "branch-next", "HEAD")
+        .unwrap();
+
+    assert!(!created.is_error, "{}", created.content);
+    let names = SessionWorktrees::new(fixture.data_directory())
+        .names("fixture")
+        .expect("list worktrees");
+    assert!(names.contains(&"session-next".to_owned()), "{names:?}");
+    assert!(
+        names.len() < MAX_SESSION_WORKTREES + 1,
+        "nothing was reclaimed: {names:?}"
+    );
+}
+
+#[test]
+fn a_session_whose_worktrees_all_carry_work_is_refused_a_new_one() {
+    let fixture = Fixture::new();
+    let mut tools = fixture.tools();
+
+    for index in 0..MAX_SESSION_WORKTREES {
+        let name = format!("session-{index}");
+        tools
+            .create_worktree(&name, &format!("branch-{index}"), "HEAD")
+            .expect("create worktree");
+        fs::write(
+            fixture
+                .data_directory()
+                .join("worktrees/fixture")
+                .join(&name)
+                .join("work.txt"),
+            "unfinished\n",
+        )
+        .expect("leave work in the worktree");
+    }
+
+    let refused = tools
+        .create_worktree("session-next", "branch-next", "HEAD")
+        .unwrap();
+
+    assert!(refused.is_error, "{}", refused.content);
+    assert!(
+        refused.content.starts_with("worktree:"),
+        "{}",
+        refused.content
+    );
+    assert!(
+        refused.content.contains("merged and clean"),
+        "{}",
+        refused.content
     );
 }
 

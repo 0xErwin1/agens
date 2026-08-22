@@ -8,7 +8,6 @@
 mod blocking;
 mod instance;
 mod sessions;
-mod worktrees;
 
 use std::os::unix::net::UnixListener;
 use std::path::Path;
@@ -22,7 +21,6 @@ pub use sessions::{
     SessionProvider, SessionRegistry, SessionRegistryError, SessionRuntime, SessionShutdown,
     SessionState, SessionStatus, SessionSupervisor,
 };
-pub use worktrees::{SessionWorktrees, WorktreeError, WorktreeStatus};
 
 #[derive(Debug)]
 pub enum ServerError {

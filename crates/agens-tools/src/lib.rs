@@ -4644,6 +4644,27 @@ impl BashInput {
     }
 }
 
+/// The most worktrees one session may hold at once. A budget rather than a
+/// limit on the work: every worktree is a full checkout on disk and a branch
+/// in the repository, and a session that keeps creating them without ever
+/// finishing one is leaking both.
+pub const MAX_SESSION_WORKTREES: usize = 8;
+
+/// Removes a worktree that was created but could not be used, and describes
+/// what happened to it, so a failure never leaves an unexplained checkout
+/// behind.
+fn discard_worktree(
+    worktrees: &SessionWorktrees,
+    repository: &Path,
+    repository_id: &str,
+    name: &str,
+) -> String {
+    match worktrees.remove(repository, repository_id, name) {
+        Ok(()) => "; the worktree was removed".to_owned(),
+        Err(error) => format!("; the worktree could not be removed: {error}"),
+    }
+}
+
 /// Where one session's worktrees live, and what to call the repository they
 /// belong to.
 #[derive(Debug)]
@@ -4661,7 +4682,7 @@ pub struct NativeTools {
     /// Where the session is working: what a relative path resolves against,
     /// what a command runs in, and what a confined open starts from. This
     /// moves; `session_root` does not.
-    project_root: PathBuf,
+    working_directory: PathBuf,
     /// The root the session was opened on. Every directory the session may
     /// move to lies under this one or under its own worktree home, so moving
     /// is bounded by the same rule a path is.
@@ -4671,7 +4692,7 @@ pub struct NativeTools {
     limits: NativeToolLimits,
     webfetch: Mutex<WebfetchState>,
     #[cfg(unix)]
-    project_root_dir: fs::File,
+    working_directory_dir: fs::File,
 }
 
 impl NativeTools {
@@ -4693,10 +4714,10 @@ impl NativeTools {
 
         Ok(Self {
             #[cfg(unix)]
-            project_root_dir: fs::File::open(&project_root)
+            working_directory_dir: fs::File::open(&project_root)
                 .map_err(|error| Error::Tool(format!("cannot open project root: {error}")))?,
             session_root: project_root.clone(),
-            project_root,
+            working_directory: project_root,
             worktrees: None,
             published_directory: None,
             limits,
@@ -4733,7 +4754,7 @@ impl NativeTools {
 
     /// Where the session is working right now.
     pub fn working_directory(&self) -> &Path {
-        &self.project_root
+        &self.working_directory
     }
 
     /// Moves the session to `path`, so later calls resolve against it.
@@ -4751,7 +4772,7 @@ impl NativeTools {
         let requested = if path.is_absolute() {
             path.to_path_buf()
         } else {
-            self.project_root.join(path)
+            self.working_directory.join(path)
         };
 
         let Ok(target) = fs::canonicalize(&requested) else {
@@ -4768,7 +4789,7 @@ impl NativeTools {
             ));
         }
 
-        self.enter(target)
+        self.enter(target, "cd")
     }
 
     /// Creates `branch` in a worktree named `name` and moves the session into
@@ -4779,15 +4800,40 @@ impl NativeTools {
         branch: &str,
         start_point: &str,
     ) -> Result<ToolOutput, Error> {
+        self.create_worktree_with_context(name, branch, start_point, None)
+    }
+
+    /// Same as [`Self::create_worktree`], with the calling turn's cancellation
+    /// and deadline carried into git, so a cancelled turn does not leave a
+    /// checkout running.
+    pub fn create_worktree_with_context(
+        &mut self,
+        name: &str,
+        branch: &str,
+        start_point: &str,
+        context: Option<&ToolExecutionContext>,
+    ) -> Result<ToolOutput, Error> {
         let Some(configured) = self.worktrees.as_ref() else {
             return Ok(ToolOutput::failure(
                 "worktree: session worktrees are unavailable",
             ));
         };
+        let repository_id = configured.repository_id.clone();
+        let worktrees = match context {
+            Some(context) => configured
+                .worktrees
+                .clone()
+                .with_execution_context(context.clone()),
+            None => configured.worktrees.clone(),
+        };
 
-        let created = configured.worktrees.create(
+        if let Some(output) = self.enforce_worktree_budget(&worktrees, &repository_id) {
+            return Ok(output);
+        }
+
+        let created = worktrees.create(
             &self.session_root,
-            &configured.repository_id,
+            &repository_id,
             name,
             branch,
             start_point,
@@ -4798,32 +4844,124 @@ impl NativeTools {
         };
 
         let Ok(path) = fs::canonicalize(&path) else {
-            return Ok(ToolOutput::failure(
-                "worktree: the created worktree is unreadable",
-            ));
+            return Ok(ToolOutput::failure(format!(
+                "worktree: the created worktree is unreadable{}",
+                discard_worktree(&worktrees, &self.session_root, &repository_id, name)
+            )));
         };
 
-        self.enter(path)
+        // The worktree was created at a path under this session's own worktree
+        // home, but what that path resolves to is only known now: a symlink
+        // planted there before the session started would otherwise confine
+        // every later tool call to a directory outside the session.
+        if !self.is_reachable(&path) {
+            return Ok(ToolOutput::failure(format!(
+                "worktree: {} resolves outside the session root and its worktrees; \
+                 it was left in place for inspection",
+                path.display()
+            )));
+        }
+
+        let entered = self.enter(path, "worktree")?;
+        if entered.is_error {
+            return Ok(ToolOutput::failure(format!(
+                "{}{}",
+                entered.content,
+                discard_worktree(&worktrees, &self.session_root, &repository_id, name)
+            )));
+        }
+
+        Ok(entered)
     }
 
-    /// Opens `target` as the directory the session works in.
-    fn enter(&mut self, target: PathBuf) -> Result<ToolOutput, Error> {
+    /// Holds one session to [`MAX_SESSION_WORKTREES`], reclaiming the
+    /// worktrees whose work is already merged and whose tree is clean before
+    /// refusing. Nothing is reclaimed while the session is below the budget:
+    /// a merged worktree is still somewhere the model may be reading.
+    fn enforce_worktree_budget(
+        &self,
+        worktrees: &SessionWorktrees,
+        repository_id: &str,
+    ) -> Option<ToolOutput> {
+        let names = match worktrees.names(repository_id) {
+            Ok(names) => names,
+            Err(error) => return Some(ToolOutput::failure(format!("worktree: {error}"))),
+        };
+        if names.len() < MAX_SESSION_WORKTREES {
+            return None;
+        }
+
+        let reclaimed = self.reclaim_worktrees(worktrees, repository_id, &names);
+        if names.len() - reclaimed < MAX_SESSION_WORKTREES {
+            return None;
+        }
+
+        Some(ToolOutput::failure(format!(
+            "worktree: this session already holds {} worktrees and none of them is \
+             both merged and clean; finish or remove one before creating another",
+            names.len()
+        )))
+    }
+
+    /// Removes every worktree whose branch is already contained in the
+    /// session repository's `HEAD` and whose tree carries no work, and
+    /// answers how many went.
+    fn reclaim_worktrees(
+        &self,
+        worktrees: &SessionWorktrees,
+        repository_id: &str,
+        names: &[String],
+    ) -> usize {
+        let Ok(merge_target) = worktrees.head_revision(&self.session_root) else {
+            return 0;
+        };
+
+        names
+            .iter()
+            .filter(|name| {
+                let path = worktrees
+                    .repository_directory(repository_id)
+                    .map(|directory| directory.join(name))
+                    .unwrap_or_default();
+                // Never reclaim the directory the session is standing in, nor
+                // one it is standing under.
+                if self.working_directory.starts_with(&path) {
+                    return false;
+                }
+
+                let reclaimable = worktrees
+                    .status(repository_id, name, &merge_target)
+                    .is_ok_and(|status| status.merged && !status.dirty);
+
+                reclaimable
+                    && worktrees
+                        .remove(&self.session_root, repository_id, name)
+                        .is_ok()
+            })
+            .count()
+    }
+
+    /// Opens `target` as the directory the session works in, reporting a
+    /// failure under the name of the tool that asked for the move.
+    fn enter(&mut self, target: PathBuf, tool: &str) -> Result<ToolOutput, Error> {
         #[cfg(unix)]
         {
             let Ok(opened) = fs::File::open(&target) else {
-                return Ok(ToolOutput::failure("cd: the directory cannot be opened"));
+                return Ok(ToolOutput::failure(format!(
+                    "{tool}: the directory cannot be opened"
+                )));
             };
-            self.project_root_dir = opened;
+            self.working_directory_dir = opened;
         }
 
-        self.project_root = target;
+        self.working_directory = target;
         if let Some(published) = self.published_directory.as_ref() {
-            published.moved_to(&self.project_root);
+            published.moved_to(&self.working_directory);
         }
 
         Ok(ToolOutput::success(format!(
             "working directory: {}",
-            self.project_root.display()
+            self.working_directory.display()
         )))
     }
 
@@ -4842,7 +4980,7 @@ impl NativeTools {
     }
 
     pub fn read_file(&self, input: ReadFileInput) -> Result<ToolOutput, Error> {
-        if let Err(output) = self.ensure_project_root_is_stable() {
+        if let Err(output) = self.ensure_working_directory_is_stable() {
             return Ok(output);
         }
         let path = match self.resolve_confined_path(&input.path) {
@@ -4861,7 +4999,7 @@ impl NativeTools {
         }
 
         #[cfg(unix)]
-        let result = read_file_confined(&self.project_root_dir, &input);
+        let result = read_file_confined(&self.working_directory_dir, &input);
 
         #[cfg(not(unix))]
         let result = Err(ToolOutput::failure(
@@ -4884,17 +5022,17 @@ impl NativeTools {
                 "file picker: limit must be greater than zero",
             ));
         }
-        self.ensure_project_root_is_stable()?;
+        self.ensure_working_directory_is_stable()?;
 
         let mut files = Vec::new();
         let mut budget = SearchBudget::new(&self.limits, "file picker");
-        self.collect_tool_files(&self.project_root, &mut budget, &mut files)?;
-        self.ensure_project_root_is_stable()?;
+        self.collect_tool_files(&self.working_directory, &mut budget, &mut files)?;
+        self.ensure_working_directory_is_stable()?;
 
         let mut candidates = files
             .into_iter()
             .filter_map(|path| {
-                path.strip_prefix(&self.project_root)
+                path.strip_prefix(&self.working_directory)
                     .ok()
                     .map(Path::to_path_buf)
             })
@@ -4942,7 +5080,7 @@ impl NativeTools {
                 #[cfg(unix)]
                 {
                     write_file_confined(
-                        &self.project_root_dir,
+                        &self.working_directory_dir,
                         relative,
                         input.content.as_bytes(),
                         context,
@@ -5023,7 +5161,7 @@ impl NativeTools {
                 #[cfg(unix)]
                 {
                     edit_file_confined(
-                        &self.project_root_dir,
+                        &self.working_directory_dir,
                         relative,
                         &input.old,
                         &input.new,
@@ -5176,7 +5314,7 @@ impl NativeTools {
                 Ok(path) => path,
                 Err(output) => return Ok(output),
             },
-            None => self.project_root.clone(),
+            None => self.working_directory.clone(),
         };
 
         let mut files = Vec::new();
@@ -5199,7 +5337,7 @@ impl NativeTools {
                 return Ok(output);
             }
             let relative = path
-                .strip_prefix(&self.project_root)
+                .strip_prefix(&self.working_directory)
                 .map_err(|_| Error::Tool("path: outside project root".into()))?;
             if !permits_read(context, relative) {
                 withheld = true;
@@ -5219,7 +5357,7 @@ impl NativeTools {
                 run_grep_test_hook();
 
                 #[cfg(unix)]
-                match read_grep_file_confined(&self.project_root_dir, relative) {
+                match read_grep_file_confined(&self.working_directory_dir, relative) {
                     Ok(Some(content)) => content,
                     Ok(None) => continue,
                     Err(output) => return Ok(output),
@@ -5291,14 +5429,16 @@ impl NativeTools {
         };
         let mut files = Vec::new();
         let mut budget = SearchBudget::new(&self.limits, "glob");
-        if let Err(output) = self.collect_tool_files(&self.project_root, &mut budget, &mut files) {
+        if let Err(output) =
+            self.collect_tool_files(&self.working_directory, &mut budget, &mut files)
+        {
             return Ok(output);
         }
 
         let mut matches = files
             .into_iter()
             .filter_map(|path| {
-                path.strip_prefix(&self.project_root)
+                path.strip_prefix(&self.working_directory)
                     .ok()
                     .map(Path::to_path_buf)
             })
@@ -5538,7 +5678,7 @@ impl NativeTools {
         command
             .arg("-c")
             .arg(&input.command)
-            .current_dir(&self.project_root)
+            .current_dir(&self.working_directory)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
@@ -5644,10 +5784,10 @@ impl NativeTools {
     fn resolve_existing(&self, path: &Path) -> Result<PathBuf, ToolOutput> {
         let relative = self.resolve_confined_path(path)?;
 
-        let path = fs::canonicalize(self.project_root.join(relative))
+        let path = fs::canonicalize(self.working_directory.join(relative))
             .map_err(|error| ToolOutput::failure(format!("path: {error}")))?;
 
-        if path.starts_with(&self.project_root) {
+        if path.starts_with(&self.working_directory) {
             Ok(path)
         } else {
             Err(ToolOutput::failure("path: outside project root"))
@@ -5698,7 +5838,7 @@ impl NativeTools {
             }
 
             let relative = path
-                .strip_prefix(&self.project_root)
+                .strip_prefix(&self.working_directory)
                 .map_err(|_| ToolOutput::failure("path: outside project root"))?;
 
             if !permits_read(walk.context, relative) {
@@ -5802,7 +5942,7 @@ impl NativeTools {
                 let absolute = if path.is_absolute() {
                     path.to_path_buf()
                 } else {
-                    self.project_root.join(path)
+                    self.working_directory.join(path)
                 };
                 let absolute = normalize_external_path(&absolute)?;
                 Ok(AuthorizedWritePath::External(absolute))
@@ -5845,7 +5985,7 @@ impl NativeTools {
 
     /// Maps an absolute path under the confinement root to a relative path.
     fn absolute_path_under_root(&self, path: &Path) -> Result<PathBuf, ToolOutput> {
-        let root = &self.project_root;
+        let root = &self.working_directory;
         if let Ok(relative) = path.strip_prefix(root) {
             if relative.as_os_str().is_empty() {
                 return Err(ToolOutput::failure("path: path must name a file"));
@@ -5876,20 +6016,20 @@ impl NativeTools {
             .map_err(|_| ToolOutput::failure("path: outside project root"))
     }
 
-    fn ensure_project_root_is_stable(&self) -> Result<(), ToolOutput> {
+    fn ensure_working_directory_is_stable(&self) -> Result<(), ToolOutput> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
 
-            let root = fs::canonicalize(&self.project_root)
+            let root = fs::canonicalize(&self.working_directory)
                 .map_err(|_| ToolOutput::failure("path: outside project root"))?;
-            let metadata = fs::symlink_metadata(&self.project_root)
+            let metadata = fs::symlink_metadata(&self.working_directory)
                 .map_err(|_| ToolOutput::failure("path: outside project root"))?;
             let opened = self
-                .project_root_dir
+                .working_directory_dir
                 .metadata()
                 .map_err(|_| ToolOutput::failure("path: outside project root"))?;
-            if root != self.project_root
+            if root != self.working_directory
                 || metadata.file_type().is_symlink()
                 || (metadata.dev(), metadata.ino()) != (opened.dev(), opened.ino())
             {
@@ -6224,7 +6364,7 @@ impl NativeToolCatalog {
             ),
             native_metadata(
                 "native::worktree",
-                "Create a git worktree for this session on a new branch and move the session into it. Branch defaults to the worktree name and start point to HEAD.",
+                "Create a git worktree for this session on a new branch and move the session into it. Branch defaults to the worktree name and start point to HEAD. This checks the repository out: repository hooks are disabled, but content filters the repository configures still run, so it executes what the repository configures the same way a checkout does.",
                 ToolAccess::Write,
                 serde_json::json!({"type":"object","additionalProperties":false,"required":["name"],"properties":{"name":{"type":"string"},"branch":{"type":"string"},"start_point":{"type":"string"}}}),
             ),
@@ -6308,7 +6448,8 @@ impl NativeToolCatalog {
                     .and_then(Value::as_str)
                     .unwrap_or("HEAD");
 
-                self.tools.create_worktree(name, branch, start_point)?
+                self.tools
+                    .create_worktree_with_context(name, branch, start_point, Some(context))?
             }
             "native::git_read" => {
                 let Some(operation) = GitReadOperation::parse(string("operation")?) else {

@@ -122,7 +122,7 @@ impl GitReadInput {
 
 impl crate::NativeTools {
     pub fn git_read(&self, input: GitReadInput) -> Result<ToolOutput, Error> {
-        if let Err(output) = self.ensure_project_root_is_stable() {
+        if let Err(output) = self.ensure_working_directory_is_stable() {
             return Ok(output);
         }
         if input.timeout.is_zero() {
@@ -142,7 +142,7 @@ impl crate::NativeTools {
     fn run_git_read(&self, input: &GitReadInput) -> Result<ToolOutput, GitRunError> {
         let mut arguments = subcommand_arguments(input)?;
         let withheld = self.exclude_denied_files(input, &mut arguments)?;
-        let outcome = run_git(&self.project_root, &arguments, input)?;
+        let outcome = run_git(&self.working_directory, &arguments, input)?;
 
         Ok(rendered_output(input.operation, outcome, withheld))
     }
@@ -202,7 +202,7 @@ impl crate::NativeTools {
     /// into the other before a rule can be asked about a file.
     fn repository_prefix(&self, input: &GitReadInput) -> Result<String, GitRunError> {
         let arguments = ["rev-parse".to_owned(), "--show-prefix".to_owned()];
-        let outcome = run_git(&self.project_root, &arguments, input)?;
+        let outcome = run_git(&self.working_directory, &arguments, input)?;
 
         if !outcome.success {
             return Err(failure(input.operation, "the repository could not be located").into());
@@ -219,7 +219,7 @@ impl crate::NativeTools {
         let mut arguments = subcommand_arguments(input)?;
         arguments.splice(1..1, ["--raw".to_owned(), "-z".to_owned()]);
 
-        let outcome = run_git(&self.project_root, &arguments, input)?;
+        let outcome = run_git(&self.working_directory, &arguments, input)?;
         let undecidable = || {
             GitRunError::from(failure(
                 input.operation,
@@ -529,7 +529,7 @@ fn run_git(
 const HARDENING_ARGUMENTS: [&str; 4] =
     ["--no-pager", "--no-optional-locks", "-c", "core.fsmonitor="];
 
-fn harden_environment(command: &mut Command) {
+pub(crate) fn harden_environment(command: &mut Command) {
     for variable in [
         "GIT_EXTERNAL_DIFF",
         "GIT_PAGER",

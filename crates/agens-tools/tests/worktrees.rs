@@ -1,10 +1,14 @@
 use std::{
     path::{Path, PathBuf},
     process::Command,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+    time::Duration,
 };
 
-use agens_tools::SessionWorktrees;
+use agens_tools::{SessionWorktrees, ToolExecutionContext, WorktreeError};
 
 static NEXT_REPOSITORY: AtomicUsize = AtomicUsize::new(0);
 
@@ -197,4 +201,153 @@ fn remove_unregisters_and_deletes_the_session_worktree() {
             .lines()
             .any(|line| line == format!("worktree {}", path.display()))
     );
+}
+
+#[test]
+fn create_does_not_run_the_repository_post_checkout_hook() {
+    let repository = Repository::new();
+    let worktrees = repository.worktrees();
+    let marker = repository.root.join("post-checkout-ran");
+    write_post_checkout_hook(&repository.checkout, &marker);
+
+    worktrees
+        .create(
+            &repository.checkout,
+            "repo-a1b2c3d4",
+            "session-hook",
+            "feature/session-hook",
+            "main",
+        )
+        .expect("create worktree");
+
+    assert!(
+        !marker.exists(),
+        "the repository's post-checkout hook ran during worktree creation"
+    );
+}
+
+#[test]
+fn status_separates_a_missing_worktree_from_an_unavailable_git() {
+    let repository = Repository::new();
+    let worktrees = repository.worktrees();
+
+    let error = worktrees
+        .status("repo-a1b2c3d4", "never-created", "main")
+        .expect_err("status of a missing worktree fails");
+
+    assert_eq!(error, WorktreeError::Missing);
+}
+
+#[test]
+fn remove_separates_a_missing_worktree_from_an_unavailable_git() {
+    let repository = Repository::new();
+    let worktrees = repository.worktrees();
+
+    let error = worktrees
+        .remove(&repository.checkout, "repo-a1b2c3d4", "never-created")
+        .expect_err("remove of a missing worktree fails");
+
+    assert_eq!(error, WorktreeError::Missing);
+}
+
+#[test]
+fn a_cancelled_turn_stops_the_invocation() {
+    let repository = Repository::new();
+    let cancellation = Arc::new(AtomicBool::new(true));
+    let worktrees = repository
+        .worktrees()
+        .with_execution_context(ToolExecutionContext::new(
+            cancellation,
+            Duration::from_secs(30),
+        ));
+
+    let error = worktrees
+        .create(
+            &repository.checkout,
+            "repo-a1b2c3d4",
+            "session-cancelled",
+            "feature/session-cancelled",
+            "main",
+        )
+        .expect_err("a cancelled turn creates nothing");
+
+    assert_eq!(error, WorktreeError::Cancelled);
+}
+
+#[test]
+fn an_exhausted_budget_times_the_invocation_out() {
+    let repository = Repository::new();
+    let worktrees = repository.worktrees().with_timeout(Duration::ZERO);
+
+    let error = worktrees
+        .create(
+            &repository.checkout,
+            "repo-a1b2c3d4",
+            "session-timeout",
+            "feature/session-timeout",
+            "main",
+        )
+        .expect_err("an exhausted budget creates nothing");
+
+    assert_eq!(error, WorktreeError::TimedOut);
+}
+
+#[test]
+fn names_lists_the_worktrees_already_on_disk() {
+    let repository = Repository::new();
+    let worktrees = repository.worktrees();
+
+    assert!(
+        worktrees
+            .names("repo-a1b2c3d4")
+            .expect("list an untouched repository")
+            .is_empty()
+    );
+
+    for name in ["session-alpha", "session-beta"] {
+        worktrees
+            .create(
+                &repository.checkout,
+                "repo-a1b2c3d4",
+                name,
+                &format!("feature/{name}"),
+                "main",
+            )
+            .expect("create worktree");
+    }
+
+    assert_eq!(
+        worktrees.names("repo-a1b2c3d4").expect("list worktrees"),
+        vec!["session-alpha".to_owned(), "session-beta".to_owned()]
+    );
+}
+
+#[test]
+fn head_revision_reads_the_repository_head() {
+    let repository = Repository::new();
+    let worktrees = repository.worktrees();
+
+    assert_eq!(
+        worktrees
+            .head_revision(&repository.checkout)
+            .expect("read head"),
+        git(&repository.checkout, &["rev-parse", "HEAD"]).trim()
+    );
+}
+
+fn write_post_checkout_hook(checkout: &Path, marker: &Path) {
+    let hooks = checkout.join(".git/hooks");
+    std::fs::create_dir_all(&hooks).expect("create hooks directory");
+
+    let hook = hooks.join("post-checkout");
+    std::fs::write(&hook, format!("#!/bin/sh\ntouch '{}'\n", marker.display()))
+        .expect("write post-checkout hook");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755))
+            .expect("make the hook executable");
+    }
 }
