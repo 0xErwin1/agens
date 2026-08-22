@@ -196,6 +196,16 @@ impl StateMachines {
         &self.store
     }
 
+    /// Appends one journal entry that no transition carries.
+    ///
+    /// Not every fact the coordinator records is a state change: ingest writes
+    /// what the harness reported, and the timer wheel writes the exception
+    /// signals it raised. Those entries are append-only and move no row, which
+    /// is why they can go through here while a state change still cannot.
+    pub fn journal(&mut self, event: &EventRow) -> Result<i64, TransitionRejection> {
+        Ok(self.store.append_event(event)?)
+    }
+
     fn load_run(&self, run_id: i64) -> Result<RunRow, TransitionRejection> {
         self.store
             .load_run(run_id)?

@@ -413,6 +413,16 @@ impl SettingSpec {
     }
 }
 
+/// Grace a worker gets past the span it promised its next checkpoint in,
+/// as a percentage of that span. The default is one and a half times what was
+/// promised.
+///
+/// A percentage rather than a multiplier because the settings catalog carries
+/// integers, and rather than a fixed number of seconds because a worker that
+/// promised five minutes and one that promised an hour are not equally late at
+/// the same absolute delay.
+pub const DEFAULT_CHECKPOINT_GRACE_PERCENT: i64 = 150;
+
 const REASONING_EFFORTS: &[&str] = &["none", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 const UNBOUNDED_TEXT: SettingKind = SettingKind::Text {
@@ -603,6 +613,15 @@ pub const SETTINGS: &[SettingSpec] = &[
         },
         default: SettingValue::Integer(0),
         doc: "Retry budget for servers that omit their own.",
+    },
+    SettingSpec {
+        path: "team.checkpoint_grace_percent",
+        kind: SettingKind::Integer {
+            minimum: 100,
+            maximum: 1_000,
+        },
+        default: SettingValue::Integer(DEFAULT_CHECKPOINT_GRACE_PERCENT),
+        doc: "Share of the span a worker promised its next checkpoint in, as a percentage, before the checkpoint counts as overdue.",
     },
 ];
 
@@ -825,6 +844,27 @@ impl From<&ResolvedSettings> for SubagentSettings {
             check_interval: size_setting(resolved, "subagents.check_interval"),
             max_concurrency: size_setting(resolved, "subagents.max_concurrency"),
             max_output_chars: size_setting(resolved, "subagents.max_output_chars"),
+        }
+    }
+}
+
+/// Team-mode thresholds as configured. The coordinator's timer wheel reads the
+/// grace; converting it into a deadline is the daemon's, not this crate's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TeamSettings {
+    pub checkpoint_grace_percent: i64,
+}
+
+impl Default for TeamSettings {
+    fn default() -> Self {
+        Self::from(&ResolvedSettings::default())
+    }
+}
+
+impl From<&ResolvedSettings> for TeamSettings {
+    fn from(resolved: &ResolvedSettings) -> Self {
+        Self {
+            checkpoint_grace_percent: integer_setting(resolved, "team.checkpoint_grace_percent"),
         }
     }
 }

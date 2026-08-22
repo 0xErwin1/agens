@@ -805,3 +805,180 @@ fn event_types(store: &ControlPlaneStore, run_id: i64) -> Vec<String> {
         .map(|event| event.event_type)
         .collect()
 }
+
+#[test]
+fn only_capped_providers_whose_reset_has_arrived_are_due() {
+    let directory = data_directory();
+    let mut store = ControlPlaneStore::open(&directory).unwrap();
+
+    store
+        .record_provider(&ProviderRow {
+            provider: "anthropic".to_owned(),
+            quota_state: QuotaState::Capped,
+            reset_at: Some(1_700_000_100),
+            updated_at: 1_700_000_000,
+        })
+        .unwrap();
+    store
+        .record_provider(&ProviderRow {
+            provider: "openai".to_owned(),
+            quota_state: QuotaState::Capped,
+            reset_at: Some(1_700_000_900),
+            updated_at: 1_700_000_000,
+        })
+        .unwrap();
+    store
+        .record_provider(&ProviderRow {
+            provider: "google".to_owned(),
+            quota_state: QuotaState::Capped,
+            reset_at: None,
+            updated_at: 1_700_000_000,
+        })
+        .unwrap();
+    store
+        .record_provider(&ProviderRow {
+            provider: "moonshot".to_owned(),
+            quota_state: QuotaState::Ok,
+            reset_at: Some(1_700_000_100),
+            updated_at: 1_700_000_000,
+        })
+        .unwrap();
+
+    let due: Vec<String> = store
+        .providers_due(1_700_000_100)
+        .unwrap()
+        .into_iter()
+        .map(|provider| provider.provider)
+        .collect();
+
+    assert_eq!(due, vec!["anthropic".to_owned()]);
+}
+
+#[test]
+fn runs_are_listed_by_state_across_every_repository() {
+    let directory = data_directory();
+    let mut store = ControlPlaneStore::open(&directory).unwrap();
+
+    let mut parked = draft_run();
+    parked.state = RunState::AwaitingQuota;
+    let parked_id = store.insert_run(&parked).unwrap();
+
+    let mut elsewhere = draft_run();
+    elsewhere.repo_id = "ffffffffffffffff".to_owned();
+    elsewhere.state = RunState::AwaitingQuota;
+    let elsewhere_id = store.insert_run(&elsewhere).unwrap();
+
+    let mut running = draft_run();
+    running.state = RunState::Running;
+    store.insert_run(&running).unwrap();
+
+    let parked_ids: Vec<Option<i64>> = store
+        .runs_in_state(RunState::AwaitingQuota)
+        .unwrap()
+        .into_iter()
+        .map(|run| run.id)
+        .collect();
+
+    assert_eq!(parked_ids, vec![Some(parked_id), Some(elsewhere_id)]);
+}
+
+#[test]
+fn questions_past_their_expiry_exclude_settled_and_undated_ones() {
+    let directory = data_directory();
+    let mut store = ControlPlaneStore::open(&directory).unwrap();
+    let run_id = store.insert_run(&draft_run()).unwrap();
+
+    let open_and_overdue = store
+        .insert_question(&question_row(
+            run_id,
+            QuestionKind::Approval,
+            QuestionState::Open,
+            Some(1_700_000_100),
+        ))
+        .unwrap();
+    let answered_and_overdue = store
+        .insert_question(&question_row(
+            run_id,
+            QuestionKind::Approval,
+            QuestionState::Answered,
+            Some(1_700_000_050),
+        ))
+        .unwrap();
+    store
+        .insert_question(&question_row(
+            run_id,
+            QuestionKind::Question,
+            QuestionState::Open,
+            Some(1_700_000_900),
+        ))
+        .unwrap();
+    store
+        .insert_question(&question_row(
+            run_id,
+            QuestionKind::Question,
+            QuestionState::Open,
+            None,
+        ))
+        .unwrap();
+    store
+        .insert_question(&question_row(
+            run_id,
+            QuestionKind::Approval,
+            QuestionState::Delivered,
+            Some(1_700_000_050),
+        ))
+        .unwrap();
+
+    let overdue: Vec<Option<i64>> = store
+        .questions_past_expiry(1_700_000_100)
+        .unwrap()
+        .into_iter()
+        .map(|question| question.id)
+        .collect();
+
+    assert_eq!(
+        overdue,
+        vec![Some(open_and_overdue), Some(answered_and_overdue)]
+    );
+}
+
+#[test]
+fn one_type_of_event_can_be_read_back_on_its_own() {
+    let directory = data_directory();
+    let mut store = ControlPlaneStore::open(&directory).unwrap();
+    let run_id = store.insert_run(&draft_run()).unwrap();
+
+    store.append_event(&event(run_id, "checkpoint")).unwrap();
+    store.append_event(&event(run_id, "turn_ended")).unwrap();
+    let last_checkpoint = store.append_event(&event(run_id, "checkpoint")).unwrap();
+
+    let checkpoints = store.events_of_type_for_run(run_id, "checkpoint").unwrap();
+
+    assert_eq!(checkpoints.len(), 2);
+    assert_eq!(checkpoints.last().unwrap().id, Some(last_checkpoint));
+}
+
+fn question_row(
+    run_id: i64,
+    kind: QuestionKind,
+    state: QuestionState,
+    expires_at: Option<i64>,
+) -> QuestionRow {
+    let answered = matches!(state, QuestionState::Answered | QuestionState::Delivered);
+
+    QuestionRow {
+        id: None,
+        run_id,
+        kind,
+        blocked_decision: "merge the branch".to_owned(),
+        options: "[\"yes\",\"no\"]".to_owned(),
+        recommendation: None,
+        answer: answered.then(|| "yes".to_owned()),
+        author: answered.then_some(QuestionAuthor::User),
+        expires_at,
+        tree_hash: (kind == QuestionKind::Approval).then(|| "c0ffee".repeat(6)),
+        paths_digest: (kind == QuestionKind::Approval).then(|| "d1ge57".repeat(6)),
+        state,
+        created_at: 1_700_000_000,
+    }
+}
