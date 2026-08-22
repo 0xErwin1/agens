@@ -14,6 +14,7 @@ pub mod grpc;
 mod ingest;
 mod instance;
 mod introspection;
+mod policy;
 mod ports;
 mod scheduler;
 mod sessions;
@@ -29,10 +30,11 @@ pub use api::{
     AdmissionState, AnswerQuestion, AnsweredQuestion, ApiCore, ApiError, ApprovePlan,
     AuthorizeMerge, CleaningAction, CleaningDisposition, CreateRun, CreatedRun, Delivery,
     DeliveryGrain, DeliveryPayload, DeliveryQueue, DetailQuestionRefusal, EventFeed, EventFilter,
-    InboxItem, InboxView, OPERATION_AUTHORIZATION, Operation, OperationAuthorization, PortError,
-    Ports, ProvisionedWorktree, RepositoryIdentity, RetryRequest, RunRef, RunSummary, RunView,
-    SchedulerPort, SessionControl, StopRequest, StopScope, Subscription, TakeoverHandle,
-    TreeSnapshot, WorktreeDerivation, WorktreeGate, WorktreeRequest, praetor_may_answer,
+    HookPolicy, InboxItem, InboxView, OPERATION_AUTHORIZATION, Operation, OperationAuthorization,
+    PortError, Ports, PreparedRun, ProvisionedWorktree, RepositoryIdentity, RetryRequest, RunRef,
+    RunSummary, RunView, SchedulerPort, SessionControl, StopRequest, StopScope, Subscription,
+    TakeoverHandle, TreeSnapshot, WorktreeDerivation, WorktreeGate, WorktreeRequest,
+    praetor_may_answer,
 };
 pub use blocking::{BlockingBoundary, BlockingError};
 pub use coordinator::{
@@ -58,6 +60,7 @@ pub use ingest::{
 };
 pub use instance::{ServeInstance, ServeInstanceError, socket_path};
 pub use introspection::{Clock, RunIntrospection};
+pub use policy::{HookTrust, PendingHookTrust, PolicyError, PolicyStore, RepositoryPolicy};
 pub use ports::{
     Admissions, GitWorktreeGate, JournalFeed, RunDeliveries, SupervisedSessions, run_mailbox,
 };

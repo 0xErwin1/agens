@@ -41,6 +41,7 @@ use agens_tools::SessionWorktrees;
 use crate::api::{ApiCore, Ports};
 use crate::fsm::StateMachines;
 use crate::ingest::{FactReceiver, FactSender, Ingest, channel as ingest_channel};
+use crate::policy::{PolicyStore, RepositoryPolicy};
 use crate::ports::{
     Admissions, GitWorktreeGate, JournalFeed, RunDeliveries, SupervisedSessions, run_mailbox,
 };
@@ -156,12 +157,17 @@ impl Coordinator {
         let machines = StateMachines::new(open_control_plane(data_directory)?);
         let admissions = Arc::new(Admissions::new());
         let feed = Arc::new(JournalFeed::new());
+        let policy = Arc::new(
+            PolicyStore::open(data_directory)
+                .map_err(|error| CoordinatorError::opening("the repository policy", error))?,
+        );
 
         let ports = Ports {
             scheduler: Arc::clone(&admissions) as Arc<dyn crate::api::SchedulerPort>,
             worktrees: Arc::new(GitWorktreeGate::new(
                 SessionWorktrees::new(data_directory),
                 settings.main_ref.clone(),
+                policy.hook_exports(),
             )),
             delivery: Arc::new(RunDeliveries::new(
                 DirectiveStore::open(data_directory)
@@ -174,7 +180,11 @@ impl Coordinator {
             feed: Arc::clone(&feed) as Arc<dyn crate::api::EventFeed>,
         };
 
-        let core = Arc::new(Mutex::new(ApiCore::new(machines, ports)));
+        let core = Arc::new(Mutex::new(ApiCore::new(
+            machines,
+            ports,
+            policy as Arc<dyn RepositoryPolicy>,
+        )));
         let (facts, reports) = ingest_channel();
         let stopping = Arc::new(AtomicBool::new(false));
 

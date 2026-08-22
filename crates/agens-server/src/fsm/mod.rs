@@ -211,6 +211,20 @@ impl StateMachines {
         self.store.insert_run(run)
     }
 
+    /// Opens a question against a run that no transition asked for.
+    ///
+    /// Not a transition, for the same reason [`Self::open_run`] is not: there
+    /// is no question row yet, so there is no state to guard. The run machine's
+    /// `ask` remains the only way a *running* run parks on one — this exists
+    /// for the question a run is created with, where nothing is parked and
+    /// nothing moves.
+    pub fn open_question(
+        &mut self,
+        question: &QuestionRow,
+    ) -> Result<i64, agens_store::ControlPlaneError> {
+        self.store.insert_question(question)
+    }
+
     /// Journals facts that no transition carries, in one transaction and in the
     /// order given.
     ///

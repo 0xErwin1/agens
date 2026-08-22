@@ -238,6 +238,15 @@ fn the_daemon_executes_a_run_through_a_real_turn_that_checkpoints_asks_and_finis
     );
     let bootstrap = bootstrap(&dependencies).expect("the production bootstrap is valid");
 
+    // The daemon serves the checkouts its operator wrote down, and nothing
+    // else: a repository nobody named is a repository whose hooks it would be
+    // executing on a caller's say-so.
+    std::fs::write(
+        data_directory.join("worktree-policy.toml"),
+        format!("project_roots = [\"{}\"]\n", checkout.display()),
+    )
+    .expect("write the daemon's repository policy");
+
     let shutdown = HeadlessTurnCancellation::new();
     let socket = agens_server::socket_path(&data_directory);
     let stopper = Stopper(shutdown.clone());

@@ -12,6 +12,7 @@ use agens_store::{
     QuestionAuthor, QuestionKind, QuestionRow, RetryTrigger, RunRow, RunState, WorktreeStatus,
 };
 
+use super::runs::HOOK_TRUST_GRANT;
 use super::{ApiCore, ApiError, Operation, praetor_may_answer};
 use crate::api::ports::{Delivery, DeliveryPayload, StopScope, TakeoverHandle};
 use crate::fsm::{
@@ -181,6 +182,16 @@ impl ApiCore {
             ));
         }
 
+        if principal == Principal::Praetor && self.policy().is_pending(request.question_id) {
+            return Err(self.refuse(
+                Operation::AnswerQuestion,
+                principal,
+                Some(question.run_id),
+                request.now,
+                "authorizing a repository's provisioning hooks is the user's alone".to_owned(),
+            ));
+        }
+
         if principal == Principal::Praetor
             && let Err(refusal) = praetor_may_answer(&question, &request.answer)
         {
@@ -211,6 +222,7 @@ impl ApiCore {
         )?;
 
         self.perform_question_effects(&answered, &question, &request.answer)?;
+        self.apply_hook_trust(request.question_id, &request.answer)?;
 
         let run = self.resume_run_waiting_on(&question, request.question_id, request.now)?;
 
@@ -512,6 +524,23 @@ impl ApiCore {
                 },
             ))?;
         }
+
+        Ok(())
+    }
+
+    /// Records the operator's decision about a repository's provisioning
+    /// hooks, when the question answered was one asking for it.
+    ///
+    /// Which question that was is looked up rather than read out of the
+    /// answer's prose: the policy remembers what it asked, so a question whose
+    /// text a client reproduces cannot grant anything.
+    ///
+    /// Anything but a verbatim `trust` is a refusal. An answer that was meant
+    /// to authorize and did not is a hook that does not run, which is the
+    /// direction a misread should fail in.
+    fn apply_hook_trust(&self, question_id: i64, answer: &str) -> Result<(), ApiError> {
+        self.policy()
+            .resolve_pending(question_id, answer.trim() == HOOK_TRUST_GRANT)?;
 
         Ok(())
     }

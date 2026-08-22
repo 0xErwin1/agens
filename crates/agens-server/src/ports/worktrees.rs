@@ -13,7 +13,9 @@
 //! of one worktree is.
 
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
+use agens_core::redaction::{bounded_detail, redact_absolute_paths, redact_credential_values};
 use agens_store::RunRow;
 use agens_tools::{
     HookAuthorization, HookAuthorizationRequest, HookFailure, HookFailureResponse,
@@ -22,8 +24,8 @@ use agens_tools::{
 };
 
 use crate::api::{
-    PortError, ProvisionedWorktree, RepositoryIdentity, WorktreeDerivation, WorktreeGate,
-    WorktreeRequest,
+    HookPolicy, PortError, ProvisionedWorktree, RepositoryIdentity, WorktreeDerivation,
+    WorktreeGate, WorktreeRequest,
 };
 use crate::gates::receipt_of;
 
@@ -32,9 +34,22 @@ use crate::gates::receipt_of;
 /// machine never collide, short enough to read in a path and a log line.
 const FINGERPRINT_CHARS: usize = 16;
 
+/// How much of a hook's own output travels to the caller and the feed.
+///
+/// A hook is repository code run with the daemon's environment, so what it
+/// prints is neither trusted nor small by construction. It is redacted first
+/// and bounded second: the point of the record is to tell a worker which hook
+/// left the environment half-built, not to reproduce a build log.
+const MAX_HOOK_OUTPUT_CHARS: usize = 1_024;
+
 /// Git derivation and disposal over the daemon's own worktree service.
 pub struct GitWorktreeGate {
     worktrees: SessionWorktrees,
+    /// The environment names a hook may export, as the operator wrote them.
+    /// Held here rather than read per call because it is policy, and a
+    /// provisioning that consulted a moving list would apply a different one to
+    /// each hook of the same run.
+    hook_exports: Vec<String>,
     /// The branch a run's work is measured against. Configuration, so it is
     /// held here rather than read from a request: a caller that named its own
     /// target could have a branch declared merged into something nobody
@@ -44,9 +59,14 @@ pub struct GitWorktreeGate {
 
 impl GitWorktreeGate {
     #[must_use]
-    pub fn new(worktrees: SessionWorktrees, main_ref: impl Into<String>) -> Self {
+    pub fn new(
+        worktrees: SessionWorktrees,
+        main_ref: impl Into<String>,
+        hook_exports: Vec<String>,
+    ) -> Self {
         Self {
             worktrees,
+            hook_exports,
             main_ref: main_ref.into(),
         }
     }
@@ -119,7 +139,10 @@ impl WorktreeGate for GitWorktreeGate {
             )
             .map_err(|error| PortError::new("worktrees", error.to_string()))?;
 
+        let decisions = CoordinatorProvisioning::new(request.hooks);
+
         let outcome = WorktreeProvisioner::new(self.worktrees.clone())
+            .with_export_allowlist(self.hook_exports.clone())
             .provision(
                 &ProvisioningRequest {
                     repository: request.repository,
@@ -127,22 +150,24 @@ impl WorktreeGate for GitWorktreeGate {
                     name: request.name,
                     branch: request.branch,
                 },
-                &CoordinatorProvisioning,
+                &decisions,
             )
             .map_err(|error| PortError::new("worktrees", error.to_string()))?;
 
         match outcome {
             ProvisioningOutcome::NotDeclared => Ok(ProvisionedWorktree {
                 path,
-                hook_failures: Vec::new(),
+                ..ProvisionedWorktree::default()
             }),
             ProvisioningOutcome::Applied(report) => Ok(ProvisionedWorktree {
                 path,
                 hook_failures: report
                     .failures
                     .iter()
-                    .map(|failure| format!("{}: {}", failure.name, failure.output))
+                    .map(|failure| format!("{}: {}", failure.name, hook_output(&failure.output)))
                     .collect(),
+                declared_hooks: decisions.declared(),
+                hooks_ran: report.hooks_authorized && !decisions.declared().is_empty(),
             }),
             // The worktree and its branch are already gone, so the run has
             // nothing to be created against.
@@ -150,7 +175,8 @@ impl WorktreeGate for GitWorktreeGate {
                 "worktrees",
                 format!(
                     "the repository's provisioning hook {} did not succeed: {}",
-                    failure.name, failure.output
+                    failure.name,
+                    hook_output(&failure.output)
                 ),
             )),
         }
@@ -182,19 +208,60 @@ fn worktree_path(run: &RunRow) -> Result<PathBuf, PortError> {
 /// The two decisions provisioning refuses to make for itself, as the daemon
 /// answers them.
 ///
-/// Hooks are allowed because a repository declares its contract in its own
-/// tree, and there is nobody at a terminal for a daemon to ask. A failure is
-/// continued past rather than aborted on, because a worktree thrown away over
-/// one hook costs the run everything and tells the worker nothing: the failure
-/// travels to it instead.
-struct CoordinatorProvisioning;
+/// Authorization is not decided here: it arrives with the request, already
+/// settled by the core against the operator's policy and the principal that
+/// asked. What this adds is the record of what was on offer, because a hook
+/// that never ran is still a hook the repository declared, and that list is
+/// what the operator is eventually shown.
+///
+/// A failure is continued past rather than aborted on, because a worktree
+/// thrown away over one hook costs the run everything and tells the worker
+/// nothing: the failure travels to it instead.
+struct CoordinatorProvisioning {
+    policy: HookPolicy,
+    declared: Mutex<Vec<String>>,
+}
+
+impl CoordinatorProvisioning {
+    const fn new(policy: HookPolicy) -> Self {
+        Self {
+            policy,
+            declared: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// The hooks the contract declared, in the order they would have run.
+    fn declared(&self) -> Vec<String> {
+        self.declared
+            .lock()
+            .map(|declared| declared.clone())
+            .unwrap_or_default()
+    }
+}
 
 impl ProvisioningDecisions for CoordinatorProvisioning {
-    fn authorize(&self, _request: &HookAuthorizationRequest<'_>) -> HookAuthorization {
-        HookAuthorization::Allow
+    fn authorize(&self, request: &HookAuthorizationRequest<'_>) -> HookAuthorization {
+        if let Ok(mut declared) = self.declared.lock() {
+            declared.clear();
+            declared.extend(request.hooks.iter().map(|hook| hook.name.clone()));
+        }
+
+        match self.policy {
+            HookPolicy::Allow => HookAuthorization::Allow,
+            HookPolicy::Ask | HookPolicy::Deny => HookAuthorization::Deny,
+        }
     }
 
     fn on_hook_failure(&self, _failure: &HookFailure) -> HookFailureResponse {
         HookFailureResponse::Continue
     }
+}
+
+/// A hook's own output, with credentials and host paths removed and the rest
+/// bounded, before it reaches a caller or the feed.
+fn hook_output(output: &str) -> String {
+    bounded_detail(
+        &redact_absolute_paths(&redact_credential_values(output)),
+        MAX_HOOK_OUTPUT_CHARS,
+    )
 }

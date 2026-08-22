@@ -47,7 +47,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use tonic::Status;
 
-use crate::api::{ApiCore, ApiError};
+use crate::api::{ApiCore, ApiError, CreateRun, CreatedRun};
 use crate::blocking::{BlockingBoundary, BlockingError};
 use crate::fsm::{Principal, TransitionRejection};
 
@@ -115,6 +115,57 @@ impl CoreHandle {
 
         outcome.map_err(status_from_api)
     }
+
+    /// Creates a run without holding the core across the provisioning it
+    /// implies.
+    ///
+    /// The core is taken twice — once to decide, once to write the row — and is
+    /// released for the step between them, which creates the worktree and runs
+    /// whatever the repository declared. That step is bounded by the
+    /// repository's own timeouts and may legitimately take minutes; the
+    /// admission loop, the timer wheel and every other request wait on this
+    /// same lock, so holding it there would stop the daemon for as long as one
+    /// caller's hooks felt like running.
+    async fn create_run(&self, request: CreateRun) -> Result<CreatedRun, Status> {
+        let prepared = self
+            .call({
+                let request = request.clone();
+
+                move |core, principal, _| core.prepare_run(principal, &request)
+            })
+            .await?;
+
+        let worktrees = {
+            let core = self.core.lock().map_err(|_| poisoned())?;
+
+            Arc::clone(&core.ports().worktrees)
+        };
+
+        let provisioned = {
+            let prepared = prepared.clone();
+            let start_point = request.start_point.clone();
+
+            self.blocking
+                .run(move || {
+                    worktrees
+                        .provision(&prepared.worktree_request(&start_point))
+                        .map_err(ApiError::Port)
+                })
+                .await
+                .map_err(status_from_blocking)?
+                .map_err(status_from_api)?
+        };
+
+        self.call(move |core, _, _| core.open_run(&request, &prepared, provisioned))
+            .await
+    }
+}
+
+/// A poisoned core means a previous operation panicked while holding it, so
+/// what the control plane's invariants rest on was established by code that
+/// did not finish.
+fn poisoned() -> Status {
+    Status::internal("the service core is unusable after a failed operation")
 }
 
 /// Epoch seconds, from the machine the daemon runs on.
