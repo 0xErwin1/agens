@@ -504,7 +504,7 @@ fn run_tui_model_effort_provider_case(
         BTreeMap::from([(
             config_home.join("config.toml"),
             format!(
-                "[provider]\ntype = \"{provider_type}\"\nmodel = \"gpt-4.1\"\nbase_url = \"http://{address}\"\n\n[options]\ndata_dir = \"{}\"\n",
+                "[provider]\nmodel = \"{provider_type}/gpt-4.1\"\nbase_url = \"http://{address}\"\n\n[options]\ndata_dir = \"{}\"\n",
                 data_directory.display()
             ),
         )]),

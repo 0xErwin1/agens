@@ -166,8 +166,8 @@ impl ModelSource {
         Self::MoonshotApi,
     ];
 
-    /// The `provider.type` value that selects this source, and the prefix a
-    /// [`QualifiedModel`] names it by.
+    /// The identifier this source is named by, and the prefix a
+    /// [`QualifiedModel`] qualifies a model with.
     pub const fn provider_type(self) -> &'static str {
         match self {
             Self::OpenAiApi => "openai-api",
@@ -655,25 +655,43 @@ pub fn parse_models(snapshot: &[u8]) -> Result<Vec<ModelMetadata>, ModelRegistry
     Ok(models)
 }
 
-pub fn format_models(models: &[ModelMetadata]) -> String {
-    if models.is_empty() {
+/// Every provider's catalog, each model under the identifier that names it.
+///
+/// A source whose snapshot cannot be read is omitted rather than failing the
+/// whole listing: one unreadable catalog should not hide the others.
+pub fn every_source_models() -> Vec<(ModelSource, Vec<ModelMetadata>)> {
+    ModelSource::ALL
+        .into_iter()
+        .filter_map(|source| source_models(source).ok().map(|models| (source, models)))
+        .collect()
+}
+
+/// Renders the catalog with each model under its qualified identifier.
+///
+/// Qualified rather than bare because the listing is what a user copies into
+/// `provider.model`, and a bare `gpt-5.5` does not say which provider serves it.
+pub fn format_qualified_models(catalog: &[(ModelSource, Vec<ModelMetadata>)]) -> String {
+    if catalog.iter().all(|(_, models)| models.is_empty()) {
         return "No supported models.\n".to_owned();
     }
 
     let mut output = "ID\tNAME\tCONTEXT\tPRICE\n".to_owned();
-    for model in models {
-        let name = model.name.as_deref().unwrap_or("-");
-        let context = model
-            .context
-            .map(|context| context.to_string())
-            .unwrap_or_else(|| "-".to_owned());
-        let input = format_price(model.input_price);
-        let output_price = format_price(model.output_price);
+    for (source, models) in catalog {
+        for model in models {
+            let name = model.name.as_deref().unwrap_or("-");
+            let context = model
+                .context
+                .map(|context| context.to_string())
+                .unwrap_or_else(|| "-".to_owned());
+            let input = format_price(model.input_price);
+            let output_price = format_price(model.output_price);
 
-        output.push_str(&format!(
-            "{}\t{name}\t{context}\t{input}/{output_price}\n",
-            model.id
-        ));
+            output.push_str(&format!(
+                "{}/{}\t{name}\t{context}\t{input}/{output_price}\n",
+                source.provider_type(),
+                model.id
+            ));
+        }
     }
 
     output
@@ -752,22 +770,9 @@ pub fn default_model(provider_type: Option<&str>) -> Option<&'static str> {
     }
 }
 
-/// The provider identifiers [`default_model`] resolves, for error messages that
+/// The provider identifiers a qualified model may name, for error messages that
 /// tell the user what they may write instead of what they wrote.
 pub const KNOWN_PROVIDER_TYPES: [&str; 3] = ["openai-api", "openai-chatgpt", "moonshotai"];
-
-/// Explains a [`default_model`] miss in the terms the user can act on: what they
-/// configured, and what the accepted values are.
-pub fn unknown_provider_message(provider_type: Option<&str>) -> String {
-    let valid = KNOWN_PROVIDER_TYPES.join(", ");
-
-    match provider_type {
-        Some(configured) if !configured.is_empty() => {
-            format!("provider.type \"{configured}\" is not supported; valid values are {valid}")
-        }
-        _ => format!("provider.type is not configured; valid values are {valid}"),
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -823,7 +828,7 @@ mod tests {
 
     #[test]
     fn formats_four_columns_and_an_explicit_empty_result() {
-        let output = crate::format_models(&[
+        let models = vec![
             crate::ModelMetadata {
                 id: "missing".to_owned(),
                 name: None,
@@ -848,13 +853,40 @@ mod tests {
                 input_modalities: Vec::new(),
                 input_mimes: Vec::new(),
             },
-        ]);
+        ];
+        let output =
+            crate::format_qualified_models(&[(crate::ModelSource::MoonshotApi, models.clone())]);
 
         assert_eq!(
             output,
-            "ID\tNAME\tCONTEXT\tPRICE\nmissing\t-\t-\t-/$0.60\nknown\tKnown\t128000\t$2.50/$10.00\n"
+            "ID\tNAME\tCONTEXT\tPRICE\nmoonshotai/missing\t-\t-\t-/$0.60\nmoonshotai/known\tKnown\t128000\t$2.50/$10.00\n"
         );
-        assert_eq!(crate::format_models(&[]), "No supported models.\n");
+        assert_eq!(
+            crate::format_qualified_models(&[(crate::ModelSource::MoonshotApi, Vec::new())]),
+            "No supported models.\n"
+        );
+        assert_eq!(
+            crate::format_qualified_models(&[]),
+            "No supported models.\n"
+        );
+    }
+
+    /// Every provider's catalog is listed, and every row carries the prefix that
+    /// says which provider serves it.
+    #[test]
+    fn every_source_is_listed_under_its_own_prefix() {
+        let catalog = crate::every_source_models();
+
+        assert_eq!(catalog.len(), crate::ModelSource::ALL.len());
+
+        let rendered = crate::format_qualified_models(&catalog);
+        for source in crate::ModelSource::ALL {
+            assert!(
+                rendered.contains(&format!("{}/", source.provider_type())),
+                "{} is missing from the listing",
+                source.provider_type()
+            );
+        }
     }
 
     #[test]

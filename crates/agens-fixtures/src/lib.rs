@@ -63,9 +63,11 @@ fn configured_provider(global: Option<&str>) -> &'static str {
         return "openai-api";
     };
 
+    // A provider is named by a qualified model identifier now, so the prefix is
+    // what a fragment carries.
     ["openai-chatgpt", "moonshotai", "openai-api"]
         .into_iter()
-        .find(|provider| global.contains(&format!("\"{provider}\"")))
+        .find(|provider| global.contains(&format!("\"{provider}/")))
         .unwrap_or("openai-api")
 }
 
@@ -85,9 +87,11 @@ fn provider_credentials(provider: &str) -> String {
     }
 }
 
+/// A configuration naming the provider the only way one can be named: through
+/// the model identifier.
 fn provider_configuration(provider: &str, model: &str, data_directory: &Path) -> String {
     format!(
-        "[provider]\ntype = \"{provider}\"\nmodel = \"{model}\"\n\n[options]\ndata_dir = \"{}\"\n",
+        "[provider]\nmodel = \"{provider}/{model}\"\n\n[options]\ndata_dir = \"{}\"\n",
         data_directory.display()
     )
 }
@@ -183,8 +187,8 @@ pub fn session_directory(label: &str) -> PathBuf {
     temporary
 }
 
-/// A `Bootstrap` fixture with several providers authenticated and no
-/// `provider.type` at all, so the provider can only come from the model.
+/// A `Bootstrap` fixture with several providers authenticated, so a bare model
+/// identifier several of them serve is genuinely ambiguous.
 pub fn session_bootstrap_from_credentials(
     temporary: &Path,
     agents: &[(&str, &str)],
@@ -285,11 +289,10 @@ pub fn session_bootstrap_for_provider(
     .expect("session bootstrap fixture should be valid")
 }
 
-/// A `Bootstrap` fixture with no `provider.type` configured at all.
+/// A `Bootstrap` fixture with no configured model and no credentials.
 ///
-/// The state a run is in before any provider is chosen: provider-dependent
-/// lookups decline rather than resolve, so a test can exercise that path
-/// without inventing a provider identifier the configuration would reject.
+/// The state a run is in before any provider can be resolved: provider-dependent
+/// lookups decline rather than resolve, so a test can exercise that path.
 pub fn session_bootstrap_without_provider(temporary: &Path, agents: &[(&str, &str)]) -> Bootstrap {
     let config_home = temporary.join("config");
     let agents_directory = config_home.join("agents");

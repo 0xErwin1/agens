@@ -1,6 +1,6 @@
 //! Opening a dialog and acting on what a person picked in it.
 
-use agens_session::model::{current_provider, model_source, resolved_provider};
+use agens_session::model::{current_provider, effective_model, model_source, resolved_provider};
 
 use agens_core::{AttemptKey, RecoveryOutcome};
 use agens_store::{SessionCursor, SessionStore};
@@ -142,13 +142,7 @@ impl TuiRuntimeRouter {
                     .session
                     .lock()
                     .map_err(|_| CliError::storage("TUI session is unavailable"))?;
-                let current = context
-                    .selection
-                    .as_ref()
-                    .map(ModelSelection::model)
-                    .or_else(|| bootstrap.model())
-                    .unwrap_or_else(|| resolved_provider(&bootstrap, &context).default_model())
-                    .to_owned();
+                let current = effective_model(&bootstrap, &context);
                 let active = resolved_provider(&bootstrap, &context);
                 drop(context);
 
@@ -165,22 +159,23 @@ impl TuiRuntimeRouter {
                             selected = entries.len();
                         }
 
+                        let qualified = format!("{}/{}", provider.identifier(), model.id);
                         let label = if is_current {
                             format!("{} · {} (current)", model.id, provider.label())
                         } else {
                             format!("{} · {}", model.id, provider.label())
                         };
 
+                        // The qualified identifier is what a person writes into
+                        // `provider.model` or `[agents.*].model`, so it belongs
+                        // in the row's own detail and in what a search matches.
+                        // It stays out of the label, where at a narrow width the
+                        // prefix would push the model's own name off the line.
                         entries.push(DialogEntry::action_with_metadata(
                             label,
                             format_model_metadata(&model),
-                            format!(
-                                "{} {} {}",
-                                model.id,
-                                provider.identifier(),
-                                provider.label()
-                            ),
-                            format_model_metadata(&model),
+                            format!("{qualified} {} {}", provider.identifier(), provider.label()),
+                            format!("{qualified}\n{}", format_model_metadata(&model)),
                             format!("model:{}:{}", provider.identifier(), model.id),
                         ));
                     }
@@ -204,14 +199,9 @@ impl TuiRuntimeRouter {
                     .session
                     .lock()
                     .map_err(|_| CliError::storage("TUI session is unavailable"))?;
-                let model = context
-                    .selection
-                    .as_ref()
-                    .map(ModelSelection::model)
-                    .or_else(|| bootstrap.model())
-                    .unwrap_or_else(|| resolved_provider(&bootstrap, &context).default_model());
+                let model = effective_model(&bootstrap, &context);
                 let selector = context.selection.clone().unwrap_or_else(|| {
-                    ModelSelection::for_source(model, model_source(&bootstrap, &context))
+                    ModelSelection::for_source(&model, model_source(&bootstrap, &context))
                 });
                 let current = selector.reasoning_effort().unwrap_or("default");
                 let values = selector.reasoning_effort_values();
@@ -763,7 +753,19 @@ impl TuiRuntimeRouter {
                         None => apply_tui_model(&bootstrap, selection, &self.session)?,
                     }
                 } else if let Some(model) = action_id.strip_prefix("model-custom:") {
-                    apply_tui_unverified_model(&bootstrap, model, &self.session)?
+                    // The picker lists qualified identifiers, so a typed one
+                    // arrives qualified too, and switching provider has to go
+                    // through the credential check rather than around it.
+                    match model
+                        .split_once('/')
+                        .and_then(|(prefix, bare)| Some((ProviderKind::parse(prefix)?, bare)))
+                    {
+                        Some((provider, bare)) => {
+                            self.apply_provider(&bootstrap, provider.identifier())?;
+                            apply_tui_unverified_model(&bootstrap, bare, &self.session)?
+                        }
+                        None => apply_tui_unverified_model(&bootstrap, model, &self.session)?,
+                    }
                 } else if let Some(provider) = action_id.strip_prefix("provider:") {
                     self.apply_provider(&bootstrap, provider)?
                 } else if let Some(effort) = action_id.strip_prefix("effort:") {
@@ -959,16 +961,20 @@ impl TuiRuntimeRouter {
         for provider in providers_with_active_first(active) {
             let selector = ModelSelection::for_source(provider.default_model(), provider.source());
             for model in selector.models().map_err(CliError::unavailable)? {
+                // Qualified, not bare: a profile is read back without the
+                // session that produced it, and a bare identifier another
+                // provider also serves would resolve somewhere else.
+                let qualified = format!("{}/{}", provider.identifier(), model.id);
                 entries.push(DialogEntry::safe_action(
-                    format!("{} · {}", model.id, provider.label()),
-                    format!("subagent-profiles:set-model:{name}:{}", model.id),
+                    qualified.clone(),
+                    format!("subagent-profiles:set-model:{name}:{qualified}"),
                 ));
             }
         }
         Ok(TuiSubmissionOutcome::Dialog(
             DialogView::selection(
                 "Choose profile model",
-                Some("Active provider catalog · Esc back"),
+                Some("Every provider · Esc back"),
                 entries,
             )
             .with_cancellation_action("subagent-profiles:back"),

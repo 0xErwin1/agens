@@ -24,8 +24,8 @@ use agens_bootstrap::Bootstrap;
 use agens_bootstrap::discover_skill_catalog;
 use agens_dispatch::RegisteredNativeTool;
 use agens_error::CliError;
-use agens_models::{default_model, unknown_provider_message};
 use agens_permissions::SharedToolDispatcher;
+use agens_session::provider::{bootstrap_authentication, resolve_provider_for_model};
 
 /// Converts configured tool bounds into the runtime shape the tools crate owns.
 pub fn native_tool_limits(settings: ToolLimitSettings) -> agens_tools::NativeToolLimits {
@@ -118,13 +118,15 @@ pub fn production_tool_runtime_with_task_runner<R: TaskRunner>(
     skills: Option<&SkillCatalog>,
     task_runner: R,
 ) -> Result<(Vec<OpenAiFunctionTool>, SharedToolDispatcher), CliError> {
+    // The provider comes from the model, so an absent model has to be resolved
+    // the same way a turn resolves one: through what this run can authenticate.
     let parent_model = match bootstrap.model() {
         Some(model) => model.to_owned(),
-        None => default_model(bootstrap.provider_type())
-            .ok_or_else(|| {
-                CliError::configuration(unknown_provider_message(bootstrap.provider_type()))
-            })?
-            .to_owned(),
+        None => {
+            resolve_provider_for_model(None, &bootstrap_authentication(bootstrap))
+                .map_err(|error| CliError::configuration(error.message()))?
+                .model
+        }
     };
     production_tool_runtime_with_parent_task_runner(
         bootstrap,

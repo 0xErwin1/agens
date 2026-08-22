@@ -22,7 +22,9 @@ use agens_error::CliError;
 use agens_models::ModelSelection;
 use agens_permissions::ParseToolInput;
 use agens_session::context::{ResumeDraft, SessionContext};
-use agens_session::provider::{CredentialResolver, ProviderKind};
+use agens_session::provider::{
+    CredentialResolver, ProviderKind, bootstrap_authentication, resolve_provider_for_model,
+};
 use agens_session::turns::sanitize_subagent_summary;
 
 #[cfg(any(test, feature = "test-support"))]
@@ -137,8 +139,11 @@ pub fn prepare_loaded_tui_session_resume(
     let restored_history = project_tui_history(&session.messages);
     let saved_provider = session.metadata.provider_id.as_deref();
     let provider = saved_provider.and_then(ProviderKind::parse);
-    let selection_provider =
-        provider.or_else(|| bootstrap.provider_type().and_then(ProviderKind::parse));
+    let selection_provider = provider.or_else(|| {
+        resolve_provider_for_model(bootstrap.model(), &bootstrap_authentication(bootstrap))
+            .ok()
+            .map(|resolved| resolved.provider)
+    });
     let selection = match (session.metadata.model_id.as_deref(), selection_provider) {
         (Some(model), Some(provider)) => {
             let mut selector = ModelSelection::for_source(model, provider.source());
@@ -1494,9 +1499,8 @@ mod tests {
         let bootstrap = bootstrap_from_configuration(
             label,
             Some(
-                "[provider]\ntype = \"openai-chatgpt\"\n\
-                 [agent]\ndefault_agent = \"primary\"\n\
-                 [agents.primary]\nmodel = \"gpt-5.6-sol\"\neffort = \"high\"\n",
+                "[agent]\ndefault_agent = \"primary\"\n\
+                 [agents.primary]\nmodel = \"openai-chatgpt/gpt-5.6-sol\"\neffort = \"high\"\n",
             ),
             None,
         );
@@ -1582,9 +1586,9 @@ mod tests {
         std::fs::remove_dir_all(temporary).unwrap();
     }
 
-    /// The shape this design exists for: two providers authenticated, no
-    /// `provider.type` anywhere, and each agent naming its own through its
-    /// model identifier.
+    /// The shape this design exists for: two providers authenticated, nothing
+    /// declaring one, and each agent naming its own through its model
+    /// identifier.
     #[test]
     fn an_agent_names_its_provider_with_no_global_setting_present() {
         let temporary = tui_session_directory("no-global-provider");

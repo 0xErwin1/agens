@@ -3,14 +3,14 @@
 //! seeding a fresh session from the last remembered selection, and rendering
 //! model metadata for `/model` and `/effort` command responses.
 
-use agens_session::model::{model_source, resolved_provider};
+use agens_session::model::{effective_model, model_source, resolved_provider};
 use std::sync::{Arc, Mutex};
 
 use agens_store::{ModelPreference, PreferenceStore, SessionStore};
 
 use agens_bootstrap::Bootstrap;
 use agens_error::{CliError, ExitStatus};
-use agens_models::ModelSelection;
+use agens_models::{ModelSelection, QualifiedModel};
 use agens_session::context::SessionContext;
 use agens_session::model::current_provider;
 use agens_session::provider::ProviderKind;
@@ -131,16 +131,33 @@ pub fn select_tui_model(
             .model_values()
             .map_err(CliError::unavailable)?
             .join(", ");
-        let current = context
-            .selection
-            .as_ref()
-            .map(|selection| selection.model())
-            .or_else(|| bootstrap.model())
-            .unwrap_or_else(|| resolved_provider(bootstrap, &context).default_model());
+        let current = effective_model(bootstrap, &context);
         return Ok(format!("Model: {current}. Available: {values}."));
     }
 
     apply_tui_model(bootstrap, model, session)
+}
+
+/// The bare identifier a selection is stored under, once the caller has settled
+/// which provider it belongs to.
+///
+/// A prefix naming that same provider is redundant and simply drops away; one
+/// naming another is refused here rather than silently retargeted, because
+/// switching provider goes through the credential check `apply_provider` owns.
+fn bare_identifier_for(model: &str, provider: ProviderKind) -> Result<String, CliError> {
+    let parsed = QualifiedModel::parse(model).map_err(CliError::configuration)?;
+
+    match parsed.source() {
+        Some(source) if ProviderKind::for_source(source) != provider => {
+            Err(CliError::configuration(format!(
+                "model \"{}\" names provider \"{}\"; this session speaks to \"{}\"",
+                parsed.model(),
+                source.provider_type(),
+                provider.identifier()
+            )))
+        }
+        _ => Ok(parsed.model().to_owned()),
+    }
 }
 
 pub fn apply_tui_model(
@@ -151,18 +168,20 @@ pub fn apply_tui_model(
     let mut context = session
         .lock()
         .map_err(|_| CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable"))?;
+    let provider = current_provider(bootstrap, &context)
+        .ok_or_else(|| CliError::configuration("TUI provider is unavailable"))?;
+    let model = bare_identifier_for(model, provider)?;
     let mut selector = context
         .selection
         .clone()
-        .unwrap_or_else(|| ModelSelection::for_source(model, model_source(bootstrap, &context)));
+        .unwrap_or_else(|| ModelSelection::for_source(&model, provider.source()));
     let previous_effort = selector.reasoning_effort();
     selector
-        .apply_model(model)
+        .apply_model(&model)
         .map_err(CliError::configuration)?;
     let reset_effort = previous_effort.filter(|_| selector.reasoning_effort().is_none());
-    let provider = current_provider(bootstrap, &context)
-        .ok_or_else(|| CliError::configuration("TUI provider is unavailable"))?;
     apply_tui_selection(bootstrap, &mut context, provider, selector)?;
+
     Ok(reset_effort.map_or_else(
         || format!("Model: {model}."),
         |effort| {
@@ -181,16 +200,17 @@ pub fn apply_tui_unverified_model(
     let mut context = session
         .lock()
         .map_err(|_| CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable"))?;
+    let provider = current_provider(bootstrap, &context)
+        .ok_or_else(|| CliError::configuration("TUI provider is unavailable"))?;
+    let model = bare_identifier_for(model, provider)?;
     let mut selector = context
         .selection
         .clone()
-        .unwrap_or_else(|| ModelSelection::for_source(model, model_source(bootstrap, &context)));
+        .unwrap_or_else(|| ModelSelection::for_source(&model, provider.source()));
     let reset_effort = selector.reasoning_effort().is_some();
     selector
-        .apply_unverified_model(model)
+        .apply_unverified_model(&model)
         .map_err(CliError::configuration)?;
-    let provider = current_provider(bootstrap, &context)
-        .ok_or_else(|| CliError::configuration("TUI provider is unavailable"))?;
     apply_tui_selection(bootstrap, &mut context, provider, selector)?;
 
     Ok(if reset_effort {
@@ -230,13 +250,8 @@ pub fn apply_tui_effort(
     let mut context = session
         .lock()
         .map_err(|_| CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable"))?;
-    let model = context
-        .selection
-        .as_ref()
-        .map(|selection| selection.model())
-        .or_else(|| bootstrap.model())
-        .unwrap_or_else(|| resolved_provider(bootstrap, &context).default_model());
-    let mut selector = ModelSelection::for_source(model, model_source(bootstrap, &context));
+    let model = effective_model(bootstrap, &context);
+    let mut selector = ModelSelection::for_source(&model, model_source(bootstrap, &context));
     selector
         .apply_reasoning_effort(effort)
         .map_err(CliError::configuration)?;
@@ -254,7 +269,9 @@ pub fn apply_tui_effort(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{tui_session_bootstrap, tui_session_directory};
+    use crate::test_support::{
+        tui_session_bootstrap, tui_session_bootstrap_for_provider, tui_session_directory,
+    };
 
     fn remember(bootstrap: &Bootstrap, model: &str, effort: Option<agens_core::ReasoningEffort>) {
         remember_for(
@@ -403,6 +420,31 @@ mod tests {
         std::fs::remove_dir_all(temporary).unwrap();
     }
 
+    /// A prefix naming the session's own provider is redundant and drops away;
+    /// one naming another is refused rather than silently retargeted, because
+    /// switching provider carries a credential check this path does not run.
+    #[test]
+    fn a_prefix_is_dropped_for_the_active_provider_and_refused_for_another() {
+        assert_eq!(
+            super::bare_identifier_for("moonshotai/kimi-k3", ProviderKind::Moonshot)
+                .expect("the session's own provider is redundant"),
+            "kimi-k3"
+        );
+        assert_eq!(
+            super::bare_identifier_for("kimi-k3", ProviderKind::Moonshot)
+                .expect("a bare identifier is unchanged"),
+            "kimi-k3"
+        );
+
+        let error = super::bare_identifier_for("moonshotai/kimi-k3", ProviderKind::OpenAiChatGpt)
+            .expect_err("another provider's model must not be retargeted");
+        let message = error.to_string();
+
+        assert!(message.contains("moonshotai"), "{message}");
+        assert!(message.contains("openai-chatgpt"), "{message}");
+        assert!(message.contains("kimi-k3"), "{message}");
+    }
+
     #[test]
     fn applying_a_moonshot_model_selects_kimi_k3_and_remembers_it() {
         let temporary = tui_session_directory("moonshot-model-selection");
@@ -432,9 +474,11 @@ mod tests {
     #[test]
     fn a_pick_made_under_one_source_never_seeds_a_session_on_another() {
         let temporary = tui_session_directory("remembered-selection-per-source");
-        let mut bootstrap = tui_session_bootstrap(&temporary, &[]);
+        // No configured model, so the remembered pick is what a fresh session
+        // would seed from; the provider comes from the only credential present.
+        let mut bootstrap =
+            tui_session_bootstrap_for_provider(&temporary, &[], "openai-chatgpt", "gpt-5.5");
         bootstrap.model = None;
-        bootstrap.provider_type = Some(ProviderKind::OpenAiChatGpt.identifier().to_owned());
         remember_for(
             &bootstrap,
             agens_models::ModelSource::MoonshotApi,

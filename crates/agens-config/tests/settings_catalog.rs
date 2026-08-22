@@ -216,3 +216,17 @@ fn keeps_a_valid_per_server_mcp_timeout() {
     let servers = mcp_servers(&document).expect("a positive timeout stays parseable");
     assert_eq!(servers[0].timeout_ms, 50);
 }
+
+/// A retired key is rejected by name with what replaced it, rather than as an
+/// anonymous unknown field: an existing configuration has to be told what to
+/// write instead, not only that what it has is wrong.
+#[test]
+fn rejects_a_retired_setting_by_name_with_its_replacement() {
+    let document = parse_toml_document("[provider]\ntype = \"openai-api\"\n").unwrap();
+
+    let error = validate_toml_document(&document).expect_err("a retired setting must not validate");
+    let message = error.to_string();
+
+    assert!(message.contains("provider.type"), "{message}");
+    assert!(message.contains("provider/model"), "{message}");
+}

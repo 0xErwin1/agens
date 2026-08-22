@@ -6,9 +6,9 @@ Agens is a Rust coding-agent CLI with a terminal interface, one-shot chat, guard
 
 - Interactive TUI launched by bare `agens`.
 - One-shot agent turns through `agens chat <prompt>`.
-- OpenAI Responses API access with `provider.type = "openai-api"` and `OPENAI_API_KEY` or an existing `auth.json` entry.
+- OpenAI Responses API access with `provider.model = "openai-api/<model>"` and `OPENAI_API_KEY` or an existing `auth.json` entry.
 - ChatGPT subscription Responses access with OAuth login through `agens auth login`.
-- Moonshot AI (Kimi) chat-completions access with `provider.type = "moonshotai"` and `MOONSHOT_API_KEY` or an `auth.json` entry, written by `agens auth login api-key moonshotai`.
+- Moonshot AI (Kimi) chat-completions access with `provider.model = "moonshotai/<model>"` and `MOONSHOT_API_KEY` or an `auth.json` entry, written by `agens auth login api-key moonshotai`.
 - Cancellation-only CLI turns with optional inherited deadlines and finite provider/tool operation timeouts.
 - Project-confined native tools: `read`, `write`, `list`, `search`, and bounded `bash`.
 - Permission evaluation before tool execution, including global/project TOML rules, temporary unsafe bypass, and persisted project grants. Unresolved approval requests fail closed.
@@ -37,17 +37,20 @@ For ChatGPT subscription authentication:
 For API-key authentication, set the key and select the provider in configuration:
 
 ```sh
-export OPENAI_API_KEY="..."      # provider.type = "openai-api"
-export MOONSHOT_API_KEY="..."    # provider.type = "moonshotai"
+export OPENAI_API_KEY="..."      # openai-api
+export MOONSHOT_API_KEY="..."    # moonshotai
 ```
 
 ```toml
 [provider]
-type = "openai-api"
+model = "openai-api/gpt-4.1"
 ```
 
-An unrecognized `provider.type` is rejected at startup rather than falling back to a
-default, so a typo cannot send a run to a provider you did not name.
+The model identifier is what says which provider a request goes to. A `provider/model`
+prefix names it outright. A bare identifier resolves only while exactly one
+authenticated provider serves it: with two, the run is refused by name rather than sent,
+and its spend charged, to a provider you did not name. `agens models` lists every
+provider's catalog under the identifier that names it.
 
 Run the TUI or a one-shot prompt:
 
@@ -99,8 +102,7 @@ A minimal configuration can select the provider, model, runtime limits, and perm
 
 ```toml
 [provider]
-type = "openai-chatgpt"
-model = "gpt-5.5"
+model = "openai-chatgpt/gpt-5.5"
 
 [agent]
 system_prompt = "You are a careful coding agent."

@@ -354,7 +354,7 @@ fn p1c1_p1b_authorized_runner_persists_one_completed_subagent_turn() {
                 "reviewer",
                 "review task",
                 agens_core::TuiExecutionState::ForegroundRunning,
-                Some("gpt-4.1"),
+                Some("openai-api/gpt-4.1"),
                 None,
             )),
             TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::reasoning(1, "inspect")),
@@ -650,7 +650,7 @@ fn production_runner_error_publication_orders_sanitized_typed_failure_before_ter
                 "reviewer",
                 "review task",
                 agens_core::TuiExecutionState::ForegroundRunning,
-                Some("gpt-4.1"),
+                Some("openai-api/gpt-4.1"),
                 None,
             )),
         ];

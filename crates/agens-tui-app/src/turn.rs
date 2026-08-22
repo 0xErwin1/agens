@@ -114,7 +114,7 @@ pub fn tui_session_presentation(
         .as_ref()
         .and_then(|metadata| metadata.provider_id.as_deref())
         .or_else(|| current_provider(bootstrap, session).map(ProviderKind::identifier))
-        .unwrap_or_else(|| bootstrap.provider_type().unwrap_or("provider"));
+        .unwrap_or("provider");
     let label = session
         .identifier
         .map_or_else(|| "new session".into(), |id| format!("session #{id}"));

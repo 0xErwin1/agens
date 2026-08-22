@@ -132,7 +132,7 @@ fn a_headless_turns_permission_policy_is_scoped_to_its_own_root_not_the_bootstra
     let mut files = BTreeMap::new();
     files.insert(
         config_home.join("config.toml"),
-        "[provider]\ntype = \"openai-api\"\nmodel = \"openai-api/gpt-4.1\"\n".to_owned(),
+        "[provider]\nmodel = \"openai-api/gpt-4.1\"\n".to_owned(),
     );
     files.insert(
         config_home.join("auth.json"),
@@ -227,7 +227,7 @@ fn a_headless_ask_user_call_returns_unavailable_within_a_bounded_deadline_and_ne
         BTreeMap::from([
             (
                 temporary.join("config/config.toml"),
-                "[provider]\ntype = \"openai-api\"\nmodel = \"openai-api/gpt-4.1\"\n".to_owned(),
+                "[provider]\nmodel = \"openai-api/gpt-4.1\"\n".to_owned(),
             ),
             (
                 temporary.join("config/auth.json"),
@@ -899,7 +899,7 @@ fn production_headless_turn_persists_the_turn_directives_it_delivered_before_the
             (
                 config_home.join("config.toml"),
                 format!(
-                    "[provider]\ntype = \"openai-api\"\nmodel = \"openai-api/gpt-4.1\"\nbase_url = \"http://{address}\"\n\n[options]\ndata_dir = \"{}\"\n",
+                    "[provider]\nmodel = \"openai-api/gpt-4.1\"\nbase_url = \"http://{address}\"\n\n[options]\ndata_dir = \"{}\"\n",
                     data_directory.display()
                 ),
             ),
@@ -1136,7 +1136,7 @@ fn production_resumed_headless_turn_replays_typed_history_and_appends_to_the_sam
             (
                 config_home.join("config.toml"),
                 format!(
-                    "[provider]\ntype = \"openai-api\"\nmodel = \"openai-api/gpt-4.1\"\nbase_url = \"http://{address}\"\n\n[options]\ndata_dir = \"{}\"\n",
+                    "[provider]\nmodel = \"openai-api/gpt-4.1\"\nbase_url = \"http://{address}\"\n\n[options]\ndata_dir = \"{}\"\n",
                     data_directory.display()
                 ),
             ),
