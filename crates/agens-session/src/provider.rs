@@ -82,6 +82,24 @@ impl ProviderKind {
     }
 }
 
+/// Splits a `provider/model` identifier into the provider it names and the
+/// bare identifier that provider's API accepts.
+///
+/// The parse is [`QualifiedModel`]'s, so what counts as a provider prefix is
+/// answered once rather than re-implemented wherever a qualified identifier
+/// arrives. `None` covers a bare identifier and one whose prefix names no
+/// provider alike: both stay with the provider the session already resolved,
+/// and the model resolution that follows is what reports an identifier nothing
+/// serves.
+pub fn split_qualified_model(value: &str) -> Option<(ProviderKind, String)> {
+    let qualified = QualifiedModel::parse(value).ok()?;
+
+    Some((
+        ProviderKind::for_source(qualified.source()?),
+        qualified.model().to_owned(),
+    ))
+}
+
 /// A model identifier resolved to the provider that will serve it, and the
 /// bare identifier that provider's API accepts.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -383,6 +401,22 @@ mod tests {
             ProviderKind::parse("moonshotai"),
             Some(ProviderKind::Moonshot)
         );
+    }
+
+    /// Both routers used to split the prefix themselves, which is one parser
+    /// per caller and one place each for the set of provider names to drift.
+    #[test]
+    fn a_qualified_identifier_splits_only_on_a_provider_this_build_serves() {
+        for provider in ProviderKind::ALL {
+            assert_eq!(
+                split_qualified_model(&format!("{}/kimi-k3", provider.identifier())),
+                Some((provider, "kimi-k3".to_owned()))
+            );
+        }
+
+        assert_eq!(split_qualified_model("kimi-k3"), None);
+        assert_eq!(split_qualified_model("not-a-provider/kimi-k3"), None);
+        assert_eq!(split_qualified_model("openai-api/"), None);
     }
 
     #[test]

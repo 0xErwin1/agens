@@ -34,7 +34,7 @@ use agens_error::CliError;
 use agens_models::ModelSelection;
 use agens_session::attempt::active_session_attempts;
 use agens_session::context::current_session_timestamp;
-use agens_session::provider::{CredentialStatus, ProviderKind};
+use agens_session::provider::{CredentialStatus, ProviderKind, split_qualified_model};
 use agens_tool_runtime::rotation::rotate_agent;
 use agens_tools::McpLifecycleState;
 
@@ -756,13 +756,10 @@ impl TuiRuntimeRouter {
                     // The picker lists qualified identifiers, so a typed one
                     // arrives qualified too, and switching provider has to go
                     // through the credential check rather than around it.
-                    match model
-                        .split_once('/')
-                        .and_then(|(prefix, bare)| Some((ProviderKind::parse(prefix)?, bare)))
-                    {
+                    match split_qualified_model(model) {
                         Some((provider, bare)) => {
                             self.apply_provider(&bootstrap, provider.identifier())?;
-                            apply_tui_unverified_model(&bootstrap, bare, &self.session)?
+                            apply_tui_unverified_model(&bootstrap, &bare, &self.session)?
                         }
                         None => apply_tui_unverified_model(&bootstrap, model, &self.session)?,
                     }
