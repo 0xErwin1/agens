@@ -59,7 +59,7 @@ fn compactions_accumulate_and_the_latest_is_the_one_a_summary_folds_into() {
     let all = store.list(7).expect("the compactions are readable");
     assert_eq!(
         all.iter()
-            .map(|entry| (entry.summary.as_str(), entry.first_kept_message_sequence))
+            .map(|entry| (entry.summary.as_str(), entry.first_kept_message_index))
             .collect::<Vec<_>>(),
         vec![("first summary", 4), ("second summary", 9)],
         "an earlier compaction is kept, not overwritten",

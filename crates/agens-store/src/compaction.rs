@@ -24,10 +24,10 @@ use crate::database;
 pub struct StoredCompaction {
     pub id: i64,
     pub summary: String,
-    /// Sequence of the first message the compaction kept verbatim. Everything
-    /// before it in the session's own message table is what the summary stands
-    /// for.
-    pub first_kept_message_sequence: i64,
+    /// Position of the first message the compaction kept verbatim, counted from
+    /// zero over the session's ordered messages. Everything before it is what
+    /// the summary stands for.
+    pub first_kept_message_index: i64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -91,7 +91,7 @@ impl CompactionStore {
         &mut self,
         session_id: i64,
         summary: &str,
-        first_kept_message_sequence: i64,
+        first_kept_message_index: i64,
     ) -> Result<i64, CompactionStoreError> {
         if summary.trim().is_empty() {
             return Err(CompactionStoreError::detail("a compaction carries no summary"));
@@ -100,12 +100,12 @@ impl CompactionStore {
         self.connection
             .execute(
                 "INSERT INTO session_compactions
-                     (session_id, summary, first_kept_message_sequence, created_at)
+                     (session_id, summary, first_kept_message_index, created_at)
                  VALUES (?1, ?2, ?3, ?4)",
                 params![
                     session_id,
                     summary,
-                    first_kept_message_sequence,
+                    first_kept_message_index,
                     timestamp()
                 ],
             )
@@ -124,14 +124,14 @@ impl CompactionStore {
     ) -> Result<Option<StoredCompaction>, CompactionStoreError> {
         self.connection
             .query_row(
-                "SELECT id, summary, first_kept_message_sequence FROM session_compactions
+                "SELECT id, summary, first_kept_message_index FROM session_compactions
                  WHERE session_id = ?1 ORDER BY id DESC LIMIT 1",
                 params![session_id],
                 |row| {
                     Ok(StoredCompaction {
                         id: row.get(0)?,
                         summary: row.get(1)?,
-                        first_kept_message_sequence: row.get(2)?,
+                        first_kept_message_index: row.get(2)?,
                     })
                 },
             )
@@ -144,7 +144,7 @@ impl CompactionStore {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT id, summary, first_kept_message_sequence FROM session_compactions
+                "SELECT id, summary, first_kept_message_index FROM session_compactions
                  WHERE session_id = ?1 ORDER BY id",
             )
             .map_err(|error| CompactionStoreError::operation("list", &self.database_path, error))?;
@@ -154,7 +154,7 @@ impl CompactionStore {
                 Ok(StoredCompaction {
                     id: row.get(0)?,
                     summary: row.get(1)?,
-                    first_kept_message_sequence: row.get(2)?,
+                    first_kept_message_index: row.get(2)?,
                 })
             })
             .map_err(|error| CompactionStoreError::operation("list", &self.database_path, error))?;

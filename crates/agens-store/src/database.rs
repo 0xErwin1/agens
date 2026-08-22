@@ -523,7 +523,7 @@ fn session_compactions_ddl() -> String {
         id INTEGER PRIMARY KEY,
         session_id INTEGER NOT NULL,
         summary TEXT NOT NULL CHECK(summary <> ''),
-        first_kept_message_sequence INTEGER NOT NULL CHECK(first_kept_message_sequence >= 0),
+        first_kept_message_index INTEGER NOT NULL CHECK(first_kept_message_index >= 0),
         created_at TEXT NOT NULL,
         FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
     );

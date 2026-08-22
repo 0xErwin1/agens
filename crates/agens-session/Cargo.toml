@@ -11,6 +11,7 @@ workspace = true
 [dependencies]
 agens-bootstrap = { path = "../agens-bootstrap" }
 agens-core = { path = "../agens-core" }
+agens-diagnostics = { path = "../agens-diagnostics" }
 agens-error = { path = "../agens-error" }
 agens-models = { path = "../agens-models" }
 agens-providers = { path = "../agens-providers" }
