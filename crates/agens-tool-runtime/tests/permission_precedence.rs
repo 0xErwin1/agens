@@ -1920,6 +1920,29 @@ const TOOL_SURFACE: &[SurfaceEntry] = &[
     // — a `PerFileProbe` needs a file the call would report and a `ReachProbe` a
     // file a rule could name it by, and there is no call to this tool that has
     // either. A delegated child never holds it, having no surface to ask on.
+    // `cd` opens no file. What it decides is where the tools that do open one
+    // start from, and the directory it is given is the target a rule matches.
+    SurfaceEntry {
+        tool: "native::cd",
+        returns_file_contents: false,
+        decided_on_its_target: true,
+        decided_per_file: None,
+        partly_reached: None,
+        unbound: None,
+        matched_as: Some(PermissionTargetKind::Path),
+    },
+    // `worktree` is named by the worktree it creates, not by a path: the
+    // directory it lands in is derived from the data directory and this
+    // project's own identity, so no rule written against a path names it.
+    SurfaceEntry {
+        tool: "native::worktree",
+        returns_file_contents: false,
+        decided_on_its_target: false,
+        decided_per_file: None,
+        partly_reached: None,
+        unbound: None,
+        matched_as: None,
+    },
     SurfaceEntry {
         tool: "native::ask_user",
         returns_file_contents: false,

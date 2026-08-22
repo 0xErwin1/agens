@@ -11,6 +11,7 @@ Agens is a Rust coding-agent CLI with a terminal interface, one-shot chat, guard
 - Moonshot AI (Kimi) chat-completions access with `provider.type = "moonshotai"` and `MOONSHOT_API_KEY` or an `auth.json` entry, written by `agens auth login api-key moonshotai`.
 - Cancellation-only CLI turns with optional inherited deadlines and finite provider/tool operation timeouts.
 - Project-confined native tools: `read`, `write`, `list`, `search`, and bounded `bash`.
+- A session that can move: `worktree` creates a git worktree for the work and moves into it, `cd` moves the session to another reachable directory, and every later call resolves relative paths and runs commands there.
 - Permission evaluation before tool execution, including global/project TOML rules, temporary unsafe bypass, and persisted project grants. Unresolved approval requests fail closed.
 - MCP tools loaded from global configuration over stdio, streamable HTTP, or SSE transports.
 - Completed-turn and project-grant persistence in SQLite.
@@ -129,7 +130,9 @@ Inspect resolved paths and validation status with:
 
 The `task` tool delegates work to a subagent, which runs its own turn loop with its own tool dispatcher and cannot delegate further.
 
-**What a subagent can reach.** It inherits the parent's native tool surface — `read`, `list`, `search`, `grep`, `glob`, `git_read`, `write`, `edit`, `bash`, `webfetch` — plus `task_control` and `task_message` for reporting back. The read-class tools (`read`, `list`, `search`, `grep`, `glob`, `git_read`) are authorized automatically. `write`, `edit`, `bash` and `webfetch` are present but unauthorized: a call to one is refused unless the agent definition declares `allow`, or the session is in dangerous mode. `webfetch` is excluded from the automatic grant deliberately — it is network egress rather than a worktree read.
+**Where the session works.** The session starts in its confinement root and can move: `worktree <name>` creates a git worktree on a new branch under the Agens data directory and moves the session into it, and `cd <path>` moves it to any directory under the confinement root or under this project's own worktrees. Nothing else is reachable, so the move is bounded by the same root a path is. Later calls — `read`, `write`, `edit`, `list`, `search`, `grep`, `glob`, `bash` — resolve against wherever the session is, and the footer names it. The move outlives the turn it was made in and is recorded in the run's diagnostics as `working_directory_changed`.
+
+**What a subagent can reach.** It inherits the parent's native tool surface — `read`, `list`, `search`, `grep`, `glob`, `git_read`, `write`, `edit`, `bash`, `webfetch` — plus `task_control` and `task_message` for reporting back. It never holds `cd` or `worktree`: moving the session is the session's own decision, and a child moves nothing its parent can see. The read-class tools (`read`, `list`, `search`, `grep`, `glob`, `git_read`) are authorized automatically. `write`, `edit`, `bash` and `webfetch` are present but unauthorized: a call to one is refused unless the agent definition declares `allow`, or the session is in dangerous mode. `webfetch` is excluded from the automatic grant deliberately — it is network egress rather than a worktree read.
 
 **What the automatic grant costs.** The read-class grant is bounded by the `[permissions]` rules that name each tool, and by nothing else. A rule names one tool, so `deny grep(**/.env)` keeps a subagent out of that file while `deny read(**/.env)` alone does not, and neither covers `search`.
 
@@ -175,6 +178,8 @@ What makes that possible is your configuration naming the server. A rule for a s
 | `task` (primary only) | what the subagent reports | **not here** — its target is the subagent's name; the subagent read under these same rules |
 | `task_control`, `task_message` | no — execution state only | not as a path; they never address a file |
 | `ask_user` (primary only) | no — only the answer given at the terminal | not as a path; its target is the tool's own name and no call to it addresses a file |
+| `cd` (primary only) | no — only the directory it moved to | the target is the directory |
+| `worktree` (primary only) | no — only the worktree it created | not as a path; its target is the worktree's name |
 | `<server>::<tool>` from MCP (primary only) | whatever that server returns | **it does not** — the target is the tool's own name, and its arguments belong to the server |
 
 The remaining limit is over names rather than contents: `glob`'s pattern denotes a set while a rule is matched as text, so `deny glob(**/.env)` does not stop `glob(**)` from listing that name — it discloses a name, which `list(**)` already discloses, not what the file holds.
