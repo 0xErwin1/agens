@@ -40,7 +40,7 @@ use crate::CliDependencies;
 use crate::commands::chat::{chat_args_with_prompt, chat_request};
 use crate::deps::bootstrap;
 
-/// AGN-106: what the terminal actually paints after a fixed scripted turn.
+/// What the terminal actually paints after a fixed scripted turn.
 ///
 /// The turn is real down to the socket and only the model is a fixture, so the
 /// frame this pins is the frame a person would see. A direct row comparison

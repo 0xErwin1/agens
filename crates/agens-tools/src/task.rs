@@ -1185,7 +1185,39 @@ impl<R: TaskRunner> TaskTool<R> {
     }
 
     pub fn input_schema() -> Value {
-        serde_json::json!({"type":"object","additionalProperties":false,"required":["description"],"properties":{"agent":{"type":"string","minLength":1,"maxLength":64},"background":{"type":"boolean","description":"Run this call in the background and return immediately. Only background calls run concurrently: several foreground calls issued together are executed one after another."},"description":{"type":"string","minLength":1,"maxLength":16384},"model":{"type":"string","minLength":1,"maxLength":64,"description":"Omit this. The agent's configured profile then decides the model, falling back to this thread's model. Send it only when the user explicitly asked for a specific model for this call: an explicit value overrides the configured profile. A model this run cannot reach falls back to this thread's model and says so."},"skills":{"type":"array","maxItems":128,"uniqueItems":true,"items":{"type":"string","minLength":1,"maxLength":64}}}})
+        serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["description"],
+            "properties": {
+                "agent": {"type": "string", "minLength": 1, "maxLength": 64},
+                "background": {
+                    "type": "boolean",
+                    "description": "Run this call in the background and return immediately. Only background calls run concurrently: several foreground calls issued together are executed one after another."
+                },
+                "description": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 16384
+                },
+                "model": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 64,
+                    "description": "Omit this. The agent's configured profile then decides the model, falling back to this thread's model. Send it only when the user explicitly asked for a specific model for this call: an explicit value overrides the configured profile. A model this run cannot reach falls back to this thread's model and says so."
+                },
+                "skills": {
+                    "type": "array",
+                    "maxItems": 128,
+                    "uniqueItems": true,
+                    "items": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 64
+                    }
+                }
+            }
+        })
     }
 
     pub fn catalog_input_schema(&self) -> Value {
