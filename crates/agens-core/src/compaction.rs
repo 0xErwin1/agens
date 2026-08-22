@@ -222,14 +222,21 @@ pub fn plan_compaction(
         return Err(CompactionError::NothingToCompact);
     }
 
-    let candidate = budget_boundary(body, budget.keep_recent_tokens);
+    // The tail keeps at least one message, whatever the budget says. A cut at
+    // the end of the body replaces the whole history with a summary of itself,
+    // and the message that would disappear is the one the caller is trying to
+    // send: a 40 KB prompt pasted into an overflowing session would be answered
+    // with a paraphrase of the prompt.
+    let last = body.len() - 1;
+
+    let candidate = budget_boundary(body, budget.keep_recent_tokens).min(last);
     if candidate == 0 {
         return Err(CompactionError::NothingToCompact);
     }
 
     let cut = next_balanced_boundary(body, candidate).ok_or(CompactionError::NoValidCut)?;
-    if cut == 0 {
-        return Err(CompactionError::NothingToCompact);
+    if cut > last || !is_balanced(&body[cut..]) {
+        return Err(CompactionError::NoValidCut);
     }
 
     Ok(CompactionPlan {
@@ -254,8 +261,9 @@ fn budget_boundary(messages: &[Message], keep_recent_tokens: usize) -> usize {
 /// The first index at or after `from` where no tool call is still awaiting its
 /// result, or `None` when no such index exists.
 ///
-/// `messages.len()` counts as a boundary: a history whose whole tail is one
-/// unbroken tool block compacts to the summary alone rather than refusing.
+/// `messages.len()` ends the search but is not a usable cut: [`plan_compaction`]
+/// rejects it, because a history whose whole tail is one unbroken tool block
+/// can only be cut by emptying it.
 fn next_balanced_boundary(messages: &[Message], from: usize) -> Option<usize> {
     let mut open = Vec::new();
     for (index, message) in messages.iter().enumerate() {
@@ -274,6 +282,23 @@ fn next_balanced_boundary(messages: &[Message], from: usize) -> Option<usize> {
     }
 
     open.is_empty().then_some(messages.len())
+}
+
+/// Whether every tool call in `messages` is answered inside it.
+///
+/// The kept tail is checked with this rather than only at its first message: a
+/// tail that still holds a call awaiting its result is one the provider
+/// rejects, and no cut can supply the result that never arrived.
+fn is_balanced(messages: &[Message]) -> bool {
+    let mut open = Vec::new();
+    for part in messages.iter().flat_map(|message| &message.parts) {
+        match part {
+            MessagePart::ToolCall { id, .. } => open.push(id.clone()),
+            MessagePart::ToolResult { tool_call_id, .. } => open.retain(|id| id != tool_call_id),
+            _ => {}
+        }
+    }
+    open.is_empty()
 }
 
 /// Turns messages into the transcript entries the summary schema renders.
@@ -473,6 +498,52 @@ mod tests {
         let summary = CompactionSummary::new("summary").expect("summary is non-empty");
         let compacted = apply_compaction(&messages, &plan, &summary);
         assert_eq!(compacted[0], messages[0]);
+    }
+
+    /// The overflow that triggers a compaction is usually the message that
+    /// caused it, so the cut has to survive a tail the budget cannot hold.
+    #[test]
+    fn a_last_message_that_alone_outruns_the_budget_still_survives_the_cut() {
+        let pasted = "x".repeat(40_000);
+        let messages = vec![
+            text(Role::User, "first"),
+            text(Role::Assistant, "answer"),
+            text(Role::User, &pasted),
+        ];
+
+        let plan = plan_compaction(&messages, tiny_budget()).expect("history can be compacted");
+        assert_eq!(plan.first_kept(), 2);
+
+        let summary = CompactionSummary::new("summary").expect("summary is non-empty");
+        let compacted = apply_compaction(&messages, &plan, &summary);
+
+        assert_eq!(compacted.last(), messages.last());
+    }
+
+    #[test]
+    fn a_single_message_history_is_refused_rather_than_replaced_by_its_own_summary() {
+        let messages = vec![text(Role::User, &"x".repeat(40_000))];
+
+        assert_eq!(
+            plan_compaction(&messages, tiny_budget()),
+            Err(CompactionError::NothingToCompact)
+        );
+    }
+
+    /// Cutting past the last tool result would leave the pinned head and the
+    /// summary alone, so the refusal is the only answer that keeps a tail.
+    #[test]
+    fn a_tail_that_is_one_unbroken_tool_block_refuses_rather_than_emptying_the_history() {
+        let messages = vec![
+            text(Role::User, "first"),
+            call("call-1"),
+            result("call-1", "body"),
+        ];
+
+        assert_eq!(
+            plan_compaction(&messages, tiny_budget()),
+            Err(CompactionError::NoValidCut)
+        );
     }
 
     #[test]
