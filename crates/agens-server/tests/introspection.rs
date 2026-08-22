@@ -13,7 +13,10 @@ use agens_core::run_introspection::{
     Ask, AskOption, CausalDisposition, Checkpoint, EvidenceClaim, EvidenceClass,
     RunIntrospectionError, RunIntrospectionPort,
 };
-use agens_server::{CHECKPOINT_EVENT, RunIntrospection, StateMachines};
+use agens_server::{
+    CHECKPOINT_EVENT, CheckpointClaim, ReportedCheckpoint, RunIntrospection, StateMachines,
+    TimerSettings, TimerWheel,
+};
 use agens_store::{ControlPlaneStore, QuestionKind, QuestionState, RunRow, RunState};
 
 const NOW: i64 = 1_700_000_500;
@@ -278,6 +281,100 @@ fn a_checkpoint_leaves_the_run_where_it_was() {
     );
 
     fs::remove_dir_all(directory).unwrap();
+}
+
+/// The wheel reads the promised deadline out of the checkpoint payload under
+/// one name. Writing it under any other name is a checkpoint that declares no
+/// deadline at all, and nothing would ever say so — the run would simply never
+/// be reported overdue.
+#[test]
+fn the_deadline_a_checkpoint_declares_is_the_one_the_timer_wheel_holds_it_to() {
+    let (directory, machines, run_id, mut introspection) = fixture(RunState::Running);
+
+    let receipt = introspection
+        .checkpoint(&checkpoint(Vec::new(), Vec::new()))
+        .expect("a running run accepts a checkpoint");
+
+    let (wheel, clock) = TimerWheel::with_manual_clock_for_test(TimerSettings::default(), NOW);
+
+    let tick = wheel.tick(&mut machines.lock().unwrap()).unwrap();
+    assert!(
+        tick.overdue_checkpoints.is_empty(),
+        "a promise that has not come due yet is not overdue: {tick:?}"
+    );
+
+    clock.set(NOW + 100_000);
+    let tick = wheel.tick(&mut machines.lock().unwrap()).unwrap();
+
+    assert_eq!(
+        tick.overdue_checkpoints
+            .iter()
+            .map(|overdue| (
+                overdue.run_id,
+                overdue.checkpoint_event_id,
+                overdue.promised_at
+            ))
+            .collect::<Vec<_>>(),
+        vec![(run_id, receipt.checkpoint_event_id, NOW + 3_600)],
+        "the wheel has to find the deadline this checkpoint declared"
+    );
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+/// Ingest declared the half of a checkpoint it consumes as a trait rather than
+/// depending on this row's shape. Two derivations of one rule drift, so the
+/// credit the journal records and the credit health derives are checked against
+/// each other here rather than assumed equal.
+#[test]
+fn what_ingest_reads_off_a_claim_agrees_with_what_the_journal_records() {
+    let cases = [
+        (
+            claim(
+                "the parser rejects an empty header",
+                EvidenceClass::Deterministic,
+                &["cargo test => 0"],
+            ),
+            true,
+        ),
+        (
+            claim("reasoned to it", EvidenceClass::Inferential, &[]),
+            false,
+        ),
+        (
+            claim("not established", EvidenceClass::Insufficient, &[]),
+            false,
+        ),
+        (
+            EvidenceClaim::new(
+                "the suite was already red on main",
+                vec!["git stash && cargo test => 101".to_owned()],
+                EvidenceClass::Deterministic,
+                CausalDisposition::PreExisting,
+            ),
+            false,
+        ),
+    ];
+
+    for (claim, credits) in cases {
+        assert_eq!(
+            ReportedCheckpoint::from_claim(&claim).credits_progress(),
+            credits,
+            "ingest disagrees about {:?}",
+            claim.description()
+        );
+        assert_eq!(
+            claim.credits_progress(),
+            credits,
+            "the journal disagrees about {:?}",
+            claim.description()
+        );
+        assert_eq!(
+            CheckpointClaim::evidence_class(&claim).as_str(),
+            claim.evidence_class().as_str(),
+            "the class ingest reads is not the class the claim carries"
+        );
+    }
 }
 
 fn ask() -> Ask {

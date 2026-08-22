@@ -195,6 +195,18 @@ impl EvidenceClaim {
     pub const fn disposition(&self) -> CausalDisposition {
         self.disposition
     }
+
+    /// Whether this claim credits progress for the run.
+    ///
+    /// Both halves are required. Deterministic evidence for something that was
+    /// already broken is a true, re-runnable claim about work the run did not
+    /// do, and crediting it would let a run report progress by proving facts
+    /// about its starting point.
+    #[must_use]
+    pub const fn credits_progress(&self) -> bool {
+        self.evidence_class.credits_progress()
+            && matches!(self.disposition, CausalDisposition::CandidateCaused)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -351,13 +363,12 @@ impl Checkpoint {
 
     /// Whether this checkpoint credits progress for its run.
     ///
-    /// One deterministic claim is enough: a milestone that established
-    /// anything re-runnable moved, whatever else the report also carries.
+    /// One crediting claim is enough: a milestone that established anything
+    /// re-runnable about its own work moved, whatever else the report also
+    /// carries.
     #[must_use]
     pub fn credits_progress(&self) -> bool {
-        self.claims
-            .iter()
-            .any(|claim| claim.evidence_class.credits_progress())
+        self.claims.iter().any(EvidenceClaim::credits_progress)
     }
 
     /// Whether this is a checkpoint with a diff behind it, which is what the
@@ -746,6 +757,25 @@ mod tests {
                 class.as_str()
             );
         }
+    }
+
+    /// Deterministic evidence about something that was already broken is a
+    /// true claim about work the run did not do.
+    #[test]
+    fn a_proved_claim_about_something_pre_existing_credits_no_progress() {
+        let pre_existing = EvidenceClaim::new(
+            "the suite was already red on main",
+            vec!["git stash && cargo test => 101".to_owned()],
+            EvidenceClass::Deterministic,
+            CausalDisposition::PreExisting,
+        );
+
+        assert!(!pre_existing.credits_progress());
+        assert!(
+            !checkpoint_with(vec![pre_existing])
+                .expect("a proved claim is valid")
+                .credits_progress()
+        );
     }
 
     #[test]

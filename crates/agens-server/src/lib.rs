@@ -49,7 +49,7 @@ pub use ingest::{
     ReportedCheckpoint, ReportedFact, channel as ingest_channel, detect_worker_lost,
 };
 pub use instance::{ServeInstance, ServeInstanceError};
-pub use introspection::{CHECKPOINT_EVENT, Clock, RunIntrospection};
+pub use introspection::{Clock, RunIntrospection};
 pub use scheduler::{
     Admission, AdmissionFailure, Candidate, Deferral, Ineligible, LaunchError, LaunchedSession,
     PendingRun, Queue, QueueReport, RunLauncher, RunSession, Scheduler, SchedulerError,

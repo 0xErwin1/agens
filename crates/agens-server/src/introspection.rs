@@ -27,10 +27,8 @@ use agens_store::{
 };
 
 use crate::fsm::{Principal, RunFacts, RunTrigger, StateMachines, TransitionRejection};
-
-/// The journal entry type every checkpoint is written as. Findings point back
-/// at the row it creates; there is no separate checkpoint table.
-pub const CHECKPOINT_EVENT: &str = "checkpoint";
+use crate::ingest::CheckpointClaim;
+use crate::timers::CHECKPOINT_EVENT;
 
 /// Reads the current time as epoch seconds.
 pub type Clock = Arc<dyn Fn() -> i64 + Send + Sync>;
@@ -99,6 +97,10 @@ impl RunIntrospection {
     /// `credits_progress` and the per-class counts are derived here rather than
     /// left for a reader to recompute, because run health consumes them on
     /// every checkpoint and two derivations of the same rule drift.
+    ///
+    /// The worker's self-declared deadline is written as `promised_at`, which
+    /// is the name the timer wheel reads it under: a checkpoint whose deadline
+    /// the wheel cannot find declares no deadline at all.
     fn checkpoint_payload(&self, checkpoint: &Checkpoint) -> serde_json::Value {
         let claims: Vec<serde_json::Value> = checkpoint.claims().iter().map(claim_json).collect();
 
@@ -111,7 +113,7 @@ impl RunIntrospection {
             "hypothesis": checkpoint.hypothesis(),
             "revised_estimate_seconds": checkpoint.revised_estimate_seconds(),
             "blockers": checkpoint.blockers(),
-            "next_checkpoint_at": checkpoint.next_checkpoint_at(),
+            "promised_at": checkpoint.next_checkpoint_at(),
             "touched_paths": checkpoint.touched_paths(),
             "carries_diff": checkpoint.carries_diff(),
             "credits_progress": checkpoint.credits_progress(),
@@ -237,6 +239,27 @@ impl RunIntrospectionPort for RunIntrospection {
             question_id,
             run_id: self.run_id,
         })
+    }
+}
+
+/// Closes the seam ingest left open: it declared the half of a checkpoint it
+/// consumes as a trait rather than depending on this row's shape, and this is
+/// the row.
+///
+/// `claims_progress` reads the disposition, because that is where a worker says
+/// whether it is reporting its own work or something it found already there.
+/// The pairing is the same one [`EvidenceClaim::credits_progress`] makes, so
+/// the number written into the journal and the number health derives cannot
+/// disagree.
+impl CheckpointClaim for EvidenceClaim {
+    fn evidence_class(&self) -> EvidenceClass {
+        // Spelled through the domain enum rather than through `self`, where the
+        // inherent accessor and this trait method share a name.
+        evidence_class(agens_core::run_introspection::EvidenceClaim::evidence_class(self))
+    }
+
+    fn claims_progress(&self) -> bool {
+        self.disposition() == agens_core::run_introspection::CausalDisposition::CandidateCaused
     }
 }
 
