@@ -73,7 +73,9 @@ pub use worktree_provisioning::{
     HookFailureResponse, HookPlan, ProvisioningContract, ProvisioningDecisions, ProvisioningError,
     ProvisioningOutcome, ProvisioningReport, ProvisioningRequest, WorktreeProvisioner,
 };
-pub use worktrees::{SessionWorktrees, WorktreeError, WorktreeStatus};
+pub use worktrees::{
+    GateDerivation, MergeOutcome, SessionWorktrees, WorktreeError, WorktreeStatus,
+};
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;

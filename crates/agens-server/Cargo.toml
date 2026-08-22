@@ -11,6 +11,8 @@ workspace = true
 [dependencies]
 agens-core = { path = "../agens-core" }
 agens-store = { path = "../agens-store" }
+agens-tools = { path = "../agens-tools" }
 libc = "0.2"
 serde_json = "1.0.150"
+sha2 = "0.10"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "time"] }

@@ -7,6 +7,7 @@
 
 mod blocking;
 mod fsm;
+mod gates;
 mod instance;
 mod sessions;
 
@@ -23,6 +24,10 @@ pub use fsm::{
     RunTransition, RunTrigger, StateMachines, TransitionOutcome, TransitionRejection,
     WORKTREE_TRANSITIONS, WorktreeEffect, WorktreeFacts, WorktreeGuard, WorktreeTransition,
     WorktreeTrigger,
+};
+pub use gates::{
+    GateError, GateRefusal, Gates, MergePath, PreMergeRequest, PreMergeVerdict, Receipt,
+    ReclaimRequest, ReclaimVerdict, SubAgentKind, SubAgentRequest, freeze_receipt,
 };
 pub use instance::{ServeInstance, ServeInstanceError};
 pub use sessions::{

@@ -260,6 +260,186 @@ impl SessionWorktrees {
         Ok(self.worktree_path(repository_id, name))
     }
 
+    /// Re-derives everything a coordinator gate compares against, in one pass
+    /// over the worktree git currently has on disk.
+    ///
+    /// The gate never reads a stored flag, so every field here is derived at
+    /// the moment of the call: the branch the worktree is on, its merge base
+    /// against the target as the target stands now, the tree an approval is
+    /// bound to, whether the branch already landed, whether anything is
+    /// uncommitted, and the paths the branch touches.
+    ///
+    /// `worktree` is an absolute path because the control plane records one per
+    /// run and that record is where a run's work lives. It is still held to
+    /// this service's own directory: a path outside it is refused rather than
+    /// derived from.
+    pub fn derive(
+        &self,
+        worktree: &Path,
+        merged_into: &str,
+    ) -> Result<GateDerivation, WorktreeError> {
+        validate_git_argument(merged_into, "merge target")?;
+        let path = self.resolve_session_worktree(worktree)?;
+
+        let branch = self.optional_line(
+            &path,
+            "symbolic-ref",
+            &[
+                "symbolic-ref".into(),
+                "--quiet".into(),
+                "--short".into(),
+                "HEAD".into(),
+            ],
+        )?;
+        let merge_base = self.optional_line(
+            &path,
+            "merge-base",
+            &["merge-base".into(), "HEAD".into(), merged_into.into()],
+        )?;
+
+        let head_tree = String::from_utf8_lossy(&self.run_checked(
+            &path,
+            "rev-parse",
+            &["rev-parse".into(), "HEAD^{tree}".into()],
+        )?)
+        .trim()
+        .to_owned();
+
+        let merged = self.is_merged(&path, merged_into)?;
+        let dirty = !self
+            .run_checked(
+                &path,
+                "status",
+                &[
+                    "status".into(),
+                    "--porcelain=v1".into(),
+                    "--untracked-files=all".into(),
+                ],
+            )?
+            .is_empty();
+
+        let changed_paths = match merge_base.as_deref() {
+            Some(base) => self.changed_paths(&path, base)?,
+            None => Vec::new(),
+        };
+
+        Ok(GateDerivation {
+            branch,
+            merge_base,
+            head_tree,
+            merged,
+            dirty,
+            changed_paths,
+        })
+    }
+
+    /// Integrates `branch` into whatever `repository` has checked out.
+    ///
+    /// A merge that does not apply cleanly is aborted before returning, so a
+    /// refused integration never leaves the checkout holding conflict markers
+    /// for a decision the coordinator is not allowed to make.
+    pub fn merge(&self, repository: &Path, branch: &str) -> Result<MergeOutcome, WorktreeError> {
+        validate_git_argument(branch, "branch")?;
+
+        let outcome = self.run_git(
+            repository,
+            &[
+                "merge".into(),
+                "--no-ff".into(),
+                "--no-edit".into(),
+                branch.into(),
+            ],
+        )?;
+
+        if !outcome.success {
+            let detail = String::from_utf8_lossy(&outcome.output.stderr)
+                .trim()
+                .to_owned();
+            self.run_git(repository, &["merge".into(), "--abort".into()])?;
+
+            return Ok(MergeOutcome::Conflicted { detail });
+        }
+
+        Ok(MergeOutcome::Merged {
+            commit: self.head_revision(repository)?,
+        })
+    }
+
+    /// The paths a branch touches between `base` and its head, as the gate
+    /// compares them against the frozen genesis paths.
+    fn changed_paths(&self, worktree: &Path, base: &str) -> Result<Vec<String>, WorktreeError> {
+        let output = self.run_checked(
+            worktree,
+            "diff",
+            &[
+                "diff".into(),
+                "--no-ext-diff".into(),
+                "--name-only".into(),
+                "-z".into(),
+                base.into(),
+                "HEAD".into(),
+            ],
+        )?;
+
+        let mut paths: Vec<String> = output
+            .split(|byte| *byte == 0)
+            .filter(|entry| !entry.is_empty())
+            .map(|entry| String::from_utf8_lossy(entry).into_owned())
+            .collect();
+        paths.sort();
+        paths.dedup();
+
+        Ok(paths)
+    }
+
+    /// The single line an invocation prints, or `None` when git reports there
+    /// is nothing to print: a detached head has no branch name, and unrelated
+    /// histories have no merge base.
+    fn optional_line(
+        &self,
+        directory: &Path,
+        operation: &'static str,
+        arguments: &[OsString],
+    ) -> Result<Option<String>, WorktreeError> {
+        let outcome = self.run_git(directory, arguments)?;
+
+        match outcome.code {
+            Some(0) => Ok(Some(
+                String::from_utf8_lossy(&outcome.output.stdout)
+                    .trim()
+                    .to_owned(),
+            )),
+            Some(1) => Ok(None),
+            _ => Err(outcome.failure(operation)),
+        }
+    }
+
+    /// Holds an absolute worktree path to the directory this service owns.
+    ///
+    /// Both sides are canonicalized before they are compared, so neither a
+    /// symlink nor a `..` segment can present a path outside the data
+    /// directory as one inside it.
+    fn resolve_session_worktree(&self, worktree: &Path) -> Result<PathBuf, WorktreeError> {
+        let root = self
+            .data_directory
+            .join("worktrees")
+            .canonicalize()
+            .map_err(|_| WorktreeError::Missing)?;
+        let path = worktree
+            .canonicalize()
+            .map_err(|_| WorktreeError::Missing)?;
+
+        if path == root || !path.starts_with(&root) {
+            return Err(WorktreeError::InvalidInput {
+                field: "worktree path",
+                detail: "must be inside this data directory's worktrees",
+            });
+        }
+        self.ensure_present(&path)?;
+
+        Ok(path)
+    }
+
     /// Where one repository's session worktrees live, once `repository_id` is
     /// known to be a single path component.
     pub fn repository_directory(&self, repository_id: &str) -> Result<PathBuf, WorktreeError> {
@@ -418,6 +598,35 @@ impl GitOutcome {
                 .to_owned(),
         }
     }
+}
+
+/// Everything a coordinator gate re-derives from git in one pass.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GateDerivation {
+    /// `None` on a detached head, which has no branch to merge or reclaim.
+    pub branch: Option<String>,
+    /// `None` when the worktree and the target share no history.
+    pub merge_base: Option<String>,
+    /// `HEAD^{tree}`: the identity an approval's receipt is bound to.
+    pub head_tree: String,
+    /// Whether `HEAD` is already an ancestor of the target.
+    pub merged: bool,
+    /// Whether tracked, staged, or untracked changes are present.
+    pub dirty: bool,
+    /// The paths changed between the merge base and `HEAD`, sorted and unique.
+    pub changed_paths: Vec<String>,
+}
+
+/// How an integration ended.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MergeOutcome {
+    Merged {
+        commit: String,
+    },
+    /// The merge did not apply and was aborted, leaving the checkout as it was.
+    Conflicted {
+        detail: String,
+    },
 }
 
 /// Git-derived facts about one session worktree.
