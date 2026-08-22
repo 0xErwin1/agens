@@ -2292,10 +2292,16 @@ fn production_task_provider_failure_is_sanitized_and_returns_control_to_the_pare
     // would tie the script's length to the provider's retry budget. The
     // exhaustion of that budget is covered where the schedule can be
     // compressed, in `agens-providers`.
-    responses.push(ScriptedOpenAiResponse {
-        required_body_fragments: vec!["child provider failure".into()],
-        response: "HTTP/1.1 400 Bad Request\r\nX-Remote-Secret: SENTINEL_HEADER\r\nContent-Length: 23\r\nConnection: close\r\n\r\nSENTINEL_PROVIDER_ERROR".into(),
-    });
+    // Twice: a rejection is retried once on the parent's own model, because a
+    // model identifier the bundled catalog still lists can have been withdrawn
+    // by the backend. Here the retry fails the same way, which is the outcome
+    // this test is about.
+    for _ in 0..2 {
+        responses.push(ScriptedOpenAiResponse {
+            required_body_fragments: vec!["child provider failure".into()],
+            response: "HTTP/1.1 400 Bad Request\r\nX-Remote-Secret: SENTINEL_HEADER\r\nContent-Length: 23\r\nConnection: close\r\n\r\nSENTINEL_PROVIDER_ERROR".into(),
+        });
+    }
     responses.push(ScriptedOpenAiResponse {
         required_body_fragments: vec!["task: provider failure".into()],
         response: text_response("parent recovered from child provider failure"),

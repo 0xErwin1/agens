@@ -888,6 +888,12 @@ pub struct TaskTurnRequest {
     description: String,
     model_notice: Option<String>,
     permission_rules: Vec<PermissionRule>,
+    /// Whether `model` is this thread's own. Answered where the model is
+    /// resolved rather than by comparing identifiers later: the parent's model
+    /// and an agent's can be the same model spelled two ways, and a retry onto
+    /// a model the request already runs costs a whole child turn to change
+    /// nothing.
+    on_parent_model: bool,
 }
 
 impl TaskTurnRequest {
@@ -1251,7 +1257,7 @@ impl<R: TaskRunner> TaskTool<R> {
     fn resolve(&self, invocation: TaskInvocation) -> Result<TaskTurnRequest, ToolOutput> {
         let agent = self.resolve_agent(invocation.agent.as_deref())?;
 
-        let (model, mut request_config, model_notice) = match invocation.model {
+        let (model, mut request_config, model_notice, on_parent_model) = match invocation.model {
             Some(model) if !is_safe_model_identifier(&model) => {
                 return Err(task_terminal(HeadlessTaskTerminal::InputLimit));
             }
@@ -1273,6 +1279,7 @@ impl<R: TaskRunner> TaskTool<R> {
                         self.parent_model.clone(),
                         self.parent_request_config.clone(),
                         Some(warning),
+                        true,
                     )
                 } else {
                     let request_config = if model == self.parent_model {
@@ -1281,17 +1288,19 @@ impl<R: TaskRunner> TaskTool<R> {
                         RequestConfig::default()
                     };
                     let notice = configuration_override_warning(agent, &model);
-                    (model, request_config, notice)
+                    let on_parent_model = model == self.parent_model;
+                    (model, request_config, notice, on_parent_model)
                 }
             }
             None => match agent.model.clone() {
                 Some(model) if self.model_validator.validate_model(&model).is_ok() => {
-                    let request_config = if model == self.parent_model {
+                    let on_parent_model = model == self.parent_model;
+                    let request_config = if on_parent_model {
                         self.parent_request_config.clone()
                     } else {
                         RequestConfig::default()
                     };
-                    (model, request_config, None)
+                    (model, request_config, None, on_parent_model)
                 }
                 Some(model) => {
                     let reference = self.record_model_unavailable(&agent.name, &model);
@@ -1305,12 +1314,14 @@ impl<R: TaskRunner> TaskTool<R> {
                         self.parent_model.clone(),
                         self.parent_request_config.clone(),
                         Some(warning),
+                        true,
                     )
                 }
                 None => (
                     self.parent_model.clone(),
                     self.parent_request_config.clone(),
                     None,
+                    true,
                 ),
             },
         };
@@ -1329,6 +1340,7 @@ impl<R: TaskRunner> TaskTool<R> {
             description: invocation.description,
             model_notice,
             permission_rules: agent.permission_rules.clone(),
+            on_parent_model,
         })
     }
 
@@ -1602,7 +1614,7 @@ fn run_with_provider_fallback<R: TaskRunner>(
 ) -> Result<(TaskTurnResult, Option<String>), TaskRunnerError> {
     let agent = request.agent_name.clone();
     let rejected_model = request.model.clone();
-    let mut fallback = (rejected_model != parent_model).then(|| request.clone());
+    let mut fallback = (!request.on_parent_model).then(|| request.clone());
 
     match runner.run(request, context) {
         Err(TaskRunnerError::ProviderFailure(TaskProviderFailure::Rejected)) => {}
