@@ -720,14 +720,40 @@ where
     .map_err(|_| ChildRunError::Runtime)?
     .map_err(child_run_error)?;
 
-    Ok(snapshot
-        .events()
-        .iter()
-        .filter_map(|event| match event {
-            TurnEvent::ProviderPart(MessagePart::Text(text)) => Some(text.as_str()),
-            _ => None,
-        })
-        .collect())
+    Ok(final_assistant_text(snapshot.events()))
+}
+
+/// The text of the delegated turn's last assistant message, which is the
+/// answer it was asked for.
+///
+/// Every text part concatenated is not that answer: it is the answer with the
+/// running commentary of up to a few dozen intermediate iterations glued in
+/// front of it, indistinguishable from the conclusion once the parent reads
+/// it, and large enough on a long delegation to hit the parent's own output
+/// budget. Text emitted before a tool call belongs to the reasoning that led
+/// to the call, so each tool call starts the answer over.
+///
+/// A turn that ended with no text after its last tool call has no final
+/// message to return, and falls back to everything it did say.
+fn final_assistant_text(events: &[TurnEvent]) -> String {
+    let mut final_text = String::new();
+    let mut every_text = String::new();
+
+    for event in events {
+        match event {
+            TurnEvent::ProviderPart(MessagePart::Text(text)) => {
+                final_text.push_str(text);
+                every_text.push_str(text);
+            }
+            TurnEvent::ToolCallRequested { .. } => final_text.clear(),
+            _ => {}
+        }
+    }
+
+    if final_text.trim().is_empty() {
+        return every_text;
+    }
+    final_text
 }
 
 /// The origin a prompt carries when the caller named none. Only tests reach
@@ -783,6 +809,49 @@ mod tests {
         ));
         std::fs::create_dir_all(&directory).expect("test data directory");
         directory
+    }
+
+    fn text(value: &str) -> TurnEvent {
+        TurnEvent::ProviderPart(MessagePart::Text(value.into()))
+    }
+
+    fn tool_call() -> TurnEvent {
+        TurnEvent::ToolCallRequested {
+            id: "call".into(),
+            name: "native::read".into(),
+            input: "{}".into(),
+        }
+    }
+
+    #[test]
+    fn a_child_returns_its_final_message_not_the_narration_that_preceded_it() {
+        let events = vec![
+            text("Let me look at the file."),
+            tool_call(),
+            text("Now the other one."),
+            tool_call(),
+            text("The parser rejects "),
+            text("empty input."),
+        ];
+
+        assert_eq!(
+            final_assistant_text(&events),
+            "The parser rejects empty input."
+        );
+    }
+
+    #[test]
+    fn a_child_that_said_nothing_after_its_last_tool_call_returns_everything_it_said() {
+        let events = vec![text("Checking."), tool_call(), text("   ")];
+
+        assert_eq!(final_assistant_text(&events), "Checking.   ");
+    }
+
+    #[test]
+    fn a_child_that_never_called_a_tool_returns_its_whole_answer() {
+        let events = vec![text("One "), text("message.")];
+
+        assert_eq!(final_assistant_text(&events), "One message.");
     }
 
     #[test]
@@ -3019,10 +3088,61 @@ mod tests {
                 "{denied} must be absent from explore's inherited surface, got: {tool_names:?}"
             );
         }
-        assert!(
-            tool_names.contains(&"native::read".to_owned()),
-            "explore must still inherit the read-class tools it relies on"
-        );
+        // Naming the whole read class, not just `read`: exploration that can
+        // only open files it already knows the path of has to guess or spend
+        // its iterations asking for tools it does not hold.
+        for held in [
+            "native::read",
+            "native::list",
+            "native::glob",
+            "native::grep",
+            "native::search",
+            "native::git_read",
+        ] {
+            assert!(
+                tool_names.contains(&held.to_owned()),
+                "{held} must stay in explore's inherited surface, got: {tool_names:?}"
+            );
+        }
+        assert!(surface.coordination_tools.contains(&"native::skill"));
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    /// The general-purpose subagent is the one an unnamed `task` call lands on,
+    /// so its surface has to be able to carry a delegation that writes.
+    #[test]
+    fn built_in_general_inherits_the_parent_surface_it_is_told_it_has() {
+        let temporary = agens_fixtures::session_directory("general-surface");
+        let bootstrap = agens_fixtures::session_bootstrap(&temporary, &[]);
+        let project_root = agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap);
+        let catalog =
+            agens_agents::discover_agent_catalog(&bootstrap, &project_root, None).unwrap();
+        let general = catalog
+            .agent("general")
+            .expect("general is a built-in agent");
+
+        let surface = resolve_child_surface(&[], &general.permission_rules, &[]).unwrap();
+        let tool_names = surface
+            .tools
+            .iter()
+            .map(|entry| entry.qualified_name.clone())
+            .collect::<Vec<_>>();
+
+        for held in [
+            "native::read",
+            "native::list",
+            "native::glob",
+            "native::grep",
+            "native::write",
+            "native::edit",
+            "native::bash",
+        ] {
+            assert!(
+                tool_names.contains(&held.to_owned()),
+                "{held} must be in general's inherited surface, got: {tool_names:?}"
+            );
+        }
 
         std::fs::remove_dir_all(temporary).unwrap();
     }
