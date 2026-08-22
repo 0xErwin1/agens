@@ -82,6 +82,41 @@ pub struct ReportedFact {
     pub fact: IngestFact,
 }
 
+/// The identity a fact about a run travels under, read from the run's own live
+/// attempt rather than supplied by the reporter.
+///
+/// It exists for the reporters that observe a run from outside the turn — the
+/// timer wheel is the one this was written for. A worker knows which physical
+/// execution it is; a wheel sweeping every running run does not, and guessing
+/// would attribute a fact to an attempt the run has already left.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Attribution {
+    /// `session_attempts.id`, which is what the evidence ledger is keyed by.
+    pub attempt_id: i64,
+    /// The run's attempt number, which is also its turn index: one admission
+    /// is one turn.
+    pub turn: i64,
+}
+
+/// How a fact about `run_id` reported right now would be attributed.
+///
+/// `None` when the run has no attempt yet or its live attempt has not been
+/// correlated with a physical execution: neither is a failure, and both mean
+/// there is nothing a fact could be attributed to.
+pub fn attribution_of(
+    store: &ControlPlaneStore,
+    run_id: i64,
+) -> Result<Option<Attribution>, ControlPlaneError> {
+    let Some(attempt) = store.attempts_for_run(run_id)?.pop() else {
+        return Ok(None);
+    };
+
+    Ok(attempt.session_attempt_id.map(|attempt_id| Attribution {
+        attempt_id,
+        turn: attempt.n,
+    }))
+}
+
 /// Why a reported fact was not ingested. Nothing was written in any of these
 /// cases.
 #[derive(Clone, Debug, PartialEq, Eq)]

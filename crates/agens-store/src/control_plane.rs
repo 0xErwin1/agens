@@ -642,6 +642,27 @@ impl ControlPlaneStore {
         )
     }
 
+    /// Names the physical execution a logical attempt is running as.
+    ///
+    /// Written after the attempt row rather than with it, because the two are
+    /// opened by different parties: the admission transition opens the logical
+    /// attempt before anything executes, and the physical row is opened by the
+    /// turn itself once the session starts. Until they are joined, every fact
+    /// the harness reports is unattributable and the evidence ledger cannot be
+    /// reached from a run at all.
+    pub fn correlate_attempt(&mut self, attempt_id: i64, session_attempt_id: i64) -> Result<()> {
+        self.connection
+            .execute(
+                "UPDATE attempts SET session_attempt_id = ?2 WHERE id = ?1",
+                params![attempt_id, session_attempt_id],
+            )
+            .map_err(|error| {
+                ControlPlaneError::operation("correlate attempt", &self.database_path, error)
+            })?;
+
+        Ok(())
+    }
+
     pub fn append_event(&mut self, event: &EventRow) -> Result<i64> {
         append_event_row(&self.connection, event).map_err(|error| {
             ControlPlaneError::operation("append event", &self.database_path, error)
