@@ -19,6 +19,7 @@ pub mod prompt;
 pub mod prompt_memory;
 pub mod redaction;
 mod request_config;
+pub mod summary;
 
 pub use permission_precedence::{
     declarations_deny_every_target, prevailing_decision, prevailing_rule_decision,
