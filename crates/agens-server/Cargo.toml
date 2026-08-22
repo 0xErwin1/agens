@@ -13,12 +13,23 @@ agens-core = { path = "../agens-core" }
 agens-store = { path = "../agens-store" }
 agens-tools = { path = "../agens-tools" }
 libc = "0.2"
+prost = "0.14"
 serde_json = "1.0.150"
 sha2 = "0.10"
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["net", "rt", "rt-multi-thread", "sync", "time"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic = { version = "0.14", default-features = false, features = ["transport", "router", "codegen"] }
+tonic-prost = "0.14"
+
+[build-dependencies]
+protox = "0.9"
+tonic-prost-build = "0.14"
 
 [dev-dependencies]
+hyper-util = "0.1.20"
 # The ingest tests seed the session rows the evidence ledger's foreign keys
 # require, which no store API exposes because nothing but a live session
 # creates them.
 rusqlite = { version = "0.40", features = ["bundled"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tower = { version = "0.5.3", features = ["util"] }

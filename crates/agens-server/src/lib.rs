@@ -9,6 +9,7 @@ mod api;
 mod blocking;
 mod fsm;
 mod gates;
+pub mod grpc;
 mod ingest;
 mod instance;
 mod scheduler;
@@ -17,6 +18,7 @@ mod timers;
 
 use std::os::unix::net::UnixListener;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use agens_core::HeadlessTurnCancellation;
 
@@ -42,6 +44,7 @@ pub use gates::{
     GateError, GateRefusal, Gates, MergePath, PreMergeRequest, PreMergeVerdict, Receipt,
     ReclaimRequest, ReclaimVerdict, SubAgentKind, SubAgentRequest, freeze_receipt,
 };
+pub use grpc::{CoreHandle, FacadeBinding, FacadeError, FeedFacade, TeamFacade};
 pub use ingest::{
     AcceptedFact, CheckpointClaim, CheckpointStanding, DrainedFact, FactReceiver, FactSender,
     HealthSignal, HealthThresholds, Ingest, IngestFact, IngestRejection, LostReason,
@@ -78,21 +81,20 @@ pub enum ServerError {
 /// closes, and only then does the instance release the slot and remove the
 /// socket file a client could still be looking at.
 ///
-/// Nothing admits a session into this daemon yet. The wire facade lands in
-/// AGN-63/64, and when it does, the one place it belongs is between accepting a
-/// client and [`SessionSupervisor::start`]: a session admitted there must be
-/// given its OWN per-session state — its own provider client, which
-/// [`SessionAdmission`] already enforces by ownership, and its own MCP
-/// connections, which `agens-bootstrap` exposes as `Bootstrap::for_new_session`.
-/// Handing a peer a bootstrap CLONE instead would put every session's MCP
-/// servers behind one lock and let one session's close reach another's.
+/// Nothing admits a session into this daemon yet. When something does, the one
+/// place it belongs is between accepting a client and
+/// [`SessionSupervisor::start`]: a session admitted there must be given its OWN
+/// per-session state — its own provider client, which [`SessionAdmission`]
+/// already enforces by ownership, and its own MCP connections, which
+/// `agens-bootstrap` exposes as `Bootstrap::for_new_session`. Handing a peer a
+/// bootstrap CLONE instead would put every session's MCP servers behind one
+/// lock and let one session's close reach another's.
 pub struct Daemon {
     runtime: tokio::runtime::Runtime,
     sessions: SessionSupervisor,
-    /// Held for its binding, not for reading: the daemon owns its address for
-    /// the life of the process, and nothing accepts on it until the client
-    /// protocol lands.
-    #[allow(dead_code)]
+    /// The daemon's address for the life of the process. Clients are accepted
+    /// on it by [`Daemon::serve_until_shutdown`]; [`Daemon::run_until_shutdown`]
+    /// holds it bound without accepting.
     listener: UnixListener,
     instance: ServeInstance,
 }
@@ -113,6 +115,9 @@ impl Daemon {
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_time()
+            // The facade accepts on this runtime, and a socket without the IO
+            // driver does not fail to bind — it panics on the first accept.
+            .enable_io()
             .build()
             .map_err(|_| ServerError::Unavailable("runtime is unavailable"))?;
         let sessions = SessionSupervisor::new(runtime.handle().clone());
@@ -134,6 +139,59 @@ impl Daemon {
     /// registry the daemon runs against rather than a copy of its contents.
     pub fn sessions(&self) -> &SessionSupervisor {
         &self.sessions
+    }
+
+    /// Serves the clients' facade until asked to stop, then stops every session
+    /// before releasing the slot and the socket.
+    ///
+    /// The facade always accepts on the daemon's unix socket, and on loopback
+    /// as well when a port is named. Both are local by construction: the facade
+    /// authenticates nobody, so remote access is an SSH tunnel rather than a
+    /// listener anything else can route to.
+    ///
+    /// The core arrives from the composition root rather than being built here.
+    /// It is the coordinator's one core — the scheduler, the gates, the
+    /// safe-point queue and the event fan-out all reach it — and a daemon that
+    /// built its own would be a second one.
+    pub fn serve_until_shutdown(
+        self,
+        core: ApiCore,
+        localhost_port: Option<u16>,
+        shutdown: &HeadlessTurnCancellation,
+    ) -> Result<SessionShutdown, ServerError> {
+        let Self {
+            runtime,
+            sessions,
+            listener,
+            instance,
+        } = self;
+
+        let mut binding = FacadeBinding::none().on_unix_socket(listener);
+
+        if let Some(port) = localhost_port {
+            binding = binding
+                .bind_localhost(port)
+                .map_err(|_| ServerError::Unavailable("loopback is unavailable"))?;
+        }
+
+        let core = Arc::new(Mutex::new(core));
+        let blocking = BlockingBoundary::new(runtime.handle().clone());
+
+        let report = runtime.block_on(async {
+            let served = grpc::serve_until_shutdown(core, blocking, binding, shutdown).await;
+            let report = sessions.cancel_all_and_join().await;
+
+            (served, report)
+        });
+
+        runtime.shutdown_timeout(std::time::Duration::ZERO);
+        drop(sessions);
+        drop(instance);
+
+        let (served, report) = report;
+        served.map_err(|_| ServerError::Unavailable("the facade is unavailable"))?;
+
+        Ok(report)
     }
 
     /// Parks until asked to stop, then stops every session before releasing the
