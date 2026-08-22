@@ -9,10 +9,13 @@ use serde_json::Value;
 use crate::http_worker::{
     HttpRequest, HttpResponse, HttpWorker, HttpWorkerError, HttpWorkerFuture, HttpWorkerOperation,
 };
-use crate::stdio_mcp::{parse_response, request_wire};
+use crate::stdio_mcp::{MAX_MCP_FRAME_BYTES, McpResponseKind, parse_response, request_wire};
 use crate::{McpOperationContext, McpRequest, McpResponse, McpTransport, McpTransportError};
 
-const MAX_HTTP_BODY_BYTES: usize = 1024 * 1024;
+/// The largest response body this transport will hold in memory, on the same
+/// ceiling the stdio transport reads a frame against. What actually reaches
+/// the model is truncated later by `map_call_result`.
+const MAX_HTTP_BODY_BYTES: usize = MAX_MCP_FRAME_BYTES;
 const HTTP_WORKER_CAPACITY: usize = 8;
 const MCP_SESSION_ID_HEADER: &str = "mcp-session-id";
 const MAX_MCP_SESSION_ID_BYTES: usize = 512;
@@ -77,6 +80,7 @@ impl McpHttpTransport {
         notify: bool,
     ) -> Result<Option<McpResponse>, McpTransportError> {
         context.check()?;
+        let kind = McpResponseKind::of(&request);
         let id = (!notify).then(|| {
             let id = self.next_id;
             self.next_id += 1;
@@ -131,8 +135,9 @@ impl McpHttpTransport {
             if notify {
                 return Ok(None);
             }
-            let value = parse_body(&response.body)?;
-            return parse_response(value, id.expect("requests have identifiers")).map(Some);
+            let id = id.expect("requests have identifiers");
+            let kind = kind.expect("requests expect a response");
+            return parse_response(parse_body(&response.body, id)?, id, kind).map(Some);
         }
         Err(McpTransportError::RetriesExhausted)
     }
@@ -231,6 +236,7 @@ impl McpSseTransport {
         notify: bool,
     ) -> Result<Option<McpResponse>, McpTransportError> {
         context.check()?;
+        let kind = McpResponseKind::of(&request);
         let id = (!notify).then(|| {
             let id = self.next_id;
             self.next_id += 1;
@@ -278,11 +284,9 @@ impl McpSseTransport {
             if notify {
                 return Ok(None);
             }
-            return parse_response(
-                parse_body(&response.body)?,
-                id.expect("requests have identifiers"),
-            )
-            .map(Some);
+            let id = id.expect("requests have identifiers");
+            let kind = kind.expect("requests expect a response");
+            return parse_response(parse_body(&response.body, id)?, id, kind).map(Some);
         }
         Err(McpTransportError::RetriesExhausted)
     }
@@ -446,6 +450,11 @@ impl HttpWorkerOperation for McpSseOperation {
             let mut response = response;
             let mut frame = SseFrame::default();
             let mut buffer = Vec::new();
+            // Bytes at the front of `buffer` already known to hold no newline.
+            // Rescanning the whole buffer per chunk made a long unterminated
+            // line cost time quadratic in its length, which at the frame
+            // ceiling is minutes rather than the prompt rejection intended.
+            let mut scanned = 0;
             let mut message_endpoint = None;
             while let Some(chunk) = response
                 .chunk()
@@ -453,8 +462,9 @@ impl HttpWorkerOperation for McpSseOperation {
                 .map_err(|_| HttpWorkerError::Transport)?
             {
                 buffer.extend_from_slice(&chunk);
-                while let Some(newline) = buffer.iter().position(|byte| *byte == b'\n') {
-                    let mut line = buffer.drain(..=newline).collect::<Vec<_>>();
+                while let Some(offset) = buffer[scanned..].iter().position(|byte| *byte == b'\n') {
+                    let mut line = buffer.drain(..=scanned + offset).collect::<Vec<_>>();
+                    scanned = 0;
                     if line.ends_with(b"\n") {
                         line.pop();
                     }
@@ -479,6 +489,7 @@ impl HttpWorkerOperation for McpSseOperation {
                         return Err(HttpWorkerError::ResponseTooLarge);
                     }
                 }
+                scanned = buffer.len();
                 if pending_line_data_bytes(&buffer) > MAX_HTTP_BODY_BYTES {
                     return Err(HttpWorkerError::ResponseTooLarge);
                 }
@@ -604,13 +615,38 @@ fn worker_error(error: HttpWorkerError) -> McpTransportError {
     }
 }
 
-fn parse_body(body: &[u8]) -> Result<Value, McpTransportError> {
+/// Picks the response to `expected_id` out of a body that may be a bare JSON
+/// object or a stream of SSE events.
+///
+/// A streamable-HTTP server is free to emit notifications ahead of the answer
+/// on the same response body, so taking the first `data:` line meant one
+/// well-behaved progress notification broke the call it was reporting on.
+fn parse_body(body: &[u8], expected_id: u64) -> Result<Value, McpTransportError> {
     let body = std::str::from_utf8(body)
         .map_err(|_| McpTransportError::Protocol("MCP HTTP response is malformed".into()))?;
-    let payload = body
+
+    let mut payloads = body
         .lines()
-        .find_map(|line| line.strip_prefix("data: "))
-        .unwrap_or(body);
-    serde_json::from_str(payload)
-        .map_err(|_| McpTransportError::Protocol("MCP HTTP response is malformed".into()))
+        .filter_map(|line| line.strip_prefix("data: "))
+        .peekable();
+    if payloads.peek().is_none() {
+        return serde_json::from_str(body)
+            .map_err(|_| McpTransportError::Protocol("MCP HTTP response is malformed".into()));
+    }
+
+    let mut fallback = None;
+    for payload in payloads {
+        let Ok(value) = serde_json::from_str::<Value>(payload) else {
+            continue;
+        };
+        if value.get("id").and_then(Value::as_u64) == Some(expected_id) {
+            return Ok(value);
+        }
+        fallback.get_or_insert(value);
+    }
+
+    // Nothing in the stream answered this request. The first well-formed
+    // event is still the most informative thing to fail against, since a
+    // server-side JSON-RPC error arrives with no id at all.
+    fallback.ok_or_else(|| McpTransportError::Protocol("MCP HTTP response is malformed".into()))
 }

@@ -95,6 +95,152 @@ fn stdio_transport_keeps_protocol_transport_deadline_and_cancellation_failures_d
     );
 }
 
+/// Notifications, a request the server makes of this client, and an answer to
+/// a request already abandoned all share the one pipe with the pending
+/// response. Every one of them used to fail the call and kill the server.
+#[test]
+fn stdio_transport_reads_past_the_traffic_the_protocol_interleaves() {
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let mut client = client("notify", Duration::from_secs(2));
+
+    client.connect(initialize(), &cancellation).unwrap();
+    let tools = client.list_tools(&cancellation).unwrap();
+
+    assert_eq!(
+        tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>(),
+        ["first", "second"]
+    );
+    assert_eq!(
+        client
+            .call_tool("first", json!({}), &cancellation)
+            .unwrap()
+            .content,
+        "tool succeeded"
+    );
+}
+
+/// A screenshot, an audio clip, or an embedded binary resource has no text to
+/// forward, so each becomes a description of what came back. The call still
+/// succeeds and the server stays up.
+#[test]
+fn stdio_transport_describes_content_blocks_that_carry_no_text() {
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let mut client = client("call-image", Duration::from_secs(2));
+    client.connect(initialize(), &cancellation).unwrap();
+
+    let output = client.call_tool("first", json!({}), &cancellation).unwrap();
+
+    assert!(!output.is_error);
+    assert_eq!(
+        output.content,
+        concat!(
+            "here is the screenshot\n",
+            "[mcp image content: image/png]\n",
+            "[mcp audio content: audio/wav]\n",
+            "embedded\n",
+            "[mcp resource content: application/octet-stream]"
+        )
+    );
+    // The connection survived the non-text blocks, so the next call still works.
+    assert_eq!(
+        client
+            .call_tool("first", json!({}), &cancellation)
+            .unwrap()
+            .content,
+        concat!(
+            "here is the screenshot\n",
+            "[mcp image content: image/png]\n",
+            "[mcp audio content: audio/wav]\n",
+            "embedded\n",
+            "[mcp resource content: application/octet-stream]"
+        )
+    );
+}
+
+/// A result that only sets `structuredContent`, and one that is empty, are
+/// both legal answers rather than shapes to fail the call over.
+#[test]
+fn stdio_transport_accepts_a_structured_or_empty_tool_result() {
+    let cancellation = Arc::new(AtomicBool::new(false));
+
+    let mut structured = client("call-structured", Duration::from_secs(2));
+    structured.connect(initialize(), &cancellation).unwrap();
+    assert_eq!(
+        structured
+            .call_tool("first", json!({}), &cancellation)
+            .unwrap()
+            .content,
+        r#"{"answer":42}"#
+    );
+
+    let mut empty = client("call-empty", Duration::from_secs(2));
+    empty.connect(initialize(), &cancellation).unwrap();
+    let output = empty.call_tool("first", json!({}), &cancellation).unwrap();
+    assert!(!output.is_error);
+    assert_eq!(output.content, "");
+}
+
+/// A result larger than the model's budget is cut down to it with a marker,
+/// not failed: the answer is worth more truncated than lost.
+#[test]
+fn stdio_transport_truncates_a_tool_result_past_the_model_budget() {
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let mut client = client("call-oversize", Duration::from_secs(2));
+    client.connect(initialize(), &cancellation).unwrap();
+
+    let output = client.call_tool("first", json!({}), &cancellation).unwrap();
+
+    assert!(!output.is_error);
+    assert!(output.content.len() <= 64 * 1024);
+    assert!(output.content.ends_with("[mcp output truncated]"));
+    assert!(output.content.starts_with("xxxx"));
+}
+
+/// A server that still answers `2024-11-05` speaks every shape this client
+/// sends, so refusing it only cost reachable servers.
+#[test]
+fn stdio_transport_accepts_the_2024_11_05_protocol_version() {
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let mut client = client("legacy-protocol", Duration::from_secs(2));
+
+    client.connect(initialize(), &cancellation).unwrap();
+
+    assert_eq!(
+        client
+            .call_tool("first", json!({}), &cancellation)
+            .unwrap()
+            .content,
+        "tool succeeded"
+    );
+}
+
+/// A malformed or oversized frame costs the caller one answer. It used to cost
+/// the whole server, so a single bad frame disabled every later tool call.
+#[test]
+fn stdio_transport_survives_a_protocol_irregularity_on_a_tool_call() {
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let mut client = client("call-malformed", Duration::from_secs(2));
+    client.connect(initialize(), &cancellation).unwrap();
+
+    assert!(matches!(
+        client.call_tool("first", json!({}), &cancellation),
+        Err(McpTransportError::Protocol(_))
+    ));
+
+    // The transport is still alive: tool listing goes through the same pipe.
+    let tools = client.list_tools(&cancellation).unwrap();
+    assert_eq!(
+        tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>(),
+        ["first", "second"]
+    );
+}
+
 #[test]
 fn stdio_transport_rejects_an_unterminated_oversized_stdout_frame() {
     let cancellation = Arc::new(AtomicBool::new(false));

@@ -56,7 +56,7 @@ pub use mcp_status::{
     McpLoadPhase, McpServerDescriptor, McpServerSource, McpServerStatus, McpServerTransport,
     McpStatusError, McpStatusHandle, McpStatusSnapshot,
 };
-pub use stdio_mcp::{McpStdioTransport, McpStdioTransportConfig};
+pub use stdio_mcp::{MAX_MCP_FRAME_BYTES, McpStdioTransport, McpStdioTransportConfig};
 pub use task::{
     TaskControlAction, TaskControlTool, TaskDeclarationRejection, TaskExecutionEvent,
     TaskExecutionId, TaskExecutionLifecycle, TaskExecutionLimits, TaskExecutionRegistry,
@@ -73,6 +73,10 @@ use std::os::unix::process::CommandExt;
 
 const MAX_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_PROCESS_OUTPUT: usize = 64 * 1024;
+/// The share of an MCP tool result that reaches the model, on the same budget
+/// native process output already holds.
+const MAX_MCP_TOOL_OUTPUT: usize = 64 * 1024;
+const MCP_TRUNCATED_MARKER: &str = "\n[mcp output truncated]";
 const MAX_CAPTURED_PROCESS_BYTES: usize = MAX_PROCESS_OUTPUT - 128;
 const DEFAULT_BASH_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 const MAX_BASH_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -1916,7 +1920,12 @@ pub const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 /// A server is free to answer with a different version than the one agens
 /// requested, as long as it is one this build knows how to speak. Any other
 /// answer fails the connection with `McpErrorCategory::Protocol`.
-pub const SUPPORTED_MCP_PROTOCOL_VERSIONS: [&str; 3] = ["2025-11-25", "2025-06-18", "2025-03-26"];
+///
+/// `2024-11-05` is still what a large share of published servers answer with,
+/// and every request and response shape agens speaks is unchanged between it
+/// and the versions above, so refusing it only cost reachable servers.
+pub const SUPPORTED_MCP_PROTOCOL_VERSIONS: [&str; 4] =
+    ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct McpInitialize {
@@ -1992,9 +2001,21 @@ impl McpProtocolError {
     }
 }
 
+/// One block of a `tools/call` result, as much of it as a text-only tool
+/// output can carry.
+///
+/// The provider surface agens speaks to takes a tool result as a single
+/// string, so an image, audio, or binary-resource block has nothing to be
+/// forwarded as. It becomes a [`McpContentBlock::NonText`] description of what
+/// the server returned instead — the model still learns a screenshot came
+/// back, and the call no longer fails the whole turn.
 #[derive(Clone, Debug, PartialEq)]
 pub enum McpContentBlock {
     Text(String),
+    /// An agens-authored description of a block that carries no text, such as
+    /// `[mcp image content: image/png]`. Never interpolates server text
+    /// beyond a bounded, sanitized media type.
+    NonText(String),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -3405,20 +3426,44 @@ fn expect_initialized(response: McpResponse) -> Result<McpInitializeResult, McpT
 }
 
 fn map_call_result(result: McpCallResult) -> ToolOutput {
-    let content = result
-        .content
-        .into_iter()
-        .map(|block| match block {
-            McpContentBlock::Text(text) => text,
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let content = truncate_mcp_tool_content(
+        result
+            .content
+            .into_iter()
+            .map(|block| match block {
+                McpContentBlock::Text(text) | McpContentBlock::NonText(text) => text,
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
 
     if result.is_error {
         ToolOutput::failure(content)
     } else {
         ToolOutput::success(content)
     }
+}
+
+/// Bounds what a single MCP tool result can put in front of the model.
+///
+/// A server is free to answer with megabytes — a whole file, a base64 asset,
+/// a full page of search results — and failing the call over its size loses
+/// the answer entirely. Native tools already truncate on the same budget
+/// (`MAX_PROCESS_OUTPUT`), and a truncated answer with a marker is worth more
+/// to the model than an infrastructure failure.
+fn truncate_mcp_tool_content(mut content: String) -> String {
+    if content.len() <= MAX_MCP_TOOL_OUTPUT {
+        return content;
+    }
+
+    let mut end = MAX_MCP_TOOL_OUTPUT - MCP_TRUNCATED_MARKER.len();
+    while !content.is_char_boundary(end) {
+        end -= 1;
+    }
+
+    content.truncate(end);
+    content.push_str(MCP_TRUNCATED_MARKER);
+    content
 }
 
 fn remote_tool_metadata(

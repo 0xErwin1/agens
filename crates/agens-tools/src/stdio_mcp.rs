@@ -5,7 +5,7 @@ use std::{
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         mpsc,
     },
     thread,
@@ -28,9 +28,29 @@ use std::os::unix::process::CommandExt;
 /// output than to identify the credential it came from.
 const MIN_CONFIGURED_SECRET_CHARS: usize = 8;
 
-const MAX_FRAME_BYTES: usize = 1024 * 1024;
+/// The largest single JSON-RPC frame this client will hold in memory.
+///
+/// This is a memory ceiling, not the model's budget: a legitimate result can
+/// be megabytes (a base64 screenshot, a whole file), and what actually reaches
+/// the model is truncated later by `map_call_result`. A frame past this
+/// ceiling is drained to its newline so the stream stays aligned, and the call
+/// fails as a protocol irregularity without taking the server down with it.
+pub const MAX_MCP_FRAME_BYTES: usize = 8 * 1024 * 1024;
 const MAX_STDERR_BYTES: usize = 64 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(2);
+
+/// How many frames that are not the pending response this client will read
+/// past before giving up on the pending one.
+///
+/// Notifications, server-initiated requests, and answers to requests this
+/// client already abandoned are all legal traffic on the same pipe, so the
+/// reader has to walk past them. The bound is what stops a server that only
+/// ever emits notifications from holding the reader forever.
+const MAX_INTERLEAVED_FRAMES: usize = 256;
+
+/// How much of a server-supplied block type or media type is interpolated into
+/// the description of a block agens cannot forward.
+const MAX_CONTENT_DESCRIPTOR_CHARS: usize = 64;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct McpStdioTransportConfig {
@@ -60,18 +80,66 @@ impl McpStdioTransportConfig {
     }
 }
 
-struct Process {
-    child: Child,
-    stdout: BufReader<ChildStdout>,
-}
-
 struct WriteRequest {
     frame: Vec<u8>,
     response: mpsc::SyncSender<Result<(), McpTransportError>>,
 }
 
+/// Which result shape a response to a given request has to carry.
+///
+/// Without it the parser had to guess from the payload, so a `tools/call`
+/// result that carried no `content` array — an empty answer, or one that only
+/// set `structuredContent` — was indistinguishable from a shape this client
+/// does not speak.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum McpResponseKind {
+    Initialize,
+    ToolsList,
+    ToolCall,
+}
+
+impl McpResponseKind {
+    pub(crate) fn of(request: &McpRequest) -> Option<Self> {
+        match request {
+            McpRequest::Initialize(_) => Some(Self::Initialize),
+            McpRequest::Initialized => None,
+            McpRequest::ListTools { .. } => Some(Self::ToolsList),
+            McpRequest::CallTool { .. } => Some(Self::ToolCall),
+        }
+    }
+}
+
+/// What the reader does with a frame it just pulled off the pipe.
+enum FrameRouting {
+    /// The response to the pending request.
+    Response,
+    /// Legal traffic that is not that response, so the reader keeps going.
+    Skipped,
+    /// A frame no correct server sends on this pipe.
+    Invalid,
+}
+
+/// The child process handle, held apart from the reader so that terminating
+/// the server never waits on the thread blocked reading from it.
+///
+/// On unix `terminate` escapes through a signal to the process group, but the
+/// portable path has to call `Child::kill`, and with one shared lock that call
+/// could only run once the reader released it — which the reader does only
+/// when the process it is waiting on produces output. Two locks break that
+/// cycle: killing needs the child, reading needs the pipe, and neither waits
+/// for the other.
 pub struct McpStdioTransport {
-    process: Arc<Mutex<Option<Process>>>,
+    child: Arc<Mutex<Option<Child>>>,
+    stdout: Arc<Mutex<BufReader<ChildStdout>>>,
+    /// Set once a frame was abandoned part-read, which leaves the rest of it
+    /// in the pipe with no way to tell where the next frame begins.
+    ///
+    /// This is the one irregularity that is not recoverable in place: every
+    /// later frame would parse against the tail of the abandoned one. The
+    /// caller that hit it still gets a protocol error rather than a dead
+    /// server, and the connection is retired on the next request so the
+    /// registry can rebuild it.
+    desynchronized: Arc<AtomicBool>,
     writer: mpsc::SyncSender<WriteRequest>,
     process_id: AtomicU32,
     next_id: AtomicU64,
@@ -116,10 +184,9 @@ impl McpStdioTransport {
         let (writer, requests) = mpsc::sync_channel(1);
         start_writer(stdin, requests);
         Ok(Self {
-            process: Arc::new(Mutex::new(Some(Process {
-                child,
-                stdout: BufReader::new(stdout),
-            }))),
+            child: Arc::new(Mutex::new(Some(child))),
+            stdout: Arc::new(Mutex::new(BufReader::new(stdout))),
+            desynchronized: Arc::new(AtomicBool::new(false)),
             writer,
             next_id: AtomicU64::new(1),
             process_id: AtomicU32::new(process_id),
@@ -133,20 +200,36 @@ impl McpStdioTransport {
         context: &McpOperationContext,
     ) -> Result<McpResponse, McpTransportError> {
         context.check()?;
+        if self.desynchronized.load(Ordering::Acquire) {
+            let _ = self.terminate();
+            return Err(McpTransportError::Transport(
+                "MCP stdout stream is unusable".into(),
+            ));
+        }
+        let kind = McpResponseKind::of(&request).ok_or_else(|| {
+            McpTransportError::Protocol("MCP notification cannot carry a response".into())
+        })?;
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let wire = request_wire(request, Some(id));
         self.write_frame(wire, context)?;
-        let process = Arc::clone(&self.process);
+        let stdout = Arc::clone(&self.stdout);
+        let desynchronized = Arc::clone(&self.desynchronized);
         let (sender, receiver) = mpsc::sync_channel(1);
         thread::spawn(move || {
-            let result = read_frame(process).and_then(|frame| parse_response(frame, id));
+            let result = read_matching_frame(&stdout, id, &desynchronized)
+                .and_then(|frame| parse_response(frame, id, kind));
             let _ = sender.send(result);
         });
         loop {
             match receiver.recv_timeout(POLL_INTERVAL) {
                 Ok(result) => match context.check() {
                     Ok(()) => {
-                        if result.is_err() {
+                        // Only a failure of the pipe itself takes the server
+                        // down. A protocol irregularity — an unparseable
+                        // frame, an oversized one, a result shape this client
+                        // does not speak — costs the caller one answer, and
+                        // the connection stays usable for the next call.
+                        if matches!(result, Err(McpTransportError::Transport(_))) {
                             let _ = self.terminate();
                         }
                         return result;
@@ -178,7 +261,7 @@ impl McpStdioTransport {
     ) -> Result<(), McpTransportError> {
         let encoded = serde_json::to_vec(&value)
             .map_err(|_| McpTransportError::Protocol("MCP request could not be encoded".into()))?;
-        if encoded.len() > MAX_FRAME_BYTES {
+        if encoded.len() > MAX_MCP_FRAME_BYTES {
             return Err(McpTransportError::Protocol(
                 "MCP request frame exceeds limit".into(),
             ));
@@ -208,20 +291,18 @@ impl McpStdioTransport {
                 }
             }
         }
-        let mut process = self
-            .process
+        let mut child = self
+            .child
             .lock()
             .map_err(|_| McpTransportError::Transport("MCP process lock is unavailable".into()))?;
-        let Some(mut process) = process.take() else {
+        let Some(mut child) = child.take() else {
             return Ok(());
         };
         #[cfg(not(unix))]
-        process
-            .child
+        child
             .kill()
             .map_err(|_| McpTransportError::Transport("MCP process termination failed".into()))?;
-        process
-            .child
+        child
             .wait()
             .map_err(|_| McpTransportError::Transport("MCP process reap failed".into()))?;
         Ok(())
@@ -280,19 +361,75 @@ pub(crate) fn request_wire(request: McpRequest, id: Option<u64>) -> Value {
     }
 }
 
-fn read_frame(process: Arc<Mutex<Option<Process>>>) -> Result<Value, McpTransportError> {
-    let mut process = process
+/// Reads frames until the response to `expected_id` arrives, walking past the
+/// traffic the protocol allows a server to interleave with it.
+///
+/// Notifications (`notifications/message`, `notifications/tools/list_changed`,
+/// progress), requests the server makes of this client, and answers to
+/// requests this client already abandoned all share the one pipe. Treating any
+/// of them as a failure was what let a single well-behaved notification kill a
+/// server for the rest of the session.
+fn read_matching_frame(
+    stdout: &Arc<Mutex<BufReader<ChildStdout>>>,
+    expected_id: u64,
+    desynchronized: &AtomicBool,
+) -> Result<Value, McpTransportError> {
+    let mut stdout = stdout
         .lock()
         .map_err(|_| McpTransportError::Transport("MCP process lock is unavailable".into()))?;
-    let process = process
-        .as_mut()
-        .ok_or_else(|| McpTransportError::Transport("MCP process is closed".into()))?;
-    let mut frame = Vec::with_capacity(MAX_FRAME_BYTES);
+
+    for _ in 0..MAX_INTERLEAVED_FRAMES {
+        let frame = read_frame(&mut stdout, desynchronized)?;
+        match frame_routing(&frame, expected_id) {
+            FrameRouting::Response => return Ok(frame),
+            FrameRouting::Skipped => {}
+            FrameRouting::Invalid => {
+                return Err(McpTransportError::Protocol(
+                    "MCP response id does not match request".into(),
+                ));
+            }
+        }
+    }
+
+    Err(McpTransportError::Protocol(
+        "MCP server sent too many frames before responding".into(),
+    ))
+}
+
+/// Decides whether a frame answers the pending request, precedes it, or is
+/// something no correct server puts on this pipe.
+///
+/// This client keeps one request in flight and numbers them upwards, so an id
+/// below the pending one belongs to a request already given up on and an id
+/// above it was never sent. A frame carrying `method` is a notification or a
+/// request from the server: its `id`, when it has one, lives in the server's
+/// own numbering and never answers ours.
+fn frame_routing(frame: &Value, expected_id: u64) -> FrameRouting {
+    let Some(object) = frame.as_object() else {
+        return FrameRouting::Invalid;
+    };
+    if object.contains_key("method") {
+        return FrameRouting::Skipped;
+    }
+    match object.get("id") {
+        None | Some(Value::Null) => FrameRouting::Skipped,
+        Some(id) => match id.as_u64() {
+            Some(id) if id == expected_id => FrameRouting::Response,
+            Some(id) if id < expected_id => FrameRouting::Skipped,
+            _ => FrameRouting::Invalid,
+        },
+    }
+}
+
+fn read_frame(
+    stdout: &mut BufReader<ChildStdout>,
+    desynchronized: &AtomicBool,
+) -> Result<Value, McpTransportError> {
+    let mut frame = Vec::new();
     let mut received = false;
     loop {
         let (count, complete) = {
-            let buffer = process
-                .stdout
+            let buffer = stdout
                 .fill_buf()
                 .map_err(|_| McpTransportError::Transport("MCP stdout failed".into()))?;
             if buffer.is_empty() {
@@ -302,7 +439,12 @@ fn read_frame(process: Arc<Mutex<Option<Process>>>) -> Result<Value, McpTranspor
                 .iter()
                 .position(|byte| *byte == b'\n')
                 .map_or(buffer.len(), |position| position + 1);
-            if frame.len() + count > MAX_FRAME_BYTES {
+            // Draining the rest would mean blocking on a frame this client has
+            // already decided not to keep, and the frame may never terminate
+            // at all. The remainder stays in the pipe and the stream is
+            // retired instead.
+            if frame.len() + count > MAX_MCP_FRAME_BYTES {
+                desynchronized.store(true, Ordering::Release);
                 return Err(McpTransportError::Protocol(
                     "MCP stdout frame exceeds limit".into(),
                 ));
@@ -310,7 +452,7 @@ fn read_frame(process: Arc<Mutex<Option<Process>>>) -> Result<Value, McpTranspor
             frame.extend_from_slice(&buffer[..count]);
             (count, buffer[count - 1] == b'\n')
         };
-        process.stdout.consume(count);
+        stdout.consume(count);
         received = true;
         if complete {
             break;
@@ -370,6 +512,7 @@ fn wait_for_write(
 pub(crate) fn parse_response(
     value: Value,
     expected_id: u64,
+    kind: McpResponseKind,
 ) -> Result<McpResponse, McpTransportError> {
     let object = value
         .as_object()
@@ -398,8 +541,9 @@ pub(crate) fn parse_response(
     let result = object
         .get("result")
         .ok_or_else(|| McpTransportError::Protocol("MCP response has no result".into()))?;
-    if result.get("protocolVersion").is_some() {
-        return Ok(McpResponse::Initialized(McpInitializeResult::new(
+
+    match kind {
+        McpResponseKind::Initialize => Ok(McpResponse::Initialized(McpInitializeResult::new(
             result
                 .get("protocolVersion")
                 .and_then(Value::as_str)
@@ -409,45 +553,113 @@ pub(crate) fn parse_response(
             result.get("capabilities").cloned().ok_or_else(|| {
                 McpTransportError::Protocol("MCP capabilities are missing".into())
             })?,
-        )));
-    }
-    if let Some(tools) = result.get("tools").and_then(Value::as_array) {
-        let tools = tools
-            .iter()
-            .map(parse_tool)
-            .collect::<Result<Vec<_>, _>>()?;
-        return Ok(McpResponse::ToolsListed(McpToolsPage::new(
-            tools,
-            result
-                .get("nextCursor")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned),
-        )));
-    }
-    if let Some(content) = result.get("content").and_then(Value::as_array) {
-        let content = content
-            .iter()
-            .map(|block| {
-                block
-                    .get("text")
+        ))),
+        McpResponseKind::ToolsList => {
+            let tools = result
+                .get("tools")
+                .and_then(Value::as_array)
+                .ok_or_else(|| McpTransportError::Protocol("MCP tools are missing".into()))?
+                .iter()
+                .map(parse_tool)
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(McpResponse::ToolsListed(McpToolsPage::new(
+                tools,
+                result
+                    .get("nextCursor")
                     .and_then(Value::as_str)
-                    .map(|text| McpContentBlock::Text(text.into()))
-                    .ok_or_else(|| {
-                        McpTransportError::Protocol("MCP tool content is invalid".into())
-                    })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        return Ok(McpResponse::ToolCalled(McpCallResult {
-            content,
-            is_error: result
-                .get("isError")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-        }));
+                    .map(ToOwned::to_owned),
+            )))
+        }
+        McpResponseKind::ToolCall => Ok(McpResponse::ToolCalled(parse_call_result(result))),
     }
-    Err(McpTransportError::Protocol(
-        "MCP result shape is unsupported".into(),
-    ))
+}
+
+/// Reads a `tools/call` result, keeping whatever of it a text-only tool output
+/// can carry.
+///
+/// Every departure from a plain `content` array of text blocks used to fail
+/// the call as a protocol error, which on stdio then killed the server: an
+/// image block, an audio block, an embedded binary resource, a result that
+/// only sets `structuredContent`, or an empty answer. None of those are
+/// irregular — they are the protocol — so each one now yields the best text
+/// available for it.
+fn parse_call_result(result: &Value) -> McpCallResult {
+    let is_error = result
+        .get("isError")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    if let Some(blocks) = result.get("content").and_then(Value::as_array)
+        && !blocks.is_empty()
+    {
+        return McpCallResult {
+            content: blocks.iter().map(parse_content_block).collect(),
+            is_error,
+        };
+    }
+
+    if let Some(structured) = result.get("structuredContent") {
+        return McpCallResult {
+            content: vec![McpContentBlock::Text(structured.to_string())],
+            is_error,
+        };
+    }
+
+    McpCallResult {
+        content: Vec::new(),
+        is_error,
+    }
+}
+
+/// Projects one content block onto the text a tool output can hold.
+///
+/// A `resource` block carries its payload one level down, and an embedded text
+/// resource is as usable as a top-level text block. Anything left has no text
+/// at all, so what survives is an agens-authored line naming what came back.
+fn parse_content_block(block: &Value) -> McpContentBlock {
+    if let Some(text) = block.get("text").and_then(Value::as_str) {
+        return McpContentBlock::Text(text.to_owned());
+    }
+
+    let resource = block.get("resource");
+    if let Some(text) = resource
+        .and_then(|resource| resource.get("text"))
+        .and_then(Value::as_str)
+    {
+        return McpContentBlock::Text(text.to_owned());
+    }
+
+    let block_type = block.get("type").and_then(Value::as_str);
+    let media_type = block.get("mimeType").and_then(Value::as_str).or_else(|| {
+        resource
+            .and_then(|resource| resource.get("mimeType"))
+            .and_then(Value::as_str)
+    });
+
+    McpContentBlock::NonText(non_text_description(block_type, media_type))
+}
+
+/// Renders a block agens cannot forward as a bounded, agens-authored line.
+///
+/// The block type and media type come from the server, so both are reduced to
+/// visible ASCII and cut short before they are interpolated: the description
+/// exists to tell the model what came back, not to become a channel for
+/// arbitrary remote text.
+fn non_text_description(block_type: Option<&str>, media_type: Option<&str>) -> String {
+    let block_type = sanitized_descriptor(block_type).unwrap_or_else(|| "unknown".to_owned());
+    match sanitized_descriptor(media_type) {
+        Some(media_type) => format!("[mcp {block_type} content: {media_type}]"),
+        None => format!("[mcp {block_type} content]"),
+    }
+}
+
+fn sanitized_descriptor(value: Option<&str>) -> Option<String> {
+    let value = value?
+        .chars()
+        .filter(|character| character.is_ascii_graphic())
+        .take(MAX_CONTENT_DESCRIPTOR_CHARS)
+        .collect::<String>();
+    (!value.is_empty()).then_some(value)
 }
 
 /// The configured transport environment entries this transport treats as secrets.
@@ -493,6 +705,9 @@ fn redact_configured_secrets(response: McpResponse, secrets: &[String]) -> McpRe
             McpContentBlock::Text(text) => {
                 McpContentBlock::Text(redact_exact_values(&text, secrets))
             }
+            // Authored here from a sanitized block type and media type, so it
+            // carries no server text a configured secret could be echoed in.
+            block @ McpContentBlock::NonText(_) => block,
         })
         .collect();
     McpResponse::ToolCalled(McpCallResult {
@@ -576,7 +791,9 @@ mod tests {
             panic!("expected a ToolCalled response");
         };
         assert!(result.is_error);
-        let McpContentBlock::Text(text) = &result.content[0];
+        let McpContentBlock::Text(text) = &result.content[0] else {
+            panic!("expected a text content block");
+        };
         assert!(!text.contains("CONFIGURED_TRANSPORT_SECRET"));
         assert!(text.starts_with("server rejected the call: [redacted:"));
         assert!(text.ends_with("was invalid"));
@@ -660,7 +877,9 @@ mod tests {
         let McpResponse::ToolCalled(result) = redacted else {
             panic!("expected a ToolCalled response");
         };
-        let McpContentBlock::Text(text) = &result.content[0];
+        let McpContentBlock::Text(text) = &result.content[0] else {
+            panic!("expected a text content block");
+        };
         assert_eq!(text, "upstream rejected [redacted: 36 characters]");
     }
 
@@ -704,7 +923,9 @@ mod tests {
             panic!("expected a ToolCalled response");
         };
         assert!(!result.is_error);
-        let McpContentBlock::Text(text) = &result.content[0];
+        let McpContentBlock::Text(text) = &result.content[0] else {
+            panic!("expected a text content block");
+        };
         assert_eq!(text, "resolved [redacted: 36 characters]");
     }
 
