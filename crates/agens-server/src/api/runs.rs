@@ -301,21 +301,24 @@ impl ApiCore {
             return Ok(None);
         }
 
-        let question_id = self.machines.open_question(&QuestionRow {
-            id: None,
-            run_id,
-            kind: QuestionKind::Question,
-            blocked_decision: HOOK_TRUST_DECISION.to_owned(),
-            options: serde_json::json!([HOOK_TRUST_GRANT, HOOK_TRUST_REFUSE]).to_string(),
-            recommendation: Some(hook_recommendation(prepared, provisioned)),
-            answer: None,
-            author: None,
-            expires_at: None,
-            tree_hash: None,
-            paths_digest: None,
-            state: QuestionState::Open,
-            created_at: now,
-        })?;
+        let question_id = self.machines.open_question(
+            &QuestionRow {
+                id: None,
+                run_id,
+                kind: QuestionKind::Question,
+                blocked_decision: HOOK_TRUST_DECISION.to_owned(),
+                options: serde_json::json!([HOOK_TRUST_GRANT, HOOK_TRUST_REFUSE]).to_string(),
+                recommendation: Some(hook_recommendation(prepared, provisioned)),
+                answer: None,
+                author: None,
+                expires_at: None,
+                tree_hash: None,
+                paths_digest: None,
+                state: QuestionState::Open,
+                created_at: now,
+            },
+            &[],
+        )?;
 
         self.policy.record_pending(&PendingHookTrust {
             question_id,

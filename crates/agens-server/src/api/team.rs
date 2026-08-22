@@ -9,7 +9,8 @@
 //! this, so a caller replaying or reconciling decides what "now" means.
 
 use agens_store::{
-    QuestionAuthor, QuestionKind, QuestionRow, RetryTrigger, RunRow, RunState, WorktreeStatus,
+    EventClass, EventRow, QuestionAuthor, QuestionKind, QuestionRow, RetryTrigger, RunRow,
+    RunState, WorktreeStatus,
 };
 
 use super::runs::HOOK_TRUST_GRANT;
@@ -19,6 +20,10 @@ use crate::fsm::{
     Principal, QuestionEffect, QuestionFacts, QuestionTrigger, RunEffect, RunFacts, RunTrigger,
     TransitionOutcome, WorktreeEffect, WorktreeFacts, WorktreeTrigger,
 };
+
+/// What an approval offers. Two options, because the decision is a merge or no
+/// merge, and a client renders them the way it renders a worker's question.
+const APPROVAL_OPTIONS: &str = r#"[{"id":"merge","label":"merge the branch","consequence":"the branch lands and the worktree is released"},{"id":"hold","label":"hold the merge","consequence":"nothing lands and the worktree stays active"}]"#;
 
 /// Naming a run, and when.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,11 +65,45 @@ pub struct AnsweredQuestion {
 /// when it was created, not to the run.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuthorizeMerge {
-    pub question_id: i64,
+    pub subject: MergeAuthorization,
     /// What the user answered. Recorded with the grant, because the record of
     /// whose authority a merge carried cannot be reconstructed later.
     pub answer: String,
     pub now: i64,
+}
+
+/// Which approval a grant is given on.
+///
+/// Nothing else in the coordinator creates one. A worker's `ask` is a plain
+/// question by construction, and an approval created anywhere but here would
+/// be an approval whose receipt nobody froze — so the operation that grants the
+/// authorization is also the one that opens it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MergeAuthorization {
+    /// An approval that is already open, asked for earlier.
+    Existing(i64),
+    /// No approval yet: freeze one over the run's worktree as it stands right
+    /// now, and grant it in the same request.
+    ForRun {
+        run_id: i64,
+        /// Epoch seconds. `None` means it never expires on its own, which is
+        /// only reasonable because the receipt expires it in practice: the
+        /// first commit after it is granted makes it authorize bytes that are
+        /// no longer there.
+        expires_at: Option<i64>,
+    },
+}
+
+/// A merge authorization granted, and the approval it was granted on.
+///
+/// The id is carried back because the caller needs it: it is what the pre-merge
+/// gate is presented with, and for an approval created by this same request
+/// there is nowhere else it could come from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MergeAuthorized {
+    pub question_id: i64,
+    pub run_id: i64,
+    pub grant: TransitionOutcome<agens_store::QuestionState, QuestionEffect>,
 }
 
 /// A retry of an approved scope, with the guidance that makes it a different
@@ -233,16 +272,32 @@ impl ApiCore {
         })
     }
 
-    /// Grants a merge authorization.
+    /// Grants a merge authorization, opening the approval first when the
+    /// request carries a run rather than a question.
     ///
     /// The user's alone. Praetor is refused by the table, and the question
-    /// machine refuses a non-user author on top of that.
+    /// machine refuses a non-user author on top of that. The refusal comes
+    /// before anything is opened, so a principal that may not authorize a merge
+    /// cannot leave an approval behind by asking for one.
     pub fn authorize_merge(
         &mut self,
         principal: Principal,
         request: &AuthorizeMerge,
-    ) -> Result<TransitionOutcome<agens_store::QuestionState, QuestionEffect>, ApiError> {
-        let question = self.load_question(request.question_id)?;
+    ) -> Result<MergeAuthorized, ApiError> {
+        let question_id = match request.subject {
+            MergeAuthorization::Existing(question_id) => question_id,
+            MergeAuthorization::ForRun { run_id, expires_at } => {
+                self.authorize(
+                    Operation::AuthorizeMerge,
+                    principal,
+                    Some(run_id),
+                    request.now,
+                )?;
+                self.open_approval(principal, run_id, expires_at, request.now)?
+            }
+        };
+
+        let question = self.load_question(question_id)?;
 
         self.authorize(
             Operation::AuthorizeMerge,
@@ -285,7 +340,7 @@ impl ApiCore {
         )?;
 
         let granted = self.machines.apply_question(
-            request.question_id,
+            question_id,
             QuestionTrigger::Answer,
             &QuestionFacts {
                 now: request.now,
@@ -296,7 +351,77 @@ impl ApiCore {
 
         self.perform_question_effects(&granted, &question, &request.answer)?;
 
-        Ok(granted)
+        Ok(MergeAuthorized {
+            question_id,
+            run_id: question.run_id,
+            grant: granted,
+        })
+    }
+
+    /// Opens the approval a merge is authorized on, with its receipt frozen
+    /// over the worktree as git has it right now.
+    ///
+    /// The receipt is derived here rather than taken from the request for the
+    /// same reason every other fact about a worktree is: a caller that named
+    /// its own tree hash would be authorizing bytes of its own choosing.
+    ///
+    /// A worktree with uncommitted work is refused rather than frozen. The
+    /// receipt describes `HEAD^{tree}`, so freezing one over a dirty worktree
+    /// would bind the authorization to a tree that does not hold the work the
+    /// user is looking at, and the gate would compare against it happily.
+    fn open_approval(
+        &mut self,
+        principal: Principal,
+        run_id: i64,
+        expires_at: Option<i64>,
+        now: i64,
+    ) -> Result<i64, ApiError> {
+        let run = self.load_run(run_id)?;
+        let derivation = self.ports.worktrees.derive(&run)?;
+
+        if !derivation.worktree_clean {
+            return Err(self.refuse(
+                Operation::AuthorizeMerge,
+                principal,
+                Some(run_id),
+                now,
+                "the worktree holds uncommitted work, so a receipt frozen over it would \
+                 authorize a tree that does not carry it"
+                    .to_owned(),
+            ));
+        }
+
+        let question = QuestionRow {
+            id: None,
+            run_id,
+            kind: QuestionKind::Approval,
+            blocked_decision: "merge this run's branch".to_owned(),
+            options: APPROVAL_OPTIONS.to_owned(),
+            recommendation: None,
+            answer: None,
+            author: None,
+            expires_at,
+            tree_hash: Some(derivation.tree_hash.clone()),
+            paths_digest: Some(derivation.paths_digest.clone()),
+            state: agens_store::QuestionState::Open,
+            created_at: now,
+        };
+
+        let announcement = EventRow {
+            id: None,
+            run_id: Some(run_id),
+            event_type: "approval_requested".to_owned(),
+            class: EventClass::Infra,
+            payload: serde_json::json!({
+                "tree_hash": derivation.tree_hash,
+                "paths_digest": derivation.paths_digest,
+                "expires_at": expires_at,
+            })
+            .to_string(),
+            ts: now,
+        };
+
+        Ok(self.machines.open_question(&question, &[announcement])?)
     }
 
     /// Cancels a run. Idempotent: a run already cancelled reports settled and
