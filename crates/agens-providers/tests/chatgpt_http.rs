@@ -15,6 +15,7 @@ use agens_core::{
 use agens_providers::{
     ChatGptResponsesProvider, OpenAiFunctionTool, ProgressAwareProvider, ProviderDiagnosticClass,
     ProviderDiagnosticKind, ProviderDiagnosticScope, ProviderDiagnostics, ProviderFailureDetail,
+    RetryPolicy,
 };
 use serde_json::{Value, json};
 
@@ -307,6 +308,50 @@ fn subscription_transport_retries_network_and_server_failures_then_succeeds() {
         Ok(vec![MessagePart::Text("recovered".to_owned())])
     );
     assert_eq!(server.join().len(), 3);
+    fs::remove_dir_all(directory).expect("temporary directory should be removed");
+}
+
+/// The same truncation the OpenAI-API path recovers from, on the transport
+/// that carries almost every turn.
+#[test]
+fn subscription_transport_retries_a_stream_cut_before_it_produced_output() {
+    let directory = temporary_directory("stream-cut-retry");
+    let credentials = write_credentials(&directory);
+    let server = ScriptedServer::start(vec![
+        ScriptedResponse::Sse(created_only_sse()),
+        ScriptedResponse::Sse(completed_text_sse("recovered")),
+    ]);
+    let mut provider = provider(&credentials, &server.responses_base_url())
+        .with_retry_policy(brisk_retry_policy(4));
+
+    assert_eq!(
+        run(&mut provider, HeadlessTurnCancellation::new()),
+        Ok(vec![MessagePart::Text("recovered".to_owned())])
+    );
+    assert_eq!(server.join().len(), 2);
+    fs::remove_dir_all(directory).expect("temporary directory should be removed");
+}
+
+/// A dropped connection is not the decoder's fault. Folding every stream
+/// failure but cancellation into `Protocol` reported a lost network as
+/// "ChatGPT response protocol failed" and logged it under the one class no
+/// retry logic can act on.
+#[test]
+fn subscription_transport_reports_a_lost_stream_as_network_not_protocol() {
+    let directory = temporary_directory("stream-cut-class");
+    let credentials = write_credentials(&directory);
+    let server = ScriptedServer::start(vec![ScriptedResponse::Sse(
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"half an answer\"}\n\n"
+            .to_owned(),
+    )]);
+    let mut provider = provider(&credentials, &server.responses_base_url())
+        .with_retry_policy(brisk_retry_policy(4));
+
+    assert_eq!(
+        run(&mut provider, HeadlessTurnCancellation::new()),
+        Err(HeadlessTurnPortError::ProviderNetwork)
+    );
+    assert_eq!(server.join().len(), 1);
     fs::remove_dir_all(directory).expect("temporary directory should be removed");
 }
 
@@ -2443,6 +2488,23 @@ fn temporary_directory(name: &str) -> PathBuf {
     ));
     fs::create_dir_all(&path).expect("temporary directory should be created");
     path
+}
+
+/// A stream that opens and is then cut: no output part is decoded and no
+/// terminal event ever arrives.
+fn created_only_sse() -> String {
+    "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_cut\"}}\n\n".to_owned()
+}
+
+/// A schedule short enough to sleep through in a test, with the same shape as
+/// the production one.
+fn brisk_retry_policy(max_attempts: usize) -> RetryPolicy {
+    RetryPolicy::new(
+        max_attempts,
+        Duration::from_millis(10),
+        Duration::from_millis(40),
+        Duration::from_millis(40),
+    )
 }
 
 fn completed_text_sse(text: &str) -> String {
