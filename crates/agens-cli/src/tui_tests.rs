@@ -30,15 +30,127 @@ use agens_tui_app::engine::{
 };
 use agens_tui_app::models::seed_remembered_tui_selection;
 use agens_tui_app::resume::resume_tui_session;
-use agens_tui_app::router::TuiRuntimeRouter;
+use agens_tui_app::router::{TuiRuntimeRouter, tui_provider_outcome};
 use agens_tui_app::test_support::{
-    persist_tui_session, persist_tui_session_metadata, render_tui_test_backend,
+    enter_tui_input, persist_tui_session, persist_tui_session_metadata, render_tui_test_backend,
     rotation_dispatcher, tui_project,
 };
 
 use crate::CliDependencies;
 use crate::commands::chat::{chat_args_with_prompt, chat_request};
 use crate::deps::bootstrap;
+
+/// AGN-106: what the terminal actually paints after a fixed scripted turn.
+///
+/// The turn is real down to the socket and only the model is a fixture, so the
+/// frame this pins is the frame a person would see. A direct row comparison
+/// rather than a snapshot library: the point is that a density or hierarchy
+/// change has to be looked at, and an inline expectation is what makes that
+/// unavoidable in review.
+#[test]
+fn journey_render_paints_a_scripted_turn_into_a_stable_frame() {
+    let temporary = tui_session_directory("journey-render");
+    let provider = ScriptedProvider::start(
+        ScriptedDialect::Responses,
+        Script::new([ScriptedTurn::text("the scripted answer")]),
+    );
+    let config_home = temporary.join("config");
+    let data_directory = temporary.join("data");
+    std::fs::create_dir_all(&config_home).expect("config directory should exist");
+    std::fs::write(
+        config_home.join("auth.json"),
+        r#"{"openai-api":{"api_key":"fixture"}}"#,
+    )
+    .expect("credentials should be written");
+
+    let dependencies = CliDependencies::for_test(
+        temporary.join("project"),
+        Some(temporary.join("home")),
+        BTreeMap::from([(
+            "AGENS_CONFIG_HOME".to_owned(),
+            config_home.display().to_string(),
+        )]),
+        BTreeMap::from([
+            (
+                config_home.join("config.toml"),
+                format!(
+                    "[provider]\ntype = \"openai-api\"\nmodel = \"openai-api/gpt-4.1\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n",
+                    provider.base_url(),
+                    data_directory.display()
+                ),
+            ),
+            (
+                config_home.join("auth.json"),
+                r#"{"openai-api":{"api_key":"fixture"}}"#.to_owned(),
+            ),
+        ]),
+    );
+    let bootstrap = bootstrap(&dependencies).expect("production bootstrap should be valid");
+    let session = Arc::new(Mutex::new(SessionContext::fresh()));
+    let cancellation = HeadlessTurnCancellation::new();
+    let mut tui = Tui::new(ProductionTuiEngine {
+        cancellation: Arc::new(Mutex::new(None)),
+    });
+
+    configure_tui_project_identity(&mut tui, &bootstrap);
+    tui.set_presentation("openai-api", "gpt-4.1", "new session");
+    let router = TuiRuntimeRouter::new(
+        bootstrap.clone(),
+        Arc::clone(&session),
+        Arc::new(Mutex::new(None)),
+        Arc::new(CommandCatalog::default()),
+        Arc::new(SkillCatalog::default()),
+    );
+    let input = enter_tui_input(&mut tui, "render this");
+    let prompt = tui
+        .apply_submission_outcome(router.route(input))
+        .expect("a plain prompt should reach the provider");
+    let answer = run_tui_prompt(&bootstrap, &prompt, &cancellation, &session, None)
+        .expect("the scripted turn should complete");
+    tui.finish_provider_turn(tui_provider_outcome(Ok(answer)));
+
+    let frame = render_tui_test_backend(&tui, 80, 12);
+    // The elapsed time is the one cell that a second run is allowed to differ
+    // on, so it is the one cell this replaces before comparing.
+    let rows: Vec<String> = frame
+        .chars()
+        .collect::<Vec<_>>()
+        .chunks(80)
+        .map(|row| {
+            let row: String = row.iter().collect();
+            let row = row.trim_end();
+            match row.split_once("│ ") {
+                Some((indent, elapsed)) if elapsed.ends_with("ms") => {
+                    format!("{indent}│ <elapsed>")
+                }
+                _ => row.to_owned(),
+            }
+        })
+        .collect();
+
+    assert_eq!(
+        rows,
+        [
+            "─".repeat(76),
+            "   ┃❯ render this".to_owned(),
+            String::new(),
+            "    ● the scripted answer".to_owned(),
+            String::new(),
+            "      │ <elapsed>".to_owned(),
+            String::new(),
+            String::new(),
+            format!("    ┌{}┐", "─".repeat(70)),
+            format!("    │{}│", " ".repeat(70)),
+            format!(
+                "    └{}─ gpt-4.1 · ctx — · /t/a/project · ask ┘",
+                "─".repeat(31)
+            ),
+            "     Esc:normal  ^?:shortcuts".to_owned(),
+        ]
+    );
+    provider.assert_script_consumed();
+    std::fs::remove_dir_all(&temporary).expect("temporary files should be removed");
+}
 
 fn remember(bootstrap: &Bootstrap, model: &str, effort: Option<agens_core::ReasoningEffort>) {
     PreferenceStore::open(bootstrap.data_directory())
