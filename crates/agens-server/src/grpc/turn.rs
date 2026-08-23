@@ -41,6 +41,15 @@ pub(super) fn session_event(session_id: i64, event: &ChatEvent) -> Option<proto:
                 detail: detail.clone(),
             })
         }
+        ChatEvent::PermissionAsked { prompt_id, request } => {
+            proto::session_event::Event::PermissionAsked(proto::PermissionAsked {
+                prompt_id: *prompt_id,
+                tool: request.tool.clone(),
+                target: request.target.clone(),
+                access: request.access.clone(),
+                reason: request.reason.clone(),
+            })
+        }
         ChatEvent::Closed => proto::session_event::Event::Closed(proto::ChatClosed {}),
     };
 

@@ -19,8 +19,9 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use agens_core::{HeadlessTurnCancellation, Message, TurnEvent, TurnProgressSink};
@@ -29,6 +30,10 @@ use crate::sessions::{
     SessionAdmission, SessionId, SessionOutcome, SessionRegistryError, SessionRuntime,
     SessionSupervisor,
 };
+
+/// How often a turn waiting on a permission answer looks again at whether
+/// anybody is still there to give one.
+const ANSWER_POLL: Duration = Duration::from_millis(50);
 
 /// How many prompts may wait while a turn is running.
 ///
@@ -71,6 +76,73 @@ pub struct ChatSessionRequest {
 /// running one means. Taken as a trait object so that stays outside this crate:
 /// a turn needs models, prompts, skills and a project root, and the control
 /// plane deliberately knows none of them.
+/// A permission decision a hosted turn cannot make for itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChatPermissionRequest {
+    /// The bare tool name, as a person reads it.
+    pub tool: String,
+    pub target: String,
+    pub access: String,
+    pub reason: String,
+}
+
+/// What came back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChatPermissionAnswer {
+    AllowOnce,
+    AllowAlways,
+    DenyOnce,
+    DenyAlways,
+    /// Nobody answered, and nobody is going to: every client watching this chat
+    /// went away while the question was open.
+    Unheard,
+}
+
+impl ChatPermissionAnswer {
+    /// The name this answer crosses the wire under.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AllowOnce => "allow_once",
+            Self::AllowAlways => "allow_always",
+            Self::DenyOnce => "deny_once",
+            Self::DenyAlways => "deny_always",
+            Self::Unheard => "unheard",
+        }
+    }
+
+    /// The answer a client named, or `None` for a name this daemon does not
+    /// know — which is refused rather than read as a permissive one.
+    ///
+    /// Not `FromStr`: that returns a `Result` whose error would have to say
+    /// something, and there is nothing to say beyond the name being unknown,
+    /// which the absence already says.
+    #[must_use]
+    pub fn parse(answer: &str) -> Option<Self> {
+        match answer {
+            "allow_once" => Some(Self::AllowOnce),
+            "allow_always" => Some(Self::AllowAlways),
+            "deny_once" => Some(Self::DenyOnce),
+            "deny_always" => Some(Self::DenyAlways),
+            _ => None,
+        }
+    }
+}
+
+/// How a hosted turn asks the person attached to it.
+///
+/// Handed to the turn rather than reached for, so a turn cannot ask a chat
+/// other than its own.
+pub trait ChatAsks: Send + Sync {
+    /// Publishes a permission question and waits for the answer.
+    ///
+    /// It blocks, without a deadline, for the reason the terminal's own bridge
+    /// does: a permission question is not something to time out and proceed
+    /// past. What ends the wait besides an answer is everybody who could give
+    /// one going away — a question nobody can hear is refused rather than left
+    /// holding the turn forever.
+    fn permission(&self, request: &ChatPermissionRequest) -> ChatPermissionAnswer;
+}
+
 pub trait ChatTurns: Send {
     /// Runs one prompt to completion, reporting progress through `progress`.
     ///
@@ -84,6 +156,7 @@ pub trait ChatTurns: Send {
         prompt: &str,
         runtime: &SessionRuntime,
         cancellation: &HeadlessTurnCancellation,
+        asks: &Arc<dyn ChatAsks>,
         progress: &TurnProgressSink,
     ) -> ChatTurnOutcome;
 }
@@ -123,8 +196,17 @@ pub type ChatHistorySource =
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ChatEvent {
     Progress(TurnEvent),
-    TurnCompleted { text: String },
-    TurnFailed { detail: String },
+    /// A decision the turn cannot make for itself, and the id an answer names.
+    PermissionAsked {
+        prompt_id: u64,
+        request: ChatPermissionRequest,
+    },
+    TurnCompleted {
+        text: String,
+    },
+    TurnFailed {
+        detail: String,
+    },
     Closed,
 }
 
@@ -136,6 +218,9 @@ pub enum ChatError {
     Unknown,
     /// A turn is already running and one prompt is already waiting behind it.
     Busy,
+    /// An answer named a question this chat is not waiting on, or an answer
+    /// this daemon does not know.
+    NotAsked,
     Unavailable(String),
 }
 
@@ -144,6 +229,8 @@ impl std::fmt::Display for ChatError {
         match self {
             Self::Unknown => formatter.write_str("no such chat session"),
             Self::Busy => formatter.write_str("the chat session is already running a turn"),
+            Self::NotAsked => formatter
+                .write_str("the chat is not waiting on that question, or that is not an answer"),
             Self::Unavailable(detail) => formatter.write_str(detail),
         }
     }
@@ -151,9 +238,36 @@ impl std::fmt::Display for ChatError {
 
 impl std::error::Error for ChatError {}
 
+/// One client's stream of a chat's events.
+///
+/// A guard rather than a bare `Receiver`, because the fan-out has to know a
+/// client left without waiting for the next publish to discover it. A turn
+/// stopped on a permission question publishes nothing while it waits, so a
+/// count that only refreshed on publish would never notice that the person who
+/// could answer had gone.
+pub struct ChatSubscription {
+    events: Receiver<ChatEvent>,
+    /// Held for exactly as long as this subscription is, and counted through
+    /// the weak handle the fan-out keeps.
+    _listening: Arc<()>,
+}
+
+impl ChatSubscription {
+    /// The next event, or what stopped it arriving.
+    pub fn recv_timeout(&self, timeout: Duration) -> Result<ChatEvent, RecvTimeoutError> {
+        self.events.recv_timeout(timeout)
+    }
+}
+
+/// One client, and the handle that says whether it is still there.
+struct Subscriber {
+    outbound: SyncSender<ChatEvent>,
+    listening: Weak<()>,
+}
+
 /// The subscribers of one hosted chat.
 #[derive(Default)]
-struct Subscribers(Mutex<Vec<SyncSender<ChatEvent>>>);
+struct Subscribers(Mutex<Vec<Subscriber>>);
 
 impl Subscribers {
     /// Hands one event to every subscriber, dropping the ones that are gone and
@@ -169,21 +283,43 @@ impl Subscribers {
             return;
         };
 
-        subscribers.retain(|outbound| match outbound.try_send(event.clone()) {
-            Ok(()) => true,
-            Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => false,
-        });
+        subscribers.retain(
+            |subscriber| match subscriber.outbound.try_send(event.clone()) {
+                Ok(()) => true,
+                Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => false,
+            },
+        );
     }
 
-    fn add(&self) -> Result<Receiver<ChatEvent>, ChatError> {
+    /// How many clients are still listening.
+    ///
+    /// Read off the guards each subscription holds rather than off the channel,
+    /// so it is true between publishes as well as after one.
+    fn listeners(&self) -> usize {
+        self.0.lock().map_or(0, |subscribers| {
+            subscribers
+                .iter()
+                .filter(|subscriber| subscriber.listening.strong_count() > 0)
+                .count()
+        })
+    }
+
+    fn add(&self) -> Result<ChatSubscription, ChatError> {
         let (outbound, inbound) = sync_channel(SUBSCRIBER_BACKLOG);
+        let listening = Arc::new(());
 
         self.0
             .lock()
             .map_err(|_| unusable("the chat fan-out"))?
-            .push(outbound);
+            .push(Subscriber {
+                outbound,
+                listening: Arc::downgrade(&listening),
+            });
 
-        Ok(inbound)
+        Ok(ChatSubscription {
+            events: inbound,
+            _listening: listening,
+        })
     }
 }
 
@@ -199,6 +335,11 @@ pub struct OpenChatSummary {
     pub answering: bool,
 }
 
+/// A question this chat is waiting on an answer to.
+struct PendingQuestion {
+    answer: SyncSender<ChatPermissionAnswer>,
+}
+
 /// One open chat, as the daemon holds it.
 struct OpenChat {
     /// Dropping this ends the session's loop, which is what closing a chat is.
@@ -212,6 +353,8 @@ struct OpenChat {
     /// cancelling reaches the answer being produced and never the one before
     /// it.
     running: Arc<Mutex<Option<HeadlessTurnCancellation>>>,
+    /// The questions this chat is waiting on, by the id an answer names.
+    asked: Arc<Mutex<BTreeMap<u64, PendingQuestion>>>,
 }
 
 /// The chat sessions this daemon is hosting.
@@ -270,6 +413,8 @@ impl ChatSessions {
         let published = Arc::clone(&subscribers);
         let running = Arc::new(Mutex::new(None));
         let turn = Arc::clone(&running);
+        let asked = Arc::new(Mutex::new(BTreeMap::new()));
+        let questions = Arc::clone(&asked);
         let checkout = request.checkout.clone();
 
         let mut open = self.locked()?;
@@ -286,12 +431,20 @@ impl ChatSessions {
                 subscribers,
                 checkout,
                 running,
+                asked,
             },
         );
         drop(open);
 
         let started = self.supervisor.start(admission, move |runtime| {
-            serve_prompts(turns.as_mut(), &runtime, &inbox, &published, &turn)
+            serve_prompts(
+                turns.as_mut(),
+                &runtime,
+                &inbox,
+                &published,
+                &turn,
+                &questions,
+            )
         });
 
         if let Err(error) = started {
@@ -314,12 +467,41 @@ impl ChatSessions {
         })
     }
 
+    /// Answers a question a chat's turn is waiting on.
+    ///
+    /// A question this chat is not waiting on is refused rather than ignored:
+    /// an answer to a question that already resolved is a person answering
+    /// something other than what they are looking at, and letting it through
+    /// silently would apply it to nothing.
+    pub fn answer(
+        &self,
+        session: SessionId,
+        prompt_id: u64,
+        answer: ChatPermissionAnswer,
+    ) -> Result<(), ChatError> {
+        let open = self.locked()?;
+        let chat = open.get(&session).ok_or(ChatError::Unknown)?;
+
+        let mut asked = chat
+            .asked
+            .lock()
+            .map_err(|_| unusable("the chat's open questions"))?;
+        let question = asked.remove(&prompt_id).ok_or(ChatError::NotAsked)?;
+
+        // A full or closed channel means the turn stopped waiting between the
+        // lookup and now, which is the same thing as never having asked.
+        question
+            .answer
+            .try_send(answer)
+            .map_err(|_| ChatError::NotAsked)
+    }
+
     /// Opens a stream of one chat's events, live from now.
     ///
     /// It is not a replay: a client that wants what it missed while it was
     /// detached asks for the session's stored history, which is the projection
     /// built for exactly that.
-    pub fn subscribe(&self, session: SessionId) -> Result<Receiver<ChatEvent>, ChatError> {
+    pub fn subscribe(&self, session: SessionId) -> Result<ChatSubscription, ChatError> {
         self.locked()?
             .get(&session)
             .ok_or(ChatError::Unknown)?
@@ -411,6 +593,63 @@ impl ChatSessions {
     }
 }
 
+/// The asking half of one chat, handed to each of its turns.
+///
+/// It owns the publishing and the waiting so a turn owns neither: what a turn
+/// decides is what to ask, never who hears it or for how long.
+struct ChatQuestions {
+    subscribers: Arc<Subscribers>,
+    asked: Arc<Mutex<BTreeMap<u64, PendingQuestion>>>,
+    next_id: AtomicU64,
+}
+
+impl ChatAsks for ChatQuestions {
+    fn permission(&self, request: &ChatPermissionRequest) -> ChatPermissionAnswer {
+        let prompt_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (answer, answered) = sync_channel(1);
+
+        let Ok(mut asked) = self.asked.lock() else {
+            return ChatPermissionAnswer::Unheard;
+        };
+        asked.insert(prompt_id, PendingQuestion { answer });
+        drop(asked);
+
+        self.subscribers.publish(&ChatEvent::PermissionAsked {
+            prompt_id,
+            request: request.clone(),
+        });
+
+        let outcome = self.wait_for(&answered);
+
+        if let Ok(mut asked) = self.asked.lock() {
+            asked.remove(&prompt_id);
+        }
+
+        outcome
+    }
+}
+
+impl ChatQuestions {
+    /// Waits for the answer, checking between waits that anybody is still there
+    /// to give one.
+    ///
+    /// The subscriber count is read after the publish that would have dropped a
+    /// client that went away, so it is the count of clients that could still
+    /// answer rather than the count that existed when the question was asked.
+    fn wait_for(&self, answered: &Receiver<ChatPermissionAnswer>) -> ChatPermissionAnswer {
+        loop {
+            match answered.recv_timeout(ANSWER_POLL) {
+                Ok(answer) => return answer,
+                Err(RecvTimeoutError::Disconnected) => return ChatPermissionAnswer::Unheard,
+                Err(RecvTimeoutError::Timeout) if self.subscribers.listeners() == 0 => {
+                    return ChatPermissionAnswer::Unheard;
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+            }
+        }
+    }
+}
+
 /// One hosted chat's life: take a prompt, run it, publish what it did, repeat.
 fn serve_prompts(
     turns: &mut dyn ChatTurns,
@@ -418,8 +657,14 @@ fn serve_prompts(
     inbox: &Receiver<String>,
     subscribers: &Arc<Subscribers>,
     running: &Arc<Mutex<Option<HeadlessTurnCancellation>>>,
+    asked: &Arc<Mutex<BTreeMap<u64, PendingQuestion>>>,
 ) -> SessionOutcome {
     let progress = progress_sink(subscribers);
+    let questions: Arc<dyn ChatAsks> = Arc::new(ChatQuestions {
+        subscribers: Arc::clone(subscribers),
+        asked: Arc::clone(asked),
+        next_id: AtomicU64::new(0),
+    });
 
     loop {
         if runtime.cancellation().is_cancelled() {
@@ -453,7 +698,7 @@ fn serve_prompts(
             *turn = Some(cancellation.clone());
         }
 
-        let event = match turns.run(&prompt, runtime, &cancellation, &progress) {
+        let event = match turns.run(&prompt, runtime, &cancellation, &questions, &progress) {
             ChatTurnOutcome::Completed(text) => ChatEvent::TurnCompleted { text },
             ChatTurnOutcome::Failed(detail) => ChatEvent::TurnFailed { detail },
         };

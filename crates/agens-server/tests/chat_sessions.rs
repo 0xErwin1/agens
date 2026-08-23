@@ -8,9 +8,10 @@ use std::time::{Duration, Instant};
 
 use agens_core::{HeadlessTurnCancellation, TurnEvent, TurnState};
 use agens_server::{
-    ChatError, ChatEvent, ChatSession, ChatSessionRequest, ChatSessions, ChatTurnOutcome,
-    ChatTurns, SessionAdmission, SessionBudget, SessionId, SessionProvider, SessionRuntime,
-    SessionState, SessionSupervisor,
+    ChatAsks, ChatError, ChatEvent, ChatPermissionAnswer, ChatPermissionRequest, ChatSession,
+    ChatSessionRequest, ChatSessions, ChatSubscription, ChatTurnOutcome, ChatTurns,
+    SessionAdmission, SessionBudget, SessionId, SessionProvider, SessionRuntime, SessionState,
+    SessionSupervisor,
 };
 use tokio::runtime::Runtime;
 
@@ -30,6 +31,9 @@ impl SessionProvider for StubProvider {
 struct ScriptedTurns {
     started: Sender<String>,
     release: Arc<Mutex<Receiver<ChatTurnOutcome>>>,
+    /// A question this turn asks before doing anything else, when the test gave
+    /// it one. The answer becomes the turn's own outcome, so a test can read it.
+    question: Option<ChatPermissionRequest>,
 }
 
 impl ChatTurns for ScriptedTurns {
@@ -38,10 +42,19 @@ impl ChatTurns for ScriptedTurns {
         prompt: &str,
         _runtime: &SessionRuntime,
         cancellation: &HeadlessTurnCancellation,
+        asks: &Arc<dyn ChatAsks>,
         progress: &agens_core::TurnProgressSink,
     ) -> ChatTurnOutcome {
         let _ = self.started.send(prompt.to_owned());
         progress(TurnEvent::StateChanged(TurnState::Streaming));
+
+        // A turn the test gave a question to asks it and reports the answer as
+        // its own outcome, so what came back is readable from the stream.
+        if let Some(question) = self.question.take() {
+            let answer = asks.permission(&question);
+
+            return ChatTurnOutcome::Completed(answer.as_str().to_owned());
+        }
 
         let release = self
             .release
@@ -84,6 +97,11 @@ struct Harness {
 }
 
 fn harness() -> Harness {
+    harness_asking(None)
+}
+
+fn harness_asking(question: Option<ChatPermissionRequest>) -> Harness {
+    let asked = Arc::new(Mutex::new(question));
     let runtime = Runtime::new().expect("a runtime is available");
     let supervisor = SessionSupervisor::new(runtime.handle().clone());
 
@@ -105,6 +123,7 @@ fn harness() -> Harness {
                 turns: Box::new(ScriptedTurns {
                     started: started.clone(),
                     release: Arc::clone(&release_rx),
+                    question: asked.lock().expect("the script is readable").clone(),
                 }),
             })
         }),
@@ -133,7 +152,7 @@ fn request(session: i64) -> ChatSessionRequest {
 }
 
 /// Drains a subscription until it carries the event the predicate accepts.
-fn wait_for(events: &Receiver<ChatEvent>, accepts: impl Fn(&ChatEvent) -> bool) -> ChatEvent {
+fn wait_for(events: &ChatSubscription, accepts: impl Fn(&ChatEvent) -> bool) -> ChatEvent {
     let deadline = Instant::now() + PATIENCE;
 
     loop {
@@ -461,5 +480,113 @@ fn the_conversation_of_a_chat_nobody_opened_is_refused() {
     assert_eq!(
         harness.chats.history(SessionId::new(7)).err(),
         Some(ChatError::Unknown),
+    );
+}
+
+fn a_question() -> ChatPermissionRequest {
+    ChatPermissionRequest {
+        tool: "bash".to_owned(),
+        target: "cargo test".to_owned(),
+        access: "execute".to_owned(),
+        reason: "permission policy requires confirmation".to_owned(),
+    }
+}
+
+/// The turn stops on the question, the person answers it, and the answer is
+/// what the turn acts on.
+#[test]
+fn a_question_the_turn_asks_reaches_a_subscriber_and_the_answer_reaches_the_turn() {
+    let harness = harness_asking(Some(a_question()));
+    let session = harness.chats.open(&request(1)).expect("the chat opens");
+    let events = harness.chats.subscribe(session).expect("the chat is open");
+
+    harness
+        .chats
+        .prompt(session, "run the tests".to_owned())
+        .expect("the prompt is accepted");
+    assert_eq!(
+        harness.started.recv_timeout(PATIENCE),
+        Ok("run the tests".to_owned()),
+    );
+
+    let asked = wait_for(&events, |event| {
+        matches!(event, ChatEvent::PermissionAsked { .. })
+    });
+    let ChatEvent::PermissionAsked { prompt_id, request } = asked else {
+        panic!("the chat published something else");
+    };
+    assert_eq!(request, a_question());
+
+    harness
+        .chats
+        .answer(session, prompt_id, ChatPermissionAnswer::AllowOnce)
+        .expect("the chat is waiting on it");
+
+    assert_eq!(
+        wait_for(&events, |event| matches!(
+            event,
+            ChatEvent::TurnCompleted { .. }
+        )),
+        ChatEvent::TurnCompleted {
+            text: "allow_once".to_owned(),
+        },
+    );
+}
+
+/// A question nobody can hear is refused rather than left holding the turn
+/// forever. Without this a chat everybody detached from would stop for good on
+/// the first tool call that needed a decision.
+///
+/// Observed through the next prompt rather than through the stream: a client
+/// subscribed in order to watch would be a client that could answer, which is
+/// the situation this is about the absence of. The second prompt only reaches
+/// the turn machinery once the first turn has returned, so it arriving is what
+/// says the stopped turn ended.
+#[test]
+fn a_question_nobody_is_listening_to_is_refused_rather_than_held() {
+    let harness = harness_asking(Some(a_question()));
+    let session = harness.chats.open(&request(1)).expect("the chat opens");
+    let events = harness.chats.subscribe(session).expect("the chat is open");
+
+    harness
+        .chats
+        .prompt(session, "run the tests".to_owned())
+        .expect("the prompt is accepted");
+    assert_eq!(
+        harness.started.recv_timeout(PATIENCE),
+        Ok("run the tests".to_owned()),
+    );
+
+    wait_for(&events, |event| {
+        matches!(event, ChatEvent::PermissionAsked { .. })
+    });
+
+    // The one client watching goes away without answering.
+    drop(events);
+
+    harness
+        .chats
+        .prompt(session, "again".to_owned())
+        .expect("the prompt is accepted");
+
+    assert_eq!(
+        harness.started.recv_timeout(PATIENCE),
+        Ok("again".to_owned()),
+        "the turn stopped on an unanswerable question ended instead of holding the chat"
+    );
+}
+
+/// An answer to a question that already resolved should not be applied to
+/// whatever the person is looking at now.
+#[test]
+fn an_answer_to_a_question_this_chat_is_not_waiting_on_is_refused() {
+    let harness = harness();
+    let session = harness.chats.open(&request(1)).expect("the chat opens");
+
+    assert_eq!(
+        harness
+            .chats
+            .answer(session, 99, ChatPermissionAnswer::AllowOnce),
+        Err(ChatError::NotAsked),
     );
 }

@@ -13,11 +13,15 @@
 //! written a session id down, and by drawing the conversation the daemon has
 //! been having in the meantime.
 //!
-//! This mode is narrower than the local one and stays opt-in until it is not. A
-//! hosted chat cannot yet be asked a permission question and has no task runtime
-//! behind it, so slash commands, the skill palette, the file picker and
-//! delegation are not wired here. A submission this mode cannot serve is
-//! reported as such rather than silently doing nothing.
+//! A permission question the daemon's turn is stopped on comes back on the same
+//! stream and is answered on the same connection, so confirming a tool call
+//! reads no differently from confirming one this process was running.
+//!
+//! This mode is still narrower than the local one and stays opt-in until it is
+//! not. A hosted chat has no task runtime behind it, so slash commands, the
+//! skill palette, the file picker and delegation are not wired here. A
+//! submission this mode cannot serve is reported as such rather than silently
+//! doing nothing.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -25,11 +29,14 @@ use std::sync::Mutex;
 use std::sync::mpsc::Sender;
 
 use agens_bootstrap::Bootstrap;
-use agens_coordinator_client::{ChatClient, ClientError, Coordinator, HostedChatEvent};
-use agens_core::{Message, TurnEvent};
+use agens_coordinator_client::{
+    ChatClient, ClientError, Coordinator, HostedChatEvent, PermissionDecision, PermissionQuestion,
+};
+use agens_core::{HeadlessTurnCancellation, Message, TurnEvent};
 use agens_error::{CliError, ExitStatus};
 use agens_tui::{
-    Engine, Tui, TuiRouteRequest, TuiSubmissionOutcome, run_with_default_progress_submit,
+    Engine, Tui, TuiPermissionBridge, TuiPermissionReply, TuiRouteRequest, TuiSubmissionOutcome,
+    run_with_default_progress_submit_with_permissions,
 };
 use tokio::runtime::Runtime;
 use tokio_stream::{Stream, StreamExt};
@@ -53,12 +60,16 @@ struct Attachment {
     chat: Mutex<ChatClient>,
     events: Mutex<Events>,
     session_id: i64,
+    /// Where a permission question the daemon asked is put to the person, and
+    /// where their answer comes back from.
+    permissions: TuiPermissionBridge,
 }
 
 impl Attachment {
     /// Sends one prompt and reports what the turn did, forwarding everything it
     /// produced to the surface as it happens.
     fn take_turn(&self, prompt: &str, progress: &Sender<TurnEvent>) -> Result<String, CliError> {
+        let asking = HeadlessTurnCancellation::new();
         let mut chat = self
             .chat
             .lock()
@@ -88,6 +99,22 @@ impl Attachment {
                         return Err(unavailable("the terminal stopped listening"));
                     }
                 }
+                HostedChatEvent::PermissionAsked(question) => {
+                    // Answered on this thread, which is the one draining the
+                    // stream. The daemon's turn is stopped on the question, so
+                    // there is nothing else on this chat to miss while a person
+                    // decides — and the surface is drawing the overlay from its
+                    // own thread meanwhile.
+                    let decision = self.decide(&question, &asking);
+
+                    self.runtime
+                        .block_on(chat.answer_permission(
+                            self.session_id,
+                            question.prompt_id,
+                            decision,
+                        ))
+                        .map_err(refused)?;
+                }
                 HostedChatEvent::TurnCompleted { text } => return Ok(text),
                 HostedChatEvent::TurnFailed { detail } => {
                     return Err(CliError::new(ExitStatus::Failure, "provider", detail));
@@ -98,6 +125,38 @@ impl Attachment {
                     ));
                 }
             }
+        }
+    }
+}
+
+impl Attachment {
+    /// Puts one question to the person and waits for their answer.
+    ///
+    /// A cancelled prompt is answered as a refusal rather than left open. The
+    /// daemon's turn is stopped on it either way, and the cancellation the
+    /// person asked for reaches the turn through `cancel`, not through a
+    /// question nobody resolves.
+    fn decide(
+        &self,
+        question: &PermissionQuestion,
+        asking: &HeadlessTurnCancellation,
+    ) -> PermissionDecision {
+        let reply = self.permissions.wait_for_reply(
+            question.tool.clone(),
+            question.target.clone(),
+            question.access.clone(),
+            Some(question.reason.clone()),
+            None,
+            asking,
+        );
+
+        match reply {
+            TuiPermissionReply::AllowOnce => PermissionDecision::AllowOnce,
+            TuiPermissionReply::AllowAlways => PermissionDecision::AllowAlways,
+            TuiPermissionReply::DenyAlways => PermissionDecision::DenyAlways,
+            TuiPermissionReply::DenyOnce
+            | TuiPermissionReply::Cancelled
+            | TuiPermissionReply::DeadlineExpired => PermissionDecision::DenyOnce,
         }
     }
 }
@@ -178,7 +237,8 @@ pub fn run_attached_tui(
         .clone()
         .unwrap_or_else(|| PathBuf::from("."));
 
-    let (attachment, engine, arrival) = attach(socket, &checkout, resume)?;
+    let (permissions, permission_requests) = TuiPermissionBridge::channel();
+    let (attachment, engine, arrival) = attach(socket, &checkout, resume, permissions)?;
 
     let mut tui = Tui::new(engine);
     tui.adopt_environment();
@@ -195,12 +255,18 @@ pub fn run_attached_tui(
         ));
     }
 
-    run_with_default_progress_submit(
+    let permissions = attachment.permissions.clone();
+
+    run_with_default_progress_submit_with_permissions(
         &mut tui,
-        move |request, _progress| route(&request),
+        move |request, _progress, _cancellation| route(&request),
         move |prompt, _origin, progress, _metrics| {
             tui_provider_outcome(attachment.take_turn(&prompt, &progress))
         },
+        // Nothing delegates in this mode, so no execution can be sent to the
+        // background and this is asked about nothing.
+        |_| false,
+        Some((permissions, permission_requests)),
     )
     .map_err(|error| CliError::new(ExitStatus::Failure, "ui", error.to_string()))?;
 
@@ -254,6 +320,7 @@ fn attach(
     socket: &Path,
     checkout: &Path,
     resume: Option<i64>,
+    permissions: TuiPermissionBridge,
 ) -> Result<(Attachment, AttachedEngine, Arrival), CliError> {
     let runtime = Arc::new(
         Runtime::new()
@@ -307,6 +374,7 @@ fn attach(
             chat: Mutex::new(chat),
             events: Mutex::new(Box::pin(events)),
             session_id,
+            permissions,
         },
         engine,
         arrival,

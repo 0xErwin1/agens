@@ -61,6 +61,7 @@ impl ChatTurns for ScriptedTurns {
         prompt: &str,
         _runtime: &SessionRuntime,
         _cancellation: &HeadlessTurnCancellation,
+        _asks: &Arc<dyn agens_server::ChatAsks>,
         progress: &agens_core::TurnProgressSink,
     ) -> ChatTurnOutcome {
         let _ = self.started.send(prompt.to_owned());

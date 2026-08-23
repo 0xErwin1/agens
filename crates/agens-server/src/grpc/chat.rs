@@ -25,7 +25,7 @@ use super::subscriptions::{
 };
 use super::{proto, turn};
 use crate::blocking::{BlockingBoundary, BlockingError};
-use crate::chat::{ChatError, ChatSessionRequest, ChatSessions};
+use crate::chat::{ChatError, ChatPermissionAnswer, ChatSessionRequest, ChatSessions};
 use crate::sessions::SessionId;
 
 pub struct ChatFacade {
@@ -162,6 +162,28 @@ impl Chat for ChatFacade {
         }))
     }
 
+    /// Answers a question the chat's turn is stopped on.
+    async fn answer_permission(
+        &self,
+        request: Request<proto::AnswerPermissionRequest>,
+    ) -> Result<Response<proto::ChatAck>, Status> {
+        let request = request.into_inner();
+        let session = SessionId::new(request.session_id);
+        let prompt_id = request.prompt_id;
+
+        // Refused rather than read as a denial: a name this daemon does not
+        // know is a client saying something this one cannot interpret, and
+        // guessing at it decides a permission on the person's behalf.
+        let answer = ChatPermissionAnswer::parse(&request.answer).ok_or_else(|| {
+            Status::invalid_argument(format!("`{}` is not an answer", request.answer))
+        })?;
+
+        self.off_runtime(move |chats| chats.answer(session, prompt_id, answer))
+            .await?;
+
+        Ok(Response::new(proto::ChatAck {}))
+    }
+
     /// What the chat has said so far.
     async fn history(
         &self,
@@ -266,6 +288,10 @@ fn refusal(error: ChatError) -> Status {
     match error {
         ChatError::Unknown => Status::not_found(error.to_string()),
         ChatError::Busy => Status::failed_precondition(error.to_string()),
+        // Not `not_found`: the chat is there, and what is gone is the question.
+        // A client that answered something already resolved has to know the
+        // difference in order to stop showing it.
+        ChatError::NotAsked => Status::failed_precondition(error.to_string()),
         ChatError::Unavailable(detail) => Status::unavailable(detail),
     }
 }
