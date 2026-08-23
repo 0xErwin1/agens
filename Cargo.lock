@@ -368,6 +368,7 @@ dependencies = [
  "agens-bus",
  "agens-callcount",
  "agens-config",
+ "agens-coordinator-client",
  "agens-core",
  "agens-diagnostics",
  "agens-dispatch",
@@ -387,6 +388,7 @@ dependencies = [
  "rusqlite",
  "serde_json",
  "tokio",
+ "tokio-stream",
 ]
 
 [[package]]

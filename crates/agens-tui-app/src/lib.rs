@@ -8,6 +8,7 @@
 //! It is a surface, so it may depend on logic and logic may never depend on it.
 
 pub mod ask_user_prompt;
+pub mod attached;
 pub mod dialogs;
 pub mod engine;
 pub mod extensions;

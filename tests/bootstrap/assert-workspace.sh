@@ -175,6 +175,7 @@ jq -e '
       "agens-bus",
       "agens-callcount",
       "agens-config",
+      "agens-coordinator-client",
       "agens-core",
       "agens-diagnostics",
       "agens-dispatch",

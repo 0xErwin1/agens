@@ -19,7 +19,7 @@ use agens_core::HeadlessTurnCancellation;
 use crate::commands::auth::run_production_auth_login;
 use crate::commands::config::{create_configuration_file, create_global_configuration_file};
 use crate::headless::run_production_headless_chat;
-use crate::tui::run_production_tui;
+use crate::tui::{TuiMode, run_production_tui};
 use agens_bootstrap::{Bootstrap, HostEnvironment};
 use agens_error::CliError;
 use agens_headless::HeadlessChatRequest;
@@ -34,7 +34,7 @@ type ConfigCreator = Box<dyn Fn(&Path, &str) -> Result<(), CliError>>;
 type HeadlessChat = Box<
     dyn Fn(HeadlessChatRequest, &Bootstrap, &HeadlessTurnCancellation) -> Result<String, CliError>,
 >;
-type TuiLauncher = Box<dyn Fn(&Bootstrap, Option<i64>) -> Result<String, CliError>>;
+type TuiLauncher = Box<dyn Fn(&Bootstrap, Option<i64>, TuiMode) -> Result<String, CliError>>;
 type AuthLogin = Box<dyn Fn(&Path, bool, &HeadlessTurnCancellation) -> Result<String, CliError>>;
 /// Whether the process's standard input is attached to a terminal.
 ///
@@ -105,7 +105,7 @@ impl CliDependencies {
             host: HostEnvironment::fixed(current_directory, home_directory, environment, files),
             create_file: Box::new(|_, _| Err(CliError::unavailable(UNAVAILABLE_MESSAGE))),
             headless_chat: Box::new(|_, _, _| Err(CliError::unavailable(UNAVAILABLE_MESSAGE))),
-            tui_launcher: Box::new(|_, _| Err(CliError::unavailable(UNAVAILABLE_MESSAGE))),
+            tui_launcher: Box::new(|_, _, _| Err(CliError::unavailable(UNAVAILABLE_MESSAGE))),
             auth_login: Box::new(|_, _, _| Err(CliError::unavailable(UNAVAILABLE_MESSAGE))),
             stdin_is_terminal: Box::new(|| false),
         }
@@ -134,7 +134,7 @@ impl CliDependencies {
 
     pub fn with_tui_launcher(
         mut self,
-        launcher: impl Fn(&Bootstrap, Option<i64>) -> Result<String, CliError> + 'static,
+        launcher: impl Fn(&Bootstrap, Option<i64>, TuiMode) -> Result<String, CliError> + 'static,
     ) -> Self {
         self.tui_launcher = Box::new(launcher);
         self

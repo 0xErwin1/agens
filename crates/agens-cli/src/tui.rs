@@ -3,6 +3,11 @@
 //! The surface itself is `agens-tui-app`. What stays here is the one decision
 //! the binary owns: resolving the run's configuration and handing it to the
 //! launcher the composition root installed.
+//!
+//! There are two shapes it can run in, and which one is not decided here
+//! either. Local runs the turn in this process, which is what it has always
+//! done. Attached runs it in the daemon and renders what comes back, so closing
+//! the terminal stops the client and not the work.
 
 use crate::CliDependencies;
 use std::path::PathBuf;
@@ -36,10 +41,30 @@ impl AgentProfileStore for TuiProfileStore {
     }
 }
 
+/// Where a terminal's turns run.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TuiMode {
+    /// In this process, which is what closing the terminal ends.
+    #[default]
+    Local,
+    /// In the daemon, which keeps the session whether anybody is watching or
+    /// not.
+    Attached,
+}
+
 pub(crate) fn run_production_tui(
     bootstrap: &agens_bootstrap::Bootstrap,
     resume: Option<i64>,
+    mode: TuiMode,
 ) -> Result<String, CliError> {
+    if mode == TuiMode::Attached {
+        return agens_tui_app::attached::run_attached_tui(
+            bootstrap,
+            &agens_server::socket_path(bootstrap.data_directory()),
+            resume,
+        );
+    }
+
     let project_root = bootstrap
         .project_root
         .clone()
@@ -58,8 +83,9 @@ pub(crate) fn run_production_tui(
 pub(crate) fn run_tui(
     dependencies: &CliDependencies,
     resume: Option<i64>,
+    mode: TuiMode,
 ) -> Result<String, CliError> {
     let bootstrap = bootstrap(dependencies)?;
-    let output = (dependencies.tui_launcher)(&bootstrap, resume)?;
+    let output = (dependencies.tui_launcher)(&bootstrap, resume, mode)?;
     Ok(format!("{output}\n"))
 }

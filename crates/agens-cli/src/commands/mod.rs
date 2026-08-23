@@ -26,7 +26,7 @@ pub(crate) fn dispatch(
     cancellation: &HeadlessTurnCancellation,
 ) -> Result<String, CliError> {
     match parsed.command {
-        None => run_tui(dependencies, parsed.resume.flatten()),
+        None => run_tui(dependencies, parsed.resume.flatten(), parsed.tui_mode()),
         Some(cli::Command::Config { action }) => run_config(action, dependencies),
         Some(cli::Command::Auth { action }) => run_auth(action, dependencies, cancellation),
         Some(cli::Command::Chat(chat_arguments)) => {

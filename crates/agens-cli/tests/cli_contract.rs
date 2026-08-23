@@ -169,7 +169,7 @@ fn table_a_root_shapes_hold() {
         {
             let temporary = TemporaryDirectory::new("root-empty");
             let dependencies = base_dependencies(&temporary)
-                .with_tui_launcher(|_, resume| Ok(format!("resume={resume:?}")));
+                .with_tui_launcher(|_, resume, _| Ok(format!("resume={resume:?}")));
             Case {
                 name: "[] resumes with no session",
                 argv: argv(&[]),
@@ -181,7 +181,7 @@ fn table_a_root_shapes_hold() {
         {
             let temporary = TemporaryDirectory::new("root-resume-flag-alone");
             let dependencies = base_dependencies(&temporary)
-                .with_tui_launcher(|_, resume| Ok(format!("resume={resume:?}")));
+                .with_tui_launcher(|_, resume, _| Ok(format!("resume={resume:?}")));
             Case {
                 name: "--resume alone resumes with no session",
                 argv: argv(&["--resume"]),
@@ -193,7 +193,7 @@ fn table_a_root_shapes_hold() {
         {
             let temporary = TemporaryDirectory::new("root-resume-flag-with-id");
             let dependencies = base_dependencies(&temporary)
-                .with_tui_launcher(|_, resume| Ok(format!("resume={resume:?}")));
+                .with_tui_launcher(|_, resume, _| Ok(format!("resume={resume:?}")));
             Case {
                 name: "--resume 42 resumes session 42",
                 argv: argv(&["--resume", "42"]),
@@ -205,7 +205,7 @@ fn table_a_root_shapes_hold() {
         {
             let temporary = TemporaryDirectory::new("root-bare-integer");
             let dependencies = base_dependencies(&temporary)
-                .with_tui_launcher(|_, resume| Ok(format!("resume={resume:?}")));
+                .with_tui_launcher(|_, resume, _| Ok(format!("resume={resume:?}")));
             Case {
                 name: "a bare integer resumes that session",
                 argv: argv(&["42"]),
@@ -219,12 +219,48 @@ fn table_a_root_shapes_hold() {
             // integer resumes a (nonsensical) negative session id today.
             let temporary = TemporaryDirectory::new("root-negative-integer");
             let dependencies = base_dependencies(&temporary)
-                .with_tui_launcher(|_, resume| Ok(format!("resume={resume:?}")));
+                .with_tui_launcher(|_, resume, _| Ok(format!("resume={resume:?}")));
             Case {
                 name: "a bare negative integer resumes session -5 today (R1)",
                 argv: argv(&["-5"]),
                 dependencies,
                 expected: success("resume=Some(-5)\n"),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("root-default-mode");
+            let dependencies = base_dependencies(&temporary)
+                .with_tui_launcher(|_, _, mode| Ok(format!("mode={mode:?}")));
+            Case {
+                name: "neither flag runs the turn in this process today",
+                argv: argv(&[]),
+                dependencies,
+                expected: success("mode=Local\n"),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("root-local");
+            let dependencies = base_dependencies(&temporary)
+                .with_tui_launcher(|_, _, mode| Ok(format!("mode={mode:?}")));
+            Case {
+                name: "--local runs the turn in this process",
+                argv: argv(&["--local"]),
+                dependencies,
+                expected: success("mode=Local\n"),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("root-attach");
+            let dependencies = base_dependencies(&temporary)
+                .with_tui_launcher(|_, _, mode| Ok(format!("mode={mode:?}")));
+            Case {
+                name: "--attach runs the turn in the daemon",
+                argv: argv(&["--attach"]),
+                dependencies,
+                expected: success("mode=Attached\n"),
                 _temporary: temporary,
             }
         },
@@ -989,7 +1025,7 @@ fn table_a_models_and_sessions_hold() {
 mod parser_surface_baseline {
     pub(crate) const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-    pub(crate) const ROOT_HELP: &str = "Agens is a coding agent CLI\n\nUsage: agens [OPTIONS] [COMMAND]\n\nCommands:\n  config    inspect configuration\n  auth      inspect supported authentication\n  chat      run a headless agent turn\n  models    list provider models\n  serve     run the headless daemon for this machine\n  sessions  inspect completed turns\n  direct    queue a message for a running session, delivered at its next safe point\n\nOptions:\n      --resume [<SESSION_ID>]  Resume the most recent session, or the given session id\n  -h, --help                   Print help\n  -V, --version                Print version\n";
+    pub(crate) const ROOT_HELP: &str = "Agens is a coding agent CLI\n\nUsage: agens [OPTIONS] [COMMAND]\n\nCommands:\n  config    inspect configuration\n  auth      inspect supported authentication\n  chat      run a headless agent turn\n  models    list provider models\n  serve     run the headless daemon for this machine\n  sessions  inspect completed turns\n  direct    queue a message for a running session, delivered at its next safe point\n\nOptions:\n      --resume [<SESSION_ID>]  Resume the most recent session, or the given session id\n      --local                  Run the turn in this process\n      --attach                 Run the turn in the machine's daemon\n  -h, --help                   Print help\n  -V, --version                Print version\n";
 
     pub(crate) fn version_line() -> String {
         format!("agens {VERSION}\n")
