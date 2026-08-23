@@ -23,6 +23,7 @@ agens-bootstrap = { path = "../agens-bootstrap" }
 agens-bus = { path = "../agens-bus" }
 agens-callcount = { path = "../agens-callcount" }
 agens-config = { path = "../agens-config" }
+agens-coordinator-client = { path = "../agens-coordinator-client" }
 agens-core = { path = "../agens-core" }
 agens-diagnostics = { path = "../agens-diagnostics" }
 agens-dispatch = { path = "../agens-dispatch" }
@@ -41,6 +42,7 @@ agens-tui = { path = "../agens-tui" }
 ratatui = { version = "0.30.2", optional = true }
 serde_json = "1"
 tokio = { version = "1", features = ["rt", "time"] }
+tokio-stream = "0.1"
 
 [dev-dependencies]
 agens-fixtures = { path = "../agens-fixtures" }
