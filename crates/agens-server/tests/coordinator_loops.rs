@@ -223,6 +223,18 @@ fn the_facts_of_the_last_window_are_ingested_on_the_way_out() {
         })
         .expect("the ingest channel has a reader");
 
+    // The fact is still in the channel when the stop is asked for. Without this
+    // the test would also pass on a pass that folded it before the stop, which
+    // is the one thing it is not about.
+    assert!(
+        ControlPlaneStore::open(&directory)
+            .unwrap()
+            .load_run_health(run_id)
+            .unwrap()
+            .is_none(),
+        "a heartbeat folded the fact before the stop, so the exit drain is not what is under test"
+    );
+
     coordinator.stop();
     runtime.shutdown_timeout(Duration::ZERO);
 
