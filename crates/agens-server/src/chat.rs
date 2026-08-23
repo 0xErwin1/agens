@@ -18,7 +18,7 @@
 //! scheduler takes its workers from.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -179,11 +179,27 @@ impl Subscribers {
     }
 }
 
+/// One open chat, as a client that came back sees it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenChatSummary {
+    pub session_id: SessionId,
+    /// The checkout it was opened against, which is how a terminal recognizes
+    /// the chat that belongs to the project it is sitting in.
+    pub checkout: PathBuf,
+    /// Whether a turn is running right now, so a client that reattaches
+    /// mid-answer can say so rather than looking idle.
+    pub answering: bool,
+}
+
 /// One open chat, as the daemon holds it.
 struct OpenChat {
     /// Dropping this ends the session's loop, which is what closing a chat is.
     prompts: SyncSender<String>,
     subscribers: Arc<Subscribers>,
+    /// What the chat was opened against. Held so a client that comes back can
+    /// find the chat belonging to the project it is in without having written
+    /// its session id down.
+    checkout: PathBuf,
     /// The turn running right now, when one is. Replaced per turn, so
     /// cancelling reaches the answer being produced and never the one before
     /// it.
@@ -225,6 +241,7 @@ impl ChatSessions {
         let published = Arc::clone(&subscribers);
         let running = Arc::new(Mutex::new(None));
         let turn = Arc::clone(&running);
+        let checkout = request.checkout.clone();
 
         let mut open = self.locked()?;
         // Chats come and go for the life of the daemon, so the ones that have
@@ -238,6 +255,7 @@ impl ChatSessions {
             OpenChat {
                 prompts,
                 subscribers,
+                checkout,
                 running,
             },
         );
@@ -314,6 +332,35 @@ impl ChatSessions {
             .remove(&session)
             .map(|_| ())
             .ok_or(ChatError::Unknown)
+    }
+
+    /// The chats open against `checkout`, newest first.
+    ///
+    /// Newest first because that is the order a person means. A terminal coming
+    /// back to a project reattaches to the conversation it was last having
+    /// there, and the daemon's ids are assigned in the order the chats were
+    /// opened, so the largest is the last one.
+    ///
+    /// Scoped to a checkout, never listed whole: one daemon serves N projects,
+    /// and a terminal offered another project's conversation would be a
+    /// terminal that can attach to the wrong one.
+    pub fn open_against(&self, checkout: &Path) -> Result<Vec<OpenChatSummary>, ChatError> {
+        let open = self.locked()?;
+
+        let mut chats = open
+            .iter()
+            .filter(|(_, chat)| chat.checkout == checkout)
+            .filter(|(session, _)| self.is_running(**session))
+            .map(|(session, chat)| OpenChatSummary {
+                session_id: *session,
+                checkout: chat.checkout.clone(),
+                answering: chat.running.lock().is_ok_and(|running| running.is_some()),
+            })
+            .collect::<Vec<_>>();
+
+        chats.sort_by_key(|chat| std::cmp::Reverse(chat.session_id.value()));
+
+        Ok(chats)
     }
 
     /// How many chats are open. Read by the tests, and by nothing that decides.

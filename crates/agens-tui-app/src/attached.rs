@@ -8,7 +8,9 @@
 //!
 //! What follows from that is the point of the change: closing the terminal ends
 //! the client and not the turn. The daemon keeps the session running, and a
-//! terminal that attaches again finds it where it was left.
+//! terminal that attaches again finds it where it was left — by asking the
+//! daemon what is already open for this checkout, rather than by anybody having
+//! written a session id down.
 //!
 //! This mode is narrower than the local one and stays opt-in until it is not. A
 //! hosted chat cannot yet be asked a permission question and has no task runtime
@@ -162,8 +164,9 @@ fn route(request: &TuiRouteRequest) -> TuiSubmissionOutcome {
 
 /// Attaches to the daemon on `socket` and runs the terminal against it.
 ///
-/// `resume` names a stored session to continue. Absent, the daemon opens a
-/// fresh one rooted at this project.
+/// `resume` names a stored session to continue. Absent, this comes back to the
+/// chat already open for this checkout, and opens a fresh one only when there
+/// is none.
 pub fn run_attached_tui(
     bootstrap: &Bootstrap,
     socket: &Path,
@@ -174,15 +177,12 @@ pub fn run_attached_tui(
         .clone()
         .unwrap_or_else(|| PathBuf::from("."));
 
-    let (attachment, engine) = attach(socket, &checkout, resume)?;
-    let session_id = attachment.session_id;
+    let (attachment, engine, arrival) = attach(socket, &checkout, resume)?;
 
     let mut tui = Tui::new(engine);
     tui.adopt_environment();
     tui.set_collapse_thinking(bootstrap.collapse_thinking);
-    tui.add_info(format!(
-        "attached to the daemon as session {session_id}; leaving does not stop it"
-    ));
+    tui.add_info(arrival.describe());
 
     run_with_default_progress_submit(
         &mut tui,
@@ -196,11 +196,42 @@ pub fn run_attached_tui(
     Ok(String::new())
 }
 
+/// How this terminal came to the chat it is now on, so it can say so.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Arrival {
+    Opened(i64),
+    CameBack { session_id: i64, answering: bool },
+}
+
+impl Arrival {
+    fn describe(self) -> String {
+        match self {
+            Self::Opened(session_id) => {
+                format!("attached to the daemon as session {session_id}; leaving does not stop it")
+            }
+            Self::CameBack {
+                session_id,
+                answering: false,
+            } => format!("back on session {session_id}, where you left it"),
+            Self::CameBack {
+                session_id,
+                answering: true,
+            } => format!("back on session {session_id}, which is still answering"),
+        }
+    }
+
+    const fn session_id(self) -> i64 {
+        match self {
+            Self::Opened(session_id) | Self::CameBack { session_id, .. } => session_id,
+        }
+    }
+}
+
 fn attach(
     socket: &Path,
     checkout: &Path,
     resume: Option<i64>,
-) -> Result<(Attachment, AttachedEngine), CliError> {
+) -> Result<(Attachment, AttachedEngine, Arrival), CliError> {
     let runtime = Arc::new(
         Runtime::new()
             .map_err(|error| CliError::new(ExitStatus::Failure, "ui", error.to_string()))?,
@@ -211,9 +242,20 @@ fn attach(
         .map_err(refused)?;
     let mut chat = coordinator.chat();
 
-    let session_id = runtime
-        .block_on(chat.open(checkout, resume))
-        .map_err(refused)?;
+    // A named session is what the person asked for and is not second-guessed;
+    // otherwise the chat already open for this checkout is the one they mean,
+    // because a terminal that opened a second one beside it would leave the
+    // first answering into a stream nobody reads.
+    let arrival = match resume {
+        Some(session_id) => Arrival::Opened(
+            runtime
+                .block_on(chat.open(checkout, Some(session_id)))
+                .map_err(refused)?,
+        ),
+        None => rejoin_or_open(&runtime, &mut chat, checkout)?,
+    };
+
+    let session_id = arrival.session_id();
     let events = runtime
         .block_on(chat.subscribe(session_id))
         .map_err(refused)?;
@@ -232,6 +274,47 @@ fn attach(
             session_id,
         },
         engine,
+        arrival,
+    ))
+}
+
+/// Comes back to this checkout's chat, or opens one when there is none.
+///
+/// The newest is the one taken when several are open. That is the order the
+/// daemon lists them in and the one a person means: the conversation they were
+/// last having here.
+fn rejoin_or_open(
+    runtime: &Runtime,
+    chat: &mut ChatClient,
+    checkout: &Path,
+) -> Result<Arrival, CliError> {
+    let open = runtime
+        .block_on(chat.open_against(checkout))
+        .map_err(refused)?;
+
+    if let Some(existing) = open.first() {
+        // Opening it by id rather than trusting the listing: between the two
+        // calls the chat can end, and `open` is what settles that — either it
+        // returns the same session, or it opens a fresh one and this terminal
+        // is where a new conversation starts.
+        let session_id = runtime
+            .block_on(chat.open(checkout, Some(existing.session_id)))
+            .map_err(refused)?;
+
+        if session_id == existing.session_id {
+            return Ok(Arrival::CameBack {
+                session_id,
+                answering: existing.answering,
+            });
+        }
+
+        return Ok(Arrival::Opened(session_id));
+    }
+
+    Ok(Arrival::Opened(
+        runtime
+            .block_on(chat.open(checkout, None))
+            .map_err(refused)?,
     ))
 }
 
@@ -291,5 +374,32 @@ mod tests {
             route(&TuiRouteRequest::BusyInput("and the tests".to_owned())),
             TuiSubmissionOutcome::BusyRefusal(_)
         ));
+    }
+
+    #[test]
+    fn coming_back_says_where_you_landed_and_whether_it_is_mid_answer() {
+        assert!(
+            Arrival::CameBack {
+                session_id: 7,
+                answering: false,
+            }
+            .describe()
+            .contains("where you left it")
+        );
+        assert!(
+            Arrival::CameBack {
+                session_id: 7,
+                answering: true,
+            }
+            .describe()
+            .contains("still answering")
+        );
+    }
+
+    /// A fresh chat says that leaving does not stop it, because that is the one
+    /// thing about this mode a person has to know before they close the window.
+    #[test]
+    fn a_fresh_chat_says_that_leaving_does_not_stop_it() {
+        assert!(Arrival::Opened(7).describe().contains("does not stop it"));
     }
 }
