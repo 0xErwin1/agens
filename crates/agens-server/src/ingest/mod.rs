@@ -31,7 +31,8 @@ mod checkpoint;
 mod detectors;
 mod health;
 
-use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel as mpsc_channel};
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
+use std::time::{Duration, Instant};
 
 use agens_core::ToolResultFacts;
 use agens_store::{
@@ -136,6 +137,9 @@ pub enum IngestRejection {
     Malformed(String),
     /// The reader that drains the channel is gone.
     ChannelClosed,
+    /// The queue was full for longer than a reporter waits. Nothing was
+    /// written, and the fact is the reporter's to account for.
+    Backlogged,
     Storage(String),
 }
 
@@ -154,6 +158,9 @@ impl std::fmt::Display for IngestRejection {
             ),
             Self::Malformed(detail) => write!(formatter, "unusable reported fact: {detail}"),
             Self::ChannelClosed => formatter.write_str("the ingest channel has no reader"),
+            Self::Backlogged => {
+                formatter.write_str("the ingest channel stayed full for longer than a report waits")
+            }
             Self::Storage(detail) => formatter.write_str(detail),
         }
     }
@@ -188,17 +195,57 @@ pub struct DrainedFact {
     pub outcome: Result<AcceptedFact, IngestRejection>,
 }
 
+/// How many reported facts may wait for the single writer.
+///
+/// Bounded for the reason the fan-out's backlog is: the writer drains once per
+/// heartbeat against SQLite, and a queue with no ceiling turns a run reporting
+/// faster than that into memory the daemon never gets back. Deep enough that a
+/// turn's ordinary burst of tool results never meets it.
+const INGEST_BACKLOG: usize = 1_024;
+
+/// How long a reporter waits for room before giving the fact up.
+///
+/// The policy the ceiling needs, and it is deliberately not "block until the
+/// writer catches up": a worker parked forever on a full queue is a turn that
+/// stopped for a reason nothing in the run says. It waits several heartbeats,
+/// which is the writer being slow, and then reports the fact refused.
+const INGEST_PATIENCE: Duration = Duration::from_secs(5);
+
+/// How often a waiting reporter looks for room again.
+const INGEST_POLL: Duration = Duration::from_millis(10);
+
 /// The reporting end of the in-process ingest channel. Cloneable, so every
 /// session's sink holds one.
 #[derive(Clone, Debug)]
-pub struct FactSender(Sender<ReportedFact>);
+pub struct FactSender {
+    outbound: SyncSender<ReportedFact>,
+    patience: Duration,
+}
 
 impl FactSender {
-    /// Queues one fact for the single writer.
+    /// Queues one fact for the single writer, waiting for room while the
+    /// backlog is full.
+    ///
+    /// A fact that could not be queued is refused rather than dropped
+    /// silently: the reporter is the party that knows which run it belongs to,
+    /// and a health plane missing a turn it was told about should say so.
     pub fn report(&self, fact: ReportedFact) -> Result<(), IngestRejection> {
-        self.0
-            .send(fact)
-            .map_err(|_| IngestRejection::ChannelClosed)
+        let deadline = Instant::now() + self.patience;
+        let mut fact = fact;
+
+        loop {
+            match self.outbound.try_send(fact) {
+                Ok(()) => return Ok(()),
+                Err(TrySendError::Disconnected(_)) => return Err(IngestRejection::ChannelClosed),
+                Err(TrySendError::Full(_)) if Instant::now() >= deadline => {
+                    return Err(IngestRejection::Backlogged);
+                }
+                Err(TrySendError::Full(returned)) => {
+                    fact = returned;
+                    std::thread::sleep(INGEST_POLL);
+                }
+            }
+        }
     }
 }
 
@@ -209,8 +256,13 @@ pub struct FactReceiver(Receiver<ReportedFact>);
 /// Opens the in-process ingest channel.
 #[must_use]
 pub fn channel() -> (FactSender, FactReceiver) {
-    let (sender, receiver) = mpsc_channel();
-    (FactSender(sender), FactReceiver(receiver))
+    channel_with_backlog(INGEST_BACKLOG, INGEST_PATIENCE)
+}
+
+fn channel_with_backlog(backlog: usize, patience: Duration) -> (FactSender, FactReceiver) {
+    let (outbound, receiver) = sync_channel(backlog);
+
+    (FactSender { outbound, patience }, FactReceiver(receiver))
 }
 
 /// The single writer of the harness's facts and of the health they derive.
@@ -469,5 +521,83 @@ fn signal_event(reported: &ReportedFact, signal: &HealthSignal) -> EventRow {
         class: EventClass::Infra,
         payload: payload.to_string(),
         ts: reported.now,
+    }
+}
+
+#[cfg(test)]
+mod channel_tests {
+    use std::time::{Duration, Instant};
+
+    use super::{IngestFact, IngestRejection, ReportedFact, channel_with_backlog};
+
+    const PATIENCE: Duration = Duration::from_millis(50);
+
+    fn turn_started() -> ReportedFact {
+        ReportedFact {
+            run_id: 1,
+            attempt_id: 1,
+            turn: 0,
+            now: 1_700_000_000,
+            fact: IngestFact::TurnStarted,
+        }
+    }
+
+    #[test]
+    fn a_reporter_waits_for_the_writer_rather_than_queueing_without_end() {
+        let (sender, _receiver) = channel_with_backlog(1, PATIENCE);
+
+        assert_eq!(sender.report(turn_started()), Ok(()), "the first fact fits");
+
+        let started = Instant::now();
+
+        assert_eq!(
+            sender.report(turn_started()),
+            Err(IngestRejection::Backlogged),
+            "a queue nothing is draining refuses the fact instead of growing"
+        );
+        assert!(
+            started.elapsed() >= PATIENCE,
+            "it waited for the single writer before giving up"
+        );
+    }
+
+    #[test]
+    fn room_that_appears_inside_the_wait_is_used() {
+        let (sender, receiver) = channel_with_backlog(1, Duration::from_secs(10));
+
+        sender.report(turn_started()).expect("the first fact fits");
+
+        let draining = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            let taken = receiver.0.recv().expect("the fact is there");
+
+            (receiver, taken)
+        });
+
+        assert_eq!(
+            sender.report(turn_started()),
+            Ok(()),
+            "a writer that caught up inside the wait takes the fact"
+        );
+
+        let (_receiver, taken) = draining.join().expect("the draining thread finishes");
+        assert_eq!(taken.run_id, 1);
+    }
+
+    #[test]
+    fn a_queue_with_no_reader_is_not_something_to_wait_out() {
+        let (sender, receiver) = channel_with_backlog(1, Duration::from_secs(60));
+        drop(receiver);
+
+        let started = Instant::now();
+
+        assert_eq!(
+            sender.report(turn_started()),
+            Err(IngestRejection::ChannelClosed)
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the daemon is shutting down, and a reporter does not wait that out"
+        );
     }
 }
