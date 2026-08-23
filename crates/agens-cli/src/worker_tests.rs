@@ -66,6 +66,14 @@ const HEALTH_EVENTS: [&str; 8] = [
     "worker_lost",
 ];
 
+/// What the admission loop writes about a queue rather than about a run.
+///
+/// Filtered out of the run's own story because it is timing, not lifecycle: a
+/// run coming back from an answer is offered a slot while the session it was
+/// parked in is still ending, so whether that first launch is refused depends
+/// on which of the two the scheduler reaches first.
+const SCHEDULING_EVENTS: [&str; 2] = ["run_deferred", "admission_failed"];
+
 /// What the health plane has to have written by the time the run is done.
 const EXPECTED_HEALTH_EVENTS: [&str; 7] = [
     "turn_started",
@@ -527,9 +535,11 @@ fn the_daemon_executes_a_run_through_a_real_turn_that_checkpoints_asks_and_finis
     assert_eq!(
         journal
             .iter()
-            .filter(
-                |event| *event != "run_state_changed" && !HEALTH_EVENTS.contains(&event.as_str())
-            )
+            .filter(|event| {
+                *event != "run_state_changed"
+                    && !HEALTH_EVENTS.contains(&event.as_str())
+                    && !SCHEDULING_EVENTS.contains(&event.as_str())
+            })
             .cloned()
             .collect::<Vec<_>>(),
         [

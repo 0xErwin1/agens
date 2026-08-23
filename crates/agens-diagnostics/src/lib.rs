@@ -151,6 +151,134 @@ pub enum SessionLifecycle<'a> {
     },
 }
 
+/// What the daemon's control plane did, for a supervisor that reads the
+/// diagnostics log instead of attaching to the facade.
+///
+/// The journal is the control plane's own record and stays authoritative. This
+/// is the second reader's copy: it lives in a rotating file that is already
+/// being tailed, it survives a control plane that cannot be opened, and it is
+/// the only place a fact about the daemon rather than about one run can be
+/// read at all.
+///
+/// Every field is either an integer or a name from a closed set the daemon
+/// authored. No repository path, branch, task text, tool argument or worker
+/// message travels here: this file is read by the audit overlay, and a
+/// coordinator event carries nothing a person wrote.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoordinatorEvent<'a> {
+    /// One run's state machine moved.
+    RunStateChanged {
+        run_id: i64,
+        machine: &'a str,
+        from: &'a str,
+        to: &'a str,
+        trigger: &'a str,
+    },
+    /// A gate reached a verdict, whether or not anything moved because of it.
+    GateResult {
+        run_id: i64,
+        gate: &'a str,
+        passed: bool,
+        /// The refusal's own name when it refused. Absent when it passed.
+        reason: Option<&'a str>,
+    },
+    RunAdmitted {
+        run_id: i64,
+        /// Whether this is work coming back rather than starting.
+        resumed: bool,
+    },
+    /// A queued run stayed queued, naming the condition that held it.
+    RunDeferred { run_id: i64, reason: &'a str },
+    /// A launch was attempted and did not work.
+    AdmissionFailed { run_id: i64, reason: &'a str },
+    /// One pass of the timer wheel, counted rather than enumerated: what a
+    /// supervisor acts on is a wheel that stopped ticking or a count that keeps
+    /// growing, and each deadline it raised is already its own event.
+    TimersTicked {
+        quota_resets: usize,
+        expired_questions: usize,
+        overdue_checkpoints: usize,
+    },
+    /// A detector made something of a run's evidence.
+    HealthSignalRaised {
+        run_id: i64,
+        signal: &'a str,
+        reason: &'a str,
+    },
+    /// The service core was left poisoned by an operation that panicked while
+    /// holding it, so the daemon is stopping for a supervisor to restart.
+    ///
+    /// The one event here that is about the daemon rather than about a run, and
+    /// the reason this component writes to a file at all: a core nothing can
+    /// take is a core nothing can journal through either.
+    CorePoisoned { component: &'a str },
+}
+
+impl CoordinatorEvent<'_> {
+    const fn kind(self) -> ProviderDiagnosticKind {
+        match self {
+            Self::RunStateChanged { .. } => ProviderDiagnosticKind::RunStateChanged,
+            Self::GateResult { .. } => ProviderDiagnosticKind::GateResult,
+            Self::RunAdmitted { .. } => ProviderDiagnosticKind::RunAdmitted,
+            Self::RunDeferred { .. } => ProviderDiagnosticKind::RunDeferred,
+            Self::AdmissionFailed { .. } => ProviderDiagnosticKind::AdmissionFailed,
+            Self::TimersTicked { .. } => ProviderDiagnosticKind::TimersTicked,
+            Self::HealthSignalRaised { .. } => ProviderDiagnosticKind::HealthSignalRaised,
+            Self::CorePoisoned { .. } => ProviderDiagnosticKind::CorePoisoned,
+        }
+    }
+
+    fn detail(self) -> serde_json::Value {
+        match self {
+            Self::RunStateChanged {
+                run_id,
+                machine,
+                from,
+                to,
+                trigger,
+            } => serde_json::json!({
+                "run": run_id,
+                "machine": machine,
+                "from": from,
+                "to": to,
+                "trigger": trigger,
+            }),
+            Self::GateResult {
+                run_id,
+                gate,
+                passed,
+                reason,
+            } => serde_json::json!({
+                "run": run_id,
+                "gate": gate,
+                "passed": passed,
+                "reason": reason,
+            }),
+            Self::RunAdmitted { run_id, resumed } => {
+                serde_json::json!({ "run": run_id, "resumed": resumed })
+            }
+            Self::RunDeferred { run_id, reason } | Self::AdmissionFailed { run_id, reason } => {
+                serde_json::json!({ "run": run_id, "reason": reason })
+            }
+            Self::TimersTicked {
+                quota_resets,
+                expired_questions,
+                overdue_checkpoints,
+            } => serde_json::json!({
+                "quota_resets": quota_resets,
+                "expired_questions": expired_questions,
+                "overdue_checkpoints": overdue_checkpoints,
+            }),
+            Self::HealthSignalRaised {
+                run_id,
+                signal,
+                reason,
+            } => serde_json::json!({ "run": run_id, "signal": signal, "reason": reason }),
+            Self::CorePoisoned { component } => serde_json::json!({ "component": component }),
+        }
+    }
+}
+
 /// What asked for a compaction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CompactionReason {
@@ -337,6 +465,30 @@ impl SafeDiagnosticStore {
         best_effort(self.write_session_lifecycle(reference, scope, event));
     }
 
+    /// Records one coordinator event.
+    ///
+    /// Its own path for the same reason a lifecycle event has one: it has no
+    /// attempt, no retry budget and no HTTP status, and forcing it through the
+    /// provider event shape would write a line whose fields are mostly null.
+    pub fn record_coordinator(&self, reference: &DiagnosticRef, event: CoordinatorEvent<'_>) {
+        if !self.enabled {
+            return;
+        }
+        let _guard = DIAGNOSTIC_FILE_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        best_effort(self.write_coordinator(reference, event));
+    }
+
+    fn write_coordinator(
+        &self,
+        reference: &DiagnosticRef,
+        event: CoordinatorEvent<'_>,
+    ) -> std::io::Result<()> {
+        self.append(coordinator_json_line(reference, event)?)
+    }
+
     fn write_session_lifecycle(
         &self,
         reference: &DiagnosticRef,
@@ -501,6 +653,30 @@ fn session_lifecycle_json_line(
         "reference": reference.as_str(),
         "scope": scope.as_str(),
         "component": event.component().as_str(),
+        "event": event.kind().as_str(),
+    });
+    if let (Some(line), Some(detail)) = (line.as_object_mut(), event.detail().as_object()) {
+        line.extend(detail.clone());
+    }
+
+    let mut line = serde_json::to_vec(&line).map_err(std::io::Error::other)?;
+    line.push(b'\n');
+    Ok(line)
+}
+
+fn coordinator_json_line(
+    reference: &DiagnosticRef,
+    event: CoordinatorEvent<'_>,
+) -> std::io::Result<Vec<u8>> {
+    let timestamp_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let mut line = serde_json::json!({
+        "timestamp_ms": u64::try_from(timestamp_ms).unwrap_or(u64::MAX),
+        "reference": reference.as_str(),
+        "scope": ProviderDiagnosticScope::Parent.as_str(),
+        "component": ProviderDiagnosticComponent::Coordinator.as_str(),
         "event": event.kind().as_str(),
     });
     if let (Some(line), Some(detail)) = (line.as_object_mut(), event.detail().as_object()) {

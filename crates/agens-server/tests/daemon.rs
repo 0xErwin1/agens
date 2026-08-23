@@ -491,3 +491,42 @@ async fn collect_streamed(events: &mut tonic::Streaming<proto::Event>) -> Vec<St
 
     seen
 }
+
+/// A daemon that cannot compose says what stopped it.
+///
+/// The whole of the operator's evidence is this one line: the refusal happens
+/// before the journal, the facade and the diagnostics file exist, so a fixed
+/// phrase would leave them with a daemon that will not start and nothing at all
+/// about why.
+#[test]
+fn a_coordinator_that_cannot_open_its_store_carries_the_cause_out() {
+    let directory = scratch_directory("unopenable");
+
+    // A directory where the control plane's file belongs: the store cannot open
+    // it, and the failure is the store's own rather than one this test wrote.
+    fs::create_dir_all(directory.join("agens.db")).unwrap();
+
+    let shutdown = HeadlessTurnCancellation::new();
+    let refused = agens_server::serve_until_shutdown(
+        &directory,
+        &CoordinatorSettings::default(),
+        std::sync::Arc::new(|_launch: &RunLaunch<'_>| {
+            Err(LaunchError("this test starts no sessions".to_owned()))
+        }) as RunWorkerFactory,
+        &shutdown,
+    )
+    .expect_err("the control plane cannot be opened");
+
+    let cause = match &refused {
+        agens_server::ServerError::Unavailable(cause) => cause.clone(),
+        other => panic!("{other:?}"),
+    };
+
+    assert!(
+        cause.contains("the control plane"),
+        "the component that failed travels: {cause}"
+    );
+    assert_eq!(cause, refused.to_string());
+
+    fs::remove_dir_all(directory).unwrap();
+}

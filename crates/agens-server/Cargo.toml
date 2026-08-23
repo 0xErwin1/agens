@@ -10,6 +10,8 @@ workspace = true
 
 [dependencies]
 agens-core = { path = "../agens-core" }
+agens-diagnostics = { path = "../agens-diagnostics" }
+agens-providers = { path = "../agens-providers" }
 agens-store = { path = "../agens-store" }
 agens-tools = { path = "../agens-tools" }
 libc = "0.2"

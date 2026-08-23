@@ -226,6 +226,8 @@ name = "agens-server"
 version = "0.1.0"
 dependencies = [
  "agens-core",
+ "agens-diagnostics",
+ "agens-providers",
  "agens-store",
  "agens-tools",
  "hyper-util",

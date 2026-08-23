@@ -70,7 +70,7 @@ by which of these sentences it fits, not by which directory is convenient.
 - `agens-config` is a leaf crate for configuration and credential compatibility.
 - Provider, tool, and store crates may depend on `agens-core` and `agens-config` where required.
 - `agens-tui` depends on `agens-bus`, `agens-core` and `agens-perf`, and remains a surface adapter.
-- `agens-server` depends on `agens-core`, `agens-store` and `agens-tools`. It owns the daemon: the single-instance runtime, the coordinator's state machines, its service core, its gates, the scheduler and the timer wheel. None of that belongs to a command surface, so `serve` stays a thin adapter over this crate.
+- `agens-server` depends on `agens-core`, `agens-store`, `agens-tools`, `agens-diagnostics` and `agens-providers`. It owns the daemon: the single-instance runtime, the coordinator's state machines, its service core, its gates, the scheduler and the timer wheel. None of that belongs to a command surface, so `serve` stays a thin adapter over this crate.
 
   **One API, two facades.** Praetor's `team_*` tools and the clients' gRPC surface differ only in transport and in the principal they arrive as. The authorization table that decides what a principal reaches lives in the core rather than in either facade, so adding a transport cannot widen anyone's authority.
 
@@ -79,6 +79,8 @@ by which of these sentences it fits, not by which directory is convenient.
   **Why the tools.** Both the gates and the worktree port re-derive a repository's topology from git, and `agens-tools` already owns the one hardened way this workspace reaches git. A second git surface inside the daemon would be a second set of answers to which configuration, environment and hooks a git invocation may execute.
 
   **The wire.** The gRPC facade lives in the same crate: its `.proto` is `crates/agens-server/proto/`, and its build script compiles it into `OUT_DIR` with `protox` so the codegen needs no `protoc` on the machine. Generated code is never committed, because a checked-in copy is a second definition of the wire that can disagree with the `.proto` beside it. The facade carries no authentication of its own and pins the user's authority to whoever reaches it, so it accepts on the daemon's unix socket and nowhere else: the socket's directory is the operating system's answer to who may connect. Remote access is an SSH tunnel, which puts identity where it belongs.
+
+  **Why the diagnostics.** The journal is the control plane's own account and stays authoritative, but it is a table behind the facade: a supervisor watching a machine rather than a project would have to attach a client to see anything, and the one fact that matters most — the service core left unusable — hangs off no run and so has no journal row it could be written as. The coordinator therefore also writes typed, capture-gated lines under the `coordinator` component of the same rotating JSONL log every other subsystem writes to, carrying only integers and names from closed sets it authored. `agens-providers` comes with it: the component, kind and scope vocabulary those lines are written in is defined there.
 - `agens-cli` is the composition root and the sole shipped binary crate. `agens-tui` also carries `agens-perf-audit`, a development binary that only exists behind a non-default feature.
 
 ## Surfaces and logic

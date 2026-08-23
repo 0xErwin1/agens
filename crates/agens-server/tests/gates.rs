@@ -878,6 +878,7 @@ fn the_daemon_merges_an_authorized_run_and_releases_its_worktree() {
         .expect("build a runtime");
     let supervisor = SessionSupervisor::new(runtime.handle().clone());
 
+    let shutdown = agens_core::HeadlessTurnCancellation::new();
     let coordinator = Coordinator::start(
         &fixture.data_directory,
         &CoordinatorSettings {
@@ -888,6 +889,7 @@ fn the_daemon_merges_an_authorized_run_and_releases_its_worktree() {
         },
         supervisor,
         no_worker(),
+        &shutdown,
     )
     .expect("the coordinator composes");
     let core = coordinator.core();

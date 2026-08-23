@@ -7,7 +7,9 @@
 
 mod api;
 mod blocking;
+mod cache;
 mod coordinator;
+mod diagnostics;
 mod fsm;
 mod gates;
 pub mod grpc;
@@ -58,9 +60,11 @@ pub use api::{
 };
 pub use blocking::{BlockingBoundary, BlockingError};
 pub use coordinator::{
-    BootReconciliation, Coordinator, CoordinatorError, CoordinatorSettings, MissingWorktree,
-    OrphanWorktree, RunLaunch, RunWorkerFactory, WORKTREE_MISSING_EVENT, WORKTREE_ORPHANED_EVENT,
+    ADMISSION_FAILED_EVENT, BootReconciliation, CORE_POISONED_EVENT, Coordinator, CoordinatorError,
+    CoordinatorSettings, MissingWorktree, OrphanWorktree, RUN_DEFERRED_EVENT, RunLaunch,
+    RunWorkerFactory, WORKTREE_MISSING_EVENT, WORKTREE_ORPHANED_EVENT,
 };
+pub use diagnostics::CoordinatorDiagnostics;
 pub use fsm::{
     AppliedQuestionTransition, AppliedRunTransition, AppliedTransition, AppliedWorktreeTransition,
     Principal, QUESTION_TRANSITIONS, QuestionEffect, QuestionFacts, QuestionGuard,
@@ -104,8 +108,29 @@ pub enum ServerError {
     /// Another daemon owns this machine's slot. Its own variant because the
     /// caller must attach rather than start a second process.
     AlreadyRunning,
-    Unavailable(&'static str),
+    /// Something the daemon is built from could not be opened, carrying what
+    /// said so.
+    ///
+    /// The cause travels rather than being replaced by a fixed phrase: the
+    /// component that failed and the reason it gave are the whole of what an
+    /// operator can act on, and a daemon that refuses to start is exactly the
+    /// moment there is no journal, no facade and no diagnostics file to read it
+    /// from instead.
+    Unavailable(String),
 }
+
+impl std::fmt::Display for ServerError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AlreadyRunning => {
+                formatter.write_str("a daemon already holds this machine's slot")
+            }
+            Self::Unavailable(cause) => formatter.write_str(cause),
+        }
+    }
+}
+
+impl std::error::Error for ServerError {}
 
 /// The machine's daemon: its slot, its socket, its runtime, and the sessions
 /// living in it.
@@ -137,13 +162,14 @@ impl Daemon {
     pub fn start(data_directory: &Path) -> Result<Self, ServerError> {
         let instance = ServeInstance::acquire(data_directory).map_err(|error| match error {
             ServeInstanceError::AlreadyRunning => ServerError::AlreadyRunning,
-            ServeInstanceError::Unavailable(_) => {
-                ServerError::Unavailable("runtime is unavailable")
+            ServeInstanceError::Unavailable(cause) => {
+                ServerError::Unavailable(format!("the daemon's slot is unavailable: {cause}"))
             }
         })?;
 
-        let listener = UnixListener::bind(instance.socket_path())
-            .map_err(|_| ServerError::Unavailable("socket is unavailable"))?;
+        let listener = UnixListener::bind(instance.socket_path()).map_err(|error| {
+            ServerError::Unavailable(format!("the socket is unavailable: {error}"))
+        })?;
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_time()
@@ -151,7 +177,9 @@ impl Daemon {
             // driver does not fail to bind — it panics on the first accept.
             .enable_io()
             .build()
-            .map_err(|_| ServerError::Unavailable("runtime is unavailable"))?;
+            .map_err(|error| {
+                ServerError::Unavailable(format!("the runtime is unavailable: {error}"))
+            })?;
         let sessions = SessionSupervisor::new(runtime.handle().clone());
 
         Ok(Self {
@@ -212,7 +240,7 @@ impl Daemon {
         drop(instance);
 
         let (served, report) = report;
-        served.map_err(|_| ServerError::Unavailable("the facade is unavailable"))?;
+        served.map_err(|error| ServerError::Unavailable(format!("the facade stopped: {error}")))?;
 
         Ok(report)
     }
@@ -274,9 +302,14 @@ pub fn serve_until_shutdown(
 
     // The supervisor is the daemon's, so the sessions the scheduler starts are
     // the ones the daemon stops on its way out.
-    let coordinator =
-        Coordinator::start(data_directory, settings, daemon.sessions().clone(), worker)
-            .map_err(|_| ServerError::Unavailable("the coordinator is unavailable"))?;
+    let coordinator = Coordinator::start(
+        data_directory,
+        settings,
+        daemon.sessions().clone(),
+        worker,
+        shutdown,
+    )
+    .map_err(|error| ServerError::Unavailable(error.to_string()))?;
 
     let report = daemon.serve_until_shutdown(coordinator.core(), shutdown);
 

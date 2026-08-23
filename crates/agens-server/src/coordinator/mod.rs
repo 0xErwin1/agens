@@ -42,6 +42,8 @@
 //! confinement root, its own MCP connections — belongs to the surface that
 //! knows about models, and admission must not have to know any of it.
 
+mod fatal;
+mod queue_journal;
 mod reconcile;
 
 use std::path::{Path, PathBuf};
@@ -50,6 +52,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use agens_core::HeadlessTurnCancellation;
 use agens_store::{
     ControlPlaneStore, DirectiveStore, EventRow, QuestionAuthor, QuestionKind, QuestionState,
     RunRow, RunState, WorktreeStatus,
@@ -57,6 +60,10 @@ use agens_store::{
 use agens_tools::SessionWorktrees;
 
 use crate::api::{ApiCore, Ports};
+use crate::cache::RunCache;
+use crate::coordinator::fatal::FatalCore;
+use crate::coordinator::queue_journal::QueueJournal;
+use crate::diagnostics::CoordinatorDiagnostics;
 use crate::fsm::StateMachines;
 use crate::gates::{
     Gates, MergePath, PreMergeRequest, ReclaimRequest, SUB_AGENT_EVENT, SubAgentKind,
@@ -76,6 +83,8 @@ use crate::scheduler::{
 use crate::sessions::SessionSupervisor;
 use crate::timers::{TimerSettings, TimerWheel};
 
+pub use fatal::CORE_POISONED_EVENT;
+pub use queue_journal::{ADMISSION_FAILED_EVENT, RUN_DEFERRED_EVENT};
 pub use reconcile::{
     BootReconciliation, MissingWorktree, OrphanWorktree, WORKTREE_MISSING_EVENT,
     WORKTREE_ORPHANED_EVENT,
@@ -119,6 +128,12 @@ pub struct CoordinatorSettings {
     pub heartbeat: Duration,
     /// How long the gates sweep waits between passes.
     pub gates_sweep: Duration,
+    /// Whether the coordinator writes its own diagnostics log.
+    ///
+    /// Capture-gated like every other diagnostic, and off by default: the file
+    /// is the second reader's copy of what the journal already holds, and a
+    /// machine that did not ask for one should not be given a file that grows.
+    pub diagnostics: bool,
 }
 
 impl Default for CoordinatorSettings {
@@ -135,6 +150,7 @@ impl Default for CoordinatorSettings {
             attempt_cap: 3,
             heartbeat: HEARTBEAT,
             gates_sweep: GATES_SWEEP,
+            diagnostics: false,
         }
     }
 }
@@ -195,11 +211,17 @@ impl Coordinator {
     /// The supervisor arrives from the daemon rather than being built here: the
     /// sessions the scheduler starts and the sessions the daemon stops on its
     /// way out have to be the same ones.
+    ///
+    /// The daemon's own stop arrives for the same reason. A service core left
+    /// poisoned has no recovery and no owner: the loops that find it can stop
+    /// themselves, and only this can stop the facade that would otherwise keep
+    /// answering clients from behind it.
     pub fn start(
         data_directory: &Path,
         settings: &CoordinatorSettings,
         supervisor: SessionSupervisor,
         worker: RunWorkerFactory,
+        shutdown: &HeadlessTurnCancellation,
     ) -> Result<Self, CoordinatorError> {
         let machines = StateMachines::new(open_control_plane(data_directory)?);
         let admissions = Arc::new(Admissions::new());
@@ -234,6 +256,13 @@ impl Coordinator {
         )));
         let (facts, reports) = ingest_channel();
         let stopping = Arc::new(AtomicBool::new(false));
+        let diagnostics = CoordinatorDiagnostics::new(data_directory, settings.diagnostics);
+        let fatal = Arc::new(FatalCore::new(
+            data_directory,
+            &stopping,
+            shutdown,
+            diagnostics.clone(),
+        ));
 
         // Steps 2 to 4, before anything is ticking or serving. Nothing else
         // holds the core yet, so the pass reads and moves the same rows the
@@ -250,11 +279,27 @@ impl Coordinator {
                 supervisor,
                 worker,
                 facts.clone(),
+                diagnostics.clone(),
+                Arc::clone(&fatal),
             ),
-            timer_loop(settings, &core, &admissions, &stopping, facts.clone()),
-            gates_loop(data_directory, settings, &core, &stopping),
-            ingest_loop(data_directory, settings, reports, &stopping)?,
-            publisher_loop(data_directory, settings, feed, &stopping)?,
+            timer_loop(
+                settings,
+                &core,
+                &admissions,
+                &stopping,
+                facts.clone(),
+                diagnostics.clone(),
+                Arc::clone(&fatal),
+            ),
+            gates_loop(data_directory, settings, &core, &stopping, fatal),
+            ingest_loop(
+                data_directory,
+                settings,
+                reports,
+                &stopping,
+                diagnostics.clone(),
+            )?,
+            publisher_loop(data_directory, settings, feed, &stopping, diagnostics)?,
         ];
 
         let coordinator = Self {
@@ -378,6 +423,8 @@ fn admission_loop(
     supervisor: SessionSupervisor,
     worker: RunWorkerFactory,
     facts: FactSender,
+    diagnostics: CoordinatorDiagnostics,
+    fatal: Arc<FatalCore>,
 ) -> JoinHandle<()> {
     let core = Arc::clone(core);
     let admissions = Arc::clone(admissions);
@@ -388,6 +435,7 @@ fn admission_loop(
     let data_directory = data_directory.to_path_buf();
 
     std::thread::spawn(move || {
+        let mut queue_journal = QueueJournal::default();
         let launcher = SupervisorLauncher::new(supervisor, |pending: &PendingRun<'_>| {
             worker(&RunLaunch {
                 run_id: pending.run_id,
@@ -416,10 +464,23 @@ fn admission_loop(
                 // A tick that could not read the queue did nothing and is not
                 // fatal: the next occasion reads it again, and the runs it
                 // would have admitted are still queued where they were.
-                Ok(mut core) => core
-                    .admit_queued_runs(&scheduler, &launcher, &load)
-                    .map_or(true, |report| !report.failures.is_empty()),
-                Err(_) => true,
+                Ok(mut core) => match core.admit_queued_runs(&scheduler, &launcher, &load) {
+                    Ok(report) => {
+                        queue_journal.record(core.machines_mut(), &report, load.now);
+                        diagnostics.admission(&report);
+
+                        !report.failures.is_empty()
+                    }
+                    Err(_) => true,
+                },
+                // A poisoned core is not a tick that did nothing: it is a core
+                // no later tick will take either, so the daemon stops here
+                // rather than sleeping the backoff forever.
+                Err(_) => {
+                    fatal.poisoned("admission");
+
+                    true
+                }
             };
 
             // A launch that did not work leaves its run queued, so the next
@@ -454,6 +515,8 @@ fn timer_loop(
     admissions: &Arc<Admissions>,
     stopping: &Arc<AtomicBool>,
     facts: FactSender,
+    diagnostics: CoordinatorDiagnostics,
+    fatal: Arc<FatalCore>,
 ) -> JoinHandle<()> {
     let core = Arc::clone(core);
     let admissions = Arc::clone(admissions);
@@ -465,17 +528,29 @@ fn timer_loop(
         while !stopping.load(Ordering::Acquire) {
             let (requeued, expired) = match core.lock() {
                 Ok(mut core) => match core.advance_timers(&wheel) {
-                    Ok(tick) => (
-                        !tick.quota_resets.is_empty(),
-                        // Attributed while the core is still held, from the
-                        // same rows the tick read: a fact attributed to an
-                        // attempt the run left between the two would be
-                        // refused as a straggler.
-                        expired_checkpoint_facts(&core, &tick),
-                    ),
+                    Ok(tick) => {
+                        diagnostics.timers(&tick);
+
+                        (
+                            !tick.quota_resets.is_empty(),
+                            // Attributed while the core is still held, from the
+                            // same rows the tick read: a fact attributed to an
+                            // attempt the run left between the two would be
+                            // refused as a straggler.
+                            expired_checkpoint_facts(&core, &tick),
+                        )
+                    }
                     Err(_) => (false, Vec::new()),
                 },
-                Err(_) => (false, Vec::new()),
+                // The wheel reading a poisoned core as "nothing was due" is how
+                // a daemon goes on ticking against a core it will never take
+                // again. It is fatal here for the same reason it is in
+                // admission.
+                Err(_) => {
+                    fatal.poisoned("timers");
+
+                    (false, Vec::new())
+                }
             };
 
             // A provider whose reset arrived put its runs back in the queue,
@@ -536,6 +611,7 @@ fn gates_loop(
     settings: &CoordinatorSettings,
     core: &Arc<Mutex<ApiCore>>,
     stopping: &Arc<AtomicBool>,
+    fatal: Arc<FatalCore>,
 ) -> JoinHandle<()> {
     let core = Arc::clone(core);
     let stopping = Arc::clone(stopping);
@@ -543,6 +619,7 @@ fn gates_loop(
         worktrees: SessionWorktrees::new(data_directory),
         main_ref: settings.main_ref.clone(),
         attempt_cap: settings.attempt_cap,
+        fatal,
     };
     let interval = settings.gates_sweep;
     let heartbeat = settings.heartbeat;
@@ -578,13 +655,14 @@ struct GatesSweep {
     worktrees: SessionWorktrees,
     main_ref: String,
     attempt_cap: i64,
+    fatal: Arc<FatalCore>,
 }
 
 impl GatesSweep {
     /// One pass over every run whose work is finished and whose worktree is
     /// still active.
     fn pass(&self, core: &Mutex<ApiCore>, now: i64) {
-        let Ok(candidates) = core.lock().map(|core| candidates(&core)) else {
+        let Some(candidates) = self.taken(core).map(|core| candidates(&core)) else {
             return;
         };
 
@@ -612,7 +690,7 @@ impl GatesSweep {
             now,
         };
 
-        let Ok(mut core) = core.lock() else {
+        let Some(mut core) = self.taken(core) else {
             return;
         };
 
@@ -648,10 +726,26 @@ impl GatesSweep {
             now,
         };
 
-        let Ok(mut core) = core.lock() else {
+        let Some(mut core) = self.taken(core) else {
             return;
         };
         let _verdict = Gates::new(core.machines_mut(), self.worktrees.clone()).reclaim(&request);
+    }
+
+    /// The core, or nothing and a daemon on its way down.
+    ///
+    /// A sweep that skipped a poisoned core would go on passing over the same
+    /// candidates forever, presenting each of them to a gate that can no longer
+    /// be reached.
+    fn taken<'a>(&self, core: &'a Mutex<ApiCore>) -> Option<std::sync::MutexGuard<'a, ApiCore>> {
+        match core.lock() {
+            Ok(core) => Some(core),
+            Err(_) => {
+                self.fatal.poisoned("gates");
+
+                None
+            }
+        }
     }
 }
 
@@ -746,6 +840,7 @@ fn ingest_loop(
     settings: &CoordinatorSettings,
     reports: FactReceiver,
     stopping: &Arc<AtomicBool>,
+    diagnostics: CoordinatorDiagnostics,
 ) -> Result<JoinHandle<()>, CoordinatorError> {
     let mut ingest = Ingest::new(open_control_plane(data_directory)?);
     let stopping = Arc::clone(stopping);
@@ -755,7 +850,15 @@ fn ingest_loop(
         while !stopping.load(Ordering::Acquire) {
             // A refused fact is already carried back on its own outcome, and
             // the reporter is the party that can do something about it.
-            let _ = ingest.drain_available(&reports);
+            for drained in ingest.drain_available(&reports) {
+                let Ok(accepted) = &drained.outcome else {
+                    continue;
+                };
+
+                for signal in &accepted.signals {
+                    diagnostics.health_signal(drained.fact.run_id, signal);
+                }
+            }
 
             std::thread::sleep(heartbeat);
         }
@@ -768,6 +871,7 @@ fn publisher_loop(
     settings: &CoordinatorSettings,
     feed: Arc<JournalFeed>,
     stopping: &Arc<AtomicBool>,
+    diagnostics: CoordinatorDiagnostics,
 ) -> Result<JoinHandle<()>, CoordinatorError> {
     let store = open_control_plane(data_directory)?;
     let stopping = Arc::clone(stopping);
@@ -780,9 +884,10 @@ fn publisher_loop(
     Ok(std::thread::spawn(move || {
         // One run's repository, cached: a filter is scoped by repository, the
         // entries of one run arrive in bursts, and the run a journal entry
-        // belongs to never changes repository.
-        let mut repositories: std::collections::HashMap<i64, Option<String>> =
-            std::collections::HashMap::new();
+        // belongs to never changes repository. Bounded, because nothing tells
+        // this loop that a run ended and every entry is one more run it would
+        // otherwise remember for the life of the daemon.
+        let mut repositories: RunCache<Option<String>> = RunCache::with_capacity(PUBLISH_MEMO);
 
         while !stopping.load(Ordering::Acquire) {
             std::thread::sleep(heartbeat);
@@ -793,10 +898,14 @@ fn publisher_loop(
             // taken past them.
             let head = store.latest_event_id().unwrap_or(watermark);
 
-            if feed.subscribers() == 0 {
+            if feed.subscribers() == 0 && !diagnostics.enabled() {
                 // Nobody is watching, so the tail is not read. The watermark
                 // still moves, because a subscriber arriving later asks for
                 // what happens next rather than for what it missed.
+                //
+                // A supervisor reading the diagnostics log is a watcher with no
+                // subscription, which is why capture keeps the tail being read
+                // with no client attached.
                 watermark = head;
                 continue;
             }
@@ -807,6 +916,7 @@ fn publisher_loop(
 
             for event in &events {
                 watermark = event.id.unwrap_or(watermark).max(watermark);
+                diagnostics.journal_entry(event);
                 feed.publish(event, repository_of(&store, &mut repositories, event));
             }
         }
@@ -818,16 +928,22 @@ fn publisher_loop(
 /// publisher inside one query while it grows.
 const PUBLISH_BATCH: usize = 256;
 
+/// How many runs the publisher remembers a repository for. Comfortably more
+/// than the runs one burst of journal entries spans, and a miss costs a single
+/// row read.
+const PUBLISH_MEMO: usize = 1024;
+
 fn repository_of<'a>(
     store: &ControlPlaneStore,
-    known: &'a mut std::collections::HashMap<i64, Option<String>>,
+    known: &'a mut RunCache<Option<String>>,
     event: &EventRow,
 ) -> Option<&'a str> {
     let run_id = event.run_id?;
 
     known
-        .entry(run_id)
-        .or_insert_with(|| store.load_run(run_id).ok().flatten().map(|run| run.repo_id))
+        .get_or_insert_with(run_id, || {
+            store.load_run(run_id).ok().flatten().map(|run| run.repo_id)
+        })
         .as_deref()
 }
 

@@ -146,11 +146,13 @@ fn a_coordinator_started_over_a_running_row_puts_it_back_in_the_queue() {
         .unwrap();
     let supervisor = SessionSupervisor::new(runtime.handle().clone());
 
+    let shutdown = agens_core::HeadlessTurnCancellation::new();
     let coordinator = Coordinator::start(
         &directory,
         &CoordinatorSettings::default(),
         supervisor,
         refusing_worker(),
+        &shutdown,
     )
     .expect("the coordinator composes over the data directory");
 
