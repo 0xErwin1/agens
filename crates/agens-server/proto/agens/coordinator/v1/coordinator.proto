@@ -12,9 +12,12 @@ syntax = "proto3";
 // them. The vocabulary has one definition — the store's — and a second copy on
 // the wire is a copy that can drift out of step with the rows it names.
 //
-// Chat with Praetor is deliberately absent. It is the one operation of the
-// design's Team sketch with nothing behind it yet, and a stub that accepts a
-// stream and answers nothing is a worse contract than an absent method.
+// `Chat` is the third plane, and it is the user's own conversation rather than
+// the design's chat-with-Praetor: a turn the daemon hosts on an attached
+// client's behalf, so it survives the terminal that asked for it. It is not
+// folded into `Feed` because a turn's progress is ephemeral and belongs to one
+// session, while `Feed` carries the coordinator's persisted, repository-scoped
+// journal; a provider delta has no business becoming a journal row.
 package agens.coordinator.v1;
 
 // One state machine transition, as the caller sees it.
@@ -359,4 +362,149 @@ service Feed {
   rpc Tree(TreeRequest) returns (TreeSnapshot);
   rpc RunDetail(RunDetailRequest) returns (RunView);
   rpc Inbox(InboxRequest) returns (InboxView);
+}
+
+// A part of one message, as a turn produces it.
+//
+// The same five shapes the domain has. A part is carried structurally rather
+// than as an encoded blob because a client renders it: a blob would make every
+// surface parse the daemon's private encoding to draw a line of text.
+message MessagePart {
+  oneof part {
+    string text = 1;
+    string reasoning = 2;
+    ToolCall tool_call = 3;
+    ToolResult tool_result = 4;
+    Media media = 5;
+  }
+}
+
+message ToolCall {
+  string id = 1;
+  string name = 2;
+  // The call's raw argument payload, exactly as the provider produced it.
+  string input = 3;
+}
+
+message ToolResult {
+  string tool_call_id = 1;
+  string content = 2;
+  bool is_error = 3;
+}
+
+message Media {
+  int64 media_id = 1;
+  string mime = 2;
+}
+
+message Usage {
+  optional uint64 input_tokens = 1;
+  optional uint64 output_tokens = 2;
+  optional uint64 total_tokens = 3;
+  optional uint64 context_window = 4;
+}
+
+// A transient provider failure the turn is about to retry.
+//
+// It carries no failure text: a client rendering this is describing what the
+// turn is doing right now, not reporting an error anybody has to act on.
+message ProviderRetry {
+  uint32 attempt = 1;
+  optional uint32 max_attempts = 2;
+  optional uint64 delay_millis = 3;
+  // "rate_limited", "server_error", "network", "timeout" or "transient".
+  string reason = 4;
+}
+
+// Input that reached a running turn at a tool boundary.
+message IntraTurnInput {
+  // "human" or "supervisor". The two do not carry the same authority, so who
+  // spoke is recorded rather than inferred.
+  string source = 1;
+  string text = 2;
+}
+
+// One thing a running turn did.
+//
+// The turn's own facts about tool results — the paths a write touched, the exit
+// status of a command — are deliberately absent. They are what the daemon feeds
+// its own ingest with, no surface renders them, and a run's health is already
+// readable through `Feed`.
+message TurnProgress {
+  oneof event {
+    // "idle", "requesting", "streaming", "dispatching", "completed",
+    // "cancelled" or "failed".
+    string state = 1;
+    MessagePart provider_part = 2;
+    Usage usage = 3;
+    ToolCall tool_call_requested = 4;
+    MessagePart tool_result = 5;
+    ProviderRetry provider_retry = 6;
+    IntraTurnInput intra_turn_input = 7;
+  }
+}
+
+message TurnCompleted {
+  string text = 1;
+}
+
+message TurnFailed {
+  string detail = 1;
+}
+
+// The chat has ended and will publish nothing further.
+message ChatClosed {}
+
+// One thing a hosted chat did, as a subscriber sees it.
+message SessionEvent {
+  int64 session_id = 1;
+  oneof event {
+    TurnProgress progress = 2;
+    TurnCompleted turn_completed = 3;
+    TurnFailed turn_failed = 4;
+    ChatClosed closed = 5;
+  }
+}
+
+message OpenChatRequest {
+  // The checkout the chat's tools run in.
+  //
+  // A path rather than a repository id, for the reason `CreateRunRequest`
+  // takes one: the daemon derives the identity from the checkout, and a
+  // repository that has never had a run has no id for a client to name.
+  string checkout = 1;
+  // The stored session to continue, when the client is resuming one.
+  optional int64 resume = 2;
+}
+
+message ChatHandle {
+  int64 session_id = 1;
+}
+
+message PromptRequest {
+  int64 session_id = 1;
+  string prompt = 2;
+}
+
+// One open chat, named.
+message ChatRef {
+  int64 session_id = 1;
+}
+
+message ChatAck {}
+
+// The chat plane: the user's own conversation, hosted by the daemon.
+//
+// `Prompt` returns as soon as the turn has somewhere to start, not when it
+// finishes. What the turn does arrives on `Subscribe`, which is what lets a
+// client detach from a turn without ending it — and lets another one attach to
+// a turn already under way.
+service Chat {
+  rpc Open(OpenChatRequest) returns (ChatHandle);
+  rpc Prompt(PromptRequest) returns (ChatAck);
+  // Ends the turn a chat is running and leaves the session open.
+  rpc Cancel(ChatRef) returns (ChatAck);
+  // Ends the session, letting the turn it may be running finish first.
+  rpc Close(ChatRef) returns (ChatAck);
+  rpc Subscribe(ChatRef) returns (stream SessionEvent);
 }

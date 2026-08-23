@@ -23,10 +23,13 @@
 //! - **The principal.** It is fixed when the facade is built, never read off the
 //!   wire. A request cannot name who it is.
 
+mod chat;
 mod convert;
 mod feed;
 mod serve;
+mod subscriptions;
 mod team;
+mod turn;
 
 // Generated from `proto/agens/coordinator/v1/coordinator.proto` at build time.
 // The lints are relaxed for this module alone: it is machine output, and
@@ -52,6 +55,7 @@ use crate::api::{ApiCore, ApiError, CreateRun, CreatedRun};
 use crate::blocking::{BlockingBoundary, BlockingError};
 use crate::fsm::{Principal, TransitionRejection};
 
+pub use chat::ChatFacade;
 pub use feed::FeedFacade;
 pub use serve::{FacadeBinding, FacadeError, serve_until_shutdown};
 pub use team::TeamFacade;

@@ -83,7 +83,7 @@ pub use gates::{
     DisposeVerdict, GateError, GateRefusal, Gates, MergePath, PreMergeRequest, PreMergeVerdict,
     Receipt, ReclaimRequest, ReclaimVerdict, SubAgentKind, SubAgentRequest, freeze_receipt,
 };
-pub use grpc::{CoreHandle, FacadeBinding, FacadeError, FeedFacade, TeamFacade};
+pub use grpc::{ChatFacade, CoreHandle, FacadeBinding, FacadeError, FeedFacade, TeamFacade};
 pub use ingest::{
     AcceptedFact, Attribution, BACKLOGGED_EVENT, BacklogNotice, CheckpointClaim,
     CheckpointStanding, DrainedFact, FactReceiver, FactSender, HealthSignal, HealthThresholds,

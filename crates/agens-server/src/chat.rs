@@ -18,6 +18,7 @@
 //! scheduler takes its workers from.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -52,9 +53,14 @@ const SUBSCRIBER_BACKLOG: usize = 2048;
 
 /// What a client asked for when it opened a chat session.
 pub struct ChatSessionRequest {
-    /// The project the chat belongs to. One daemon serves N of them, and a chat
-    /// without a project is a chat whose tools have no root to run in.
-    pub repo_id: String,
+    /// The checkout the chat's tools run in.
+    ///
+    /// A path rather than a repository id, for the reason a run's creation
+    /// takes one: the identity is derived from the checkout, and a repository
+    /// that has never had a run has no id for a client to name. One daemon
+    /// serves N projects, and a chat without one is a chat whose tools have no
+    /// root to run in.
+    pub checkout: PathBuf,
     /// The stored session to continue, when the client is resuming one.
     pub resume: Option<i64>,
 }

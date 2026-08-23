@@ -1,6 +1,7 @@
 //! A chat hosted by the daemon: prompts in, a turn's events out, and a session
 //! whose life is nobody's terminal.
 
+use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -102,7 +103,7 @@ fn harness() -> Harness {
 
 fn request(session: i64) -> ChatSessionRequest {
     ChatSessionRequest {
-        repo_id: "repo".to_owned(),
+        checkout: PathBuf::from("/projects/agens"),
         resume: Some(session),
     }
 }
