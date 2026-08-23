@@ -493,8 +493,11 @@ async fn every_team_rpc_reaches_the_core_over_a_unix_socket() {
     let granted = wire
         .team
         .authorize_merge(proto::AuthorizeMergeRequest {
-            question_id: fixture.merge_approval,
+            subject: Some(proto::authorize_merge_request::Subject::QuestionId(
+                fixture.merge_approval,
+            )),
             answer: "merge".to_owned(),
+            expires_at: None,
         })
         .await
         .unwrap()
@@ -688,8 +691,11 @@ async fn a_praetor_facade_is_refused_what_the_table_keeps_for_the_user() {
     let refused = wire
         .team
         .authorize_merge(proto::AuthorizeMergeRequest {
-            question_id: fixture.merge_approval,
+            subject: Some(proto::authorize_merge_request::Subject::QuestionId(
+                fixture.merge_approval,
+            )),
             answer: "merge".to_owned(),
+            expires_at: None,
         })
         .await
         .expect_err("the user approves bytes");

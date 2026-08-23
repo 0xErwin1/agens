@@ -12,7 +12,7 @@ use super::proto::team_server::Team;
 use super::{CoreHandle, convert, proto};
 use crate::api::{
     AnswerQuestion, ApprovePlan, AuthorizeMerge, CleaningAction, CleaningDisposition, CreateRun,
-    RetryRequest, RunRef, StopRequest, StopScope,
+    MergeAuthorization, RetryRequest, RunRef, StopRequest, StopScope,
 };
 
 /// The Team service, bound to one principal for its whole life.
@@ -56,6 +56,29 @@ fn stop_scope(request: proto::StopRequest) -> Result<StopScope, Status> {
             "a machine scope set to false names nothing to stop",
         )),
         None => Err(Status::invalid_argument("a stop names how far it reaches")),
+    }
+}
+
+/// Which approval a grant is given on.
+///
+/// An absent subject is refused rather than defaulted. Defaulting it either way
+/// would mean guessing whether the caller meant to open an authorization or to
+/// spend one that already exists.
+fn merge_authorization(
+    subject: Option<proto::authorize_merge_request::Subject>,
+    expires_at: Option<i64>,
+) -> Result<MergeAuthorization, Status> {
+    match subject {
+        Some(proto::authorize_merge_request::Subject::QuestionId(question_id)) => {
+            Ok(MergeAuthorization::Existing(question_id))
+        }
+        Some(proto::authorize_merge_request::Subject::RunId(run_id)) => {
+            Ok(MergeAuthorization::ForRun { run_id, expires_at })
+        }
+        None => Err(Status::invalid_argument(
+            "a merge authorization names either the approval it is given on or the run to open \
+             one for",
+        )),
     }
 }
 
@@ -153,16 +176,17 @@ impl Team for TeamFacade {
     async fn authorize_merge(
         &self,
         request: Request<proto::AuthorizeMergeRequest>,
-    ) -> Result<Response<proto::Ack>, Status> {
+    ) -> Result<Response<proto::AuthorizeMergeAck>, Status> {
         let request = request.into_inner();
+        let subject = merge_authorization(request.subject, request.expires_at)?;
 
-        let outcome = self
+        let authorized = self
             .core
             .call(move |core, principal, now| {
                 core.authorize_merge(
                     principal,
                     &AuthorizeMerge {
-                        question_id: request.question_id,
+                        subject,
                         answer: request.answer,
                         now,
                     },
@@ -170,8 +194,10 @@ impl Team for TeamFacade {
             })
             .await?;
 
-        Ok(Response::new(proto::Ack {
-            transition: Some(convert::transition(&outcome)),
+        Ok(Response::new(proto::AuthorizeMergeAck {
+            question_id: authorized.question_id,
+            run_id: authorized.run_id,
+            transition: Some(convert::transition(&authorized.grant)),
         }))
     }
 

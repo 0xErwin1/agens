@@ -16,11 +16,11 @@ use std::{
 use agens_server::{
     AnswerQuestion, ApiCore, ApiError, ApprovePlan, AuthorizeMerge, CleaningAction,
     CleaningDisposition, CreateRun, Delivery, DeliveryGrain, DeliveryPayload, DeliveryQueue,
-    DetailQuestionRefusal, EventFeed, EventFilter, HookPolicy, HookTrust, OPERATION_AUTHORIZATION,
-    Operation, PendingHookTrust, PortError, Ports, Principal, ProvisionedWorktree,
-    RepositoryIdentity, RepositoryPolicy, RetryRequest, RunRef, SchedulerPort, SessionControl,
-    StateMachines, StopRequest, StopScope, Subscription, TakeoverHandle, TransitionRejection,
-    WorktreeDerivation, WorktreeGate, WorktreeRequest, praetor_may_answer,
+    DetailQuestionRefusal, EventFeed, EventFilter, HookPolicy, HookTrust, MergeAuthorization,
+    OPERATION_AUTHORIZATION, Operation, PendingHookTrust, PortError, Ports, Principal,
+    ProvisionedWorktree, RepositoryIdentity, RepositoryPolicy, RetryRequest, RunRef, SchedulerPort,
+    SessionControl, StateMachines, StopRequest, StopScope, Subscription, TakeoverHandle,
+    TransitionRejection, WorktreeDerivation, WorktreeGate, WorktreeRequest, praetor_may_answer,
 };
 use agens_store::{
     ControlPlaneStore, QuestionAuthor, QuestionKind, QuestionRow, QuestionState, RetryTrigger,
@@ -543,7 +543,7 @@ fn praetor_can_never_authorize_a_merge() {
         .authorize_merge(
             Principal::Praetor,
             &AuthorizeMerge {
-                question_id,
+                subject: MergeAuthorization::Existing(question_id),
                 answer: "merge".to_owned(),
                 now: NOW,
             },
@@ -624,7 +624,7 @@ fn a_refusal_is_journaled_against_the_run() {
         .authorize_merge(
             Principal::Praetor,
             &AuthorizeMerge {
-                question_id,
+                subject: MergeAuthorization::Existing(question_id),
                 answer: "merge".to_owned(),
                 now: NOW,
             },
@@ -709,14 +709,15 @@ fn the_user_authorizes_a_merge_with_a_receipt() {
         .authorize_merge(
             Principal::User,
             &AuthorizeMerge {
-                question_id,
+                subject: MergeAuthorization::Existing(question_id),
                 answer: "merge".to_owned(),
                 now: NOW,
             },
         )
         .unwrap();
 
-    assert_eq!(outcome.applied().unwrap().to, QuestionState::Answered);
+    assert_eq!(outcome.grant.applied().unwrap().to, QuestionState::Answered);
+    assert_eq!(outcome.question_id, question_id);
 
     let question = harness
         .core
@@ -726,6 +727,142 @@ fn the_user_authorizes_a_merge_with_a_receipt() {
         .unwrap()
         .unwrap();
     assert_eq!(question.author, Some(QuestionAuthor::User));
+}
+
+#[test]
+fn authorizing_a_merge_for_a_run_opens_the_approval_and_freezes_its_receipt() {
+    let mut store = store();
+    let run_id = store
+        .insert_run(&run_in(RunState::Done, Some(WorktreeStatus::Active)))
+        .unwrap();
+    let mut harness = Harness::build(store, RecordingWorktrees::new(false, true));
+
+    let authorized = harness
+        .core
+        .authorize_merge(
+            Principal::User,
+            &AuthorizeMerge {
+                subject: MergeAuthorization::ForRun {
+                    run_id,
+                    expires_at: Some(NOW + 600),
+                },
+                answer: "merge".to_owned(),
+                now: NOW,
+            },
+        )
+        .unwrap();
+
+    assert_eq!(authorized.run_id, run_id);
+    assert_eq!(
+        authorized.grant.applied().unwrap().to,
+        QuestionState::Answered
+    );
+
+    let approval = harness
+        .core
+        .machines()
+        .store()
+        .load_question(authorized.question_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(approval.kind, QuestionKind::Approval);
+    assert_eq!(approval.author, Some(QuestionAuthor::User));
+    assert_eq!(approval.expires_at, Some(NOW + 600));
+    assert_eq!(
+        (approval.tree_hash, approval.paths_digest),
+        (
+            Some(harness.worktrees.derivation.tree_hash.clone()),
+            Some(harness.worktrees.derivation.paths_digest.clone())
+        ),
+        "the receipt is derived from the worktree, never taken from the request"
+    );
+    assert_eq!(
+        harness.event_types(run_id),
+        [
+            "approval_requested",
+            "run_state_changed",
+            "approval_granted"
+        ],
+        "the approval is announced when it is opened, not only when it is granted"
+    );
+}
+
+#[test]
+fn no_approval_is_frozen_over_a_worktree_with_uncommitted_work() {
+    let mut store = store();
+    let run_id = store
+        .insert_run(&run_in(RunState::Done, Some(WorktreeStatus::Active)))
+        .unwrap();
+    let mut harness = Harness::build(store, RecordingWorktrees::new(false, false));
+
+    let error = harness
+        .core
+        .authorize_merge(
+            Principal::User,
+            &AuthorizeMerge {
+                subject: MergeAuthorization::ForRun {
+                    run_id,
+                    expires_at: None,
+                },
+                answer: "merge".to_owned(),
+                now: NOW,
+            },
+        )
+        .unwrap_err();
+
+    assert_eq!(
+        unauthorized(&error),
+        (Operation::AuthorizeMerge, Principal::User, true)
+    );
+    assert!(
+        harness
+            .core
+            .machines()
+            .store()
+            .questions_for_run(run_id)
+            .unwrap()
+            .is_empty(),
+        "a refused authorization leaves no approval behind"
+    );
+}
+
+#[test]
+fn praetor_asking_for_an_approval_opens_nothing() {
+    let mut store = store();
+    let run_id = store
+        .insert_run(&run_in(RunState::Done, Some(WorktreeStatus::Active)))
+        .unwrap();
+    let mut harness = Harness::build(store, RecordingWorktrees::new(false, true));
+
+    let error = harness
+        .core
+        .authorize_merge(
+            Principal::Praetor,
+            &AuthorizeMerge {
+                subject: MergeAuthorization::ForRun {
+                    run_id,
+                    expires_at: None,
+                },
+                answer: "merge".to_owned(),
+                now: NOW,
+            },
+        )
+        .unwrap_err();
+
+    assert_eq!(
+        unauthorized(&error),
+        (Operation::AuthorizeMerge, Principal::Praetor, true)
+    );
+    assert!(
+        harness
+            .core
+            .machines()
+            .store()
+            .questions_for_run(run_id)
+            .unwrap()
+            .is_empty(),
+        "the table is checked before anything is opened"
+    );
 }
 
 #[test]
@@ -758,7 +895,7 @@ fn authorize_merge_refuses_a_plain_question() {
         .authorize_merge(
             Principal::User,
             &AuthorizeMerge {
-                question_id,
+                subject: MergeAuthorization::Existing(question_id),
                 answer: "serde_json".to_owned(),
                 now: NOW,
             },

@@ -211,18 +211,39 @@ impl StateMachines {
         self.store.insert_run(run)
     }
 
-    /// Opens a question against a run that no transition asked for.
+    /// Opens a question no transition opened, with the facts that announce it,
+    /// in one transaction.
     ///
     /// Not a transition, for the same reason [`Self::open_run`] is not: there
     /// is no question row yet, so there is no state to guard. The run machine's
-    /// `ask` remains the only way a *running* run parks on one — this exists
-    /// for the question a run is created with, where nothing is parked and
-    /// nothing moves.
+    /// `ask` remains the only way a *running* run parks on one. This is for the
+    /// two questions nothing parks on — the one a run is created with, and the
+    /// merge authorization, whose run has already finished working.
+    ///
+    /// It still goes through the machines, because they are the single writer
+    /// of the control-plane tables, and whatever announces the question lands
+    /// in the same write: an approval that exists with nothing in the journal
+    /// saying it was asked for is a row nobody can account for.
     pub fn open_question(
         &mut self,
         question: &QuestionRow,
-    ) -> Result<i64, agens_store::ControlPlaneError> {
-        self.store.insert_question(question)
+        events: &[EventRow],
+    ) -> Result<i64, TransitionRejection> {
+        let outcome = self.store.apply_transition(&agens_store::TransitionWrite {
+            run_id: question.run_id,
+            run_state: None,
+            worktree_status: None,
+            question: None,
+            new_question: Some(question),
+            attempt: None,
+            close_attempt: None,
+            provider: None,
+            events,
+        })?;
+
+        outcome.question_id.ok_or_else(|| {
+            TransitionRejection::Storage("the question was written without an id".to_owned())
+        })
     }
 
     /// Journals facts that no transition carries, in one transaction and in the

@@ -88,10 +88,31 @@ message AnswerAck {
 }
 
 message AuthorizeMergeRequest {
-  int64 question_id = 1;
+  // Which approval the grant is given on. An approval that does not exist yet
+  // is opened by this same request, because the receipt it is bound to is
+  // frozen from the worktree at the moment it is asked for.
+  oneof subject {
+    // An approval asked for earlier.
+    int64 question_id = 1;
+    // The run to open one for, over its worktree as it stands now.
+    int64 run_id = 3;
+  }
   // Recorded with the grant: whose authority a merge carried cannot be
   // reconstructed afterwards.
   string answer = 2;
+  // Epoch seconds a newly opened approval expires at. Ignored when the grant
+  // names an approval that already exists, which carries its own.
+  optional int64 expires_at = 4;
+}
+
+// A merge authorization granted, and the approval it was granted on.
+//
+// The id is carried back because the pre-merge gate is presented with it, and
+// for an approval this same request opened there is nowhere else to read it.
+message AuthorizeMergeAck {
+  int64 question_id = 1;
+  int64 run_id = 2;
+  Transition transition = 3;
 }
 
 message CancelRunRequest {
@@ -155,7 +176,7 @@ service Team {
   rpc CreateRun(CreateRunRequest) returns (CreateRunResponse);
   rpc ApprovePlan(ApprovePlanRequest) returns (Ack);
   rpc AnswerQuestion(AnswerQuestionRequest) returns (AnswerAck);
-  rpc AuthorizeMerge(AuthorizeMergeRequest) returns (Ack);
+  rpc AuthorizeMerge(AuthorizeMergeRequest) returns (AuthorizeMergeAck);
   rpc CancelRun(CancelRunRequest) returns (Ack);
   rpc Retry(RetryRequest) returns (Ack);
   rpc Cleaning(CleaningRequest) returns (Ack);

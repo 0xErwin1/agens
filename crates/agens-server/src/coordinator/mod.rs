@@ -6,20 +6,25 @@
 //! This is where they are given each other, once, and where the loops that give
 //! them an occasion to run are started.
 //!
-//! Four loops, each with one reason to exist:
+//! Five loops, each with one reason to exist:
 //!
 //! - **Admission** ticks when a run enters the queue and on a heartbeat, because
 //!   a slot also frees when a session ends and nothing announces that.
 //! - **The timer wheel** ticks on a heartbeat and recomputes every deadline from
 //!   the database, so a daemon that was down keeps no deadline in memory to be
 //!   wrong about.
+//! - **The gates sweep** re-derives git for every run whose work is finished and
+//!   whose worktree is still held: it merges what the user authorized and
+//!   releases what already landed. It is the only production caller of
+//!   [`crate::Gates`], and it is what keeps a finished run from leaving a
+//!   worktree active and a branch unmerged forever.
 //! - **Ingest** drains the harness's facts, which is the only path a worker's
 //!   evidence has into the control plane.
 //! - **The journal publisher** reads the journal's tail once for every
 //!   subscriber and hands each one what its filter asked for.
 //!
-//! The loops are threads rather than tasks on the daemon's runtime. All four
-//! reach a synchronous SQLite connection and would otherwise sit on the
+//! The loops are threads rather than tasks on the daemon's runtime. All of
+//! them reach a synchronous SQLite connection and would otherwise sit on the
 //! runtime's worker threads for the length of a query, next to the facade that
 //! is trying to answer a client.
 //!
@@ -45,11 +50,17 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use agens_store::{ControlPlaneStore, DirectiveStore, EventRow, RunRow};
+use agens_store::{
+    ControlPlaneStore, DirectiveStore, EventRow, QuestionAuthor, QuestionKind, QuestionState,
+    RunRow, RunState, WorktreeStatus,
+};
 use agens_tools::SessionWorktrees;
 
 use crate::api::{ApiCore, Ports};
 use crate::fsm::StateMachines;
+use crate::gates::{
+    Gates, MergePath, PreMergeRequest, ReclaimRequest, SUB_AGENT_EVENT, SubAgentKind,
+};
 use crate::ingest::{
     FactReceiver, FactSender, Ingest, IngestFact, ReportedFact, attribution_of,
     channel as ingest_channel,
@@ -73,6 +84,14 @@ pub use reconcile::{
 /// How often a loop looks again when nothing woke it.
 const HEARTBEAT: Duration = Duration::from_millis(250);
 
+/// How often the gates sweep looks at the worktrees that are still held.
+///
+/// Far slower than the heartbeat, and deliberately: every candidate costs a
+/// handful of git invocations, and nothing it acts on moves on the scale of a
+/// heartbeat — an authorization is a person's, and a branch landing elsewhere
+/// is somebody else's push.
+const GATES_SWEEP: Duration = Duration::from_secs(15);
+
 /// How many heartbeats admission waits after a launch that did not work.
 ///
 /// A failed launch is not a condition that passes on its own the way a ceiling
@@ -92,8 +111,14 @@ pub struct CoordinatorSettings {
     pub timers: TimerSettings,
     /// The branch a run's work is measured against.
     pub main_ref: String,
+    /// How many attempts a run's budget allows before the pre-merge gate
+    /// refuses to land its work. Configuration, which is why the gate takes it
+    /// with the request instead of reading it from the store.
+    pub attempt_cap: i64,
     /// How long a loop waits before looking again on its own.
     pub heartbeat: Duration,
+    /// How long the gates sweep waits between passes.
+    pub gates_sweep: Duration,
 }
 
 impl Default for CoordinatorSettings {
@@ -107,7 +132,9 @@ impl Default for CoordinatorSettings {
             },
             timers: TimerSettings::default(),
             main_ref: "main".to_owned(),
+            attempt_cap: 3,
             heartbeat: HEARTBEAT,
+            gates_sweep: GATES_SWEEP,
         }
     }
 }
@@ -225,6 +252,7 @@ impl Coordinator {
                 facts.clone(),
             ),
             timer_loop(settings, &core, &admissions, &stopping, facts.clone()),
+            gates_loop(data_directory, settings, &core, &stopping),
             ingest_loop(data_directory, settings, reports, &stopping)?,
             publisher_loop(data_directory, settings, feed, &stopping)?,
         ];
@@ -492,6 +520,225 @@ fn expired_checkpoint_facts(core: &ApiCore, tick: &crate::timers::TimerTick) -> 
         })
         .collect()
 }
+
+/// The gates sweep: the pre-merge and reclaim gates, given an occasion to run.
+///
+/// It is the one production caller of [`crate::Gates`], and it builds them for
+/// the span of each candidate from `ApiCore::machines_mut`, which is what lets
+/// the daemon run the gates and the service core over one control plane rather
+/// than two.
+///
+/// The core is locked per candidate rather than per pass. Every candidate costs
+/// a handful of git invocations and one of them costs a merge, and a facade
+/// answering a client has no reason to wait behind the whole sweep.
+fn gates_loop(
+    data_directory: &Path,
+    settings: &CoordinatorSettings,
+    core: &Arc<Mutex<ApiCore>>,
+    stopping: &Arc<AtomicBool>,
+) -> JoinHandle<()> {
+    let core = Arc::clone(core);
+    let stopping = Arc::clone(stopping);
+    let sweep = GatesSweep {
+        worktrees: SessionWorktrees::new(data_directory),
+        main_ref: settings.main_ref.clone(),
+        attempt_cap: settings.attempt_cap,
+    };
+    let interval = settings.gates_sweep;
+    let heartbeat = settings.heartbeat;
+
+    std::thread::spawn(move || {
+        while !stopping.load(Ordering::Acquire) {
+            sweep.pass(&core, now());
+
+            // Waited in heartbeats rather than in one stretch, so a shutdown
+            // does not sit out a sweep interval it is never going to use.
+            let mut waited = Duration::ZERO;
+            while waited < interval && !stopping.load(Ordering::Acquire) {
+                std::thread::sleep(heartbeat);
+                waited += heartbeat;
+            }
+        }
+    })
+}
+
+/// One run whose worktree is still held, and the authorization it carries.
+struct GateCandidate {
+    run_id: i64,
+    worktree_path: PathBuf,
+    /// The approval this run's merge would go through, when the user granted
+    /// one that no gate has been presented with yet.
+    approval_id: Option<i64>,
+    /// Whether a cleanup sub-agent has already been asked for.
+    cleanup_requested: bool,
+}
+
+/// The sweep's own state: everything it needs that the store does not hold.
+struct GatesSweep {
+    worktrees: SessionWorktrees,
+    main_ref: String,
+    attempt_cap: i64,
+}
+
+impl GatesSweep {
+    /// One pass over every run whose work is finished and whose worktree is
+    /// still active.
+    fn pass(&self, core: &Mutex<ApiCore>, now: i64) {
+        let Ok(candidates) = core.lock().map(|core| candidates(&core)) else {
+            return;
+        };
+
+        for candidate in candidates {
+            match candidate.approval_id {
+                Some(approval_id) => self.merge(core, &candidate, approval_id, now),
+                None => self.release(core, &candidate, now),
+            }
+        }
+    }
+
+    /// Presents one authorization to the pre-merge gate.
+    ///
+    /// A refusal is journaled by the gate and never retried here: the approval
+    /// it refused is bound to bytes that did not move, so the next pass would
+    /// reach the same verdict and would journal it again. That is what makes an
+    /// approval a candidate only until a `gate_result` names it.
+    fn merge(&self, core: &Mutex<ApiCore>, candidate: &GateCandidate, approval_id: i64, now: i64) {
+        let request = PreMergeRequest {
+            run_id: candidate.run_id,
+            approval_id,
+            path: MergePath::Integrate,
+            main_ref: self.main_ref.clone(),
+            attempt_cap: self.attempt_cap,
+            now,
+        };
+
+        let Ok(mut core) = core.lock() else {
+            return;
+        };
+
+        // The verdict, whichever it is, is journaled by the gate against the
+        // run. Nothing is done with it here: a merge that did not apply left a
+        // sub-agent request in the journal, and the surface that may invoke one
+        // is not this loop.
+        let _verdict = Gates::new(core.machines_mut(), self.worktrees.clone()).pre_merge(&request);
+    }
+
+    /// Releases a worktree whose branch landed without this coordinator having
+    /// merged it.
+    ///
+    /// The derivation here decides only whether it is worth asking, and the
+    /// gate re-derives and stays the only thing that forms a verdict. Asking
+    /// about a branch that has not landed would journal a refusal on every
+    /// pass, for a run nobody has done anything to.
+    fn release(&self, core: &Mutex<ApiCore>, candidate: &GateCandidate, now: i64) {
+        let Ok(derivation) = self
+            .worktrees
+            .derive(&candidate.worktree_path, &self.main_ref)
+        else {
+            return;
+        };
+
+        if !derivation.merged || (derivation.dirty && candidate.cleanup_requested) {
+            return;
+        }
+
+        let request = ReclaimRequest {
+            run_id: candidate.run_id,
+            main_ref: self.main_ref.clone(),
+            now,
+        };
+
+        let Ok(mut core) = core.lock() else {
+            return;
+        };
+        let _verdict = Gates::new(core.machines_mut(), self.worktrees.clone()).reclaim(&request);
+    }
+}
+
+/// The runs whose work is over and whose worktree is still held.
+///
+/// A run in any other state is not one the gates have anything to say about:
+/// its work is still moving, or its worktree has already been let go.
+fn candidates(core: &ApiCore) -> Vec<GateCandidate> {
+    let store = core.machines().store();
+    let mut candidates = Vec::new();
+
+    for state in [RunState::Done, RunState::Failed] {
+        let Ok(runs) = store.runs_in_state(state) else {
+            continue;
+        };
+
+        for run in runs {
+            if run.worktree_status != Some(WorktreeStatus::Active) {
+                continue;
+            }
+
+            let (Some(run_id), Some(worktree_path)) = (
+                run.id,
+                run.worktree_path
+                    .as_deref()
+                    .filter(|path| !path.is_empty())
+                    .map(PathBuf::from),
+            ) else {
+                continue;
+            };
+
+            candidates.push(GateCandidate {
+                run_id,
+                worktree_path,
+                approval_id: pending_approval(store, run_id),
+                cleanup_requested: cleanup_requested(store, run_id),
+            });
+        }
+    }
+
+    candidates
+}
+
+/// The authorization this run's merge would go through.
+///
+/// Granted by the user, and not presented to a gate yet. The journal is what
+/// says it was presented, because the gate writes a `gate_result` naming the
+/// approval whatever verdict it reached.
+fn pending_approval(store: &ControlPlaneStore, run_id: i64) -> Option<i64> {
+    let questions = store.questions_for_run(run_id).ok()?;
+    let presented: Vec<i64> = store
+        .events_of_type_for_run(run_id, GATE_RESULT_EVENT)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|event| {
+            serde_json::from_str::<serde_json::Value>(&event.payload)
+                .ok()?
+                .get("approval_id")?
+                .as_i64()
+        })
+        .collect();
+
+    questions
+        .iter()
+        .filter(|question| {
+            question.kind == QuestionKind::Approval
+                && question.state == QuestionState::Answered
+                && question.author == Some(QuestionAuthor::User)
+        })
+        .filter_map(|question| question.id)
+        .find(|id| !presented.contains(id))
+}
+
+/// Whether a cleanup sub-agent was already asked for on this run's worktree.
+///
+/// Asking twice for the same uncommitted work would put one request per pass in
+/// the journal for as long as nobody deals with it.
+fn cleanup_requested(store: &ControlPlaneStore, run_id: i64) -> bool {
+    store
+        .events_of_type_for_run(run_id, SUB_AGENT_EVENT)
+        .unwrap_or_default()
+        .iter()
+        .any(|event| event.payload.contains(SubAgentKind::Cleanup.as_str()))
+}
+
+/// The journal entry every gate verdict becomes.
+const GATE_RESULT_EVENT: &str = "gate_result";
 
 /// Ingest: the harness's facts, folded into the journal and into run health.
 fn ingest_loop(

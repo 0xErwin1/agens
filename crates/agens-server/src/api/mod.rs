@@ -43,7 +43,7 @@ pub use ports::{
 pub use runs::{CreateRun, CreatedRun, PreparedRun};
 pub use team::{
     AdmissionState, AnswerQuestion, AnsweredQuestion, ApprovePlan, AuthorizeMerge, CleaningAction,
-    CleaningDisposition, RetryRequest, RunRef, StopRequest,
+    CleaningDisposition, MergeAuthorization, MergeAuthorized, RetryRequest, RunRef, StopRequest,
 };
 
 /// Why a request did not go through.
