@@ -12,6 +12,8 @@
 
 mod common;
 
+use agens_server::SessionSupervisor;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1008,6 +1010,7 @@ fn serving_no_address_is_refused_rather_than_treated_as_serving_nothing() {
 
     let refused = runtime.block_on(agens_server::grpc::serve_until_shutdown(
         core,
+        common::no_chats(SessionSupervisor::new(runtime.handle().clone())),
         blocking,
         FacadeBinding::none(),
         &shutdown,
@@ -1063,8 +1066,12 @@ fn the_daemon_serves_the_facade_on_its_socket() {
         })
     });
 
+    // The daemon's own supervisor, so its chats are peers of its runs exactly as
+    // the production composition makes them.
+    let chats = common::no_chats(daemon.sessions().clone());
+
     let report = daemon
-        .serve_until_shutdown(Arc::new(Mutex::new(core)), &shutdown)
+        .serve_until_shutdown(Arc::new(Mutex::new(core)), chats, &shutdown)
         .unwrap();
 
     assert!(report.is_clean());

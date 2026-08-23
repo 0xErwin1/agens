@@ -17,11 +17,13 @@ use agens_core::HeadlessTurnCancellation;
 use tokio_stream::wrappers::UnixListenerStream;
 use tonic::transport::Server;
 
+use super::proto::chat_server::ChatServer;
 use super::proto::feed_server::FeedServer;
 use super::proto::team_server::TeamServer;
-use super::{CoreHandle, FeedFacade, TeamFacade};
+use super::{ChatFacade, CoreHandle, FeedFacade, TeamFacade};
 use crate::api::ApiCore;
 use crate::blocking::BlockingBoundary;
+use crate::chat::ChatSessions;
 use crate::fsm::Principal;
 
 /// How often the shutdown signal is looked at. The daemon's cancellation is a
@@ -79,14 +81,15 @@ impl FacadeBinding {
     }
 }
 
-/// Serves Team and Feed on the bound address until the daemon is asked to
-/// stop.
+/// Serves Team, Feed and Chat on the bound address until the daemon is asked
+/// to stop.
 ///
 /// The principal is pinned to the user here and read from nothing: this is the
 /// clients' facade, and the design gives the user's authority to whoever reaches
 /// the socket. Narrowing it is a different facade, not a field on a request.
 pub async fn serve_until_shutdown(
     core: Arc<Mutex<ApiCore>>,
+    chats: Arc<ChatSessions>,
     blocking: BlockingBoundary,
     binding: FacadeBinding,
     shutdown: &HeadlessTurnCancellation,
@@ -102,13 +105,22 @@ pub async fn serve_until_shutdown(
     let listener = tokio::net::UnixListener::from_std(listener)
         .map_err(|error| FacadeError::unavailable("adopt the unix socket", error))?;
 
-    let handle = CoreHandle::new(core, blocking, Principal::User);
+    let handle = CoreHandle::new(core, blocking.clone(), Principal::User);
 
-    serve_on(handle, UnixListenerStream::new(listener), shutdown.clone()).await
+    serve_on(
+        handle,
+        chats,
+        blocking,
+        UnixListenerStream::new(listener),
+        shutdown.clone(),
+    )
+    .await
 }
 
 async fn serve_on<S, C>(
     handle: CoreHandle,
+    chats: Arc<ChatSessions>,
+    blocking: BlockingBoundary,
     incoming: S,
     shutdown: HeadlessTurnCancellation,
 ) -> Result<(), FacadeError>
@@ -121,6 +133,7 @@ where
     Server::builder()
         .add_service(TeamServer::new(TeamFacade::new(handle.clone())))
         .add_service(FeedServer::new(FeedFacade::new(handle)))
+        .add_service(ChatServer::new(ChatFacade::new(chats, blocking)))
         .serve_with_incoming_shutdown(incoming, park_until_shutdown(shutdown))
         .await
         .map_err(|error| FacadeError::unavailable("serve the facade", error))

@@ -15,7 +15,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use agens_server::{LaunchError, RunLaunch, RunWorkerFactory};
+use agens_server::{
+    ChatError, ChatSessionFactory, ChatSessionRequest, ChatSessions, LaunchError, RunLaunch,
+    RunWorkerFactory, SessionSupervisor,
+};
 use agens_store::{RunRow, RunState, WorktreeStatus};
 
 /// The repository every coordinator test drives a run in.
@@ -106,4 +109,22 @@ pub(crate) fn run_in(state: RunState, worktree: &Path) -> RunRow {
 /// of racing the admission loop for the row.
 pub(crate) fn refusing_worker() -> RunWorkerFactory {
     Arc::new(|_launch: &RunLaunch<'_>| Err(LaunchError(REFUSAL.to_owned()))) as RunWorkerFactory
+}
+
+/// A chat factory for the tests that compose a daemon without opening a chat.
+///
+/// It refuses rather than building anything: reaching it would mean a test
+/// opened a chat, and what a hosted chat does is asserted where one is opened.
+pub(crate) fn refusing_chat() -> ChatSessionFactory {
+    Arc::new(|_: &ChatSessionRequest| Err(ChatError::Unavailable(REFUSAL.to_owned())))
+        as ChatSessionFactory
+}
+
+/// The same, already assembled into the registry a facade is served with.
+///
+/// It takes the supervisor rather than building one, so a daemon's chats are
+/// held by the same registry its runs are, which is what the production
+/// composition does.
+pub(crate) fn no_chats(supervisor: SessionSupervisor) -> Arc<ChatSessions> {
+    Arc::new(ChatSessions::new(supervisor, refusing_chat()))
 }

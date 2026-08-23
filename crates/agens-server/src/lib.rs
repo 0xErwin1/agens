@@ -229,6 +229,7 @@ impl Daemon {
     pub fn serve_until_shutdown(
         self,
         core: Arc<Mutex<ApiCore>>,
+        chats: Arc<ChatSessions>,
         shutdown: &HeadlessTurnCancellation,
     ) -> Result<SessionShutdown, ServerError> {
         let Self {
@@ -248,7 +249,7 @@ impl Daemon {
         let blocking = BlockingBoundary::new(runtime.handle().clone());
 
         let report = runtime.block_on(async {
-            let served = grpc::serve_until_shutdown(core, blocking, binding, shutdown).await;
+            let served = grpc::serve_until_shutdown(core, chats, blocking, binding, shutdown).await;
             let report = sessions.cancel_all_and_join().await;
 
             (served, report)
@@ -319,6 +320,7 @@ pub fn serve_until_shutdown(
     data_directory: &Path,
     settings: &CoordinatorSettings,
     worker: RunWorkerFactory,
+    chat: ChatSessionFactory,
     shutdown: &HeadlessTurnCancellation,
 ) -> Result<SessionShutdown, ServerError> {
     let daemon = Daemon::start(data_directory)?;
@@ -334,7 +336,12 @@ pub fn serve_until_shutdown(
     )
     .map_err(|error| ServerError::Unavailable(error.to_string()))?;
 
-    let report = daemon.serve_until_shutdown(coordinator.core(), shutdown);
+    // The same supervisor the scheduler launches into, so a hosted chat is a
+    // peer of the runs rather than a session the daemon does not know it has:
+    // one capacity, one shutdown, one drain.
+    let chats = Arc::new(ChatSessions::new(daemon.sessions().clone(), chat));
+
+    let report = daemon.serve_until_shutdown(coordinator.core(), chats, shutdown);
 
     // After the facade has stopped: nothing is admitting, ticking or publishing
     // against a core the sessions behind it have already been stopped.
