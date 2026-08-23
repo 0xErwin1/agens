@@ -12,16 +12,25 @@
 //! which is the projection built for exactly that.
 
 use std::sync::Mutex;
-use std::sync::mpsc::{Sender, channel};
+use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
 
 use agens_store::EventRow;
 
 use crate::api::{EventFeed, EventFilter, PortError, Subscription};
 
+/// How many journal entries one subscriber may have waiting before the fan-out
+/// gives up on it.
+///
+/// The channel is bounded rather than unbounded because the publisher never
+/// waits: a subscriber that stops draining would otherwise grow this queue for
+/// as long as the daemon runs, and the memory it grows into belongs to the
+/// daemon rather than to the client that stopped reading.
+const SUBSCRIBER_BACKLOG: usize = 1024;
+
 /// One subscriber: where to send, and what it asked for.
 struct Subscriber {
     filter: EventFilter,
-    outbound: Sender<EventRow>,
+    outbound: SyncSender<EventRow>,
 }
 
 impl Subscriber {
@@ -63,11 +72,19 @@ impl JournalFeed {
     }
 
     /// Hands one journal entry to every subscriber that asked for it, dropping
-    /// the ones whose receiver is gone.
+    /// the ones whose receiver is gone and the ones that fell too far behind.
     ///
     /// A client that disconnected is not an error and is not retried: its end
     /// of the channel closed, which is the only signal a fan-out gets and the
     /// only one it needs.
+    ///
+    /// A backlog that is full ends the subscription rather than blocking or
+    /// skipping the entry. Blocking would let one client that stopped reading
+    /// stall the publisher for every other subscriber, and skipping would leave
+    /// a hole in an append-only sequence with nothing in the stream to say so.
+    /// Ending it is the one outcome the client can act on: the stream closes,
+    /// and a subscription that starts again is live from the head with the
+    /// run's detail available for whatever it missed.
     pub(crate) fn publish(&self, event: &EventRow, repo_id: Option<&str>) {
         let Ok(mut subscribers) = self.subscribers.lock() else {
             return;
@@ -78,7 +95,10 @@ impl JournalFeed {
                 return true;
             }
 
-            subscriber.outbound.send(event.clone()).is_ok()
+            match subscriber.outbound.try_send(event.clone()) {
+                Ok(()) => true,
+                Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => false,
+            }
         });
     }
 
@@ -94,7 +114,7 @@ impl JournalFeed {
 
 impl EventFeed for JournalFeed {
     fn subscribe(&self, filter: &EventFilter) -> Result<Subscription, PortError> {
-        let (outbound, inbound) = channel();
+        let (outbound, inbound) = sync_channel(SUBSCRIBER_BACKLOG);
 
         self.subscribers
             .lock()
@@ -105,5 +125,81 @@ impl EventFeed for JournalFeed {
             });
 
         Ok(inbound)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc::TryRecvError;
+
+    use agens_store::EventClass;
+
+    fn entry(id: i64) -> EventRow {
+        EventRow {
+            id: Some(id),
+            run_id: Some(7),
+            event_type: "checkpoint".to_owned(),
+            class: EventClass::Agent,
+            payload: r#"{"claim":"the parser handles escapes"}"#.to_owned(),
+            ts: 1_700_000_000 + id,
+        }
+    }
+
+    #[test]
+    fn a_subscriber_that_stops_reading_is_dropped_once_its_backlog_is_full() {
+        let feed = JournalFeed::new();
+        let subscription = feed
+            .subscribe(&EventFilter::default())
+            .expect("the fan-out registers the subscriber");
+
+        for id in 1..=i64::try_from(SUBSCRIBER_BACKLOG).unwrap() {
+            feed.publish(&entry(id), None);
+        }
+
+        assert_eq!(
+            feed.subscribers(),
+            1,
+            "a backlog that is exactly full is still being served"
+        );
+
+        feed.publish(&entry(i64::try_from(SUBSCRIBER_BACKLOG).unwrap() + 1), None);
+
+        assert_eq!(
+            feed.subscribers(),
+            0,
+            "the entry that did not fit ends the subscription"
+        );
+
+        let mut delivered = 0;
+        loop {
+            match subscription.try_recv() {
+                Ok(_) => delivered += 1,
+                Err(TryRecvError::Empty) => {
+                    panic!("the sending end is gone, so this cannot be empty")
+                }
+                Err(TryRecvError::Disconnected) => break,
+            }
+        }
+
+        assert_eq!(
+            delivered, SUBSCRIBER_BACKLOG,
+            "what the subscriber queued is bounded by the backlog and nothing more"
+        );
+    }
+
+    #[test]
+    fn a_subscriber_that_keeps_reading_is_never_dropped() {
+        let feed = JournalFeed::new();
+        let subscription = feed
+            .subscribe(&EventFilter::default())
+            .expect("the fan-out registers the subscriber");
+
+        for id in 1..=i64::try_from(SUBSCRIBER_BACKLOG).unwrap() * 3 {
+            feed.publish(&entry(id), None);
+            assert_eq!(subscription.recv().map(|event| event.id), Ok(Some(id)));
+        }
+
+        assert_eq!(feed.subscribers(), 1);
     }
 }

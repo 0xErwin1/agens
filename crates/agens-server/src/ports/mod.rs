@@ -25,5 +25,4 @@ pub(crate) use delivery::{RunDeliveries, run_mailbox};
 pub(crate) use feed::JournalFeed;
 pub(crate) use scheduler::Admissions;
 pub(crate) use sessions::SupervisedSessions;
-
 pub use worktrees::GitWorktreeGate;
