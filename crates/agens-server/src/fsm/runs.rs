@@ -492,6 +492,11 @@ impl StateMachines {
         }))
     }
 
+    /// The guard the transition names, run against the facts it reads.
+    ///
+    /// Dispatch only. Every arm that reads more than the facts it was handed is
+    /// a check of its own below, so what this reads as is the table of which
+    /// guard governs which trigger.
     fn check_run_guard(
         &self,
         transition: &RunTransition,
@@ -500,129 +505,152 @@ impl StateMachines {
         worktree_status: Option<WorktreeStatus>,
         facts: &RunFacts,
     ) -> Result<(), TransitionRejection> {
-        let refuse = |detail: String| {
-            Err(TransitionRejection::GuardFailed {
-                machine: "run",
-                guard: transition.guard.as_str(),
-                detail,
-            })
-        };
-
         match transition.guard {
             RunGuard::None => Ok(()),
-            RunGuard::UserApproval => {
-                if facts.principal == Principal::User {
-                    Ok(())
-                } else {
-                    refuse(format!(
-                        "{} cannot approve an execution",
-                        facts.principal.as_str()
-                    ))
-                }
-            }
-            RunGuard::ReportedByHarness => {
-                if facts.principal == Principal::Coordinator {
-                    Ok(())
-                } else {
-                    refuse(format!(
-                        "{} cannot report a run's own lifecycle facts",
-                        facts.principal.as_str()
-                    ))
-                }
-            }
-            RunGuard::SchedulerAdmission => {
-                if facts.slot_available && facts.provider_serving && facts.worktree_ready {
-                    Ok(())
-                } else {
-                    refuse(format!(
-                        "slot_available={}, provider_serving={}, worktree_ready={}",
-                        facts.slot_available, facts.provider_serving, facts.worktree_ready
-                    ))
-                }
-            }
-            RunGuard::AnsweredQuestion => match facts.answered_question_id {
-                None => refuse("no question was named".to_owned()),
-                Some(question_id) => {
-                    let question = self.load_question(question_id)?;
-
-                    if question.run_id != run_id {
-                        refuse(format!("question {question_id} belongs to another run"))
-                    } else if matches!(
-                        question.state,
-                        QuestionState::Answered | QuestionState::Delivered
-                    ) {
-                        Ok(())
-                    } else {
-                        refuse(format!(
-                            "question {question_id} is {}",
-                            question.state.as_str()
-                        ))
-                    }
-                }
-            },
-            RunGuard::AskOpensQuestion => {
-                if facts.principal != Principal::Coordinator {
-                    return refuse(format!(
-                        "{} cannot report a run's own lifecycle facts",
-                        facts.principal.as_str()
-                    ));
-                }
-
-                match facts.opened_question.as_ref() {
-                    Some(question) if question.run_id == run_id => Ok(()),
-                    Some(question) => refuse(format!(
-                        "the question carries run {} rather than {run_id}",
-                        question.run_id
-                    )),
-                    None => refuse(
-                        "a run cannot park on awaiting_input without the question it parks on"
-                            .to_owned(),
-                    ),
-                }
-            }
-            RunGuard::QuotaResetElapsed => match self.store.load_provider(provider)? {
-                Some(row) if row.quota_state == QuotaState::Ok => Ok(()),
-                Some(row) => match row.reset_at {
-                    Some(reset_at) if reset_at <= facts.now => Ok(()),
-                    Some(reset_at) => refuse(format!(
-                        "{provider} resets at {reset_at}, which is after {}",
-                        facts.now
-                    )),
-                    None => refuse(format!("{provider} named no reset time")),
-                },
-                None => refuse(format!("nothing recorded for provider {provider}")),
-            },
+            RunGuard::UserApproval => check_principal(
+                transition,
+                facts.principal,
+                Principal::User,
+                "approve an execution",
+            ),
+            RunGuard::ReportedByHarness => check_principal(
+                transition,
+                facts.principal,
+                Principal::Coordinator,
+                "report a run's own lifecycle facts",
+            ),
+            RunGuard::SchedulerAdmission => check_admission(transition, facts),
+            RunGuard::AnsweredQuestion => self.check_answered_question(transition, run_id, facts),
+            RunGuard::AskOpensQuestion => check_ask_opens_question(transition, run_id, facts),
+            RunGuard::QuotaResetElapsed => self.check_quota_reset(transition, provider, facts),
             RunGuard::RetryEligible => {
-                if worktree_status != Some(WorktreeStatus::Active) {
-                    return refuse(format!(
-                        "worktree is {}, and what already landed is redone in a new run rather \
-                         than retried",
-                        worktree_status.map_or("absent", WorktreeStatus::as_str)
-                    ));
-                }
-
-                if facts.guidance.as_ref().is_none_or(|text| text.is_empty()) {
-                    return refuse("a retry without guidance is the same attempt again".to_owned());
-                }
-
-                let chargeable = self.chargeable_attempts(run_id)?;
-                if chargeable >= facts.retry_budget {
-                    return refuse(format!(
-                        "{chargeable} chargeable attempts against a budget of {}",
-                        facts.retry_budget
-                    ));
-                }
-
-                Ok(())
+                self.check_retry_eligible(transition, run_id, worktree_status, facts)
             }
             RunGuard::BootReconciliation => {
                 if facts.boot_reconciliation {
                     Ok(())
                 } else {
-                    refuse("only boot reconciliation interrupts a run".to_owned())
+                    Err(guard_refused(
+                        transition,
+                        "only boot reconciliation interrupts a run".to_owned(),
+                    ))
                 }
             }
         }
+    }
+
+    /// The question the run is coming back on is one of its own, and it has
+    /// been answered.
+    fn check_answered_question(
+        &self,
+        transition: &RunTransition,
+        run_id: i64,
+        facts: &RunFacts,
+    ) -> Result<(), TransitionRejection> {
+        let Some(question_id) = facts.answered_question_id else {
+            return Err(guard_refused(
+                transition,
+                "no question was named".to_owned(),
+            ));
+        };
+
+        let question = self.load_question(question_id)?;
+
+        if question.run_id != run_id {
+            return Err(guard_refused(
+                transition,
+                format!("question {question_id} belongs to another run"),
+            ));
+        }
+
+        if matches!(
+            question.state,
+            QuestionState::Answered | QuestionState::Delivered
+        ) {
+            Ok(())
+        } else {
+            Err(guard_refused(
+                transition,
+                format!("question {question_id} is {}", question.state.as_str()),
+            ))
+        }
+    }
+
+    /// The provider this run was capped on is serving again, either because the
+    /// cap is already lifted or because the reset it named has passed.
+    fn check_quota_reset(
+        &self,
+        transition: &RunTransition,
+        provider: &str,
+        facts: &RunFacts,
+    ) -> Result<(), TransitionRejection> {
+        let Some(row) = self.store.load_provider(provider)? else {
+            return Err(guard_refused(
+                transition,
+                format!("nothing recorded for provider {provider}"),
+            ));
+        };
+
+        if row.quota_state == QuotaState::Ok {
+            return Ok(());
+        }
+
+        match row.reset_at {
+            Some(reset_at) if reset_at <= facts.now => Ok(()),
+            Some(reset_at) => Err(guard_refused(
+                transition,
+                format!(
+                    "{provider} resets at {reset_at}, which is after {}",
+                    facts.now
+                ),
+            )),
+            None => Err(guard_refused(
+                transition,
+                format!("{provider} named no reset time"),
+            )),
+        }
+    }
+
+    /// There is something left to retry, something new to try, and budget to
+    /// try it with.
+    fn check_retry_eligible(
+        &self,
+        transition: &RunTransition,
+        run_id: i64,
+        worktree_status: Option<WorktreeStatus>,
+        facts: &RunFacts,
+    ) -> Result<(), TransitionRejection> {
+        if worktree_status != Some(WorktreeStatus::Active) {
+            return Err(guard_refused(
+                transition,
+                format!(
+                    "worktree is {}, and what already landed is redone in a new run rather \
+                     than retried",
+                    worktree_status.map_or("absent", WorktreeStatus::as_str)
+                ),
+            ));
+        }
+
+        if facts.guidance.as_ref().is_none_or(|text| text.is_empty()) {
+            return Err(guard_refused(
+                transition,
+                "a retry without guidance is the same attempt again".to_owned(),
+            ));
+        }
+
+        let chargeable = self.chargeable_attempts(run_id)?;
+
+        if chargeable >= facts.retry_budget {
+            return Err(guard_refused(
+                transition,
+                format!(
+                    "{chargeable} chargeable attempts against a budget of {}",
+                    facts.retry_budget
+                ),
+            ));
+        }
+
+        Ok(())
     }
 
     /// Attempts that spend the retry budget.
@@ -693,6 +721,81 @@ impl StateMachines {
             reset_at,
             updated_at: facts.now,
         })
+    }
+}
+
+/// The refusal a failed guard produces, so every check below names the guard it
+/// is rather than restating the machine.
+fn guard_refused(transition: &RunTransition, detail: String) -> TransitionRejection {
+    TransitionRejection::GuardFailed {
+        machine: "run",
+        guard: transition.guard.as_str(),
+        detail,
+    }
+}
+
+/// A move only the named principal may report.
+fn check_principal(
+    transition: &RunTransition,
+    principal: Principal,
+    admitted: Principal,
+    act: &str,
+) -> Result<(), TransitionRejection> {
+    if principal == admitted {
+        Ok(())
+    } else {
+        Err(guard_refused(
+            transition,
+            format!("{} cannot {act}", principal.as_str()),
+        ))
+    }
+}
+
+/// Everything a run needs at once for the scheduler to start it.
+fn check_admission(
+    transition: &RunTransition,
+    facts: &RunFacts,
+) -> Result<(), TransitionRejection> {
+    if facts.slot_available && facts.provider_serving && facts.worktree_ready {
+        Ok(())
+    } else {
+        Err(guard_refused(
+            transition,
+            format!(
+                "slot_available={}, provider_serving={}, worktree_ready={}",
+                facts.slot_available, facts.provider_serving, facts.worktree_ready
+            ),
+        ))
+    }
+}
+
+/// A run parks on a question it opened for itself, and the harness is the only
+/// party that opens one.
+fn check_ask_opens_question(
+    transition: &RunTransition,
+    run_id: i64,
+    facts: &RunFacts,
+) -> Result<(), TransitionRejection> {
+    check_principal(
+        transition,
+        facts.principal,
+        Principal::Coordinator,
+        "report a run's own lifecycle facts",
+    )?;
+
+    match facts.opened_question.as_ref() {
+        Some(question) if question.run_id == run_id => Ok(()),
+        Some(question) => Err(guard_refused(
+            transition,
+            format!(
+                "the question carries run {} rather than {run_id}",
+                question.run_id
+            ),
+        )),
+        None => Err(guard_refused(
+            transition,
+            "a run cannot park on awaiting_input without the question it parks on".to_owned(),
+        )),
     }
 }
 

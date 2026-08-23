@@ -14,9 +14,9 @@ use agens_core::run_introspection::{
     RunIntrospectionError, RunIntrospectionPort,
 };
 use agens_server::{
-    ApiCore, CHECKPOINT_EVENT, CheckpointClaim, Delivery, DeliveryQueue, EventFeed, EventFilter,
-    HookTrust, PendingHookTrust, PortError, Ports, ProvisionedWorktree, ReportedCheckpoint,
-    RepositoryIdentity, RepositoryPolicy, RunIntrospection, SchedulerPort, SessionControl,
+    AdmissionControl, ApiCore, CHECKPOINT_EVENT, CheckpointClaim, Delivery, DeliveryQueue,
+    EventFeed, EventFilter, HookTrust, PendingHookTrust, PortError, Ports, ProvisionedWorktree,
+    ReportedCheckpoint, RepositoryIdentity, RepositoryPolicy, RunIntrospection, SessionControl,
     StateMachines, StopScope, Subscription, TakeoverHandle, TimerSettings, TimerWheel,
     WorktreeDerivation, WorktreeGate, WorktreeRequest,
 };
@@ -68,7 +68,7 @@ fn run_in(state: RunState) -> RunRow {
 /// happens.
 struct Unreached;
 
-impl SchedulerPort for Unreached {
+impl AdmissionControl for Unreached {
     fn admissions_paused(&self) -> bool {
         false
     }
@@ -162,7 +162,7 @@ fn ports() -> Ports {
     let unreached = Arc::new(Unreached);
 
     Ports {
-        scheduler: Arc::clone(&unreached) as Arc<dyn SchedulerPort>,
+        scheduler: Arc::clone(&unreached) as Arc<dyn AdmissionControl>,
         worktrees: Arc::clone(&unreached) as Arc<dyn WorktreeGate>,
         delivery: Arc::clone(&unreached) as Arc<dyn DeliveryQueue>,
         sessions: Arc::clone(&unreached) as Arc<dyn SessionControl>,
@@ -415,14 +415,14 @@ fn the_deadline_a_checkpoint_declares_is_the_one_the_timer_wheel_holds_it_to() {
 
     let (wheel, clock) = TimerWheel::with_manual_clock_for_test(TimerSettings::default(), NOW);
 
-    let tick = wheel.tick(core.lock().unwrap().machines_mut()).unwrap();
+    let tick = core.lock().unwrap().advance_timers(&wheel).unwrap();
     assert!(
         tick.overdue_checkpoints.is_empty(),
         "a promise that has not come due yet is not overdue: {tick:?}"
     );
 
     clock.set(NOW + 100_000);
-    let tick = wheel.tick(core.lock().unwrap().machines_mut()).unwrap();
+    let tick = core.lock().unwrap().advance_timers(&wheel).unwrap();
 
     assert_eq!(
         tick.overdue_checkpoints

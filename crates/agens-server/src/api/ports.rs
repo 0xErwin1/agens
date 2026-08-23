@@ -58,7 +58,11 @@ impl std::error::Error for PortError {}
 /// that a tick cannot derive: the operator's toggle, which says whether a tick
 /// should run, and the fact that an approval, an answer or a retry just put a
 /// run in the queue, which is what gives a tick its occasion.
-pub trait SchedulerPort: Send + Sync {
+///
+/// Named for what it controls rather than for what implements it: a port called
+/// after the scheduler reads as a handle on the scheduler, which is the one
+/// thing it is not.
+pub trait AdmissionControl: Send + Sync {
     fn admissions_paused(&self) -> bool;
 
     /// Sets the toggle and reports what it was before, so a caller can tell a

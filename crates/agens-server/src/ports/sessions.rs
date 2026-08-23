@@ -18,14 +18,14 @@ use crate::api::{PortError, SessionControl, StopScope, TakeoverHandle};
 use crate::sessions::{SessionId, SessionRegistryError, SessionSupervisor};
 
 /// The daemon's sessions, addressed by run.
-pub struct SupervisedSessions {
+pub(crate) struct SupervisedSessions {
     supervisor: SessionSupervisor,
     store: Mutex<ControlPlaneStore>,
 }
 
 impl SupervisedSessions {
     #[must_use]
-    pub const fn new(supervisor: SessionSupervisor, store: ControlPlaneStore) -> Self {
+    pub(crate) const fn new(supervisor: SessionSupervisor, store: ControlPlaneStore) -> Self {
         Self {
             supervisor,
             store: Mutex::new(store),

@@ -26,15 +26,35 @@ use std::sync::{Arc, Mutex};
 
 use agens_core::HeadlessTurnCancellation;
 
+/// What this crate is, as one list.
+///
+/// Everything below is re-exported out of a private module, so this block is
+/// the whole of the daemon's surface and the modules stay free to move behind
+/// it. Three kinds of name are in it, and they are not interchangeable:
+///
+/// - **The composition root.** [`serve_until_shutdown`], [`Daemon`],
+///   [`Coordinator`] and [`CoordinatorSettings`]: what a command surface needs
+///   to run a daemon, and nothing about how one is built.
+/// - **The worker's contract.** [`ApiCore`]'s named operations, [`RunLaunch`],
+///   [`RunIntrospection`], [`FactSender`] and the types they carry. A harness
+///   executing a run reaches the control plane through exactly these.
+/// - **The tables and their vocabulary.** [`RUN_TRANSITIONS`] and the guards,
+///   triggers and effects it is written in. Public because a machine written as
+///   data is a machine something else can read, which is what the tests that
+///   assert the tables do.
+///
+/// A name reachable from none of the three is not surface: it is an internal
+/// that a flat re-export happened to carry, and it belongs behind the module it
+/// came from.
 pub use api::{
-    AdmissionState, AnswerQuestion, AnsweredQuestion, ApiCore, ApiError, ApprovePlan,
-    AuthorizeMerge, CleaningAction, CleaningDisposition, CreateRun, CreatedRun, Delivery,
-    DeliveryGrain, DeliveryPayload, DeliveryQueue, DetailQuestionRefusal, EventFeed, EventFilter,
-    HookPolicy, InboxItem, InboxView, MergeAuthorization, MergeAuthorized, OPERATION_AUTHORIZATION,
-    Operation, OperationAuthorization, PortError, Ports, PreparedRun, ProvisionedWorktree,
-    RepositoryIdentity, RetryRequest, RunRef, RunSummary, RunView, SchedulerPort, SessionControl,
-    StopRequest, StopScope, Subscription, TakeoverHandle, TreeSnapshot, WorktreeDerivation,
-    WorktreeGate, WorktreeRequest, praetor_may_answer,
+    AdmissionControl, AdmissionState, AnswerQuestion, AnsweredQuestion, ApiCore, ApiError,
+    ApprovePlan, AuthorizeMerge, CleaningAction, CleaningDisposition, CreateRun, CreatedRun,
+    Delivery, DeliveryGrain, DeliveryPayload, DeliveryQueue, DetailQuestionRefusal, EventFeed,
+    EventFilter, HookPolicy, InboxItem, InboxView, MergeAuthorization, MergeAuthorized,
+    OPERATION_AUTHORIZATION, Operation, OperationAuthorization, PortError, Ports, PreparedRun,
+    ProvisionedWorktree, RepositoryIdentity, RetryRequest, RunRef, RunSummary, RunView,
+    SessionControl, StopRequest, StopScope, Subscription, TakeoverHandle, TreeSnapshot,
+    WorktreeDerivation, WorktreeGate, WorktreeRequest, praetor_may_answer,
 };
 pub use blocking::{BlockingBoundary, BlockingError};
 pub use coordinator::{
@@ -57,15 +77,12 @@ pub use grpc::{CoreHandle, FacadeBinding, FacadeError, FeedFacade, TeamFacade};
 pub use ingest::{
     AcceptedFact, Attribution, CheckpointClaim, CheckpointStanding, DrainedFact, FactReceiver,
     FactSender, HealthSignal, HealthThresholds, Ingest, IngestFact, IngestRejection, LostReason,
-    ReportedCheckpoint, ReportedFact, attribution_of, channel as ingest_channel,
-    detect_worker_lost,
+    ReportedCheckpoint, ReportedFact, channel as ingest_channel,
 };
 pub use instance::{ServeInstance, ServeInstanceError, socket_path};
 pub use introspection::{AttemptResolver, CheckpointReporting, Clock, RunIntrospection};
 pub use policy::{HookTrust, PendingHookTrust, PolicyError, PolicyStore, RepositoryPolicy};
-pub use ports::{
-    Admissions, GitWorktreeGate, JournalFeed, RunDeliveries, SupervisedSessions, run_mailbox,
-};
+pub use ports::GitWorktreeGate;
 pub use scheduler::{
     Admission, AdmissionFailure, Candidate, Deferral, Ineligible, LaunchError, LaunchedSession,
     PendingRun, Queue, QueueReport, RunLauncher, RunSession, Scheduler, SchedulerError,
@@ -96,14 +113,13 @@ pub enum ServerError {
 /// closes, and only then does the instance release the slot and remove the
 /// socket file a client could still be looking at.
 ///
-/// Nothing admits a session into this daemon yet. When something does, the one
-/// place it belongs is between accepting a client and
-/// [`SessionSupervisor::start`]: a session admitted there must be given its OWN
-/// per-session state — its own provider client, which [`SessionAdmission`]
-/// already enforces by ownership, and its own MCP connections, which
-/// `agens-bootstrap` exposes as `Bootstrap::for_new_session`. Handing a peer a
-/// bootstrap CLONE instead would put every session's MCP servers behind one
-/// lock and let one session's close reach another's.
+/// The scheduler's admission tick is what admits a session into this daemon,
+/// through the supervisor the daemon owns rather than one of its own. Every
+/// session it starts is given its OWN per-session state: its own provider
+/// client, which [`SessionAdmission`] enforces by ownership, and its own MCP
+/// connections, which the worker takes from `Bootstrap::for_new_session`.
+/// Handing a peer a bootstrap CLONE instead would put every session's MCP
+/// servers behind one lock and let one session's close reach another's.
 pub struct Daemon {
     runtime: tokio::runtime::Runtime,
     sessions: SessionSupervisor,
@@ -159,10 +175,10 @@ impl Daemon {
     /// Serves the clients' facade until asked to stop, then stops every session
     /// before releasing the slot and the socket.
     ///
-    /// The facade always accepts on the daemon's unix socket, and on loopback
-    /// as well when a port is named. Both are local by construction: the facade
-    /// authenticates nobody, so remote access is an SSH tunnel rather than a
-    /// listener anything else can route to.
+    /// The facade accepts on the daemon's unix socket and nowhere else: it
+    /// authenticates nobody, so the only address it may carry the user's
+    /// authority on is one whose reach something outside it already decides.
+    /// Remote access is an SSH tunnel rather than a second listener.
     ///
     /// The core arrives from the composition root rather than being built here.
     /// It is the coordinator's one core — the scheduler, the gates, the
@@ -171,7 +187,6 @@ impl Daemon {
     pub fn serve_until_shutdown(
         self,
         core: Arc<Mutex<ApiCore>>,
-        localhost_port: Option<u16>,
         shutdown: &HeadlessTurnCancellation,
     ) -> Result<SessionShutdown, ServerError> {
         let Self {
@@ -181,14 +196,7 @@ impl Daemon {
             instance,
         } = self;
 
-        let mut binding = FacadeBinding::none().on_unix_socket(listener);
-
-        if let Some(port) = localhost_port {
-            binding = binding
-                .bind_localhost(port)
-                .map_err(|_| ServerError::Unavailable("loopback is unavailable"))?;
-        }
-
+        let binding = FacadeBinding::none().on_unix_socket(listener);
         let blocking = BlockingBoundary::new(runtime.handle().clone());
 
         let report = runtime.block_on(async {
@@ -259,7 +267,6 @@ pub fn serve_until_shutdown(
     data_directory: &Path,
     settings: &CoordinatorSettings,
     worker: RunWorkerFactory,
-    localhost_port: Option<u16>,
     shutdown: &HeadlessTurnCancellation,
 ) -> Result<SessionShutdown, ServerError> {
     let daemon = Daemon::start(data_directory)?;
@@ -270,7 +277,7 @@ pub fn serve_until_shutdown(
         Coordinator::start(data_directory, settings, daemon.sessions().clone(), worker)
             .map_err(|_| ServerError::Unavailable("the coordinator is unavailable"))?;
 
-    let report = daemon.serve_until_shutdown(coordinator.core(), localhost_port, shutdown);
+    let report = daemon.serve_until_shutdown(coordinator.core(), shutdown);
 
     // After the facade has stopped: nothing is admitting, ticking or publishing
     // against a core the sessions behind it have already been stopped.
@@ -279,8 +286,9 @@ pub fn serve_until_shutdown(
     report
 }
 
-/// The daemon has no admission surface of its own yet, so it parks on the shared
-/// cancellation rather than inventing a second stop path.
+/// Parks on the shared cancellation rather than inventing a second stop path:
+/// the daemon is stopped from outside, by the same flag every other loop in the
+/// process is watching.
 async fn park_until_shutdown(shutdown: &HeadlessTurnCancellation) {
     const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 

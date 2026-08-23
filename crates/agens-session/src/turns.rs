@@ -38,11 +38,34 @@ pub fn drain_turn_directives_for(
     data_directory: impl AsRef<Path>,
     target: &DirectiveTarget,
 ) -> Result<Vec<Message>, CliError> {
+    drain_into_messages(data_directory, target, Some(DirectiveGrain::Turn))
+}
+
+/// Everything queued for a coordinator run, whichever grain it was queued at.
+///
+/// A run's next turn is the earliest safe point its queue has: the session that
+/// would have taken a tool-call-grain delivery at a tool-call edge ended when
+/// the run parked. Leaving those for the resumed turn's first tool call would
+/// resume the run without the answer it parked for.
+pub fn drain_run_directives_for(
+    data_directory: impl AsRef<Path>,
+    target: &DirectiveTarget,
+) -> Result<Vec<Message>, CliError> {
+    drain_into_messages(data_directory, target, None)
+}
+
+fn drain_into_messages(
+    data_directory: impl AsRef<Path>,
+    target: &DirectiveTarget,
+    grain: Option<DirectiveGrain>,
+) -> Result<Vec<Message>, CliError> {
     let mut store = DirectiveStore::open(data_directory)
         .map_err(|_| CliError::storage("session directives are unavailable"))?;
-    let directives = store
-        .drain(target, DirectiveGrain::Turn)
-        .map_err(|_| CliError::storage("session directives could not be drained"))?;
+    let directives = match grain {
+        Some(grain) => store.drain(target, grain),
+        None => store.drain_every_grain(target),
+    }
+    .map_err(|_| CliError::storage("session directives could not be drained"))?;
 
     Ok(directives
         .into_iter()

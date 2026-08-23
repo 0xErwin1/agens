@@ -174,8 +174,7 @@ impl WorkerFacts {
             .pop()?;
         let attempt_id = attempt.id?;
 
-        core.machines_mut()
-            .correlate_attempt(attempt_id, session_attempt_id)
+        core.correlate_attempt(attempt_id, session_attempt_id)
             .ok()?;
 
         Some(Attribution {
