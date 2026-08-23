@@ -60,6 +60,7 @@ use agens_tools::SessionWorktrees;
 use crate::api::{ApiCore, Ports};
 use crate::cache::RunCache;
 use crate::coordinator::queue_journal::QueueJournal;
+use crate::diagnostics::CoordinatorDiagnostics;
 use crate::fsm::StateMachines;
 use crate::gates::{
     Gates, MergePath, PreMergeRequest, ReclaimRequest, SUB_AGENT_EVENT, SubAgentKind,
@@ -123,6 +124,12 @@ pub struct CoordinatorSettings {
     pub heartbeat: Duration,
     /// How long the gates sweep waits between passes.
     pub gates_sweep: Duration,
+    /// Whether the coordinator writes its own diagnostics log.
+    ///
+    /// Capture-gated like every other diagnostic, and off by default: the file
+    /// is the second reader's copy of what the journal already holds, and a
+    /// machine that did not ask for one should not be given a file that grows.
+    pub diagnostics: bool,
 }
 
 impl Default for CoordinatorSettings {
@@ -139,6 +146,7 @@ impl Default for CoordinatorSettings {
             attempt_cap: 3,
             heartbeat: HEARTBEAT,
             gates_sweep: GATES_SWEEP,
+            diagnostics: false,
         }
     }
 }
@@ -238,6 +246,7 @@ impl Coordinator {
         )));
         let (facts, reports) = ingest_channel();
         let stopping = Arc::new(AtomicBool::new(false));
+        let diagnostics = CoordinatorDiagnostics::new(data_directory, settings.diagnostics);
 
         // Steps 2 to 4, before anything is ticking or serving. Nothing else
         // holds the core yet, so the pass reads and moves the same rows the
@@ -254,11 +263,25 @@ impl Coordinator {
                 supervisor,
                 worker,
                 facts.clone(),
+                diagnostics.clone(),
             ),
-            timer_loop(settings, &core, &admissions, &stopping, facts.clone()),
+            timer_loop(
+                settings,
+                &core,
+                &admissions,
+                &stopping,
+                facts.clone(),
+                diagnostics.clone(),
+            ),
             gates_loop(data_directory, settings, &core, &stopping),
-            ingest_loop(data_directory, settings, reports, &stopping)?,
-            publisher_loop(data_directory, settings, feed, &stopping)?,
+            ingest_loop(
+                data_directory,
+                settings,
+                reports,
+                &stopping,
+                diagnostics.clone(),
+            )?,
+            publisher_loop(data_directory, settings, feed, &stopping, diagnostics)?,
         ];
 
         let coordinator = Self {
@@ -382,6 +405,7 @@ fn admission_loop(
     supervisor: SessionSupervisor,
     worker: RunWorkerFactory,
     facts: FactSender,
+    diagnostics: CoordinatorDiagnostics,
 ) -> JoinHandle<()> {
     let core = Arc::clone(core);
     let admissions = Arc::clone(admissions);
@@ -424,6 +448,7 @@ fn admission_loop(
                 Ok(mut core) => match core.admit_queued_runs(&scheduler, &launcher, &load) {
                     Ok(report) => {
                         queue_journal.record(core.machines_mut(), &report, load.now);
+                        diagnostics.admission(&report);
 
                         !report.failures.is_empty()
                     }
@@ -464,6 +489,7 @@ fn timer_loop(
     admissions: &Arc<Admissions>,
     stopping: &Arc<AtomicBool>,
     facts: FactSender,
+    diagnostics: CoordinatorDiagnostics,
 ) -> JoinHandle<()> {
     let core = Arc::clone(core);
     let admissions = Arc::clone(admissions);
@@ -475,14 +501,18 @@ fn timer_loop(
         while !stopping.load(Ordering::Acquire) {
             let (requeued, expired) = match core.lock() {
                 Ok(mut core) => match core.advance_timers(&wheel) {
-                    Ok(tick) => (
-                        !tick.quota_resets.is_empty(),
-                        // Attributed while the core is still held, from the
-                        // same rows the tick read: a fact attributed to an
-                        // attempt the run left between the two would be
-                        // refused as a straggler.
-                        expired_checkpoint_facts(&core, &tick),
-                    ),
+                    Ok(tick) => {
+                        diagnostics.timers(&tick);
+
+                        (
+                            !tick.quota_resets.is_empty(),
+                            // Attributed while the core is still held, from the
+                            // same rows the tick read: a fact attributed to an
+                            // attempt the run left between the two would be
+                            // refused as a straggler.
+                            expired_checkpoint_facts(&core, &tick),
+                        )
+                    }
                     Err(_) => (false, Vec::new()),
                 },
                 Err(_) => (false, Vec::new()),
@@ -756,6 +786,7 @@ fn ingest_loop(
     settings: &CoordinatorSettings,
     reports: FactReceiver,
     stopping: &Arc<AtomicBool>,
+    diagnostics: CoordinatorDiagnostics,
 ) -> Result<JoinHandle<()>, CoordinatorError> {
     let mut ingest = Ingest::new(open_control_plane(data_directory)?);
     let stopping = Arc::clone(stopping);
@@ -765,7 +796,15 @@ fn ingest_loop(
         while !stopping.load(Ordering::Acquire) {
             // A refused fact is already carried back on its own outcome, and
             // the reporter is the party that can do something about it.
-            let _ = ingest.drain_available(&reports);
+            for drained in ingest.drain_available(&reports) {
+                let Ok(accepted) = &drained.outcome else {
+                    continue;
+                };
+
+                for signal in &accepted.signals {
+                    diagnostics.health_signal(drained.fact.run_id, signal);
+                }
+            }
 
             std::thread::sleep(heartbeat);
         }
@@ -778,6 +817,7 @@ fn publisher_loop(
     settings: &CoordinatorSettings,
     feed: Arc<JournalFeed>,
     stopping: &Arc<AtomicBool>,
+    diagnostics: CoordinatorDiagnostics,
 ) -> Result<JoinHandle<()>, CoordinatorError> {
     let store = open_control_plane(data_directory)?;
     let stopping = Arc::clone(stopping);
@@ -804,10 +844,14 @@ fn publisher_loop(
             // taken past them.
             let head = store.latest_event_id().unwrap_or(watermark);
 
-            if feed.subscribers() == 0 {
+            if feed.subscribers() == 0 && !diagnostics.enabled() {
                 // Nobody is watching, so the tail is not read. The watermark
                 // still moves, because a subscriber arriving later asks for
                 // what happens next rather than for what it missed.
+                //
+                // A supervisor reading the diagnostics log is a watcher with no
+                // subscription, which is why capture keeps the tail being read
+                // with no client attached.
                 watermark = head;
                 continue;
             }
@@ -818,6 +862,7 @@ fn publisher_loop(
 
             for event in &events {
                 watermark = event.id.unwrap_or(watermark).max(watermark);
+                diagnostics.journal_entry(event);
                 feed.publish(event, repository_of(&store, &mut repositories, event));
             }
         }

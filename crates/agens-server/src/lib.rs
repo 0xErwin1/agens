@@ -9,6 +9,7 @@ mod api;
 mod blocking;
 mod cache;
 mod coordinator;
+mod diagnostics;
 mod fsm;
 mod gates;
 pub mod grpc;
@@ -63,6 +64,7 @@ pub use coordinator::{
     MissingWorktree, OrphanWorktree, RUN_DEFERRED_EVENT, RunLaunch, RunWorkerFactory,
     WORKTREE_MISSING_EVENT, WORKTREE_ORPHANED_EVENT,
 };
+pub use diagnostics::CoordinatorDiagnostics;
 pub use fsm::{
     AppliedQuestionTransition, AppliedRunTransition, AppliedTransition, AppliedWorktreeTransition,
     Principal, QUESTION_TRANSITIONS, QuestionEffect, QuestionFacts, QuestionGuard,

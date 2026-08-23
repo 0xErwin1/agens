@@ -30,6 +30,10 @@ pub(crate) fn run_serve(
         timers: TimerSettings {
             checkpoint_grace_percent: team.checkpoint_grace_percent,
         },
+        // The same switch every other diagnostic is behind. A supervisor that
+        // wants to follow this daemon without attaching a client starts it with
+        // `--debug`; one that did not ask gets no file.
+        diagnostics: bootstrap.debug(),
         ..CoordinatorSettings::default()
     };
 

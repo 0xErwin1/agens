@@ -125,6 +125,11 @@ fn safe_diagnostic_entry(value: &serde_json::Value, relative_path: &str) -> Opti
             "agent",
             "session",
             "mcp",
+            // The daemon's own component. Its lines carry no attempt and no
+            // retry budget, so this dialog drops them a few fields further
+            // down the way it drops every other non-provider line; the name is
+            // allowlisted so this list keeps tracking the enum.
+            "coordinator",
         ],
     )?;
     let event = allowlisted_diagnostic_value(
@@ -443,6 +448,7 @@ mod tests {
                 ProviderDiagnosticComponent::Agent => component.as_str(),
                 ProviderDiagnosticComponent::Session => component.as_str(),
                 ProviderDiagnosticComponent::Mcp => component.as_str(),
+                ProviderDiagnosticComponent::Coordinator => component.as_str(),
             }
         }
 
@@ -454,6 +460,7 @@ mod tests {
             ProviderDiagnosticComponent::Agent,
             ProviderDiagnosticComponent::Session,
             ProviderDiagnosticComponent::Mcp,
+            ProviderDiagnosticComponent::Coordinator,
         ] {
             let component_str = component_as_str(component);
             assert!(

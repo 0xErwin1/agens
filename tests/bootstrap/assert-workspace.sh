@@ -116,6 +116,8 @@ jq -e '
     ],
     "agens-server": [
       "agens-core",
+      "agens-diagnostics",
+      "agens-providers",
       "agens-store",
       "agens-tools"
     ],

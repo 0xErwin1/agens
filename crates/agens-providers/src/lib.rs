@@ -317,6 +317,9 @@ pub enum ProviderDiagnosticComponent {
     Session,
     /// An MCP server, as opposed to the tool call that reached it.
     Mcp,
+    /// The daemon's control plane: what it admitted, deferred, ticked and
+    /// detected, as opposed to anything one session did.
+    Coordinator,
 }
 
 impl ProviderDiagnosticComponent {
@@ -329,6 +332,7 @@ impl ProviderDiagnosticComponent {
             Self::Subagent => "subagent",
             Self::Agent => "agent",
             Self::Mcp => "mcp",
+            Self::Coordinator => "coordinator",
         }
     }
 }
@@ -352,6 +356,14 @@ pub enum ProviderDiagnosticKind {
     ContextExhausted,
     CompactionStarted,
     CompactionEnded,
+    RunStateChanged,
+    GateResult,
+    RunAdmitted,
+    RunDeferred,
+    AdmissionFailed,
+    TimersTicked,
+    HealthSignalRaised,
+    CorePoisoned,
 }
 
 impl ProviderDiagnosticKind {
@@ -374,6 +386,14 @@ impl ProviderDiagnosticKind {
             Self::ContextExhausted => "context_exhausted",
             Self::CompactionStarted => "compaction_started",
             Self::CompactionEnded => "compaction_ended",
+            Self::RunStateChanged => "run_state_changed",
+            Self::GateResult => "gate_result",
+            Self::RunAdmitted => "run_admitted",
+            Self::RunDeferred => "run_deferred",
+            Self::AdmissionFailed => "admission_failed",
+            Self::TimersTicked => "timers_ticked",
+            Self::HealthSignalRaised => "health_signal_raised",
+            Self::CorePoisoned => "core_poisoned",
         }
     }
 }
