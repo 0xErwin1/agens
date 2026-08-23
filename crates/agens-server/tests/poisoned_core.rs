@@ -5,11 +5,13 @@
 //! poisoned on purpose, and a test that reached in to set a flag would be
 //! asserting about its own fixture rather than about the daemon.
 
+mod common;
+
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use agens_core::HeadlessTurnCancellation;
 use agens_server::grpc::proto::{self, feed_client::FeedClient};
@@ -17,61 +19,25 @@ use agens_server::{
     CORE_POISONED_EVENT, Coordinator, CoordinatorSettings, LaunchError, RunLaunch, RunSession,
     RunWorkerFactory, SessionSupervisor,
 };
-use agens_store::{ControlPlaneStore, EventRow, RunRow, RunState, WorktreeStatus};
+use agens_store::{ControlPlaneStore, EventRow, RunRow, RunState};
 use tonic::transport::{Endpoint, Uri};
 
-const REPO: &str = "a1b2c3d4e5f60718";
-const PROVIDER: &str = "scripted";
+use common::{REPO, run_in, scratch_directory, worktree_in};
 
 /// How long an assertion waits for a loop that ticks on a heartbeat.
 const PATIENCE: Duration = Duration::from_secs(10);
 
-static NEXT_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
-
-fn scratch_directory(kind: &str) -> PathBuf {
-    let suffix = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
-    let directory = std::env::temp_dir().join(format!(
-        "agens-server-poison-{kind}-{}-{suffix}",
-        std::process::id()
-    ));
-    fs::create_dir_all(&directory).unwrap();
-
-    directory
-}
-
-fn now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| i64::try_from(elapsed.as_secs()).unwrap_or(0))
-}
-
 /// A queued run with the worktree `CreateRun` provisions: admission reads that
 /// column, and a run whose directory is not `active` is never offered a slot,
 /// so the launcher this test needs to reach would never be called.
-fn queued_run(directory: &std::path::Path) -> RunRow {
-    let worktree = directory.join("worktrees").join(REPO).join("agn-186");
-    fs::create_dir_all(&worktree).unwrap();
+fn queued_run(directory: &Path) -> RunRow {
+    let worktree = worktree_in(directory, "agn-186");
 
     RunRow {
-        id: None,
-        repo_id: REPO.to_owned(),
-        repo_root: "/home/dev/agens".to_owned(),
-        remote_url: None,
         external_ref: Some("agens/AGN-186".to_owned()),
-        parent_run_id: None,
         task: "give admission something to try to launch".to_owned(),
-        scope: "crates/agens-server/src/coordinator".to_owned(),
         dod: "a poisoned core stops the daemon".to_owned(),
-        genesis_paths: None,
-        state: RunState::Queued,
-        priority: 5,
-        dep_run_id: None,
-        provider: PROVIDER.to_owned(),
-        budget_tokens: None,
-        worktree_path: Some(worktree.display().to_string()),
-        worktree_status: Some(WorktreeStatus::Active),
-        created_at: now(),
-        result: None,
+        ..run_in(RunState::Queued, &worktree)
     }
 }
 
@@ -186,7 +152,7 @@ fn recorded_diagnostics(directory: &Path) -> String {
 /// able to bind it.
 #[test]
 fn a_daemon_that_stopped_on_a_poisoned_core_says_so_to_whoever_started_it() {
-    let directory = scratch_directory("serve");
+    let directory = scratch_directory("poison", "serve");
 
     ControlPlaneStore::open(&directory)
         .expect("open the control plane")
@@ -250,7 +216,7 @@ fn a_daemon_that_stopped_on_a_poisoned_core_says_so_to_whoever_started_it() {
 
 #[test]
 fn a_poisoned_core_stops_the_daemon_instead_of_being_slept_through() {
-    let directory = scratch_directory("fatal");
+    let directory = scratch_directory("poison", "fatal");
 
     ControlPlaneStore::open(&directory)
         .expect("open the control plane")

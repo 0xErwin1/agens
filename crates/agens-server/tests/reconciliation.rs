@@ -7,78 +7,28 @@
 //! control plane, because a reconciliation that only holds inside the pass that
 //! ran it has reconciled nothing.
 
+mod common;
+
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::path::Path;
+use std::time::{Duration, Instant};
 
-use agens_server::{
-    Coordinator, CoordinatorSettings, LaunchError, RunLaunch, RunWorkerFactory, SessionSupervisor,
-    WORKTREE_ORPHANED_EVENT,
-};
-use agens_store::{
-    AttemptOutcome, AttemptRow, ControlPlaneStore, RunRow, RunState, WorktreeStatus,
-};
+use agens_server::{Coordinator, CoordinatorSettings, SessionSupervisor, WORKTREE_ORPHANED_EVENT};
+use agens_store::{AttemptOutcome, AttemptRow, ControlPlaneStore, RunRow, RunState};
 
-const REPO: &str = "a1b2c3d4e5f60718";
-const PROVIDER: &str = "scripted";
+use common::{now, refusing_worker, run_in, scratch_directory, worktree_in};
 
 /// How long an assertion waits for a loop that ticks on a heartbeat.
 const PATIENCE: Duration = Duration::from_secs(10);
 
-static NEXT_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
-
-fn scratch_directory(kind: &str) -> PathBuf {
-    let suffix = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
-    let directory = std::env::temp_dir().join(format!(
-        "agens-server-reconcile-{kind}-{}-{suffix}",
-        std::process::id()
-    ));
-    fs::create_dir_all(&directory).unwrap();
-
-    directory
-}
-
-fn now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| i64::try_from(elapsed.as_secs()).unwrap_or(0))
-}
-
 /// A run the last process was executing when it died.
 fn interrupted_run(worktree: &Path) -> RunRow {
     RunRow {
-        id: None,
-        repo_id: REPO.to_owned(),
-        repo_root: "/home/dev/agens".to_owned(),
-        remote_url: None,
         external_ref: Some("agens/AGN-62".to_owned()),
-        parent_run_id: None,
         task: "reconcile the state a restart left behind".to_owned(),
-        scope: "crates/agens-server/src/coordinator".to_owned(),
         dod: "a running row with no session goes back to the queue".to_owned(),
-        genesis_paths: None,
-        state: RunState::Running,
-        priority: 5,
-        dep_run_id: None,
-        provider: PROVIDER.to_owned(),
-        budget_tokens: None,
-        worktree_path: Some(worktree.display().to_string()),
-        worktree_status: Some(WorktreeStatus::Active),
-        created_at: now(),
-        result: None,
+        ..run_in(RunState::Running, worktree)
     }
-}
-
-/// A worker that never produces a session.
-///
-/// The run this test follows is the one reconciliation put back in the queue,
-/// and a launch that refuses leaves it queued where the assertion can read it
-/// instead of racing the admission loop for the row.
-fn refusing_worker() -> RunWorkerFactory {
-    std::sync::Arc::new(|_launch: &RunLaunch<'_>| {
-        Err(LaunchError("this test starts no sessions".to_owned()))
-    }) as RunWorkerFactory
 }
 
 /// The run's state, read straight from the control plane.
@@ -107,11 +57,9 @@ fn await_state(directory: &Path, run_id: i64, wanted: RunState) -> Option<RunSta
 
 #[test]
 fn a_coordinator_started_over_a_running_row_puts_it_back_in_the_queue() {
-    let directory = scratch_directory("running-row");
-    let orphan = directory.join("worktrees").join(REPO).join("agn-99");
-    fs::create_dir_all(&orphan).unwrap();
-    let worktree = directory.join("worktrees").join(REPO).join("agn-62");
-    fs::create_dir_all(&worktree).unwrap();
+    let directory = scratch_directory("reconcile", "running-row");
+    let orphan = worktree_in(&directory, "agn-99");
+    let worktree = worktree_in(&directory, "agn-62");
 
     let run_id = {
         let mut store = ControlPlaneStore::open(&directory).expect("open the control plane");
@@ -225,9 +173,8 @@ fn a_coordinator_started_over_a_running_row_puts_it_back_in_the_queue() {
 /// ceiling went on counting it against admission. Both now read one list.
 #[test]
 fn a_cancelled_run_still_claims_its_worktree() {
-    let directory = scratch_directory("cancelled-claim");
-    let worktree = directory.join("worktrees").join(REPO).join("agn-191");
-    fs::create_dir_all(&worktree).unwrap();
+    let directory = scratch_directory("reconcile", "cancelled-claim");
+    let worktree = worktree_in(&directory, "agn-191");
 
     {
         let mut store = ControlPlaneStore::open(&directory).expect("open the control plane");

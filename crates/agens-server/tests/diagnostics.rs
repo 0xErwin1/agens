@@ -4,81 +4,38 @@
 //! because the whole point of these lines is that they are readable by
 //! something that never attached a client.
 
+mod common;
+
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use agens_core::HeadlessTurnCancellation;
-use agens_server::{
-    Coordinator, CoordinatorSettings, LaunchError, RunLaunch, RunWorkerFactory, SessionSupervisor,
-};
-use agens_store::{AttemptRow, ControlPlaneStore, RunRow, RunState, WorktreeStatus};
+use agens_server::{Coordinator, CoordinatorSettings, SessionSupervisor};
+use agens_store::{AttemptRow, ControlPlaneStore, RunRow, RunState};
 
-const REPO: &str = "a1b2c3d4e5f60718";
-const PROVIDER: &str = "scripted";
-const REPO_ROOT: &str = "/home/dev/agens";
-const SCOPE: &str = "crates/agens-server/src/coordinator";
+use common::{
+    REFUSAL, REPO_ROOT, SCOPE, now, refusing_worker, run_in, scratch_directory, worktree_in,
+};
 
 /// How long an assertion waits for a loop that ticks on a heartbeat.
 const PATIENCE: Duration = Duration::from_secs(10);
-
-static NEXT_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
-
-fn scratch_directory(kind: &str) -> PathBuf {
-    let suffix = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
-    let directory = std::env::temp_dir().join(format!(
-        "agens-server-diagnostics-{kind}-{}-{suffix}",
-        std::process::id()
-    ));
-    fs::create_dir_all(&directory).unwrap();
-
-    directory
-}
-
-fn now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| i64::try_from(elapsed.as_secs()).unwrap_or(0))
-}
 
 /// A run the last process was executing when it died, so boot reconciliation
 /// has something to interrupt and resume through the state machines.
 fn interrupted_run(worktree: &Path) -> RunRow {
     RunRow {
-        id: None,
-        repo_id: REPO.to_owned(),
-        repo_root: REPO_ROOT.to_owned(),
-        remote_url: None,
         external_ref: Some("agens/AGN-186".to_owned()),
-        parent_run_id: None,
         task: "give a supervisor something to read".to_owned(),
-        scope: SCOPE.to_owned(),
         dod: "the coordinator's own events reach the diagnostics log".to_owned(),
-        genesis_paths: None,
-        state: RunState::Running,
-        priority: 5,
-        dep_run_id: None,
-        provider: PROVIDER.to_owned(),
-        budget_tokens: None,
-        worktree_path: Some(worktree.display().to_string()),
-        worktree_status: Some(WorktreeStatus::Active),
-        created_at: now(),
-        result: None,
+        ..run_in(RunState::Running, worktree)
     }
-}
-
-fn refusing_worker() -> RunWorkerFactory {
-    std::sync::Arc::new(|_launch: &RunLaunch<'_>| {
-        Err(LaunchError("this test starts no sessions".to_owned()))
-    }) as RunWorkerFactory
 }
 
 /// Seeds a directory with a run a killed daemon left behind and returns it.
 fn seeded_directory(kind: &str) -> PathBuf {
-    let directory = scratch_directory(kind);
-    let worktree = directory.join("worktrees").join(REPO).join("agn-186");
-    fs::create_dir_all(&worktree).unwrap();
+    let directory = scratch_directory("diagnostics", kind);
+    let worktree = worktree_in(&directory, "agn-186");
 
     let mut store = ControlPlaneStore::open(&directory).expect("open the control plane");
     let run_id = store
@@ -221,7 +178,7 @@ fn the_coordinator_records_what_it_moved_and_what_it_could_not_start() {
         .collect::<String>();
     assert!(!whole.contains(REPO_ROOT), "{whole}");
     assert!(!whole.contains(SCOPE), "{whole}");
-    assert!(!whole.contains("this test starts no sessions"), "{whole}");
+    assert!(!whole.contains(REFUSAL), "{whole}");
 
     fs::remove_dir_all(directory).unwrap();
 }

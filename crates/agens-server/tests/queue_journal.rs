@@ -4,79 +4,38 @@
 //! because the thing under test is what the loop does with the report — the
 //! scheduler already returned the same report before any of this was journaled.
 
+mod common;
+
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::path::Path;
+use std::time::{Duration, Instant};
 
 use agens_core::HeadlessTurnCancellation;
 use agens_server::{
-    ADMISSION_FAILED_EVENT, Coordinator, CoordinatorSettings, LaunchError, RUN_DEFERRED_EVENT,
-    RunLaunch, RunWorkerFactory, SchedulerLimits, SessionSupervisor,
+    ADMISSION_FAILED_EVENT, Coordinator, CoordinatorSettings, RUN_DEFERRED_EVENT, SchedulerLimits,
+    SessionSupervisor,
 };
-use agens_store::{ControlPlaneStore, EventRow, RunRow, RunState, WorktreeStatus};
+use agens_store::{ControlPlaneStore, EventRow, RunRow, RunState};
 
-const REPO: &str = "a1b2c3d4e5f60718";
-const PROVIDER: &str = "scripted";
-const REFUSAL: &str = "this test starts no sessions";
+use common::{REFUSAL, refusing_worker, run_in, scratch_directory, worktree_in};
 
 /// How long an assertion waits for a loop that ticks on a heartbeat.
 const PATIENCE: Duration = Duration::from_secs(10);
-
-static NEXT_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
-
-fn scratch_directory(kind: &str) -> PathBuf {
-    let suffix = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
-    let directory = std::env::temp_dir().join(format!(
-        "agens-server-queue-{kind}-{}-{suffix}",
-        std::process::id()
-    ));
-    fs::create_dir_all(&directory).unwrap();
-
-    directory
-}
-
-fn now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| i64::try_from(elapsed.as_secs()).unwrap_or(0))
-}
 
 /// A queued run with the worktree `CreateRun` provisions.
 ///
 /// Admission reads that column: a run whose directory is not `active` is held
 /// as ineligible rather than offered a slot, and this test writes the row
 /// directly instead of going through the call that would have provisioned it.
-fn queued_run(directory: &std::path::Path) -> RunRow {
-    let worktree = directory.join("worktrees").join(REPO).join("agn-186");
-    fs::create_dir_all(&worktree).unwrap();
+fn queued_run(directory: &Path) -> RunRow {
+    let worktree = worktree_in(directory, "agn-186");
 
     RunRow {
-        id: None,
-        repo_id: REPO.to_owned(),
-        repo_root: "/home/dev/agens".to_owned(),
-        remote_url: None,
         external_ref: Some("agens/AGN-186".to_owned()),
-        parent_run_id: None,
         task: "make a queue that is not moving visible".to_owned(),
-        scope: "crates/agens-server/src/coordinator".to_owned(),
         dod: "the reason a run stayed queued is in the journal".to_owned(),
-        genesis_paths: None,
-        state: RunState::Queued,
-        priority: 5,
-        dep_run_id: None,
-        provider: PROVIDER.to_owned(),
-        budget_tokens: None,
-        worktree_path: Some(worktree.display().to_string()),
-        worktree_status: Some(WorktreeStatus::Active),
-        created_at: now(),
-        result: None,
+        ..run_in(RunState::Queued, &worktree)
     }
-}
-
-fn refusing_worker() -> RunWorkerFactory {
-    std::sync::Arc::new(|_launch: &RunLaunch<'_>| Err(LaunchError(REFUSAL.to_owned())))
-        as RunWorkerFactory
 }
 
 fn entries_of_type(directory: &Path, run_id: i64, event_type: &str) -> Vec<EventRow> {
@@ -129,7 +88,7 @@ fn coordinator_over(
 
 #[test]
 fn a_run_held_by_a_ceiling_says_so_once_rather_than_on_every_tick() {
-    let directory = scratch_directory("deferred");
+    let directory = scratch_directory("queue", "deferred");
 
     let run_id = ControlPlaneStore::open(&directory)
         .expect("open the control plane")
@@ -164,7 +123,7 @@ fn a_run_held_by_a_ceiling_says_so_once_rather_than_on_every_tick() {
 
 #[test]
 fn a_launch_that_keeps_failing_says_why_and_says_it_once() {
-    let directory = scratch_directory("failed");
+    let directory = scratch_directory("queue", "failed");
 
     let run_id = ControlPlaneStore::open(&directory)
         .expect("open the control plane")

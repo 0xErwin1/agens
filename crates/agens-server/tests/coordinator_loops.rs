@@ -4,72 +4,32 @@
 //! body, because what they assert is a property of the running daemon: how long
 //! `stop` takes, and what is still folded after it was asked to stop.
 
+mod common;
+
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use agens_server::{
     Coordinator, CoordinatorSettings, IngestFact, LaunchError, ReportedFact, RunLaunch,
     RunWorkerFactory, SessionSupervisor,
 };
-use agens_store::{AttemptRow, ControlPlaneStore, RunRow, RunState, WorktreeStatus};
+use agens_store::{AttemptRow, ControlPlaneStore, RunRow, RunState};
 
-const REPO: &str = "a1b2c3d4e5f60718";
-const PROVIDER: &str = "scripted";
+use common::{now, run_in as base_run, scratch_directory, worktree_in};
 
 /// The physical execution the reported fact is attributed to.
 const SESSION_ATTEMPT: i64 = 1;
 
-static NEXT_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
-
-fn scratch_directory(kind: &str) -> PathBuf {
-    let suffix = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
-    let directory = std::env::temp_dir().join(format!(
-        "agens-server-loops-{kind}-{}-{suffix}",
-        std::process::id()
-    ));
-    fs::create_dir_all(&directory).unwrap();
-
-    directory
-}
-
-fn now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| i64::try_from(elapsed.as_secs()).unwrap_or(0))
-}
-
 fn run_in(state: RunState, worktree: &Path) -> RunRow {
     RunRow {
-        id: None,
-        repo_id: REPO.to_owned(),
-        repo_root: "/home/dev/agens".to_owned(),
-        remote_url: None,
         external_ref: Some("agens/AGN-185".to_owned()),
-        parent_run_id: None,
         task: "the loops answer to the stop flag".to_owned(),
-        scope: "crates/agens-server/src/coordinator".to_owned(),
         dod: "a shutdown waits for no backoff and loses no fact".to_owned(),
-        genesis_paths: None,
-        state,
-        priority: 5,
-        dep_run_id: None,
-        provider: PROVIDER.to_owned(),
-        budget_tokens: None,
-        worktree_path: Some(worktree.display().to_string()),
-        worktree_status: Some(WorktreeStatus::Active),
-        created_at: now(),
-        result: None,
+        ..base_run(state, worktree)
     }
-}
-
-fn worktree_in(directory: &Path) -> PathBuf {
-    let worktree = directory.join("worktrees").join(REPO).join("agn-185");
-    fs::create_dir_all(&worktree).unwrap();
-
-    worktree
 }
 
 fn runtime() -> tokio::runtime::Runtime {
@@ -113,8 +73,8 @@ fn await_launch_attempt(attempts: &AtomicUsize) {
 /// over.
 #[test]
 fn a_shutdown_does_not_wait_out_the_failed_launch_backoff() {
-    let directory = scratch_directory("backoff");
-    let worktree = worktree_in(&directory);
+    let directory = scratch_directory("loops", "backoff");
+    let worktree = worktree_in(&directory, "agn-185");
 
     {
         let mut store = ControlPlaneStore::open(&directory).unwrap();
@@ -161,8 +121,8 @@ fn a_shutdown_does_not_wait_out_the_failed_launch_backoff() {
 /// health describes a window the daemon had the facts for and never read.
 #[test]
 fn the_facts_of_the_last_window_are_ingested_on_the_way_out() {
-    let directory = scratch_directory("drain");
-    let worktree = worktree_in(&directory);
+    let directory = scratch_directory("loops", "drain");
+    let worktree = worktree_in(&directory, "agn-185");
 
     let run_id = {
         let mut store = ControlPlaneStore::open(&directory).unwrap();
@@ -222,6 +182,18 @@ fn the_facts_of_the_last_window_are_ingested_on_the_way_out() {
             fact: IngestFact::TurnStarted,
         })
         .expect("the ingest channel has a reader");
+
+    // The fact is still in the channel when the stop is asked for. Without this
+    // the test would also pass on a pass that folded it before the stop, which
+    // is the one thing it is not about.
+    assert!(
+        ControlPlaneStore::open(&directory)
+            .unwrap()
+            .load_run_health(run_id)
+            .unwrap()
+            .is_none(),
+        "a heartbeat folded the fact before the stop, so the exit drain is not what is under test"
+    );
 
     coordinator.stop();
     runtime.shutdown_timeout(Duration::ZERO);

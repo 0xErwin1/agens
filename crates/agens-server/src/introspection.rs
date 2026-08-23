@@ -37,7 +37,7 @@ use crate::timers::CHECKPOINT_EVENT;
 pub type Clock = Arc<dyn Fn() -> i64 + Send + Sync>;
 
 /// The journal entry a suspension the sessions port refused is recorded as.
-pub const SESSION_SUSPEND_REFUSED_EVENT: &str = "session_suspend_refused";
+const SESSION_SUSPEND_REFUSED_EVENT: &str = "session_suspend_refused";
 
 /// Resolves the physical execution the reports are coming from.
 ///

@@ -64,7 +64,7 @@ use sha2::{Digest, Sha256};
 
 use crate::fsm::{
     AppliedWorktreeTransition, MergeSettlement, SettledMerge, StateMachines, TransitionOutcome,
-    TransitionRejection, WorktreeFacts, WorktreeTrigger,
+    TransitionRejection, WorktreeFacts, WorktreeTrigger, charged_attempts,
 };
 
 /// Which of the two doors a merge came through.
@@ -996,20 +996,6 @@ fn paths_digest(paths: &[String]) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
-}
-
-/// Attempts that count against the run's budget.
-///
-/// An `interrupted` attempt does not: a quota park, a wait on a person and a
-/// reboot are not the agent's failures, and charging them would spend a budget
-/// on infrastructure.
-fn charged_attempts(attempts: &[agens_store::AttemptRow]) -> i64 {
-    attempts
-        .iter()
-        .filter(|attempt| attempt.outcome != Some(agens_store::AttemptOutcome::Interrupted))
-        .count()
-        .try_into()
-        .unwrap_or(i64::MAX)
 }
 
 fn parse_genesis_paths(stored: &str) -> Result<Vec<String>, GateError> {

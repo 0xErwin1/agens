@@ -44,6 +44,7 @@ pub use questions::{
     AppliedQuestionTransition, QUESTION_TRANSITIONS, QuestionEffect, QuestionFacts, QuestionGuard,
     QuestionTransition, QuestionTrigger,
 };
+pub(crate) use runs::charged_attempts;
 pub use runs::{
     AppliedRunTransition, RUN_TRANSITIONS, RunEffect, RunFacts, RunGuard, RunTransition, RunTrigger,
 };
