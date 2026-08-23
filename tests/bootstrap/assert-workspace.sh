@@ -164,6 +164,10 @@ jq -e '
       "agens-core",
       "agens-perf"
     ],
+    "agens-coordinator-client": [
+      "agens-core",
+      "agens-server"
+    ],
     "agens-tui-app": [
       "agens-agents",
       "agens-auth",

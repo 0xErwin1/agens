@@ -24,6 +24,7 @@ members = [
   "crates/agens-tui",
   "crates/agens-tui-app",
   "crates/agens-server",
+  "crates/agens-coordinator-client",
   "crates/agens-cli",
 ]
 resolver = "3"

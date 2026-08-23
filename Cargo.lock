@@ -104,6 +104,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "agens-coordinator-client"
+version = "0.1.0"
+dependencies = [
+ "agens-core",
+ "agens-server",
+ "hyper-util",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tower",
+]
+
+[[package]]
 name = "agens-core"
 version = "0.1.0"
 dependencies = [
