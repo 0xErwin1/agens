@@ -68,6 +68,35 @@ const ADMISSION_PATIENCE: Duration = Duration::from_secs(30);
 /// How often that wait looks again.
 const ADMISSION_POLL: Duration = Duration::from_millis(20);
 
+/// The longest a run parks on one refusal, unless the operator configured a
+/// longer window.
+///
+/// A named reset arrives from the provider's own headers and nothing between
+/// the socket and here bounds it: the header is read with no cap, its seconds
+/// saturate at `u32::MAX`, and a refusal that named a century would park the
+/// provider for one. A day is the far side of what any subscription cap is
+/// worth waiting out, and coming back early costs one refused request.
+const QUOTA_PARK_CEILING_SECONDS: i64 = 86_400;
+
+/// The longest park this daemon honours: the fixed ceiling, or the operator's
+/// window when they configured a longer one.
+///
+/// The window is what lifts a cap that named no reset at all, so parking for
+/// less than it would bring runs back before the daemon's own idea of a cap
+/// has passed.
+const fn quota_park_ceiling(quota_window_seconds: i64) -> i64 {
+    if quota_window_seconds > QUOTA_PARK_CEILING_SECONDS {
+        quota_window_seconds
+    } else {
+        QUOTA_PARK_CEILING_SECONDS
+    }
+}
+
+/// The reset this daemon parks on, given what the provider named.
+fn honoured_reset(reset_after_seconds: u32, ceiling: i64) -> i64 {
+    i64::from(reset_after_seconds).min(ceiling)
+}
+
 /// The factory `agens serve` gives the daemon: how a run becomes a session.
 #[must_use]
 pub(crate) fn run_worker(bootstrap: &Bootstrap) -> RunWorkerFactory {
@@ -96,6 +125,8 @@ fn build_session(bootstrap: &Bootstrap, launch: &RunLaunch<'_>) -> Result<RunSes
         model: model.clone(),
         facts: launch.facts.clone(),
         data_directory: launch.data_directory.clone(),
+        quota_window_seconds: agens_config::TeamSettings::from(bootstrap.settings())
+            .quota_window_seconds,
     };
     let core = Arc::clone(&launch.core);
 
@@ -136,6 +167,9 @@ struct ExecutingRun {
     /// evidence has into run health.
     facts: FactSender,
     data_directory: PathBuf,
+    /// `team.quota_window_seconds`, which is the floor of how long a park on
+    /// this run's provider may last.
+    quota_window_seconds: i64,
 }
 
 /// The provider client the registry lists this session under.
@@ -314,9 +348,14 @@ fn execute(
 
     match (completion, quota) {
         (Ok(completion), _) => finish(core, run.run_id, &completion.text),
-        (Err(_), Some(reset_after_seconds)) => {
-            park_on_quota(core, run, &reported, reset_after_seconds)
-        }
+        (Err(_), Some(reset_after_seconds)) => park_on_quota(
+            core,
+            run,
+            &reported,
+            reset_after_seconds.map(|seconds| {
+                honoured_reset(seconds, quota_park_ceiling(run.quota_window_seconds))
+            }),
+        ),
         (Err(_), None) => stopped(core, run.run_id),
     }
 }
@@ -352,7 +391,7 @@ fn park_on_quota(
     core: &Arc<Mutex<ApiCore>>,
     run: &ExecutingRun,
     reported: &Arc<WorkerFacts>,
-    reset_after_seconds: Option<u32>,
+    reset_after_seconds: Option<i64>,
 ) -> SessionOutcome {
     if state_of(core, run.run_id) != Some(RunState::Running) {
         // Cancelled, or already moved by something else. The run is where that
@@ -382,8 +421,7 @@ fn park_on_quota(
             // control plane stores deadlines and reads no clock of its own. A
             // refusal that named nothing records none, and the configured
             // window is what lifts that cap.
-            quota_reset_at: reset_after_seconds
-                .map(|seconds| now.saturating_add(i64::from(seconds))),
+            quota_reset_at: reset_after_seconds.map(|seconds| now.saturating_add(seconds)),
             ..RunFacts::default()
         },
     );
@@ -403,7 +441,7 @@ fn park_on_quota(
 /// does not already say.
 fn quota_checkpoint(
     run: &ExecutingRun,
-    reset_after_seconds: Option<u32>,
+    reset_after_seconds: Option<i64>,
 ) -> Result<Checkpoint, agens_core::run_introspection::CheckpointError> {
     let reset = reset_after_seconds.map_or_else(
         || "and named no reset time".to_owned(),
@@ -811,4 +849,40 @@ fn now() -> i64 {
         .map_or(0, |elapsed| {
             i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX)
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{QUOTA_PARK_CEILING_SECONDS, honoured_reset, quota_park_ceiling};
+
+    #[test]
+    fn a_reset_within_the_ceiling_is_honoured_as_the_provider_named_it() {
+        assert_eq!(honoured_reset(900, QUOTA_PARK_CEILING_SECONDS), 900);
+    }
+
+    #[test]
+    fn a_forged_reset_parks_the_run_for_the_ceiling_rather_than_for_a_century() {
+        assert_eq!(
+            honoured_reset(u32::MAX, QUOTA_PARK_CEILING_SECONDS),
+            QUOTA_PARK_CEILING_SECONDS,
+            "a header nothing bounds cannot park a provider past what an operator would wait"
+        );
+    }
+
+    #[test]
+    fn a_window_longer_than_the_ceiling_is_what_the_ceiling_becomes() {
+        let window = QUOTA_PARK_CEILING_SECONDS * 2;
+
+        assert_eq!(
+            quota_park_ceiling(window),
+            window,
+            "an operator who configured a longer window meant it"
+        );
+        assert_eq!(honoured_reset(u32::MAX, quota_park_ceiling(window)), window);
+    }
+
+    #[test]
+    fn a_window_shorter_than_the_ceiling_does_not_shorten_it() {
+        assert_eq!(quota_park_ceiling(60), QUOTA_PARK_CEILING_SECONDS);
+    }
 }
