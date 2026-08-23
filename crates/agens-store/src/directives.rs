@@ -196,7 +196,32 @@ impl DirectiveStore {
         target: &DirectiveTarget,
         grain: DirectiveGrain,
     ) -> Result<Vec<PendingIntraTurnInput>, DirectiveStoreError> {
+        self.drain_matching(target, Some(grain))
+    }
+
+    /// The same drain, at every grain at once, for an addressee whose next
+    /// prompt is the earliest safe point either grain has.
+    ///
+    /// A coordinator run coming back from parked is the case: the session that
+    /// would have taken its tool-call-grain deliveries at a tool-call edge has
+    /// already ended, so the next turn's opening is where they are due. Draining
+    /// them by grain there would leave an answer queued until the resumed turn
+    /// happened to call a tool, which is after the model has already decided
+    /// what to do without it.
+    pub fn drain_every_grain(
+        &mut self,
+        target: &DirectiveTarget,
+    ) -> Result<Vec<PendingIntraTurnInput>, DirectiveStoreError> {
+        self.drain_matching(target, None)
+    }
+
+    fn drain_matching(
+        &mut self,
+        target: &DirectiveTarget,
+        grain: Option<DirectiveGrain>,
+    ) -> Result<Vec<PendingIntraTurnInput>, DirectiveStoreError> {
         let (session_id, child) = target.columns();
+        let grain = grain.map(DirectiveGrain::as_str);
         let transaction = self
             .connection
             .transaction()
@@ -206,7 +231,8 @@ impl DirectiveStore {
             let mut statement = transaction
                 .prepare(
                     "SELECT id, source, text FROM directives
-                     WHERE session_id IS ?1 AND child IS ?2 AND grain = ?3
+                     WHERE session_id IS ?1 AND child IS ?2
+                       AND (?3 IS NULL OR grain = ?3)
                        AND delivered_at IS NULL
                      ORDER BY id",
                 )
@@ -214,7 +240,7 @@ impl DirectiveStore {
                     DirectiveStoreError::operation("drain", &self.database_path, error)
                 })?;
             statement
-                .query_map(params![session_id, child, grain.as_str()], |row| {
+                .query_map(params![session_id, child, grain], |row| {
                     Ok((
                         row.get::<_, i64>(0)?,
                         row.get::<_, String>(1)?,

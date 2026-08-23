@@ -55,7 +55,7 @@ use agens_session::provider::{
 };
 use agens_session::turns::{
     completed_session_turn_from_events_with_media, completed_session_turn_with_media,
-    drain_turn_directives_for, next_session_metadata,
+    drain_run_directives_for, drain_turn_directives_for, next_session_metadata,
 };
 use agens_tool_runtime::block_on_headless_turn;
 use agens_tool_runtime::child::TaskMailboxProvider;
@@ -1144,10 +1144,12 @@ where
             // Recorded before the provider even runs: the drain marks these
             // delivered, so a turn that stops early still has to persist them
             // or the queue has consumed a message no history carries.
-            let directives = drain_turn_directives_for(
-                context.bootstrap.data_directory(),
-                &mailbox_of(context.run, attempt_key.session_id()),
-            )?;
+            let mailbox = mailbox_of(context.run, attempt_key.session_id());
+            let directives = if context.run.is_some() {
+                drain_run_directives_for(context.bootstrap.data_directory(), &mailbox)?
+            } else {
+                drain_turn_directives_for(context.bootstrap.data_directory(), &mailbox)?
+            };
             if let Ok(mut delivered) = runtime_directives.lock() {
                 delivered.clone_from(&directives);
             }

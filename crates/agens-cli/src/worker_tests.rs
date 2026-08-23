@@ -168,6 +168,28 @@ fn script(promised_at: i64) -> Script {
     ])
 }
 
+/// How many requests the script spends before the run parks: the write, the
+/// checkpoint, the bash call, the `ask` and the text the parked turn ends on.
+/// The next one is the resumed turn's.
+const fn requests_before_the_answer() -> usize {
+    5
+}
+
+/// Whether this request carries the answer as its own message.
+///
+/// An exact match on a string in the request's JSON, because the answer's own
+/// word also appears inside the `ask` call's arguments — as an option id, and
+/// as the recommendation — where it is part of a longer string rather than a
+/// message the model was handed.
+fn carries_the_answer(request: &serde_json::Value) -> bool {
+    match request {
+        serde_json::Value::String(text) => text == ANSWER,
+        serde_json::Value::Array(values) => values.iter().any(carries_the_answer),
+        serde_json::Value::Object(fields) => fields.values().any(carries_the_answer),
+        _ => false,
+    }
+}
+
 /// Epoch seconds, for the deadline the scripted checkpoint declares.
 fn now() -> i64 {
     i64::try_from(
@@ -456,6 +478,24 @@ fn the_daemon_executes_a_run_through_a_real_turn_that_checkpoints_asks_and_finis
 
     let (created, parked, findings, question, finished, journal) =
         client.join().expect("the client thread finishes");
+
+    // The answer has to reach the turn that resumed, not only the journal: a
+    // run that comes back without what it parked for is a run whose question
+    // decided nothing. It arrives as a message of its own, so the assertion is
+    // an exact string in the request rather than a substring of one.
+    let carrying: Vec<usize> = provider
+        .requests()
+        .iter()
+        .enumerate()
+        .filter(|(_, request)| carries_the_answer(&request.json()))
+        .map(|(index, _)| index)
+        .collect();
+
+    assert_eq!(
+        carrying,
+        vec![requests_before_the_answer()],
+        "the answer reached the resumed turn and no earlier one, journal: {journal:?}"
+    );
 
     assert!(report.is_clean(), "every session ended: {report:?}");
     assert!(
