@@ -53,6 +53,29 @@ pub use team::{
     CleaningDisposition, MergeAuthorization, MergeAuthorized, RetryRequest, RunRef, StopRequest,
 };
 
+/// The journal entry a turn that ended without a completion is recorded as.
+///
+/// Its payload names the failure's class, what it said, and the state the run
+/// was in when the turn ended: a provider that failed after the run had already
+/// left `running` is a different fact from one that failed the attempt.
+pub const TURN_FAILED_EVENT: &str = "turn_failed";
+
+/// How much of a failure's own words the journal keeps. A cause is a sentence;
+/// what arrives is whatever a provider, a tool or a transport produced.
+const TURN_FAILURE_DETAIL_MAX_CHARS: usize = 512;
+
+/// What a worker knows about a turn that ended without a completion.
+#[derive(Clone, Copy, Debug)]
+pub struct TurnFailure<'a> {
+    /// The failure's class, as the error carries it.
+    pub category: &'a str,
+    pub detail: &'a str,
+    /// Where the run's own row was when the turn ended. `None` when the run is
+    /// no longer readable at all.
+    pub state: Option<RunState>,
+    pub now: i64,
+}
+
 /// Why a request did not go through.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ApiError {
@@ -234,6 +257,41 @@ impl ApiCore {
                 ..facts.clone()
             },
         )
+    }
+
+    /// Records why a turn ended without a completion.
+    ///
+    /// Not a transition: what the run does about a failed turn is decided by
+    /// the trigger the harness reports next, and a turn that failed after
+    /// something else had already moved the run moves nothing at all. What
+    /// this writes is the cause, which the transition does not carry and which
+    /// is otherwise only in the error the worker discards.
+    pub fn journal_turn_failure(
+        &mut self,
+        run_id: i64,
+        failure: &TurnFailure<'_>,
+    ) -> Result<(), TransitionRejection> {
+        let detail: String = failure
+            .detail
+            .chars()
+            .take(TURN_FAILURE_DETAIL_MAX_CHARS)
+            .collect();
+
+        self.machines.journal(&[EventRow {
+            id: None,
+            run_id: Some(run_id),
+            event_type: TURN_FAILED_EVENT.to_owned(),
+            class: EventClass::Infra,
+            payload: serde_json::json!({
+                "category": failure.category,
+                "detail": detail,
+                "state": failure.state.map(RunState::as_str),
+            })
+            .to_string(),
+            ts: failure.now,
+        }])?;
+
+        Ok(())
     }
 
     /// Names the physical execution one of a run's attempts is running as.

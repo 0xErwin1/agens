@@ -20,8 +20,8 @@ use agens_server::{
     MergeAuthorization, OPERATION_AUTHORIZATION, Operation, PendingHookTrust, PortError, Ports,
     Principal, ProvisionedWorktree, RepositoryIdentity, RepositoryPolicy, RetryRequest, RunFacts,
     RunRef, RunTrigger, SessionControl, StateMachines, StopRequest, StopScope, Subscription,
-    TakeoverHandle, TransitionRejection, WorktreeDerivation, WorktreeGate, WorktreeRequest,
-    praetor_may_answer,
+    TURN_FAILED_EVENT, TakeoverHandle, TransitionRejection, TurnFailure, WorktreeDerivation,
+    WorktreeGate, WorktreeRequest, praetor_may_answer,
 };
 use agens_store::{
     ControlPlaneStore, QuestionAuthor, QuestionKind, QuestionRow, QuestionState, RetryTrigger,
@@ -653,6 +653,57 @@ fn a_refusal_is_journaled_against_the_run() {
     assert_eq!(payload["operation"], "authorize_merge");
     assert_eq!(payload["principal"], "praetor");
     assert_eq!(denial.ts, NOW);
+}
+
+/// A turn that ended without a completion carries the only account of why, and
+/// the transition the harness reports next does not carry it.
+#[test]
+fn a_turn_that_failed_leaves_its_cause_in_the_run_s_journal() {
+    let mut store = store();
+    let run_id = store.insert_run(&run_in(RunState::Running, None)).unwrap();
+    let mut harness = Harness::build(store, RecordingWorktrees::new(false, true));
+
+    let detail = "x".repeat(4_096);
+    harness
+        .core
+        .journal_turn_failure(
+            run_id,
+            &TurnFailure {
+                category: "provider",
+                detail: &detail,
+                state: Some(RunState::Running),
+                now: NOW,
+            },
+        )
+        .unwrap();
+
+    let recorded = harness
+        .core
+        .machines()
+        .store()
+        .events_for_run(run_id)
+        .unwrap()
+        .into_iter()
+        .find(|event| event.event_type == TURN_FAILED_EVENT)
+        .expect("the cause is not in the journal");
+
+    let payload: serde_json::Value = serde_json::from_str(&recorded.payload).unwrap();
+    assert_eq!(payload["category"], "provider");
+    assert_eq!(payload["state"], "running");
+    assert!(
+        payload["detail"]
+            .as_str()
+            .expect("the detail is a string")
+            .len()
+            < detail.len(),
+        "whatever a provider produced is kept to a cause, not a document"
+    );
+    assert_eq!(recorded.ts, NOW);
+    assert_eq!(
+        harness.run_state(run_id),
+        RunState::Running,
+        "recording the cause moves nothing"
+    );
 }
 
 #[test]

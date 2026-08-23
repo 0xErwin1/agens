@@ -51,7 +51,7 @@ use agens_permissions::{PermissionPromptAnswer, PermissionPromptContext, Permiss
 use agens_server::{
     ApiCore, FactSender, LaunchError, RunFacts, RunIntrospection, RunLaunch, RunSession,
     RunTrigger, RunWorkerFactory, SessionAdmission, SessionBudget, SessionId, SessionOutcome,
-    SessionProvider, SessionRuntime,
+    SessionProvider, SessionRuntime, TurnFailure,
 };
 use agens_store::{ControlPlaneStore, RunRow, RunState, SessionStore};
 
@@ -356,7 +356,7 @@ fn execute(
                 honoured_reset(seconds, quota_park_ceiling(run.quota_window_seconds))
             }),
         ),
-        (Err(_), None) => stopped(core, run.run_id),
+        (Err(failure), None) => stopped(core, run.run_id, &failure.error),
     }
 }
 
@@ -477,20 +477,68 @@ fn quota_checkpoint(
 /// successful park looks from here. A run that left `running` stopped where a
 /// transition put it, and calling that attempt a failure would both contradict
 /// the row and spend a retry the park does not cost.
-fn stopped(core: &Arc<Mutex<ApiCore>>, run_id: i64) -> SessionOutcome {
-    match state_of(core, run_id) {
-        // The failure is already recorded in the run's diagnostics and in the
-        // attempt the turn wrote; what the control plane needs is that this
-        // attempt did not succeed.
-        Some(RunState::Running) => report(
-            core,
-            run_id,
-            RunTrigger::AttemptFailed,
-            SessionOutcome::Failed,
-        ),
-        Some(_) => SessionOutcome::Completed,
-        None => SessionOutcome::Failed,
+///
+/// Which is only true of the two states a park leaves. Every other state the
+/// run could be in means the turn failed after something else moved it, and
+/// reporting that session completed would credit a failure to whatever moved
+/// the run. The cause goes in the journal first: it is the only account of why
+/// the turn ended, and the transition the session reports does not carry it.
+fn stopped(
+    core: &Arc<Mutex<ApiCore>>,
+    run_id: i64,
+    failure: &agens_error::CliError,
+) -> SessionOutcome {
+    let state = state_of(core, run_id);
+    let outcome = outcome_after_failed_turn(state);
+
+    if outcome != SessionOutcome::Completed {
+        journal_turn_failure(core, run_id, state, failure);
     }
+
+    match state {
+        Some(RunState::Running) => report(core, run_id, RunTrigger::AttemptFailed, outcome),
+        _ => outcome,
+    }
+}
+
+/// What the session's outcome is, given where the run's row ended up.
+///
+/// `awaiting_input` and `awaiting_quota` are the two states a turn ends the run
+/// in on purpose, and both are the session doing its job. `cancelled` is not
+/// this session's failure either: it is what somebody asked for while the turn
+/// was running.
+const fn outcome_after_failed_turn(state: Option<RunState>) -> SessionOutcome {
+    match state {
+        Some(RunState::AwaitingInput | RunState::AwaitingQuota) => SessionOutcome::Completed,
+        Some(RunState::Cancelled) => SessionOutcome::Cancelled,
+        _ => SessionOutcome::Failed,
+    }
+}
+
+/// Writes down what ended the turn.
+///
+/// Best effort, and deliberately not something the outcome depends on: a run
+/// whose cause could not be journaled is still a run whose session failed, and
+/// refusing to report that would leave the row saying the work is executing.
+fn journal_turn_failure(
+    core: &Arc<Mutex<ApiCore>>,
+    run_id: i64,
+    state: Option<RunState>,
+    failure: &agens_error::CliError,
+) {
+    let Ok(mut core) = core.lock() else {
+        return;
+    };
+
+    let _ = core.journal_turn_failure(
+        run_id,
+        &TurnFailure {
+            category: failure.category,
+            detail: &failure.message,
+            state,
+            now: now(),
+        },
+    );
 }
 
 /// Reports a turn that came back, given what the run's own row now says.
@@ -853,7 +901,55 @@ fn now() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{QUOTA_PARK_CEILING_SECONDS, honoured_reset, quota_park_ceiling};
+    use agens_server::SessionOutcome;
+    use agens_store::RunState;
+
+    use super::{
+        QUOTA_PARK_CEILING_SECONDS, honoured_reset, outcome_after_failed_turn, quota_park_ceiling,
+    };
+
+    #[test]
+    fn a_turn_that_parked_the_run_is_a_session_that_did_its_job() {
+        for state in [RunState::AwaitingInput, RunState::AwaitingQuota] {
+            assert_eq!(
+                outcome_after_failed_turn(Some(state)),
+                SessionOutcome::Completed,
+                "{state:?} is where a turn parks the run on purpose"
+            );
+        }
+    }
+
+    #[test]
+    fn a_turn_that_failed_after_the_run_moved_is_not_reported_as_completed() {
+        for state in [
+            RunState::Running,
+            RunState::Queued,
+            RunState::Draft,
+            RunState::Done,
+            RunState::Failed,
+            RunState::Interrupted,
+        ] {
+            assert_eq!(
+                outcome_after_failed_turn(Some(state)),
+                SessionOutcome::Failed,
+                "a provider that failed with the run in {state:?} failed this session"
+            );
+        }
+
+        assert_eq!(
+            outcome_after_failed_turn(None),
+            SessionOutcome::Failed,
+            "a run that cannot be read says nothing that would excuse the turn"
+        );
+    }
+
+    #[test]
+    fn a_run_somebody_cancelled_did_not_fail() {
+        assert_eq!(
+            outcome_after_failed_turn(Some(RunState::Cancelled)),
+            SessionOutcome::Cancelled
+        );
+    }
 
     #[test]
     fn a_reset_within_the_ceiling_is_honoured_as_the_provider_named_it() {

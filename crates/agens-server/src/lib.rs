@@ -55,8 +55,9 @@ pub use api::{
     EventFilter, HookPolicy, InboxItem, InboxView, MergeAuthorization, MergeAuthorized,
     OPERATION_AUTHORIZATION, Operation, OperationAuthorization, PortError, Ports, PreparedRun,
     ProvisionedWorktree, RepositoryIdentity, RetryRequest, RunRef, RunSummary, RunView,
-    SessionControl, StopRequest, StopScope, Subscription, TakeoverHandle, TreeSnapshot,
-    WorktreeDerivation, WorktreeGate, WorktreeRequest, praetor_may_answer,
+    SessionControl, StopRequest, StopScope, Subscription, TURN_FAILED_EVENT, TakeoverHandle,
+    TreeSnapshot, TurnFailure, WorktreeDerivation, WorktreeGate, WorktreeRequest,
+    praetor_may_answer,
 };
 pub use blocking::{BlockingBoundary, BlockingError};
 pub use coordinator::{
