@@ -62,12 +62,12 @@ pub use mcp_status::{
 pub use run_introspection::{AskTool, CheckpointTool};
 pub use stdio_mcp::{MAX_MCP_FRAME_BYTES, McpStdioTransport, McpStdioTransportConfig};
 pub use task::{
-    TaskControlAction, TaskControlTool, TaskDeclarationRejection, TaskExecutionEvent,
-    TaskExecutionId, TaskExecutionLifecycle, TaskExecutionLimits, TaskExecutionRegistry,
-    TaskExecutionSnapshot, TaskInvocation, TaskLaunchMode, TaskMessage, TaskMessageSource,
-    TaskMessageTarget, TaskMessageTool, TaskModelResolutionError, TaskRegistryError,
-    TaskRunContext, TaskRunner, TaskRunnerError, TaskSkill, TaskTerminalState, TaskTool,
-    TaskTurnRequest, TaskTurnResult,
+    TaskCancellationCause, TaskControlAction, TaskControlTool, TaskDeclarationRejection,
+    TaskExecutionEvent, TaskExecutionId, TaskExecutionLifecycle, TaskExecutionLimits,
+    TaskExecutionRegistry, TaskExecutionSnapshot, TaskInvocation, TaskLaunchMode, TaskMessage,
+    TaskMessageSource, TaskMessageTarget, TaskMessageTool, TaskModelResolutionError,
+    TaskRegistryError, TaskRunContext, TaskRunner, TaskRunnerError, TaskSkill, TaskTerminalState,
+    TaskTool, TaskTurnRequest, TaskTurnResult,
 };
 pub use working_directory::{WorkingDirectory, WorkingDirectoryObserver};
 pub use worktree_provisioning::{

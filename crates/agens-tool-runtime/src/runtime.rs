@@ -743,7 +743,7 @@ pub fn production_child_tool_runtime(
         provider_tools.push(
             OpenAiFunctionTool::new(
                 "task_control",
-                "Inspect, background, or cancel this subagent execution",
+                "Inspect, background, cancel, or wait for this subagent execution",
                 TaskControlTool::input_schema(),
             )
             .map_err(|_| CliError::configuration("task control tool is unavailable"))?,
@@ -1588,7 +1588,7 @@ mod tests {
             .expect("eligible catalog should expose task");
         assert_eq!(
             task.description(),
-            "Dispatch an isolated eligible subagent task in the foreground or background"
+            "Dispatch an isolated eligible subagent task. After background delegation, end the turn; its completion notice arrives on the next turn."
         );
         assert_eq!(
             task.parameters()["properties"]["agent"]["enum"],

@@ -333,7 +333,7 @@ fn register_task_tool<R: TaskRunner>(
         "task".into(),
         OpenAiFunctionTool::new(
             "task",
-            "Dispatch an isolated eligible subagent task in the foreground or background",
+            "Dispatch an isolated eligible subagent task. After background delegation, end the turn; its completion notice arrives on the next turn.",
             input_schema,
         )
         .map_err(|_| CliError::configuration("task tool is unavailable"))?,
@@ -424,7 +424,7 @@ fn register_task_coordination_tools(
         "task_control".into(),
         OpenAiFunctionTool::new(
             "task_control",
-            "Inspect, background, or cancel a live subagent execution",
+            "Inspect, background, cancel, or wait for a live subagent execution",
             TaskControlTool::input_schema(),
         )
         .map_err(|_| CliError::configuration("task control tool is unavailable"))?,

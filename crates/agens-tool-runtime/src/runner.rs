@@ -13,8 +13,8 @@ use agens_core::{MessagePart, TurnEvent, TurnProgressSink};
 use agens_core::{SubagentErrorKind, SubagentStatus};
 use agens_core::{TuiExecutionEvent, TuiRuntimeEvent, TuiSubagentEvent};
 use agens_tools::{
-    TaskExecutionEvent, TaskExecutionLifecycle, TaskExecutionRegistry, TaskLaunchMode,
-    TaskRunContext, TaskRunner, TaskRunnerError, TaskTurnRequest, TaskTurnResult,
+    TaskCancellationCause, TaskExecutionEvent, TaskExecutionLifecycle, TaskExecutionRegistry,
+    TaskLaunchMode, TaskRunContext, TaskRunner, TaskRunnerError, TaskTurnRequest, TaskTurnResult,
 };
 
 use crate::child::{ChildRunError, ProductionTaskExecutionContext, run_production_task};
@@ -227,10 +227,13 @@ impl TuiTaskLifecycleBridge {
                             TuiExecutionEvent::Completed { .. } => {
                                 (SubagentStatus::Success, "completed")
                             }
-                            TuiExecutionEvent::Failed { .. } => (SubagentStatus::Failure, "failed"),
-                            TuiExecutionEvent::Cancelled { .. } => {
-                                (SubagentStatus::Cancelled, "cancelled")
+                            TuiExecutionEvent::Failed { .. } => {
+                                (SubagentStatus::Failure, "failed on its own")
                             }
+                            TuiExecutionEvent::Cancelled { .. } => (
+                                SubagentStatus::Cancelled,
+                                terminal_cancellation_state(&registry, id),
+                            ),
                             _ => unreachable!("terminal event was matched above"),
                         };
                         let final_result = terminal_results
@@ -328,6 +331,20 @@ impl TuiTaskLifecycleBridge {
 
     fn publish(&self, event: TuiRuntimeEvent) {
         let _ = self.events.publish(event, &BridgeCancel::new(), None);
+    }
+}
+
+fn terminal_cancellation_state(registry: &TaskExecutionRegistry, id: u64) -> &'static str {
+    match registry
+        .snapshot(agens_tools::TaskExecutionId::from_value(id))
+        .and_then(|snapshot| snapshot.cancellation_cause)
+    {
+        Some(TaskCancellationCause::ParentTurn) => {
+            "cancelled because the parent turn was cancelled"
+        }
+        Some(TaskCancellationCause::TaskControl) => "cancelled by task_control cancel",
+        Some(TaskCancellationCause::SessionClosed) => "cancelled because the session closed",
+        None => "cancelled",
     }
 }
 

@@ -7,7 +7,7 @@ use std::{
     collections::{BTreeMap, VecDeque},
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc,
     },
@@ -66,6 +66,13 @@ pub enum TaskTerminalState {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TaskCancellationCause {
+    ParentTurn,
+    TaskControl,
+    SessionClosed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TaskExecutionEvent {
     Admitted(TaskExecutionId, TaskLaunchMode),
     Backgrounded(TaskExecutionId),
@@ -79,12 +86,14 @@ pub enum TaskControlAction {
     Background,
     Cancel,
     Status,
+    Wait,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TaskMessageSource {
     Main,
     User,
+    Supervisor,
     Execution(TaskExecutionId),
 }
 
@@ -124,6 +133,7 @@ pub struct TaskExecutionSnapshot {
     pub id: TaskExecutionId,
     pub mode: TaskLaunchMode,
     pub cancellation_requested: bool,
+    pub cancellation_cause: Option<TaskCancellationCause>,
     pub terminal: Option<TaskTerminalState>,
     pub result: Option<ToolOutput>,
 }
@@ -143,10 +153,23 @@ impl TaskControlTool {
         serde_json::json!({
             "type": "object",
             "additionalProperties": false,
-            "required": ["action", "id"],
+            "required": ["action"],
             "properties": {
-                "action": {"type": "string", "enum": ["background", "cancel", "status"]},
-                "id": {"type": "integer", "minimum": 1}
+                "action": {"type": "string", "enum": ["background", "cancel", "status", "wait"]},
+                "id": {"type": "integer", "minimum": 1},
+                "ids": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 4,
+                    "uniqueItems": true,
+                    "items": {"type": "integer", "minimum": 1}
+                },
+                "deadline_ms": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 300000,
+                    "description": "Required for wait. Waits until every named subagent is terminal or this bounded deadline expires; expiry reports their current states and does not cancel them."
+                }
             }
         })
     }
@@ -154,22 +177,48 @@ impl TaskControlTool {
 
 impl DispatchTool for TaskControlTool {
     fn permission_target(&self, arguments: &Value) -> Result<String, Error> {
-        parse_execution_id(arguments).map(|id| id.value().to_string())
+        let request = parse_task_control_request(arguments)?;
+        Ok(request
+            .ids
+            .iter()
+            .map(|id| id.value().to_string())
+            .collect::<Vec<_>>()
+            .join(","))
     }
 
-    fn execute(&mut self, _: &ToolExecutionContext, arguments: Value) -> Result<ToolOutput, Error> {
-        let id = parse_execution_id(&arguments)?;
-        let action = match arguments.get("action").and_then(Value::as_str) {
-            Some("background") => TaskControlAction::Background,
-            Some("cancel") => TaskControlAction::Cancel,
-            Some("status") => TaskControlAction::Status,
-            _ => return Ok(ToolOutput::failure("task control arguments are invalid")),
+    fn execute(
+        &mut self,
+        context: &ToolExecutionContext,
+        arguments: Value,
+    ) -> Result<ToolOutput, Error> {
+        let request = match parse_task_control_request(&arguments) {
+            Ok(request) => request,
+            Err(_) => return Ok(ToolOutput::failure("task control arguments are invalid")),
         };
-        if arguments.as_object().is_none_or(|object| object.len() != 2) {
-            return Ok(ToolOutput::failure("task control arguments are invalid"));
+
+        if request.action == TaskControlAction::Wait {
+            if matches!(self.source, TaskMessageSource::Execution(_)) {
+                return Ok(ToolOutput::failure("task control target is unavailable"));
+            }
+            let snapshots = self.registry.wait_for_terminal(
+                &request.ids,
+                Duration::from_millis(request.deadline_ms.expect("wait has a deadline")),
+                context,
+            );
+            return Ok(match snapshots {
+                Some(snapshots) => ToolOutput::success(
+                    snapshots
+                        .iter()
+                        .map(task_status)
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ),
+                None => ToolOutput::failure("task control target is unavailable"),
+            });
         }
 
-        if action == TaskControlAction::Status {
+        let id = request.ids[0];
+        if request.action == TaskControlAction::Status {
             if let TaskMessageSource::Execution(source_id) = self.source
                 && source_id != id
             {
@@ -181,19 +230,98 @@ impl DispatchTool for TaskControlTool {
             });
         }
 
-        Ok(match self.registry.control(self.source, id, action) {
-            Ok(()) => match action {
-                TaskControlAction::Background => {
-                    ToolOutput::success(format!("Subagent #{} moved to background", id.value()))
-                }
-                TaskControlAction::Cancel => {
-                    ToolOutput::success(format!("Subagent #{} cancellation requested", id.value()))
-                }
-                TaskControlAction::Status => unreachable!("status handled above"),
+        Ok(
+            match self.registry.control(self.source, id, request.action) {
+                Ok(()) => match request.action {
+                    TaskControlAction::Background => {
+                        ToolOutput::success(format!("Subagent #{} moved to background", id.value()))
+                    }
+                    TaskControlAction::Cancel => ToolOutput::success(format!(
+                        "Subagent #{} cancellation requested",
+                        id.value()
+                    )),
+                    TaskControlAction::Status | TaskControlAction::Wait => {
+                        unreachable!("status and wait are handled above")
+                    }
+                },
+                Err(_) => ToolOutput::failure("task control target is unavailable"),
             },
-            Err(_) => ToolOutput::failure("task control target is unavailable"),
-        })
+        )
     }
+}
+
+struct TaskControlRequest {
+    action: TaskControlAction,
+    ids: Vec<TaskExecutionId>,
+    deadline_ms: Option<u64>,
+}
+
+fn parse_task_control_request(arguments: &Value) -> Result<TaskControlRequest, Error> {
+    const MAX_WAIT_IDS: usize = 4;
+    const MAX_WAIT_DEADLINE_MS: u64 = 300_000;
+
+    let object = arguments
+        .as_object()
+        .ok_or_else(|| Error::Tool("task control arguments are invalid".into()))?;
+    let action = match object.get("action").and_then(Value::as_str) {
+        Some("background") => TaskControlAction::Background,
+        Some("cancel") => TaskControlAction::Cancel,
+        Some("status") => TaskControlAction::Status,
+        Some("wait") => TaskControlAction::Wait,
+        _ => return Err(Error::Tool("task control arguments are invalid".into())),
+    };
+    let ids = match (object.get("id"), object.get("ids")) {
+        (Some(id), None) => vec![parse_execution_id_value(id)?],
+        (None, Some(Value::Array(ids)))
+            if action == TaskControlAction::Wait
+                && !ids.is_empty()
+                && ids.len() <= MAX_WAIT_IDS =>
+        {
+            let ids = ids
+                .iter()
+                .map(parse_execution_id_value)
+                .collect::<Result<Vec<_>, _>>()?;
+            if ids
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                != ids.len()
+            {
+                return Err(Error::Tool("task control arguments are invalid".into()));
+            }
+            ids
+        }
+        _ => return Err(Error::Tool("task control arguments are invalid".into())),
+    };
+    let deadline_ms = match action {
+        TaskControlAction::Wait => match object.get("deadline_ms").and_then(Value::as_u64) {
+            Some(deadline_ms) if deadline_ms <= MAX_WAIT_DEADLINE_MS => Some(deadline_ms),
+            _ => return Err(Error::Tool("task control arguments are invalid".into())),
+        },
+        _ => None,
+    };
+    let expected_fields = match action {
+        TaskControlAction::Wait => 2 + usize::from(deadline_ms.is_some()),
+        TaskControlAction::Background | TaskControlAction::Cancel | TaskControlAction::Status => 2,
+    };
+    if object.len() != expected_fields {
+        return Err(Error::Tool("task control arguments are invalid".into()));
+    }
+
+    Ok(TaskControlRequest {
+        action,
+        ids,
+        deadline_ms,
+    })
+}
+
+fn parse_execution_id_value(value: &Value) -> Result<TaskExecutionId, Error> {
+    value
+        .as_u64()
+        .filter(|id| *id > 0)
+        .map(TaskExecutionId)
+        .ok_or_else(|| Error::Tool("task control arguments are invalid".into()))
 }
 
 #[derive(Clone)]
@@ -270,15 +398,6 @@ fn enqueue_message(
     Ok(())
 }
 
-fn parse_execution_id(arguments: &Value) -> Result<TaskExecutionId, Error> {
-    arguments
-        .get("id")
-        .and_then(Value::as_u64)
-        .filter(|id| *id > 0)
-        .map(TaskExecutionId)
-        .ok_or_else(|| Error::Tool("task control arguments are invalid".into()))
-}
-
 fn parse_message_target(arguments: &Value) -> Result<TaskMessageTarget, Error> {
     match arguments.get("target") {
         Some(Value::String(target)) if target == "main" => Ok(TaskMessageTarget::Main),
@@ -328,7 +447,13 @@ impl Default for TaskExecutionLimits {
 
 #[derive(Clone, Default)]
 pub struct TaskExecutionRegistry {
-    inner: Arc<Mutex<TaskExecutionRegistryState>>,
+    inner: Arc<TaskExecutionRegistryInner>,
+}
+
+#[derive(Default)]
+struct TaskExecutionRegistryInner {
+    state: Mutex<TaskExecutionRegistryState>,
+    changed: Condvar,
 }
 
 #[derive(Default)]
@@ -342,15 +467,37 @@ struct TaskExecutionRegistryState {
 struct TaskExecutionRecord {
     lifecycle: TaskExecutionLifecycle,
     cancellation: Arc<AtomicBool>,
+    cancellation_cause: Option<TaskCancellationCause>,
     result: Option<ToolOutput>,
     mailbox: TaskMailbox,
     worker: Option<thread::JoinHandle<()>>,
+}
+
+fn request_cancellation(execution: &mut TaskExecutionRecord, cause: TaskCancellationCause) {
+    if !execution.cancellation.swap(true, Ordering::AcqRel) {
+        execution.cancellation_cause = Some(cause);
+    }
 }
 
 #[derive(Default)]
 struct TaskMailbox {
     messages: VecDeque<TaskMessage>,
     bytes: usize,
+}
+
+fn task_snapshot(
+    registry: &TaskExecutionRegistryState,
+    id: TaskExecutionId,
+) -> Option<TaskExecutionSnapshot> {
+    let execution = registry.executions.get(&id)?;
+    Some(TaskExecutionSnapshot {
+        id,
+        mode: execution.lifecycle.mode(),
+        cancellation_requested: execution.cancellation.load(Ordering::Acquire),
+        cancellation_cause: execution.cancellation_cause,
+        terminal: execution.lifecycle.terminal(),
+        result: execution.result.clone(),
+    })
 }
 
 impl TaskExecutionRegistry {
@@ -362,6 +509,7 @@ impl TaskExecutionRegistry {
         let registry = Self::default();
         registry
             .inner
+            .state
             .lock()
             .expect("task registry lock poisoned")
             .limits = limits;
@@ -370,6 +518,7 @@ impl TaskExecutionRegistry {
 
     pub fn limits(&self) -> TaskExecutionLimits {
         self.inner
+            .state
             .lock()
             .expect("task registry lock poisoned")
             .limits
@@ -377,7 +526,11 @@ impl TaskExecutionRegistry {
 
     pub fn admit(&self, mode: TaskLaunchMode) -> Option<TaskExecutionId> {
         self.join_finished_workers();
-        let mut registry = self.inner.lock().expect("task registry lock poisoned");
+        let mut registry = self
+            .inner
+            .state
+            .lock()
+            .expect("task registry lock poisoned");
         let active = registry
             .executions
             .values()
@@ -394,6 +547,7 @@ impl TaskExecutionRegistry {
             TaskExecutionRecord {
                 lifecycle: TaskExecutionLifecycle::new(id, mode),
                 cancellation: Arc::new(AtomicBool::new(false)),
+                cancellation_cause: None,
                 result: None,
                 mailbox: TaskMailbox::default(),
                 worker: None,
@@ -404,6 +558,7 @@ impl TaskExecutionRegistry {
 
     pub fn lifecycle(&self, id: TaskExecutionId) -> Option<TaskExecutionLifecycle> {
         self.inner
+            .state
             .lock()
             .ok()?
             .executions
@@ -413,6 +568,7 @@ impl TaskExecutionRegistry {
 
     pub fn cancellation_handle(&self, id: TaskExecutionId) -> Option<Arc<AtomicBool>> {
         self.inner
+            .state
             .lock()
             .ok()?
             .executions
@@ -421,20 +577,13 @@ impl TaskExecutionRegistry {
     }
 
     pub fn snapshot(&self, id: TaskExecutionId) -> Option<TaskExecutionSnapshot> {
-        let registry = self.inner.lock().ok()?;
-        let execution = registry.executions.get(&id)?;
-        Some(TaskExecutionSnapshot {
-            id,
-            mode: execution.lifecycle.mode(),
-            cancellation_requested: execution.cancellation.load(Ordering::Acquire),
-            terminal: execution.lifecycle.terminal(),
-            result: execution.result.clone(),
-        })
+        let registry = self.inner.state.lock().ok()?;
+        task_snapshot(&registry, id)
     }
 
     /// Returns active executions in admission order for read-only projections.
     pub fn active_snapshots(&self) -> Vec<TaskExecutionSnapshot> {
-        let Ok(registry) = self.inner.lock() else {
+        let Ok(registry) = self.inner.state.lock() else {
             return Vec::new();
         };
 
@@ -446,6 +595,7 @@ impl TaskExecutionRegistry {
                 id: *id,
                 mode: execution.lifecycle.mode(),
                 cancellation_requested: execution.cancellation.load(Ordering::Acquire),
+                cancellation_cause: execution.cancellation_cause,
                 terminal: None,
                 result: None,
             })
@@ -462,18 +612,54 @@ impl TaskExecutionRegistry {
         terminal: TaskTerminalState,
         result: ToolOutput,
     ) -> bool {
-        let Ok(mut registry) = self.inner.lock() else {
-            return false;
-        };
-        let Some(execution) = registry.executions.get_mut(&id) else {
-            return false;
-        };
-        if !execution.lifecycle.finish(terminal) {
-            return false;
-        }
+        let finished = {
+            let Ok(mut registry) = self.inner.state.lock() else {
+                return false;
+            };
+            let Some(execution) = registry.executions.get_mut(&id) else {
+                return false;
+            };
+            if !execution.lifecycle.finish(terminal) {
+                return false;
+            }
 
-        execution.result = Some(result);
-        true
+            execution.result = Some(result);
+            true
+        };
+        if finished {
+            self.inner.changed.notify_all();
+        }
+        finished
+    }
+
+    /// Waits only for the named executions. The caller's timeout bounds this
+    /// wait; expiry merely returns their last snapshots and never cancels work.
+    fn wait_for_terminal(
+        &self,
+        ids: &[TaskExecutionId],
+        timeout: Duration,
+        context: &ToolExecutionContext,
+    ) -> Option<Vec<TaskExecutionSnapshot>> {
+        let deadline = Instant::now().checked_add(timeout)?;
+        let mut registry = self.inner.state.lock().ok()?;
+        loop {
+            let snapshots = ids
+                .iter()
+                .map(|id| task_snapshot(&registry, *id))
+                .collect::<Option<Vec<_>>>()?;
+            if snapshots.iter().all(|snapshot| snapshot.terminal.is_some())
+                || context.is_cancelled()
+                || context.is_expired()
+                || Instant::now() >= deadline
+            {
+                return Some(snapshots);
+            }
+
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let wait = remaining.min(TASK_RESULT_POLL_INTERVAL);
+            let (next, _) = self.inner.changed.wait_timeout(registry, wait).ok()?;
+            registry = next;
+        }
     }
 
     pub fn control(
@@ -490,6 +676,7 @@ impl TaskExecutionRegistry {
 
         let mut registry = self
             .inner
+            .state
             .lock()
             .map_err(|_| TaskRegistryError::UnknownExecution)?;
         let execution = registry
@@ -507,10 +694,10 @@ impl TaskExecutionRegistry {
                 .then_some(())
                 .ok_or(TaskRegistryError::InvalidControl),
             TaskControlAction::Cancel => {
-                execution.cancellation.store(true, Ordering::Release);
+                request_cancellation(execution, TaskCancellationCause::TaskControl);
                 Ok(())
             }
-            TaskControlAction::Status => Ok(()),
+            TaskControlAction::Status | TaskControlAction::Wait => Ok(()),
         }
     }
 
@@ -522,6 +709,24 @@ impl TaskExecutionRegistry {
     pub fn cancel(&self, id: TaskExecutionId) -> bool {
         self.control(TaskMessageSource::Main, id, TaskControlAction::Cancel)
             .is_ok()
+    }
+
+    pub fn cancel_for_parent_turn(&self, id: TaskExecutionId) -> bool {
+        self.request_cancellation(id, TaskCancellationCause::ParentTurn)
+    }
+
+    fn request_cancellation(&self, id: TaskExecutionId, cause: TaskCancellationCause) -> bool {
+        let Ok(mut registry) = self.inner.state.lock() else {
+            return false;
+        };
+        let Some(execution) = registry.executions.get_mut(&id) else {
+            return false;
+        };
+        if execution.lifecycle.terminal().is_some() {
+            return false;
+        }
+        request_cancellation(execution, cause);
+        true
     }
 
     pub fn is_cancelled(&self, id: TaskExecutionId) -> bool {
@@ -549,6 +754,7 @@ impl TaskExecutionRegistry {
 
         let mut registry = self
             .inner
+            .state
             .lock()
             .map_err(|_| TaskRegistryError::UnknownExecution)?;
         if let TaskMessageSource::Execution(source_id) = source {
@@ -590,6 +796,7 @@ impl TaskExecutionRegistry {
 
         let mut registry = self
             .inner
+            .state
             .lock()
             .map_err(|_| TaskRegistryError::UnknownExecution)?;
         if !registry.executions.contains_key(&id) {
@@ -603,8 +810,27 @@ impl TaskExecutionRegistry {
         )
     }
 
+    /// Queues a trusted system-originated notice for the next main turn. It is
+    /// intentionally separate from `task_message`: a cancellation is not prose
+    /// from a child or a person, and the provider must receive its origin as a role.
+    pub fn notify_main_supervisor(&self, content: String) -> Result<(), TaskRegistryError> {
+        if content.is_empty() || content.len() > MAX_TASK_MESSAGE_BYTES {
+            return Err(TaskRegistryError::MessageLimit);
+        }
+        let mut registry = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| TaskRegistryError::UnknownExecution)?;
+        enqueue_message(
+            &mut registry.main_mailbox,
+            TaskMessageSource::Supervisor,
+            content,
+        )
+    }
+
     pub fn drain_messages(&self, target: TaskMessageTarget) -> Vec<TaskMessage> {
-        let Ok(mut registry) = self.inner.lock() else {
+        let Ok(mut registry) = self.inner.state.lock() else {
             return Vec::new();
         };
         let mailbox = match target {
@@ -623,7 +849,7 @@ impl TaskExecutionRegistry {
     pub fn wait_for_idle(&self, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         loop {
-            let idle = self.inner.lock().is_ok_and(|registry| {
+            let idle = self.inner.state.lock().is_ok_and(|registry| {
                 registry
                     .executions
                     .values()
@@ -642,23 +868,23 @@ impl TaskExecutionRegistry {
 
     /// Requests cancellation for every active execution and returns the IDs confirmed active.
     pub fn cancel_all(&self) -> Vec<TaskExecutionId> {
-        let Ok(registry) = self.inner.lock() else {
+        let Ok(mut registry) = self.inner.state.lock() else {
             return Vec::new();
         };
 
         registry
             .executions
-            .iter()
+            .iter_mut()
             .filter(|(_, execution)| execution.lifecycle.terminal().is_none())
             .map(|(id, execution)| {
-                execution.cancellation.store(true, Ordering::Release);
+                request_cancellation(execution, TaskCancellationCause::SessionClosed);
                 *id
             })
             .collect()
     }
 
     fn set_worker(&self, id: TaskExecutionId, worker: thread::JoinHandle<()>) {
-        if let Ok(mut registry) = self.inner.lock()
+        if let Ok(mut registry) = self.inner.state.lock()
             && let Some(execution) = registry.executions.get_mut(&id)
         {
             execution.worker = Some(worker);
@@ -668,6 +894,7 @@ impl TaskExecutionRegistry {
     fn join_finished_workers(&self) {
         let workers = self
             .inner
+            .state
             .lock()
             .map(|mut registry| {
                 registry
@@ -981,6 +1208,7 @@ pub enum TaskModelResolutionError {
 pub struct TaskRunContext {
     pub cancellation: Arc<AtomicBool>,
     parent_cancellation: Arc<AtomicBool>,
+    inherits_parent_cancellation: bool,
     deadline: Option<Instant>,
     timed_out: Arc<AtomicBool>,
     execution: Option<TaskExecutionLifecycle>,
@@ -992,6 +1220,7 @@ impl TaskRunContext {
     fn new(
         cancellation: Arc<AtomicBool>,
         parent_cancellation: Arc<AtomicBool>,
+        inherits_parent_cancellation: bool,
         deadline: Option<Instant>,
         execution: TaskExecutionLifecycle,
         registry: TaskExecutionRegistry,
@@ -999,6 +1228,7 @@ impl TaskRunContext {
         Self {
             cancellation,
             parent_cancellation,
+            inherits_parent_cancellation,
             deadline,
             timed_out: Arc::new(AtomicBool::new(false)),
             execution: Some(execution),
@@ -1028,7 +1258,8 @@ impl TaskRunContext {
 
     pub fn is_cancelled(&self) -> bool {
         self.cancellation.load(Ordering::Acquire)
-            || self.parent_cancellation.load(Ordering::Acquire)
+            || (self.inherits_parent_cancellation
+                && self.parent_cancellation.load(Ordering::Acquire))
     }
 
     pub fn is_expired(&self) -> bool {
@@ -1193,7 +1424,7 @@ impl<R: TaskRunner> TaskTool<R> {
                 "agent": {"type": "string", "minLength": 1, "maxLength": 64},
                 "background": {
                     "type": "boolean",
-                    "description": "Run this call in the background and return immediately. Only background calls run concurrently: several foreground calls issued together are executed one after another."
+                    "description": "Use background only when you can do other work or should return control to the user. For one delegation whose result is needed now, use foreground: it waits in this turn and avoids a follow-up turn. After a background call, end this turn; its terminal notice is delivered on the next turn. Use task_message to steer the child while it runs. Only background calls run concurrently: several foreground calls issued together are executed one after another."
                 },
                 "description": {
                     "type": "string",
@@ -1500,6 +1731,7 @@ impl<R: TaskRunner> TaskTool<R> {
         let context = TaskRunContext::new(
             cancellation,
             parent.cancellation_handle(),
+            mode == TaskLaunchMode::Foreground,
             parent.deadline(),
             lifecycle,
             self.registry.clone(),
@@ -1554,6 +1786,7 @@ impl<R: TaskRunner> TaskTool<R> {
             self.registry.clone(),
             execution_id,
             context.parent_cancellation.clone(),
+            context.inherits_parent_cancellation,
             context.deadline,
             context.timed_out.clone(),
         );
@@ -1564,7 +1797,7 @@ impl<R: TaskRunner> TaskTool<R> {
 
         loop {
             if parent.is_cancelled() {
-                self.registry.cancel(execution_id);
+                self.registry.cancel_for_parent_turn(execution_id);
                 return Ok(task_terminal(HeadlessTaskTerminal::Cancelled));
             }
             if parent.is_expired() {
@@ -1598,6 +1831,7 @@ fn spawn_inherited_stop_relay(
     registry: TaskExecutionRegistry,
     execution_id: TaskExecutionId,
     parent_cancellation: Arc<AtomicBool>,
+    inherits_parent_cancellation: bool,
     deadline: Option<Instant>,
     timed_out: Arc<AtomicBool>,
 ) {
@@ -1609,7 +1843,7 @@ fn spawn_inherited_stop_relay(
             {
                 return;
             }
-            if parent_cancellation.load(Ordering::Acquire) {
+            if inherits_parent_cancellation && parent_cancellation.load(Ordering::Acquire) {
                 registry.cancel(execution_id);
                 return;
             }

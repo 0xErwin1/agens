@@ -536,14 +536,7 @@ impl<P: TurnProvider + Send> TurnProvider for TaskMailboxProvider<P> {
             .map(|registry| registry.drain_messages(self.target))
             .unwrap_or_default()
             .into_iter()
-            .map(|message| Message {
-                role: Role::User,
-                parts: vec![MessagePart::Text(format!(
-                    "[coordination source={} untrusted=true]\n{}",
-                    task_message_source_label(message.source()),
-                    message.content(),
-                ))],
-            })
+            .map(coordination_message)
             .collect::<Vec<_>>();
         if self.provider_rounds > 0
             && self
@@ -590,13 +583,20 @@ fn supervision_advisory(
 }
 
 fn coordination_message(message: agens_tools::TaskMessage) -> Message {
+    let (role, content) = match message.source() {
+        TaskMessageSource::Supervisor => (Role::Supervisor, message.content().to_owned()),
+        source => (
+            Role::User,
+            format!(
+                "[coordination source={} untrusted=true]\n{}",
+                task_message_source_label(source),
+                message.content(),
+            ),
+        ),
+    };
     Message {
-        role: Role::User,
-        parts: vec![MessagePart::Text(format!(
-            "[coordination source={} untrusted=true]\n{}",
-            task_message_source_label(message.source()),
-            message.content(),
-        ))],
+        role,
+        parts: vec![MessagePart::Text(content)],
     }
 }
 
@@ -604,6 +604,7 @@ fn task_message_source_label(source: TaskMessageSource) -> String {
     match source {
         TaskMessageSource::Main => "main".into(),
         TaskMessageSource::User => "user".into(),
+        TaskMessageSource::Supervisor => "supervisor".into(),
         TaskMessageSource::Execution(id) => format!("subagent:{}", id.value()),
     }
 }
