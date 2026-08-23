@@ -247,6 +247,7 @@ impl StateMachines {
             }),
             new_question: None,
             attempt: None,
+            close_attempt: None,
             provider: None,
             events: &events,
         })?;

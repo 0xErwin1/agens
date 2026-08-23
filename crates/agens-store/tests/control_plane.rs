@@ -577,6 +577,7 @@ fn an_applied_transition_writes_the_state_change_and_every_event_together() {
             question: None,
             new_question: None,
             attempt: None,
+            close_attempt: None,
             provider: None,
             events: &[
                 event(run_id, "run_state_changed"),
@@ -616,6 +617,7 @@ fn a_transition_against_a_state_the_run_already_left_writes_nothing() {
             question: None,
             new_question: None,
             attempt: None,
+            close_attempt: None,
             provider: None,
             events: &[event(run_id, "run_state_changed")],
         })
@@ -695,6 +697,7 @@ fn a_transition_carries_its_attempt_question_and_provider_writes() {
                 tokens: None,
                 cost_micros: None,
             }),
+            close_attempt: None,
             provider: Some(&ProviderRow {
                 provider: "anthropic".to_owned(),
                 quota_state: QuotaState::Ok,
@@ -771,6 +774,7 @@ fn a_question_write_that_loses_its_race_rolls_back_the_run_state_with_it() {
             }),
             new_question: None,
             attempt: None,
+            close_attempt: None,
             provider: None,
             events: &[event(run_id, "run_state_changed")],
         })
@@ -870,6 +874,7 @@ fn a_transition_opens_its_question_in_the_same_write_as_the_state_change() {
             question: None,
             new_question: Some(&question_in(run_id, QuestionState::Open)),
             attempt: None,
+            close_attempt: None,
             provider: None,
             events: &[event(run_id, "run_state_changed")],
         })
@@ -908,6 +913,7 @@ fn a_refused_transition_opens_no_question() {
             question: None,
             new_question: Some(&question_in(run_id, QuestionState::Open)),
             attempt: None,
+            close_attempt: None,
             provider: None,
             events: &[event(run_id, "run_state_changed")],
         })

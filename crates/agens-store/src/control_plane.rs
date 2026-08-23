@@ -413,6 +413,18 @@ pub struct QuestionChange {
     pub answer: Option<QuestionAnswer>,
 }
 
+/// How the attempt a transition ends came to an end.
+///
+/// The outcome is what separates a leg the agent is answerable for from one it
+/// is not: parking on a question, waiting out a quota and being cut off by a
+/// restart all end an attempt without it having failed, and only the recorded
+/// outcome can tell them apart afterwards.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AttemptClose {
+    pub ended_at: i64,
+    pub outcome: AttemptOutcome,
+}
+
 /// Everything one applied transition writes.
 ///
 /// It is one struct rather than a call per table because a state change and the
@@ -434,6 +446,14 @@ pub struct TransitionWrite<'a> {
     pub new_question: Option<&'a QuestionRow>,
     /// A new attempt row opened by this transition.
     pub attempt: Option<&'a AttemptRow>,
+    /// How the run's open attempt ended, when this transition ends one.
+    ///
+    /// It travels with the transition for the same reason the new attempt
+    /// does: an attempt left open after the leg it measured has finished is
+    /// counted as still running by everything that reads the table, and a
+    /// close written in a second statement can be lost while the state change
+    /// stands.
+    pub close_attempt: Option<AttemptClose>,
     /// The provider's quota state as this transition leaves it.
     pub provider: Option<&'a ProviderRow>,
     pub events: &'a [EventRow],
@@ -445,6 +465,10 @@ pub struct TransitionOutcome {
     /// Journal ids in the order the events were given.
     pub event_ids: Vec<i64>,
     pub attempt_id: Option<i64>,
+    /// How many of the run's open attempts this transition closed. Zero is an
+    /// ordinary answer: a run leaving a state it never executed in has no open
+    /// attempt to end.
+    pub closed_attempts: usize,
     /// The question this transition opened, when it opened one.
     pub question_id: Option<i64>,
 }
@@ -507,6 +531,34 @@ impl ControlPlaneStore {
     #[must_use]
     pub fn database_path(&self) -> PathBuf {
         self.database_path.clone()
+    }
+
+    /// Reports whether the database file is structurally sound.
+    ///
+    /// `quick_check` rather than `integrity_check`: it finds the corruption a
+    /// process killed mid-write leaves behind, which is the case boot has to
+    /// rule out, without the full-table scan that would make the check itself
+    /// a reason not to run it at every start.
+    ///
+    /// It is a read, so a caller that skips it is not less safe than one that
+    /// never had it. What it buys is that a coordinator refuses to reconcile
+    /// against a file it cannot trust, rather than writing transitions into it.
+    pub fn verify_integrity(&self) -> Result<()> {
+        const OPERATION: &str = "verify integrity";
+
+        let verdict: String = self
+            .connection
+            .query_row("PRAGMA quick_check(1)", [], |row| row.get(0))
+            .map_err(|error| ControlPlaneError::operation(OPERATION, &self.database_path, error))?;
+
+        if verdict == "ok" {
+            Ok(())
+        } else {
+            Err(ControlPlaneError::detail(format!(
+                "control plane at {} failed its integrity check: {verdict}",
+                self.database_path.display()
+            )))
+        }
     }
 
     pub fn insert_run(&mut self, run: &RunRow) -> Result<i64> {
@@ -920,6 +972,15 @@ impl ControlPlaneStore {
             None => None,
         };
 
+        // Closed before the new one is opened, so a transition that does both
+        // cannot close the attempt it just wrote.
+        let closed_attempts = match write.close_attempt {
+            Some(close) => {
+                close_open_attempts(&transaction, write.run_id, close).map_err(failure)?
+            }
+            None => 0,
+        };
+
         let attempt_id = match write.attempt {
             Some(attempt) => Some(insert_attempt_row(&transaction, attempt).map_err(failure)?),
             None => None,
@@ -939,6 +1000,7 @@ impl ControlPlaneStore {
         Ok(TransitionOutcome {
             event_ids,
             attempt_id,
+            closed_attempts,
             question_id,
         })
     }
@@ -1053,6 +1115,24 @@ fn insert_attempt_row(connection: &Connection, attempt: &AttemptRow) -> rusqlite
     )?;
 
     Ok(connection.last_insert_rowid())
+}
+
+/// Ends every attempt of one run that is still open.
+///
+/// Every one rather than the latest: a row left open by an earlier defect is
+/// counted as running by the retry budget and by anything summing durations,
+/// and the transition that ends the leg is the last moment at which the
+/// coordinator knows they are all over.
+fn close_open_attempts(
+    connection: &Connection,
+    run_id: i64,
+    close: AttemptClose,
+) -> rusqlite::Result<usize> {
+    connection.execute(
+        "UPDATE attempts SET ended_at = ?1, outcome = ?2
+         WHERE run_id = ?3 AND ended_at IS NULL AND outcome IS NULL",
+        params![close.ended_at, close.outcome.as_str(), run_id],
+    )
 }
 
 fn insert_question_row(connection: &Connection, question: &QuestionRow) -> rusqlite::Result<i64> {

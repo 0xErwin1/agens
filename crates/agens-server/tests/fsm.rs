@@ -12,9 +12,9 @@ use std::{
 
 use agens_server::{
     Principal, QUESTION_TRANSITIONS, QuestionFacts, QuestionGuard, QuestionTransition,
-    QuestionTrigger, RUN_TRANSITIONS, RunFacts, RunGuard, RunTransition, RunTrigger, StateMachines,
-    TransitionOutcome, TransitionRejection, WORKTREE_TRANSITIONS, WorktreeFacts, WorktreeGuard,
-    WorktreeTransition, WorktreeTrigger,
+    QuestionTrigger, RUN_TRANSITIONS, RunEffect, RunFacts, RunGuard, RunTransition, RunTrigger,
+    StateMachines, TransitionOutcome, TransitionRejection, WORKTREE_TRANSITIONS, WorktreeFacts,
+    WorktreeGuard, WorktreeTransition, WorktreeTrigger,
 };
 use agens_store::{
     AttemptOutcome, AttemptRow, ControlPlaneStore, ProviderRow, QuestionAuthor, QuestionKind,
@@ -1295,6 +1295,229 @@ fn every_run_parked_on_one_provider_wakes_once_its_cap_is_lifted() {
         machines.store().load_run(second).unwrap().unwrap().state,
         RunState::Queued
     );
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+/// The open attempt of one run, for the assertions about how a leg ended.
+fn open_attempt(run_id: i64, started_at: i64) -> AttemptRow {
+    AttemptRow {
+        id: None,
+        run_id,
+        n: 1,
+        session_id: None,
+        session_attempt_id: None,
+        started_at,
+        ended_at: None,
+        outcome: None,
+        retry_trigger: None,
+        tokens: None,
+        cost_micros: None,
+    }
+}
+
+#[test]
+fn every_transition_that_declares_it_closes_the_open_attempt_with_the_declared_outcome() {
+    for transition in RUN_TRANSITIONS {
+        let Some(declared) = transition.effects.iter().find_map(|effect| match effect {
+            RunEffect::CloseAttempt(outcome) => Some(*outcome),
+            _ => None,
+        }) else {
+            continue;
+        };
+
+        let directory = data_directory();
+        let mut store = ControlPlaneStore::open(&directory).unwrap();
+        let run_id = store
+            .insert_run(&run_in(transition.from, Some(WorktreeStatus::Active)))
+            .unwrap();
+        store
+            .insert_attempt(&open_attempt(run_id, NOW - 90))
+            .unwrap();
+        let facts = facts_for(&mut store, run_id, transition);
+        let mut machines = StateMachines::new(store);
+
+        machines
+            .apply_run(run_id, transition.trigger, &facts)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{} on {} was refused: {error}",
+                    transition.trigger.as_str(),
+                    transition.from.as_str()
+                )
+            });
+
+        let attempt = machines
+            .store()
+            .attempts_for_run(run_id)
+            .unwrap()
+            .into_iter()
+            .find(|attempt| attempt.n == 1)
+            .expect("the attempt the leg ran as is still there");
+
+        assert_eq!(
+            attempt.outcome,
+            Some(declared),
+            "{} on {}",
+            transition.trigger.as_str(),
+            transition.from.as_str()
+        );
+        assert_eq!(attempt.ended_at, Some(NOW));
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+}
+
+#[test]
+fn a_run_that_only_ever_parked_keeps_its_whole_retry_budget() {
+    let directory = data_directory();
+    let mut store = ControlPlaneStore::open(&directory).unwrap();
+    let run_id = store
+        .insert_run(&run_in(RunState::Running, Some(WorktreeStatus::Active)))
+        .unwrap();
+    store
+        .insert_attempt(&open_attempt(run_id, NOW - 90))
+        .unwrap();
+    let mut machines = StateMachines::new(store);
+
+    // Three legs that end without the agent having failed: an `ask`, the
+    // answer that brings it back, and a restart that cuts the next one off.
+    machines
+        .apply_run(
+            run_id,
+            RunTrigger::Ask,
+            &RunFacts {
+                now: NOW,
+                opened_question: Some(question_in(
+                    run_id,
+                    QuestionKind::Question,
+                    QuestionState::Open,
+                    None,
+                )),
+                ..RunFacts::default()
+            },
+        )
+        .unwrap();
+
+    let question_id = machines
+        .store()
+        .questions_for_run(run_id)
+        .unwrap()
+        .first()
+        .and_then(|question| question.id)
+        .expect("the ask opened a question");
+
+    machines
+        .apply_question(
+            question_id,
+            agens_server::QuestionTrigger::Answer,
+            &QuestionFacts {
+                now: NOW,
+                answer: Some("keep it".to_owned()),
+                author: Some(QuestionAuthor::User),
+            },
+        )
+        .unwrap();
+    machines
+        .apply_run(
+            run_id,
+            RunTrigger::Answered,
+            &RunFacts {
+                now: NOW,
+                answered_question_id: Some(question_id),
+                ..RunFacts::default()
+            },
+        )
+        .unwrap();
+    machines
+        .apply_run(
+            run_id,
+            RunTrigger::Admit,
+            &RunFacts {
+                now: NOW,
+                slot_available: true,
+                provider_serving: true,
+                worktree_ready: true,
+                ..RunFacts::default()
+            },
+        )
+        .unwrap();
+    machines
+        .apply_run(
+            run_id,
+            RunTrigger::Reconcile,
+            &RunFacts {
+                now: NOW,
+                boot_reconciliation: true,
+                ..RunFacts::default()
+            },
+        )
+        .unwrap();
+
+    let parked: Vec<Option<AttemptOutcome>> = machines
+        .store()
+        .attempts_for_run(run_id)
+        .unwrap()
+        .into_iter()
+        .map(|attempt| attempt.outcome)
+        .collect();
+    assert_eq!(
+        parked,
+        vec![
+            Some(AttemptOutcome::Interrupted),
+            Some(AttemptOutcome::Interrupted)
+        ]
+    );
+
+    machines
+        .apply_run(
+            run_id,
+            RunTrigger::Resume,
+            &RunFacts {
+                now: NOW,
+                ..RunFacts::default()
+            },
+        )
+        .unwrap();
+    machines
+        .apply_run(
+            run_id,
+            RunTrigger::Admit,
+            &RunFacts {
+                now: NOW,
+                slot_available: true,
+                provider_serving: true,
+                worktree_ready: true,
+                ..RunFacts::default()
+            },
+        )
+        .unwrap();
+    machines
+        .apply_run(
+            run_id,
+            RunTrigger::AttemptFailed,
+            &RunFacts {
+                now: NOW,
+                ..RunFacts::default()
+            },
+        )
+        .unwrap();
+
+    // Four attempt rows, and only the last one failed. A budget of two has
+    // room for exactly one more, which is what a run that parked three times
+    // and failed once should have: before the legs were closed, all four
+    // counted and the retry was refused with the budget untouched.
+    let retried = machines.apply_run(
+        run_id,
+        RunTrigger::Retry,
+        &RunFacts {
+            now: NOW,
+            guidance: Some("read the failing test first".to_owned()),
+            retry_budget: 2,
+            ..RunFacts::default()
+        },
+    );
+    assert!(retried.is_ok(), "{:?}", retried.err());
 
     fs::remove_dir_all(directory).unwrap();
 }

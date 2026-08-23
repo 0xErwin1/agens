@@ -9,8 +9,8 @@
 //! replanning opens a new run that inherits the worktree and the lineage.
 
 use agens_store::{
-    AttemptRow, EventClass, ProviderRow, QuestionRow, QuestionState, QuotaState, RetryTrigger,
-    RunState, StateChange, TransitionWrite, WorktreeStatus,
+    AttemptClose, AttemptOutcome, AttemptRow, EventClass, ProviderRow, QuestionRow, QuestionState,
+    QuotaState, RetryTrigger, RunState, StateChange, TransitionWrite, WorktreeStatus,
 };
 
 use super::{
@@ -130,17 +130,24 @@ impl RunGuard {
 
 /// What an applied transition causes.
 ///
-/// [`RunEffect::OpenAttempt`], [`RunEffect::CapProvider`] and
-/// [`RunEffect::ClearProviderCap`] are control-plane state, and the machine
-/// writes them in the same transaction as the state change. Every other effect
-/// names work outside this store — a slot, a session, a queue, a cancellation —
-/// and is returned to the caller to perform.
+/// [`RunEffect::OpenAttempt`], [`RunEffect::CloseAttempt`],
+/// [`RunEffect::CapProvider`] and [`RunEffect::ClearProviderCap`] are
+/// control-plane state, and the machine writes them in the same transaction as
+/// the state change. Every other effect names work outside this store — a slot,
+/// a session, a queue, a cancellation — and is returned to the caller to
+/// perform.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RunEffect {
     /// Scope, definition of done, priority and budget stop being editable.
     FreezeApprovedScope,
     /// Opens attempt N+1, with its own cost and duration.
     OpenAttempt,
+    /// Ends the attempt the run was executing, with the outcome that says
+    /// whether the agent is answerable for how the leg ended. An attempt left
+    /// open reads as still running to everything that counts them, and the
+    /// retry budget is what pays for it: a run that only ever parked would
+    /// exhaust its budget without a single failure.
+    CloseAttempt(AttemptOutcome),
     /// Writes the durable question the run parks on. `ask` is the only way a
     /// question comes into being: one buried in a transcript does not exist.
     OpenQuestion,
@@ -213,6 +220,7 @@ pub static RUN_TRANSITIONS: &[RunTransition] = &[
         guard: RunGuard::AskOpensQuestion,
         effects: &[
             RunEffect::OpenQuestion,
+            RunEffect::CloseAttempt(AttemptOutcome::Interrupted),
             RunEffect::ReleaseSlot,
             RunEffect::SuspendSession,
         ],
@@ -225,6 +233,7 @@ pub static RUN_TRANSITIONS: &[RunTransition] = &[
         to: RunState::AwaitingQuota,
         guard: RunGuard::ReportedByHarness,
         effects: &[
+            RunEffect::CloseAttempt(AttemptOutcome::Interrupted),
             RunEffect::ReleaseSlot,
             RunEffect::SuspendSession,
             RunEffect::CapProvider,
@@ -264,7 +273,7 @@ pub static RUN_TRANSITIONS: &[RunTransition] = &[
         trigger: RunTrigger::Finished,
         to: RunState::Done,
         guard: RunGuard::ReportedByHarness,
-        effects: &[],
+        effects: &[RunEffect::CloseAttempt(AttemptOutcome::Succeeded)],
         domain_event: "run_finished",
         class: EventClass::Agent,
     },
@@ -273,7 +282,7 @@ pub static RUN_TRANSITIONS: &[RunTransition] = &[
         trigger: RunTrigger::AttemptFailed,
         to: RunState::Failed,
         guard: RunGuard::ReportedByHarness,
-        effects: &[],
+        effects: &[RunEffect::CloseAttempt(AttemptOutcome::Failed)],
         domain_event: "run_failed",
         class: EventClass::Agent,
     },
@@ -300,7 +309,10 @@ pub static RUN_TRANSITIONS: &[RunTransition] = &[
         trigger: RunTrigger::Reconcile,
         to: RunState::Interrupted,
         guard: RunGuard::BootReconciliation,
-        effects: &[RunEffect::ResumeWithoutChargingRetry],
+        effects: &[
+            RunEffect::CloseAttempt(AttemptOutcome::Interrupted),
+            RunEffect::ResumeWithoutChargingRetry,
+        ],
         domain_event: "run_interrupted",
         class: EventClass::Infra,
     },
@@ -327,13 +339,21 @@ pub static RUN_TRANSITIONS: &[RunTransition] = &[
 
 /// Cancellation reaches every state a run can still be doing something in, and
 /// always the same way, so the rows are generated rather than copied.
+///
+/// Closing the attempt is declared for all of them even though only `running`
+/// has one open: closing nothing writes nothing, and a state whose attempt
+/// stayed open because its row was the one not listed is the failure this
+/// exists to prevent.
 const fn cancellation(from: RunState) -> RunTransition {
     RunTransition {
         from,
         trigger: RunTrigger::Cancel,
         to: RunState::Cancelled,
         guard: RunGuard::None,
-        effects: &[RunEffect::CancelImmediately],
+        effects: &[
+            RunEffect::CloseAttempt(AttemptOutcome::Interrupted),
+            RunEffect::CancelImmediately,
+        ],
         domain_event: "run_cancelled",
         class: EventClass::Infra,
     }
@@ -415,6 +435,11 @@ impl StateMachines {
             .then(|| self.next_attempt(run_id, facts))
             .transpose()?;
 
+        let close_attempt = closed_outcome(transition.effects).map(|outcome| AttemptClose {
+            ended_at: facts.now,
+            outcome,
+        });
+
         let provider = self.provider_write(transition, &run.provider, facts);
 
         let events = transition_events(
@@ -449,6 +474,7 @@ impl StateMachines {
                 .then_some(facts.opened_question.as_ref())
                 .flatten(),
             attempt: attempt.as_ref(),
+            close_attempt,
             provider: provider.as_ref(),
             events: &events,
         })?;
@@ -668,4 +694,15 @@ impl StateMachines {
             updated_at: facts.now,
         })
     }
+}
+
+/// The outcome a transition ends the run's open attempt with, if it ends one.
+///
+/// Read out of the declared effects rather than restated per transition, so the
+/// table stays the only place that says which legs end an attempt and how.
+fn closed_outcome(effects: &[RunEffect]) -> Option<AttemptOutcome> {
+    effects.iter().find_map(|effect| match effect {
+        RunEffect::CloseAttempt(outcome) => Some(*outcome),
+        _ => None,
+    })
 }
