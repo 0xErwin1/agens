@@ -8,6 +8,7 @@
 mod api;
 mod blocking;
 mod cache;
+mod chat;
 mod coordinator;
 mod diagnostics;
 mod fsm;
@@ -60,6 +61,10 @@ pub use api::{
     praetor_may_answer,
 };
 pub use blocking::{BlockingBoundary, BlockingError};
+pub use chat::{
+    ChatError, ChatEvent, ChatSession, ChatSessionFactory, ChatSessionRequest, ChatSessions,
+    ChatTurnOutcome, ChatTurns,
+};
 pub use coordinator::{
     ADMISSION_FAILED_EVENT, BootReconciliation, CORE_POISONED_EVENT, Coordinator, CoordinatorError,
     CoordinatorSettings, MissingWorktree, OrphanWorktree, RUN_DEFERRED_EVENT, RunLaunch,
