@@ -232,10 +232,13 @@ pub static RUN_TRANSITIONS: &[RunTransition] = &[
         trigger: RunTrigger::QuotaReached,
         to: RunState::AwaitingQuota,
         guard: RunGuard::ReportedByHarness,
+        // No `SuspendSession`, unlike `ask`: the worker is the party that
+        // reports the cap, and it ends its own session on the way out. Nothing
+        // realized the effect, and a declared effect nobody performs reads as a
+        // suspension the daemon owes and never makes.
         effects: &[
             RunEffect::CloseAttempt(AttemptOutcome::Interrupted),
             RunEffect::ReleaseSlot,
-            RunEffect::SuspendSession,
             RunEffect::CapProvider,
         ],
         domain_event: "quota_reached",

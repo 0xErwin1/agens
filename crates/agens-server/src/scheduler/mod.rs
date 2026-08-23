@@ -42,7 +42,10 @@ use agens_store::{RunRow, RunState, WorktreeStatus};
 pub use launcher::{RunSession, SupervisorLauncher};
 pub use queue::{Candidate, Ineligible, Queue};
 
-use crate::fsm::{Principal, RunFacts, RunTrigger, StateMachines, TransitionRejection};
+use crate::fsm::{
+    Principal, RunFacts, RunTrigger, StateMachines, TransitionRejection,
+    WORKTREE_HOLDING_RUN_STATES,
+};
 use crate::sessions::SessionId;
 
 /// The ceilings admission is bounded by.
@@ -386,7 +389,7 @@ impl Slots {
 
         let held_worktrees = machines
             .store()
-            .held_worktrees_outside(RunState::Queued)
+            .held_worktrees_in(&holding_states_outside_the_queue())
             .map_err(SchedulerError::from_store)?;
 
         let mut per_provider: BTreeMap<String, usize> = BTreeMap::new();
@@ -404,7 +407,22 @@ impl Slots {
             subagents: load.subagents.clone(),
         })
     }
+}
 
+/// The worktree-holding states, less the one this tick is deciding on.
+///
+/// Queued runs are left out on purpose: each admission below reserves a
+/// worktree of its own, and counting a queued run here as well would charge it
+/// against the ceiling it is asking to pass.
+fn holding_states_outside_the_queue() -> Vec<RunState> {
+    WORKTREE_HOLDING_RUN_STATES
+        .iter()
+        .copied()
+        .filter(|state| *state != RunState::Queued)
+        .collect()
+}
+
+impl Slots {
     /// Takes a slot for one provider, or names the ceiling that refused it.
     fn offer(&mut self, provider: &str) -> Result<(), Deferral> {
         if self.running >= self.concurrency_limit {

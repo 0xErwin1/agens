@@ -67,15 +67,15 @@ pub use coordinator::{
 pub use diagnostics::CoordinatorDiagnostics;
 pub use fsm::{
     AppliedQuestionTransition, AppliedRunTransition, AppliedTransition, AppliedWorktreeTransition,
-    Principal, QUESTION_TRANSITIONS, QuestionEffect, QuestionFacts, QuestionGuard,
+    MergeSettlement, Principal, QUESTION_TRANSITIONS, QuestionEffect, QuestionFacts, QuestionGuard,
     QuestionTransition, QuestionTrigger, RUN_TRANSITIONS, RunEffect, RunFacts, RunGuard,
-    RunTransition, RunTrigger, StateMachines, TransitionOutcome, TransitionRejection,
-    WORKTREE_TRANSITIONS, WorktreeEffect, WorktreeFacts, WorktreeGuard, WorktreeTransition,
-    WorktreeTrigger,
+    RunTransition, RunTrigger, SettledMerge, StateMachines, TransitionOutcome, TransitionRejection,
+    WORKTREE_HOLDING_RUN_STATES, WORKTREE_TRANSITIONS, WorktreeEffect, WorktreeFacts,
+    WorktreeGuard, WorktreeTransition, WorktreeTrigger,
 };
 pub use gates::{
-    GateError, GateRefusal, Gates, MergePath, PreMergeRequest, PreMergeVerdict, Receipt,
-    ReclaimRequest, ReclaimVerdict, SubAgentKind, SubAgentRequest, freeze_receipt,
+    DisposeVerdict, GateError, GateRefusal, Gates, MergePath, PreMergeRequest, PreMergeVerdict,
+    Receipt, ReclaimRequest, ReclaimVerdict, SubAgentKind, SubAgentRequest, freeze_receipt,
 };
 pub use grpc::{CoreHandle, FacadeBinding, FacadeError, FeedFacade, TeamFacade};
 pub use ingest::{
@@ -101,8 +101,9 @@ pub use sessions::{
 };
 pub use timers::{
     CHECKPOINT_EVENT, CHECKPOINT_OVERDUE_EVENT, DEFAULT_CHECKPOINT_GRACE_PERCENT,
-    DEFAULT_QUOTA_WINDOW_SECONDS, ExpiredQuestion, ManualTimerClock, OverdueCheckpoint, QuotaReset,
-    RejectedStage, TIMER_STAGE_REJECTED_EVENT, TimerSettings, TimerStage, TimerTick, TimerWheel,
+    DEFAULT_FIRST_CHECKPOINT_SECONDS, DEFAULT_QUOTA_WINDOW_SECONDS, ExpiredQuestion,
+    ManualTimerClock, OverdueCheckpoint, QuotaReset, RejectedStage, TIMER_STAGE_REJECTED_EVENT,
+    TimerSettings, TimerStage, TimerTick, TimerWheel,
 };
 
 #[derive(Debug)]

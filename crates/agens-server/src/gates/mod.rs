@@ -56,12 +56,14 @@
 
 use std::path::Path;
 
-use agens_store::{EventClass, EventRow, QuestionAuthor, QuestionKind, QuestionState, RunRow};
+use agens_store::{
+    EventClass, EventRow, QuestionAuthor, QuestionKind, QuestionState, RunRow, WorktreeStatus,
+};
 use agens_tools::{GateDerivation, MergeOutcome, SessionWorktrees, WorktreeError};
 use sha2::{Digest, Sha256};
 
 use crate::fsm::{
-    AppliedWorktreeTransition, QuestionFacts, QuestionTrigger, StateMachines, TransitionOutcome,
+    AppliedWorktreeTransition, MergeSettlement, SettledMerge, StateMachines, TransitionOutcome,
     TransitionRejection, WorktreeFacts, WorktreeTrigger,
 };
 
@@ -167,9 +169,28 @@ pub enum PreMergeVerdict {
 /// How a reclaim sweep ended.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReclaimVerdict {
-    Released(AppliedWorktreeTransition),
+    Released {
+        released: AppliedWorktreeTransition,
+        /// The move to `cleaned` the same sweep went on to make. `None` when
+        /// the directory could not be removed, which leaves the row
+        /// `reclaimable` for the next pass rather than declaring a disposal
+        /// that did not happen.
+        cleaned: Option<AppliedWorktreeTransition>,
+    },
     CleanupRequired(SubAgentRequest),
     Refused(GateRefusal),
+}
+
+/// How finishing an already released worktree ended.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DisposeVerdict {
+    /// The directory is gone and the row reached `cleaned`.
+    Cleaned(AppliedWorktreeTransition),
+    /// The row was not `reclaimable`, so there was nothing to finish.
+    NotReleased,
+    /// The directory is still on disk. Journaled, and the row stays
+    /// `reclaimable` for the next pass to try again.
+    Retained,
 }
 
 /// Why a gate refused. Nothing was merged and no worktree moved in any of these
@@ -218,6 +239,9 @@ pub enum GateRefusal {
     },
     /// The attestation says the work landed and git says it did not.
     NotMerged,
+    /// Git could not be asked at all, so no rule was evaluated. It is the one
+    /// entry here that is journaled beside an error rather than a verdict.
+    DerivationFailed,
 }
 
 impl GateRefusal {
@@ -238,6 +262,7 @@ impl GateRefusal {
             Self::GenesisUnfrozen => "genesis_unfrozen",
             Self::OutsideGenesisPaths { .. } => "outside_genesis_paths",
             Self::NotMerged => "not_merged",
+            Self::DerivationFailed => "derivation_failed",
         }
     }
 }
@@ -333,10 +358,11 @@ impl<'a> Gates<'a> {
     /// first because everything after it is a comparison against what git says
     /// now, the authorization is checked against that derivation, the
     /// transaction is checked against the frozen scope, and only then does
-    /// anything land. `gate_result`, the authorization being spent and `merged`
-    /// are all journaled before the worktree becomes reclaimable, so a
-    /// subscriber never sees a worktree released without the verdict that
-    /// released it, and never a merge whose authorization is still standing.
+    /// anything land. Once it has, `gate_result`, the authorization being
+    /// spent, `merged` and the release are one write: a subscriber never sees a
+    /// released directory without the verdict that released it, never a merge
+    /// whose authorization is still standing, and a failure between them is not
+    /// a state the store can be left in.
     pub fn pre_merge(&mut self, request: &PreMergeRequest) -> Result<PreMergeVerdict, GateError> {
         let run = self.load_run(request.run_id)?;
 
@@ -344,9 +370,13 @@ impl<'a> Gates<'a> {
             return self.refuse_pre_merge(request, None, GateRefusal::NoWorktree);
         };
 
-        let derivation = self
+        let derivation = match self
             .worktrees
-            .derive(Path::new(&worktree), &request.main_ref)?;
+            .derive(Path::new(&worktree), &request.main_ref)
+        {
+            Ok(derivation) => derivation,
+            Err(error) => return Err(self.journal_derivation_failure(request, &error)?),
+        };
 
         if let Some(refusal) = topology_refusal(&derivation) {
             return self.refuse_pre_merge(request, Some(&derivation), refusal);
@@ -364,17 +394,57 @@ impl<'a> Gates<'a> {
             Integration::Refused(verdict) => return Ok(verdict),
         };
 
-        self.journal_gate_result(
+        let settled = self.settle(request, &derivation, &branch, commit.as_deref())?;
+
+        Ok(PreMergeVerdict::Merged {
+            commit,
+            worktree: settled.worktree,
+        })
+    }
+
+    /// Records everything a landed merge implies, in one write.
+    ///
+    /// The verdict, the authorization being spent, the `merged` entry and the
+    /// release travel together because a merge that has already happened cannot
+    /// be undone by a second statement failing. A settlement that never lands
+    /// leaves the approval unspent and no `gate_result` naming it, which is
+    /// exactly what the next sweep needs in order to present it again against a
+    /// branch git now reports as merged.
+    fn settle(
+        &mut self,
+        request: &PreMergeRequest,
+        derivation: &GateDerivation,
+        branch: &str,
+        commit: Option<&str>,
+    ) -> Result<SettledMerge, GateError> {
+        let verdict = self.gate_event(
             request.run_id,
             request.now,
-            &gate_payload(request, Some(&derivation), None),
-        )?;
-        self.consume_authorization(request)?;
-        self.journal_merged(request, &branch, commit.as_deref())?;
+            &gate_payload(request, Some(derivation), None),
+        );
+        let merged = EventRow {
+            id: None,
+            run_id: Some(request.run_id),
+            event_type: MERGED_EVENT.to_owned(),
+            class: EventClass::Infra,
+            payload: serde_json::json!({
+                "branch": branch,
+                "into": request.main_ref,
+                "path": request.path.as_str(),
+                "commit": commit,
+            })
+            .to_string(),
+            ts: request.now,
+        };
 
-        let worktree = self.release_worktree(request.run_id, request.now, &derivation)?;
-
-        Ok(PreMergeVerdict::Merged { commit, worktree })
+        Ok(self.machines.settle_merge(&MergeSettlement {
+            run_id: request.run_id,
+            approval_id: request.approval_id,
+            now: request.now,
+            verdict: &verdict,
+            merged: &merged,
+            worktree_clean: !derivation.dirty,
+        })?)
     }
 
     /// Sweeps one run's worktree, releasing it only when git says here and now
@@ -387,9 +457,17 @@ impl<'a> Gates<'a> {
             return Ok(ReclaimVerdict::Refused(GateRefusal::NoWorktree));
         };
 
-        let derivation = self
+        let derivation = match self
             .worktrees
-            .derive(Path::new(&worktree), &request.main_ref)?;
+            .derive(Path::new(&worktree), &request.main_ref)
+        {
+            Ok(derivation) => derivation,
+            Err(error) => {
+                self.journal_reclaim_result(request, None, Some(&GateRefusal::DerivationFailed))?;
+
+                return Err(GateError::Derivation(error));
+            }
+        };
 
         if derivation.branch.is_none() {
             self.journal_reclaim_result(
@@ -425,7 +503,7 @@ impl<'a> Gates<'a> {
 
         self.journal_reclaim_result(request, Some(&derivation), None)?;
 
-        let applied = self
+        let released = self
             .release_worktree(request.run_id, request.now, &derivation)?
             .ok_or_else(|| {
                 GateError::Transition(TransitionRejection::NoSuchTransition {
@@ -435,7 +513,93 @@ impl<'a> Gates<'a> {
                 })
             })?;
 
-        Ok(ReclaimVerdict::Released(applied))
+        // The sweep continues into the disposal rather than leaving the row on
+        // `reclaimable`: nothing else ever moves it on, and a row that stops
+        // there still counts against the worktree ceiling for the rest of the
+        // installation's life.
+        let cleaned = match self.dispose(request)? {
+            DisposeVerdict::Cleaned(applied) => Some(applied),
+            DisposeVerdict::NotReleased | DisposeVerdict::Retained => None,
+        };
+
+        Ok(ReclaimVerdict::Released { released, cleaned })
+    }
+
+    /// Removes a released worktree's directory and moves its row to `cleaned`.
+    ///
+    /// This is what makes `cleaned` reachable without a person: the merge gate
+    /// and the reclaim sweep both stop at `reclaimable`, and until this runs the
+    /// run goes on holding a directory and a slot in the worktree ceiling.
+    ///
+    /// A directory that is already gone is not an error. The row is the thing
+    /// that costs the machine something, and a disposal that refused to finish
+    /// because the filesystem had got there first would leave exactly the row
+    /// this exists to retire.
+    pub fn dispose(&mut self, request: &ReclaimRequest) -> Result<DisposeVerdict, GateError> {
+        let run = self.load_run(request.run_id)?;
+
+        if run.worktree_status != Some(WorktreeStatus::Reclaimable) {
+            return Ok(DisposeVerdict::NotReleased);
+        }
+
+        if let Some(worktree) = worktree_path(&run).map(ToOwned::to_owned)
+            && Path::new(&worktree).is_dir()
+            && let Some(refusal) = self.remove_directory(&run, Path::new(&worktree))
+        {
+            self.journal_dispose_result(request, Some(&refusal))?;
+
+            return Ok(DisposeVerdict::Retained);
+        }
+
+        // Nothing uncommitted is left to lose: either the directory is gone, or
+        // git has just removed it, and `worktree remove` refuses a worktree
+        // that still holds work.
+        let facts = WorktreeFacts {
+            now: request.now,
+            merge_re_derived: false,
+            worktree_clean: true,
+            manual_disposition_confirmed: false,
+        };
+
+        match self
+            .machines
+            .apply_worktree(request.run_id, WorktreeTrigger::Reclaim, &facts)
+        {
+            Ok(TransitionOutcome::Applied(applied)) => {
+                self.journal_dispose_result(request, None)?;
+
+                Ok(DisposeVerdict::Cleaned(applied))
+            }
+            Ok(TransitionOutcome::AlreadySettled)
+            | Err(TransitionRejection::NoSuchTransition { .. }) => Ok(DisposeVerdict::NotReleased),
+            Err(rejection) => Err(GateError::Transition(rejection)),
+        }
+    }
+
+    /// Removes the worktree directory, reporting what git said when it would
+    /// not.
+    ///
+    /// The repository id and the worktree name come from the path rather than
+    /// from the run row: the layout is `worktrees/<repository id>/<name>`, and
+    /// the directory that exists is the one the removal has to name.
+    fn remove_directory(&self, run: &RunRow, worktree: &Path) -> Option<String> {
+        let (Some(name), Some(repository_id)) = (
+            worktree.file_name().and_then(|name| name.to_str()),
+            worktree
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str()),
+        ) else {
+            return Some(format!(
+                "{} is not a session worktree path",
+                worktree.display()
+            ));
+        };
+
+        self.worktrees
+            .remove(Path::new(&run.repo_root), repository_id, name)
+            .err()
+            .map(|error| error.to_string())
     }
 
     /// Executes the merge, or reports why nothing was executed.
@@ -568,31 +732,6 @@ impl<'a> Gates<'a> {
         }
     }
 
-    /// Spends the authorization the merge went through.
-    ///
-    /// The question machine has no transition out of `delivered`, so this is
-    /// what makes an approval single-use: the same id presented again lands on
-    /// [`GateRefusal::NotAuthorized`] instead of passing a receipt comparison
-    /// that a landed branch has already made vacuous.
-    ///
-    /// It runs after the verdict is journaled and before `merged` is, so the
-    /// journal can hold neither a merge whose authorization was never spent nor
-    /// a spent authorization with no verdict behind it. A refusal never reaches
-    /// here: the approval stands, bound to bytes that did not move, and asking
-    /// again is the caller's.
-    fn consume_authorization(&mut self, request: &PreMergeRequest) -> Result<(), GateError> {
-        self.machines.apply_question(
-            request.approval_id,
-            QuestionTrigger::Deliver,
-            &QuestionFacts {
-                now: request.now,
-                ..QuestionFacts::default()
-            },
-        )?;
-
-        Ok(())
-    }
-
     /// Moves the worktree to `reclaimable`, reporting `None` when it was
     /// already past `active`.
     fn release_worktree(
@@ -656,6 +795,27 @@ impl<'a> Gates<'a> {
         self.journal_gate_result(request.run_id, request.now, &payload)
     }
 
+    /// Records what the disposal did, whichever way it went.
+    ///
+    /// A disposal that could not remove the directory is journaled for the same
+    /// reason a refused gate is: the row stays `reclaimable` and the next sweep
+    /// tries again, and without an entry a directory git will never let go of
+    /// is retried every interval with nothing to show for it.
+    fn journal_dispose_result(
+        &mut self,
+        request: &ReclaimRequest,
+        refusal: Option<&str>,
+    ) -> Result<(), GateError> {
+        let payload = serde_json::json!({
+            "gate": "dispose",
+            "passed": refusal.is_none(),
+            "main_ref": request.main_ref,
+            "reason": refusal,
+        });
+
+        self.journal_gate_result(request.run_id, request.now, &payload)
+    }
+
     /// Records work the coordinator is not allowed to do itself.
     ///
     /// It lands in the journal rather than only in the return value because the
@@ -692,41 +852,44 @@ impl<'a> Gates<'a> {
         now: i64,
         payload: &serde_json::Value,
     ) -> Result<(), GateError> {
-        self.machines.journal(&[EventRow {
-            id: None,
-            run_id: Some(run_id),
-            event_type: "gate_result".to_owned(),
-            class: EventClass::Infra,
-            payload: payload.to_string(),
-            ts: now,
-        }])?;
+        let event = self.gate_event(run_id, now, payload);
+        self.machines.journal(&[event])?;
 
         Ok(())
     }
 
-    fn journal_merged(
+    /// Records that git itself could not be asked, and carries the failure on.
+    ///
+    /// Without the entry the sweep re-runs the same invocation every interval
+    /// and leaves nothing behind that says it did: a repository the daemon
+    /// cannot reach looks identical to one it never looked at.
+    fn journal_derivation_failure(
         &mut self,
         request: &PreMergeRequest,
-        branch: &str,
-        commit: Option<&str>,
-    ) -> Result<(), GateError> {
-        let payload = serde_json::json!({
-            "branch": branch,
-            "into": request.main_ref,
-            "path": request.path.as_str(),
-            "commit": commit,
-        });
+        error: &WorktreeError,
+    ) -> Result<GateError, GateError> {
+        let mut payload = gate_payload(request, None, Some(GateRefusal::DerivationFailed.as_str()));
+        if let Some(object) = payload.as_object_mut() {
+            object.insert(
+                "detail".to_owned(),
+                serde_json::Value::from(error.to_string()),
+            );
+        }
 
-        self.machines.journal(&[EventRow {
+        self.journal_gate_result(request.run_id, request.now, &payload)?;
+
+        Ok(GateError::Derivation(error.clone()))
+    }
+
+    fn gate_event(&self, run_id: i64, now: i64, payload: &serde_json::Value) -> EventRow {
+        EventRow {
             id: None,
-            run_id: Some(request.run_id),
-            event_type: "merged".to_owned(),
+            run_id: Some(run_id),
+            event_type: GATE_RESULT_EVENT.to_owned(),
             class: EventClass::Infra,
             payload: payload.to_string(),
-            ts: request.now,
-        }])?;
-
-        Ok(())
+            ts: now,
+        }
     }
 
     fn load_run(&self, run_id: i64) -> Result<RunRow, GateError> {
@@ -740,6 +903,17 @@ impl<'a> Gates<'a> {
 
 /// The journal entry a gate's sub-agent request becomes.
 pub(crate) const SUB_AGENT_EVENT: &str = "sub_agent_requested";
+
+/// The journal entry every gate verdict becomes.
+///
+/// Declared here, where it is written, and imported by the sweep that reads it
+/// back: an approval is a candidate only until a `gate_result` names it, and the
+/// producer and the consumer disagreeing about the name would make every
+/// approval a candidate forever.
+pub(crate) const GATE_RESULT_EVENT: &str = "gate_result";
+
+/// The journal entry a landed merge becomes.
+pub(crate) const MERGED_EVENT: &str = "merged";
 
 /// Freezes the receipt an approval over `worktree` is bound to.
 ///

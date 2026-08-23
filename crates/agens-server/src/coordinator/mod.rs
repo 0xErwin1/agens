@@ -66,7 +66,8 @@ use crate::coordinator::queue_journal::QueueJournal;
 use crate::diagnostics::CoordinatorDiagnostics;
 use crate::fsm::StateMachines;
 use crate::gates::{
-    Gates, MergePath, PreMergeRequest, ReclaimRequest, SUB_AGENT_EVENT, SubAgentKind,
+    GATE_RESULT_EVENT, Gates, MergePath, PreMergeRequest, ReclaimRequest, SUB_AGENT_EVENT,
+    SubAgentKind,
 };
 use crate::ingest::{
     FactReceiver, FactSender, Ingest, IngestFact, ReportedFact, attribution_of,
@@ -656,15 +657,26 @@ fn gates_loop(
     })
 }
 
-/// One run whose worktree is still held, and the authorization it carries.
+/// One run whose worktree is still held, and the work its state calls for.
 struct GateCandidate {
     run_id: i64,
-    worktree_path: PathBuf,
-    /// The approval this run's merge would go through, when the user granted
-    /// one that no gate has been presented with yet.
-    approval_id: Option<i64>,
-    /// Whether a cleanup sub-agent has already been asked for.
-    cleanup_requested: bool,
+    work: GateWork,
+}
+
+/// What one candidate's worktree needs done to it.
+enum GateWork {
+    /// Active, with an authorization the user granted and no gate has seen.
+    Merge { approval_id: i64 },
+    /// Active, with no authorization: releasable only if its branch already
+    /// landed.
+    Release {
+        worktree_path: PathBuf,
+        /// Whether a cleanup sub-agent has already been asked for.
+        cleanup_requested: bool,
+    },
+    /// Already released, and still holding its directory and its place in the
+    /// worktree ceiling.
+    Dispose,
 }
 
 /// The sweep's own state: everything it needs that the store does not hold.
@@ -684,9 +696,26 @@ impl GatesSweep {
         };
 
         for candidate in candidates {
-            match candidate.approval_id {
-                Some(approval_id) => self.merge(core, &candidate, approval_id, now),
-                None => self.release(core, &candidate, now),
+            match &candidate.work {
+                GateWork::Merge { approval_id } => {
+                    self.merge(core, candidate.run_id, *approval_id, now);
+
+                    // The merge released the worktree; finishing it here rather
+                    // than a sweep interval later is what keeps a merged run
+                    // from holding its directory until the next pass.
+                    self.dispose(core, candidate.run_id, now);
+                }
+                GateWork::Release {
+                    worktree_path,
+                    cleanup_requested,
+                } => self.release(
+                    core,
+                    candidate.run_id,
+                    worktree_path,
+                    *cleanup_requested,
+                    now,
+                ),
+                GateWork::Dispose => self.dispose(core, candidate.run_id, now),
             }
         }
     }
@@ -697,9 +726,9 @@ impl GatesSweep {
     /// it refused is bound to bytes that did not move, so the next pass would
     /// reach the same verdict and would journal it again. That is what makes an
     /// approval a candidate only until a `gate_result` names it.
-    fn merge(&self, core: &Mutex<ApiCore>, candidate: &GateCandidate, approval_id: i64, now: i64) {
+    fn merge(&self, core: &Mutex<ApiCore>, run_id: i64, approval_id: i64, now: i64) {
         let request = PreMergeRequest {
-            run_id: candidate.run_id,
+            run_id,
             approval_id,
             path: MergePath::Integrate,
             main_ref: self.main_ref.clone(),
@@ -725,20 +754,24 @@ impl GatesSweep {
     /// gate re-derives and stays the only thing that forms a verdict. Asking
     /// about a branch that has not landed would journal a refusal on every
     /// pass, for a run nobody has done anything to.
-    fn release(&self, core: &Mutex<ApiCore>, candidate: &GateCandidate, now: i64) {
-        let Ok(derivation) = self
-            .worktrees
-            .derive(&candidate.worktree_path, &self.main_ref)
-        else {
+    fn release(
+        &self,
+        core: &Mutex<ApiCore>,
+        run_id: i64,
+        worktree_path: &Path,
+        cleanup_requested: bool,
+        now: i64,
+    ) {
+        let Ok(derivation) = self.worktrees.derive(worktree_path, &self.main_ref) else {
             return;
         };
 
-        if !derivation.merged || (derivation.dirty && candidate.cleanup_requested) {
+        if !derivation.merged || (derivation.dirty && cleanup_requested) {
             return;
         }
 
         let request = ReclaimRequest {
-            run_id: candidate.run_id,
+            run_id,
             main_ref: self.main_ref.clone(),
             now,
         };
@@ -747,6 +780,25 @@ impl GatesSweep {
             return;
         };
         let _verdict = Gates::new(core.machines_mut(), self.worktrees.clone()).reclaim(&request);
+    }
+
+    /// Finishes a released worktree: the directory goes and the row reaches
+    /// `cleaned`.
+    ///
+    /// Nothing else in the daemon moves a row off `reclaimable`, so without
+    /// this pass every finished run goes on counting against the worktree
+    /// ceiling until a person runs the cleaning flow by hand.
+    fn dispose(&self, core: &Mutex<ApiCore>, run_id: i64, now: i64) {
+        let request = ReclaimRequest {
+            run_id,
+            main_ref: self.main_ref.clone(),
+            now,
+        };
+
+        let Some(mut core) = self.taken(core) else {
+            return;
+        };
+        let _verdict = Gates::new(core.machines_mut(), self.worktrees.clone()).dispose(&request);
     }
 
     /// The core, or nothing and a daemon on its way down.
@@ -780,10 +832,6 @@ fn candidates(core: &ApiCore) -> Vec<GateCandidate> {
         };
 
         for run in runs {
-            if run.worktree_status != Some(WorktreeStatus::Active) {
-                continue;
-            }
-
             let (Some(run_id), Some(worktree_path)) = (
                 run.id,
                 run.worktree_path
@@ -794,12 +842,19 @@ fn candidates(core: &ApiCore) -> Vec<GateCandidate> {
                 continue;
             };
 
-            candidates.push(GateCandidate {
-                run_id,
-                worktree_path,
-                approval_id: pending_approval(store, run_id),
-                cleanup_requested: cleanup_requested(store, run_id),
-            });
+            let work = match run.worktree_status {
+                Some(WorktreeStatus::Active) => match pending_approval(store, run_id) {
+                    Some(approval_id) => GateWork::Merge { approval_id },
+                    None => GateWork::Release {
+                        worktree_path,
+                        cleanup_requested: cleanup_requested(store, run_id),
+                    },
+                },
+                Some(WorktreeStatus::Reclaimable) => GateWork::Dispose,
+                _ => continue,
+            };
+
+            candidates.push(GateCandidate { run_id, work });
         }
     }
 
@@ -847,9 +902,6 @@ fn cleanup_requested(store: &ControlPlaneStore, run_id: i64) -> bool {
         .iter()
         .any(|event| event.payload.contains(SubAgentKind::Cleanup.as_str()))
 }
-
-/// The journal entry every gate verdict becomes.
-const GATE_RESULT_EVENT: &str = "gate_result";
 
 /// Ingest: the harness's facts, folded into the journal and into run health.
 fn ingest_loop(

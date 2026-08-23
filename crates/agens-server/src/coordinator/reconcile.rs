@@ -38,7 +38,10 @@ use std::path::{Path, PathBuf};
 
 use agens_store::{EventClass, EventRow, RunState, WorktreeStatus};
 
-use crate::fsm::{Principal, RunFacts, RunTrigger, StateMachines, TransitionRejection};
+use crate::fsm::{
+    Principal, RunFacts, RunTrigger, StateMachines, TransitionRejection,
+    WORKTREE_HOLDING_RUN_STATES,
+};
 use crate::timers::{TimerTick, TimerWheel};
 
 /// The journal entry a worktree directory no run claims is reported as.
@@ -197,7 +200,7 @@ fn verify_worktrees(
     let mut claimed: BTreeSet<PathBuf> = BTreeSet::new();
     let mut missing = Vec::new();
 
-    for state in ACTIVE_RUN_STATES {
+    for state in WORKTREE_HOLDING_RUN_STATES {
         for run in machines.store().runs_in_state(*state)? {
             let (Some(run_id), Some(path)) = (run.id, run.worktree_path.as_deref()) else {
                 continue;
@@ -264,20 +267,6 @@ fn verify_worktrees(
 
     Ok((reported_orphans, reported_missing))
 }
-
-/// The states in which a run still has a claim on its worktree. A finished run
-/// keeps its worktree until the reclaim pass releases it, so `done` and
-/// `failed` claim theirs too.
-const ACTIVE_RUN_STATES: &[RunState] = &[
-    RunState::Draft,
-    RunState::Queued,
-    RunState::Running,
-    RunState::AwaitingInput,
-    RunState::AwaitingQuota,
-    RunState::Interrupted,
-    RunState::Done,
-    RunState::Failed,
-];
 
 /// Every session worktree directory under the data directory.
 ///

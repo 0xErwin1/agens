@@ -44,12 +44,13 @@ pub use questions::{
     AppliedQuestionTransition, QUESTION_TRANSITIONS, QuestionEffect, QuestionFacts, QuestionGuard,
     QuestionTransition, QuestionTrigger,
 };
+
 pub use runs::{
     AppliedRunTransition, RUN_TRANSITIONS, RunEffect, RunFacts, RunGuard, RunTransition, RunTrigger,
 };
 pub use worktrees::{
-    AppliedWorktreeTransition, WORKTREE_TRANSITIONS, WorktreeEffect, WorktreeFacts, WorktreeGuard,
-    WorktreeTransition, WorktreeTrigger,
+    AppliedWorktreeTransition, WORKTREE_HOLDING_RUN_STATES, WORKTREE_TRANSITIONS, WorktreeEffect,
+    WorktreeFacts, WorktreeGuard, WorktreeTransition, WorktreeTrigger,
 };
 
 /// Who is asking for a transition.
@@ -246,6 +247,71 @@ impl StateMachines {
         })
     }
 
+    /// Settles a landed merge: the verdict, the authorization it was spent on,
+    /// the `merged` entry and the release of the run's directory, in one
+    /// transaction.
+    ///
+    /// It exists because the four cannot be written separately. A failure after
+    /// the merge leaves a branch on main with its authorization still standing,
+    /// and the coordinator never presents that approval again, because a
+    /// `gate_result` already names it, so nothing spends it and nothing
+    /// releases the directory. Writing them together makes the settlement
+    /// either wholly recorded or wholly absent, and an absent one is retried by
+    /// the next sweep against a branch git now reports as merged.
+    ///
+    /// The guards run before anything is written, exactly as they do for a
+    /// single transition, and the write is still conditional on the states they
+    /// ran against.
+    pub fn settle_merge(
+        &mut self,
+        settlement: &MergeSettlement<'_>,
+    ) -> Result<SettledMerge, TransitionRejection> {
+        let question = self.load_question(settlement.approval_id)?;
+        let approval = questions::deliverable(&question, settlement.now)?;
+
+        let run = self.load_run(settlement.run_id)?;
+        let release = worktrees::releasable(&run, settlement.now, settlement.worktree_clean)?;
+
+        // The order the journal has always carried: the verdict, then the
+        // authorization it spent, then the merge that authorization allowed,
+        // then the release. What changed is that they land together, not the
+        // sequence a subscriber reads them in.
+        let mut events = vec![settlement.verdict.clone()];
+        events.extend(approval.events.iter().cloned());
+        events.push(settlement.merged.clone());
+        if let Some(release) = &release {
+            events.extend(release.events.iter().cloned());
+        }
+
+        let outcome = self.store.apply_transition(&agens_store::TransitionWrite {
+            run_id: settlement.run_id,
+            run_state: None,
+            worktree_status: release.as_ref().map(|release| release.change),
+            question: Some(approval.change.clone()),
+            new_question: None,
+            attempt: None,
+            close_attempt: None,
+            provider: None,
+            events: &events,
+        })?;
+
+        let mut ids = outcome.event_ids.into_iter();
+        let verdict_event_id = next_id(&mut ids)?;
+        let approval = approval.applied(next_id(&mut ids)?, next_id(&mut ids)?);
+        let merged_event_id = next_id(&mut ids)?;
+        let worktree = match release {
+            Some(release) => Some(release.applied(next_id(&mut ids)?, next_id(&mut ids)?)),
+            None => None,
+        };
+
+        Ok(SettledMerge {
+            verdict_event_id,
+            merged_event_id,
+            approval,
+            worktree,
+        })
+    }
+
     /// Journals facts that no transition carries, in one transaction and in the
     /// order given.
     ///
@@ -323,6 +389,71 @@ impl StateMachines {
                 id: question_id,
             })
     }
+}
+
+/// One landed merge, as the settlement that records it.
+pub struct MergeSettlement<'a> {
+    pub run_id: i64,
+    /// The `approval` the merge went through. It is spent by this write.
+    pub approval_id: i64,
+    /// Epoch seconds.
+    pub now: i64,
+    /// The gate's verdict, journaled first so a subscriber never sees a merge
+    /// without the verdict that allowed it.
+    pub verdict: &'a EventRow,
+    pub merged: &'a EventRow,
+    /// Whether git reported nothing uncommitted left behind.
+    pub worktree_clean: bool,
+}
+
+/// What one settled merge wrote.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SettledMerge {
+    pub verdict_event_id: i64,
+    pub merged_event_id: i64,
+    pub approval: AppliedQuestionTransition,
+    /// `None` when the run's directory was already past `active`, which the
+    /// attestation path reaches: a branch somebody else landed and released is
+    /// still one the gate can verify.
+    pub worktree: Option<AppliedWorktreeTransition>,
+}
+
+/// A transition whose guard has run and whose write has not: the row change it
+/// makes, the entries it journals, and what it becomes once the ids come back.
+///
+/// It is what lets two machines land in one transaction without either of them
+/// learning about the other.
+struct PreparedTransition<S: Copy, C, E: 'static> {
+    change: C,
+    from: S,
+    to: S,
+    effects: &'static [E],
+    domain_event: &'static str,
+    events: [EventRow; 2],
+}
+
+impl<S: Copy, C, E> PreparedTransition<S, C, E> {
+    fn applied(self, state_changed_event_id: i64, domain_event_id: i64) -> AppliedTransition<S, E> {
+        AppliedTransition {
+            from: self.from,
+            to: self.to,
+            effects: self.effects,
+            domain_event: self.domain_event,
+            state_changed_event_id,
+            domain_event_id,
+            opened_question_id: None,
+        }
+    }
+}
+
+/// The next journal id the settlement wrote, in the order the events were
+/// given.
+fn next_id(ids: &mut impl Iterator<Item = i64>) -> Result<i64, TransitionRejection> {
+    ids.next().ok_or_else(|| {
+        TransitionRejection::Storage(
+            "a settled merge must journal one id per event it carried".to_owned(),
+        )
+    })
 }
 
 /// One transition as the journal describes it, independent of which machine it

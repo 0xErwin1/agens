@@ -743,13 +743,29 @@ fn reclaim_releases_a_worktree_whose_branch_landed() {
 
     let verdict = gated.reclaim();
 
-    let ReclaimVerdict::Released(applied) = verdict else {
+    let ReclaimVerdict::Released { released, cleaned } = verdict else {
         panic!("a merged, clean worktree is released, got {verdict:?}");
     };
-    assert_eq!(applied.to, WorktreeStatus::Reclaimable);
+    assert_eq!(released.to, WorktreeStatus::Reclaimable);
+    assert_eq!(
+        cleaned.map(|applied| applied.to),
+        Some(WorktreeStatus::Cleaned),
+        "the sweep goes on to dispose of what it released"
+    );
     assert_eq!(
         gated.events(),
-        ["gate_result", "run_state_changed", "worktree_reclaimable"]
+        [
+            "gate_result",
+            "run_state_changed",
+            "worktree_reclaimable",
+            "run_state_changed",
+            "worktree_cleaned",
+            "gate_result",
+        ]
+    );
+    assert!(
+        !gated.fixture.worktree.is_dir(),
+        "the directory is gone, not only the row"
     );
 }
 
@@ -849,7 +865,7 @@ fn await_reclaimed(core: &Mutex<ApiCore>, run_id: i64) -> Option<agens_store::Wo
     loop {
         let status = worktree_status_of(core, run_id);
 
-        if status == Some(agens_store::WorktreeStatus::Reclaimable) || Instant::now() >= deadline {
+        if status == Some(agens_store::WorktreeStatus::Cleaned) || Instant::now() >= deadline {
             return status;
         }
 
@@ -930,8 +946,14 @@ fn the_daemon_merges_an_authorized_run_and_releases_its_worktree() {
 
     assert_eq!(
         status,
-        Some(agens_store::WorktreeStatus::Reclaimable),
-        "the sweep releases the worktree of a run whose merge it landed"
+        Some(agens_store::WorktreeStatus::Cleaned),
+        "the sweep releases the worktree of a run whose merge it landed, and \
+         goes on to dispose of it: a row that stopped at reclaimable would hold \
+         its place in the worktree ceiling for good"
+    );
+    assert!(
+        !fixture.worktree.is_dir(),
+        "the directory is gone, not only the row"
     );
     assert_eq!(
         landed, 3,

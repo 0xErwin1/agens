@@ -628,7 +628,7 @@ impl ControlPlaneStore {
         )
     }
 
-    /// How many runs outside one state hold a worktree the machine has not
+    /// How many runs in the given states hold a worktree the machine has not
     /// cleaned up.
     ///
     /// A worktree is provisioned when the run is created and stops costing the
@@ -637,20 +637,37 @@ impl ControlPlaneStore {
     /// that happen to be executing: a run parked on a question holds its
     /// directory for as long as the question is open.
     ///
-    /// The excluded state is how a caller leaves out the runs it is about to
-    /// decide on, so that a run is not counted once as a holder and once again
-    /// as the admission that reserves it.
-    pub fn held_worktrees_outside(&self, state: RunState) -> Result<usize> {
+    /// Which states those are is the caller's, not this table's: the daemon
+    /// holds one definition of it next to the worktree transition table, and a
+    /// second copy expressed as a SQL predicate here is exactly how the two
+    /// would drift. An empty list counts nothing.
+    pub fn held_worktrees_in(&self, states: &[RunState]) -> Result<usize> {
+        if states.is_empty() {
+            return Ok(0);
+        }
+
+        let placeholders = std::iter::repeat_n("?", states.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT COUNT(*) FROM runs
+             WHERE state IN ({placeholders})
+               AND worktree_status IS NOT NULL
+               AND worktree_status != ?{}",
+            states.len() + 1
+        );
+
+        let mut bound: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(states.len() + 1);
+        let names: Vec<&str> = states.iter().map(|state| state.as_str()).collect();
+        for name in &names {
+            bound.push(name);
+        }
+        let cleaned = WorktreeStatus::Cleaned.as_str();
+        bound.push(&cleaned);
+
         let held: i64 = self
             .connection
-            .query_row(
-                "SELECT COUNT(*) FROM runs
-                 WHERE state != ?1
-                   AND worktree_status IS NOT NULL
-                   AND worktree_status != ?2",
-                params![state.as_str(), WorktreeStatus::Cleaned.as_str()],
-                |row| row.get(0),
-            )
+            .query_row(&sql, bound.as_slice(), |row| row.get(0))
             .map_err(|error| {
                 ControlPlaneError::operation("count held worktrees", &self.database_path, error)
             })?;

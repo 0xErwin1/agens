@@ -19,8 +19,8 @@ use agens_store::{
 };
 
 use super::{
-    AppliedTransition, JournaledMove, StateMachines, TransitionOutcome, TransitionRejection,
-    event_pair, transition_events,
+    AppliedTransition, JournaledMove, PreparedTransition, StateMachines, TransitionOutcome,
+    TransitionRejection, event_pair, transition_events,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -264,6 +264,77 @@ impl StateMachines {
             opened_question_id: None,
         }))
     }
+}
+
+/// One question transition prepared but not yet written.
+pub(super) type PreparedQuestion =
+    PreparedTransition<QuestionState, QuestionChange, QuestionEffect>;
+
+/// Prepares the delivery of an authorization without writing it.
+///
+/// The guard runs here, so a caller that composes this into a larger write is
+/// refused on exactly the same terms as one that applies it on its own. What it
+/// does not do is decide when the write happens: that is the point, and it is
+/// what lets a merge spend its authorization in the same transaction that
+/// records the merge.
+pub(super) fn deliverable(
+    question: &QuestionRow,
+    now: i64,
+) -> Result<PreparedQuestion, TransitionRejection> {
+    let transition = QUESTION_TRANSITIONS
+        .iter()
+        .find(|candidate| {
+            candidate.kind == question.kind
+                && candidate.from == question.state
+                && candidate.trigger == QuestionTrigger::Deliver
+        })
+        .ok_or(TransitionRejection::NoSuchTransition {
+            machine: "question",
+            from: question.state.as_str(),
+            trigger: QuestionTrigger::Deliver.as_str(),
+        })?;
+
+    let facts = QuestionFacts {
+        now,
+        ..QuestionFacts::default()
+    };
+    check_question_guard(transition, question, &facts)?;
+
+    let question_id = question.id.ok_or_else(|| {
+        TransitionRejection::Storage("a stored question must carry an id".to_owned())
+    })?;
+
+    let events = transition_events(
+        &JournaledMove {
+            run_id: question.run_id,
+            ts: now,
+            class: transition.class,
+            machine: "question",
+            from: question.state.as_str(),
+            to: transition.to.as_str(),
+            trigger: QuestionTrigger::Deliver.as_str(),
+            domain_event: transition.domain_event,
+        },
+        &serde_json::json!({
+            "question_id": question_id,
+            "kind": question.kind.as_str(),
+            "author": Option::<&str>::None,
+        }),
+    );
+
+    Ok(PreparedQuestion {
+        change: QuestionChange {
+            question_id,
+            expected: question.state,
+            next: transition.to,
+            answer: None,
+        },
+        from: question.state,
+        to: transition.to,
+        effects: transition.effects,
+        domain_event: transition.domain_event,
+        events,
+    })
 }
 
 fn check_question_guard(
