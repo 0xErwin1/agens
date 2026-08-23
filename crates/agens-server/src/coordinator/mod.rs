@@ -50,7 +50,10 @@ use agens_tools::SessionWorktrees;
 
 use crate::api::{ApiCore, Ports};
 use crate::fsm::StateMachines;
-use crate::ingest::{FactReceiver, FactSender, Ingest, channel as ingest_channel};
+use crate::ingest::{
+    FactReceiver, FactSender, Ingest, IngestFact, ReportedFact, attribution_of,
+    channel as ingest_channel,
+};
 use crate::policy::{PolicyStore, RepositoryPolicy};
 use crate::ports::{
     Admissions, GitWorktreeGate, JournalFeed, RunDeliveries, SupervisedSessions, run_mailbox,
@@ -221,7 +224,7 @@ impl Coordinator {
                 worker,
                 facts.clone(),
             ),
-            timer_loop(settings, &core, &admissions, &stopping),
+            timer_loop(settings, &core, &admissions, &stopping, facts.clone()),
             ingest_loop(data_directory, settings, reports, &stopping)?,
             publisher_loop(data_directory, settings, feed, &stopping)?,
         ];
@@ -403,11 +406,26 @@ fn admission_loop(
 }
 
 /// The timer wheel, recomputing every deadline from the database.
+///
+/// The wheel raises signals; it applies no judgment and reports to nobody. What
+/// it found due therefore has to be carried somewhere by this loop, and the two
+/// kinds it finds go to different places:
+///
+/// - An **overdue checkpoint** is a fact about the run's health, so it is
+///   reported into ingest as [`IngestFact::CheckpointExpired`]. That is the
+///   only producer of the fact, and without it the lost-worker detector's
+///   `CheckpointExpired` branch is unreachable.
+/// - An **expired question** has already been applied and journaled by the
+///   transition the wheel ran, and neither ingest nor the run machine has
+///   anything further to do with it: a run parked on a question that ran out
+///   stays parked, because nothing about the expiry says what the work should
+///   do instead. It is carried no further on purpose.
 fn timer_loop(
     settings: &CoordinatorSettings,
     core: &Arc<Mutex<ApiCore>>,
     admissions: &Arc<Admissions>,
     stopping: &Arc<AtomicBool>,
+    facts: FactSender,
 ) -> JoinHandle<()> {
     let core = Arc::clone(core);
     let admissions = Arc::clone(admissions);
@@ -417,12 +435,19 @@ fn timer_loop(
 
     std::thread::spawn(move || {
         while !stopping.load(Ordering::Acquire) {
-            let requeued = match core.lock() {
-                Ok(mut core) => wheel
-                    .tick(core.machines_mut())
-                    .map(|tick| !tick.quota_resets.is_empty())
-                    .unwrap_or_default(),
-                Err(_) => false,
+            let (requeued, expired) = match core.lock() {
+                Ok(mut core) => match wheel.tick(core.machines_mut()) {
+                    Ok(tick) => (
+                        !tick.quota_resets.is_empty(),
+                        // Attributed while the core is still held, from the
+                        // same rows the tick read: a fact attributed to an
+                        // attempt the run left between the two would be
+                        // refused as a straggler.
+                        expired_checkpoint_facts(&core, &tick),
+                    ),
+                    Err(_) => (false, Vec::new()),
+                },
+                Err(_) => (false, Vec::new()),
             };
 
             // A provider whose reset arrived put its runs back in the queue,
@@ -432,9 +457,40 @@ fn timer_loop(
                 admissions.wake();
             }
 
+            for fact in expired {
+                // A queue with no reader is the daemon shutting down. The
+                // signal is already journaled, and the wheel's own
+                // deduplication means this tick will not raise it again.
+                let _ = facts.report(fact);
+            }
+
             std::thread::sleep(heartbeat);
         }
     })
+}
+
+/// One `CheckpointExpired` fact per overdue checkpoint this tick raised.
+///
+/// A run whose live attempt is not correlated with a physical execution yet
+/// produces none: there is nothing for the fact to be attributed to, and ingest
+/// would refuse it.
+fn expired_checkpoint_facts(core: &ApiCore, tick: &crate::timers::TimerTick) -> Vec<ReportedFact> {
+    let store = core.machines().store();
+
+    tick.overdue_checkpoints
+        .iter()
+        .filter_map(|overdue| {
+            let attribution = attribution_of(store, overdue.run_id).ok().flatten()?;
+
+            Some(ReportedFact {
+                run_id: overdue.run_id,
+                attempt_id: attribution.attempt_id,
+                turn: attribution.turn,
+                now: tick.now,
+                fact: IngestFact::CheckpointExpired,
+            })
+        })
+        .collect()
 }
 
 /// Ingest: the harness's facts, folded into the journal and into run health.

@@ -8,9 +8,16 @@
 //!
 //! What it asserts is the whole path the harness exists for: a run is created
 //! and its worktree provisioned, the user approves it, the scheduler admits it,
-//! the worker's turn reports a checkpoint and then asks a question, the run
-//! parks on a person, the answer requeues it, and the resumed session finishes
-//! the run.
+//! the worker's turn writes a file, reports a checkpoint and then asks a
+//! question, the run parks on a person, the answer requeues it, and the resumed
+//! session finishes the run.
+//!
+//! It also asserts the health plane the run is measured through, which exists
+//! only once the worker actually reports: the physical attempt is correlated so
+//! the evidence ledger can be reached from the run, `run_health` is derived
+//! from what the turn did, the genesis paths are frozen off that ledger at the
+//! first checkpoint, and a checkpoint whose deadline passes reaches the
+//! lost-worker detector through the timer wheel.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -21,7 +28,8 @@ use std::time::{Duration, Instant};
 use agens_core::HeadlessTurnCancellation;
 use agens_fixtures::{Script, ScriptedDialect, ScriptedProvider, ScriptedTurn};
 use agens_server::grpc::proto::{self, feed_client::FeedClient, team_client::TeamClient};
-use agens_server::{CoordinatorSettings, SchedulerLimits};
+use agens_server::{CoordinatorSettings, SchedulerLimits, TimerSettings};
+use agens_store::ControlPlaneStore;
 use tonic::transport::{Channel, Endpoint, Uri};
 
 use crate::CliDependencies;
@@ -33,6 +41,37 @@ use crate::worker::run_worker;
 const PATIENCE: Duration = Duration::from_secs(60);
 
 const ANSWER: &str = "split";
+
+/// The file the worker's turn writes, which is what puts a row in the evidence
+/// ledger and therefore what the genesis paths freeze to.
+const TOUCHED_PATH: &str = "notes.md";
+
+/// The journal entries the health plane writes.
+///
+/// Kept out of the lifecycle assertion because ingest drains on its own
+/// heartbeat: what it wrote is asserted on its own, and where its entries fall
+/// among the run's transitions is not a fact about the run.
+const HEALTH_EVENTS: [&str; 8] = [
+    "turn_started",
+    "turn_ended",
+    "tool_result_fact",
+    "checkpoint_recorded",
+    "genesis_paths_frozen",
+    "checkpoint_overdue",
+    "checkpoint_expired",
+    "worker_lost",
+];
+
+/// What the health plane has to have written by the time the run is done.
+const EXPECTED_HEALTH_EVENTS: [&str; 7] = [
+    "turn_started",
+    "tool_result_fact",
+    "checkpoint_recorded",
+    "genesis_paths_frozen",
+    "turn_ended",
+    "checkpoint_expired",
+    "worker_lost",
+];
 
 static NEXT_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
 
@@ -80,18 +119,45 @@ pub(crate) fn checkout(root: &Path) -> PathBuf {
 
 /// The model's side of both sessions.
 ///
-/// The first is the whole shape of a worker's turn: report the milestone, then
-/// raise the one decision it cannot make, then stop — because the run parks on
-/// the question and there is nothing else for the turn to do. The second is the
-/// resumed session, which answers and ends, and ending is what reports the run
-/// finished.
-fn script() -> Script {
+/// The first is the whole shape of a worker's turn: do some work, report the
+/// milestone it produced, keep working, then raise the one decision it cannot
+/// make and stop — because the run parks on the question and there is nothing
+/// else for the turn to do. The second is the resumed session, which answers
+/// and ends, and ending is what reports the run finished.
+///
+/// The work is a real write, because the genesis-path freeze reads the evidence
+/// ledger and never the checkpoint's own list: a turn that only talks leaves
+/// that ledger empty and freezes nothing. The command after the checkpoint is
+/// what keeps the run executing long enough for the timer wheel to look at the
+/// deadline the checkpoint just declared.
+fn script(promised_at: i64) -> Script {
     Script::new([
+        ScriptedTurn::tool_call(
+            "call-write",
+            "write",
+            serde_json::json!({
+                "path": TOUCHED_PATH,
+                "content": "the options now live in their own table\n",
+            })
+            .to_string(),
+        ),
         ScriptedTurn::tool_call(
             "call-checkpoint",
             "checkpoint",
-            r#"{"next_goal":"split the options into their own table","evidence":[{"description":"cargo test -p agens-store passes","evidence_class":"deterministic","proof_refs":["cargo test -p agens-store"],"disposition":"candidate_caused"}],"touched_paths":["crates/agens-store/src/control_plane.rs"]}"#,
+            serde_json::json!({
+                "next_goal": "split the options into their own table",
+                "evidence": [{
+                    "description": "cargo test -p agens-store passes",
+                    "evidence_class": "deterministic",
+                    "proof_refs": ["cargo test -p agens-store"],
+                    "disposition": "candidate_caused",
+                }],
+                "touched_paths": [TOUCHED_PATH],
+                "next_checkpoint_at": promised_at,
+            })
+            .to_string(),
         ),
+        ScriptedTurn::tool_call("call-sleep", "bash", r#"{"command":"sleep 1"}"#),
         ScriptedTurn::tool_call(
             "call-ask",
             "ask",
@@ -100,6 +166,17 @@ fn script() -> Script {
         ScriptedTurn::text("parked on the question"),
         ScriptedTurn::text("the options now live in their own table"),
     ])
+}
+
+/// Epoch seconds, for the deadline the scripted checkpoint declares.
+fn now() -> i64 {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock is past the epoch")
+            .as_secs(),
+    )
+    .expect("epoch seconds fit")
 }
 
 pub(crate) async fn connect(socket: PathBuf) -> Channel {
@@ -183,6 +260,34 @@ pub(crate) async fn journal_of(client: &mut FeedClient<Channel>, run_id: i64) ->
         .unwrap_or_default()
 }
 
+/// The run's journal once every entry named has appeared, or once patience runs
+/// out and the assertion can say what was missing.
+///
+/// Ingest drains on its own heartbeat, so a fact reported during the turn is
+/// journaled shortly after rather than with it. Waiting is what keeps the
+/// assertion about whether the health plane produced the entry rather than
+/// about how fast it got there.
+async fn await_journal_containing(
+    client: &mut FeedClient<Channel>,
+    run_id: i64,
+    wanted: &[&str],
+) -> Vec<String> {
+    let deadline = Instant::now() + PATIENCE;
+
+    loop {
+        let journal = journal_of(client, run_id).await;
+        let complete = wanted
+            .iter()
+            .all(|event| journal.iter().any(|entry| entry == event));
+
+        if complete || Instant::now() >= deadline {
+            return journal;
+        }
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 /// What the run recorded as evidence, which is what a checkpoint that reached
 /// the control plane looks like from outside.
 async fn findings_of(client: &mut FeedClient<Channel>, run_id: i64) -> Vec<String> {
@@ -208,7 +313,11 @@ fn the_daemon_executes_a_run_through_a_real_turn_that_checkpoints_asks_and_finis
     std::fs::create_dir_all(&config_home).expect("create the config directory");
     std::fs::create_dir_all(&data_directory).expect("create the data directory");
 
-    let provider = ScriptedProvider::start(ScriptedDialect::Responses, script());
+    // Comfortably ahead of the checkpoint, so the deadline the wheel derives is
+    // a real one: a checkpoint promising a moment already past declares no
+    // deadline at all.
+    let promised_at = now() + 3600;
+    let provider = ScriptedProvider::start(ScriptedDialect::Responses, script(promised_at));
     let base_url = provider.base_url();
 
     let dependencies = CliDependencies::for_test(
@@ -312,7 +421,8 @@ fn the_daemon_executes_a_run_through_a_real_turn_that_checkpoints_asks_and_finis
             }
 
             let finished = await_reported_state(&mut feed, created.run_id, "done").await;
-            let journal = journal_of(&mut feed, created.run_id).await;
+            let journal =
+                await_journal_containing(&mut feed, created.run_id, &EXPECTED_HEALTH_EVENTS).await;
 
             drop(stopper);
 
@@ -324,6 +434,13 @@ fn the_daemon_executes_a_run_through_a_real_turn_that_checkpoints_asks_and_finis
         &data_directory,
         &CoordinatorSettings {
             heartbeat: Duration::from_millis(25),
+            // No grace at all, so the deadline is the moment the worker
+            // promised and the wheel raises the exception on its next tick.
+            // The default share of the promised span is measured in minutes,
+            // which is not a thing a test can wait for.
+            timers: TimerSettings {
+                checkpoint_grace_percent: 0,
+            },
             scheduler: SchedulerLimits {
                 max_concurrent: 1,
                 available_worktrees: 1,
@@ -366,7 +483,9 @@ fn the_daemon_executes_a_run_through_a_real_turn_that_checkpoints_asks_and_finis
     assert_eq!(
         journal
             .iter()
-            .filter(|event| *event != "run_state_changed")
+            .filter(
+                |event| *event != "run_state_changed" && !HEALTH_EVENTS.contains(&event.as_str())
+            )
             .cloned()
             .collect::<Vec<_>>(),
         [
@@ -381,6 +500,36 @@ fn the_daemon_executes_a_run_through_a_real_turn_that_checkpoints_asks_and_finis
             "run_finished",
         ],
         "the journal is the whole of what the run did"
+    );
+
+    for event in EXPECTED_HEALTH_EVENTS {
+        assert!(
+            journal.iter().any(|entry| entry == event),
+            "the worker's turn produced `{event}` for ingest, journal: {journal:?}"
+        );
+    }
+
+    let control_plane = ControlPlaneStore::open(&data_directory).expect("the control plane opens");
+    let health = control_plane
+        .load_run_health(created.run_id)
+        .expect("run health is readable")
+        .expect("the worker's facts derived a health row");
+
+    assert_eq!(
+        health.last_progress_turn,
+        Some(1),
+        "the turn's own work credited progress against the attempt it ran as: {health:?}"
+    );
+
+    let run = control_plane
+        .load_run(created.run_id)
+        .expect("the run is readable")
+        .expect("the run is still there");
+
+    assert_eq!(
+        run.genesis_paths.as_deref(),
+        Some(r#"["notes.md"]"#),
+        "the first checkpoint froze the paths the evidence ledger recorded for this run"
     );
 
     provider.assert_script_consumed();

@@ -145,6 +145,49 @@ fn only_a_deterministic_claim_of_progress_credits_progress() {
     }
 }
 
+/// The limit of what a claim buys, pinned so it is a decision rather than an
+/// oversight.
+///
+/// A `deterministic` claim credits progress on the worker's word alone.
+/// `proof_refs` names something re-runnable and nothing re-runs it, and nothing
+/// matches it against the passive layer either: the ledger here is empty and
+/// the run has been stalled for three turns, and the claim still clears every
+/// counter. What the claim cannot do is freeze anything — the genesis paths
+/// come from the ledger, so a claim with no facts behind it leaves the run
+/// with no declared paths at all.
+#[test]
+fn a_deterministic_claim_credits_progress_with_nothing_in_the_passive_layer_behind_it() {
+    let mut harness = Harness::open();
+    let run_id = harness.seed_run();
+    harness.stall(run_id, 3);
+
+    let accepted = harness.accept(
+        run_id,
+        4,
+        IngestFact::Checkpoint(ReportedCheckpoint::new(EvidenceClass::Deterministic, true)),
+    );
+
+    assert_eq!(
+        accepted.health.noop_turns, 0,
+        "the worker's own word clears the stall counter"
+    );
+    assert_eq!(
+        accepted.health.tokens_since_progress, 0,
+        "and the tokens the stall spent with it"
+    );
+    assert_eq!(
+        accepted.frozen_genesis_paths, None,
+        "a claim the ledger has nothing behind freezes no genesis paths"
+    );
+    assert!(
+        accepted.signals.is_empty(),
+        "and nothing contradicts it: {:?}",
+        accepted.signals
+    );
+
+    harness.finish();
+}
+
 #[test]
 fn a_checkpoint_that_claims_nothing_credits_nothing_even_with_deterministic_evidence() {
     let mut harness = Harness::open();

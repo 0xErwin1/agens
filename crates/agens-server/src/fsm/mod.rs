@@ -252,6 +252,22 @@ impl StateMachines {
         Ok(outcome.event_ids)
     }
 
+    /// Names the physical execution one of a run's attempts is running as.
+    ///
+    /// Not a transition: the attempt stays exactly where it is, and what is
+    /// written is the join the harness's facts are attributed through. It goes
+    /// through the machines for the same reason [`Self::open_run`] does — they
+    /// are the single writer of the control-plane tables.
+    pub fn correlate_attempt(
+        &mut self,
+        attempt_id: i64,
+        session_attempt_id: i64,
+    ) -> Result<(), TransitionRejection> {
+        Ok(self
+            .store
+            .correlate_attempt(attempt_id, session_attempt_id)?)
+    }
+
     /// Records one checkpoint: its journal entry and a finding per claim, in
     /// one write.
     ///
