@@ -212,7 +212,8 @@ impl ChatTurns for HostedChat {
     fn run(
         &mut self,
         prompt: &str,
-        runtime: &SessionRuntime,
+        _runtime: &SessionRuntime,
+        cancellation: &HeadlessTurnCancellation,
         progress: &TurnProgressSink,
     ) -> ChatTurnOutcome {
         let request = match self.request_for(prompt) {
@@ -223,7 +224,7 @@ impl ChatTurns for HostedChat {
         let completion = run_production_headless_chat_with_progress(
             request,
             &self.bootstrap,
-            runtime.cancellation(),
+            cancellation,
             Some(progress),
             Box::new(UnattendedChat),
             None,

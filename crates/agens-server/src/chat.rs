@@ -23,7 +23,7 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use agens_core::{TurnEvent, TurnProgressSink};
+use agens_core::{HeadlessTurnCancellation, TurnEvent, TurnProgressSink};
 
 use crate::sessions::{
     SessionAdmission, SessionId, SessionOutcome, SessionRegistryError, SessionRuntime,
@@ -73,10 +73,17 @@ pub struct ChatSessionRequest {
 /// plane deliberately knows none of them.
 pub trait ChatTurns: Send {
     /// Runs one prompt to completion, reporting progress through `progress`.
+    ///
+    /// `cancellation` belongs to this turn and to no other. It is not the
+    /// session's: a person stopping the answer they are reading is stopping
+    /// that answer, and a chat that ended because of it would be a chat nobody
+    /// asked to close. The session's own cancellation still ends everything,
+    /// which is what shutting the daemon down uses.
     fn run(
         &mut self,
         prompt: &str,
         runtime: &SessionRuntime,
+        cancellation: &HeadlessTurnCancellation,
         progress: &TurnProgressSink,
     ) -> ChatTurnOutcome;
 }
@@ -177,6 +184,10 @@ struct OpenChat {
     /// Dropping this ends the session's loop, which is what closing a chat is.
     prompts: SyncSender<String>,
     subscribers: Arc<Subscribers>,
+    /// The turn running right now, when one is. Replaced per turn, so
+    /// cancelling reaches the answer being produced and never the one before
+    /// it.
+    running: Arc<Mutex<Option<HeadlessTurnCancellation>>>,
 }
 
 /// The chat sessions this daemon is hosting.
@@ -212,6 +223,8 @@ impl ChatSessions {
         let (prompts, inbox) = sync_channel(PROMPT_BACKLOG);
         let subscribers = Arc::new(Subscribers::default());
         let published = Arc::clone(&subscribers);
+        let running = Arc::new(Mutex::new(None));
+        let turn = Arc::clone(&running);
 
         let mut open = self.locked()?;
         // Chats come and go for the life of the daemon, so the ones that have
@@ -225,12 +238,13 @@ impl ChatSessions {
             OpenChat {
                 prompts,
                 subscribers,
+                running,
             },
         );
         drop(open);
 
         let started = self.supervisor.start(admission, move |runtime| {
-            serve_prompts(turns.as_mut(), &runtime, &inbox, &published)
+            serve_prompts(turns.as_mut(), &runtime, &inbox, &published, &turn)
         });
 
         if let Err(error) = started {
@@ -266,16 +280,27 @@ impl ChatSessions {
             .add()
     }
 
-    /// Cancels the turn a chat is running, leaving the session open.
+    /// Stops the turn a chat is running, leaving the session open.
+    ///
+    /// It trips that turn's own cancellation rather than the session's. A
+    /// person stopping the answer they are reading is stopping that answer:
+    /// signalling the session would end the chat, and the next prompt would
+    /// have nowhere to arrive. Ending the session is what `close` and the
+    /// daemon's shutdown do.
+    ///
+    /// A chat with no turn running is already in the state this asks for, so it
+    /// is not an error.
     pub fn cancel(&self, session: SessionId) -> Result<(), ChatError> {
-        if !self.locked()?.contains_key(&session) {
-            return Err(ChatError::Unknown);
+        let open = self.locked()?;
+        let chat = open.get(&session).ok_or(ChatError::Unknown)?;
+
+        if let Ok(running) = chat.running.lock()
+            && let Some(turn) = running.as_ref()
+        {
+            turn.cancel();
         }
 
-        match self.supervisor.cancel(session) {
-            Ok(()) | Err(SessionRegistryError::Unknown | SessionRegistryError::Terminal) => Ok(()),
-            Err(error) => Err(ChatError::Unavailable(describe(error).to_owned())),
-        }
+        Ok(())
     }
 
     /// Closes a chat session.
@@ -316,6 +341,7 @@ fn serve_prompts(
     runtime: &SessionRuntime,
     inbox: &Receiver<String>,
     subscribers: &Arc<Subscribers>,
+    running: &Arc<Mutex<Option<HeadlessTurnCancellation>>>,
 ) -> SessionOutcome {
     let progress = progress_sink(subscribers);
 
@@ -344,10 +370,21 @@ fn serve_prompts(
             continue;
         }
 
-        let event = match turns.run(&prompt, runtime, &progress) {
+        // A fresh one per turn, so a cancellation that arrived while the
+        // previous answer was still being read cannot stop the next one.
+        let cancellation = HeadlessTurnCancellation::new();
+        if let Ok(mut turn) = running.lock() {
+            *turn = Some(cancellation.clone());
+        }
+
+        let event = match turns.run(&prompt, runtime, &cancellation, &progress) {
             ChatTurnOutcome::Completed(text) => ChatEvent::TurnCompleted { text },
             ChatTurnOutcome::Failed(detail) => ChatEvent::TurnFailed { detail },
         };
+
+        if let Ok(mut turn) = running.lock() {
+            *turn = None;
+        }
 
         subscribers.publish(&event);
     }

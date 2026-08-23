@@ -6,11 +6,11 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use agens_core::{TurnEvent, TurnState};
+use agens_core::{HeadlessTurnCancellation, TurnEvent, TurnState};
 use agens_server::{
     ChatError, ChatEvent, ChatSession, ChatSessionRequest, ChatSessions, ChatTurnOutcome,
     ChatTurns, SessionAdmission, SessionBudget, SessionId, SessionProvider, SessionRuntime,
-    SessionSupervisor,
+    SessionState, SessionSupervisor,
 };
 use tokio::runtime::Runtime;
 
@@ -37,16 +37,34 @@ impl ChatTurns for ScriptedTurns {
         &mut self,
         prompt: &str,
         _runtime: &SessionRuntime,
+        cancellation: &HeadlessTurnCancellation,
         progress: &agens_core::TurnProgressSink,
     ) -> ChatTurnOutcome {
         let _ = self.started.send(prompt.to_owned());
         progress(TurnEvent::StateChanged(TurnState::Streaming));
 
-        self.release
+        let release = self
+            .release
             .lock()
-            .expect("the release channel is readable")
-            .recv_timeout(PATIENCE)
-            .unwrap_or_else(|_| ChatTurnOutcome::Failed("the turn was never released".to_owned()))
+            .expect("the release channel is readable");
+        let deadline = Instant::now() + PATIENCE;
+
+        // Polled rather than blocked outright, because what this turn is
+        // standing in for is a provider call that looks at its cancellation
+        // between chunks.
+        loop {
+            if cancellation.is_cancelled() {
+                return ChatTurnOutcome::Failed("the turn was cancelled".to_owned());
+            }
+
+            match release.recv_timeout(Duration::from_millis(10)) {
+                Ok(outcome) => return outcome,
+                Err(RecvTimeoutError::Timeout) if Instant::now() < deadline => {}
+                Err(_) => {
+                    return ChatTurnOutcome::Failed("the turn was never released".to_owned());
+                }
+            }
+        }
     }
 }
 
@@ -287,7 +305,13 @@ fn opening_a_chat_drops_the_records_of_the_ones_that_already_ended() {
     let harness = harness();
 
     let first = harness.chats.open(&request(1)).expect("the chat opens");
-    harness.chats.cancel(first).expect("the chat is open");
+    // The session's own cancellation rather than the chat's: what ends a
+    // session out from under its record is the daemon stopping it, and that is
+    // the state pruning exists to clear.
+    harness
+        .supervisor
+        .cancel(first)
+        .expect("the session is live");
 
     let deadline = Instant::now() + PATIENCE;
     while !harness
@@ -304,4 +328,99 @@ fn opening_a_chat_drops_the_records_of_the_ones_that_already_ended() {
     harness.chats.open(&request(2)).expect("the chat opens");
 
     assert_eq!(harness.chats.open_chats(), 1);
+}
+
+/// Stopping the answer you are reading is stopping that answer. A cancellation
+/// that ended the chat would leave the next prompt with nowhere to arrive.
+#[test]
+fn cancelling_stops_the_running_turn_and_leaves_the_chat_open() {
+    let harness = harness();
+    let session = harness.chats.open(&request(1)).expect("the chat opens");
+    let events = harness.chats.subscribe(session).expect("the chat is open");
+
+    harness
+        .chats
+        .prompt(session, "first".to_owned())
+        .expect("the prompt is accepted");
+    assert_eq!(
+        harness.started.recv_timeout(PATIENCE),
+        Ok("first".to_owned())
+    );
+
+    harness.chats.cancel(session).expect("the chat is open");
+
+    assert_eq!(
+        wait_for(&events, |event| matches!(
+            event,
+            ChatEvent::TurnFailed { .. }
+        )),
+        ChatEvent::TurnFailed {
+            detail: "the turn was cancelled".to_owned(),
+        },
+    );
+
+    assert_eq!(
+        harness
+            .supervisor
+            .status(session)
+            .map(|status| status.state),
+        Some(SessionState::Running),
+        "the session survives the turn it was running"
+    );
+
+    harness
+        .chats
+        .prompt(session, "second".to_owned())
+        .expect("a cancelled turn does not close the chat");
+    assert_eq!(
+        harness.started.recv_timeout(PATIENCE),
+        Ok("second".to_owned()),
+    );
+}
+
+/// A cancellation belongs to the turn that was running when it arrived. Reusing
+/// one would let a person who stopped an answer stop the next one they asked
+/// for without meaning to.
+#[test]
+fn a_cancellation_does_not_carry_into_the_next_turn() {
+    let harness = harness();
+    let session = harness.chats.open(&request(1)).expect("the chat opens");
+    let events = harness.chats.subscribe(session).expect("the chat is open");
+
+    harness
+        .chats
+        .prompt(session, "first".to_owned())
+        .expect("the prompt is accepted");
+    assert_eq!(
+        harness.started.recv_timeout(PATIENCE),
+        Ok("first".to_owned())
+    );
+    harness.chats.cancel(session).expect("the chat is open");
+    wait_for(&events, |event| {
+        matches!(event, ChatEvent::TurnFailed { .. })
+    });
+
+    harness
+        .chats
+        .prompt(session, "second".to_owned())
+        .expect("the prompt is accepted");
+    assert_eq!(
+        harness.started.recv_timeout(PATIENCE),
+        Ok("second".to_owned()),
+    );
+
+    harness
+        .release
+        .send(ChatTurnOutcome::Completed("an answer".to_owned()))
+        .expect("the second turn is waiting");
+
+    assert_eq!(
+        wait_for(&events, |event| matches!(
+            event,
+            ChatEvent::TurnCompleted { .. }
+        )),
+        ChatEvent::TurnCompleted {
+            text: "an answer".to_owned(),
+        },
+    );
 }
