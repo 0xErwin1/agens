@@ -22,6 +22,7 @@ perf-audit = ["agens-tui-app/perf-audit"]
 
 [dependencies]
 agens-config = { path = "../agens-config" }
+agens-coordinator-client = { path = "../agens-coordinator-client" }
 agens-agents = { path = "../agens-agents" }
 agens-auth = { path = "../agens-auth" }
 agens-diagnostics = { path = "../agens-diagnostics" }

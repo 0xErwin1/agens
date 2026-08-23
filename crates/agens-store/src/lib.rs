@@ -17,6 +17,7 @@ mod directives;
 mod fact_store;
 mod media;
 mod prompt_memory;
+mod questions;
 mod repository_policy;
 mod session_writer;
 pub use compaction::{CompactionStore, CompactionStoreError, StoredCompaction};
@@ -38,6 +39,9 @@ pub use media::{
     ingest_media_bytes, ingest_media_path, is_media_mime, media_chip_label, media_mime, open_media,
 };
 pub use prompt_memory::{PromptMemoryStore, PromptMemoryStoreError, StoredPrompt};
+pub use questions::{
+    ExternalQuestionAnswer, OpenQuestion, QuestionClass, QuestionStore, QuestionStoreError,
+};
 pub use repository_policy::{
     RepositoryPolicyStore, RepositoryPolicyStoreError, StoredHookTrust, StoredPendingTrust,
 };

@@ -269,10 +269,22 @@ impl AskUserBridgeState {
 /// [`AskUserReply::Cancelled`] — ask-user has an explicit unavailable status
 /// the permission bridge does not, and collapsing "the surface is gone" into
 /// "the user declined" would lose that information.
+pub struct ExternalAskUserAnswer {
+    pub reply: AskUserReply,
+    pub answered_by: &'static str,
+}
+
+pub trait TuiAskUserObserver: Send + Sync {
+    fn opened(&self, id: u64, request: &AskUserRequest, origin: Option<&PromptOrigin>);
+    fn answer(&self, id: u64, request: &AskUserRequest) -> Option<ExternalAskUserAnswer>;
+    fn closed(&self, id: u64, reply: &AskUserReply, answered_by: &'static str);
+}
+
 #[derive(Clone)]
 pub struct TuiAskUserBridge {
     requests: Sender<TuiAskUserRequest>,
     state: Arc<AskUserBridgeState>,
+    observer: Option<Arc<dyn TuiAskUserObserver>>,
 }
 
 impl TuiAskUserBridge {
@@ -283,7 +295,19 @@ impl TuiAskUserBridge {
             next_id: AtomicU64::new(0),
             pending: Mutex::new(BTreeMap::new()),
         });
-        (Self { requests, state }, receiver)
+        (
+            Self {
+                requests,
+                state,
+                observer: None,
+            },
+            receiver,
+        )
+    }
+
+    pub fn with_observer(mut self, observer: Arc<dyn TuiAskUserObserver>) -> Self {
+        self.observer = Some(observer);
+        self
     }
 
     /// Parks the calling thread until the request is answered, cancelled, or
@@ -323,6 +347,10 @@ impl TuiAskUserBridge {
                 sender,
             },
         );
+        if let Some(observer) = self.observer.as_ref() {
+            observer.opened(id, &request, origin.as_ref());
+        }
+        let observed_request = request.clone();
         let tui_request = TuiAskUserRequest {
             id,
             request,
@@ -346,7 +374,15 @@ impl TuiAskUserBridge {
 
             match receiver.recv_timeout(RETRY_QUANTUM) {
                 Ok(reply) => return reply,
-                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Timeout) => {
+                    if let Some(answer) = self
+                        .observer
+                        .as_ref()
+                        .and_then(|observer| observer.answer(id, &observed_request))
+                    {
+                        let _ = self.deliver(id, answer.reply, answer.answered_by);
+                    }
+                }
                 Err(RecvTimeoutError::Disconnected) => {
                     return AskUserReply::Unavailable(AskUserUnavailable::SurfaceClosed);
                 }
@@ -390,6 +426,10 @@ impl TuiAskUserBridge {
     /// the channel is unbounded — `send` on an unbounded `mpsc` channel never
     /// blocks, so the lock is never held across a wait.
     pub fn reply(&self, id: u64, reply: AskUserReply) -> bool {
+        self.deliver(id, reply, "human")
+    }
+
+    fn deliver(&self, id: u64, reply: AskUserReply, answered_by: &'static str) -> bool {
         let mut pending = self.state.pending();
         let Some(parked) = pending.remove(&id) else {
             return false;
@@ -405,6 +445,11 @@ impl TuiAskUserBridge {
                     let _ = parked.sender.send(AskUserReply::Cancelled);
                 }
             }
+        }
+        drop(pending);
+
+        if delivered && let Some(observer) = self.observer.as_ref() {
+            observer.closed(id, &reply, answered_by);
         }
 
         delivered
@@ -474,14 +519,17 @@ impl SubagentErrorPresentation for SubagentErrorKind {
 
 #[cfg(test)]
 mod tests {
-    use super::{Parked, PromptOrigin, SubagentErrorPresentation, TuiAskUserBridge};
+    use super::{
+        ExternalAskUserAnswer, Parked, PromptOrigin, SubagentErrorPresentation, TuiAskUserBridge,
+        TuiAskUserObserver,
+    };
     use agens_core::SubagentErrorKind;
     use agens_core::ask_user::{
         AskUserAnswer, AskUserMode, AskUserOption, AskUserQuestion, AskUserReply, AskUserRequest,
         AskUserUnavailable,
     };
     use std::sync::mpsc;
-    use std::sync::{Arc, Barrier};
+    use std::sync::{Arc, Barrier, Mutex};
     use std::thread;
 
     #[test]
@@ -536,6 +584,54 @@ mod tests {
             other: None,
             note: None,
         }])
+    }
+
+    struct ExternalAnswer {
+        answered: std::sync::atomic::AtomicBool,
+        closed: Mutex<Option<&'static str>>,
+    }
+
+    impl TuiAskUserObserver for ExternalAnswer {
+        fn opened(&self, _: u64, _: &AskUserRequest, _: Option<&PromptOrigin>) {}
+
+        fn answer(&self, _: u64, _: &AskUserRequest) -> Option<ExternalAskUserAnswer> {
+            (!self
+                .answered
+                .swap(true, std::sync::atomic::Ordering::AcqRel))
+            .then(|| ExternalAskUserAnswer {
+                reply: answered_reply(),
+                answered_by: "supervisor",
+            })
+        }
+
+        fn closed(&self, _: u64, _: &AskUserReply, answered_by: &'static str) {
+            *self.closed.lock().expect("the close record is writable") = Some(answered_by);
+        }
+    }
+
+    #[test]
+    fn a_valid_external_answer_closes_the_question_as_the_supervisor() {
+        let observer = Arc::new(ExternalAnswer {
+            answered: std::sync::atomic::AtomicBool::new(false),
+            closed: Mutex::new(None),
+        });
+        let (bridge, _requests) = TuiAskUserBridge::channel();
+        let bridge = bridge.with_observer(observer.clone());
+
+        let reply = bridge.wait_for_reply(
+            single_question_request(),
+            None,
+            &agens_core::HeadlessTurnCancellation::new(),
+        );
+
+        assert_eq!(reply, answered_reply());
+        assert_eq!(
+            *observer
+                .closed
+                .lock()
+                .expect("the close record is readable"),
+            Some("supervisor")
+        );
     }
 
     #[test]

@@ -104,11 +104,22 @@ impl ChatClient {
         prompt_id: u64,
         decision: PermissionDecision,
     ) -> Result<(), ClientError> {
+        self.answer_question(session_id, prompt_id, decision.as_str())
+            .await
+    }
+
+    /// Answers any bounded question through the chat's existing decision wire.
+    pub async fn answer_question(
+        &mut self,
+        session_id: i64,
+        prompt_id: u64,
+        answer: &str,
+    ) -> Result<(), ClientError> {
         self.inner
             .answer_permission(proto::AnswerPermissionRequest {
                 session_id,
                 prompt_id,
-                answer: decision.as_str().to_owned(),
+                answer: answer.to_owned(),
             })
             .await?;
 

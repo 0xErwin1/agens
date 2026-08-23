@@ -6,7 +6,7 @@
 
 use agens_core::IntraTurnInputSource;
 use agens_error::CliError;
-use agens_store::{DirectiveGrain, DirectiveStore, DirectiveTarget, SessionStore};
+use agens_store::{DirectiveGrain, DirectiveStore, DirectiveTarget, QuestionStore, SessionStore};
 
 use crate::CliDependencies;
 use crate::deps::bootstrap;
@@ -14,6 +14,7 @@ use crate::deps::bootstrap;
 pub(crate) fn run_direct(
     session: Option<String>,
     child: Option<String>,
+    answer: Option<String>,
     at_turn_end: bool,
     as_supervisor: bool,
     message: Vec<String>,
@@ -73,6 +74,33 @@ pub(crate) fn run_direct(
         IntraTurnInputSource::Human
     };
 
+    if let Some(question_id) = answer {
+        let question_id = question_id.trim();
+        let hosted_answered = match &target {
+            DirectiveTarget::Session(session_id) => {
+                question_id.parse::<u64>().ok().is_some_and(|prompt_id| {
+                    answer_hosted_question(
+                        &bootstrap.data_directory,
+                        *session_id,
+                        prompt_id,
+                        message,
+                    )
+                })
+            }
+            DirectiveTarget::Child(_) => false,
+        };
+        if !hosted_answered {
+            QuestionStore::open(&bootstrap.data_directory)
+                .and_then(|mut store| store.answer(&target, question_id, message, source))
+                .map_err(|error| CliError::usage(error.to_string()))?;
+        }
+
+        return Ok(format!(
+            "Answered question {} for {addressee}.\n",
+            question_id.trim()
+        ));
+    }
+
     DirectiveStore::open(&bootstrap.data_directory)
         .and_then(|mut store| store.enqueue(&target, source, grain, message))
         .map_err(|_| CliError::storage("the directive could not be queued"))?;
@@ -86,13 +114,43 @@ pub(crate) fn run_direct(
     ))
 }
 
+fn answer_hosted_question(
+    data_directory: &std::path::Path,
+    session_id: i64,
+    question_id: u64,
+    answer: &str,
+) -> bool {
+    let socket = agens_server::socket_path(data_directory);
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(_) => return false,
+    };
+
+    runtime.block_on(async {
+        let Ok(coordinator) = agens_coordinator_client::Coordinator::attach(&socket).await else {
+            return false;
+        };
+        coordinator
+            .chat()
+            .answer_question(session_id, question_id, answer)
+            .await
+            .is_ok()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
     use std::path::PathBuf;
 
     use agens_core::{IntraTurnInputSource, SessionMetadata};
-    use agens_store::{DirectiveGrain, DirectiveStore, DirectiveTarget, SessionStore};
+    use agens_store::{
+        DirectiveGrain, DirectiveStore, DirectiveTarget, OpenQuestion, QuestionClass,
+        QuestionStore, SessionStore,
+    };
 
     use super::run_direct;
     use crate::CliDependencies;
@@ -149,6 +207,7 @@ mod tests {
         let message = run_direct(
             Some(session_id.to_string()),
             None,
+            None,
             false,
             true,
             vec!["change course".to_owned()],
@@ -196,6 +255,7 @@ mod tests {
         let message = run_direct(
             None,
             Some("a1b2c3d4".to_owned()),
+            None,
             false,
             true,
             vec!["read the manifest first".to_owned()],
@@ -241,6 +301,7 @@ mod tests {
         let error = run_direct(
             None,
             None,
+            None,
             false,
             false,
             vec!["change course".to_owned()],
@@ -249,6 +310,88 @@ mod tests {
         .expect_err("an unaddressed directive is refused");
         assert!(error.to_string().contains("--child"), "{error}");
 
+        std::fs::remove_dir_all(&data_home).ok();
+    }
+
+    #[test]
+    fn a_supervisor_answers_a_child_question_by_reference() {
+        let data_home = std::env::temp_dir().join(format!(
+            "agens-direct-child-answer-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::remove_dir_all(&data_home).ok();
+        let data_directory = data_home.join("agens");
+        std::fs::create_dir_all(&data_directory).unwrap();
+        let target = DirectiveTarget::Child("a1b2c3d4".to_owned());
+        QuestionStore::open(&data_directory)
+            .unwrap()
+            .open_question(&OpenQuestion {
+                target: target.clone(),
+                question_id: "9".into(),
+                class: QuestionClass::Consent,
+                origin: "review".into(),
+                admissible_answers: vec!["granted".into(), "declined".into()],
+            })
+            .unwrap();
+
+        let message = run_direct(
+            None,
+            Some("a1b2c3d4".to_owned()),
+            Some("9".to_owned()),
+            false,
+            true,
+            vec!["declined".to_owned()],
+            &dependencies(&data_home),
+        )
+        .unwrap();
+
+        assert_eq!(message, "Answered question 9 for child a1b2c3d4.\n");
+        let answer = QuestionStore::open(&data_directory)
+            .unwrap()
+            .take_answer(&target, "9")
+            .unwrap()
+            .unwrap();
+        assert_eq!(answer.value, "declined");
+        assert_eq!(answer.source, IntraTurnInputSource::Supervisor);
+
+        std::fs::remove_dir_all(&data_home).ok();
+    }
+
+    #[test]
+    fn direct_refuses_an_answer_outside_the_open_question_domain() {
+        let data_home = std::env::temp_dir().join(format!(
+            "agens-direct-invalid-answer-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::remove_dir_all(&data_home).ok();
+        let data_directory = data_home.join("agens");
+        std::fs::create_dir_all(&data_directory).unwrap();
+        let target = DirectiveTarget::Child("a1b2c3d4".to_owned());
+        QuestionStore::open(&data_directory)
+            .unwrap()
+            .open_question(&OpenQuestion {
+                target,
+                question_id: "9".into(),
+                class: QuestionClass::Consent,
+                origin: "review".into(),
+                admissible_answers: vec!["granted".into(), "declined".into()],
+            })
+            .unwrap();
+
+        let error = run_direct(
+            None,
+            Some("a1b2c3d4".to_owned()),
+            Some("9".to_owned()),
+            false,
+            true,
+            vec!["maybe".to_owned()],
+            &dependencies(&data_home),
+        )
+        .expect_err("the closed answer domain must be enforced");
+
+        assert!(error.to_string().contains("not admissible"), "{error}");
         std::fs::remove_dir_all(&data_home).ok();
     }
 }

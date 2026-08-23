@@ -27,11 +27,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use agens_bootstrap::Bootstrap;
+use agens_core::ask_user::{AskUserPort, AskUserReply, AskUserRequest};
 use agens_core::{
     HeadlessTurnCancellation, HeadlessTurnPortError, Message, PermissionMode, RequestConfig,
     SessionMetadata, TurnProgressSink,
 };
-use agens_headless::{HeadlessChatRequest, run_production_headless_chat_with_progress};
+use agens_headless::{
+    HeadlessChatRequest, run_production_headless_chat_with_progress_and_ask_user,
+};
 use agens_permissions::{PermissionPromptAnswer, PermissionPromptContext, PermissionPrompter};
 use agens_server::{
     ChatAsks, ChatError, ChatHistorySource, ChatPermissionAnswer, ChatPermissionRequest,
@@ -240,7 +243,7 @@ impl ChatTurns for HostedChat {
             Err(error) => return ChatTurnOutcome::Failed(error),
         };
 
-        let completion = run_production_headless_chat_with_progress(
+        let completion = run_production_headless_chat_with_progress_and_ask_user(
             request,
             &self.bootstrap,
             cancellation,
@@ -250,6 +253,9 @@ impl ChatTurns for HostedChat {
             }),
             None,
             None,
+            Some(Box::new(AttachedAskUserPort {
+                asks: Arc::clone(asks),
+            })),
         );
 
         match completion {
@@ -333,6 +339,20 @@ impl HostedChat {
 /// that call, because the rules the operator configured are what this chat runs
 /// under and a prompt is by definition something they did not decide in
 /// advance.
+struct AttachedAskUserPort {
+    asks: Arc<dyn ChatAsks>,
+}
+
+impl AskUserPort for AttachedAskUserPort {
+    fn ask(
+        &self,
+        request: &AskUserRequest,
+        _cancellation: &HeadlessTurnCancellation,
+    ) -> AskUserReply {
+        self.asks.ask_user(request)
+    }
+}
+
 struct AttachedPrompter {
     asks: Arc<dyn ChatAsks>,
 }

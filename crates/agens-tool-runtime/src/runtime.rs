@@ -184,6 +184,31 @@ pub fn production_tool_runtime_for_parent_executing_run(
     discovery_cancellation: std::sync::Arc<std::sync::atomic::AtomicBool>,
     run_introspection: Option<RunIntrospectionFactory>,
 ) -> Result<(Vec<OpenAiFunctionTool>, SharedToolDispatcher), CliError> {
+    production_tool_runtime_for_parent_executing_run_with_ask_user(
+        bootstrap,
+        project_root,
+        skills,
+        parent_model,
+        parent_request_config,
+        model_resolution_reference,
+        discovery_cancellation,
+        run_introspection,
+        Box::new(UnavailableAskUserPort),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn production_tool_runtime_for_parent_executing_run_with_ask_user(
+    bootstrap: &Bootstrap,
+    project_root: &Path,
+    skills: Option<&SkillCatalog>,
+    parent_model: String,
+    parent_request_config: agens_core::RequestConfig,
+    model_resolution_reference: Option<String>,
+    discovery_cancellation: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    run_introspection: Option<RunIntrospectionFactory>,
+    ask_user: Box<dyn AskUserPort>,
+) -> Result<(Vec<OpenAiFunctionTool>, SharedToolDispatcher), CliError> {
     production_tool_runtime_inner(
         bootstrap,
         project_root,
@@ -192,7 +217,7 @@ pub fn production_tool_runtime_for_parent_executing_run(
         parent_request_config,
         model_resolution_reference.clone(),
         ProductionTaskRunner::new(bootstrap.clone(), project_root.to_path_buf()),
-        Box::new(UnavailableAskUserPort),
+        ask_user,
         model_resolution_reference
             .map(|reference| diagnosed_working_directory(bootstrap, project_root, reference)),
         discovery_cancellation,

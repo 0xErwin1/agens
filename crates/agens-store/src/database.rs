@@ -57,7 +57,7 @@ struct Migration {
     preserved_tables: &'static [&'static str],
 }
 
-const MIGRATIONS: [Migration; 18] = [
+const MIGRATIONS: [Migration; 19] = [
     Migration {
         id: "0001_permission_grants",
         ddl: permission_grants_ddl,
@@ -152,6 +152,11 @@ const MIGRATIONS: [Migration; 18] = [
     Migration {
         id: "0018_repository_policy",
         ddl: repository_policy_ddl,
+        preserved_tables: &[],
+    },
+    Migration {
+        id: "0019_open_questions",
+        ddl: open_questions_ddl,
         preserved_tables: &[],
     },
 ];
@@ -572,6 +577,28 @@ fn repository_policy_ddl() -> String {
         repository TEXT NOT NULL CHECK(repository <> ''),
         asked_at INTEGER NOT NULL
     );
+    "
+    .to_owned()
+}
+
+fn open_questions_ddl() -> String {
+    "
+    CREATE TABLE open_questions (
+        id INTEGER PRIMARY KEY,
+        session_id INTEGER,
+        child TEXT,
+        question_id TEXT NOT NULL CHECK(question_id <> ''),
+        class TEXT NOT NULL CHECK(class IN ('ask_user', 'permission', 'consent')),
+        origin TEXT NOT NULL CHECK(origin <> ''),
+        admissible_answers TEXT NOT NULL CHECK(json_valid(admissible_answers)),
+        opened_at TEXT NOT NULL,
+        answer TEXT,
+        answered_by TEXT CHECK(answered_by IN ('human', 'supervisor')),
+        answered_at TEXT,
+        delivered_at TEXT,
+        CHECK((session_id IS NOT NULL) != (child IS NOT NULL))
+    );
+    CREATE UNIQUE INDEX open_questions_identity ON open_questions(question_id);
     "
     .to_owned()
 }
