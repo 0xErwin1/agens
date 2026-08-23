@@ -752,7 +752,10 @@ impl GatesSweep {
     /// One pass over every run whose work is finished and whose worktree is
     /// still active.
     fn pass(&self, core: &Mutex<ApiCore>, now: i64) {
-        let Some(candidates) = self.taken(core).map(|core| candidates(&core)) else {
+        let Some(candidates) = self
+            .taken(core)
+            .map(|core| candidates(core.machines().store()))
+        else {
             return;
         };
 
@@ -883,11 +886,15 @@ impl GatesSweep {
 ///
 /// A run in any other state is not one the gates have anything to say about:
 /// its work is still moving, or its worktree has already been let go.
-fn candidates(core: &ApiCore) -> Vec<GateCandidate> {
-    let store = core.machines().store();
+///
+/// `Cancelled` is one of them. Cancellation moves the run and never touches
+/// `worktree_status`, so the directory and its place in the ceiling stay taken;
+/// a sweep that skipped it counted the worktree forever and reclaimed it on
+/// every boot without anything ever reaching `cleaned`.
+fn candidates(store: &ControlPlaneStore) -> Vec<GateCandidate> {
     let mut candidates = Vec::new();
 
-    for state in [RunState::Done, RunState::Failed] {
+    for state in [RunState::Done, RunState::Failed, RunState::Cancelled] {
         let Ok(runs) = store.runs_in_state(state) else {
             continue;
         };
@@ -1109,7 +1116,7 @@ fn now() -> i64 {
 mod tests {
     use agens_store::{AttemptRow, RunRow, RunState, WorktreeStatus};
 
-    use super::{ControlPlaneStore, IngestFact, expired_checkpoint_facts};
+    use super::{ControlPlaneStore, IngestFact, candidates, expired_checkpoint_facts};
     use crate::timers::{OverdueCheckpoint, TimerTick};
 
     const NOW: i64 = 1_700_000_000;
@@ -1229,6 +1236,77 @@ mod tests {
             .unwrap();
 
         assert!(expired_checkpoint_facts(&store, &overdue_tick(orphan)).is_empty());
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A run whose worktree is still held, with nothing else in it that a
+    /// candidate is chosen by.
+    fn held_run() -> RunRow {
+        RunRow {
+            id: None,
+            repo_id: "a1b2c3d4e5f60718".to_owned(),
+            repo_root: "/home/dev/agens".to_owned(),
+            remote_url: None,
+            external_ref: None,
+            parent_run_id: None,
+            task: "a cancelled run still holds its worktree".to_owned(),
+            scope: "crates/agens-server/src/coordinator".to_owned(),
+            dod: "the sweep reaches it".to_owned(),
+            genesis_paths: None,
+            state: RunState::Cancelled,
+            priority: 5,
+            dep_run_id: None,
+            provider: "scripted".to_owned(),
+            budget_tokens: None,
+            worktree_path: None,
+            worktree_status: None,
+            created_at: NOW,
+            result: None,
+        }
+    }
+
+    /// Cancellation moves the run and never touches `worktree_status`. A sweep
+    /// that only looked at `done` and `failed` therefore counted a cancelled
+    /// run's directory against the ceiling forever and reclaimed it on every
+    /// boot, with nothing ever taking it to `cleaned`.
+    #[test]
+    fn a_cancelled_run_still_holding_its_worktree_is_a_candidate() {
+        let directory = scratch();
+        let mut store = ControlPlaneStore::open(&directory).unwrap();
+        let cancelled = store
+            .insert_run(&RunRow {
+                worktree_path: Some("/data/worktrees/agens-a1b2c3d4/agn-196".to_owned()),
+                worktree_status: Some(WorktreeStatus::Reclaimable),
+                ..held_run()
+            })
+            .unwrap();
+        store
+            .insert_run(&RunRow {
+                state: RunState::Running,
+                worktree_path: Some("/data/worktrees/agens-a1b2c3d4/agn-197".to_owned()),
+                worktree_status: Some(WorktreeStatus::Reclaimable),
+                ..held_run()
+            })
+            .unwrap();
+        store
+            .insert_run(&RunRow {
+                worktree_path: Some("/data/worktrees/agens-a1b2c3d4/agn-198".to_owned()),
+                worktree_status: Some(WorktreeStatus::Cleaned),
+                ..held_run()
+            })
+            .unwrap();
+
+        let swept: Vec<i64> = candidates(&store)
+            .into_iter()
+            .map(|candidate| candidate.run_id)
+            .collect();
+
+        assert_eq!(
+            swept,
+            vec![cancelled],
+            "a run still working holds its worktree by right, and a cleaned one holds nothing"
+        );
 
         std::fs::remove_dir_all(directory).unwrap();
     }

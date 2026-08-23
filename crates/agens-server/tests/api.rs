@@ -353,6 +353,16 @@ impl Harness {
             .state
     }
 
+    fn worktree_status(&self, run_id: i64) -> Option<WorktreeStatus> {
+        self.core
+            .machines()
+            .store()
+            .load_run(run_id)
+            .unwrap()
+            .unwrap()
+            .worktree_status
+    }
+
     fn event_types(&self, run_id: i64) -> Vec<String> {
         self.core
             .machines()
@@ -2223,5 +2233,10 @@ fn a_creation_that_fails_after_the_row_exists_leaves_no_run_and_no_worktree() {
         harness.run_state(run_id),
         RunState::Cancelled,
         "the row the failed creation opened is not left as a draft anything could approve"
+    );
+    assert_eq!(
+        harness.worktree_status(run_id),
+        Some(WorktreeStatus::Cleaned),
+        "the directory is gone, so nothing counts it against the ceiling or looks for it at boot"
     );
 }

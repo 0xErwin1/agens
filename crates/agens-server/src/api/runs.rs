@@ -29,7 +29,7 @@ use agens_store::{
 
 use super::{ApiCore, ApiError, Operation};
 use crate::api::ports::{HookPolicy, ProvisionedWorktree, WorktreeRequest};
-use crate::fsm::{Principal, RunFacts, RunTrigger};
+use crate::fsm::{Principal, RunFacts, RunTrigger, WorktreeFacts, WorktreeTrigger};
 use crate::policy::{HookTrust, PendingHookTrust, TrustReadFailure};
 
 /// How many characters of a task's own words the worktree directory carries.
@@ -262,8 +262,23 @@ impl ApiCore {
     /// the outcome — the directory goes first, so a rollback that only got
     /// halfway leaves a cancelled run naming a worktree the sweep can reclaim
     /// rather than a live draft holding one.
+    ///
+    /// The worktree is let go before the run is cancelled. `Discard` carries no
+    /// effects, so a rollback that stopped after it left a `cancelled` row with
+    /// `worktree_status = active` naming a directory that no longer exists:
+    /// counted against the ceiling for the life of the daemon, and reported as
+    /// a missing worktree on every boot.
     fn discard_created_run(&mut self, run_id: i64, row: &RunRow, now: i64) {
         let _ = self.ports.worktrees.remove(row);
+        let _ = self.machines.apply_worktree(
+            run_id,
+            WorktreeTrigger::ManualDisposition,
+            &WorktreeFacts {
+                now,
+                manual_disposition_confirmed: true,
+                ..WorktreeFacts::default()
+            },
+        );
         let _ = self.machines.apply_run(
             run_id,
             RunTrigger::Discard,
