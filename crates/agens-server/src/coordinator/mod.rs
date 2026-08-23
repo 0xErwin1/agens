@@ -210,7 +210,7 @@ impl Coordinator {
         );
 
         let ports = Ports {
-            scheduler: Arc::clone(&admissions) as Arc<dyn crate::api::SchedulerPort>,
+            scheduler: Arc::clone(&admissions) as Arc<dyn crate::api::AdmissionControl>,
             worktrees: Arc::new(GitWorktreeGate::new(
                 SessionWorktrees::new(data_directory),
                 settings.main_ref.clone(),

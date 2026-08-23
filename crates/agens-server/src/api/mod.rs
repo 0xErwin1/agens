@@ -43,9 +43,9 @@ pub use authorization::{
 };
 pub use feed::{InboxItem, InboxView, RunSummary, RunView, TreeSnapshot};
 pub use ports::{
-    Delivery, DeliveryGrain, DeliveryPayload, DeliveryQueue, EventFeed, EventFilter, HookPolicy,
-    PortError, ProvisionedWorktree, RepositoryIdentity, SchedulerPort, SessionControl, StopScope,
-    Subscription, TakeoverHandle, WorktreeDerivation, WorktreeGate, WorktreeRequest,
+    AdmissionControl, Delivery, DeliveryGrain, DeliveryPayload, DeliveryQueue, EventFeed,
+    EventFilter, HookPolicy, PortError, ProvisionedWorktree, RepositoryIdentity, SessionControl,
+    StopScope, Subscription, TakeoverHandle, WorktreeDerivation, WorktreeGate, WorktreeRequest,
 };
 pub use runs::{CreateRun, CreatedRun, PreparedRun};
 pub use team::{
@@ -127,7 +127,7 @@ impl From<agens_store::ControlPlaneError> for ApiError {
 /// call sites.
 #[derive(Clone)]
 pub struct Ports {
-    pub scheduler: Arc<dyn SchedulerPort>,
+    pub scheduler: Arc<dyn AdmissionControl>,
     pub worktrees: Arc<dyn WorktreeGate>,
     pub delivery: Arc<dyn DeliveryQueue>,
     pub sessions: Arc<dyn SessionControl>,

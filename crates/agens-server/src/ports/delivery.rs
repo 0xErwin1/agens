@@ -26,7 +26,7 @@ use crate::api::{Delivery, DeliveryGrain, DeliveryPayload, DeliveryQueue, PortEr
 /// answer queued while the run was parked is read by whichever session picks
 /// the run up next.
 #[must_use]
-pub fn run_mailbox(run_id: i64) -> String {
+pub(crate) fn run_mailbox(run_id: i64) -> String {
     format!("run:{run_id}")
 }
 
@@ -34,13 +34,13 @@ pub fn run_mailbox(run_id: i64) -> String {
 ///
 /// The store is behind a mutex because it holds one SQLite connection and the
 /// core performs an effect from whichever thread the request arrived on.
-pub struct RunDeliveries {
+pub(crate) struct RunDeliveries {
     store: Mutex<DirectiveStore>,
 }
 
 impl RunDeliveries {
     #[must_use]
-    pub const fn new(store: DirectiveStore) -> Self {
+    pub(crate) const fn new(store: DirectiveStore) -> Self {
         Self {
             store: Mutex::new(store),
         }

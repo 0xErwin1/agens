@@ -19,10 +19,11 @@ use std::time::Duration;
 use agens_core::HeadlessTurnCancellation;
 use agens_server::grpc::proto::{self, feed_client::FeedClient, team_client::TeamClient};
 use agens_server::{
-    ApiCore, BlockingBoundary, CoreHandle, Delivery, DeliveryQueue, EventFeed, EventFilter,
-    FacadeBinding, FeedFacade, PolicyStore, PortError, Ports, Principal, ProvisionedWorktree,
-    RepositoryIdentity, RepositoryPolicy, SchedulerPort, SessionControl, StateMachines, StopScope,
-    Subscription, TakeoverHandle, TeamFacade, WorktreeDerivation, WorktreeGate, WorktreeRequest,
+    AdmissionControl, ApiCore, BlockingBoundary, CoreHandle, Delivery, DeliveryQueue, EventFeed,
+    EventFilter, FacadeBinding, FeedFacade, PolicyStore, PortError, Ports, Principal,
+    ProvisionedWorktree, RepositoryIdentity, RepositoryPolicy, SessionControl, StateMachines,
+    StopScope, Subscription, TakeoverHandle, TeamFacade, WorktreeDerivation, WorktreeGate,
+    WorktreeRequest,
 };
 use agens_store::{
     ControlPlaneStore, EventClass, EventRow, QuestionKind, QuestionRow, QuestionState, RunRow,
@@ -55,7 +56,7 @@ struct StubScheduler {
     paused: AtomicBool,
 }
 
-impl SchedulerPort for StubScheduler {
+impl AdmissionControl for StubScheduler {
     fn admissions_paused(&self) -> bool {
         self.paused.load(Ordering::Relaxed)
     }

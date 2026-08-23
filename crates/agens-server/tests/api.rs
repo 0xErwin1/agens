@@ -14,12 +14,12 @@ use std::{
 };
 
 use agens_server::{
-    AnswerQuestion, ApiCore, ApiError, ApprovePlan, AuthorizeMerge, CleaningAction,
-    CleaningDisposition, CreateRun, Delivery, DeliveryGrain, DeliveryPayload, DeliveryQueue,
-    DetailQuestionRefusal, EventFeed, EventFilter, HookPolicy, HookTrust, MergeAuthorization,
-    OPERATION_AUTHORIZATION, Operation, PendingHookTrust, PortError, Ports, Principal,
-    ProvisionedWorktree, RepositoryIdentity, RepositoryPolicy, RetryRequest, RunFacts, RunRef,
-    RunTrigger, SchedulerPort, SessionControl, StateMachines, StopRequest, StopScope, Subscription,
+    AdmissionControl, AnswerQuestion, ApiCore, ApiError, ApprovePlan, AuthorizeMerge,
+    CleaningAction, CleaningDisposition, CreateRun, Delivery, DeliveryGrain, DeliveryPayload,
+    DeliveryQueue, DetailQuestionRefusal, EventFeed, EventFilter, HookPolicy, HookTrust,
+    MergeAuthorization, OPERATION_AUTHORIZATION, Operation, PendingHookTrust, PortError, Ports,
+    Principal, ProvisionedWorktree, RepositoryIdentity, RepositoryPolicy, RetryRequest, RunFacts,
+    RunRef, RunTrigger, SessionControl, StateMachines, StopRequest, StopScope, Subscription,
     TakeoverHandle, TransitionRejection, WorktreeDerivation, WorktreeGate, WorktreeRequest,
     praetor_may_answer,
 };
@@ -50,7 +50,7 @@ struct RecordingScheduler {
     queue_changed: Mutex<Vec<i64>>,
 }
 
-impl SchedulerPort for RecordingScheduler {
+impl AdmissionControl for RecordingScheduler {
     fn admissions_paused(&self) -> bool {
         self.paused.load(Ordering::Relaxed)
     }

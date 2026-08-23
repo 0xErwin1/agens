@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
-use crate::api::{PortError, SchedulerPort};
+use crate::api::{AdmissionControl, PortError};
 
 /// The operator's toggle and the scheduler loop's doorbell.
 ///
@@ -17,7 +17,7 @@ use crate::api::{PortError, SchedulerPort};
 /// store, so several announcements between two ticks are one occasion to look,
 /// and the run id they named is not carried anywhere.
 #[derive(Debug)]
-pub struct Admissions {
+pub(crate) struct Admissions {
     paused: AtomicBool,
     /// Whether something happened that a tick has not looked at yet.
     pending: Mutex<bool>,
@@ -32,7 +32,7 @@ impl Default for Admissions {
 
 impl Admissions {
     #[must_use]
-    pub const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self {
             paused: AtomicBool::new(false),
             pending: Mutex::new(false),
@@ -47,7 +47,7 @@ impl Admissions {
     /// when a session ends, which nothing announces, and a tick that only ran
     /// on new arrivals would leave the queue standing behind a ceiling that has
     /// already lifted.
-    pub fn wait_for_occasion(&self, timeout: Duration) -> bool {
+    pub(crate) fn wait_for_occasion(&self, timeout: Duration) -> bool {
         let Ok(pending) = self.pending.lock() else {
             return false;
         };
@@ -65,7 +65,7 @@ impl Admissions {
 
     /// Wakes the loop without anything having entered the queue, so a daemon
     /// that is shutting down does not wait out the poll interval first.
-    pub fn wake(&self) {
+    pub(crate) fn wake(&self) {
         self.announce();
     }
 
@@ -78,7 +78,7 @@ impl Admissions {
     }
 }
 
-impl SchedulerPort for Admissions {
+impl AdmissionControl for Admissions {
     fn admissions_paused(&self) -> bool {
         self.paused.load(Ordering::Acquire)
     }

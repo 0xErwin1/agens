@@ -26,15 +26,35 @@ use std::sync::{Arc, Mutex};
 
 use agens_core::HeadlessTurnCancellation;
 
+/// What this crate is, as one list.
+///
+/// Everything below is re-exported out of a private module, so this block is
+/// the whole of the daemon's surface and the modules stay free to move behind
+/// it. Three kinds of name are in it, and they are not interchangeable:
+///
+/// - **The composition root.** [`serve_until_shutdown`], [`Daemon`],
+///   [`Coordinator`] and [`CoordinatorSettings`]: what a command surface needs
+///   to run a daemon, and nothing about how one is built.
+/// - **The worker's contract.** [`ApiCore`]'s named operations, [`RunLaunch`],
+///   [`RunIntrospection`], [`FactSender`] and the types they carry. A harness
+///   executing a run reaches the control plane through exactly these.
+/// - **The tables and their vocabulary.** [`RUN_TRANSITIONS`] and the guards,
+///   triggers and effects it is written in. Public because a machine written as
+///   data is a machine something else can read, which is what the tests that
+///   assert the tables do.
+///
+/// A name reachable from none of the three is not surface: it is an internal
+/// that a flat re-export happened to carry, and it belongs behind the module it
+/// came from.
 pub use api::{
-    AdmissionState, AnswerQuestion, AnsweredQuestion, ApiCore, ApiError, ApprovePlan,
-    AuthorizeMerge, CleaningAction, CleaningDisposition, CreateRun, CreatedRun, Delivery,
-    DeliveryGrain, DeliveryPayload, DeliveryQueue, DetailQuestionRefusal, EventFeed, EventFilter,
-    HookPolicy, InboxItem, InboxView, MergeAuthorization, MergeAuthorized, OPERATION_AUTHORIZATION,
-    Operation, OperationAuthorization, PortError, Ports, PreparedRun, ProvisionedWorktree,
-    RepositoryIdentity, RetryRequest, RunRef, RunSummary, RunView, SchedulerPort, SessionControl,
-    StopRequest, StopScope, Subscription, TakeoverHandle, TreeSnapshot, WorktreeDerivation,
-    WorktreeGate, WorktreeRequest, praetor_may_answer,
+    AdmissionControl, AdmissionState, AnswerQuestion, AnsweredQuestion, ApiCore, ApiError,
+    ApprovePlan, AuthorizeMerge, CleaningAction, CleaningDisposition, CreateRun, CreatedRun,
+    Delivery, DeliveryGrain, DeliveryPayload, DeliveryQueue, DetailQuestionRefusal, EventFeed,
+    EventFilter, HookPolicy, InboxItem, InboxView, MergeAuthorization, MergeAuthorized,
+    OPERATION_AUTHORIZATION, Operation, OperationAuthorization, PortError, Ports, PreparedRun,
+    ProvisionedWorktree, RepositoryIdentity, RetryRequest, RunRef, RunSummary, RunView,
+    SessionControl, StopRequest, StopScope, Subscription, TakeoverHandle, TreeSnapshot,
+    WorktreeDerivation, WorktreeGate, WorktreeRequest, praetor_may_answer,
 };
 pub use blocking::{BlockingBoundary, BlockingError};
 pub use coordinator::{
@@ -57,15 +77,12 @@ pub use grpc::{CoreHandle, FacadeBinding, FacadeError, FeedFacade, TeamFacade};
 pub use ingest::{
     AcceptedFact, Attribution, CheckpointClaim, CheckpointStanding, DrainedFact, FactReceiver,
     FactSender, HealthSignal, HealthThresholds, Ingest, IngestFact, IngestRejection, LostReason,
-    ReportedCheckpoint, ReportedFact, attribution_of, channel as ingest_channel,
-    detect_worker_lost,
+    ReportedCheckpoint, ReportedFact, channel as ingest_channel,
 };
 pub use instance::{ServeInstance, ServeInstanceError, socket_path};
 pub use introspection::{AttemptResolver, CheckpointReporting, Clock, RunIntrospection};
 pub use policy::{HookTrust, PendingHookTrust, PolicyError, PolicyStore, RepositoryPolicy};
-pub use ports::{
-    Admissions, GitWorktreeGate, JournalFeed, RunDeliveries, SupervisedSessions, run_mailbox,
-};
+pub use ports::GitWorktreeGate;
 pub use scheduler::{
     Admission, AdmissionFailure, Candidate, Deferral, Ineligible, LaunchError, LaunchedSession,
     PendingRun, Queue, QueueReport, RunLauncher, RunSession, Scheduler, SchedulerError,

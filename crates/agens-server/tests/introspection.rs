@@ -14,9 +14,9 @@ use agens_core::run_introspection::{
     RunIntrospectionError, RunIntrospectionPort,
 };
 use agens_server::{
-    ApiCore, CHECKPOINT_EVENT, CheckpointClaim, Delivery, DeliveryQueue, EventFeed, EventFilter,
-    HookTrust, PendingHookTrust, PortError, Ports, ProvisionedWorktree, ReportedCheckpoint,
-    RepositoryIdentity, RepositoryPolicy, RunIntrospection, SchedulerPort, SessionControl,
+    AdmissionControl, ApiCore, CHECKPOINT_EVENT, CheckpointClaim, Delivery, DeliveryQueue,
+    EventFeed, EventFilter, HookTrust, PendingHookTrust, PortError, Ports, ProvisionedWorktree,
+    ReportedCheckpoint, RepositoryIdentity, RepositoryPolicy, RunIntrospection, SessionControl,
     StateMachines, StopScope, Subscription, TakeoverHandle, TimerSettings, TimerWheel,
     WorktreeDerivation, WorktreeGate, WorktreeRequest,
 };
@@ -68,7 +68,7 @@ fn run_in(state: RunState) -> RunRow {
 /// happens.
 struct Unreached;
 
-impl SchedulerPort for Unreached {
+impl AdmissionControl for Unreached {
     fn admissions_paused(&self) -> bool {
         false
     }
@@ -162,7 +162,7 @@ fn ports() -> Ports {
     let unreached = Arc::new(Unreached);
 
     Ports {
-        scheduler: Arc::clone(&unreached) as Arc<dyn SchedulerPort>,
+        scheduler: Arc::clone(&unreached) as Arc<dyn AdmissionControl>,
         worktrees: Arc::clone(&unreached) as Arc<dyn WorktreeGate>,
         delivery: Arc::clone(&unreached) as Arc<dyn DeliveryQueue>,
         sessions: Arc::clone(&unreached) as Arc<dyn SessionControl>,

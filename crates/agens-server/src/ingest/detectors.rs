@@ -95,7 +95,7 @@ pub struct CheckpointStanding {
 /// a checkpoint that never arrived. A run with no checkpoint yet raises
 /// nothing: there is no claim to contradict, and the first interval is grace.
 #[must_use]
-pub fn detect_worker_lost(
+pub(crate) fn detect_worker_lost(
     health: &RunHealthRow,
     checkpoint: &CheckpointStanding,
     thresholds: &HealthThresholds,

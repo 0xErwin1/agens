@@ -42,9 +42,8 @@ use agens_store::{
 };
 
 pub use checkpoint::{CheckpointClaim, ReportedCheckpoint};
-pub use detectors::{
-    CheckpointStanding, HealthSignal, HealthThresholds, LostReason, detect_worker_lost,
-};
+pub(crate) use detectors::detect_worker_lost;
+pub use detectors::{CheckpointStanding, HealthSignal, HealthThresholds, LostReason};
 
 use health::{HealthState, Observation};
 
@@ -103,7 +102,7 @@ pub struct Attribution {
 /// `None` when the run has no attempt yet or its live attempt has not been
 /// correlated with a physical execution: neither is a failure, and both mean
 /// there is nothing a fact could be attributed to.
-pub fn attribution_of(
+pub(crate) fn attribution_of(
     store: &ControlPlaneStore,
     run_id: i64,
 ) -> Result<Option<Attribution>, ControlPlaneError> {

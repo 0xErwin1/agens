@@ -50,13 +50,13 @@ impl Subscriber {
 
 /// The fan-out every client's `Subscribe` reaches.
 #[derive(Default)]
-pub struct JournalFeed {
+pub(crate) struct JournalFeed {
     subscribers: Mutex<Vec<Subscriber>>,
 }
 
 impl JournalFeed {
     #[must_use]
-    pub const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self {
             subscribers: Mutex::new(Vec::new()),
         }
@@ -68,7 +68,7 @@ impl JournalFeed {
     /// A client that disconnected is not an error and is not retried: its end
     /// of the channel closed, which is the only signal a fan-out gets and the
     /// only one it needs.
-    pub fn publish(&self, event: &EventRow, repo_id: Option<&str>) {
+    pub(crate) fn publish(&self, event: &EventRow, repo_id: Option<&str>) {
         let Ok(mut subscribers) = self.subscribers.lock() else {
             return;
         };
@@ -85,7 +85,7 @@ impl JournalFeed {
     /// How many subscribers are still listening. The publisher reads it to skip
     /// the journal entirely while nobody is watching.
     #[must_use]
-    pub fn subscribers(&self) -> usize {
+    pub(crate) fn subscribers(&self) -> usize {
         self.subscribers
             .lock()
             .map_or(0, |subscribers| subscribers.len())
