@@ -468,7 +468,7 @@ fn the_deadline_a_checkpoint_declares_is_the_one_the_timer_wheel_holds_it_to() {
                 overdue.promised_at
             ))
             .collect::<Vec<_>>(),
-        vec![(run_id, receipt.checkpoint_event_id, NOW + 3_600)],
+        vec![(run_id, receipt.checkpoint_event_id, Some(NOW + 3_600))],
         "the wheel has to find the deadline this checkpoint declared"
     );
 

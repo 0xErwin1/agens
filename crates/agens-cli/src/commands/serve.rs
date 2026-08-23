@@ -29,6 +29,7 @@ pub(crate) fn run_serve(
     let settings = CoordinatorSettings {
         timers: TimerSettings {
             checkpoint_grace_percent: team.checkpoint_grace_percent,
+            first_checkpoint_seconds: team.first_checkpoint_seconds,
             quota_window_seconds: team.quota_window_seconds,
         },
         // The same switch every other diagnostic is behind. A supervisor that

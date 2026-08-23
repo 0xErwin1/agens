@@ -13,6 +13,11 @@
 //!   They apply a transition through the state machines and are done; no model
 //!   is involved, which is what lets a team recover while every provider is
 //!   capped.
+//! - A **missed first checkpoint** is the same exception, raised for a run that
+//!   has never checkpointed at all. It is measured from the run starting rather
+//!   than from a promise, because a worker that has said nothing has promised
+//!   nothing, and without it such a worker holds its slot and its directory
+//!   indefinitely.
 //! - An **overdue checkpoint** is an exception raised for Praetor to judge. The
 //!   wheel does not decide what to do about it: it journals the signal once and
 //!   hands the caller the context to activate Praetor with. Once, not once per
@@ -44,6 +49,10 @@ pub const CHECKPOINT_EVENT: &str = "checkpoint";
 /// one. One per overdue checkpoint, and its payload names which.
 pub const CHECKPOINT_OVERDUE_EVENT: &str = "checkpoint_overdue";
 
+/// The domain event the run machine's admission journals. It is what the first
+/// checkpoint's deadline is measured from.
+const RUN_STARTED_EVENT: &str = "run_started";
+
 /// The journal entry a refused stage of a tick is recorded as. Its payload
 /// names the stage and what refused it.
 pub const TIMER_STAGE_REJECTED_EVENT: &str = "timer_stage_rejected";
@@ -52,8 +61,10 @@ pub const TIMER_STAGE_REJECTED_EVENT: &str = "timer_stage_rejected";
 /// its next checkpoint by. A checkpoint without it declares no deadline.
 const PROMISED_AT_FIELD: &str = "promised_at";
 
-/// The payload field of [`CHECKPOINT_OVERDUE_EVENT`] naming the checkpoint it
-/// was raised for. It is what keeps the signal to one per checkpoint.
+/// The payload field of [`CHECKPOINT_OVERDUE_EVENT`] naming the entry it was
+/// raised for: the checkpoint that went past its promise, or the admission a
+/// run that has never checkpointed is measured from. It is what keeps the
+/// signal to one per entry, across restarts.
 const CHECKPOINT_ID_FIELD: &str = "checkpoint_id";
 
 /// Share of the promised span a worker gets before its checkpoint is overdue,
@@ -61,6 +72,12 @@ const CHECKPOINT_ID_FIELD: &str = "checkpoint_id";
 /// conservative on purpose, since a wheel that cries early costs Praetor a
 /// activation for a worker that was only slow.
 pub const DEFAULT_CHECKPOINT_GRACE_PERCENT: i64 = 150;
+
+/// How long a run has from the moment it starts executing to its first
+/// checkpoint. Conservative on purpose: everything before the first checkpoint
+/// is setup a worker cannot report on, and the deadline exists to bound a
+/// worker that never reports at all rather than to hurry a slow one.
+pub const DEFAULT_FIRST_CHECKPOINT_SECONDS: i64 = 3_600;
 
 /// How long a cap the provider named no reset for is honoured before the
 /// provider is tried again. The run costs no retry budget either way, so being
@@ -74,6 +91,8 @@ pub const DEFAULT_QUOTA_WINDOW_SECONDS: i64 = 900;
 pub struct TimerSettings {
     /// `team.checkpoint_grace_percent`.
     pub checkpoint_grace_percent: i64,
+    /// `team.first_checkpoint_seconds`.
+    pub first_checkpoint_seconds: i64,
     /// `team.quota_window_seconds`.
     pub quota_window_seconds: i64,
 }
@@ -82,6 +101,7 @@ impl Default for TimerSettings {
     fn default() -> Self {
         Self {
             checkpoint_grace_percent: DEFAULT_CHECKPOINT_GRACE_PERCENT,
+            first_checkpoint_seconds: DEFAULT_FIRST_CHECKPOINT_SECONDS,
             quota_window_seconds: DEFAULT_QUOTA_WINDOW_SECONDS,
         }
     }
@@ -153,10 +173,14 @@ pub struct ExpiredQuestion {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OverdueCheckpoint {
     pub run_id: i64,
-    /// The journal entry of the checkpoint that went overdue.
+    /// The journal entry the deadline was measured from: the checkpoint that
+    /// went past its promise, or the admission of a run that has never
+    /// checkpointed.
     pub checkpoint_event_id: i64,
-    pub promised_at: i64,
-    /// `promised_at` plus its share of grace.
+    /// `None` for a run that has never checkpointed, which promised nothing.
+    pub promised_at: Option<i64>,
+    /// `promised_at` plus its share of grace, or the run starting plus the
+    /// first-checkpoint span.
     pub deadline: i64,
     /// The journal entry the wheel wrote, which is also what keeps this signal
     /// from being raised again for the same checkpoint.
@@ -395,17 +419,23 @@ impl TimerWheel {
             .store()
             .events_of_type_for_run(run_id, CHECKPOINT_EVENT)?;
 
-        let Some(latest) = checkpoints.last() else {
-            return Ok(None);
-        };
-        let Some(checkpoint_event_id) = latest.id else {
-            return Ok(None);
-        };
-        let Some(promised_at) = promised_at(&latest.payload) else {
-            return Ok(None);
-        };
-        let Some(deadline) = self.deadline(latest.ts, promised_at) else {
-            return Ok(None);
+        let (checkpoint_event_id, promised_at, deadline) = match checkpoints.last() {
+            Some(latest) => {
+                let (Some(checkpoint_event_id), Some(promised_at)) =
+                    (latest.id, promised_at(&latest.payload))
+                else {
+                    return Ok(None);
+                };
+                let Some(deadline) = self.deadline(latest.ts, promised_at) else {
+                    return Ok(None);
+                };
+
+                (checkpoint_event_id, Some(promised_at), deadline)
+            }
+            None => match self.first_checkpoint_deadline(machines, run_id)? {
+                Some((started_event_id, deadline)) => (started_event_id, None, deadline),
+                None => return Ok(None),
+            },
         };
 
         if now < deadline {
@@ -421,6 +451,10 @@ impl TimerWheel {
             "promised_at": promised_at,
             "deadline": deadline,
             "grace_percent": self.settings.checkpoint_grace_percent,
+            // A first checkpoint that never arrived is measured from the run
+            // starting rather than from a promise, so the entry says which of
+            // the two deadlines passed.
+            "first_checkpoint": promised_at.is_none(),
         });
 
         let journaled = machines.journal(&[EventRow {
@@ -445,6 +479,42 @@ impl TimerWheel {
             deadline,
             signal_event_id,
         }))
+    }
+
+    /// The deadline a run that has never checkpointed is measured against, and
+    /// the entry it is measured from.
+    ///
+    /// It runs from the moment the run started executing, because that is the
+    /// last thing the control plane knows about a worker that has said nothing
+    /// since. Without it a worker that never checkpoints is never reported
+    /// lost, and goes on holding its slot and its directory for as long as the
+    /// daemon lives.
+    ///
+    /// A run with no `run_started` entry has not executed, so there is nothing
+    /// to be late for.
+    fn first_checkpoint_deadline(
+        &self,
+        machines: &StateMachines,
+        run_id: i64,
+    ) -> Result<Option<(i64, i64)>, TransitionRejection> {
+        let started = machines
+            .store()
+            .events_of_type_for_run(run_id, RUN_STARTED_EVENT)?;
+
+        let Some(latest) = started.last() else {
+            return Ok(None);
+        };
+        let Some(event_id) = latest.id else {
+            return Ok(None);
+        };
+        let Some(deadline) = latest
+            .ts
+            .checked_add(self.settings.first_checkpoint_seconds)
+        else {
+            return Ok(None);
+        };
+
+        Ok(Some((event_id, deadline)))
     }
 
     /// When a checkpoint stops being merely late and becomes overdue.

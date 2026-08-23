@@ -260,7 +260,7 @@ fn a_checkpoint_is_overdue_only_once_the_promised_span_plus_its_grace_has_passed
 
     let overdue = tick.overdue_checkpoints.first().unwrap();
     assert_eq!(overdue.run_id, run_id);
-    assert_eq!(overdue.promised_at, START + PROMISED_SPAN);
+    assert_eq!(overdue.promised_at, Some(START + PROMISED_SPAN));
     assert_eq!(overdue.deadline, START + 900);
     assert_eq!(overdue_signals(&machines, run_id), 1);
 }
