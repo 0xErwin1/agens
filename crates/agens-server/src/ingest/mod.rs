@@ -328,6 +328,22 @@ impl FactSender {
     /// A fact that could not be queued is refused rather than dropped
     /// silently: the reporter is the party that knows which run it belongs to,
     /// and a health plane missing a turn it was told about should say so.
+    /// The same sender with no patience at all.
+    ///
+    /// For a reporter that is not the run it is reporting about. A worker
+    /// waiting several heartbeats for room is a turn that is slow; the timer
+    /// wheel waiting is every deadline in the daemon standing still behind one
+    /// backlogged run, and quota resets, question expiry and checkpoint
+    /// deadlines all stop with it. The refusal is journaled either way, so
+    /// waiting buys the wheel nothing it does not already record.
+    #[must_use]
+    pub fn impatient(&self) -> Self {
+        Self {
+            outbound: self.outbound.clone(),
+            patience: Duration::ZERO,
+        }
+    }
+
     pub fn report(&self, fact: ReportedFact) -> Result<(), RefusedReport> {
         let deadline = Instant::now() + self.patience;
         let mut fact = fact;
@@ -746,6 +762,42 @@ mod channel_tests {
             started.elapsed() >= PATIENCE,
             "it waited for the single writer before giving up"
         );
+    }
+
+    /// The wheel raises every deadline in the daemon. One backlogged run must
+    /// not hold quota resets, question expiry and the other checkpoints behind
+    /// it for the length of a reporter's patience.
+    #[test]
+    fn a_reporter_with_no_patience_refuses_the_fact_at_once() {
+        let (sender, _receiver) = channel_with_backlog(1, Duration::from_secs(60));
+        let wheel = sender.impatient();
+
+        wheel.report(turn_started()).expect("the first fact fits");
+
+        let started = Instant::now();
+        let refused = wheel
+            .report(turn_started())
+            .expect_err("the queue is full and this reporter does not wait");
+
+        assert_eq!(refused.rejection, IngestRejection::Backlogged);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "it waited {:?} on a queue it shares with the run it is watching",
+            started.elapsed()
+        );
+    }
+
+    /// The impatient sender is the same queue, not a second one.
+    #[test]
+    fn a_fact_reported_without_patience_reaches_the_same_writer() {
+        let (sender, receiver) = channel_with_backlog(1, Duration::from_secs(60));
+
+        sender
+            .impatient()
+            .report(turn_started())
+            .expect("the one slot is free");
+
+        assert_eq!(receiver.0.recv().expect("the fact is there").run_id, 1);
     }
 
     #[test]

@@ -562,6 +562,9 @@ fn timer_loop(
     let stopping = Arc::clone(stopping);
     let wheel = TimerWheel::new(settings.timers);
     let heartbeat = settings.heartbeat;
+    // The wheel is the one reporter that never waits: a tick that parks on a
+    // full queue stops every other deadline it was about to raise.
+    let facts = facts.impatient();
     // Which runs already have a standing entry for this backlog. A queue that
     // stays full is one fact lost per run, not one per heartbeat.
     let mut backlogged: std::collections::HashSet<i64> = std::collections::HashSet::new();
