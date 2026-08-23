@@ -493,6 +493,26 @@ message ChatRef {
 
 message ChatAck {}
 
+message ListChatsRequest {
+  // Required. One daemon serves N projects, and a terminal offered another
+  // project's conversation is a terminal that can attach to the wrong one.
+  string checkout = 1;
+}
+
+// One chat the daemon is hosting.
+message OpenChat {
+  int64 session_id = 1;
+  string checkout = 2;
+  // Whether a turn is running right now, so a client that comes back
+  // mid-answer can say so rather than looking idle.
+  bool answering = 3;
+}
+
+// The chats open against one checkout, newest first.
+message OpenChats {
+  repeated OpenChat chats = 1;
+}
+
 // The chat plane: the user's own conversation, hosted by the daemon.
 //
 // `Prompt` returns as soon as the turn has somewhere to start, not when it
@@ -507,4 +527,7 @@ service Chat {
   // Ends the session, letting the turn it may be running finish first.
   rpc Close(ChatRef) returns (ChatAck);
   rpc Subscribe(ChatRef) returns (stream SessionEvent);
+  // What is already open for a checkout, so a terminal that detached comes
+  // back to its conversation instead of starting a second one beside it.
+  rpc List(ListChatsRequest) returns (OpenChats);
 }

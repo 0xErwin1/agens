@@ -1,6 +1,6 @@
 //! The chat plane, as a surface uses it.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use tokio_stream::{Stream, StreamExt};
 use tonic::transport::Channel;
@@ -8,6 +8,16 @@ use tonic::transport::Channel;
 use crate::ClientError;
 use crate::decode::{HostedChatEvent, session_event};
 use crate::proto;
+
+/// One chat the daemon is hosting.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenChat {
+    pub session_id: i64,
+    pub checkout: PathBuf,
+    /// Whether a turn is running right now, so a client that comes back
+    /// mid-answer can say so rather than looking idle.
+    pub answering: bool,
+}
 
 /// A handle on one daemon's chat plane.
 #[derive(Clone, Debug)]
@@ -38,6 +48,31 @@ impl ChatClient {
             .into_inner();
 
         Ok(opened.session_id)
+    }
+
+    /// What is already open for `checkout`, newest first.
+    ///
+    /// This is how a terminal that detached comes back to its conversation
+    /// rather than starting a second one beside it, without anybody having
+    /// written a session id down.
+    pub async fn open_against(&mut self, checkout: &Path) -> Result<Vec<OpenChat>, ClientError> {
+        let chats = self
+            .inner
+            .list(proto::ListChatsRequest {
+                checkout: checkout.display().to_string(),
+            })
+            .await?
+            .into_inner();
+
+        Ok(chats
+            .chats
+            .into_iter()
+            .map(|chat| OpenChat {
+                session_id: chat.session_id,
+                checkout: PathBuf::from(chat.checkout),
+                answering: chat.answering,
+            })
+            .collect())
     }
 
     /// Sends a prompt and returns as soon as the daemon has somewhere to run it.

@@ -478,3 +478,110 @@ async fn a_chat_that_names_no_checkout_is_refused() {
 
     assert_eq!(refused.code(), Code::InvalidArgument);
 }
+
+/// A terminal that detached comes back to the conversation it left. Opening a
+/// second one beside it would leave the first answering into a stream nobody
+/// reads.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_that_comes_back_is_told_which_chat_is_already_open_here() {
+    let mut wire = wire("listed").await;
+
+    let handle = wire
+        .client
+        .open(Request::new(open_request("/projects/agens")))
+        .await
+        .expect("the chat opens")
+        .into_inner();
+
+    let open = wire
+        .client
+        .list(Request::new(proto::ListChatsRequest {
+            checkout: "/projects/agens".to_owned(),
+        }))
+        .await
+        .expect("the listing is served")
+        .into_inner();
+
+    assert_eq!(open.chats.len(), 1);
+    assert_eq!(open.chats[0].session_id, handle.session_id);
+    assert_eq!(open.chats[0].checkout, "/projects/agens");
+    assert!(!open.chats[0].answering, "no turn is running yet");
+}
+
+/// One daemon serves N projects, so a listing scoped to one checkout never
+/// offers another project's conversation.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_chat_open_for_another_checkout_is_not_offered_here() {
+    let mut wire = wire("scoped").await;
+
+    wire.client
+        .open(Request::new(open_request("/projects/agens")))
+        .await
+        .expect("the chat opens");
+
+    let elsewhere = wire
+        .client
+        .list(Request::new(proto::ListChatsRequest {
+            checkout: "/projects/something-else".to_owned(),
+        }))
+        .await
+        .expect("the listing is served")
+        .into_inner();
+
+    assert!(elsewhere.chats.is_empty());
+}
+
+/// A client that comes back mid-answer is told so, rather than being handed a
+/// chat that looks idle while a turn is still producing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_chat_that_is_answering_says_so_in_the_listing() {
+    let mut wire = wire("answering").await;
+
+    let handle = wire
+        .client
+        .open(Request::new(open_request("/projects/agens")))
+        .await
+        .expect("the chat opens")
+        .into_inner();
+
+    wire.client
+        .prompt(Request::new(proto::PromptRequest {
+            session_id: handle.session_id,
+            prompt: "take your time".to_owned(),
+        }))
+        .await
+        .expect("the prompt is accepted");
+
+    assert_eq!(
+        wire.started.recv_timeout(PATIENCE),
+        Ok("take your time".to_owned()),
+    );
+
+    let open = wire
+        .client
+        .list(Request::new(proto::ListChatsRequest {
+            checkout: "/projects/agens".to_owned(),
+        }))
+        .await
+        .expect("the listing is served")
+        .into_inner();
+
+    assert!(open.chats[0].answering);
+}
+
+/// A listing that names no checkout would be a listing across every project on
+/// the machine.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_listing_that_names_no_checkout_is_refused() {
+    let mut wire = wire("unscoped-list").await;
+
+    let refused = wire
+        .client
+        .list(Request::new(proto::ListChatsRequest {
+            checkout: String::new(),
+        }))
+        .await
+        .expect_err("a listing names its checkout");
+
+    assert_eq!(refused.code(), Code::InvalidArgument);
+}

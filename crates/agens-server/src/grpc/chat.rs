@@ -135,6 +135,33 @@ impl Chat for ChatFacade {
         Ok(Response::new(proto::ChatAck {}))
     }
 
+    /// What is already open for a checkout, newest first.
+    ///
+    /// The checkout is required for the reason every listing on this facade
+    /// requires one: a daemon serves N projects, and a terminal offered another
+    /// project's conversation is a terminal that can attach to the wrong one.
+    async fn list(
+        &self,
+        request: Request<proto::ListChatsRequest>,
+    ) -> Result<Response<proto::OpenChats>, Status> {
+        let checkout = checkout(request.into_inner().checkout)?;
+
+        let chats = self
+            .off_runtime(move |chats| chats.open_against(&checkout))
+            .await?;
+
+        Ok(Response::new(proto::OpenChats {
+            chats: chats
+                .into_iter()
+                .map(|chat| proto::OpenChat {
+                    session_id: chat.session_id.value(),
+                    checkout: chat.checkout.display().to_string(),
+                    answering: chat.answering,
+                })
+                .collect(),
+        }))
+    }
+
     /// Opens a subscription to one chat and forwards it to the client.
     ///
     /// One thread per subscriber, for the reason the journal's `Subscribe` has
