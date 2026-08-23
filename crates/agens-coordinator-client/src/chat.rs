@@ -5,8 +5,10 @@ use std::path::{Path, PathBuf};
 use tokio_stream::{Stream, StreamExt};
 use tonic::transport::Channel;
 
+use agens_core::Message;
+
 use crate::ClientError;
-use crate::decode::{HostedChatEvent, session_event};
+use crate::decode::{HostedChatEvent, message, session_event};
 use crate::proto;
 
 /// One chat the daemon is hosting.
@@ -103,6 +105,21 @@ impl ChatClient {
         self.inner.close(proto::ChatRef { session_id }).await?;
 
         Ok(())
+    }
+
+    /// What the chat has said so far.
+    ///
+    /// A snapshot: this is what a terminal coming back needs in order to draw
+    /// the conversation it left, and what happens next arrives on
+    /// [`Self::subscribe`].
+    pub async fn history(&mut self, session_id: i64) -> Result<Vec<Message>, ClientError> {
+        let history = self
+            .inner
+            .history(proto::ChatRef { session_id })
+            .await?
+            .into_inner();
+
+        history.messages.into_iter().map(message).collect()
     }
 
     /// Follows what the chat is doing, live from now.

@@ -404,6 +404,7 @@ fn the_daemon_runs_a_run_from_approval_to_a_question_and_back() {
         },
         scripted_worker(Arc::clone(&script)),
         common::refusing_chat(),
+        common::refusing_chat_history(),
         &shutdown,
     )
     .expect("the daemon serves");
@@ -537,6 +538,7 @@ fn the_first_answer_a_client_gets_is_from_a_reconciled_control_plane() {
             Err(LaunchError("this test starts no sessions".to_owned()))
         }) as RunWorkerFactory,
         common::refusing_chat(),
+        common::refusing_chat_history(),
         &shutdown,
     )
     .expect("the daemon serves");
@@ -575,6 +577,7 @@ fn a_coordinator_that_cannot_open_its_store_carries_the_cause_out() {
             Err(LaunchError("this test starts no sessions".to_owned()))
         }) as RunWorkerFactory,
         common::refusing_chat(),
+        common::refusing_chat_history(),
         &shutdown,
     )
     .expect_err("the control plane cannot be opened");
@@ -683,6 +686,7 @@ fn the_daemon_reclaims_the_worktree_of_a_finished_run_whose_branch_landed() {
             Err(LaunchError("this test starts no sessions".to_owned()))
         }) as RunWorkerFactory,
         common::refusing_chat(),
+        common::refusing_chat_history(),
         &shutdown,
     )
     .expect("the daemon serves");

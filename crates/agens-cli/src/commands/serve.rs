@@ -20,7 +20,7 @@ use agens_server::{CoordinatorSettings, PolicySettings, ServerError, TimerSettin
 mod lifecycle;
 
 use crate::CliDependencies;
-use crate::chat_session::hosted_chat;
+use crate::chat_session::{hosted_chat, hosted_chat_history};
 use crate::cli::ServeAction;
 use crate::deps::bootstrap;
 use crate::worker::run_worker;
@@ -119,6 +119,7 @@ fn run_daemon(
         &settings,
         run_worker(bootstrap),
         hosted_chat(bootstrap),
+        hosted_chat_history(bootstrap),
         cancellation,
     )
     .map_err(|error| match error {

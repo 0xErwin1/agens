@@ -23,7 +23,7 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use agens_core::{HeadlessTurnCancellation, TurnEvent, TurnProgressSink};
+use agens_core::{HeadlessTurnCancellation, Message, TurnEvent, TurnProgressSink};
 
 use crate::sessions::{
     SessionAdmission, SessionId, SessionOutcome, SessionRegistryError, SessionRuntime,
@@ -104,6 +104,14 @@ pub struct ChatSession {
 /// How the daemon turns a client's request into a chat session.
 pub type ChatSessionFactory =
     Arc<dyn Fn(&ChatSessionRequest) -> Result<ChatSession, ChatError> + Send + Sync>;
+
+/// Where a chat's conversation is read back from.
+///
+/// A port for the same reason the factory is one: what a session's history is
+/// made of — which messages are kept, which turns are somebody else's — belongs
+/// to whoever writes it, and the control plane stores none of it.
+pub type ChatHistorySource =
+    Arc<dyn Fn(SessionId) -> Result<Vec<Message>, ChatError> + Send + Sync>;
 
 /// What a subscriber to a hosted chat sees.
 ///
@@ -210,17 +218,38 @@ struct OpenChat {
 pub struct ChatSessions {
     supervisor: SessionSupervisor,
     open_chat: ChatSessionFactory,
+    history: ChatHistorySource,
     open: Mutex<BTreeMap<SessionId, OpenChat>>,
 }
 
 impl ChatSessions {
     #[must_use]
-    pub fn new(supervisor: SessionSupervisor, open_chat: ChatSessionFactory) -> Self {
+    pub fn new(
+        supervisor: SessionSupervisor,
+        open_chat: ChatSessionFactory,
+        history: ChatHistorySource,
+    ) -> Self {
         Self {
             supervisor,
             open_chat,
+            history,
             open: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    /// What one chat has said so far.
+    ///
+    /// Read from where the session is stored rather than from the running
+    /// chat's own memory: the turn owns that memory while it runs, and a reader
+    /// that waited for it would be a reader blocked for as long as the answer
+    /// takes. The store is behind the turn by at most the turn in flight, which
+    /// is exactly the part `Subscribe` is already delivering.
+    pub fn history(&self, session: SessionId) -> Result<Vec<Message>, ChatError> {
+        if !self.locked()?.contains_key(&session) {
+            return Err(ChatError::Unknown);
+        }
+
+        (self.history)(session)
     }
 
     /// Opens a chat session and starts it, so a prompt has somewhere to arrive.

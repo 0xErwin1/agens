@@ -513,6 +513,23 @@ message OpenChats {
   repeated OpenChat chats = 1;
 }
 
+// One message of a conversation.
+message Message {
+  // "system", "user", "assistant", "tool" or "supervisor". A string for the
+  // reason every other vocabulary here is one: the set has a definition
+  // already, and a protobuf enum beside it is a second copy that can drift.
+  string role = 1;
+  repeated MessagePart parts = 2;
+}
+
+// What a chat has said so far.
+//
+// A snapshot, not a stream: it is what a terminal coming back needs in order to
+// draw the conversation it left, and what happens next arrives on `Subscribe`.
+message ChatHistory {
+  repeated Message messages = 1;
+}
+
 // The chat plane: the user's own conversation, hosted by the daemon.
 //
 // `Prompt` returns as soon as the turn has somewhere to start, not when it
@@ -530,4 +547,7 @@ service Chat {
   // What is already open for a checkout, so a terminal that detached comes
   // back to its conversation instead of starting a second one beside it.
   rpc List(ListChatsRequest) returns (OpenChats);
+  // What the chat has said so far, so a terminal that comes back draws the
+  // conversation it left rather than an empty one.
+  rpc History(ChatRef) returns (ChatHistory);
 }

@@ -10,7 +10,8 @@
 //! the client and not the turn. The daemon keeps the session running, and a
 //! terminal that attaches again finds it where it was left — by asking the
 //! daemon what is already open for this checkout, rather than by anybody having
-//! written a session id down.
+//! written a session id down, and by drawing the conversation the daemon has
+//! been having in the meantime.
 //!
 //! This mode is narrower than the local one and stays opt-in until it is not. A
 //! hosted chat cannot yet be asked a permission question and has no task runtime
@@ -25,7 +26,7 @@ use std::sync::mpsc::Sender;
 
 use agens_bootstrap::Bootstrap;
 use agens_coordinator_client::{ChatClient, ClientError, Coordinator, HostedChatEvent};
-use agens_core::TurnEvent;
+use agens_core::{Message, TurnEvent};
 use agens_error::{CliError, ExitStatus};
 use agens_tui::{
     Engine, Tui, TuiRouteRequest, TuiSubmissionOutcome, run_with_default_progress_submit,
@@ -184,6 +185,16 @@ pub fn run_attached_tui(
     tui.set_collapse_thinking(bootstrap.collapse_thinking);
     tui.add_info(arrival.describe());
 
+    // Drawn through the surface's own projection, so a conversation the daemon
+    // held reads exactly as one this process held. A hosted chat delegates
+    // nothing yet, so there are no out-of-band subagent turns to filter — the
+    // unit that gives it a task runtime is the one that will need that.
+    if let Err(error) = tui.replace_history(&arrival.history) {
+        tui.add_info(format!(
+            "the conversation so far could not be drawn: {error:?}"
+        ));
+    }
+
     run_with_default_progress_submit(
         &mut tui,
         move |request, _progress| route(&request),
@@ -196,33 +207,45 @@ pub fn run_attached_tui(
     Ok(String::new())
 }
 
-/// How this terminal came to the chat it is now on, so it can say so.
+/// How this terminal came to the chat it is now on, and what was already
+/// said there.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Arrival {
+    session_id: i64,
+    landing: Landing,
+    /// What the chat has said so far. Empty for one this terminal just opened.
+    history: Vec<Message>,
+}
+
+/// Whether this terminal started the conversation or came back to it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Arrival {
-    Opened(i64),
-    CameBack { session_id: i64, answering: bool },
+enum Landing {
+    Opened,
+    CameBack { answering: bool },
 }
 
 impl Arrival {
-    fn describe(self) -> String {
-        match self {
-            Self::Opened(session_id) => {
-                format!("attached to the daemon as session {session_id}; leaving does not stop it")
-            }
-            Self::CameBack {
-                session_id,
-                answering: false,
-            } => format!("back on session {session_id}, where you left it"),
-            Self::CameBack {
-                session_id,
-                answering: true,
-            } => format!("back on session {session_id}, which is still answering"),
+    const fn opened(session_id: i64) -> Self {
+        Self {
+            session_id,
+            landing: Landing::Opened,
+            history: Vec::new(),
         }
     }
 
-    const fn session_id(self) -> i64 {
-        match self {
-            Self::Opened(session_id) | Self::CameBack { session_id, .. } => session_id,
+    fn describe(&self) -> String {
+        let session_id = self.session_id;
+
+        match self.landing {
+            Landing::Opened => {
+                format!("attached to the daemon as session {session_id}; leaving does not stop it")
+            }
+            Landing::CameBack { answering: false } => {
+                format!("back on session {session_id}, where you left it")
+            }
+            Landing::CameBack { answering: true } => {
+                format!("back on session {session_id}, which is still answering")
+            }
         }
     }
 }
@@ -246,16 +269,28 @@ fn attach(
     // otherwise the chat already open for this checkout is the one they mean,
     // because a terminal that opened a second one beside it would leave the
     // first answering into a stream nobody reads.
-    let arrival = match resume {
-        Some(session_id) => Arrival::Opened(
-            runtime
+    let mut arrival = match resume {
+        // A named session is the person saying which conversation they want, so
+        // it is not second-guessed and not looked up in the listing first.
+        Some(session_id) => Arrival {
+            session_id: runtime
                 .block_on(chat.open(checkout, Some(session_id)))
                 .map_err(refused)?,
-        ),
+            landing: Landing::CameBack { answering: false },
+            history: Vec::new(),
+        },
         None => rejoin_or_open(&runtime, &mut chat, checkout)?,
     };
 
-    let session_id = arrival.session_id();
+    // Read after the arrival is settled and before the subscription opens, so
+    // nothing said between the two is drawn twice or missed: what is in the
+    // history is what the store already holds, and everything after it arrives
+    // on the stream.
+    arrival.history = runtime
+        .block_on(chat.history(arrival.session_id))
+        .map_err(refused)?;
+
+    let session_id = arrival.session_id;
     let events = runtime
         .block_on(chat.subscribe(session_id))
         .map_err(refused)?;
@@ -302,16 +337,19 @@ fn rejoin_or_open(
             .map_err(refused)?;
 
         if session_id == existing.session_id {
-            return Ok(Arrival::CameBack {
+            return Ok(Arrival {
                 session_id,
-                answering: existing.answering,
+                landing: Landing::CameBack {
+                    answering: existing.answering,
+                },
+                history: Vec::new(),
             });
         }
 
-        return Ok(Arrival::Opened(session_id));
+        return Ok(Arrival::opened(session_id));
     }
 
-    Ok(Arrival::Opened(
+    Ok(Arrival::opened(
         runtime
             .block_on(chat.open(checkout, None))
             .map_err(refused)?,
@@ -376,30 +414,24 @@ mod tests {
         ));
     }
 
+    fn came_back_to(answering: bool) -> Arrival {
+        Arrival {
+            session_id: 7,
+            landing: Landing::CameBack { answering },
+            history: Vec::new(),
+        }
+    }
+
     #[test]
     fn coming_back_says_where_you_landed_and_whether_it_is_mid_answer() {
-        assert!(
-            Arrival::CameBack {
-                session_id: 7,
-                answering: false,
-            }
-            .describe()
-            .contains("where you left it")
-        );
-        assert!(
-            Arrival::CameBack {
-                session_id: 7,
-                answering: true,
-            }
-            .describe()
-            .contains("still answering")
-        );
+        assert!(came_back_to(false).describe().contains("where you left it"));
+        assert!(came_back_to(true).describe().contains("still answering"));
     }
 
     /// A fresh chat says that leaving does not stop it, because that is the one
     /// thing about this mode a person has to know before they close the window.
     #[test]
     fn a_fresh_chat_says_that_leaving_does_not_stop_it() {
-        assert!(Arrival::Opened(7).describe().contains("does not stop it"));
+        assert!(Arrival::opened(7).describe().contains("does not stop it"));
     }
 }

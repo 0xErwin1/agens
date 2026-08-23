@@ -14,7 +14,9 @@
 
 use std::time::Duration;
 
-use agens_core::{IntraTurnInputSource, MessagePart, TurnEvent, TurnRetryReason, TurnState, Usage};
+use agens_core::{
+    IntraTurnInputSource, Message, MessagePart, Role, TurnEvent, TurnRetryReason, TurnState, Usage,
+};
 
 use crate::ClientError;
 use crate::proto;
@@ -49,6 +51,37 @@ pub(crate) fn session_event(event: proto::SessionEvent) -> Result<HostedChatEven
             detail: failed.detail,
         }),
         proto::session_event::Event::Closed(_) => Ok(HostedChatEvent::Closed),
+    }
+}
+
+/// One stored message, as the client reads it back.
+pub(crate) fn message(message: proto::Message) -> Result<Message, ClientError> {
+    Ok(Message {
+        role: role(&message.role)?,
+        parts: message
+            .parts
+            .into_iter()
+            .map(message_part)
+            .collect::<Result<Vec<_>, _>>()?,
+    })
+}
+
+/// A role, refused rather than guessed at.
+///
+/// Unlike a turn state, this one is not forgiving of a name it does not know.
+/// Who spoke decides how a message is rendered and what authority it carries,
+/// and a message attributed to the wrong speaker is worse than a message that
+/// did not arrive.
+fn role(role: &str) -> Result<Role, ClientError> {
+    match role {
+        "system" => Ok(Role::System),
+        "user" => Ok(Role::User),
+        "assistant" => Ok(Role::Assistant),
+        "tool" => Ok(Role::Tool),
+        "supervisor" => Ok(Role::Supervisor),
+        other => Err(ClientError::Unreadable(format!(
+            "a message came back from a speaker this client does not know: {other}"
+        ))),
     }
 }
 
@@ -227,5 +260,13 @@ mod tests {
     fn an_attempt_count_past_the_domains_width_saturates() {
         assert_eq!(attempt(3), 3);
         assert_eq!(attempt(4_000), u8::MAX);
+    }
+
+    /// Who spoke decides how a message is rendered and what authority it
+    /// carries, so an unknown speaker is refused rather than guessed at.
+    #[test]
+    fn a_message_from_a_speaker_this_client_does_not_know_is_refused() {
+        assert!(matches!(role("assistant"), Ok(Role::Assistant)));
+        assert!(matches!(role("oracle"), Err(ClientError::Unreadable(_))));
     }
 }

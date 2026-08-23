@@ -108,6 +108,12 @@ fn harness() -> Harness {
                 }),
             })
         }),
+        Arc::new(|_| {
+            Ok(vec![agens_core::Message {
+                role: agens_core::Role::User,
+                parts: vec![agens_core::MessagePart::Text("what we said".to_owned())],
+            }])
+        }),
     );
 
     Harness {
@@ -422,5 +428,38 @@ fn a_cancellation_does_not_carry_into_the_next_turn() {
         ChatEvent::TurnCompleted {
             text: "an answer".to_owned(),
         },
+    );
+}
+
+/// Read back from where the session is stored rather than from the running
+/// chat's memory, so a client asking mid-answer is not blocked for as long as
+/// the answer takes.
+#[test]
+fn a_chats_conversation_is_readable_while_a_turn_is_running() {
+    let harness = harness();
+    let session = harness.chats.open(&request(1)).expect("the chat opens");
+
+    harness
+        .chats
+        .prompt(session, "first".to_owned())
+        .expect("the prompt is accepted");
+    assert_eq!(
+        harness.started.recv_timeout(PATIENCE),
+        Ok("first".to_owned())
+    );
+
+    let history = harness.chats.history(session).expect("the chat is open");
+
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].role, agens_core::Role::User);
+}
+
+#[test]
+fn the_conversation_of_a_chat_nobody_opened_is_refused() {
+    let harness = harness();
+
+    assert_eq!(
+        harness.chats.history(SessionId::new(7)).err(),
+        Some(ChatError::Unknown),
     );
 }

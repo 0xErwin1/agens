@@ -158,6 +158,12 @@ async fn wire(name: &str) -> Wire {
                 }),
             })
         }),
+        Arc::new(|_| {
+            Ok(vec![agens_core::Message {
+                role: agens_core::Role::Assistant,
+                parts: vec![agens_core::MessagePart::Text("what we said".to_owned())],
+            }])
+        }),
     ));
 
     let directory = scratch_directory(name);
@@ -584,4 +590,47 @@ async fn a_listing_that_names_no_checkout_is_refused() {
         .expect_err("a listing names its checkout");
 
     assert_eq!(refused.code(), Code::InvalidArgument);
+}
+
+/// A terminal that comes back draws the conversation it left rather than an
+/// empty one.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_conversation_so_far_comes_back_over_the_wire() {
+    let mut wire = wire("history").await;
+
+    let handle = wire
+        .client
+        .open(Request::new(open_request("/projects/agens")))
+        .await
+        .expect("the chat opens")
+        .into_inner();
+
+    let history = wire
+        .client
+        .history(Request::new(proto::ChatRef {
+            session_id: handle.session_id,
+        }))
+        .await
+        .expect("the conversation is served")
+        .into_inner();
+
+    assert_eq!(history.messages.len(), 1);
+    assert_eq!(history.messages[0].role, "assistant");
+    assert_eq!(
+        history.messages[0].parts[0].part,
+        Some(proto::message_part::Part::Text("what we said".to_owned())),
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_conversation_of_a_chat_nobody_opened_is_not_found() {
+    let mut wire = wire("history-unknown").await;
+
+    let refused = wire
+        .client
+        .history(Request::new(proto::ChatRef { session_id: 404 }))
+        .await
+        .expect_err("there is no such chat");
+
+    assert_eq!(refused.code(), Code::NotFound);
 }

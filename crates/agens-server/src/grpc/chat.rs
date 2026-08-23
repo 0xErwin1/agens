@@ -162,6 +162,22 @@ impl Chat for ChatFacade {
         }))
     }
 
+    /// What the chat has said so far.
+    async fn history(
+        &self,
+        request: Request<proto::ChatRef>,
+    ) -> Result<Response<proto::ChatHistory>, Status> {
+        let session = SessionId::new(request.into_inner().session_id);
+
+        let messages = self
+            .off_runtime(move |chats| chats.history(session))
+            .await?;
+
+        Ok(Response::new(proto::ChatHistory {
+            messages: messages.iter().map(turn::message).collect(),
+        }))
+    }
+
     /// Opens a subscription to one chat and forwards it to the client.
     ///
     /// One thread per subscriber, for the reason the journal's `Subscribe` has
