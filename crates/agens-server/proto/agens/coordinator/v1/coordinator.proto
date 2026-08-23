@@ -452,6 +452,29 @@ message TurnFailed {
   string detail = 1;
 }
 
+// A decision the turn cannot make for itself.
+//
+// The turn is stopped on this until somebody answers it, so a client that
+// renders one has to be a client that can also answer.
+message PermissionAsked {
+  // What an answer names. Unique within one chat, and only while the question
+  // is open.
+  uint64 prompt_id = 1;
+  // The bare tool name, as a person reads it.
+  string tool = 2;
+  string target = 3;
+  string access = 4;
+  string reason = 5;
+}
+
+message AnswerPermissionRequest {
+  int64 session_id = 1;
+  uint64 prompt_id = 2;
+  // "allow_once", "allow_always", "deny_once" or "deny_always". A name this
+  // daemon does not know is refused, never read as a permissive one.
+  string answer = 3;
+}
+
 // The chat has ended and will publish nothing further.
 message ChatClosed {}
 
@@ -463,6 +486,7 @@ message SessionEvent {
     TurnCompleted turn_completed = 3;
     TurnFailed turn_failed = 4;
     ChatClosed closed = 5;
+    PermissionAsked permission_asked = 6;
   }
 }
 
@@ -550,4 +574,6 @@ service Chat {
   // What the chat has said so far, so a terminal that comes back draws the
   // conversation it left rather than an empty one.
   rpc History(ChatRef) returns (ChatHistory);
+  // Answers a question the chat's turn is stopped on.
+  rpc AnswerPermission(AnswerPermissionRequest) returns (ChatAck);
 }

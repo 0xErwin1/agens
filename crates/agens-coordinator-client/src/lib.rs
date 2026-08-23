@@ -25,7 +25,7 @@ use tonic::transport::{Channel, Endpoint, Uri};
 
 pub use agens_server::grpc::proto;
 pub use chat::{ChatClient, OpenChat};
-pub use decode::HostedChatEvent;
+pub use decode::{HostedChatEvent, PermissionDecision, PermissionQuestion};
 pub use feed::{FeedClient, JournalEntry};
 pub use team::TeamClient;
 

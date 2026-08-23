@@ -18,10 +18,10 @@
 //!   it runs unattended in a worktree of its own on a scope a person approved.
 //!   A chat has neither, so a call the operator did not decide in advance is
 //!   refused rather than allowed.
-//! - It cannot ask. There is nobody at the other end of this session yet: the
-//!   prompts a client would answer are the next unit of AGN-65, and until then
-//!   a call that needs a decision is denied with the reason, not left hanging
-//!   on a question nothing will answer.
+//! - It asks whoever is attached, and refuses when nobody is. A permission
+//!   question reaches the clients watching the chat and the turn stops on it,
+//!   the way it stops in a terminal. What it will not do is decide one on
+//!   nobody's behalf: a question nobody can hear is denied for that call.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -34,9 +34,9 @@ use agens_core::{
 use agens_headless::{HeadlessChatRequest, run_production_headless_chat_with_progress};
 use agens_permissions::{PermissionPromptAnswer, PermissionPromptContext, PermissionPrompter};
 use agens_server::{
-    ChatError, ChatHistorySource, ChatSession, ChatSessionFactory, ChatSessionRequest,
-    ChatTurnOutcome, ChatTurns, SessionAdmission, SessionBudget, SessionId, SessionProvider,
-    SessionRuntime,
+    ChatAsks, ChatError, ChatHistorySource, ChatPermissionAnswer, ChatPermissionRequest,
+    ChatSession, ChatSessionFactory, ChatSessionRequest, ChatTurnOutcome, ChatTurns,
+    SessionAdmission, SessionBudget, SessionId, SessionProvider, SessionRuntime,
 };
 use agens_store::SessionStore;
 
@@ -232,6 +232,7 @@ impl ChatTurns for HostedChat {
         prompt: &str,
         _runtime: &SessionRuntime,
         cancellation: &HeadlessTurnCancellation,
+        asks: &Arc<dyn ChatAsks>,
         progress: &TurnProgressSink,
     ) -> ChatTurnOutcome {
         let request = match self.request_for(prompt) {
@@ -244,7 +245,9 @@ impl ChatTurns for HostedChat {
             &self.bootstrap,
             cancellation,
             Some(progress),
-            Box::new(UnattendedChat),
+            Box::new(AttachedPrompter {
+                asks: Arc::clone(asks),
+            }),
             None,
             None,
         );
@@ -323,21 +326,45 @@ impl HostedChat {
     }
 }
 
-/// What a permission question does in a chat nobody can answer yet.
+/// A permission question, asked of whoever is watching this chat.
 ///
-/// Denied for this call alone, never parked and never allowed. The rules the
-/// operator configured are what this chat runs under, and a prompt is by
-/// definition something they did not decide in advance; with no client able to
-/// answer one, letting the call through would authorize on their behalf.
-struct UnattendedChat;
+/// The turn stops on it, the way it stops in a terminal. What this will not do
+/// is decide one on nobody's behalf: a question nobody can hear is denied for
+/// that call, because the rules the operator configured are what this chat runs
+/// under and a prompt is by definition something they did not decide in
+/// advance.
+struct AttachedPrompter {
+    asks: Arc<dyn ChatAsks>,
+}
 
-impl PermissionPrompter for UnattendedChat {
+impl PermissionPrompter for AttachedPrompter {
     fn prompt(
         &mut self,
-        _context: &PermissionPromptContext,
+        context: &PermissionPromptContext,
         _cancellation: &HeadlessTurnCancellation,
     ) -> Result<PermissionPromptAnswer, HeadlessTurnPortError> {
-        Ok(PermissionPromptAnswer::DenyOnce)
+        let request = ChatPermissionRequest {
+            // Reduced from the dispatcher's own identity, which equals no
+            // spelling a person writes.
+            tool: agens_core::bare_tool_name(&context.tool_identity).into_owned(),
+            target: agens_permissions::sanitize_permission_target(
+                &context.tool_identity,
+                &context.target_identifier,
+            ),
+            // The same spelling the terminal's own prompt shows, so a question
+            // reads identically whether the turn ran here or in this process.
+            access: format!("{:?}", context.access),
+            reason: context.reason.clone(),
+        };
+
+        Ok(match self.asks.permission(&request) {
+            ChatPermissionAnswer::AllowOnce => PermissionPromptAnswer::AllowOnce,
+            ChatPermissionAnswer::AllowAlways => PermissionPromptAnswer::AllowAlways,
+            ChatPermissionAnswer::DenyAlways => PermissionPromptAnswer::DenyAlways,
+            ChatPermissionAnswer::DenyOnce | ChatPermissionAnswer::Unheard => {
+                PermissionPromptAnswer::DenyOnce
+            }
+        })
     }
 }
 

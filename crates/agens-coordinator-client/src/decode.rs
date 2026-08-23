@@ -27,6 +27,9 @@ pub enum HostedChatEvent {
     /// Exactly what a locally run turn produces, so a surface renders it with
     /// the code it already has.
     Progress(TurnEvent),
+    /// A decision the turn cannot make for itself. The turn is stopped on this
+    /// until it is answered, so a client that renders one has to answer it.
+    PermissionAsked(PermissionQuestion),
     TurnCompleted {
         text: String,
     },
@@ -35,6 +38,41 @@ pub enum HostedChatEvent {
     },
     /// The chat has ended and will publish nothing further.
     Closed,
+}
+
+/// A permission question a hosted turn is stopped on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PermissionQuestion {
+    /// What an answer names. Unique within one chat, while the question is
+    /// open.
+    pub prompt_id: u64,
+    pub tool: String,
+    pub target: String,
+    pub access: String,
+    pub reason: String,
+}
+
+/// What a client may answer a permission question with.
+///
+/// Deliberately without an "unheard": that is what the daemon concludes when
+/// nobody answers, never something a client says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PermissionDecision {
+    AllowOnce,
+    AllowAlways,
+    DenyOnce,
+    DenyAlways,
+}
+
+impl PermissionDecision {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::AllowOnce => "allow_once",
+            Self::AllowAlways => "allow_always",
+            Self::DenyOnce => "deny_once",
+            Self::DenyAlways => "deny_always",
+        }
+    }
 }
 
 pub(crate) fn session_event(event: proto::SessionEvent) -> Result<HostedChatEvent, ClientError> {
@@ -50,6 +88,15 @@ pub(crate) fn session_event(event: proto::SessionEvent) -> Result<HostedChatEven
         proto::session_event::Event::TurnFailed(failed) => Ok(HostedChatEvent::TurnFailed {
             detail: failed.detail,
         }),
+        proto::session_event::Event::PermissionAsked(asked) => {
+            Ok(HostedChatEvent::PermissionAsked(PermissionQuestion {
+                prompt_id: asked.prompt_id,
+                tool: asked.tool,
+                target: asked.target,
+                access: asked.access,
+                reason: asked.reason,
+            }))
+        }
         proto::session_event::Event::Closed(_) => Ok(HostedChatEvent::Closed),
     }
 }

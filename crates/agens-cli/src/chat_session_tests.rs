@@ -53,6 +53,14 @@ async fn turn_on(
             Some(proto::session_event::Event::TurnFailed(failed)) => {
                 panic!("the turn failed: {}", failed.detail);
             }
+            // No prompt reaches this journey: the scripted model calls no
+            // tool, so nothing asks for a decision.
+            Some(proto::session_event::Event::PermissionAsked(asked)) => {
+                panic!(
+                    "the turn asked for a decision nobody scripted: {}",
+                    asked.tool
+                );
+            }
             Some(proto::session_event::Event::Closed(_)) | None => return (streamed, None),
         }
     }

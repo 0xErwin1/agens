@@ -8,7 +8,7 @@ use tonic::transport::Channel;
 use agens_core::Message;
 
 use crate::ClientError;
-use crate::decode::{HostedChatEvent, message, session_event};
+use crate::decode::{HostedChatEvent, PermissionDecision, message, session_event};
 use crate::proto;
 
 /// One chat the daemon is hosting.
@@ -87,6 +87,28 @@ impl ChatClient {
             .prompt(proto::PromptRequest {
                 session_id,
                 prompt: prompt.to_owned(),
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    /// Answers a question the chat's turn is stopped on.
+    ///
+    /// A question that already resolved is refused rather than ignored: an
+    /// answer to something the person is no longer looking at should not be
+    /// applied to whatever they are.
+    pub async fn answer_permission(
+        &mut self,
+        session_id: i64,
+        prompt_id: u64,
+        decision: PermissionDecision,
+    ) -> Result<(), ClientError> {
+        self.inner
+            .answer_permission(proto::AnswerPermissionRequest {
+                session_id,
+                prompt_id,
+                answer: decision.as_str().to_owned(),
             })
             .await?;
 
