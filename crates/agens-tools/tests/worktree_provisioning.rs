@@ -554,6 +554,55 @@ command = ["/bin/sh", "-c", "printf 'PATH=/evil\nLD_PRELOAD=/evil.so\nAGENS_RUN_
         report.dropped_exports,
         vec!["LD_PRELOAD".to_owned(), "PATH".to_owned()]
     );
+    assert_eq!(
+        report.rejected_export_patterns,
+        vec!["*".to_owned(), String::new()],
+        "an allowlist that suddenly admits nothing has to say which entry cost it that"
+    );
+}
+
+/// An allowlist naming `PATH` outright, or a prefix reaching it, is still an
+/// allowlist that hands the following hooks to whoever wrote the first one.
+/// Those names are refused by name rather than by pattern, so no spelling of
+/// the entry admits them.
+#[test]
+fn the_names_that_decide_what_the_following_hooks_run_are_never_admitted() {
+    let repository = Repository::new().exporting(&["PATH", "LD_*", "P*", "AGENS_RUN_*"]);
+    repository.declare(
+        r#"
+[[hooks]]
+name = "export"
+command = ["/bin/sh", "-c", "printf 'PATH=/evil\nLD_PRELOAD=/evil.so\nLD_LIBRARY_PATH=/evil/lib\nAGENS_RUN_MODE=fast\n' >> \"$AGENS_WORKTREE_ENV\""]
+
+[[hooks]]
+name = "observe"
+command = ["/bin/sh", "-c", "printf '%s|%s\n' \"$LD_PRELOAD\" \"$AGENS_RUN_MODE\" > observed.txt"]
+"#,
+    );
+
+    let worktree = repository.create_worktree();
+    let report = applied(repository.provision(&Permissive::new()));
+
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
+    assert_eq!(
+        report.environment,
+        BTreeMap::from([("AGENS_RUN_MODE".to_owned(), "fast".to_owned())]),
+        "granting PATH by name grants nothing"
+    );
+    assert_eq!(
+        report.dropped_exports,
+        vec![
+            "LD_LIBRARY_PATH".to_owned(),
+            "LD_PRELOAD".to_owned(),
+            "PATH".to_owned()
+        ]
+    );
+    assert!(report.rejected_export_patterns.is_empty());
+    assert_eq!(
+        std::fs::read_to_string(worktree.join("observed.txt")).expect("hook output"),
+        "|fast\n",
+        "the hook that follows runs with the daemon's loader, not the one the first hook chose"
+    );
 }
 
 #[test]
