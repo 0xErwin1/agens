@@ -49,6 +49,10 @@ pub(crate) enum Command {
     Models,
     #[command(about = "run the headless daemon for this machine")]
     Serve {
+        /// Stay attached to the terminal instead of detaching. This is the
+        /// shape a process supervisor starts the daemon in.
+        #[arg(long)]
+        foreground: bool,
         #[command(subcommand)]
         action: Option<ServeAction>,
     },
@@ -140,6 +144,10 @@ pub(crate) enum ServeAction {
         /// what `team.project_roots` says.
         repository: PathBuf,
     },
+    #[command(about = "stop the daemon running for this machine")]
+    Stop,
+    #[command(about = "report the running daemon's pid, socket, uptime and active runs")]
+    Status,
 }
 
 #[derive(Subcommand, Debug)]

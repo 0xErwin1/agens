@@ -33,7 +33,9 @@ pub(crate) fn dispatch(
             run_chat(chat_arguments, dependencies, cancellation)
         }
         Some(cli::Command::Models) => run_models(),
-        Some(cli::Command::Serve { action }) => run_serve(action, dependencies, cancellation),
+        Some(cli::Command::Serve { foreground, action }) => {
+            run_serve(foreground, action, dependencies, cancellation)
+        }
         Some(cli::Command::Sessions { action }) => run_sessions(action, dependencies),
         Some(cli::Command::Direct {
             session,

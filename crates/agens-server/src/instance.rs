@@ -15,6 +15,8 @@ use std::{
 
 const LOCK_FILE: &str = "serve.lock";
 const SOCKET_FILE: &str = "serve.sock";
+const PID_FILE: &str = "serve.pid";
+const LOG_FILE: &str = "serve.log";
 
 /// Where a client attaches to the daemon of one data directory.
 ///
@@ -23,6 +25,24 @@ const SOCKET_FILE: &str = "serve.sock";
 #[must_use]
 pub fn socket_path(data_directory: &Path) -> PathBuf {
     data_directory.join(SOCKET_FILE)
+}
+
+/// Where the running daemon publishes its process id.
+///
+/// Derived like the socket, and for the same reason: `serve stop` and
+/// `serve status` have to find a daemon nobody told them about.
+#[must_use]
+pub fn pid_path(data_directory: &Path) -> PathBuf {
+    data_directory.join(PID_FILE)
+}
+
+/// Where a detached daemon's output goes.
+///
+/// A daemon that returns the terminal has nowhere else to write: this is the
+/// one place an operator can read why it refused to start.
+#[must_use]
+pub fn log_path(data_directory: &Path) -> PathBuf {
+    data_directory.join(LOG_FILE)
 }
 
 #[derive(Debug)]
@@ -41,10 +61,16 @@ impl ServeInstanceError {
 
 /// Exclusive ownership of the daemon runtime, held for the life of the process.
 /// Dropping it releases the advisory lock and removes the socket.
+///
+/// Taking the slot and being ready to serve are two different moments, and the
+/// pid file marks the second one. Everything between them — binding the socket,
+/// composing the coordinator, opening the control plane — is a daemon that owns
+/// the machine's slot and cannot answer for it yet.
 #[derive(Debug)]
 pub struct ServeInstance {
     lock: File,
     socket_path: PathBuf,
+    pid_path: PathBuf,
 }
 
 impl ServeInstance {
@@ -70,17 +96,76 @@ impl ServeInstance {
         let socket_path = socket_path(data_directory);
         remove_stale_socket(&socket_path)?;
 
-        Ok(Self { lock, socket_path })
+        // A pid left by a crashed daemon is stale by construction here, and it
+        // must not be readable as this one until this one is actually serving.
+        let pid_path = pid_path(data_directory);
+        remove_stale_pid(&pid_path)?;
+
+        Ok(Self {
+            lock,
+            socket_path,
+            pid_path,
+        })
     }
 
     pub fn socket_path(&self) -> &Path {
         &self.socket_path
     }
+
+    pub fn pid_path(&self) -> &Path {
+        &self.pid_path
+    }
+
+    /// Publishes this process's id, which is what says the daemon is serving.
+    ///
+    /// Called by the daemon once everything it serves with is built, so whoever
+    /// finds a pid finds a daemon whose socket, coordinator and control plane
+    /// are all up. That is what makes it the signal a start can wait on: a
+    /// socket answers `connect` from the moment it is bound, long before
+    /// anything behind it can answer a request.
+    ///
+    /// Only reached with the lock held, which is what makes the write safe: the
+    /// id and the lock name the same process for as long as the file exists,
+    /// and the drop below is what ends that.
+    pub fn publish_pid(&self) -> Result<(), ServeInstanceError> {
+        fs::write(&self.pid_path, format!("{}\n", std::process::id()))
+            .map_err(|error| ServeInstanceError::unavailable("publish the runtime pid", error))?;
+
+        restrict(&self.pid_path, 0o600)
+    }
+}
+
+/// Whether a daemon holds this data directory's slot right now.
+///
+/// Asked of the lock rather than of the pid file, so it also answers for a
+/// daemon that has taken the machine's slot and has not finished starting. A
+/// caller that finds no pid and a held slot is looking at a daemon on its way
+/// up, not at an absent one.
+///
+/// Read-only: the lock file is never created here, and a lock this probe
+/// happens to take is released before it returns.
+#[must_use]
+pub fn slot_is_held(data_directory: &Path) -> bool {
+    let Ok(lock) = File::open(data_directory.join(LOCK_FILE)) else {
+        return false;
+    };
+
+    let taken = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if taken == 0 {
+        unsafe {
+            libc::flock(lock.as_raw_fd(), libc::LOCK_UN);
+        }
+
+        return false;
+    }
+
+    io::Error::last_os_error().raw_os_error() == Some(libc::EWOULDBLOCK)
 }
 
 impl Drop for ServeInstance {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.socket_path);
+        let _ = fs::remove_file(&self.pid_path);
         let _ = &self.lock;
     }
 }
@@ -103,13 +188,20 @@ fn take_exclusive_lock(lock: &File) -> Result<(), ServeInstanceError> {
 /// Only reached with the lock held, which is what makes the removal safe: a
 /// socket file left by a crashed daemon is stale by construction here.
 fn remove_stale_socket(socket_path: &Path) -> Result<(), ServeInstanceError> {
-    match fs::remove_file(socket_path) {
+    remove_stale(socket_path, "remove stale runtime socket")
+}
+
+/// The same, for the pid: whoever holds the lock is the only daemon there is,
+/// so any id still on disk belongs to one that is gone.
+fn remove_stale_pid(pid_path: &Path) -> Result<(), ServeInstanceError> {
+    remove_stale(pid_path, "remove stale runtime pid")
+}
+
+fn remove_stale(path: &Path, action: &str) -> Result<(), ServeInstanceError> {
+    match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(ServeInstanceError::unavailable(
-            "remove stale runtime socket",
-            error,
-        )),
+        Err(error) => Err(ServeInstanceError::unavailable(action, error)),
     }
 }
 
@@ -158,6 +250,9 @@ mod tests {
         assert_eq!(mode(&directory.join(LOCK_FILE)), 0o600);
         assert_eq!(instance.socket_path(), directory.join(SOCKET_FILE));
 
+        instance.publish_pid().unwrap();
+        assert_eq!(mode(&directory.join(PID_FILE)), 0o600);
+
         drop(instance);
         fs::remove_dir_all(directory).unwrap();
     }
@@ -169,6 +264,7 @@ mod tests {
         let instance = ServeInstance::acquire(&directory).unwrap();
 
         assert!(instance.socket_path().starts_with(&directory));
+        assert!(instance.pid_path().starts_with(&directory));
         assert!(directory.join(LOCK_FILE).starts_with(&directory));
 
         drop(instance);
@@ -220,6 +316,91 @@ mod tests {
         assert!(socket_path.exists());
 
         drop(first);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Holding the slot is not serving. Until the daemon says it is serving,
+    /// nothing may read a pid for it — that is what makes the pid the signal a
+    /// start waits on.
+    #[test]
+    fn taking_the_slot_publishes_no_pid() {
+        let directory = data_directory();
+
+        let instance = ServeInstance::acquire(&directory).unwrap();
+
+        assert!(!instance.pid_path().exists());
+        assert!(slot_is_held(&directory));
+
+        drop(instance);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_serving_daemon_publishes_its_own_pid() {
+        let directory = data_directory();
+
+        let instance = ServeInstance::acquire(&directory).unwrap();
+        instance.publish_pid().unwrap();
+
+        let published = fs::read_to_string(instance.pid_path()).unwrap();
+        assert_eq!(published.trim().parse::<u32>().unwrap(), std::process::id());
+
+        drop(instance);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A pid left by a crashed daemon must not outlive it: whoever takes the
+    /// lock next is the process `serve stop` has to reach, and until that one
+    /// serves there is no pid to read at all.
+    #[test]
+    fn a_pid_left_by_a_crashed_daemon_is_cleared_and_then_replaced() {
+        let directory = data_directory();
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join(PID_FILE), "999999\n").unwrap();
+
+        let instance = ServeInstance::acquire(&directory).unwrap();
+
+        assert!(!instance.pid_path().exists());
+
+        instance.publish_pid().unwrap();
+        let published = fs::read_to_string(instance.pid_path()).unwrap();
+        assert_eq!(published.trim().parse::<u32>().unwrap(), std::process::id());
+
+        drop(instance);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The lock is what says a daemon owns this data directory, and reading it
+    /// must leave it exactly as it was found.
+    #[test]
+    fn an_unheld_slot_reads_as_unheld_and_stays_takeable() {
+        let directory = data_directory();
+
+        assert!(!slot_is_held(&directory), "no lock file yet");
+
+        let instance = ServeInstance::acquire(&directory).unwrap();
+        assert!(slot_is_held(&directory));
+        drop(instance);
+
+        assert!(!slot_is_held(&directory), "the lock file outlives the lock");
+        assert!(
+            ServeInstance::acquire(&directory).is_ok(),
+            "probing the slot did not take it"
+        );
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn releasing_the_runtime_removes_its_pid() {
+        let directory = data_directory();
+        let instance = ServeInstance::acquire(&directory).unwrap();
+        instance.publish_pid().unwrap();
+        let pid_path = instance.pid_path().to_path_buf();
+
+        drop(instance);
+
+        assert!(!pid_path.exists());
         fs::remove_dir_all(directory).unwrap();
     }
 

@@ -17,6 +17,8 @@ use agens_config::TeamSettings;
 use agens_core::HeadlessTurnCancellation;
 use agens_server::{CoordinatorSettings, PolicySettings, ServerError, TimerSettings};
 
+mod lifecycle;
+
 use crate::CliDependencies;
 use crate::cli::ServeAction;
 use crate::deps::bootstrap;
@@ -24,15 +26,32 @@ use crate::worker::run_worker;
 use agens_error::CliError;
 
 pub(crate) fn run_serve(
+    foreground: bool,
     action: Option<ServeAction>,
     dependencies: &CliDependencies,
     cancellation: &HeadlessTurnCancellation,
 ) -> Result<String, CliError> {
+    // `--foreground` says how to run the daemon, so it means nothing next to a
+    // verb that does not run one. Refused rather than ignored: the operator who
+    // typed it believed it was doing something.
+    if foreground && action.is_some() {
+        return Err(CliError::usage(
+            "serve --foreground takes no subcommand: it is how the daemon runs, not a verb",
+        ));
+    }
+
     let bootstrap = bootstrap(dependencies)?;
 
     match action {
         Some(ServeAction::Trust { repository }) => run_trust(&bootstrap, &repository),
-        None => run_daemon(&bootstrap, cancellation),
+        Some(ServeAction::Stop) => lifecycle::stop(&bootstrap),
+        Some(ServeAction::Status) => lifecycle::status(&bootstrap),
+        // Detached by default: a daemon that holds the terminal it was started
+        // from is one an operator has to dedicate a terminal to. `--foreground`
+        // is the shape a process supervisor wants, where detaching is exactly
+        // what would lose it the process it is supervising.
+        None if foreground => run_daemon(&bootstrap, cancellation),
+        None => lifecycle::start_detached(&bootstrap),
     }
 }
 
