@@ -85,9 +85,7 @@ pub use ingest::{
     ReportedCheckpoint, ReportedFact, channel as ingest_channel,
 };
 pub use instance::{ServeInstance, ServeInstanceError, socket_path};
-pub use introspection::{
-    AttemptResolver, CheckpointReporting, Clock, RunIntrospection, SESSION_SUSPEND_REFUSED_EVENT,
-};
+pub use introspection::{AttemptResolver, CheckpointReporting, Clock, RunIntrospection};
 pub use policy::{
     HookTrust, PendingHookTrust, PolicyError, PolicySettings, PolicyStore, RepositoryPolicy,
     TrustedRepository, trust_repository,
