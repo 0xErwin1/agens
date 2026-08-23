@@ -11,7 +11,6 @@
 //! because that is the property a new transport could otherwise quietly widen.
 
 use std::fs;
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -910,17 +909,6 @@ async fn a_request_missing_what_scopes_it_is_refused_rather_than_widened() {
 }
 
 #[test]
-fn the_facade_refuses_an_address_it_cannot_keep_local() {
-    let listener = std::net::TcpListener::bind(("0.0.0.0", 0)).unwrap();
-
-    let refused = FacadeBinding::none()
-        .on_localhost(listener)
-        .expect_err("the facade authenticates nobody");
-
-    assert!(refused.to_string().contains("is not loopback"));
-}
-
-#[test]
 fn serving_no_address_is_refused_rather_than_treated_as_serving_nothing() {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -955,9 +943,9 @@ fn serving_no_address_is_refused_rather_than_treated_as_serving_nothing() {
 }
 
 /// The daemon's own path, end to end: it takes the machine's slot, serves the
-/// facade on the socket it owns and on loopback, and both answer.
+/// facade on the socket it owns, and that socket answers.
 #[test]
-fn the_daemon_serves_the_facade_on_its_socket_and_on_loopback() {
+fn the_daemon_serves_the_facade_on_its_socket() {
     let directory = scratch_directory("daemon");
     let (store, _) = seeded_store(&directory);
 
@@ -983,12 +971,9 @@ fn the_daemon_serves_the_facade_on_its_socket_and_on_loopback() {
         .enable_all()
         .build()
         .unwrap();
-    let address = reserve_loopback_port();
-
     let asking = std::thread::spawn(move || {
         client_runtime.block_on(async move {
             let over_unix = await_unix(&socket).await;
-            let over_loopback = await_loopback(address).await;
 
             let by_socket = FeedClient::new(over_unix)
                 .tree(proto::TreeRequest {
@@ -998,36 +983,18 @@ fn the_daemon_serves_the_facade_on_its_socket_and_on_loopback() {
                 .unwrap()
                 .into_inner();
 
-            let by_loopback = FeedClient::new(over_loopback)
-                .tree(proto::TreeRequest {
-                    repo_id: REPO.to_owned(),
-                })
-                .await
-                .unwrap()
-                .into_inner();
-
             stopper.cancel();
 
-            (by_socket.runs.len(), by_loopback.runs.len())
+            by_socket.runs.len()
         })
     });
 
     let report = daemon
-        .serve_until_shutdown(Arc::new(Mutex::new(core)), Some(address.port()), &shutdown)
+        .serve_until_shutdown(Arc::new(Mutex::new(core)), &shutdown)
         .unwrap();
 
     assert!(report.is_clean());
-    assert_eq!(asking.join().unwrap(), (7, 7));
-}
-
-/// A port the operating system just handed out and nothing is listening on, so
-/// the daemon binds a free one rather than a guessed one.
-fn reserve_loopback_port() -> SocketAddr {
-    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let address = listener.local_addr().unwrap();
-    drop(listener);
-
-    address
+    assert_eq!(asking.join().unwrap(), 7);
 }
 
 /// The daemon binds after this thread starts asking, so connecting retries
@@ -1042,22 +1009,6 @@ async fn await_unix(socket: &Path) -> tonic::transport::Channel {
     }
 
     panic!("the daemon never accepted on its socket");
-}
-
-async fn await_loopback(address: SocketAddr) -> tonic::transport::Channel {
-    for _ in 0..200 {
-        if let Ok(channel) = Endpoint::from_shared(format!("http://{address}"))
-            .unwrap()
-            .connect()
-            .await
-        {
-            return channel;
-        }
-
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-
-    panic!("the daemon never accepted on loopback");
 }
 
 /// How long the repository's provisioning is made to take. Short enough that

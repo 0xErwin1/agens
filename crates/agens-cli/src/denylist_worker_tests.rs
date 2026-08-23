@@ -177,7 +177,6 @@ fn a_denylisted_call_parks_the_run_on_a_durable_question_instead_of_running() {
             ..CoordinatorSettings::default()
         },
         run_worker(&bootstrap),
-        None,
         &shutdown,
     )
     .expect("the daemon serves");

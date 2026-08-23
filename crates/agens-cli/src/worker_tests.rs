@@ -450,7 +450,6 @@ fn the_daemon_executes_a_run_through_a_real_turn_that_checkpoints_asks_and_finis
             ..CoordinatorSettings::default()
         },
         run_worker(&bootstrap),
-        None,
         &shutdown,
     )
     .expect("the daemon serves");

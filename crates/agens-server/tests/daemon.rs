@@ -424,7 +424,6 @@ fn the_daemon_runs_a_run_from_approval_to_a_question_and_back() {
             ..CoordinatorSettings::default()
         },
         scripted_worker(Arc::clone(&script)),
-        None,
         &shutdown,
     )
     .expect("the daemon serves");

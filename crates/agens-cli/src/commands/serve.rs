@@ -37,9 +37,6 @@ pub(crate) fn run_serve(
         bootstrap.data_directory(),
         &settings,
         run_worker(&bootstrap),
-        // The unix socket alone. A loopback listener is a second address to
-        // reach the control plane on, and nothing asks for one yet.
-        None,
         cancellation,
     )
     .map_err(|error| match error {

@@ -159,10 +159,10 @@ impl Daemon {
     /// Serves the clients' facade until asked to stop, then stops every session
     /// before releasing the slot and the socket.
     ///
-    /// The facade always accepts on the daemon's unix socket, and on loopback
-    /// as well when a port is named. Both are local by construction: the facade
-    /// authenticates nobody, so remote access is an SSH tunnel rather than a
-    /// listener anything else can route to.
+    /// The facade accepts on the daemon's unix socket and nowhere else: it
+    /// authenticates nobody, so the only address it may carry the user's
+    /// authority on is one whose reach something outside it already decides.
+    /// Remote access is an SSH tunnel rather than a second listener.
     ///
     /// The core arrives from the composition root rather than being built here.
     /// It is the coordinator's one core — the scheduler, the gates, the
@@ -171,7 +171,6 @@ impl Daemon {
     pub fn serve_until_shutdown(
         self,
         core: Arc<Mutex<ApiCore>>,
-        localhost_port: Option<u16>,
         shutdown: &HeadlessTurnCancellation,
     ) -> Result<SessionShutdown, ServerError> {
         let Self {
@@ -181,14 +180,7 @@ impl Daemon {
             instance,
         } = self;
 
-        let mut binding = FacadeBinding::none().on_unix_socket(listener);
-
-        if let Some(port) = localhost_port {
-            binding = binding
-                .bind_localhost(port)
-                .map_err(|_| ServerError::Unavailable("loopback is unavailable"))?;
-        }
-
+        let binding = FacadeBinding::none().on_unix_socket(listener);
         let blocking = BlockingBoundary::new(runtime.handle().clone());
 
         let report = runtime.block_on(async {
@@ -259,7 +251,6 @@ pub fn serve_until_shutdown(
     data_directory: &Path,
     settings: &CoordinatorSettings,
     worker: RunWorkerFactory,
-    localhost_port: Option<u16>,
     shutdown: &HeadlessTurnCancellation,
 ) -> Result<SessionShutdown, ServerError> {
     let daemon = Daemon::start(data_directory)?;
@@ -270,7 +261,7 @@ pub fn serve_until_shutdown(
         Coordinator::start(data_directory, settings, daemon.sessions().clone(), worker)
             .map_err(|_| ServerError::Unavailable("the coordinator is unavailable"))?;
 
-    let report = daemon.serve_until_shutdown(coordinator.core(), localhost_port, shutdown);
+    let report = daemon.serve_until_shutdown(coordinator.core(), shutdown);
 
     // After the facade has stopped: nothing is admitting, ticking or publishing
     // against a core the sessions behind it have already been stopped.
