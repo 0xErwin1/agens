@@ -158,7 +158,7 @@ pub(crate) fn child_run_error(error: HeadlessTurnError) -> ChildRunError {
         HeadlessTurnError::TimedOut => ChildRunError::TimedOut,
         HeadlessTurnError::Provider => ChildRunError::Provider,
         HeadlessTurnError::ProviderProtocol => ChildRunError::Protocol,
-        HeadlessTurnError::ProviderRateLimited => ChildRunError::RateLimited,
+        HeadlessTurnError::ProviderRateLimited { .. } => ChildRunError::RateLimited,
         HeadlessTurnError::ProviderRejected => ChildRunError::Rejected,
         HeadlessTurnError::ProviderServer => ChildRunError::Server,
         HeadlessTurnError::Tool => ChildRunError::Tool,

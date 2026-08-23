@@ -134,7 +134,7 @@ impl CliError {
                 "provider",
                 "this session's history outgrew what one request can replay",
             ),
-            HeadlessTurnError::ProviderRateLimited => (
+            HeadlessTurnError::ProviderRateLimited { .. } => (
                 ExitStatus::Failure,
                 "provider",
                 "provider request was rate limited",

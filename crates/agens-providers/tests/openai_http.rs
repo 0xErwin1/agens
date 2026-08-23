@@ -292,7 +292,9 @@ fn openai_transport_uses_frozen_failure_precedence() {
         (
             429,
             r#"{"error":{"code":"context_length_exceeded"}}"#,
-            HeadlessTurnPortError::ProviderRateLimited,
+            HeadlessTurnPortError::ProviderRateLimited {
+                reset_after_seconds: None,
+            },
         ),
         (
             500,
@@ -780,11 +782,40 @@ fn openai_stops_retrying_when_the_total_wait_budget_is_spent() {
             policy,
             None,
         ),
-        Err(HeadlessTurnPortError::ProviderRateLimited)
+        Err(HeadlessTurnPortError::ProviderRateLimited {
+            // The scripted `Retry-After` names a delay this request could
+            // afford, so the refusal carries the provider's own reset.
+            reset_after_seconds: Some(0),
+        })
     );
     // Two waits of the capped 40ms fit the 100ms budget and a third does not,
     // so the eight-attempt budget is never reached.
     assert_eq!(server.join(), 3);
+}
+
+/// A quota wall is not a burst, and the two are told apart by the delay the
+/// provider named: one this request cannot honour ends the retries there and
+/// then, and the refusal carries the reset uncapped so a caller can park on it
+/// instead of asking again on a schedule of its own.
+#[test]
+fn openai_stops_at_a_named_delay_it_cannot_honour_and_reports_the_reset() {
+    let server = RetryResponsesServer::start(vec![RetryResponse::StatusWithRetryAfter(
+        429, "3600",
+    )]);
+
+    assert_eq!(
+        run_provider_with_retry_policy(
+            server.base_url(),
+            &HeadlessTurnCancellation::new(),
+            Duration::from_secs(2),
+            brisk_retry_policy(4),
+            None,
+        ),
+        Err(HeadlessTurnPortError::ProviderRateLimited {
+            reset_after_seconds: Some(3_600),
+        })
+    );
+    assert_eq!(server.join(), 1);
 }
 
 /// Connection failures used to be exempt from the attempt budget and retried

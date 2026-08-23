@@ -1638,7 +1638,17 @@ pub enum HeadlessTurnPortError {
     ProviderRejected,
     ProviderContext,
     ProviderHistoryBudget,
-    ProviderRateLimited,
+    /// The provider refused the request for quota or rate: a `429`, or a
+    /// transport failure right after one.
+    ///
+    /// `reset_after_seconds` is what the provider itself named through
+    /// `Retry-After`, uncapped: the retry schedule's ceiling bounds how long
+    /// one request may wait, and a caller deciding when to come back needs the
+    /// wall the provider described rather than the wait the client afforded.
+    /// `None` means the provider named nothing.
+    ProviderRateLimited {
+        reset_after_seconds: Option<u32>,
+    },
     ProviderServer,
     ProviderNetwork,
     ProviderProtocol,
@@ -1930,7 +1940,11 @@ pub enum HeadlessTurnError {
     /// the runtime's budget, not the model's context window: reporting it as
     /// context sends the reader to shorten a prompt that was never the problem.
     ProviderHistoryBudget,
-    ProviderRateLimited,
+    /// Quota or rate, carrying the reset the provider named, uncapped. See
+    /// [`HeadlessTurnPortError::ProviderRateLimited`].
+    ProviderRateLimited {
+        reset_after_seconds: Option<u32>,
+    },
     ProviderServer,
     ProviderNetwork,
     ProviderProtocol,
@@ -1956,7 +1970,7 @@ impl fmt::Display for HeadlessTurnError {
             Self::ProviderRejected => "provider rejected the request",
             Self::ProviderContext => "provider rejected the request because it exceeds context",
             Self::ProviderHistoryBudget => "session history outgrew the replay budget",
-            Self::ProviderRateLimited => "provider rate limited the request",
+            Self::ProviderRateLimited { .. } => "provider rate limited the request",
             Self::ProviderServer => "provider service failed",
             Self::ProviderNetwork => "provider network request failed",
             Self::ProviderProtocol => "provider response protocol failed",
@@ -2570,7 +2584,11 @@ fn map_port_error(error: HeadlessTurnPortError) -> Option<HeadlessTurnError> {
         HeadlessTurnPortError::ProviderHistoryBudget => {
             Some(HeadlessTurnError::ProviderHistoryBudget)
         }
-        HeadlessTurnPortError::ProviderRateLimited => Some(HeadlessTurnError::ProviderRateLimited),
+        HeadlessTurnPortError::ProviderRateLimited {
+            reset_after_seconds,
+        } => Some(HeadlessTurnError::ProviderRateLimited {
+            reset_after_seconds,
+        }),
         HeadlessTurnPortError::ProviderServer => Some(HeadlessTurnError::ProviderServer),
         HeadlessTurnPortError::ProviderNetwork => Some(HeadlessTurnError::ProviderNetwork),
         HeadlessTurnPortError::ProviderProtocol => Some(HeadlessTurnError::ProviderProtocol),
