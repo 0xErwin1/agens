@@ -489,9 +489,9 @@ fn stopped(
     failure: &agens_error::CliError,
 ) -> SessionOutcome {
     let state = state_of(core, run_id);
-    let outcome = outcome_after_failed_turn(state);
+    let outcome = outcome_after_failed_turn(state, ended_itself(failure));
 
-    if outcome != SessionOutcome::Completed {
+    if outcome == SessionOutcome::Failed {
         journal_turn_failure(core, run_id, state, failure);
     }
 
@@ -501,17 +501,37 @@ fn stopped(
     }
 }
 
-/// What the session's outcome is, given where the run's row ended up.
+/// Whether the turn ended because something inside the session ended it.
 ///
-/// `awaiting_input` and `awaiting_quota` are the two states a turn ends the run
-/// in on purpose, and both are the session doing its job. `cancelled` is not
-/// this session's failure either: it is what somebody asked for while the turn
-/// was running.
-const fn outcome_after_failed_turn(state: Option<RunState>) -> SessionOutcome {
+/// Both park paths look like this from here: an `ask` and a denylisted call
+/// each move the run and then cancel the turn, so a cancelled turn says the
+/// session did what it meant to and the run is wherever that left it.
+fn ended_itself(failure: &agens_error::CliError) -> bool {
+    matches!(
+        failure.runtime_error(),
+        Some(agens_core::HeadlessTurnError::Cancelled)
+    )
+}
+
+/// What the session's outcome is, given where the run's row ended up and
+/// whether the turn ended itself.
+///
+/// `awaiting_input` and `awaiting_quota` are the two states a turn parks the
+/// run in, and both are the session doing its job — as is any state the run has
+/// moved on to since, because an answer arriving while the turn was still
+/// returning requeues it. `cancelled` is not this session's failure either: it
+/// is what somebody asked for while the turn was running.
+///
+/// Every other state means the turn failed after something else had moved the
+/// run, and reporting that as completed would credit the failure to whatever
+/// moved it.
+const fn outcome_after_failed_turn(state: Option<RunState>, ended_itself: bool) -> SessionOutcome {
     match state {
         Some(RunState::AwaitingInput | RunState::AwaitingQuota) => SessionOutcome::Completed,
         Some(RunState::Cancelled) => SessionOutcome::Cancelled,
-        _ => SessionOutcome::Failed,
+        Some(RunState::Running) | None => SessionOutcome::Failed,
+        Some(_) if ended_itself => SessionOutcome::Completed,
+        Some(_) => SessionOutcome::Failed,
     }
 }
 
@@ -911,12 +931,23 @@ mod tests {
     #[test]
     fn a_turn_that_parked_the_run_is_a_session_that_did_its_job() {
         for state in [RunState::AwaitingInput, RunState::AwaitingQuota] {
-            assert_eq!(
-                outcome_after_failed_turn(Some(state)),
-                SessionOutcome::Completed,
-                "{state:?} is where a turn parks the run on purpose"
-            );
+            for ended_itself in [true, false] {
+                assert_eq!(
+                    outcome_after_failed_turn(Some(state), ended_itself),
+                    SessionOutcome::Completed,
+                    "{state:?} is where a turn parks the run on purpose"
+                );
+            }
         }
+    }
+
+    #[test]
+    fn an_answer_that_arrived_before_the_parking_turn_returned_is_not_a_failure() {
+        assert_eq!(
+            outcome_after_failed_turn(Some(RunState::Queued), true),
+            SessionOutcome::Completed,
+            "the park worked and the answer requeued the run while the turn was returning"
+        );
     }
 
     #[test]
@@ -930,14 +961,19 @@ mod tests {
             RunState::Interrupted,
         ] {
             assert_eq!(
-                outcome_after_failed_turn(Some(state)),
+                outcome_after_failed_turn(Some(state), false),
                 SessionOutcome::Failed,
                 "a provider that failed with the run in {state:?} failed this session"
             );
         }
 
         assert_eq!(
-            outcome_after_failed_turn(None),
+            outcome_after_failed_turn(Some(RunState::Running), true),
+            SessionOutcome::Failed,
+            "a turn that ended itself and left the run running failed its attempt"
+        );
+        assert_eq!(
+            outcome_after_failed_turn(None, true),
             SessionOutcome::Failed,
             "a run that cannot be read says nothing that would excuse the turn"
         );
@@ -946,7 +982,7 @@ mod tests {
     #[test]
     fn a_run_somebody_cancelled_did_not_fail() {
         assert_eq!(
-            outcome_after_failed_turn(Some(RunState::Cancelled)),
+            outcome_after_failed_turn(Some(RunState::Cancelled), true),
             SessionOutcome::Cancelled
         );
     }
