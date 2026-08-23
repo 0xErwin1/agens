@@ -83,6 +83,12 @@ impl Fixture {
         git(&self.worktree, &["commit", "--quiet", "-m", path]);
     }
 
+    /// Whether the worktree's branch is in the checkout's history, asked of
+    /// git rather than of the control plane.
+    fn branch_is_merged(&self) -> bool {
+        git(&self.checkout, &["branch", "--merged", "HEAD"]).contains(BRANCH)
+    }
+
     fn worktrees(&self) -> SessionWorktrees {
         SessionWorktrees::new(&self.data_directory)
     }
@@ -199,6 +205,24 @@ impl Gated {
         self.gates().reclaim(&request).expect("reclaim runs")
     }
 
+    /// Makes every journal write fail until the guard is lifted.
+    ///
+    /// A trigger rather than a fake store: the settlement's whole claim is that
+    /// its four writes are one SQLite transaction, and only the real one can
+    /// roll that transaction back.
+    fn refuse_journal_writes(&self) -> RefusedWrites {
+        let connection =
+            rusqlite::Connection::open(self.machines.store().database_path()).expect("open");
+        connection
+            .execute_batch(
+                "CREATE TRIGGER refuse_events BEFORE INSERT ON events
+                 BEGIN SELECT RAISE(ABORT, 'injected'); END",
+            )
+            .expect("install the refusal");
+
+        RefusedWrites(connection)
+    }
+
     fn events(&self) -> Vec<String> {
         self.machines
             .store()
@@ -247,6 +271,17 @@ impl Gated {
             .expect("load run")
             .expect("the run exists")
             .worktree_status
+    }
+}
+
+/// A control plane that refuses every journal write while it is held.
+struct RefusedWrites(rusqlite::Connection);
+
+impl RefusedWrites {
+    fn lift(self) {
+        self.0
+            .execute_batch("DROP TRIGGER refuse_events")
+            .expect("lift the refusal");
     }
 }
 
@@ -977,46 +1012,51 @@ fn dispose_retires_a_row_whose_directory_vanished() {
 }
 
 /// The merge is irreversible, so everything that records it has to land with
-/// it. A settlement whose authorization cannot be delivered writes nothing at
-/// all: no verdict naming the approval, no `merged`, and a worktree still
-/// active for the next sweep to reach.
+/// it. A settlement whose write fails writes nothing at all: no verdict naming
+/// the approval, no `merged`, the authorization still standing, and a worktree
+/// still active for the next sweep to reach against a branch git now reports as
+/// merged.
+///
+/// The failure is injected at the settlement's own write rather than at the
+/// authorization check in front of it. A test that never reaches
+/// `settle_merge` passes against a settlement that was four separate
+/// statements, which is the arrangement this one exists to rule out.
 #[test]
-fn a_settlement_that_cannot_spend_its_authorization_writes_nothing() {
-    let mut gated = Gated::with_approval(GENESIS, QuestionState::Answered, Some(NOW + 600));
+fn a_settlement_whose_write_fails_writes_nothing() {
+    let mut gated = Gated::new(GENESIS);
+    let refuse_writes = gated.refuse_journal_writes();
 
-    // Delivered out from under the gate: the question machine has no
-    // transition out of `delivered`, so the settlement's guard refuses.
-    let approval_id = gated.approval_id;
-    gated
+    let request = gated.request(MergePath::Integrate);
+    let error = gated
         .gates()
-        .machines_mut()
-        .apply_question(
-            approval_id,
-            agens_server::QuestionTrigger::Deliver,
-            &agens_server::QuestionFacts {
-                now: NOW,
-                ..agens_server::QuestionFacts::default()
-            },
-        )
-        .expect("deliver the approval");
+        .pre_merge(&request)
+        .expect_err("the settlement cannot be written");
 
-    let before = gated.events();
-    let verdict = gated.pre_merge(MergePath::Integrate);
-
-    assert_eq!(
-        refusal(verdict),
-        GateRefusal::NotAuthorized { state: "delivered" },
-        "a spent authorization is refused before anything is merged"
+    assert!(
+        matches!(error, agens_server::GateError::Transition(_)),
+        "the write is what failed, got {error:?}"
     );
-    assert_eq!(gated.worktree_status(), Some(WorktreeStatus::Active));
+
+    refuse_writes.lift();
+
+    assert!(
+        gated.fixture.branch_is_merged(),
+        "the merge itself did happen, which is what makes the rest matter"
+    );
     assert_eq!(
-        gated
-            .events()
-            .into_iter()
-            .filter(|event| event == "merged")
-            .count(),
-        0,
-        "nothing landed, so nothing says it did: {before:?}"
+        gated.events(),
+        Vec::<String>::new(),
+        "the verdict, the merge and the release travel together or not at all"
+    );
+    assert_eq!(
+        gated.question_state(),
+        QuestionState::Answered,
+        "the authorization is still standing for the next sweep to spend"
+    );
+    assert_eq!(
+        gated.worktree_status(),
+        Some(WorktreeStatus::Active),
+        "and the directory is still there to be released"
     );
 }
 
