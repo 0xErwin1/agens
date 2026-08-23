@@ -29,7 +29,9 @@ use agens_store::{
 
 use super::{ApiCore, ApiError, Operation};
 use crate::api::ports::{HookPolicy, ProvisionedWorktree, WorktreeRequest};
-use crate::fsm::{Principal, RunFacts, RunTrigger, WorktreeFacts, WorktreeTrigger};
+use crate::fsm::{
+    Principal, QuestionFacts, QuestionTrigger, RunFacts, RunTrigger, WorktreeFacts, WorktreeTrigger,
+};
 use crate::policy::{HookTrust, PendingHookTrust, TrustReadFailure};
 
 /// How many characters of a task's own words the worktree directory carries.
@@ -400,12 +402,28 @@ impl ApiCore {
             &[],
         )?;
 
-        self.policy.record_pending(&PendingHookTrust {
+        // The question and the record of what answering it decides live in
+        // two stores, so they cannot be one statement. What they can be is all
+        // or nothing: a question whose answer nothing would act on is a run
+        // parked on a decision that has no consequence, and it used to be left
+        // open against a run this failure is about to cancel.
+        if let Err(error) = self.policy.record_pending(&PendingHookTrust {
             question_id,
             repo_id: prepared.repo_id.clone(),
             repository: prepared.repository.clone(),
             asked_at: now,
-        })?;
+        }) {
+            let _ = self.machines.apply_question(
+                question_id,
+                QuestionTrigger::Void,
+                &QuestionFacts {
+                    now,
+                    ..QuestionFacts::default()
+                },
+            );
+
+            return Err(error.into());
+        }
 
         Ok(Some(question_id))
     }

@@ -2239,4 +2239,20 @@ fn a_creation_that_fails_after_the_row_exists_leaves_no_run_and_no_worktree() {
         Some(WorktreeStatus::Cleaned),
         "the directory is gone, so nothing counts it against the ceiling or looks for it at boot"
     );
+
+    let questions = harness
+        .core
+        .machines()
+        .store()
+        .questions_for_run(run_id)
+        .unwrap();
+
+    assert_eq!(
+        questions
+            .iter()
+            .map(|question| question.state)
+            .collect::<Vec<_>>(),
+        vec![QuestionState::Expired],
+        "the question was opened, and one whose answer nothing recorded is not left standing"
+    );
 }

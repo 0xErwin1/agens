@@ -31,6 +31,10 @@ pub enum QuestionTrigger {
     Deliver,
     /// The timer wheel found it past its expiry.
     Expire,
+    /// The write the question was opened for did not complete, so nothing will
+    /// ever act on the answer. Only the opener uses it, and only while it is
+    /// unwinding its own failure.
+    Void,
 }
 
 impl QuestionTrigger {
@@ -40,6 +44,7 @@ impl QuestionTrigger {
             Self::Answer => "answer",
             Self::Deliver => "deliver",
             Self::Expire => "expire",
+            Self::Void => "void",
         }
     }
 }
@@ -60,6 +65,9 @@ pub enum QuestionGuard {
     NotExpired,
     /// Past its expiry.
     Expired,
+    /// Nothing to check. The opener of a question is the one party that knows
+    /// the write it was opened for did not complete.
+    None,
 }
 
 impl QuestionGuard {
@@ -70,6 +78,7 @@ impl QuestionGuard {
             Self::UserAuthorizationInDate => "user_authorization_in_date",
             Self::NotExpired => "not_expired",
             Self::Expired => "expired",
+            Self::None => "none",
         }
     }
 }
@@ -121,6 +130,16 @@ pub static QUESTION_TRANSITIONS: &[QuestionTransition] = &[
         guard: QuestionGuard::NotExpired,
         effects: &[],
         domain_event: "question_delivered",
+        class: EventClass::Infra,
+    },
+    QuestionTransition {
+        kind: QuestionKind::Question,
+        from: QuestionState::Open,
+        trigger: QuestionTrigger::Void,
+        to: QuestionState::Expired,
+        guard: QuestionGuard::None,
+        effects: &[],
+        domain_event: "question_voided",
         class: EventClass::Infra,
     },
     QuestionTransition {
@@ -400,6 +419,7 @@ fn check_question_guard(
                 Ok(())
             }
         }
+        QuestionGuard::None => Ok(()),
     }
 }
 

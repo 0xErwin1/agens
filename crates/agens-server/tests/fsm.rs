@@ -170,7 +170,7 @@ fn question_facts_for(transition: &QuestionTransition) -> QuestionFacts {
             author: Some(QuestionAuthor::User),
             ..QuestionFacts::default()
         },
-        QuestionGuard::NotExpired | QuestionGuard::Expired => QuestionFacts {
+        QuestionGuard::NotExpired | QuestionGuard::Expired | QuestionGuard::None => QuestionFacts {
             now: NOW,
             ..QuestionFacts::default()
         },
