@@ -37,6 +37,8 @@ mod turns_tests;
 mod worker;
 mod worker_facts;
 #[cfg(test)]
+mod worker_prompt_tests;
+#[cfg(test)]
 mod worker_tests;
 
 use tui::run_tui;
