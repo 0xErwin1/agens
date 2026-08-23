@@ -28,6 +28,7 @@ use std::sync::Arc;
 use agens_store::{EventClass, EventRow};
 
 use crate::fsm::{Principal, StateMachines, TransitionRejection};
+use crate::policy::RepositoryPolicy;
 
 pub use authorization::{
     DetailQuestionRefusal, OPERATION_AUTHORIZATION, Operation, OperationAuthorization,
@@ -35,11 +36,11 @@ pub use authorization::{
 };
 pub use feed::{InboxItem, InboxView, RunSummary, RunView, TreeSnapshot};
 pub use ports::{
-    Delivery, DeliveryGrain, DeliveryPayload, DeliveryQueue, EventFeed, EventFilter, PortError,
-    ProvisionedWorktree, RepositoryIdentity, SchedulerPort, SessionControl, StopScope,
+    Delivery, DeliveryGrain, DeliveryPayload, DeliveryQueue, EventFeed, EventFilter, HookPolicy,
+    PortError, ProvisionedWorktree, RepositoryIdentity, SchedulerPort, SessionControl, StopScope,
     Subscription, TakeoverHandle, WorktreeDerivation, WorktreeGate, WorktreeRequest,
 };
-pub use runs::{CreateRun, CreatedRun};
+pub use runs::{CreateRun, CreatedRun, PreparedRun};
 pub use team::{
     AdmissionState, AnswerQuestion, AnsweredQuestion, ApprovePlan, AuthorizeMerge, CleaningAction,
     CleaningDisposition, RetryRequest, RunRef, StopRequest,
@@ -134,12 +135,27 @@ pub struct Ports {
 pub struct ApiCore {
     machines: StateMachines,
     ports: Ports,
+    /// What the operator decided about the repositories this daemon serves.
+    ///
+    /// Held beside the ports rather than among them because it performs no
+    /// effect: it is the data an authorization decision is made from, and the
+    /// decision itself stays here.
+    policy: Arc<dyn RepositoryPolicy>,
 }
 
 impl ApiCore {
     #[must_use]
-    pub const fn new(machines: StateMachines, ports: Ports) -> Self {
-        Self { machines, ports }
+    pub fn new(machines: StateMachines, ports: Ports, policy: Arc<dyn RepositoryPolicy>) -> Self {
+        Self {
+            machines,
+            ports,
+            policy,
+        }
+    }
+
+    #[must_use]
+    pub fn policy(&self) -> &Arc<dyn RepositoryPolicy> {
+        &self.policy
     }
 
     /// The state machines, for the coordinator's own components. Facades reach

@@ -83,24 +83,19 @@ impl Team for TeamFacade {
 
         let created = self
             .core
-            .call(move |core, principal, now| {
-                core.create_run(
-                    principal,
-                    &CreateRun {
-                        repo_root: std::path::PathBuf::from(request.repo_root),
-                        task: request.task,
-                        scope: request.scope,
-                        dod: request.dod,
-                        external_ref: request.external_ref,
-                        parent_run_id: request.parent_run_id,
-                        dep_run_id: request.dep_run_id,
-                        provider: request.provider,
-                        priority: request.priority,
-                        budget_tokens: request.budget_tokens,
-                        start_point: start_point(&request.start_point),
-                        now,
-                    },
-                )
+            .create_run(CreateRun {
+                repo_root: std::path::PathBuf::from(request.repo_root),
+                task: request.task,
+                scope: request.scope,
+                dod: request.dod,
+                external_ref: request.external_ref,
+                parent_run_id: request.parent_run_id,
+                dep_run_id: request.dep_run_id,
+                provider: request.provider,
+                priority: request.priority,
+                budget_tokens: request.budget_tokens,
+                start_point: start_point(&request.start_point),
+                now: super::now(),
             })
             .await?;
 
@@ -109,6 +104,8 @@ impl Team for TeamFacade {
             repo_id: created.repo_id,
             worktree_path: created.worktree_path.display().to_string(),
             hook_failures: created.hook_failures,
+            hooks_ran: created.hooks_ran,
+            hook_authorization_question: created.hook_authorization_question,
         }))
     }
 

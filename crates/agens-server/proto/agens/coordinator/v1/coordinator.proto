@@ -62,6 +62,12 @@ message CreateRunResponse {
   // Provisioning hooks that failed and were continued past: the run starts in
   // an environment that is not what the repository declared.
   repeated string hook_failures = 4;
+  // Whether the repository's declared provisioning hooks ran at all. False
+  // when it declares hooks the operator has not authorized.
+  bool hooks_ran = 5;
+  // The durable question asking the operator to decide about this
+  // repository's hooks, when creating this run opened one.
+  optional int64 hook_authorization_question = 6;
 }
 
 message ApprovePlanRequest {

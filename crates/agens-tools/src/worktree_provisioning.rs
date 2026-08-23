@@ -40,9 +40,13 @@
 //! full ambient environment — which is what makes ecosystem support
 //! unnecessary, and which also hands provider credentials to a script the
 //! repository declares, so the authorization request names every command and
-//! states the inheritance. A hook exports environment back to the worker
-//! session by appending `KEY=value` lines to the file named by
-//! `AGENS_WORKTREE_ENV`; each export is visible to the hooks that follow it.
+//! states the inheritance. A hook exports environment to the hooks that follow
+//! it by appending `KEY=value` lines to the file named by
+//! `AGENS_WORKTREE_ENV`, and only names the caller allowed are accepted: an
+//! export is a hook writing the next hook's environment, and `PATH` or
+//! `LD_PRELOAD` written there would decide what the next command even is. The
+//! exports are reported, and nothing carries them into the worker's own
+//! session yet.
 //!
 //! A hook failure is never resolved here. The caller decides between
 //! continuing — in which case the failure is recorded so the worker can be
@@ -109,6 +113,10 @@ const EXPORT_VARIABLE: &str = "AGENS_WORKTREE_ENV";
 pub struct WorktreeProvisioner {
     worktrees: SessionWorktrees,
     hook_timeout: Duration,
+    /// The environment names a hook may export. Empty accepts none, which is
+    /// what a caller that has declared no policy means: an export changes what
+    /// the following hooks execute, so it is granted rather than assumed.
+    export_allowlist: Vec<String>,
     execution_context: Option<ToolExecutionContext>,
 }
 
@@ -230,8 +238,12 @@ pub struct ProvisioningReport {
     /// A destination that already existed is not here, because provisioning
     /// did not create it.
     pub copied: Vec<PathBuf>,
-    /// What the hooks exported for the worker session.
+    /// What the hooks exported, after the allowlist.
     pub environment: BTreeMap<String, String>,
+    /// The names a hook tried to export that the allowlist does not admit, in
+    /// the order they were seen. A worker that finds its environment missing
+    /// something the repository declared is looking at this list.
+    pub dropped_exports: Vec<String>,
     /// Whether the hooks were allowed to run. A contract without hooks is
     /// authorized trivially, having asked nothing.
     pub hooks_authorized: bool,
@@ -518,8 +530,21 @@ impl WorktreeProvisioner {
         Self {
             worktrees,
             hook_timeout: DEFAULT_HOOK_TIMEOUT,
+            export_allowlist: Vec::new(),
             execution_context: None,
         }
+    }
+
+    /// Accepts exactly these exported names, and drops every other one.
+    ///
+    /// A trailing `*` makes an entry a prefix, so `CARGO_*` admits
+    /// `CARGO_TARGET_DIR` without admitting `CARGOX`. A dropped export is
+    /// recorded rather than refused: a contract that exports one name the
+    /// operator has not granted is still a contract worth applying.
+    #[must_use]
+    pub fn with_export_allowlist(mut self, names: Vec<String>) -> Self {
+        self.export_allowlist = names;
+        self
     }
 
     /// Bounds every hook that declares no timeout of its own, never above the
@@ -571,6 +596,7 @@ impl WorktreeProvisioner {
             contract: contract.path.clone(),
             copied,
             environment: BTreeMap::new(),
+            dropped_exports: Vec::new(),
             hooks_authorized: true,
             failures: Vec::new(),
         };
@@ -637,9 +663,11 @@ impl WorktreeProvisioner {
             truncate_export_file(export_file)?;
             let failure =
                 self.run_hook(worktree, plan, index + 1, &report.environment, export_file)?;
-            report
-                .environment
-                .extend(read_exported_environment(export_file)?);
+
+            let exported = read_exported_environment(export_file)?;
+            let (admitted, dropped) = self.split_exports(exported);
+            report.environment.extend(admitted);
+            report.dropped_exports.extend(dropped);
 
             if let Some(failure) = failure {
                 if decisions.on_hook_failure(&failure) == HookFailureResponse::Abort {
@@ -651,6 +679,35 @@ impl WorktreeProvisioner {
         }
 
         Ok(None)
+    }
+
+    /// Separates what a hook exported into what the allowlist admits and what
+    /// it does not.
+    fn split_exports(
+        &self,
+        exported: BTreeMap<String, String>,
+    ) -> (BTreeMap<String, String>, Vec<String>) {
+        let mut admitted = BTreeMap::new();
+        let mut dropped = Vec::new();
+
+        for (name, value) in exported {
+            if self.admits_export(&name) {
+                admitted.insert(name, value);
+            } else {
+                dropped.push(name);
+            }
+        }
+
+        (admitted, dropped)
+    }
+
+    fn admits_export(&self, name: &str) -> bool {
+        self.export_allowlist
+            .iter()
+            .any(|allowed| match allowed.strip_suffix('*') {
+                Some(prefix) => name.starts_with(prefix),
+                None => name == allowed,
+            })
     }
 
     fn discard(&self, request: &ProvisioningRequest<'_>) -> Result<(), ProvisioningError> {

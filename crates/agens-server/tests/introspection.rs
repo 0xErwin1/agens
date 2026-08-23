@@ -15,9 +15,10 @@ use agens_core::run_introspection::{
 };
 use agens_server::{
     ApiCore, CHECKPOINT_EVENT, CheckpointClaim, Delivery, DeliveryQueue, EventFeed, EventFilter,
-    PortError, Ports, ProvisionedWorktree, ReportedCheckpoint, RepositoryIdentity,
-    RunIntrospection, SchedulerPort, SessionControl, StateMachines, StopScope, Subscription,
-    TakeoverHandle, TimerSettings, TimerWheel, WorktreeDerivation, WorktreeGate, WorktreeRequest,
+    HookTrust, PendingHookTrust, PortError, Ports, ProvisionedWorktree, ReportedCheckpoint,
+    RepositoryIdentity, RepositoryPolicy, RunIntrospection, SchedulerPort, SessionControl,
+    StateMachines, StopScope, Subscription, TakeoverHandle, TimerSettings, TimerWheel,
+    WorktreeDerivation, WorktreeGate, WorktreeRequest,
 };
 use agens_store::{ControlPlaneStore, QuestionKind, QuestionState, RunRow, RunState};
 
@@ -123,6 +124,36 @@ impl EventFeed for Unreached {
     }
 }
 
+impl RepositoryPolicy for Unreached {
+    fn admits(&self, _repository: &std::path::Path) -> bool {
+        false
+    }
+
+    fn admission_remedy(&self) -> String {
+        "no introspection write names a repository".to_owned()
+    }
+
+    fn hook_trust(&self, _repo_id: &str) -> HookTrust {
+        HookTrust::Refused
+    }
+
+    fn hook_exports(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn record_pending(&self, _pending: &PendingHookTrust) -> Result<(), PortError> {
+        Err(unreached("policy"))
+    }
+
+    fn is_pending(&self, _question_id: i64) -> bool {
+        false
+    }
+
+    fn resolve_pending(&self, _question_id: i64, _granted: bool) -> Result<bool, PortError> {
+        Ok(false)
+    }
+}
+
 fn unreached(port: &'static str) -> PortError {
     PortError::new(port, "no introspection write reaches a port")
 }
@@ -151,7 +182,11 @@ fn fixture(
     let directory = data_directory();
     let mut store = ControlPlaneStore::open(&directory).unwrap();
     let run_id = store.insert_run(&run_in(state)).unwrap();
-    let core = Arc::new(Mutex::new(ApiCore::new(StateMachines::new(store), ports())));
+    let core = Arc::new(Mutex::new(ApiCore::new(
+        StateMachines::new(store),
+        ports(),
+        Arc::new(Unreached) as Arc<dyn RepositoryPolicy>,
+    )));
     let introspection = RunIntrospection::new(Arc::clone(&core), run_id, Arc::new(|| NOW))
         .for_attempt(Some(11), Some(22));
 

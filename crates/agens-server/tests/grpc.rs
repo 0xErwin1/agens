@@ -21,9 +21,9 @@ use agens_core::HeadlessTurnCancellation;
 use agens_server::grpc::proto::{self, feed_client::FeedClient, team_client::TeamClient};
 use agens_server::{
     ApiCore, BlockingBoundary, CoreHandle, Delivery, DeliveryQueue, EventFeed, EventFilter,
-    FacadeBinding, FeedFacade, PortError, Ports, Principal, ProvisionedWorktree,
-    RepositoryIdentity, SchedulerPort, SessionControl, StateMachines, StopScope, Subscription,
-    TakeoverHandle, TeamFacade, WorktreeDerivation, WorktreeGate, WorktreeRequest,
+    FacadeBinding, FeedFacade, PolicyStore, PortError, Ports, Principal, ProvisionedWorktree,
+    RepositoryIdentity, RepositoryPolicy, SchedulerPort, SessionControl, StateMachines, StopScope,
+    Subscription, TakeoverHandle, TeamFacade, WorktreeDerivation, WorktreeGate, WorktreeRequest,
 };
 use agens_store::{
     ControlPlaneStore, EventClass, EventRow, QuestionKind, QuestionRow, QuestionState, RunRow,
@@ -70,7 +70,25 @@ impl SchedulerPort for StubScheduler {
 
 /// A worktree whose branch git says is merged and whose tree is clean, so the
 /// cleaning transition has facts it can act on.
-struct StubWorktrees;
+struct StubWorktrees {
+    /// How long provisioning takes, which is the repository's business and not
+    /// the daemon's: a hook may legitimately run for minutes.
+    provision_delay: Option<Duration>,
+}
+
+impl StubWorktrees {
+    const fn prompt() -> Self {
+        Self {
+            provision_delay: None,
+        }
+    }
+
+    const fn taking(delay: Duration) -> Self {
+        Self {
+            provision_delay: Some(delay),
+        }
+    }
+}
 
 impl WorktreeGate for StubWorktrees {
     fn derive(&self, _run: &RunRow) -> Result<WorktreeDerivation, PortError> {
@@ -94,9 +112,13 @@ impl WorktreeGate for StubWorktrees {
     }
 
     fn provision(&self, request: &WorktreeRequest<'_>) -> Result<ProvisionedWorktree, PortError> {
+        if let Some(delay) = self.provision_delay {
+            std::thread::sleep(delay);
+        }
+
         Ok(ProvisionedWorktree {
             path: std::path::PathBuf::from("/worktrees").join(request.name),
-            hook_failures: Vec::new(),
+            ..ProvisionedWorktree::default()
         })
     }
 }
@@ -310,6 +332,11 @@ struct Wire {
     feed: FeedClient<tonic::transport::Channel>,
     events: Arc<StubFeed>,
     fixture: Fixture,
+    /// The one core behind the facade, so a test can ask whether it is free
+    /// while a request is in flight.
+    core: Arc<Mutex<ApiCore>>,
+    /// A checkout the policy serves, for the requests that name one.
+    repository: PathBuf,
     shutdown: HeadlessTurnCancellation,
 }
 
@@ -342,21 +369,33 @@ async fn connect_unix(path: PathBuf) -> tonic::transport::Channel {
 }
 
 async fn wire_for(principal: Principal) -> Wire {
+    wire_with(principal, StubWorktrees::prompt()).await
+}
+
+async fn wire_with(principal: Principal, worktrees: StubWorktrees) -> Wire {
     let directory = scratch_directory(principal.as_str());
     let (store, fixture) = seeded_store(&directory);
+    let repository = directory.join("checkout");
+    fs::create_dir_all(&repository).unwrap();
+    let repository = repository.canonicalize().unwrap();
 
     let events = Arc::new(StubFeed::default());
     let ports = Ports {
         scheduler: Arc::new(StubScheduler::default()),
-        worktrees: Arc::new(StubWorktrees),
+        worktrees: Arc::new(worktrees),
         delivery: Arc::new(StubDelivery),
         sessions: Arc::new(StubSessions),
         feed: Arc::clone(&events) as Arc<dyn EventFeed>,
     };
 
-    let core = Arc::new(Mutex::new(ApiCore::new(StateMachines::new(store), ports)));
+    let core = Arc::new(Mutex::new(ApiCore::new(
+        StateMachines::new(store),
+        ports,
+        Arc::new(PolicyStore::in_memory(vec![repository.clone()], Vec::new()))
+            as Arc<dyn RepositoryPolicy>,
+    )));
     let blocking = BlockingBoundary::new(tokio::runtime::Handle::current());
-    let handle = CoreHandle::new(core, blocking, principal);
+    let handle = CoreHandle::new(Arc::clone(&core), blocking, principal);
 
     let socket = socket_in(&directory);
     let listener = tokio::net::UnixListener::bind(&socket).unwrap();
@@ -387,7 +426,26 @@ async fn wire_for(principal: Principal) -> Wire {
         feed: FeedClient::new(channel),
         events,
         fixture,
+        core,
+        repository,
         shutdown,
+    }
+}
+
+/// A creation request naming a checkout the daemon serves.
+fn creation(repository: &Path) -> proto::CreateRunRequest {
+    proto::CreateRunRequest {
+        repo_root: repository.display().to_string(),
+        task: "the worker harness".to_owned(),
+        scope: "crates/agens-cli/src/worker".to_owned(),
+        dod: "a run executes against the scripted provider".to_owned(),
+        external_ref: None,
+        parent_run_id: None,
+        dep_run_id: None,
+        provider: "openai-api".to_owned(),
+        priority: 5,
+        budget_tokens: None,
+        start_point: String::new(),
     }
 }
 
@@ -869,11 +927,12 @@ fn serving_no_address_is_refused_rather_than_treated_as_serving_nothing() {
         StateMachines::new(store),
         Ports {
             scheduler: Arc::new(StubScheduler::default()),
-            worktrees: Arc::new(StubWorktrees),
+            worktrees: Arc::new(StubWorktrees::prompt()),
             delivery: Arc::new(StubDelivery),
             sessions: Arc::new(StubSessions),
             feed: Arc::new(StubFeed::default()),
         },
+        Arc::new(PolicyStore::in_memory(Vec::new(), Vec::new())) as Arc<dyn RepositoryPolicy>,
     )));
     let blocking = BlockingBoundary::new(runtime.handle().clone());
     let shutdown = HeadlessTurnCancellation::new();
@@ -900,11 +959,12 @@ fn the_daemon_serves_the_facade_on_its_socket_and_on_loopback() {
         StateMachines::new(store),
         Ports {
             scheduler: Arc::new(StubScheduler::default()),
-            worktrees: Arc::new(StubWorktrees),
+            worktrees: Arc::new(StubWorktrees::prompt()),
             delivery: Arc::new(StubDelivery),
             sessions: Arc::new(StubSessions),
             feed: Arc::new(StubFeed::default()),
         },
+        Arc::new(PolicyStore::in_memory(Vec::new(), Vec::new())) as Arc<dyn RepositoryPolicy>,
     );
 
     let daemon = agens_server::Daemon::start(&directory).unwrap();
@@ -992,4 +1052,76 @@ async fn await_loopback(address: SocketAddr) -> tonic::transport::Channel {
     }
 
     panic!("the daemon never accepted on loopback");
+}
+
+/// How long the repository's provisioning is made to take. Short enough that
+/// the suite stays fast, long enough that a facade holding the core across it
+/// would be caught with room to spare.
+const SLOW_PROVISIONING: Duration = Duration::from_millis(1_500);
+
+/// The daemon stays answerable while one caller's repository provisions.
+///
+/// Provisioning runs whatever the repository declared, bounded by the
+/// repository's own timeouts rather than the daemon's: half an hour by default
+/// and two hours at the ceiling. Every other request, the admission loop and
+/// the timer wheel reach the control plane through the one lock this facade
+/// takes, so a facade holding it across provisioning stops the whole daemon for
+/// as long as one caller's hooks feel like running.
+#[tokio::test]
+async fn a_slow_provisioning_blocks_neither_another_request_nor_the_core() {
+    let mut wire = wire_with(Principal::User, StubWorktrees::taking(SLOW_PROVISIONING)).await;
+    let mut team = wire.team.clone();
+    let request = creation(&wire.repository);
+
+    let creating = tokio::spawn(async move { team.create_run(request).await });
+
+    // Far enough in that the decision step has finished and provisioning is
+    // under way, far short of provisioning finishing.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let started = std::time::Instant::now();
+    let tree = wire
+        .feed
+        .tree(proto::TreeRequest {
+            repo_id: REPO.to_owned(),
+        })
+        .await
+        .expect("the feed answers while a repository provisions")
+        .into_inner();
+    let waited = started.elapsed();
+
+    assert_eq!(tree.repo_id, REPO);
+    assert!(
+        waited < SLOW_PROVISIONING / 2,
+        "the feed waited {waited:?}, which is provisioning's wait rather than its own"
+    );
+    assert!(
+        wire.core.try_lock().is_ok(),
+        "the core is free while provisioning runs, so admission and the timers reach it"
+    );
+
+    let created = creating
+        .await
+        .expect("the creating task finishes")
+        .expect("a client may propose an execution")
+        .into_inner();
+
+    assert!(created.run_id > 0, "the run exists once provisioning ended");
+}
+
+/// A checkout no configured root covers is refused over the wire, with the code
+/// that says the caller may not rather than the one that says try again.
+#[tokio::test]
+async fn a_checkout_the_daemon_does_not_serve_is_refused_over_the_wire() {
+    let mut wire = wire_for(Principal::User).await;
+    let elsewhere = wire.repository.parent().map(Path::to_path_buf).unwrap();
+
+    let refused = wire
+        .team
+        .create_run(creation(&elsewhere))
+        .await
+        .expect_err("the daemon serves the roots the operator configured");
+
+    assert_eq!(code(&refused), Code::PermissionDenied);
+    assert!(refused.message().contains("does not serve"));
 }

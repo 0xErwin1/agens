@@ -134,6 +134,22 @@ pub struct RepositoryIdentity {
     pub remote_url: Option<String>,
 }
 
+/// Whether this run's provisioning hooks may run, as the core decided it.
+///
+/// The decision is the core's and travels with the request, because the port
+/// knows how to execute a hook and nothing about who asked for it. There is no
+/// variant that means "decide for yourself".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HookPolicy {
+    /// The operator has authorized this repository's hooks.
+    Allow,
+    /// They do not run, and the core opens the question that would authorize
+    /// them for the next run.
+    Ask,
+    /// They do not run, and nothing is asked.
+    Deny,
+}
+
 /// The worktree one new run is asking for.
 #[derive(Clone, Copy, Debug)]
 pub struct WorktreeRequest<'a> {
@@ -147,10 +163,11 @@ pub struct WorktreeRequest<'a> {
     pub branch: &'a str,
     /// The commit the branch starts from.
     pub start_point: &'a str,
+    pub hooks: HookPolicy,
 }
 
 /// A worktree that exists on disk and has had its contract applied.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ProvisionedWorktree {
     pub path: PathBuf,
     /// Every provisioning hook that did not succeed and was continued past.
@@ -158,6 +175,12 @@ pub struct ProvisionedWorktree {
     /// the repository declared, so the worker has to be told rather than left
     /// to discover it.
     pub hook_failures: Vec<String>,
+    /// The names of the hooks the repository declared, whether or not they ran.
+    /// Empty for a repository that declares none, which is what separates
+    /// "nothing to authorize" from "not authorized".
+    pub declared_hooks: Vec<String>,
+    /// Whether those hooks were executed.
+    pub hooks_ran: bool,
 }
 
 /// Which edge of the worker's execution a delivery waits for.
