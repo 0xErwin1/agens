@@ -97,7 +97,21 @@ Do not check a validation item based on expectation. If a platform, provider, li
 
 ## Running the daemon
 
-`agens serve` runs the headless daemon for the machine. Two operator decisions gate it, and both are closed by default.
+`agens serve` starts the headless daemon for the machine and returns the terminal. It detaches into its own session, redirects its output to `<data_dir>/serve.log`, and returns only once the daemon is serving — socket bound, coordinator composed, control plane open — printing `<data_dir>/serve.sock`. A second `agens serve` finds the running one, says so, and exits 0 without starting another.
+
+```sh
+agens serve            # start it detached, and get the prompt back
+agens serve status     # pid, socket, uptime, and the runs it is carrying
+agens serve stop       # SIGTERM, then wait for it to be gone
+```
+
+`agens serve --foreground` keeps today's behaviour: the daemon holds the terminal until it is interrupted. That is the shape a process supervisor starts it in, since detaching is exactly what would lose systemd the process it is supervising.
+
+Either way `SIGTERM` and `SIGINT` reach the same bounded shutdown: sessions are cancelled and joined within ten seconds, and any that outlive the wait are named on the way out. A second signal exits immediately with 143. A daemon that came down on a poisoned service core exits non-zero in both modes.
+
+The runtime files all live under the data directory — `serve.sock`, `serve.pid`, `serve.log` and `serve.lock` — and the running daemon owns them: it removes both the pid file and the socket when it stops. The pid file means *serving*, not *started*: it is written once the daemon is fully composed, which is what `serve` waits for and why a socket that already answers `connect` is not enough. Between taking the machine's slot and publishing that pid, `serve status` reports `starting`.
+
+Two operator decisions gate the daemon, and both are closed by default.
 
 Name the checkouts it may create runs against:
 

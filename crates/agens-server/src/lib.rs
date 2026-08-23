@@ -85,7 +85,9 @@ pub use ingest::{
     Ingest, IngestFact, IngestRejection, LostReason, RefusedReport, ReportedCheckpoint,
     ReportedFact, backlogged_event, channel as ingest_channel, channel_with_backlog,
 };
-pub use instance::{ServeInstance, ServeInstanceError, socket_path};
+pub use instance::{
+    ServeInstance, ServeInstanceError, log_path, pid_path, slot_is_held, socket_path,
+};
 pub use introspection::{AttemptResolver, CheckpointReporting, Clock, RunIntrospection};
 pub use policy::{
     HookTrust, PendingHookTrust, PolicyError, PolicySettings, PolicyStore, RepositoryPolicy,
@@ -231,6 +233,12 @@ impl Daemon {
             instance,
         } = self;
 
+        // Everything this daemon serves with is built by now — the core arrived
+        // composed — so this is the first moment the pid is true. A start
+        // waiting on it gets back a daemon whose control plane is already open,
+        // rather than a socket that answers `connect` because it is bound.
+        publish_pid(&instance)?;
+
         let binding = FacadeBinding::none().on_unix_socket(listener);
         let blocking = BlockingBoundary::new(runtime.handle().clone());
 
@@ -253,6 +261,10 @@ impl Daemon {
 
     /// Parks until asked to stop, then stops every session before releasing the
     /// slot and the socket, reporting any session that outlived the wait.
+    ///
+    /// It publishes no pid, because it answers nothing: it holds the slot and
+    /// the socket without accepting on either. The pid file says a daemon is
+    /// serving, and a process that never serves must not be found under it.
     ///
     /// Takes the daemon by value so the runtime is shut down explicitly rather
     /// than dropped: dropping a runtime waits for its blocking tasks, and a
@@ -334,6 +346,16 @@ pub fn serve_until_shutdown(
     }
 
     report
+}
+
+/// Says the daemon is serving, in the one place that is true.
+fn publish_pid(instance: &ServeInstance) -> Result<(), ServerError> {
+    instance.publish_pid().map_err(|error| match error {
+        ServeInstanceError::AlreadyRunning => ServerError::AlreadyRunning,
+        ServeInstanceError::Unavailable(cause) => {
+            ServerError::Unavailable(format!("the daemon's pid is unavailable: {cause}"))
+        }
+    })
 }
 
 /// Parks on the shared cancellation rather than inventing a second stop path:

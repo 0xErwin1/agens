@@ -26,7 +26,7 @@ use std::fs;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use agens_server::grpc::proto::{self, feed_client::FeedClient, team_client::TeamClient};
@@ -152,26 +152,41 @@ impl Probe {
         }
     }
 
-    /// Starts `agens serve` the way an operator does, with the four roots
-    /// replaced and everything else inherited: the worker builds with the
-    /// repository's own toolchain, which is on the caller's `PATH` and nowhere
-    /// else.
-    fn start_daemon(&self) -> Daemon {
-        let log = fs::File::create(self.root.join("serve.log")).expect("a daemon log");
-
-        let child = Command::new(env!("CARGO_BIN_EXE_agens"))
-            .arg("serve")
+    /// The binary with the four roots replaced and everything else inherited:
+    /// the worker builds with the repository's own toolchain, which is on the
+    /// caller's `PATH` and nowhere else.
+    fn agens(&self) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agens"));
+        command
             .env("HOME", &self.home)
             .env("XDG_CONFIG_HOME", &self.xdg_config_home)
             .env("XDG_DATA_HOME", &self.xdg_data_home)
             .env("AGENS_CONFIG_HOME", &self.configuration_home)
-            .stdin(Stdio::null())
-            .stderr(log.try_clone().expect("a shared daemon log"))
-            .stdout(log)
-            .spawn()
+            .stdin(Stdio::null());
+
+        command
+    }
+
+    /// Starts `agens serve` the way an operator does: bare, detached, and
+    /// returning once the daemon is answering. Its own log lives under the data
+    /// directory now, which is where `serve` puts it.
+    fn start_daemon(&self) -> Daemon {
+        let started = self
+            .agens()
+            .arg("serve")
+            .output()
             .expect("the daemon starts");
 
-        Daemon { child }
+        assert!(
+            started.status.success(),
+            "the daemon did not start: {}",
+            String::from_utf8_lossy(&started.stderr)
+        );
+
+        let mut stopper = self.agens();
+        stopper.args(["serve", "stop"]);
+
+        Daemon { stopper }
     }
 
     async fn walk_the_journey(&self) -> Journey {
@@ -316,15 +331,16 @@ impl Journey {
 /// The daemon process, stopped by the test rather than by the harness.
 ///
 /// A daemon left running holds its data directory's lock, and the next run of
-/// this test would be refused by a process nobody remembers starting.
+/// this test would be refused by a process nobody remembers starting. It is
+/// stopped through `serve stop` rather than killed: the daemon this test starts
+/// is not its child any more, and a signal is what it answers to either way.
 struct Daemon {
-    child: Child,
+    stopper: Command,
 }
 
 impl Daemon {
     fn stop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = self.stopper.output();
     }
 }
 
