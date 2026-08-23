@@ -47,6 +47,30 @@ fn draft_run() -> RunRow {
     }
 }
 
+/// One physical execution for a correlation to name. The session writer owns
+/// these rows; a control-plane test that needs one writes it directly, the way
+/// the ingest suite does.
+fn seed_session_attempt(database_path: &std::path::Path, id: i64) {
+    let connection = Connection::open(database_path).unwrap();
+
+    connection
+        .execute(
+            "INSERT OR IGNORE INTO sessions (
+                 id, project, title, active_agent, created_at, updated_at
+             ) VALUES (?1, 'project', 'title', 'build', 0, 0)",
+            [id],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT OR IGNORE INTO session_attempts (
+                 id, session_id, sequence, status, retry_prompt, started_at
+             ) VALUES (?1, ?1, 1, 'running', 'retry', 0)",
+            [id],
+        )
+        .unwrap();
+}
+
 fn table_names(database_path: &std::path::Path) -> Vec<String> {
     let connection = Connection::open(database_path).unwrap();
     let mut statement = connection
@@ -182,6 +206,73 @@ fn an_attempt_carries_its_own_cost_duration_and_correlation() {
                 ..second
             },
         ]
+    );
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+/// The evidence ledger is keyed by the execution an attempt is correlated
+/// with, so a closed leg that acquired a later execution's id would collect
+/// that execution's facts.
+#[test]
+fn only_an_open_attempt_is_correlated_with_a_physical_execution() {
+    let directory = data_directory();
+    let mut store = ControlPlaneStore::open(&directory).unwrap();
+    let run_id = store.insert_run(&draft_run()).unwrap();
+
+    let open = AttemptRow {
+        id: None,
+        run_id,
+        n: 1,
+        session_id: None,
+        session_attempt_id: None,
+        started_at: 1_700_000_100,
+        ended_at: None,
+        outcome: None,
+        retry_trigger: None,
+        tokens: None,
+        cost_micros: None,
+    };
+    let closed = AttemptRow {
+        n: 2,
+        ended_at: Some(1_700_000_400),
+        outcome: Some(AttemptOutcome::Interrupted),
+        ..open.clone()
+    };
+    let open_id = store.insert_attempt(&open).unwrap();
+    let closed_id = store.insert_attempt(&closed).unwrap();
+
+    for execution in [7, 8] {
+        seed_session_attempt(&store.database_path(), execution);
+    }
+
+    store.correlate_attempt(open_id, 7).unwrap();
+    store
+        .correlate_attempt(open_id, 7)
+        .expect("writing the same join twice is not a second correlation");
+
+    let taken = store
+        .correlate_attempt(open_id, 8)
+        .expect_err("an attempt already running as one execution is not re-pointed at another");
+    let ended = store
+        .correlate_attempt(closed_id, 8)
+        .expect_err("a closed leg is finished accounting");
+    let absent = store
+        .correlate_attempt(closed_id + 404, 8)
+        .expect_err("an attempt that does not exist correlates nothing");
+
+    assert!(taken.is_conflict());
+    assert!(ended.is_conflict());
+    assert!(absent.is_conflict());
+    assert_eq!(
+        store
+            .attempts_for_run(run_id)
+            .unwrap()
+            .into_iter()
+            .map(|attempt| attempt.session_attempt_id)
+            .collect::<Vec<_>>(),
+        vec![Some(7), None],
+        "a refused correlation writes nothing"
     );
 
     fs::remove_dir_all(directory).unwrap();

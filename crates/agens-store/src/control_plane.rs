@@ -697,15 +697,33 @@ impl ControlPlaneStore {
     /// turn itself once the session starts. Until they are joined, every fact
     /// the harness reports is unattributable and the evidence ledger cannot be
     /// reached from a run at all.
+    /// Only an attempt that is still open, and only once.
+    ///
+    /// A closed leg is finished accounting: pointing it at a later execution
+    /// would make every fact that execution reports look like the closed
+    /// attempt's, and the evidence ledger is keyed by exactly this column.
+    /// Writing the same join twice is not a second correlation and is allowed;
+    /// anything else is refused as a conflict, with nothing written.
     pub fn correlate_attempt(&mut self, attempt_id: i64, session_attempt_id: i64) -> Result<()> {
-        self.connection
+        let correlated = self
+            .connection
             .execute(
-                "UPDATE attempts SET session_attempt_id = ?2 WHERE id = ?1",
+                "UPDATE attempts SET session_attempt_id = ?2
+                 WHERE id = ?1
+                   AND ended_at IS NULL
+                   AND (session_attempt_id IS NULL OR session_attempt_id = ?2)",
                 params![attempt_id, session_attempt_id],
             )
             .map_err(|error| {
                 ControlPlaneError::operation("correlate attempt", &self.database_path, error)
             })?;
+
+        if correlated == 0 {
+            return Err(ControlPlaneError::conflict(format!(
+                "attempt {attempt_id} is closed, already correlated with another execution, \
+                 or does not exist"
+            )));
+        }
 
         Ok(())
     }
