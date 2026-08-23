@@ -437,8 +437,12 @@ fn a_reset_that_has_not_arrived_wakes_nothing() {
     assert_eq!(state_of(&machines, parked), RunState::AwaitingQuota);
 }
 
+/// Nothing re-derives a cap the provider named no reset for: it is lifted by a
+/// run reaching that provider, and every run parked on it is barred from
+/// starting. The configured window is what breaks that circle, and it is
+/// measured from the moment the cap was recorded.
 #[test]
-fn a_cap_with_no_reset_time_never_wakes_on_a_timer() {
+fn a_cap_with_no_reset_time_waits_out_the_configured_window() {
     let mut store = store();
     let parked = store
         .insert_run(&run_in(RunState::AwaitingQuota, "anthropic"))
@@ -446,11 +450,19 @@ fn a_cap_with_no_reset_time_never_wakes_on_a_timer() {
     store.record_provider(&capped("anthropic", None)).unwrap();
     let mut machines = StateMachines::new(store);
 
-    let (wheel, clock) = TimerWheel::with_manual_clock_for_test(TimerSettings::default(), START);
-    clock.set(START + 100_000);
+    let settings = TimerSettings {
+        quota_window_seconds: 900,
+        ..TimerSettings::default()
+    };
+    let (wheel, clock) = TimerWheel::with_manual_clock_for_test(settings, START);
 
+    clock.set(START + 899);
     assert!(wheel.tick(&mut machines).unwrap().quota_resets.is_empty());
     assert_eq!(state_of(&machines, parked), RunState::AwaitingQuota);
+
+    clock.set(START + 900);
+    assert_eq!(wheel.tick(&mut machines).unwrap().quota_resets.len(), 1);
+    assert_eq!(state_of(&machines, parked), RunState::Queued);
 }
 
 #[test]

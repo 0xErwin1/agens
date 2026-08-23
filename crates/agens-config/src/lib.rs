@@ -625,15 +625,6 @@ pub const SETTINGS: &[SettingSpec] = &[
         doc: "Retry budget for servers that omit their own.",
     },
     SettingSpec {
-        path: "team.quota_window_seconds",
-        kind: SettingKind::Integer {
-            minimum: 60,
-            maximum: 86_400,
-        },
-        default: SettingValue::Integer(DEFAULT_QUOTA_WINDOW_SECONDS),
-        doc: "How long a provider cap that named no reset time is honoured before the parked runs try it again.",
-    },
-    SettingSpec {
         path: "team.checkpoint_grace_percent",
         kind: SettingKind::Integer {
             minimum: 100,
@@ -641,6 +632,15 @@ pub const SETTINGS: &[SettingSpec] = &[
         },
         default: SettingValue::Integer(DEFAULT_CHECKPOINT_GRACE_PERCENT),
         doc: "Share of the span a worker promised its next checkpoint in, as a percentage, before the checkpoint counts as overdue.",
+    },
+    SettingSpec {
+        path: "team.quota_window_seconds",
+        kind: SettingKind::Integer {
+            minimum: 60,
+            maximum: 86_400,
+        },
+        default: SettingValue::Integer(DEFAULT_QUOTA_WINDOW_SECONDS),
+        doc: "How long a provider cap that named no reset time is honoured before the parked runs try it again.",
     },
 ];
 

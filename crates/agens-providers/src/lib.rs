@@ -1926,18 +1926,28 @@ impl<'a> RetryLoop<'a> {
 
     /// Records that another attempt is going out.
     pub(crate) fn begin_attempt(&self) {
-        self.emit(ProviderDiagnosticKind::Attempt, None, None);
+        self.emit(ProviderDiagnosticKind::Attempt, None, None, None);
     }
 
     /// Records the attempt that ended the request, so the diagnostics file
     /// says which one was the last and how it went. No class is a request that
     /// ended by succeeding.
+    ///
+    /// A reset the provider named travels with it, because a request that ended
+    /// against a wall and one that ended against a burst are the same three
+    /// fields otherwise.
     pub(crate) fn emit_terminal(
         &self,
         status: Option<u16>,
         class: Option<ProviderDiagnosticClass>,
     ) {
-        self.emit(ProviderDiagnosticKind::Terminal, status, class);
+        self.emit(
+            ProviderDiagnosticKind::Terminal,
+            status,
+            class,
+            self.named_reset
+                .map(|seconds| Duration::from_secs(seconds.into())),
+        );
     }
 
     fn emit(
@@ -1945,14 +1955,14 @@ impl<'a> RetryLoop<'a> {
         kind: ProviderDiagnosticKind,
         status: Option<u16>,
         class: Option<ProviderDiagnosticClass>,
+        delay: Option<Duration>,
     ) {
         if let Some(diagnostics) = self.diagnostics {
             diagnostics.emit(
                 self.component,
                 kind,
                 self.attempt_number(),
-                self.named_reset
-                    .map(|seconds| Duration::from_secs(seconds.into())),
+                delay,
                 status,
                 class,
             );

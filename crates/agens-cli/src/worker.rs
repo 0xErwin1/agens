@@ -362,6 +362,9 @@ fn park_on_quota(
 
     let now = now();
 
+    // A checkpoint that could not be written leaves the run less legible, and
+    // parking it is still the right thing to do: refusing to park because the
+    // note failed would leave the run running with nothing executing it.
     if let Ok(checkpoint) = quota_checkpoint(run, reset_after_seconds) {
         let _ = introspection_factory(core, run, reported)().checkpoint(&checkpoint);
     }

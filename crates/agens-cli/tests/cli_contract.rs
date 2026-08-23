@@ -149,6 +149,7 @@ const CONFIG_DOCTOR_DEFAULT_SETTINGS: &str = concat!(
     "  mcp_defaults.connect_timeout_ms  10000         default\n",
     "  mcp_defaults.max_retries         0             default\n",
     "  team.checkpoint_grace_percent    150           default\n",
+    "  team.quota_window_seconds        900           default\n",
 );
 
 fn config_global_config_path(temporary: &TemporaryDirectory) -> PathBuf {
