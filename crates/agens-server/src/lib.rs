@@ -89,7 +89,7 @@ pub use instance::{ServeInstance, ServeInstanceError, socket_path};
 pub use introspection::{AttemptResolver, CheckpointReporting, Clock, RunIntrospection};
 pub use policy::{
     HookTrust, PendingHookTrust, PolicyError, PolicySettings, PolicyStore, RepositoryPolicy,
-    TrustedRepository, trust_repository,
+    TrustReadFailure, TrustedRepository, trust_repository,
 };
 pub use ports::GitWorktreeGate;
 pub use scheduler::{

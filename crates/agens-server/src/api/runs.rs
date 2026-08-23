@@ -30,13 +30,16 @@ use agens_store::{
 use super::{ApiCore, ApiError, Operation};
 use crate::api::ports::{HookPolicy, ProvisionedWorktree, WorktreeRequest};
 use crate::fsm::{Principal, RunFacts, RunTrigger};
-use crate::policy::{HookTrust, PendingHookTrust};
+use crate::policy::{HookTrust, PendingHookTrust, TrustReadFailure};
 
 /// How many characters of a task's own words the worktree directory carries.
 ///
 /// Long enough to recognize at a `cd`, short enough that the path stays one
 /// terminal line beside the repository segment and the data directory.
 const SLUG_CHARS: usize = 32;
+
+/// The journal entry an unreadable hook-trust register is recorded as.
+const HOOK_TRUST_UNREADABLE_EVENT: &str = "hook_trust_unreadable";
 
 /// What the operator is asked when a repository's hooks have never been
 /// decided on.
@@ -165,7 +168,7 @@ impl ApiCore {
         let identity = self.ports.worktrees.identify(&repository)?;
         let name = worktree_name(&request.task, &identity.repo_id, request.now);
         let branch = format!("agens/{name}");
-        let hooks = self.hook_policy(principal, &identity.repo_id);
+        let hooks = self.hook_policy(principal, &identity.repo_id, request.now);
 
         Ok(PreparedRun {
             repository,
@@ -305,7 +308,7 @@ impl ApiCore {
     /// A hook is repository code executed with the daemon's environment, and a
     /// run proposed by the manager is exactly the path where nobody looked at
     /// the repository first.
-    fn hook_policy(&self, principal: Principal, repo_id: &str) -> HookPolicy {
+    fn hook_policy(&mut self, principal: Principal, repo_id: &str, now: i64) -> HookPolicy {
         if principal == Principal::Praetor {
             return HookPolicy::Deny;
         }
@@ -314,7 +317,34 @@ impl ApiCore {
             HookTrust::Granted => HookPolicy::Allow,
             HookTrust::Refused => HookPolicy::Deny,
             HookTrust::Unknown => HookPolicy::Ask,
+            HookTrust::Unreadable(failure) => {
+                self.journal_unreadable_trust(repo_id, failure, now);
+
+                HookPolicy::Deny
+            }
         }
+    }
+
+    /// Records that the hook-trust register could not be read.
+    ///
+    /// The refusal it produces is indistinguishable from an operator saying no,
+    /// and it lasts as long as the register stays unreadable: every repository
+    /// this daemon serves becomes permanently untrusted, with nothing anywhere
+    /// saying why. The entry is that record, and it hangs off no run because a
+    /// register the daemon cannot read is not a fact about one.
+    fn journal_unreadable_trust(&mut self, repo_id: &str, failure: TrustReadFailure, now: i64) {
+        let _ = self.machines.journal(&[EventRow {
+            id: None,
+            run_id: None,
+            event_type: HOOK_TRUST_UNREADABLE_EVENT.to_owned(),
+            class: EventClass::Infra,
+            payload: serde_json::json!({
+                "repo_id": repo_id,
+                "reason": failure.as_str(),
+            })
+            .to_string(),
+            ts: now,
+        }]);
     }
 
     /// Opens the durable question a repository whose hooks nobody has decided

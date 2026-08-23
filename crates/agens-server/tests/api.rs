@@ -20,8 +20,8 @@ use agens_server::{
     MergeAuthorization, OPERATION_AUTHORIZATION, Operation, PendingHookTrust, PortError, Ports,
     Principal, ProvisionedWorktree, RepositoryIdentity, RepositoryPolicy, RetryRequest, RunFacts,
     RunRef, RunTrigger, SessionControl, StateMachines, StopRequest, StopScope, Subscription,
-    TURN_FAILED_EVENT, TakeoverHandle, TransitionRejection, TurnFailure, WorktreeDerivation,
-    WorktreeGate, WorktreeRequest, praetor_may_answer,
+    TURN_FAILED_EVENT, TakeoverHandle, TransitionRejection, TrustReadFailure, TurnFailure,
+    WorktreeDerivation, WorktreeGate, WorktreeRequest, praetor_may_answer,
 };
 use agens_store::{
     ControlPlaneStore, QuestionAuthor, QuestionKind, QuestionRow, QuestionState, RetryTrigger,
@@ -1992,6 +1992,61 @@ fn a_repository_whose_hooks_the_operator_refused_is_not_asked_again() {
         vec![HookPolicy::Deny]
     );
     assert_eq!(created.hook_authorization_question, None);
+}
+
+/// A poisoned lock or a failing query made every repository this daemon serves
+/// permanently untrusted, in a way indistinguishable from the operator having
+/// said no and with nothing written down. The refusal stands, and now it says
+/// so.
+#[test]
+fn a_hook_trust_register_that_cannot_be_read_refuses_and_says_why() {
+    let repository = checkout();
+    let mut harness = Harness::with_policy(
+        store(),
+        RecordingWorktrees::new(false, true).declaring_hooks(&["devshell"]),
+        Arc::new(
+            RecordingPolicy::serving(&repository)
+                .trusting(HookTrust::Unreadable(TrustReadFailure::Poisoned)),
+        ),
+        repository.clone(),
+    );
+
+    let created = harness
+        .core
+        .create_run(Principal::User, &create_run(&repository))
+        .unwrap();
+
+    assert_eq!(
+        *harness.worktrees.hook_policies.lock().unwrap(),
+        vec![HookPolicy::Deny],
+        "a register nothing can read grants nothing"
+    );
+    assert_eq!(created.hook_authorization_question, None);
+
+    let recorded: Vec<_> = harness
+        .core
+        .machines()
+        .store()
+        .events_after(0, 256)
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.event_type == "hook_trust_unreadable")
+        .collect();
+
+    assert_eq!(
+        recorded.len(),
+        1,
+        "the read failure leaves a record behind it"
+    );
+    assert!(
+        recorded[0].run_id.is_none(),
+        "a register the daemon cannot read is not a fact about one run"
+    );
+    assert!(
+        recorded[0].payload.contains("\"reason\":\"poisoned\""),
+        "the entry names which failure it was: {}",
+        recorded[0].payload
+    );
 }
 
 #[test]
