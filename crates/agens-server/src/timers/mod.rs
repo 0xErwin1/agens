@@ -44,6 +44,10 @@ pub const CHECKPOINT_EVENT: &str = "checkpoint";
 /// one. One per overdue checkpoint, and its payload names which.
 pub const CHECKPOINT_OVERDUE_EVENT: &str = "checkpoint_overdue";
 
+/// The journal entry a refused stage of a tick is recorded as. Its payload
+/// names the stage and what refused it.
+pub const TIMER_STAGE_REJECTED_EVENT: &str = "timer_stage_rejected";
+
 /// The checkpoint payload field carrying the epoch second the worker promised
 /// its next checkpoint by. A checkpoint without it declares no deadline.
 const PROMISED_AT_FIELD: &str = "promised_at";
@@ -169,6 +173,38 @@ pub struct TimerTick {
     pub quota_resets: Vec<QuotaReset>,
     pub expired_questions: Vec<ExpiredQuestion>,
     pub overdue_checkpoints: Vec<OverdueCheckpoint>,
+    /// The stages that were refused, in the order they ran. Empty on an
+    /// ordinary tick.
+    pub rejections: Vec<RejectedStage>,
+}
+
+/// One of the three things a tick does, named so a refusal can say which.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TimerStage {
+    QuotaResets,
+    ExpiredQuestions,
+    OverdueCheckpoints,
+}
+
+impl TimerStage {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::QuotaResets => "quota_resets",
+            Self::ExpiredQuestions => "expired_questions",
+            Self::OverdueCheckpoints => "overdue_checkpoints",
+        }
+    }
+}
+
+/// A stage that was refused, and by what.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RejectedStage {
+    pub stage: TimerStage,
+    pub rejection: TransitionRejection,
+    /// The journal entry that recorded it, or `None` when the journal itself
+    /// could not be written.
+    pub event_id: Option<i64>,
 }
 
 /// The single wheel.
@@ -211,19 +247,62 @@ impl TimerWheel {
 
     /// Recomputes every deadline from the database and applies what is due.
     ///
-    /// A rejection is propagated rather than skipped. The wheel re-derives each
-    /// guard's facts from the same rows the guard reads, and the coordinator is
-    /// the only writer of those rows, so a refused transition here means an
-    /// invariant broke and the next tick would refuse it again.
-    pub fn tick(&self, machines: &mut StateMachines) -> Result<TimerTick, TransitionRejection> {
+    /// The three stages are independent, and a stage that is refused does not
+    /// take the other two with it. They read different tables and answer to
+    /// different deadlines: a run that left `awaiting_quota` between the read
+    /// and the apply says nothing about the questions that ran out or the
+    /// checkpoints that went overdue, and letting it decide their fate would
+    /// suspend every mechanical deadline the machine has for as long as the
+    /// row disagreed.
+    ///
+    /// A refusal is journaled rather than dropped, once per occurrence, and
+    /// carried back in [`TimerTick::rejections`]: this is the wheel's only
+    /// reader, and a rejection it swallowed would leave a wheel that looks
+    /// healthy and applies nothing.
+    pub fn tick(&self, machines: &mut StateMachines) -> TimerTick {
         let now = self.clock.now();
-
-        Ok(TimerTick {
+        let mut tick = TimerTick {
             now,
-            quota_resets: self.lift_elapsed_quota_caps(machines, now)?,
-            expired_questions: void_expired_questions(machines, now)?,
-            overdue_checkpoints: self.raise_overdue_checkpoints(machines, now)?,
-        })
+            ..TimerTick::default()
+        };
+
+        match self.lift_elapsed_quota_caps(machines, now) {
+            Ok(resets) => tick.quota_resets = resets,
+            Err(rejection) => {
+                tick.rejections.push(record_rejection(
+                    machines,
+                    TimerStage::QuotaResets,
+                    rejection,
+                    now,
+                ));
+            }
+        }
+
+        match void_expired_questions(machines, now) {
+            Ok(expired) => tick.expired_questions = expired,
+            Err(rejection) => {
+                tick.rejections.push(record_rejection(
+                    machines,
+                    TimerStage::ExpiredQuestions,
+                    rejection,
+                    now,
+                ));
+            }
+        }
+
+        match self.raise_overdue_checkpoints(machines, now) {
+            Ok(overdue) => tick.overdue_checkpoints = overdue,
+            Err(rejection) => {
+                tick.rejections.push(record_rejection(
+                    machines,
+                    TimerStage::OverdueCheckpoints,
+                    rejection,
+                    now,
+                ));
+            }
+        }
+
+        tick
     }
 
     /// Requeues every run parked on a provider whose reset has arrived.
@@ -386,6 +465,42 @@ impl TimerWheel {
             .checked_div(100)?;
 
         i64::try_from(i128::from(checkpoint_ts).checked_add(granted)?).ok()
+    }
+}
+
+/// Journals one refused stage and returns it for the caller to carry.
+///
+/// A journal that cannot be written is recorded as such rather than turned into
+/// a second failure: the rejection is what the caller has to hear about, and
+/// losing it because the record of it could not be stored would be the same
+/// silence this exists to end.
+fn record_rejection(
+    machines: &mut StateMachines,
+    stage: TimerStage,
+    rejection: TransitionRejection,
+    now: i64,
+) -> RejectedStage {
+    let payload = serde_json::json!({
+        "stage": stage.as_str(),
+        "reason": rejection.to_string(),
+    });
+
+    let event_id = machines
+        .journal(&[EventRow {
+            id: None,
+            run_id: None,
+            event_type: TIMER_STAGE_REJECTED_EVENT.to_owned(),
+            class: EventClass::Infra,
+            payload: payload.to_string(),
+            ts: now,
+        }])
+        .ok()
+        .and_then(|ids| ids.first().copied());
+
+    RejectedStage {
+        stage,
+        rejection,
+        event_id,
     }
 }
 

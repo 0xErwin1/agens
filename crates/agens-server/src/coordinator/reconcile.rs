@@ -94,7 +94,7 @@ pub(super) fn reconcile_before_surface(
     now: i64,
 ) -> Result<BootReconciliation, TransitionRejection> {
     let interrupted = interrupt_orphaned_runs(machines, now)?;
-    let timers = wheel.tick(machines)?;
+    let timers = wheel.tick(machines);
     let (orphan_worktrees, missing_worktrees) = verify_worktrees(machines, data_directory, now)?;
 
     Ok(BootReconciliation {

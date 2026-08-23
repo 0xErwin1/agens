@@ -100,7 +100,7 @@ pub use sessions::{
 pub use timers::{
     CHECKPOINT_EVENT, CHECKPOINT_OVERDUE_EVENT, DEFAULT_CHECKPOINT_GRACE_PERCENT,
     DEFAULT_QUOTA_WINDOW_SECONDS, ExpiredQuestion, ManualTimerClock, OverdueCheckpoint, QuotaReset,
-    TimerSettings, TimerTick, TimerWheel,
+    RejectedStage, TIMER_STAGE_REJECTED_EVENT, TimerSettings, TimerStage, TimerTick, TimerWheel,
 };
 
 #[derive(Debug)]
