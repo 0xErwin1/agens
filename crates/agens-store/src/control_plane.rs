@@ -628,6 +628,36 @@ impl ControlPlaneStore {
         )
     }
 
+    /// How many runs outside one state hold a worktree the machine has not
+    /// cleaned up.
+    ///
+    /// A worktree is provisioned when the run is created and stops costing the
+    /// machine anything only once it is `cleaned`, so what a ceiling on
+    /// worktrees has to be measured against is this count rather than the runs
+    /// that happen to be executing: a run parked on a question holds its
+    /// directory for as long as the question is open.
+    ///
+    /// The excluded state is how a caller leaves out the runs it is about to
+    /// decide on, so that a run is not counted once as a holder and once again
+    /// as the admission that reserves it.
+    pub fn held_worktrees_outside(&self, state: RunState) -> Result<usize> {
+        let held: i64 = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM runs
+                 WHERE state != ?1
+                   AND worktree_status IS NOT NULL
+                   AND worktree_status != ?2",
+                params![state.as_str(), WorktreeStatus::Cleaned.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|error| {
+                ControlPlaneError::operation("count held worktrees", &self.database_path, error)
+            })?;
+
+        Ok(usize::try_from(held).unwrap_or(0))
+    }
+
     pub fn insert_attempt(&mut self, attempt: &AttemptRow) -> Result<i64> {
         insert_attempt_row(&self.connection, attempt).map_err(|error| {
             ControlPlaneError::operation("insert attempt", &self.database_path, error)

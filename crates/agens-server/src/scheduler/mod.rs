@@ -9,7 +9,10 @@
 //! Three ceilings bound admission, and they are not interchangeable:
 //!
 //! - `max_concurrent` and the worktree ceiling bound the machine as a whole. A
-//!   run held back by either stays queued in its position.
+//!   run held back by either stays queued in its position. They are counted
+//!   against different things: slots against the runs executing, worktrees
+//!   against every run that holds a directory, which includes the ones parked
+//!   on a question and the ones still waiting for approval.
 //! - Provider headroom bounds one provider. A run whose provider is out of
 //!   headroom is skipped rather than allowed to hold up the queue behind it:
 //!   stopping there would starve every other provider on account of one.
@@ -34,7 +37,7 @@ mod queue;
 
 use std::collections::BTreeMap;
 
-use agens_store::{RunRow, RunState};
+use agens_store::{RunRow, RunState, WorktreeStatus};
 
 pub use launcher::{RunSession, SupervisorLauncher};
 pub use queue::{Candidate, Ineligible, Queue};
@@ -138,7 +141,9 @@ pub enum Deferral {
         limit: usize,
     },
     WorktreeCeiling {
-        running: usize,
+        /// Worktrees the machine already holds, this tick's admissions
+        /// included.
+        held: usize,
         limit: usize,
     },
     ProviderHeadroom {
@@ -309,13 +314,14 @@ impl Scheduler {
         let facts = RunFacts {
             now: load.now,
             principal: Principal::Coordinator,
-            // The three facts the admission guard re-checks are the ones this
-            // tick just established: the ceilings gave out a slot, an eligible
-            // run's provider is serving, and the launcher would not have
-            // produced a session without a worktree to run it in.
+            // The ceilings gave out a slot and an eligible run's provider is
+            // serving, so both are facts this tick established. The worktree is
+            // not: it is read back off the row the queue was built from, so the
+            // guard refuses a run whose directory was reclaimed rather than
+            // being told what the launcher assumed.
             slot_available: true,
             provider_serving: true,
-            worktree_ready: true,
+            worktree_ready: candidate.run.worktree_status == Some(WorktreeStatus::Active),
             session_id: Some(launched.session.value()),
             session_attempt_id: launched.session_attempt_id,
             ..RunFacts::default()
@@ -340,6 +346,9 @@ impl Scheduler {
 /// The slots one tick has to give out, and what taking one costs.
 struct Slots {
     running: usize,
+    /// Worktrees held by runs this tick is not deciding on, plus one for every
+    /// run it admits.
+    held_worktrees: usize,
     concurrency_limit: usize,
     worktree_limit: usize,
     /// Runs executing, by provider.
@@ -350,7 +359,21 @@ struct Slots {
 }
 
 impl Slots {
-    /// Counts what is already running, from the store rather than from memory.
+    /// Counts what is already running and what already holds a worktree, from
+    /// the store rather than from memory.
+    ///
+    /// The two counts are not the same set and neither stands in for the other.
+    /// A worktree is provisioned when the run is created and released when it
+    /// is cleaned, so a run parked on a question holds a directory without
+    /// occupying a slot, and counting `running` twice was what left the
+    /// worktree ceiling unable to refuse anything the concurrency ceiling had
+    /// not already refused.
+    ///
+    /// Queued runs are left out of the count on purpose: this tick is deciding
+    /// on them, and each admission reserves one below. Counting them here as
+    /// well would charge a queued run's own worktree against the ceiling it is
+    /// asking to pass, and a machine whose worktrees all belong to queued runs
+    /// would admit none of them and so never reclaim any.
     fn read(
         machines: &StateMachines,
         limits: &SchedulerLimits,
@@ -361,6 +384,11 @@ impl Slots {
             .runs_in_state(RunState::Running)
             .map_err(SchedulerError::from_store)?;
 
+        let held_worktrees = machines
+            .store()
+            .held_worktrees_outside(RunState::Queued)
+            .map_err(SchedulerError::from_store)?;
+
         let mut per_provider: BTreeMap<String, usize> = BTreeMap::new();
         for run in &running {
             *per_provider.entry(run.provider.clone()).or_default() += 1;
@@ -368,6 +396,7 @@ impl Slots {
 
         Ok(Self {
             running: running.len(),
+            held_worktrees,
             concurrency_limit: limits.max_concurrent,
             worktree_limit: limits.available_worktrees,
             per_provider,
@@ -385,9 +414,9 @@ impl Slots {
             });
         }
 
-        if self.running >= self.worktree_limit {
+        if self.held_worktrees >= self.worktree_limit {
             return Err(Deferral::WorktreeCeiling {
-                running: self.running,
+                held: self.held_worktrees,
                 limit: self.worktree_limit,
             });
         }
@@ -404,6 +433,7 @@ impl Slots {
         }
 
         self.running += 1;
+        self.held_worktrees += 1;
         *self.per_provider.entry(provider.to_owned()).or_default() += 1;
 
         Ok(())

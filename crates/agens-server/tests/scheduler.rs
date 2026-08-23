@@ -272,6 +272,11 @@ impl Draft {
         self
     }
 
+    fn worktree(mut self, worktree_status: Option<WorktreeStatus>) -> Self {
+        self.worktree_status = worktree_status;
+        self
+    }
+
     fn row(&self) -> RunRow {
         RunRow {
             id: None,
@@ -506,6 +511,41 @@ fn a_provider_with_no_recorded_row_is_serving() {
     assert_eq!(admitted_runs(&report), vec![run]);
 }
 
+/// A run parked on a question keeps its place in the queue while its worktree
+/// is reclaimed underneath it. Admitting it would start a session over a
+/// directory that is being taken apart, so the queue holds it until a worktree
+/// is provisioned again.
+#[test]
+fn a_run_whose_worktree_is_not_active_is_ineligible() {
+    let mut harness = Harness::new();
+    let reclaimed = harness.insert(
+        &Draft::queued("anthropic")
+            .created_at(10)
+            .worktree(Some(WorktreeStatus::Reclaimable)),
+    );
+    let never_provisioned =
+        harness.insert(&Draft::queued("anthropic").created_at(20).worktree(None));
+    let ready = harness.insert(&Draft::queued("anthropic").created_at(30));
+
+    let (report, launcher) = harness.tick(limits(4, 4, 4));
+
+    assert_eq!(admitted_runs(&report), vec![ready]);
+    assert_eq!(launcher.launched().len(), 1);
+    assert_eq!(harness.state_of(reclaimed), RunState::Queued);
+    assert_eq!(
+        deferral_for(&report, reclaimed),
+        &Deferral::Ineligible(Ineligible::WorktreeNotReady {
+            worktree_status: Some(WorktreeStatus::Reclaimable),
+        })
+    );
+    assert_eq!(
+        deferral_for(&report, never_provisioned),
+        &Deferral::Ineligible(Ineligible::WorktreeNotReady {
+            worktree_status: None,
+        })
+    );
+}
+
 #[test]
 fn a_dependency_holds_a_run_until_its_worktree_is_reclaimable() {
     let mut harness = Harness::new();
@@ -597,11 +637,46 @@ fn the_worktree_ceiling_bounds_admission_on_its_own() {
     assert_eq!(admitted_runs(&report), vec![first]);
     assert_eq!(
         deferral_for(&report, second),
-        &Deferral::WorktreeCeiling {
-            running: 1,
-            limit: 1
-        }
+        &Deferral::WorktreeCeiling { held: 1, limit: 1 }
     );
+}
+
+/// The worktree ceiling counts worktrees, and a run parked on a question holds
+/// one without occupying a slot. Counted as slots instead, the parked run costs
+/// nothing and the ceiling can only refuse what `max_concurrent` already
+/// refused.
+#[test]
+fn a_parked_run_holds_its_worktree_against_the_ceiling() {
+    let mut harness = Harness::new();
+    let parked = harness.insert(&Draft::in_state(RunState::AwaitingInput, "anthropic"));
+    let first = harness.insert(&Draft::queued("anthropic").created_at(10));
+    let second = harness.insert(&Draft::queued("anthropic").created_at(20));
+
+    let (report, _) = harness.tick(limits(8, 2, 8));
+
+    assert_eq!(harness.state_of(parked), RunState::AwaitingInput);
+    assert_eq!(admitted_runs(&report), vec![first]);
+    assert_eq!(
+        deferral_for(&report, second),
+        &Deferral::WorktreeCeiling { held: 2, limit: 2 }
+    );
+    assert!(report.is_saturated());
+}
+
+/// A worktree that was cleaned costs the machine nothing, so the run that used
+/// to hold it is not charged for it.
+#[test]
+fn a_cleaned_worktree_is_not_held_against_the_ceiling() {
+    let mut harness = Harness::new();
+    harness.insert(
+        &Draft::in_state(RunState::AwaitingInput, "anthropic")
+            .worktree(Some(WorktreeStatus::Cleaned)),
+    );
+    let queued = harness.insert(&Draft::queued("anthropic"));
+
+    let (report, _) = harness.tick(limits(8, 1, 8));
+
+    assert_eq!(admitted_runs(&report), vec![queued]);
 }
 
 #[test]
@@ -693,6 +768,8 @@ fn more_sub_agents_than_capacity_closes_the_provider_rather_than_going_negative(
     );
 }
 
+/// A parked run holds a worktree and no slot, so the machine is given worktree
+/// headroom for the two parked runs and a single slot to compete for.
 #[test]
 fn a_parked_run_holds_no_slot() {
     let mut harness = Harness::new();
@@ -701,7 +778,7 @@ fn a_parked_run_holds_no_slot() {
     harness.insert(&Draft::in_state(RunState::AwaitingQuota, "anthropic"));
     let waiting = harness.insert(&Draft::queued("anthropic"));
 
-    let (report, _) = harness.tick(limits(1, 1, 1));
+    let (report, _) = harness.tick(limits(1, 3, 1));
 
     assert_eq!(report.running_before, 0);
     assert_eq!(admitted_runs(&report), vec![waiting]);

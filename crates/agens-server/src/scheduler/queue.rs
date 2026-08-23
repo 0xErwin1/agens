@@ -10,13 +10,20 @@ use super::SchedulerError;
 
 /// Why a queued run was not even considered for a slot.
 ///
-/// Both reasons are conditions of the world rather than faults of the run: it
+/// Every reason is a condition of the world rather than a fault of the run: it
 /// stays queued, keeps its position, and is charged nothing. A run held back
 /// here has not failed at anything.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Ineligible {
     /// The run's provider is capped, so there is nothing to admit it into.
     ProviderCapped { provider: String },
+    /// The run has no worktree to execute in. The run itself is intact: it
+    /// becomes admittable again as soon as a worktree is provisioned for it.
+    WorktreeNotReady {
+        /// The worktree as the run's own row records it, or `None` when the
+        /// run never had one provisioned.
+        worktree_status: Option<WorktreeStatus>,
+    },
     /// The run it depends on has not been merged and reclaimed yet.
     DependencyPending {
         dep_run_id: i64,
@@ -93,6 +100,12 @@ pub(super) fn build(store: &ControlPlaneStore) -> Result<Queue, SchedulerError> 
 }
 
 /// The reason this run cannot be admitted at all, or `None` when it can.
+///
+/// The worktree is read here rather than assumed by whoever launches the
+/// session. A run keeps its place in the queue while its worktree is reclaimed
+/// underneath it — a run parked on a question is the ordinary way that happens
+/// — and the answer that requeues it says nothing about the directory the
+/// session would be started in.
 fn eligibility(
     store: &ControlPlaneStore,
     run: &RunRow,
@@ -107,6 +120,12 @@ fn eligibility(
     if provider.is_some_and(|row| row.quota_state == QuotaState::Capped) {
         return Ok(Some(Ineligible::ProviderCapped {
             provider: run.provider.clone(),
+        }));
+    }
+
+    if run.worktree_status != Some(WorktreeStatus::Active) {
+        return Ok(Some(Ineligible::WorktreeNotReady {
+            worktree_status: run.worktree_status,
         }));
     }
 
