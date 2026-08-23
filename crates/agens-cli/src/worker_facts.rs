@@ -198,7 +198,7 @@ impl WorkerFacts {
             .ok()?;
 
         Some(Attribution {
-            attempt_id: session_attempt_id,
+            attempt_id: Some(session_attempt_id),
             turn: attempt.n,
         })
     }

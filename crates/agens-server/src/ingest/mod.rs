@@ -77,7 +77,12 @@ pub struct ReportedFact {
     pub run_id: i64,
     /// The physical execution that produced it (`session_attempts.id`), which
     /// is what the evidence ledger is keyed by.
-    pub attempt_id: i64,
+    ///
+    /// `None` when the run's live attempt has not been correlated with one
+    /// yet. A worker always knows its own execution; a reporter watching a run
+    /// from outside the turn does not, and a worker that died before it ever
+    /// correlated is exactly the case with no ledger row to name.
+    pub attempt_id: Option<i64>,
     /// Turn index within the attempt. Non-negative.
     pub turn: i64,
     /// Epoch seconds. Ingest reads no clock.
@@ -95,7 +100,8 @@ pub struct ReportedFact {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Attribution {
     /// `session_attempts.id`, which is what the evidence ledger is keyed by.
-    pub attempt_id: i64,
+    /// `None` while the attempt has not been correlated with one.
+    pub attempt_id: Option<i64>,
     /// The run's attempt number, which is also its turn index: one admission
     /// is one turn.
     pub turn: i64,
@@ -103,9 +109,11 @@ pub struct Attribution {
 
 /// How a fact about `run_id` reported right now would be attributed.
 ///
-/// `None` when the run has no attempt yet or its live attempt has not been
-/// correlated with a physical execution: neither is a failure, and both mean
-/// there is nothing a fact could be attributed to.
+/// `None` only when the run has no attempt yet, which is not a failure and
+/// means there is nothing a fact could belong to. An attempt that exists but
+/// has not been correlated with a physical execution still attributes: the
+/// fact belongs to that attempt, and what it lacks is a row in the evidence
+/// ledger rather than an owner.
 pub(crate) fn attribution_of(
     store: &ControlPlaneStore,
     run_id: i64,
@@ -114,8 +122,8 @@ pub(crate) fn attribution_of(
         return Ok(None);
     };
 
-    Ok(attempt.session_attempt_id.map(|attempt_id| Attribution {
-        attempt_id,
+    Ok(Some(Attribution {
+        attempt_id: attempt.session_attempt_id,
         turn: attempt.n,
     }))
 }
@@ -130,7 +138,7 @@ pub enum IngestRejection {
     /// The fact names an attempt that is not the run's live one.
     StaleAttempt {
         run_id: i64,
-        reported: i64,
+        reported: Option<i64>,
         live: Option<i64>,
     },
     /// The fact violated a bound ingest enforces before folding anything.
@@ -154,7 +162,7 @@ impl std::fmt::Display for IngestRejection {
                 live,
             } => write!(
                 formatter,
-                "attempt {reported} is not the live attempt of run {run_id} ({live:?})"
+                "attempt {reported:?} is not the live attempt of run {run_id} ({live:?})"
             ),
             Self::Malformed(detail) => write!(formatter, "unusable reported fact: {detail}"),
             Self::ChannelClosed => formatter.write_str("the ingest channel has no reader"),
@@ -443,7 +451,7 @@ impl Ingest {
             .ok_or(IngestRejection::NoLiveAttempt(reported.run_id))?
             .session_attempt_id;
 
-        if live == Some(reported.attempt_id) {
+        if live == reported.attempt_id {
             Ok(())
         } else {
             Err(IngestRejection::StaleAttempt {
@@ -548,7 +556,7 @@ mod channel_tests {
     fn turn_started() -> ReportedFact {
         ReportedFact {
             run_id: 1,
-            attempt_id: 1,
+            attempt_id: Some(1),
             turn: 0,
             now: 1_700_000_000,
             fact: IngestFact::TurnStarted,

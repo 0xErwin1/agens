@@ -264,7 +264,7 @@ impl RunIntrospectionPort for RunIntrospection {
             .and_then(CheckpointReporting::attribution);
         let session_attempt_id = self
             .session_attempt_id
-            .or_else(|| attribution.map(|attempt| attempt.attempt_id));
+            .or_else(|| attribution.and_then(|attempt| attempt.attempt_id));
 
         let event = self.checkpoint_event(checkpoint, session_attempt_id, now);
         let findings = self.finding_rows(checkpoint, now);

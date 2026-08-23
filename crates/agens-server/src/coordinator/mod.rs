@@ -577,7 +577,7 @@ fn timer_loop(
                         // same rows the tick read: a fact attributed to an
                         // attempt the run left between the two would be
                         // refused as a straggler.
-                        expired_checkpoint_facts(&core, &tick),
+                        expired_checkpoint_facts(core.machines().store(), &tick),
                     )
                 }
                 // The wheel reading a poisoned core as "nothing was due" is how
@@ -612,12 +612,15 @@ fn timer_loop(
 
 /// One `CheckpointExpired` fact per overdue checkpoint this tick raised.
 ///
-/// A run whose live attempt is not correlated with a physical execution yet
-/// produces none: there is nothing for the fact to be attributed to, and ingest
-/// would refuse it.
-fn expired_checkpoint_facts(core: &ApiCore, tick: &crate::timers::TimerTick) -> Vec<ReportedFact> {
-    let store = core.machines().store();
-
+/// A run whose live attempt has not been correlated with a physical execution
+/// still produces one, attributed to that attempt with no ledger row named: a
+/// worker that died during provisioning never correlates, and it is the case
+/// the first checkpoint's deadline exists to catch. Only a run with no attempt
+/// at all produces nothing.
+fn expired_checkpoint_facts(
+    store: &ControlPlaneStore,
+    tick: &crate::timers::TimerTick,
+) -> Vec<ReportedFact> {
     tick.overdue_checkpoints
         .iter()
         .filter_map(|overdue| {
@@ -1062,4 +1065,133 @@ fn now() -> i64 {
         .map_or(0, |elapsed| {
             i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX)
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use agens_store::{AttemptRow, RunRow, RunState, WorktreeStatus};
+
+    use super::{ControlPlaneStore, IngestFact, expired_checkpoint_facts};
+    use crate::timers::{OverdueCheckpoint, TimerTick};
+
+    const NOW: i64 = 1_700_000_000;
+
+    fn scratch() -> std::path::PathBuf {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let suffix = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "agens-server-wheel-{}-{suffix}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+
+        directory
+    }
+
+    /// A run that was admitted, opened its attempt, and died before the worker
+    /// ever named the physical execution it was running as.
+    fn uncorrelated_run(store: &mut ControlPlaneStore) -> i64 {
+        let run_id = store
+            .insert_run(&RunRow {
+                id: None,
+                repo_id: "a1b2c3d4e5f60718".to_owned(),
+                repo_root: "/home/dev/agens".to_owned(),
+                remote_url: None,
+                external_ref: None,
+                parent_run_id: None,
+                task: "the deadline reaches a worker that never correlated".to_owned(),
+                scope: "crates/agens-server/src/coordinator".to_owned(),
+                dod: "the wheel raises the fact anyway".to_owned(),
+                genesis_paths: None,
+                state: RunState::Running,
+                priority: 5,
+                dep_run_id: None,
+                provider: "scripted".to_owned(),
+                budget_tokens: None,
+                worktree_path: None,
+                worktree_status: Some(WorktreeStatus::Active),
+                created_at: NOW,
+                result: None,
+            })
+            .unwrap();
+
+        store
+            .insert_attempt(&AttemptRow {
+                id: None,
+                run_id,
+                n: 1,
+                session_id: None,
+                session_attempt_id: None,
+                started_at: NOW,
+                ended_at: None,
+                outcome: None,
+                retry_trigger: None,
+                tokens: None,
+                cost_micros: None,
+            })
+            .unwrap();
+
+        run_id
+    }
+
+    fn overdue_tick(run_id: i64) -> TimerTick {
+        TimerTick {
+            now: NOW + 1_800,
+            quota_resets: Vec::new(),
+            expired_questions: Vec::new(),
+            overdue_checkpoints: vec![OverdueCheckpoint {
+                run_id,
+                checkpoint_event_id: 1,
+                promised_at: None,
+                deadline: NOW + 1_800,
+                signal_event_id: 2,
+            }],
+            rejections: Vec::new(),
+        }
+    }
+
+    /// The whole point of the first checkpoint's deadline is the worker that
+    /// died before it reported anything, and that worker never correlated. A
+    /// wheel that produced no fact for it left the detector unreached and the
+    /// slot held.
+    #[test]
+    fn an_overdue_checkpoint_is_reported_for_a_run_that_never_correlated() {
+        let directory = scratch();
+        let mut store = ControlPlaneStore::open(&directory).unwrap();
+        let run_id = uncorrelated_run(&mut store);
+
+        let facts = expired_checkpoint_facts(&store, &overdue_tick(run_id));
+
+        let [fact] = facts.as_slice() else {
+            panic!("expected one fact, got {facts:?}");
+        };
+        assert_eq!(fact.run_id, run_id);
+        assert_eq!(
+            fact.attempt_id, None,
+            "the fact belongs to the attempt, which has no physical execution"
+        );
+        assert_eq!(fact.turn, 1);
+        assert_eq!(fact.fact, IngestFact::CheckpointExpired);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A run that was never admitted has no attempt for a fact to belong to.
+    #[test]
+    fn an_overdue_checkpoint_for_a_run_without_an_attempt_reports_nothing() {
+        let directory = scratch();
+        let mut store = ControlPlaneStore::open(&directory).unwrap();
+        let run_id = uncorrelated_run(&mut store);
+        let orphan = store
+            .insert_run(&RunRow {
+                id: None,
+                task: "no attempt was ever opened".to_owned(),
+                ..store.load_run(run_id).unwrap().unwrap()
+            })
+            .unwrap();
+
+        assert!(expired_checkpoint_facts(&store, &overdue_tick(orphan)).is_empty());
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 }

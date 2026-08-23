@@ -423,6 +423,65 @@ fn an_expired_checkpoint_reports_a_lost_worker_whatever_the_counters_say() {
     harness.finish();
 }
 
+/// The first checkpoint's deadline exists for the worker that died during
+/// provisioning: it journaled `run_started`, never correlated, and never
+/// reported anything. A fact refused for want of a physical execution left the
+/// detector unreached and the slot held for the life of the daemon.
+#[test]
+fn an_expired_checkpoint_reaches_the_detector_for_an_attempt_that_never_correlated() {
+    let mut harness = Harness::open();
+    let run_id = harness.seed_uncorrelated_run();
+
+    let accepted = harness
+        .ingest
+        .accept(&ReportedFact {
+            run_id,
+            attempt_id: None,
+            turn: 1,
+            now: NOW,
+            fact: IngestFact::CheckpointExpired,
+        })
+        .expect("an attempt with no physical execution still owns its facts");
+
+    assert_eq!(
+        accepted.signals,
+        vec![HealthSignal::WorkerLost {
+            reason: LostReason::CheckpointExpired,
+            noop_turns: 0,
+        }]
+    );
+
+    harness.finish();
+}
+
+/// A worker naming its own execution against a run whose live attempt has not
+/// been correlated is still a straggler: the two do not describe the same
+/// physical execution.
+#[test]
+fn a_correlated_fact_against_an_uncorrelated_attempt_is_refused() {
+    let mut harness = Harness::open();
+    let run_id = harness.seed_uncorrelated_run();
+
+    let refused = harness.ingest.accept(&ReportedFact {
+        run_id,
+        attempt_id: Some(SESSION_ATTEMPT),
+        turn: 1,
+        now: NOW,
+        fact: IngestFact::TurnStarted,
+    });
+
+    assert_eq!(
+        refused.expect_err("the live attempt names no execution"),
+        IngestRejection::StaleAttempt {
+            run_id,
+            reported: Some(SESSION_ATTEMPT),
+            live: None,
+        }
+    );
+
+    harness.finish();
+}
+
 #[test]
 fn a_fact_from_an_attempt_the_run_has_left_is_refused_and_writes_nothing() {
     let mut harness = Harness::open();
@@ -432,7 +491,7 @@ fn a_fact_from_an_attempt_the_run_has_left_is_refused_and_writes_nothing() {
 
     let straggler = harness.ingest.accept(&ReportedFact {
         run_id,
-        attempt_id: SESSION_ATTEMPT,
+        attempt_id: Some(SESSION_ATTEMPT),
         turn: 3,
         now: NOW,
         fact: IngestFact::ToolResult(wrote("src/one.rs")),
@@ -442,7 +501,7 @@ fn a_fact_from_an_attempt_the_run_has_left_is_refused_and_writes_nothing() {
         straggler,
         Err(IngestRejection::StaleAttempt {
             run_id,
-            reported: SESSION_ATTEMPT,
+            reported: Some(SESSION_ATTEMPT),
             live: Some(OTHER_SESSION_ATTEMPT),
         })
     );
@@ -468,14 +527,14 @@ fn a_fact_for_an_unknown_run_or_a_negative_turn_is_refused() {
 
     let unknown = harness.ingest.accept(&ReportedFact {
         run_id: run_id + 404,
-        attempt_id: SESSION_ATTEMPT,
+        attempt_id: Some(SESSION_ATTEMPT),
         turn: 1,
         now: NOW,
         fact: IngestFact::TurnStarted,
     });
     let negative_turn = harness.ingest.accept(&ReportedFact {
         run_id,
-        attempt_id: SESSION_ATTEMPT,
+        attempt_id: Some(SESSION_ATTEMPT),
         turn: -1,
         now: NOW,
         fact: IngestFact::TurnStarted,
@@ -557,7 +616,7 @@ fn the_channel_hands_every_queued_fact_to_the_single_writer_in_order() {
         sender
             .report(ReportedFact {
                 run_id,
-                attempt_id: SESSION_ATTEMPT,
+                attempt_id: Some(SESSION_ATTEMPT),
                 turn,
                 now: NOW,
                 fact: IngestFact::TurnEnded { tokens: 10 },
@@ -567,7 +626,7 @@ fn the_channel_hands_every_queued_fact_to_the_single_writer_in_order() {
     sender
         .report(ReportedFact {
             run_id,
-            attempt_id: OTHER_SESSION_ATTEMPT,
+            attempt_id: Some(OTHER_SESSION_ATTEMPT),
             turn: 4,
             now: NOW,
             fact: IngestFact::TurnEnded { tokens: 10 },
@@ -687,6 +746,21 @@ impl Harness {
         run_id
     }
 
+    /// A running run whose live attempt was opened and never correlated with a
+    /// physical execution, which is where a worker that died during
+    /// provisioning leaves it.
+    fn seed_uncorrelated_run(&mut self) -> i64 {
+        let run_id = self.seed_run();
+        self.connection
+            .execute(
+                "UPDATE attempts SET session_attempt_id = NULL WHERE run_id = ?1",
+                [run_id],
+            )
+            .unwrap();
+
+        run_id
+    }
+
     fn open_second_attempt(&mut self, run_id: i64) {
         self.open_attempt(run_id, 2, OTHER_SESSION_ATTEMPT);
     }
@@ -751,7 +825,7 @@ impl Harness {
         self.ingest
             .accept(&ReportedFact {
                 run_id,
-                attempt_id: SESSION_ATTEMPT,
+                attempt_id: Some(SESSION_ATTEMPT),
                 turn,
                 now: NOW,
                 fact,
