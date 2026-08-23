@@ -43,10 +43,10 @@
 //! states the inheritance. A hook exports environment to the hooks that follow
 //! it by appending `KEY=value` lines to the file named by
 //! `AGENS_WORKTREE_ENV`, and only names the caller allowed are accepted: an
-//! export is a hook writing the next hook's environment, and `PATH` or
-//! `LD_PRELOAD` written there would decide what the next command even is. The
-//! exports are reported, and nothing carries them into the worker's own
-//! session yet.
+//! export is a hook writing the next hook's environment. `PATH` and the loader
+//! variables are refused whatever the caller allowed, because those decide what
+//! the next command even is rather than what it reads. The exports are
+//! reported, and nothing carries them into the worker's own session yet.
 //!
 //! A hook failure is never resolved here. The caller decides between
 //! continuing — in which case the failure is recorded so the worker can be
@@ -117,6 +117,10 @@ pub struct WorktreeProvisioner {
     /// what a caller that has declared no policy means: an export changes what
     /// the following hooks execute, so it is granted rather than assumed.
     export_allowlist: Vec<String>,
+    /// The allowlist entries this provisioner refused to carry, in the order
+    /// the operator wrote them. Dropping one silently leaves an operator with
+    /// an allowlist that admits nothing and no way to see why.
+    rejected_export_patterns: Vec<String>,
     execution_context: Option<ToolExecutionContext>,
 }
 
@@ -244,6 +248,11 @@ pub struct ProvisioningReport {
     /// the order they were seen. A worker that finds its environment missing
     /// something the repository declared is looking at this list.
     pub dropped_exports: Vec<String>,
+    /// The allowlist entries the provisioner refused to carry, in the order the
+    /// operator wrote them. An entry that admits every name is one, and an
+    /// allowlist made only of those admits nothing at all — which reads exactly
+    /// like a policy nobody configured unless this list says otherwise.
+    pub rejected_export_patterns: Vec<String>,
     /// Whether the hooks were allowed to run. A contract without hooks is
     /// authorized trivially, having asked nothing.
     pub hooks_authorized: bool,
@@ -531,6 +540,7 @@ impl WorktreeProvisioner {
             worktrees,
             hook_timeout: DEFAULT_HOOK_TIMEOUT,
             export_allowlist: Vec::new(),
+            rejected_export_patterns: Vec::new(),
             execution_context: None,
         }
     }
@@ -543,15 +553,21 @@ impl WorktreeProvisioner {
     /// operator has not granted is still a contract worth applying.
     ///
     /// An entry that would admit every name is rejected here rather than
-    /// carried: the allowlist exists to keep `PATH` and `LD_PRELOAD` out of the
-    /// environment the following hooks execute in, and a pattern with nothing
-    /// before its `*` admits exactly those.
+    /// carried, and recorded on the report as
+    /// [`ProvisioningReport::rejected_export_patterns`]: an allowlist that
+    /// suddenly admits nothing is otherwise indistinguishable from one nobody
+    /// wrote.
+    ///
+    /// Rejecting those entries is not what keeps `PATH` and the loader
+    /// variables out — [`Self::admits_export`] refuses those by name, whatever
+    /// the allowlist says.
     #[must_use]
     pub fn with_export_allowlist(mut self, names: Vec<String>) -> Self {
-        self.export_allowlist = names
-            .into_iter()
-            .filter(|name| !admits_every_name(name))
-            .collect();
+        let (rejected, allowed): (Vec<String>, Vec<String>) =
+            names.into_iter().partition(|name| admits_every_name(name));
+
+        self.export_allowlist = allowed;
+        self.rejected_export_patterns = rejected;
         self
     }
 
@@ -605,6 +621,7 @@ impl WorktreeProvisioner {
             copied,
             environment: BTreeMap::new(),
             dropped_exports: Vec::new(),
+            rejected_export_patterns: self.rejected_export_patterns.clone(),
             hooks_authorized: true,
             failures: Vec::new(),
         };
@@ -709,10 +726,20 @@ impl WorktreeProvisioner {
         (admitted, dropped)
     }
 
+    /// Whether the allowlist admits an exported name.
+    ///
+    /// [`NEVER_EXPORTED`] is checked first and answers on its own. An allowlist
+    /// is an operator's statement about which values the following hooks may
+    /// read, and those names are not values: they choose which programs run and
+    /// which code is linked into them, so a hook that sets one has taken every
+    /// hook after it whatever the operator meant to grant.
     fn admits_export(&self, name: &str) -> bool {
+        if NEVER_EXPORTED.contains(&name) {
+            return false;
+        }
+
         self.export_allowlist
             .iter()
-            .filter(|allowed| !admits_every_name(allowed))
             .any(|allowed| match allowed.strip_suffix('*') {
                 Some(prefix) => name.starts_with(prefix),
                 None => name == allowed,
@@ -1170,6 +1197,14 @@ fn read_exported_environment(path: &Path) -> Result<BTreeMap<String, String>, Pr
 fn admits_every_name(entry: &str) -> bool {
     entry.strip_suffix('*').unwrap_or(entry).is_empty()
 }
+
+/// The names no allowlist admits, however it is written.
+///
+/// `PATH` decides which program each following hook runs, and the loader
+/// variables decide which code is linked into it. An entry naming one of these
+/// outright, or a prefix reaching one, would hand every hook after the first to
+/// whoever wrote that hook.
+const NEVER_EXPORTED: [&str; 3] = ["PATH", "LD_PRELOAD", "LD_LIBRARY_PATH"];
 
 fn is_environment_name(name: &str) -> bool {
     let mut characters = name.chars();

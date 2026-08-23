@@ -399,7 +399,16 @@ fn strip_prefixes(tokens: &[String]) -> &[String] {
 /// inside it are read as invocations rather than as an opaque argument.
 fn shell_script(tokens: &[String]) -> Option<String> {
     let (first, rest) = tokens.split_first()?;
-    if !SHELL_COMMANDS.contains(&command_name(first)) {
+    let program = command_name(first);
+
+    // `eval` names no flag and takes no script argument: it runs the words
+    // after it, joined back into one line. Reading it as an opaque argument
+    // would leave `eval "cd .. && rm -rf x"` as a single unreadable token.
+    if program == "eval" {
+        return (!rest.is_empty()).then(|| rest.join(" "));
+    }
+
+    if !SHELL_COMMANDS.contains(&program) {
         return None;
     }
 
