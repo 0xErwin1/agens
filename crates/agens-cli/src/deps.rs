@@ -18,8 +18,9 @@ use agens_core::HeadlessTurnCancellation;
 
 use crate::commands::auth::run_production_auth_login;
 use crate::commands::config::{create_configuration_file, create_global_configuration_file};
+use crate::commands::serve::DaemonStartupRequest;
 use crate::headless::run_production_headless_chat;
-use crate::tui::{TuiMode, run_production_tui};
+use crate::tui::{TuiLaunch, run_production_tui};
 use agens_bootstrap::{Bootstrap, HostEnvironment};
 use agens_error::CliError;
 use agens_headless::HeadlessChatRequest;
@@ -34,7 +35,8 @@ type ConfigCreator = Box<dyn Fn(&Path, &str) -> Result<(), CliError>>;
 type HeadlessChat = Box<
     dyn Fn(HeadlessChatRequest, &Bootstrap, &HeadlessTurnCancellation) -> Result<String, CliError>,
 >;
-type TuiLauncher = Box<dyn Fn(&Bootstrap, Option<i64>, TuiMode) -> Result<String, CliError>>;
+type TuiLauncher = Box<dyn Fn(&Bootstrap, TuiLaunch) -> Result<String, CliError>>;
+type DaemonEnsurer = Box<dyn Fn(&Bootstrap, DaemonStartupRequest) -> Result<bool, CliError>>;
 type AuthLogin = Box<dyn Fn(&Path, bool, &HeadlessTurnCancellation) -> Result<String, CliError>>;
 /// Whether the process's standard input is attached to a terminal.
 ///
@@ -49,6 +51,7 @@ pub struct CliDependencies {
     pub(crate) create_file: ConfigCreator,
     pub(crate) headless_chat: HeadlessChat,
     pub(crate) tui_launcher: TuiLauncher,
+    pub(crate) daemon_ensurer: DaemonEnsurer,
     pub(crate) auth_login: AuthLogin,
     pub(crate) stdin_is_terminal: StdinIsTerminal,
 }
@@ -90,6 +93,7 @@ impl CliDependencies {
             }),
             headless_chat: Box::new(run_production_headless_chat),
             tui_launcher: Box::new(run_production_tui),
+            daemon_ensurer: Box::new(crate::commands::serve::ensure_daemon_running),
             auth_login: Box::new(run_production_auth_login),
             stdin_is_terminal: Box::new(|| std::io::stdin().is_terminal()),
         }
@@ -105,7 +109,8 @@ impl CliDependencies {
             host: HostEnvironment::fixed(current_directory, home_directory, environment, files),
             create_file: Box::new(|_, _| Err(CliError::unavailable(UNAVAILABLE_MESSAGE))),
             headless_chat: Box::new(|_, _, _| Err(CliError::unavailable(UNAVAILABLE_MESSAGE))),
-            tui_launcher: Box::new(|_, _, _| Err(CliError::unavailable(UNAVAILABLE_MESSAGE))),
+            tui_launcher: Box::new(|_, _| Err(CliError::unavailable(UNAVAILABLE_MESSAGE))),
+            daemon_ensurer: Box::new(|_, _| Ok(false)),
             auth_login: Box::new(|_, _, _| Err(CliError::unavailable(UNAVAILABLE_MESSAGE))),
             stdin_is_terminal: Box::new(|| false),
         }
@@ -134,9 +139,17 @@ impl CliDependencies {
 
     pub fn with_tui_launcher(
         mut self,
-        launcher: impl Fn(&Bootstrap, Option<i64>, TuiMode) -> Result<String, CliError> + 'static,
+        launcher: impl Fn(&Bootstrap, TuiLaunch) -> Result<String, CliError> + 'static,
     ) -> Self {
         self.tui_launcher = Box::new(launcher);
+        self
+    }
+
+    pub fn with_daemon_ensurer(
+        mut self,
+        ensurer: impl Fn(&Bootstrap) -> Result<bool, CliError> + 'static,
+    ) -> Self {
+        self.daemon_ensurer = Box::new(move |bootstrap, _| ensurer(bootstrap));
         self
     }
 

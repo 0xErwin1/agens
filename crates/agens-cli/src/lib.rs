@@ -177,7 +177,13 @@ fn execute_command(
     if let Some(identifier) = cli::resume_shorthand(arguments) {
         // The shorthand carries no flags of its own, so it runs the way an
         // invocation with neither `--local` nor `--attach` does.
-        return run_tui(dependencies, Some(identifier), tui::TuiMode::default());
+        return run_tui(
+            dependencies,
+            Some(identifier),
+            tui::TuiMode::default(),
+            None,
+            None,
+        );
     }
 
     if let Some(error) = cli::root_shape_conflict(arguments) {

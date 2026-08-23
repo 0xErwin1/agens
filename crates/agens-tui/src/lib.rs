@@ -7258,9 +7258,14 @@ where
         }
     }
 
-    fn restore_resume_draft(&mut self, draft: String) {
-        self.input = draft;
+    pub fn set_composer_draft(&mut self, draft: impl Into<String>) {
+        self.input = draft.into();
         self.input_cursor = self.input.chars().count();
+        self.recovered_failed_prompt = false;
+    }
+
+    fn restore_resume_draft(&mut self, draft: String) {
+        self.set_composer_draft(draft);
         self.recovered_failed_prompt = true;
         let scroll_offset = self.following_scroll_bottom();
         let record = self.active_record_mut();
@@ -13492,6 +13497,16 @@ mod runtime_tests {
 
     impl Engine for NoopEngine {
         fn cancel(&mut self) {}
+    }
+
+    #[test]
+    fn a_supplied_composer_draft_is_ready_for_an_ordinary_submit() {
+        let mut tui = Tui::new(NoopEngine);
+
+        tui.set_composer_draft("coordinate this");
+
+        assert_eq!(tui.input(), "coordinate this");
+        assert!(!tui.view().recovered_failed_prompt);
     }
 
     struct FailingRenderer {

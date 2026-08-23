@@ -232,6 +232,15 @@ pub fn run_attached_tui(
     socket: &Path,
     resume: Option<i64>,
 ) -> Result<String, CliError> {
+    run_attached_tui_with_prompt(bootstrap, socket, resume, None)
+}
+
+pub fn run_attached_tui_with_prompt(
+    bootstrap: &Bootstrap,
+    socket: &Path,
+    resume: Option<i64>,
+    initial_prompt: Option<&str>,
+) -> Result<String, CliError> {
     let checkout = bootstrap
         .project_root
         .clone()
@@ -244,6 +253,12 @@ pub fn run_attached_tui(
     tui.adopt_environment();
     tui.set_collapse_thinking(bootstrap.collapse_thinking);
     tui.add_info(arrival.describe());
+    tui.add_info(
+        "attached mode does not support slash commands, the skill palette, file selection, or delegation yet",
+    );
+    if let Some(prompt) = initial_prompt {
+        tui.set_composer_draft(prompt);
+    }
 
     // Drawn through the surface's own projection, so a conversation the daemon
     // held reads exactly as one this process held. A hosted chat delegates

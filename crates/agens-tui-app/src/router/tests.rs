@@ -743,6 +743,32 @@ fn test_chatgpt_credentials(
 }
 
 #[test]
+fn team_switches_out_of_local_mode_and_praetor_is_not_an_agent_rotation() {
+    let temporary = tui_session_directory("team-transition");
+    let bootstrap = tui_session_bootstrap(&temporary, &[]);
+    let requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let router = TuiRuntimeRouter::new(
+        bootstrap,
+        Arc::new(Mutex::new(SessionContext::fresh())),
+        Arc::new(Mutex::new(None)),
+        Arc::new(CommandCatalog::default()),
+        Arc::new(SkillCatalog::default()),
+    )
+    .with_team_transition(Arc::clone(&requested));
+
+    assert_eq!(
+        router.resolve("/team".to_owned()).unwrap(),
+        TuiSubmissionOutcome::Quit
+    );
+    assert!(requested.load(std::sync::atomic::Ordering::SeqCst));
+
+    let error = router.resolve("/agent praetor".to_owned()).unwrap_err();
+    assert!(error.to_string().contains("use /team"), "{error}");
+
+    std::fs::remove_dir_all(temporary).unwrap();
+}
+
+#[test]
 fn tui_enter_routes_unknown_slash_and_local_output_without_provider_history() {
     let temporary = tui_session_directory("enter-local-routing");
     let bootstrap = tui_session_bootstrap(&temporary, &[]);

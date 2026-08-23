@@ -19,12 +19,21 @@ use agens_server::{CoordinatorSettings, PolicySettings, ServerError, TimerSettin
 
 mod lifecycle;
 
+pub(crate) use lifecycle::DaemonStartupRequest;
+
 use crate::CliDependencies;
 use crate::chat_session::{hosted_chat, hosted_chat_history};
 use crate::cli::ServeAction;
 use crate::deps::bootstrap;
 use crate::worker::run_worker;
 use agens_error::CliError;
+
+pub(crate) fn ensure_daemon_running(
+    bootstrap: &Bootstrap,
+    request: DaemonStartupRequest,
+) -> Result<bool, CliError> {
+    lifecycle::ensure_running(bootstrap, request)
+}
 
 pub(crate) fn run_serve(
     foreground: bool,

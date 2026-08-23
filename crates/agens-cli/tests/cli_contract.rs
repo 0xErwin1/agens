@@ -169,7 +169,7 @@ fn table_a_root_shapes_hold() {
         {
             let temporary = TemporaryDirectory::new("root-empty");
             let dependencies = base_dependencies(&temporary)
-                .with_tui_launcher(|_, resume, _| Ok(format!("resume={resume:?}")));
+                .with_tui_launcher(|_, launch| Ok(format!("resume={:?}", launch.resume())));
             Case {
                 name: "[] resumes with no session",
                 argv: argv(&[]),
@@ -181,7 +181,7 @@ fn table_a_root_shapes_hold() {
         {
             let temporary = TemporaryDirectory::new("root-resume-flag-alone");
             let dependencies = base_dependencies(&temporary)
-                .with_tui_launcher(|_, resume, _| Ok(format!("resume={resume:?}")));
+                .with_tui_launcher(|_, launch| Ok(format!("resume={:?}", launch.resume())));
             Case {
                 name: "--resume alone resumes with no session",
                 argv: argv(&["--resume"]),
@@ -193,7 +193,7 @@ fn table_a_root_shapes_hold() {
         {
             let temporary = TemporaryDirectory::new("root-resume-flag-with-id");
             let dependencies = base_dependencies(&temporary)
-                .with_tui_launcher(|_, resume, _| Ok(format!("resume={resume:?}")));
+                .with_tui_launcher(|_, launch| Ok(format!("resume={:?}", launch.resume())));
             Case {
                 name: "--resume 42 resumes session 42",
                 argv: argv(&["--resume", "42"]),
@@ -205,7 +205,7 @@ fn table_a_root_shapes_hold() {
         {
             let temporary = TemporaryDirectory::new("root-bare-integer");
             let dependencies = base_dependencies(&temporary)
-                .with_tui_launcher(|_, resume, _| Ok(format!("resume={resume:?}")));
+                .with_tui_launcher(|_, launch| Ok(format!("resume={:?}", launch.resume())));
             Case {
                 name: "a bare integer resumes that session",
                 argv: argv(&["42"]),
@@ -219,7 +219,7 @@ fn table_a_root_shapes_hold() {
             // integer resumes a (nonsensical) negative session id today.
             let temporary = TemporaryDirectory::new("root-negative-integer");
             let dependencies = base_dependencies(&temporary)
-                .with_tui_launcher(|_, resume, _| Ok(format!("resume={resume:?}")));
+                .with_tui_launcher(|_, launch| Ok(format!("resume={:?}", launch.resume())));
             Case {
                 name: "a bare negative integer resumes session -5 today (R1)",
                 argv: argv(&["-5"]),
@@ -231,7 +231,7 @@ fn table_a_root_shapes_hold() {
         {
             let temporary = TemporaryDirectory::new("root-default-mode");
             let dependencies = base_dependencies(&temporary)
-                .with_tui_launcher(|_, _, mode| Ok(format!("mode={mode:?}")));
+                .with_tui_launcher(|_, launch| Ok(format!("mode={:?}", launch.mode())));
             Case {
                 name: "neither flag runs the turn in this process today",
                 argv: argv(&[]),
@@ -243,7 +243,7 @@ fn table_a_root_shapes_hold() {
         {
             let temporary = TemporaryDirectory::new("root-local");
             let dependencies = base_dependencies(&temporary)
-                .with_tui_launcher(|_, _, mode| Ok(format!("mode={mode:?}")));
+                .with_tui_launcher(|_, launch| Ok(format!("mode={:?}", launch.mode())));
             Case {
                 name: "--local runs the turn in this process",
                 argv: argv(&["--local"]),
@@ -255,7 +255,7 @@ fn table_a_root_shapes_hold() {
         {
             let temporary = TemporaryDirectory::new("root-attach");
             let dependencies = base_dependencies(&temporary)
-                .with_tui_launcher(|_, _, mode| Ok(format!("mode={mode:?}")));
+                .with_tui_launcher(|_, launch| Ok(format!("mode={:?}", launch.mode())));
             Case {
                 name: "--attach runs the turn in the daemon",
                 argv: argv(&["--attach"]),
@@ -303,6 +303,98 @@ fn table_a_root_shapes_hold() {
     ];
 
     run_table_a(cases);
+}
+
+#[test]
+fn team_and_attach_are_first_class_attached_entry_points() {
+    let temporary = TemporaryDirectory::new("team-and-attach-entry-points");
+    let starts = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+    let observed_starts = std::sync::Arc::clone(&starts);
+    let dependencies = base_dependencies(&temporary)
+        .with_daemon_ensurer(move |_| {
+            *observed_starts.lock().expect("start count lock") += 1;
+            Ok(false)
+        })
+        .with_tui_launcher(|_, launch| {
+            Ok(format!(
+                "mode={:?};resume={:?};prompt={:?};notice={:?}",
+                launch.mode(),
+                launch.resume(),
+                launch.initial_prompt(),
+                launch.startup_notice()
+            ))
+        });
+
+    let attach = execute(["attach", "17"], &dependencies);
+    let team = execute(["team", "coordinate", "this"], &dependencies);
+    let attach_help = execute(["attach", "--help"], &dependencies);
+    let team_help = execute(["team", "--help"], &dependencies);
+
+    assert_eq!(
+        attach,
+        success("mode=Attached;resume=Some(17);prompt=None;notice=None\n")
+    );
+    assert_eq!(
+        team,
+        success("mode=Attached;resume=None;prompt=Some(\"coordinate this\");notice=None\n")
+    );
+    assert_eq!(
+        attach_help,
+        success(
+            "attach the terminal to a chat in the machine daemon\n\nUsage: agens attach [TARGET]\n\nArguments:\n  [TARGET]  The hosted session to resume. Without one, attach to this checkout's latest chat\n\nOptions:\n  -h, --help  Print help\n"
+        )
+    );
+    assert_eq!(
+        team_help,
+        success(
+            "enter team mode through the machine daemon\n\nUsage: agens team [PROMPT]...\n\nArguments:\n  [PROMPT]...  An optional first prompt for the attached chat\n\nOptions:\n  -h, --help  Print help\n"
+        )
+    );
+    assert_eq!(*starts.lock().expect("start count lock"), 1);
+}
+
+#[test]
+fn default_tui_reports_start_and_reuses_an_existing_daemon() {
+    for (started, expected_notice) in [
+        (
+            true,
+            "Some(\"started the machine daemon; this chat remains local until you use /team\")",
+        ),
+        (false, "None"),
+    ] {
+        let temporary = TemporaryDirectory::new("default-tui-daemon-state");
+        let dependencies = base_dependencies(&temporary)
+            .with_daemon_ensurer(move |_| Ok(started))
+            .with_tui_launcher(|_, launch| {
+                Ok(format!(
+                    "mode={:?};notice={:?}",
+                    launch.mode(),
+                    launch.startup_notice()
+                ))
+            });
+
+        assert_eq!(
+            execute(std::iter::empty::<&str>(), &dependencies),
+            success(format!("mode=Local;notice={expected_notice}\n"))
+        );
+    }
+}
+
+#[test]
+fn test_dependencies_do_not_autostart_for_the_default_tui() {
+    let temporary = TemporaryDirectory::new("default-tui-no-autostart");
+    let dependencies = base_dependencies(&temporary).with_tui_launcher(|_, launch| {
+        Ok(format!(
+            "mode={:?};notice={:?}",
+            launch.mode(),
+            launch.startup_notice()
+        ))
+    });
+
+    assert_eq!(
+        execute(std::iter::empty::<&str>(), &dependencies),
+        success("mode=Local;notice=None\n")
+    );
 }
 
 #[test]
@@ -1025,7 +1117,7 @@ fn table_a_models_and_sessions_hold() {
 mod parser_surface_baseline {
     pub(crate) const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-    pub(crate) const ROOT_HELP: &str = "Agens is a coding agent CLI\n\nUsage: agens [OPTIONS] [COMMAND]\n\nCommands:\n  config    inspect configuration\n  auth      inspect supported authentication\n  chat      run a headless agent turn\n  models    list provider models\n  serve     run the headless daemon for this machine\n  sessions  inspect completed turns\n  direct    queue a message for a running session, delivered at its next safe point\n\nOptions:\n      --resume [<SESSION_ID>]  Resume the most recent session, or the given session id\n      --local                  Run the turn in this process\n      --attach                 Run the turn in the machine's daemon\n  -h, --help                   Print help\n  -V, --version                Print version\n";
+    pub(crate) const ROOT_HELP: &str = "Agens is a coding agent CLI\n\nUsage: agens [OPTIONS] [COMMAND]\n\nCommands:\n  config    inspect configuration\n  auth      inspect supported authentication\n  chat      run a headless agent turn\n  models    list provider models\n  attach    attach the terminal to a chat in the machine daemon\n  team      enter team mode through the machine daemon\n  serve     run the headless daemon for this machine\n  sessions  inspect completed turns\n  direct    queue a message for a running session, delivered at its next safe point\n\nOptions:\n      --resume [<SESSION_ID>]  Resume the most recent session, or the given session id\n      --local                  Run the turn in this process\n      --attach                 Run the turn in the machine's daemon\n  -h, --help                   Print help\n  -V, --version                Print version\n";
 
     pub(crate) fn version_line() -> String {
         format!("agens {VERSION}\n")

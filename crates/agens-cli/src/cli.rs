@@ -74,6 +74,17 @@ pub(crate) enum Command {
     Chat(ChatArgs),
     #[command(about = "list provider models")]
     Models,
+    #[command(about = "attach the terminal to a chat in the machine daemon")]
+    Attach {
+        /// The hosted session to resume. Without one, attach to this checkout's latest chat.
+        target: Option<i64>,
+    },
+    #[command(about = "enter team mode through the machine daemon")]
+    Team {
+        /// An optional first prompt for the attached chat.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        prompt: Vec<String>,
+    },
     #[command(about = "run the headless daemon for this machine")]
     Serve {
         /// Stay attached to the terminal instead of detaching. This is the

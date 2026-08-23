@@ -93,6 +93,16 @@ impl TuiRuntimeRouter {
             "/stash" => self.open_dialog("stash")?,
             command if command.starts_with("/attach") => self.attach_media(command)?,
             "/quit" => TuiSubmissionOutcome::Quit,
+            "/team" => {
+                self.team_transition
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                TuiSubmissionOutcome::Quit
+            }
+            "/agent praetor" => {
+                return Err(CliError::usage(
+                    "praetor is team mode, not an agent profile; use /team",
+                ));
+            }
             "/sessions" | "/resume" => self.open_dialog("sessions")?,
             "/connect" => self.open_dialog("connect")?,
             "/disconnect" => self.open_dialog("disconnect")?,
