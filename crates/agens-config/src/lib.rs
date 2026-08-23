@@ -374,7 +374,33 @@ pub enum SettingKind {
     TextList {
         max_items: usize,
         max_chars: usize,
+        entry: TextListEntry,
     },
+}
+
+/// What every entry of a text list has to look like, beyond fitting its length.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextListEntry {
+    /// Any text within the bound.
+    Any,
+    /// A path that resolves to the same place wherever it is read from:
+    /// absolute, or written against the home directory as `~` or `~/…`.
+    ///
+    /// A relative entry is rejected rather than resolved. The process reading
+    /// it is a daemon whose working directory nobody chose, so the checkout it
+    /// would name is not the one the operator wrote down.
+    RootedPath,
+}
+
+impl TextListEntry {
+    fn accepts(self, entry: &str) -> bool {
+        match self {
+            Self::Any => true,
+            Self::RootedPath => {
+                Path::new(entry).is_absolute() || entry == "~" || entry.starts_with("~/")
+            }
+        }
+    }
 }
 
 impl SettingKind {
@@ -391,12 +417,13 @@ impl SettingKind {
             Self::TextList {
                 max_items,
                 max_chars,
+                entry: shape,
             } => value.as_array().is_some_and(|values| {
                 values.len() <= max_items
                     && values.iter().all(|entry| {
-                        entry
-                            .as_str()
-                            .is_some_and(|text| text.chars().count() <= max_chars)
+                        entry.as_str().is_some_and(|text| {
+                            text.chars().count() <= max_chars && shape.accepts(text)
+                        })
                     })
             }),
         }
@@ -689,15 +716,17 @@ pub const SETTINGS: &[SettingSpec] = &[
         kind: SettingKind::TextList {
             max_items: 256,
             max_chars: 4_096,
+            entry: TextListEntry::RootedPath,
         },
         default: SettingValue::Absent,
-        doc: "Checkouts, or directories holding them, the daemon accepts runs against. Empty serves nothing.",
+        doc: "Checkouts, or directories holding them, the daemon accepts runs against, written absolute or against `~`. Empty serves nothing.",
     },
     SettingSpec {
         path: "team.hook_exports",
         kind: SettingKind::TextList {
             max_items: 256,
             max_chars: 256,
+            entry: TextListEntry::Any,
         },
         default: SettingValue::Absent,
         doc: "Environment names a repository's provisioning hook may export into the hooks after it.",
@@ -950,9 +979,9 @@ pub struct TeamSettings {
     pub checkpoint_grace_percent: i64,
     pub first_checkpoint_seconds: i64,
     pub quota_window_seconds: i64,
-    /// The checkouts this daemon serves. Written by hand: a root is the
-    /// operator's statement about which repositories exist, and nothing the
-    /// daemon runs may add to it.
+    /// The checkouts this daemon serves, with a leading `~` already resolved.
+    /// Written by hand: a root is the operator's statement about which
+    /// repositories exist, and nothing the daemon runs may add to it.
     pub project_roots: Vec<PathBuf>,
     /// The environment names a provisioning hook may export.
     pub hook_exports: Vec<String>,
@@ -974,13 +1003,41 @@ impl From<&ResolvedSettings> for TeamSettings {
                 .text_list("team.project_roots")
                 .unwrap_or_default()
                 .iter()
-                .map(PathBuf::from)
+                .map(|root| expand_home_prefix(root, std::env::home_dir().as_deref()))
                 .collect(),
             hook_exports: resolved
                 .text_list("team.hook_exports")
                 .unwrap_or_default()
                 .to_vec(),
         }
+    }
+}
+
+/// Resolves a leading `~` against `home`, so a root written the way an operator
+/// writes a path is the path the daemon compares a checkout against.
+///
+/// A `~` the catalog accepted and this cannot resolve is left as written, which
+/// matches nothing rather than matching the wrong checkout. Only `~` and `~/…`
+/// expand: `~someone` names another user's home, which this cannot look up and
+/// must not guess at.
+#[must_use]
+pub fn expand_home_prefix(entry: &str, home: Option<&Path>) -> PathBuf {
+    let rest = if entry == "~" {
+        ""
+    } else if let Some(rest) = entry.strip_prefix("~/") {
+        rest
+    } else {
+        return PathBuf::from(entry);
+    };
+
+    let Some(home) = home else {
+        return PathBuf::from(entry);
+    };
+
+    if rest.is_empty() {
+        home.to_path_buf()
+    } else {
+        home.join(rest)
     }
 }
 

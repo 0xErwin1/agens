@@ -1,8 +1,11 @@
 use agens_config::{
     DEFAULT_MCP_CONNECT_TIMEOUT_MS, McpDefaultSettings, SETTINGS, SettingKind, SettingSpec,
-    SettingValue, mcp_servers, mcp_servers_with_defaults,
+    SettingValue, TextListEntry, mcp_servers, mcp_servers_with_defaults,
 };
-use agens_config::{TeamSettings, parse_toml_document, resolve_settings, validate_toml_document};
+use agens_config::{
+    TeamSettings, expand_home_prefix, parse_toml_document, resolve_settings,
+    validate_toml_document,
+};
 
 fn document_for(path: &str, literal: &str) -> toml::Table {
     let (table, key) = path
@@ -22,7 +25,10 @@ fn sample_literal(spec: &SettingSpec) -> String {
         SettingKind::Integer { minimum, .. } => minimum.to_string(),
         SettingKind::Text { .. } => "\"sample\"".to_owned(),
         SettingKind::Choice(choices) => format!("\"{}\"", choices[0]),
-        SettingKind::TextList { .. } => "[\"sample\"]".to_owned(),
+        SettingKind::TextList { entry, .. } => match entry {
+            TextListEntry::Any => "[\"sample\"]".to_owned(),
+            TextListEntry::RootedPath => "[\"/sample\"]".to_owned(),
+        },
     }
 }
 
@@ -239,13 +245,21 @@ fn rejects_a_list_setting_beyond_its_documented_bounds() {
         let SettingKind::TextList {
             max_items,
             max_chars,
+            entry,
         } = spec.kind
         else {
             continue;
         };
 
+        // An entry has to satisfy the list's own shape, or the bound under test
+        // is not the reason the document is refused.
+        let prefix = match entry {
+            TextListEntry::Any => "",
+            TextListEntry::RootedPath => "/",
+        };
+
         let too_many = (0..=max_items)
-            .map(|index| format!("\"{index}\""))
+            .map(|index| format!("\"{prefix}{index}\""))
             .collect::<Vec<_>>()
             .join(", ");
         assert!(
@@ -255,7 +269,10 @@ fn rejects_a_list_setting_beyond_its_documented_bounds() {
             max_items + 1
         );
 
-        let overlong = format!("[\"{}\"]", "a".repeat(max_chars + 1));
+        let overlong = format!(
+            "[\"{prefix}{}\"]",
+            "a".repeat(max_chars + 1 - prefix.chars().count())
+        );
         assert!(
             !accepts(spec.path, &overlong),
             "{} must reject an entry of {} characters",
@@ -281,4 +298,62 @@ fn reads_project_roots_and_hook_exports_as_the_lists_the_daemon_serves() {
         vec![std::path::PathBuf::from("/srv/checkouts")]
     );
     assert_eq!(team.hook_exports, vec!["PATH".to_owned()]);
+}
+
+/// A root written against the home directory is the spelling an operator
+/// reaches for, and the daemon resolves a checkout by canonicalizing the root.
+/// A literal `~/dev` canonicalizes to nothing, so it silently serves no
+/// repository at all.
+#[test]
+fn resolves_a_project_root_written_against_the_home_directory() {
+    let home = std::path::Path::new("/home/dev");
+
+    assert_eq!(
+        expand_home_prefix("~/dev/checkouts", Some(home)),
+        std::path::PathBuf::from("/home/dev/dev/checkouts")
+    );
+    assert_eq!(
+        expand_home_prefix("~", Some(home)),
+        std::path::PathBuf::from("/home/dev")
+    );
+
+    // Another user's home cannot be looked up, and an unknown home cannot be
+    // guessed at. Both stay as written and match nothing.
+    assert_eq!(
+        expand_home_prefix("~someone/dev", Some(home)),
+        std::path::PathBuf::from("~someone/dev")
+    );
+    assert_eq!(
+        expand_home_prefix("~/dev", None),
+        std::path::PathBuf::from("~/dev")
+    );
+
+    assert_eq!(
+        expand_home_prefix("/srv/checkouts", Some(home)),
+        std::path::PathBuf::from("/srv/checkouts")
+    );
+}
+
+/// A relative root names a different checkout for every working directory the
+/// daemon might have been started from, so it is refused by name rather than
+/// resolved into whichever one that happens to be.
+#[test]
+fn rejects_a_project_root_that_is_neither_absolute_nor_written_against_the_home_directory() {
+    for root in ["dev/checkouts", "./checkouts", "../checkouts", ""] {
+        let document =
+            parse_toml_document(&format!("[team]\nproject_roots = [\"{root}\"]\n")).unwrap();
+        let error = validate_toml_document(&document)
+            .expect_err("a relative project root must not validate");
+
+        assert!(
+            error.to_string().contains("team.project_roots"),
+            "the rejection has to name the key holding {root}: {error}"
+        );
+    }
+
+    for root in ["/srv/checkouts", "~/dev", "~"] {
+        let document =
+            parse_toml_document(&format!("[team]\nproject_roots = [\"{root}\"]\n")).unwrap();
+        validate_toml_document(&document).unwrap_or_else(|error| panic!("{root}: {error}"));
+    }
 }
