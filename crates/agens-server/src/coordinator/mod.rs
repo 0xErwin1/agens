@@ -57,6 +57,7 @@ use agens_store::{
 use agens_tools::SessionWorktrees;
 
 use crate::api::{ApiCore, Ports};
+use crate::cache::RunCache;
 use crate::fsm::StateMachines;
 use crate::gates::{
     Gates, MergePath, PreMergeRequest, ReclaimRequest, SUB_AGENT_EVENT, SubAgentKind,
@@ -780,9 +781,10 @@ fn publisher_loop(
     Ok(std::thread::spawn(move || {
         // One run's repository, cached: a filter is scoped by repository, the
         // entries of one run arrive in bursts, and the run a journal entry
-        // belongs to never changes repository.
-        let mut repositories: std::collections::HashMap<i64, Option<String>> =
-            std::collections::HashMap::new();
+        // belongs to never changes repository. Bounded, because nothing tells
+        // this loop that a run ended and every entry is one more run it would
+        // otherwise remember for the life of the daemon.
+        let mut repositories: RunCache<Option<String>> = RunCache::with_capacity(PUBLISH_MEMO);
 
         while !stopping.load(Ordering::Acquire) {
             std::thread::sleep(heartbeat);
@@ -818,16 +820,22 @@ fn publisher_loop(
 /// publisher inside one query while it grows.
 const PUBLISH_BATCH: usize = 256;
 
+/// How many runs the publisher remembers a repository for. Comfortably more
+/// than the runs one burst of journal entries spans, and a miss costs a single
+/// row read.
+const PUBLISH_MEMO: usize = 1024;
+
 fn repository_of<'a>(
     store: &ControlPlaneStore,
-    known: &'a mut std::collections::HashMap<i64, Option<String>>,
+    known: &'a mut RunCache<Option<String>>,
     event: &EventRow,
 ) -> Option<&'a str> {
     let run_id = event.run_id?;
 
     known
-        .entry(run_id)
-        .or_insert_with(|| store.load_run(run_id).ok().flatten().map(|run| run.repo_id))
+        .get_or_insert_with(run_id, || {
+            store.load_run(run_id).ok().flatten().map(|run| run.repo_id)
+        })
         .as_deref()
 }
 

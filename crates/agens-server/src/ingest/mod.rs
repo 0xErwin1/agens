@@ -31,15 +31,14 @@ mod checkpoint;
 mod detectors;
 mod health;
 
-use std::{
-    collections::HashMap,
-    sync::mpsc::{Receiver, Sender, TryRecvError, channel as mpsc_channel},
-};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel as mpsc_channel};
 
 use agens_core::ToolResultFacts;
 use agens_store::{
     ControlPlaneError, ControlPlaneStore, EventClass, EventRow, IngestWrite, RunHealthRow,
 };
+
+use crate::cache::RunCache;
 
 pub use checkpoint::{CheckpointClaim, ReportedCheckpoint};
 pub(crate) use detectors::detect_worker_lost;
@@ -216,8 +215,17 @@ pub struct Ingest {
     thresholds: HealthThresholds,
     /// Per-run derived state, rebuilt from the journal for any run this process
     /// has not seen — which after a restart is every one of them.
-    states: HashMap<i64, HealthState>,
+    ///
+    /// Bounded, because nothing tells ingest that a run ended: every run that
+    /// ever reported a fact would otherwise keep its fold here for the life of
+    /// the daemon. What an eviction costs is one replay of that run's journal,
+    /// and the run it evicts is the one nothing has reported about in longest.
+    states: RunCache<HealthState>,
 }
+
+/// How many runs ingest keeps a fold for. Well past the runs that can be
+/// executing at once, so a busy daemon replays nothing in steady state.
+const STATE_MEMO: usize = 256;
 
 impl Ingest {
     #[must_use]
@@ -230,7 +238,7 @@ impl Ingest {
         Self {
             store,
             thresholds,
-            states: HashMap::new(),
+            states: RunCache::with_capacity(STATE_MEMO),
         }
     }
 
@@ -325,8 +333,8 @@ impl Ingest {
         Ok(self.replay(run_id)?.snapshot(run_id, now))
     }
 
-    fn state_for(&self, run_id: i64) -> Result<HealthState, IngestRejection> {
-        match self.states.get(&run_id) {
+    fn state_for(&mut self, run_id: i64) -> Result<HealthState, IngestRejection> {
+        match self.states.get(run_id) {
             Some(state) => Ok(state.clone()),
             None => self.replay(run_id),
         }

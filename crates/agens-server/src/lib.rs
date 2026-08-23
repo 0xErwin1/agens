@@ -7,6 +7,7 @@
 
 mod api;
 mod blocking;
+mod cache;
 mod coordinator;
 mod fsm;
 mod gates;
