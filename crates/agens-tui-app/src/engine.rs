@@ -146,6 +146,22 @@ pub fn run_production_tui_with_profile_store(
     resume: Option<i64>,
     profile_store: Option<Arc<dyn crate::profiles::AgentProfileStore>>,
 ) -> Result<String, CliError> {
+    run_production_tui_with_options(
+        bootstrap,
+        resume,
+        profile_store,
+        None,
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+}
+
+pub fn run_production_tui_with_options(
+    bootstrap: &Bootstrap,
+    resume: Option<i64>,
+    profile_store: Option<Arc<dyn crate::profiles::AgentProfileStore>>,
+    startup_notice: Option<&str>,
+    team_requested: Arc<std::sync::atomic::AtomicBool>,
+) -> Result<String, CliError> {
     let cancellation = Arc::new(Mutex::new(None));
     let session = Arc::new(Mutex::new(SessionContext::fresh()));
     let task_controls = TuiTaskControls(TaskExecutionRegistry::with_limits(task_execution_limits(
@@ -156,6 +172,9 @@ pub fn run_production_tui_with_profile_store(
     };
     let mut tui = Tui::new(engine);
     tui.adopt_environment();
+    if let Some(notice) = startup_notice {
+        tui.add_info(notice);
+    }
     install_prompt_memory_from_store(&mut tui, bootstrap.data_directory());
     configure_tui_project_identity(&mut tui, &session, bootstrap);
     tui.set_collapse_thinking(bootstrap.collapse_thinking);
@@ -224,7 +243,8 @@ pub fn run_production_tui_with_profile_store(
         Arc::clone(&cancellation),
         commands,
         Arc::clone(&skills),
-    );
+    )
+    .with_team_transition(team_requested);
     let router = profile_store.map_or(router.clone(), |store| router.with_profile_store(store));
     tui.set_palette_entries(router.palette_entries()?);
     let picker_candidates = router

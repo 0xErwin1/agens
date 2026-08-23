@@ -25,14 +25,39 @@ pub(crate) fn dispatch(
     dependencies: &CliDependencies,
     cancellation: &HeadlessTurnCancellation,
 ) -> Result<String, CliError> {
+    let tui_mode = parsed.tui_mode();
     match parsed.command {
-        None => run_tui(dependencies, parsed.resume.flatten(), parsed.tui_mode()),
+        None => {
+            let daemon_startup = (parsed.resume.is_none() && !parsed.local && !parsed.attach)
+                .then_some(serve::DaemonStartupRequest::PassiveLocal);
+            run_tui(
+                dependencies,
+                parsed.resume.flatten(),
+                tui_mode,
+                None,
+                daemon_startup,
+            )
+        }
         Some(cli::Command::Config { action }) => run_config(action, dependencies),
         Some(cli::Command::Auth { action }) => run_auth(action, dependencies, cancellation),
         Some(cli::Command::Chat(chat_arguments)) => {
             run_chat(chat_arguments, dependencies, cancellation)
         }
         Some(cli::Command::Models) => run_models(),
+        Some(cli::Command::Attach { target }) => run_tui(
+            dependencies,
+            target,
+            crate::tui::TuiMode::Attached,
+            None,
+            None,
+        ),
+        Some(cli::Command::Team { prompt }) => run_tui(
+            dependencies,
+            None,
+            crate::tui::TuiMode::Attached,
+            (!prompt.is_empty()).then(|| prompt.join(" ")),
+            Some(serve::DaemonStartupRequest::ExplicitAttached),
+        ),
         Some(cli::Command::Serve { foreground, action }) => {
             run_serve(foreground, action, dependencies, cancellation)
         }

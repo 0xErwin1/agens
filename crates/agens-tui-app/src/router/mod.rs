@@ -84,6 +84,7 @@ pub struct TuiRuntimeRouter {
     profile_editor: Arc<Mutex<Option<ProfileEditor>>>,
     profile_focus: Arc<Mutex<Option<String>>>,
     profile_store: Option<Arc<dyn AgentProfileStore>>,
+    team_transition: Arc<std::sync::atomic::AtomicBool>,
 }
 
 struct RouterExtensions {
@@ -169,11 +170,17 @@ impl TuiRuntimeRouter {
             profile_editor: Arc::new(Mutex::new(None)),
             profile_focus: Arc::new(Mutex::new(None)),
             profile_store: None,
+            team_transition: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
     pub fn with_profile_store(mut self, store: Arc<dyn AgentProfileStore>) -> Self {
         self.profile_store = Some(store);
+        self
+    }
+
+    pub fn with_team_transition(mut self, requested: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        self.team_transition = requested;
         self
     }
 

@@ -181,6 +181,81 @@ fn a_bare_serve_returns_the_terminal_with_the_daemon_still_listening() {
 }
 
 #[test]
+fn default_chat_autostart_is_opt_in_under_an_isolated_config_home() {
+    let operator = Operator::prepare();
+
+    let _ = operator.run(&[]);
+
+    assert!(
+        !accepts(&operator.socket()),
+        "an isolated command does not leak a daemon unless the harness requests it"
+    );
+
+    let output = operator
+        .command()
+        .env("AGENS_DAEMON_AUTOSTART", "1")
+        .stdin(Stdio::null())
+        .output()
+        .expect("default chat runs");
+
+    assert!(
+        !output.status.success(),
+        "the non-terminal TUI still refuses"
+    );
+    assert!(
+        accepts(&operator.socket()),
+        "autostart waits for the socket"
+    );
+}
+
+#[test]
+fn explicit_team_starts_the_daemon_under_an_isolated_config_home() {
+    let operator = Operator::prepare();
+
+    let output = operator.run(&["team"]);
+
+    assert!(
+        !output.status.success(),
+        "the non-terminal TUI still refuses"
+    );
+    assert!(
+        accepts(&operator.socket()),
+        "an explicit attached transition waits for the daemon"
+    );
+}
+
+#[test]
+fn concurrent_explicit_team_starts_wait_for_one_ready_daemon() {
+    let operator = Operator::prepare();
+
+    let outputs = std::thread::scope(|scope| {
+        let first = scope.spawn(|| operator.run(&["team"]));
+        let second = scope.spawn(|| operator.run(&["team"]));
+        [first.join().unwrap(), second.join().unwrap()]
+    });
+
+    assert!(outputs.iter().all(|output| !output.status.success()));
+    assert!(accepts(&operator.socket()));
+    assert!(alive(operator.published_pid()));
+}
+
+#[test]
+fn default_chat_reuses_the_running_daemon() {
+    let operator = Operator::prepare();
+    assert_succeeded(&operator.run(&["serve"]), "serve");
+    let pid = operator.published_pid();
+
+    let _ = operator
+        .command()
+        .env("AGENS_DAEMON_AUTOSTART", "1")
+        .stdin(Stdio::null())
+        .output()
+        .expect("default chat runs");
+
+    assert_eq!(operator.published_pid(), pid);
+}
+
+#[test]
 fn a_second_serve_reports_the_running_daemon_and_does_not_start_another() {
     let operator = Operator::prepare();
     assert_succeeded(&operator.run(&["serve"]), "the first serve");

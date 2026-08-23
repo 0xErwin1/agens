@@ -39,6 +39,15 @@ const STOP_PATIENCE: Duration = Duration::from_secs(30);
 
 /// How often a wait looks again.
 const POLL: Duration = Duration::from_millis(25);
+const ISOLATED_CONFIG_HOME_ENV: &str = "AGENS_CONFIG_HOME";
+const TEST_AUTOSTART_ENV: &str = "AGENS_DAEMON_AUTOSTART";
+const TEST_AUTOSTART_ENABLED: &str = "1";
+
+#[derive(Clone, Copy)]
+pub(crate) enum DaemonStartupRequest {
+    PassiveLocal,
+    ExplicitAttached,
+}
 
 /// The states a run is in while the daemon is carrying it.
 ///
@@ -50,6 +59,32 @@ const ACTIVE_STATES: [RunState; 4] = [
     RunState::AwaitingInput,
     RunState::AwaitingQuota,
 ];
+
+/// Starts the daemon only when this machine has none, and reports whether it started one.
+pub(crate) fn ensure_running(
+    bootstrap: &Bootstrap,
+    request: DaemonStartupRequest,
+) -> Result<bool, CliError> {
+    if matches!(request, DaemonStartupRequest::PassiveLocal)
+        && std::env::var_os(ISOLATED_CONFIG_HOME_ENV).is_some()
+        && !std::env::var(TEST_AUTOSTART_ENV).is_ok_and(|value| value == TEST_AUTOSTART_ENABLED)
+    {
+        return Ok(false);
+    }
+
+    let data_directory = bootstrap.data_directory();
+    if running_pid(&agens_server::pid_path(data_directory)).is_some() {
+        return Ok(false);
+    }
+
+    if agens_server::slot_is_held(data_directory) {
+        await_serving(data_directory, None).map_err(CliError::unavailable)?;
+        return Ok(false);
+    }
+
+    start_detached(bootstrap)?;
+    Ok(true)
+}
 
 /// Starts the daemon detached and returns once it is serving.
 ///
@@ -73,7 +108,7 @@ pub(crate) fn start_detached(bootstrap: &Bootstrap) -> Result<String, CliError> 
     let log = open_log(&data_directory)?;
     let mut child = spawn_detached(&log)?;
 
-    match await_serving(&data_directory, &mut child) {
+    match await_serving(&data_directory, Some(&mut child)) {
         Ok(()) => Ok(format!("the daemon is listening on {}\n", socket.display())),
         Err(reason) => Err(CliError::unavailable(format!(
             "{reason}; its output is in {}",
@@ -287,7 +322,7 @@ fn spawn_detached(log: &File) -> Result<Child, CliError> {
 /// Both endings are watched, because only one of them ever arrives: a daemon
 /// that refused to start never publishes a pid, and a wait that only looked for
 /// one would spend its whole patience on a process that is already gone.
-fn await_serving(data_directory: &Path, child: &mut Child) -> Result<(), String> {
+fn await_serving(data_directory: &Path, mut child: Option<&mut Child>) -> Result<(), String> {
     let pid_path = agens_server::pid_path(data_directory);
     let deadline = Instant::now() + START_PATIENCE;
 
@@ -296,22 +331,20 @@ fn await_serving(data_directory: &Path, child: &mut Child) -> Result<(), String>
             return Ok(());
         }
 
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                // Asked once more before reporting the failure: two starts that
-                // raced both spawned a daemon, one of them lost the machine's
-                // slot, and what its caller wanted — a daemon it can use — is
-                // there anyway.
-                if running_pid(&pid_path).is_some() {
-                    return Ok(());
-                }
+        if let Some(child) = child.as_deref_mut() {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    if running_pid(&pid_path).is_some() {
+                        return Ok(());
+                    }
 
-                return Err(format!(
-                    "the daemon stopped before it started serving ({status})"
-                ));
+                    return Err(format!(
+                        "the daemon stopped before it started serving ({status})"
+                    ));
+                }
+                Ok(None) => {}
+                Err(error) => return Err(format!("the daemon could not be waited on: {error}")),
             }
-            Ok(None) => {}
-            Err(error) => return Err(format!("the daemon could not be waited on: {error}")),
         }
 
         if Instant::now() >= deadline {

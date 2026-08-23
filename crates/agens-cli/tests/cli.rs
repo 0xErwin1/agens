@@ -554,7 +554,7 @@ fn command_boundaries_invoke_injected_headless_and_tui_services_without_network(
         BTreeMap::new(),
     )
     .with_headless_chat(|request, _, _| Ok(format!("answer:{}", request.prompt)))
-    .with_tui_launcher(|_, resume, _| Ok(format!("tui-selected:{resume:?}")));
+    .with_tui_launcher(|_, launch| Ok(format!("tui-selected:{:?}", launch.resume())));
 
     let chat = execute(["chat", "hello"], &dependencies);
     let tui = execute(["--resume", "7"], &dependencies);
@@ -1294,8 +1294,8 @@ fn tui_resume_shapes_reach_the_injected_tui_launcher() {
         BTreeMap::new(),
     );
 
-    let dependencies = dependencies.with_tui_launcher(|_, resume, _| {
-        Ok(match resume {
+    let dependencies = dependencies.with_tui_launcher(|_, launch| {
+        Ok(match launch.resume() {
             Some(identifier) => format!("resume:{identifier}"),
             None => "new-session".to_owned(),
         })

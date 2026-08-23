@@ -12,6 +12,7 @@
 use crate::CliDependencies;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::deps::bootstrap;
 use crate::profile_store::{
@@ -52,16 +53,43 @@ pub enum TuiMode {
     Attached,
 }
 
-pub(crate) fn run_production_tui(
-    bootstrap: &agens_bootstrap::Bootstrap,
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TuiLaunch {
     resume: Option<i64>,
     mode: TuiMode,
+    initial_prompt: Option<String>,
+    startup_notice: Option<String>,
+}
+
+impl TuiLaunch {
+    pub const fn mode(&self) -> TuiMode {
+        self.mode
+    }
+
+    pub const fn resume(&self) -> Option<i64> {
+        self.resume
+    }
+
+    pub fn initial_prompt(&self) -> Option<&str> {
+        self.initial_prompt.as_deref()
+    }
+
+    pub fn startup_notice(&self) -> Option<&str> {
+        self.startup_notice.as_deref()
+    }
+}
+
+pub(crate) fn run_production_tui(
+    bootstrap: &agens_bootstrap::Bootstrap,
+    launch: TuiLaunch,
 ) -> Result<String, CliError> {
-    if mode == TuiMode::Attached {
-        return agens_tui_app::attached::run_attached_tui(
+    let socket = agens_server::socket_path(bootstrap.data_directory());
+    if launch.mode == TuiMode::Attached {
+        return agens_tui_app::attached::run_attached_tui_with_prompt(
             bootstrap,
-            &agens_server::socket_path(bootstrap.data_directory()),
-            resume,
+            &socket,
+            launch.resume,
+            launch.initial_prompt.as_deref(),
         );
     }
 
@@ -73,19 +101,49 @@ pub(crate) fn run_production_tui(
         bootstrap.paths.global_config.clone(),
         project_root.join(".agens/config.toml"),
     ));
-    agens_tui_app::engine::run_production_tui_with_profile_store(
+    let team_requested = Arc::new(AtomicBool::new(false));
+    let output = agens_tui_app::engine::run_production_tui_with_options(
         bootstrap,
-        resume,
+        launch.resume,
         Some(Arc::new(store)),
-    )
+        launch.startup_notice.as_deref(),
+        Arc::clone(&team_requested),
+    )?;
+
+    if !team_requested.load(Ordering::SeqCst) {
+        return Ok(output);
+    }
+
+    crate::commands::serve::ensure_daemon_running(
+        bootstrap,
+        crate::commands::serve::DaemonStartupRequest::ExplicitAttached,
+    )?;
+    agens_tui_app::attached::run_attached_tui_with_prompt(bootstrap, &socket, None, None)
 }
 
 pub(crate) fn run_tui(
     dependencies: &CliDependencies,
     resume: Option<i64>,
     mode: TuiMode,
+    initial_prompt: Option<String>,
+    daemon_startup: Option<crate::commands::serve::DaemonStartupRequest>,
 ) -> Result<String, CliError> {
     let bootstrap = bootstrap(dependencies)?;
-    let output = (dependencies.tui_launcher)(&bootstrap, resume, mode)?;
+    let startup_notice = daemon_startup
+        .map(|request| (dependencies.daemon_ensurer)(&bootstrap, request))
+        .transpose()?
+        .unwrap_or(false)
+        .then(|| {
+            "started the machine daemon; this chat remains local until you use /team".to_owned()
+        });
+    let output = (dependencies.tui_launcher)(
+        &bootstrap,
+        TuiLaunch {
+            resume,
+            mode,
+            initial_prompt,
+            startup_notice,
+        },
+    )?;
     Ok(format!("{output}\n"))
 }
