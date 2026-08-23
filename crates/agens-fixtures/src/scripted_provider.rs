@@ -55,7 +55,14 @@ pub enum ScriptedTurn {
     /// The model answers with text and stops.
     Text { content: String },
     /// The endpoint fails with an HTTP status and body instead of streaming.
-    Error { status: u16, body: String },
+    Error {
+        status: u16,
+        body: String,
+        /// Response headers beyond the ones every scripted failure carries. A
+        /// `429` says when it will serve again through them, and what the
+        /// client does about a refusal depends on that answer.
+        headers: Vec<(String, String)>,
+    },
     /// The endpoint sends stream headers and then nothing at all for
     /// `duration`, so the client's read timeout is what ends the turn.
     Stall { duration: Duration },
@@ -99,6 +106,16 @@ impl ScriptedTurn {
         Self::Error {
             status,
             body: body.into(),
+            headers: Vec::new(),
+        }
+    }
+
+    /// A refusal for quota, naming when the provider will serve again.
+    pub fn rate_limited(retry_after_seconds: u32) -> Self {
+        Self::Error {
+            status: 429,
+            body: r#"{"error":{"message":"quota reached"}}"#.to_owned(),
+            headers: vec![("Retry-After".to_owned(), retry_after_seconds.to_string())],
         }
     }
 
@@ -595,11 +612,19 @@ fn write_turn(stream: &mut TcpStream, dialect: ScriptedDialect, turn: &ScriptedT
             write_keep_alive_stream(stream, &text_events(dialect, content));
             true
         }
-        ScriptedTurn::Error { status, body } => {
+        ScriptedTurn::Error {
+            status,
+            body,
+            headers,
+        } => {
+            let declared: String = headers
+                .iter()
+                .map(|(name, value)| format!("{name}: {value}\r\n"))
+                .collect();
             write_all(
                 stream,
                 format!(
-                    "HTTP/1.1 {status} Scripted\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{body}",
+                    "HTTP/1.1 {status} Scripted\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{declared}Connection: keep-alive\r\n\r\n{body}",
                     body.len()
                 )
                 .as_bytes(),

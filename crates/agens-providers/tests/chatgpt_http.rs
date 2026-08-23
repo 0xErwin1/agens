@@ -273,7 +273,12 @@ fn subscription_transport_maps_auth_provider_and_semantic_stream_failures_withou
         (ServerBehavior::Status(403), Failure::Authentication),
         (ServerBehavior::Status(400), Failure::ProviderRejected),
         (ServerBehavior::Status(418), Failure::ProviderRejected),
-        (ServerBehavior::Status(429), Failure::ProviderRateLimited),
+        (
+            ServerBehavior::Status(429),
+            Failure::ProviderRateLimited {
+                reset_after_seconds: None,
+            },
+        ),
         (ServerBehavior::Status(500), Failure::ProviderServer),
         (
             ServerBehavior::Sse("data: {\"type\":\"response.failed\"}\n\n".to_owned()),

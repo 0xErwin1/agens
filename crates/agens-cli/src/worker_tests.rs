@@ -18,6 +18,10 @@
 //! from what the turn did, the genesis paths are frozen off that ledger at the
 //! first checkpoint, and a checkpoint whose deadline passes reaches the
 //! lost-worker detector through the timer wheel.
+//!
+//! The second journey is the one where the model never speaks at all: the
+//! provider refuses the turn for quota, and the run parks on the reset it
+//! named until the timer wheel brings it back.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -29,7 +33,7 @@ use agens_core::HeadlessTurnCancellation;
 use agens_fixtures::{Script, ScriptedDialect, ScriptedProvider, ScriptedTurn};
 use agens_server::grpc::proto::{self, feed_client::FeedClient, team_client::TeamClient};
 use agens_server::{CoordinatorSettings, SchedulerLimits, TimerSettings};
-use agens_store::ControlPlaneStore;
+use agens_store::{AttemptOutcome, ControlPlaneStore, QuotaState};
 use tonic::transport::{Channel, Endpoint, Uri};
 
 use crate::CliDependencies;
@@ -462,6 +466,7 @@ fn the_daemon_executes_a_run_through_a_real_turn_that_checkpoints_asks_and_finis
             // which is not a thing a test can wait for.
             timers: TimerSettings {
                 checkpoint_grace_percent: 0,
+                ..TimerSettings::default()
             },
             scheduler: SchedulerLimits {
                 max_concurrent: 1,
@@ -569,6 +574,221 @@ fn the_daemon_executes_a_run_through_a_real_turn_that_checkpoints_asks_and_finis
         run.genesis_paths.as_deref(),
         Some(r#"["notes.md"]"#),
         "the first checkpoint froze the paths the evidence ledger recorded for this run"
+    );
+
+    provider.assert_script_consumed();
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The model never speaks in a run that reaches its provider's cap.
+///
+/// One refusal per attempt the client's retry budget allows, each naming a
+/// reset a second away, and then the text the resumed session answers with.
+/// The turn never reaches a model, so nothing about the work decides what
+/// happens to the run.
+fn quota_script() -> Script {
+    let refusals = agens_providers::RetryPolicy::default().max_attempts();
+
+    Script::new(
+        std::iter::repeat_with(|| ScriptedTurn::rate_limited(QUOTA_RESET_SECONDS))
+            .take(refusals)
+            .chain([ScriptedTurn::text("the provider served again")]),
+    )
+}
+
+/// What the scripted provider names in `Retry-After`.
+///
+/// A second, so the wheel's resume is something a test can wait for. It is
+/// also the run's whole reason to come back: nothing else here lifts the cap,
+/// and the configured window that eventually lifts a cap naming no reset is
+/// left at its default quarter of an hour.
+const QUOTA_RESET_SECONDS: u32 = 1;
+
+/// Reaching a subscription's cap is a wall with a time on it, and retrying
+/// against it only spends the run's budget on refusals.
+///
+/// The whole park is asserted through the composed daemon: the run leaves
+/// `running` and therefore its slot, its leg closes without being charged, the
+/// provider is capped with the reset it named, and the timer wheel alone brings
+/// the run back, with no person and no model involved in any of it.
+#[test]
+fn a_provider_that_refuses_for_quota_parks_the_run_and_the_wheel_brings_it_back() {
+    let root = scratch();
+    let checkout = checkout(&root);
+    let config_home = root.join("config");
+    let data_directory = root.join("data");
+    std::fs::create_dir_all(&config_home).expect("create the config directory");
+    std::fs::create_dir_all(&data_directory).expect("create the data directory");
+
+    let provider = ScriptedProvider::start(ScriptedDialect::Responses, quota_script());
+    let base_url = provider.base_url();
+
+    let dependencies = CliDependencies::for_test(
+        checkout.clone(),
+        Some(root.join("home")),
+        BTreeMap::from([
+            (
+                "AGENS_CONFIG_HOME".to_owned(),
+                config_home.display().to_string(),
+            ),
+            ("OPENAI_API_KEY".to_owned(), "test-key".to_owned()),
+        ]),
+        BTreeMap::from([
+            (
+                config_home.join("config.toml"),
+                format!(
+                    "[provider]\nmodel = \"openai-api/gpt-4.1\"\nbase_url = \"{base_url}\"\n\n\
+                     [options]\ndata_dir = \"{}\"\n",
+                    data_directory.display()
+                ),
+            ),
+            (
+                config_home.join("auth.json"),
+                r#"{"openai-api": {"api_key": "fixture"}}"#.to_owned(),
+            ),
+        ]),
+    );
+    let bootstrap = bootstrap(&dependencies).expect("the production bootstrap is valid");
+
+    std::fs::write(
+        data_directory.join("worktree-policy.toml"),
+        format!("project_roots = [\"{}\"]\n", checkout.display()),
+    )
+    .expect("write the daemon's repository policy");
+
+    let shutdown = HeadlessTurnCancellation::new();
+    let socket = agens_server::socket_path(&data_directory);
+    let stopper = Stopper(shutdown.clone());
+    let repo_root = checkout.display().to_string();
+
+    let client = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let stopper = stopper;
+
+        runtime.block_on(async move {
+            let channel = connect(socket).await;
+            let mut team = TeamClient::new(channel.clone());
+            let mut feed = FeedClient::new(channel);
+
+            let created = team
+                .create_run(proto::CreateRunRequest {
+                    repo_root,
+                    task: "move the question options into their own table".to_owned(),
+                    scope: "crates/agens-store".to_owned(),
+                    dod: "the options are a table and the tests pass".to_owned(),
+                    external_ref: Some("agens/AGN-61".to_owned()),
+                    parent_run_id: None,
+                    dep_run_id: None,
+                    provider: "openai-api".to_owned(),
+                    priority: 5,
+                    budget_tokens: None,
+                    start_point: String::new(),
+                })
+                .await
+                .expect("a client may propose an execution")
+                .into_inner();
+
+            team.approve_plan(proto::ApprovePlanRequest {
+                run_id: created.run_id,
+            })
+            .await
+            .expect("the user may approve a proposed run");
+
+            let parked = await_reported_state(&mut feed, created.run_id, "awaiting_quota").await;
+            let findings = findings_of(&mut feed, created.run_id).await;
+            let inbox = feed
+                .inbox(proto::InboxRequest {
+                    repo_id: created.repo_id.clone(),
+                })
+                .await
+                .expect("the inbox is readable")
+                .into_inner();
+
+            let resumed = await_reported_state(&mut feed, created.run_id, "done").await;
+            let journal = journal_of(&mut feed, created.run_id).await;
+
+            drop(stopper);
+
+            (
+                created,
+                parked,
+                findings,
+                inbox.items.len(),
+                resumed,
+                journal,
+            )
+        })
+    });
+
+    let report = agens_server::serve_until_shutdown(
+        &data_directory,
+        &CoordinatorSettings {
+            heartbeat: Duration::from_millis(25),
+            scheduler: SchedulerLimits {
+                max_concurrent: 1,
+                available_worktrees: 1,
+                provider_capacity: BTreeMap::new(),
+                default_provider_capacity: 1,
+            },
+            ..CoordinatorSettings::default()
+        },
+        run_worker(&bootstrap),
+        &shutdown,
+    )
+    .expect("the daemon serves");
+
+    let (created, parked, findings, waiting, resumed, journal) =
+        client.join().expect("the client thread finishes");
+
+    assert!(report.is_clean(), "every session ended: {report:?}");
+    assert_eq!(
+        parked, "awaiting_quota",
+        "the provider's refusal parks the run instead of failing it, journal: {journal:?}"
+    );
+    assert_eq!(
+        findings,
+        vec!["insufficient".to_owned()],
+        "the forced checkpoint says what stopped the run without claiming progress for it, \
+         journal: {journal:?}"
+    );
+    assert_eq!(
+        waiting, 0,
+        "nothing is asked of a person: the reset is what brings the run back, journal: {journal:?}"
+    );
+    assert_eq!(
+        resumed, "done",
+        "the timer wheel requeued the run at the reset the provider named, journal: {journal:?}"
+    );
+
+    let control_plane = ControlPlaneStore::open(&data_directory).expect("the control plane opens");
+    let attempts = control_plane
+        .attempts_for_run(created.run_id)
+        .expect("the attempts are readable");
+
+    assert_eq!(
+        attempts
+            .iter()
+            .map(|attempt| (attempt.n, attempt.outcome))
+            .collect::<Vec<_>>(),
+        vec![
+            (1, Some(AttemptOutcome::Interrupted)),
+            (2, Some(AttemptOutcome::Succeeded)),
+        ],
+        "the parked leg closed without being charged to the retry budget"
+    );
+    assert_eq!(
+        control_plane
+            .load_provider("openai-api")
+            .expect("the provider row is readable")
+            .expect("parking recorded the provider")
+            .quota_state,
+        QuotaState::Ok,
+        "the run that came back cleared the cap as it went"
     );
 
     provider.assert_script_consumed();

@@ -29,6 +29,7 @@ pub(crate) fn run_serve(
     let settings = CoordinatorSettings {
         timers: TimerSettings {
             checkpoint_grace_percent: team.checkpoint_grace_percent,
+            quota_window_seconds: team.quota_window_seconds,
         },
         ..CoordinatorSettings::default()
     };

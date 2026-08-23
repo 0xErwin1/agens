@@ -376,8 +376,13 @@ pub struct RunFacts {
     /// The question `ask` opens, written in the same transaction as the park.
     pub opened_question: Option<QuestionRow>,
     /// When the capped provider says it will serve again. `None` means it named
-    /// no reset, so nothing can wake the parked runs on a timer.
+    /// no reset, and what wakes the parked runs then is
+    /// [`RunFacts::quota_window_seconds`].
     pub quota_reset_at: Option<i64>,
+    /// How long a cap that named no reset is honoured for before the provider
+    /// is tried again. Configuration rather than state, which is why it comes
+    /// from the caller. `None` refuses to lift such a cap on a timer at all.
+    pub quota_window_seconds: Option<i64>,
     /// Required for a retry: a retry without it is the same attempt again.
     pub guidance: Option<String>,
     /// Who asked for the retry the next admission will open an attempt for.
@@ -595,7 +600,16 @@ impl StateMachines {
             return Ok(());
         }
 
-        match row.reset_at {
+        // A cap the provider named no reset for is due a window after it was
+        // recorded: the only thing that lifts such a cap is a run reaching that
+        // provider, and every run parked on it is barred from starting.
+        let due_at = row.reset_at.or_else(|| {
+            facts
+                .quota_window_seconds
+                .map(|window| row.updated_at.saturating_add(window))
+        });
+
+        match due_at {
             Some(reset_at) if reset_at <= facts.now => Ok(()),
             Some(reset_at) => Err(guard_refused(
                 transition,

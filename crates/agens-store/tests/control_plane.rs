@@ -1014,14 +1014,30 @@ fn only_capped_providers_whose_reset_has_arrived_are_due() {
         })
         .unwrap();
 
-    let due: Vec<String> = store
-        .providers_due(1_700_000_100)
-        .unwrap()
-        .into_iter()
-        .map(|provider| provider.provider)
-        .collect();
+    let due = |now: i64, window: Option<i64>| -> Vec<String> {
+        store
+            .providers_due(now, window)
+            .unwrap()
+            .into_iter()
+            .map(|provider| provider.provider)
+            .collect()
+    };
 
-    assert_eq!(due, vec!["anthropic".to_owned()]);
+    assert_eq!(
+        due(1_700_000_100, None),
+        vec!["anthropic".to_owned()],
+        "a cap that named no reset waits for a fresh report when there is no window"
+    );
+    assert_eq!(
+        due(1_700_000_100, Some(300)),
+        vec!["anthropic".to_owned()],
+        "the window has not elapsed for the cap that named no reset"
+    );
+    assert_eq!(
+        due(1_700_000_300, Some(300)),
+        vec!["anthropic".to_owned(), "google".to_owned()],
+        "the window elapsed, so the cap nothing else can lift is due"
+    );
 }
 
 #[test]

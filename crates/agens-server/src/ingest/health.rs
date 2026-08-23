@@ -39,6 +39,10 @@ pub(crate) enum Observation {
         tokens: i64,
     },
     ContextExhausted,
+    /// The provider refused the turn for quota and the run parked on the
+    /// reset. Like an exhausted context, and unlike an idle turn: the worker
+    /// is waiting on something outside itself.
+    QuotaReached,
     Checkpoint {
         evidence_class: EvidenceClass,
         claims_progress: bool,
@@ -96,6 +100,7 @@ impl Observation {
             Self::TurnStarted => "turn_started",
             Self::TurnEnded { .. } => "turn_ended",
             Self::ContextExhausted => "context_exhausted",
+            Self::QuotaReached => "quota_parked",
             Self::Checkpoint { .. } => "checkpoint_recorded",
             Self::CheckpointExpired => "checkpoint_expired",
             Self::GenesisPathsFrozen { .. } => "genesis_paths_frozen",
@@ -129,7 +134,10 @@ impl Observation {
                 "credited": credited,
             }),
             Self::GenesisPathsFrozen { paths } => json!({ "paths": paths }),
-            Self::TurnStarted | Self::ContextExhausted | Self::CheckpointExpired => json!({}),
+            Self::TurnStarted
+            | Self::ContextExhausted
+            | Self::QuotaReached
+            | Self::CheckpointExpired => json!({}),
         }
     }
 
@@ -185,6 +193,7 @@ impl Observation {
                 tokens: payload.get("tokens").and_then(Value::as_i64).unwrap_or(0),
             },
             "context_exhausted" => Self::ContextExhausted,
+            "quota_parked" => Self::QuotaReached,
             "checkpoint_recorded" => Self::Checkpoint {
                 evidence_class: EvidenceClass::parse(
                     payload.get("evidence_class").and_then(Value::as_str)?,
@@ -287,7 +296,9 @@ impl HealthState {
                 self.progress_this_turn = false;
                 self.parked_this_turn = false;
             }
-            Observation::ContextExhausted => self.parked_this_turn = true,
+            Observation::ContextExhausted | Observation::QuotaReached => {
+                self.parked_this_turn = true;
+            }
             Observation::Checkpoint {
                 evidence_class,
                 claims_progress,

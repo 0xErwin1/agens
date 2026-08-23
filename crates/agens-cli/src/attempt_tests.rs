@@ -845,7 +845,9 @@ mod tests {
         for error in [
             HeadlessTurnError::ProviderContext,
             HeadlessTurnError::ProviderNetwork,
-            HeadlessTurnError::ProviderRateLimited,
+            HeadlessTurnError::ProviderRateLimited {
+                reset_after_seconds: None,
+            },
             HeadlessTurnError::ProviderServer,
             HeadlessTurnError::ProviderProtocol,
             HeadlessTurnError::Cancelled,

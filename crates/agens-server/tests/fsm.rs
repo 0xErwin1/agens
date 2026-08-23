@@ -757,6 +757,106 @@ fn admission_opens_the_attempt_and_parking_records_the_providers_reset() {
     fs::remove_dir_all(directory).unwrap();
 }
 
+/// A provider that refuses without naming a reset would otherwise strand every
+/// run parked on it: the cap is only ever lifted by a run reaching that
+/// provider, and no parked run is allowed to start.
+#[test]
+fn a_cap_that_named_no_reset_lifts_a_window_after_it_was_recorded() {
+    let directory = data_directory();
+    let mut store = ControlPlaneStore::open(&directory).unwrap();
+    let run_id = store
+        .insert_run(&run_in(RunState::Running, Some(WorktreeStatus::Active)))
+        .unwrap();
+    let mut machines = StateMachines::new(store);
+
+    machines
+        .apply_run(
+            run_id,
+            RunTrigger::QuotaReached,
+            &RunFacts {
+                now: NOW,
+                principal: Principal::Coordinator,
+                quota_reset_at: None,
+                ..RunFacts::default()
+            },
+        )
+        .unwrap();
+
+    let provider = machines
+        .store()
+        .load_provider("anthropic")
+        .unwrap()
+        .unwrap();
+    assert_eq!(provider.quota_state, QuotaState::Capped);
+    assert_eq!(provider.reset_at, None);
+
+    let rejection = machines
+        .apply_run(
+            run_id,
+            RunTrigger::QuotaReset,
+            &RunFacts {
+                now: NOW + 900,
+                ..RunFacts::default()
+            },
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            rejection,
+            TransitionRejection::GuardFailed {
+                guard: "quota_reset_elapsed",
+                ..
+            }
+        ),
+        "without a configured window such a cap waits for a fresh report: {rejection}"
+    );
+
+    let rejection = machines
+        .apply_run(
+            run_id,
+            RunTrigger::QuotaReset,
+            &RunFacts {
+                now: NOW + 899,
+                quota_window_seconds: Some(900),
+                ..RunFacts::default()
+            },
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            rejection,
+            TransitionRejection::GuardFailed {
+                guard: "quota_reset_elapsed",
+                ..
+            }
+        ),
+        "the window is measured from when the cap was recorded: {rejection}"
+    );
+
+    machines
+        .apply_run(
+            run_id,
+            RunTrigger::QuotaReset,
+            &RunFacts {
+                now: NOW + 900,
+                quota_window_seconds: Some(900),
+                ..RunFacts::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        machines
+            .store()
+            .load_provider("anthropic")
+            .unwrap()
+            .unwrap()
+            .quota_state,
+        QuotaState::Ok
+    );
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
 #[test]
 fn cancelling_a_cancelled_run_moves_nothing_and_journals_nothing() {
     let directory = data_directory();

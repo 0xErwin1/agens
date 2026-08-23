@@ -458,7 +458,7 @@ pub struct ProviderDiagnosticEvent {
 enum ChatGptResponseError {
     Authentication(u16),
     Rejected,
-    RateLimited,
+    RateLimited { reset_after_seconds: Option<u32> },
     Server,
     Protocol,
     Other(HeadlessTurnPortError),
@@ -474,7 +474,11 @@ impl ChatGptResponseError {
         match self {
             Self::Authentication(_) => HeadlessTurnPortError::Authentication,
             Self::Rejected => HeadlessTurnPortError::ProviderRejected,
-            Self::RateLimited => HeadlessTurnPortError::ProviderRateLimited,
+            Self::RateLimited {
+                reset_after_seconds,
+            } => HeadlessTurnPortError::ProviderRateLimited {
+                reset_after_seconds,
+            },
             Self::Server => HeadlessTurnPortError::ProviderServer,
             Self::Protocol => HeadlessTurnPortError::ProviderProtocol,
             Self::Other(error) => error,
@@ -816,7 +820,13 @@ impl OpenAiResponsesProvider {
                     }
                     let last_transient_status = retry.last_transient_status();
                     let error = last_transient_status
-                        .map(|status| classify_openai_response_status(status, false))
+                        .map(|status| {
+                            classify_openai_response_status(
+                                status,
+                                false,
+                                retry.named_reset_seconds(),
+                            )
+                        })
                         .unwrap_or(HeadlessTurnPortError::ProviderNetwork);
                     retry.emit_terminal(
                         last_transient_status,
@@ -846,7 +856,11 @@ impl OpenAiResponsesProvider {
                     Some(status),
                     Some(diagnostic_class_for_status(status, context_exceeded)),
                 );
-                return Err(classify_openai_response_status(status, context_exceeded));
+                return Err(classify_openai_response_status(
+                    status,
+                    context_exceeded,
+                    retry.named_reset_seconds(),
+                ));
             }
 
             let result = decode_http_response_stream(
@@ -879,10 +893,16 @@ impl OpenAiResponsesProvider {
     }
 }
 
-fn classify_openai_response_status(status: u16, context_exceeded: bool) -> HeadlessTurnPortError {
+fn classify_openai_response_status(
+    status: u16,
+    context_exceeded: bool,
+    reset_after_seconds: Option<u32>,
+) -> HeadlessTurnPortError {
     match status {
         401 | 403 => HeadlessTurnPortError::Authentication,
-        429 => HeadlessTurnPortError::ProviderRateLimited,
+        RATE_LIMITED_STATUS => HeadlessTurnPortError::ProviderRateLimited {
+            reset_after_seconds,
+        },
         500..=599 => HeadlessTurnPortError::ProviderServer,
         400..=499 if context_exceeded => HeadlessTurnPortError::ProviderContext,
         400..=499 => HeadlessTurnPortError::ProviderRejected,
@@ -1266,7 +1286,9 @@ impl ChatGptResponsesProvider {
                     }
                     let last_transient_status = retry.last_transient_status();
                     let error = last_transient_status
-                        .map(chatgpt_transient_status_error)
+                        .map(|status| {
+                            chatgpt_transient_status_error(status, retry.named_reset_seconds())
+                        })
                         .unwrap_or(ChatGptResponseError::Other(
                             HeadlessTurnPortError::ProviderNetwork,
                         ));
@@ -1306,7 +1328,9 @@ impl ChatGptResponsesProvider {
                 );
                 return Err(match status {
                     401 | 403 => ChatGptResponseError::Authentication(status),
-                    429 => ChatGptResponseError::RateLimited,
+                    RATE_LIMITED_STATUS => ChatGptResponseError::RateLimited {
+                        reset_after_seconds: retry.named_reset_seconds(),
+                    },
                     500..=599 => ChatGptResponseError::Server,
                     400..=499 if safe_error == Some(SafeRemoteError::ContextLengthExceeded) => {
                         ChatGptResponseError::Other(HeadlessTurnPortError::ProviderContext)
@@ -1349,7 +1373,7 @@ impl ChatGptResponsesProvider {
                 ChatGptResponseError::Other(error) => diagnostic_class_for_port_error(*error),
                 ChatGptResponseError::Authentication(_) => ProviderDiagnosticClass::Authentication,
                 ChatGptResponseError::Rejected => ProviderDiagnosticClass::Rejected,
-                ChatGptResponseError::RateLimited => ProviderDiagnosticClass::RateLimited,
+                ChatGptResponseError::RateLimited { .. } => ProviderDiagnosticClass::RateLimited,
                 ChatGptResponseError::Server => ProviderDiagnosticClass::Server,
                 ChatGptResponseError::Protocol => ProviderDiagnosticClass::Protocol,
             });
@@ -1695,9 +1719,14 @@ fn should_retry_transport_error(
     !saw_request_timeout && last_transient_status.is_none() && is_transient_transport_error(error)
 }
 
-fn chatgpt_transient_status_error(status: u16) -> ChatGptResponseError {
+fn chatgpt_transient_status_error(
+    status: u16,
+    reset_after_seconds: Option<u32>,
+) -> ChatGptResponseError {
     match status {
-        429 => ChatGptResponseError::RateLimited,
+        RATE_LIMITED_STATUS => ChatGptResponseError::RateLimited {
+            reset_after_seconds,
+        },
         500..=599 => ChatGptResponseError::Server,
         _ => ChatGptResponseError::Rejected,
     }
@@ -1722,7 +1751,7 @@ fn diagnostic_class_for_port_error(error: HeadlessTurnPortError) -> ProviderDiag
         HeadlessTurnPortError::ProviderContext => ProviderDiagnosticClass::Context,
         HeadlessTurnPortError::ProviderHistoryBudget => ProviderDiagnosticClass::ReplayBudget,
         HeadlessTurnPortError::ProviderNetwork => ProviderDiagnosticClass::Network,
-        HeadlessTurnPortError::ProviderRateLimited => ProviderDiagnosticClass::RateLimited,
+        HeadlessTurnPortError::ProviderRateLimited { .. } => ProviderDiagnosticClass::RateLimited,
         HeadlessTurnPortError::ProviderRejected => ProviderDiagnosticClass::Rejected,
         HeadlessTurnPortError::ProviderServer => ProviderDiagnosticClass::Server,
         HeadlessTurnPortError::Provider => ProviderDiagnosticClass::Provider,
@@ -1793,7 +1822,7 @@ fn parse_retry_after_ms(value: Option<&str>, cap: Duration) -> Option<Duration> 
 
 fn retry_after_from_headers(
     headers: &reqwest::header::HeaderMap,
-    policy: RetryPolicy,
+    cap: Duration,
 ) -> Option<Duration> {
     let header = |name: &str| {
         headers
@@ -1802,15 +1831,18 @@ fn retry_after_from_headers(
             .map(str::to_owned)
     };
 
-    parse_retry_after_ms(header("retry-after-ms").as_deref(), policy.retry_after_cap).or_else(
-        || {
-            parse_retry_after(
-                header("retry-after").as_deref(),
-                SystemTime::now(),
-                policy.retry_after_cap,
-            )
-        },
-    )
+    parse_retry_after_ms(header("retry-after-ms").as_deref(), cap)
+        .or_else(|| parse_retry_after(header("retry-after").as_deref(), SystemTime::now(), cap))
+}
+
+/// The status a provider refuses a request with when it is out of quota or
+/// asking for a slower rate.
+const RATE_LIMITED_STATUS: u16 = 429;
+
+/// Whole seconds of a named reset, saturating rather than wrapping: a delay
+/// beyond a `u32` of seconds is a wall no session outlives either way.
+fn reset_seconds(delay: Duration) -> u32 {
+    u32::try_from(delay.as_secs()).unwrap_or(u32::MAX)
 }
 
 fn http_retry_delay(retry: usize, retry_after: Option<Duration>, policy: RetryPolicy) -> Duration {
@@ -1845,6 +1877,10 @@ pub(crate) struct RetryLoop<'a> {
     component: ProviderDiagnosticComponent,
     attempt: usize,
     last_transient_status: Option<u16>,
+    /// The reset the provider named on its last `429`, in seconds and
+    /// uncapped. What a caller parks on when the refusal is a quota wall
+    /// rather than a burst.
+    named_reset: Option<u32>,
     saw_request_timeout: bool,
     /// What the waits between attempts have already cost, against
     /// [`RetryPolicy::total_delay_budget`].
@@ -1863,6 +1899,7 @@ impl<'a> RetryLoop<'a> {
             component,
             attempt: 0,
             last_transient_status: None,
+            named_reset: None,
             saw_request_timeout: false,
             waited: Duration::ZERO,
         }
@@ -1881,20 +1918,36 @@ impl<'a> RetryLoop<'a> {
         self.last_transient_status
     }
 
+    /// When the provider said it would serve again, in seconds from the
+    /// refusal. `None` means it named nothing.
+    pub(crate) const fn named_reset_seconds(&self) -> Option<u32> {
+        self.named_reset
+    }
+
     /// Records that another attempt is going out.
     pub(crate) fn begin_attempt(&self) {
-        self.emit(ProviderDiagnosticKind::Attempt, None, None);
+        self.emit(ProviderDiagnosticKind::Attempt, None, None, None);
     }
 
     /// Records the attempt that ended the request, so the diagnostics file
     /// says which one was the last and how it went. No class is a request that
     /// ended by succeeding.
+    ///
+    /// A reset the provider named travels with it, because a request that ended
+    /// against a wall and one that ended against a burst are the same three
+    /// fields otherwise.
     pub(crate) fn emit_terminal(
         &self,
         status: Option<u16>,
         class: Option<ProviderDiagnosticClass>,
     ) {
-        self.emit(ProviderDiagnosticKind::Terminal, status, class);
+        self.emit(
+            ProviderDiagnosticKind::Terminal,
+            status,
+            class,
+            self.named_reset
+                .map(|seconds| Duration::from_secs(seconds.into())),
+        );
     }
 
     fn emit(
@@ -1902,13 +1955,14 @@ impl<'a> RetryLoop<'a> {
         kind: ProviderDiagnosticKind,
         status: Option<u16>,
         class: Option<ProviderDiagnosticClass>,
+        delay: Option<Duration>,
     ) {
         if let Some(diagnostics) = self.diagnostics {
             diagnostics.emit(
                 self.component,
                 kind,
                 self.attempt_number(),
-                None,
+                delay,
                 status,
                 class,
             );
@@ -1962,12 +2016,32 @@ impl<'a> RetryLoop<'a> {
         cancellation: &HeadlessTurnCancellation,
     ) -> Result<Option<reqwest::Response>, HeadlessTurnPortError> {
         let status = response.status().as_u16();
-        if !is_transient_http_status(status) || !self.policy.has_attempt_after(self.attempt) {
+        if !is_transient_http_status(status) {
             return Ok(Some(response));
         }
 
-        let retry_after = retry_after_from_headers(response.headers(), self.policy);
-        let delay = self.delay_for(retry_after);
+        // Read uncapped and kept whatever the loop then decides: the cap
+        // bounds how long this request may wait, and a caller deciding when to
+        // come back needs the wall the provider described.
+        let named = retry_after_from_headers(response.headers(), Duration::MAX);
+        if status == RATE_LIMITED_STATUS && named.is_some() {
+            self.named_reset = named.map(reset_seconds);
+        }
+
+        if !self.policy.has_attempt_after(self.attempt) {
+            return Ok(Some(response));
+        }
+
+        // A delay the provider named and this request cannot honour ends the
+        // retries rather than shortening the wait. Coming back before the
+        // provider said to is asking to be refused again, and what to do about
+        // a wall no request can wait out is the caller's decision, not the
+        // retry loop's.
+        if named.is_some_and(|delay| delay > self.policy.retry_after_cap) {
+            return Ok(Some(response));
+        }
+
+        let delay = self.delay_for(named);
         if !self.affords(delay) {
             return Ok(Some(response));
         }
@@ -4847,11 +4921,11 @@ mod tests {
     /// provider that sends both means the finer one.
     #[test]
     fn the_millisecond_header_wins_over_the_second_one() {
-        let policy = RetryPolicy::default();
+        let cap = RetryPolicy::default().retry_after_cap;
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert("retry-after", "30".parse().expect("header value is valid"));
         assert_eq!(
-            retry_after_from_headers(&headers, policy),
+            retry_after_from_headers(&headers, cap),
             Some(Duration::from_secs(30))
         );
 
@@ -4860,7 +4934,7 @@ mod tests {
             "1500".parse().expect("header value is valid"),
         );
         assert_eq!(
-            retry_after_from_headers(&headers, policy),
+            retry_after_from_headers(&headers, cap),
             Some(Duration::from_millis(1_500))
         );
     }

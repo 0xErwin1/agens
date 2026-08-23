@@ -255,7 +255,13 @@ impl MoonshotProvider {
 
                     let last_transient_status = retry.last_transient_status();
                     let error = last_transient_status
-                        .map(|status| classify_openai_response_status(status, false))
+                        .map(|status| {
+                            classify_openai_response_status(
+                                status,
+                                false,
+                                retry.named_reset_seconds(),
+                            )
+                        })
                         .unwrap_or(HeadlessTurnPortError::ProviderNetwork);
                     retry.emit_terminal(
                         last_transient_status,
@@ -282,7 +288,11 @@ impl MoonshotProvider {
                     Some(status),
                     Some(diagnostic_class_for_status(status, context_exceeded)),
                 );
-                return Err(classify_openai_response_status(status, context_exceeded));
+                return Err(classify_openai_response_status(
+                    status,
+                    context_exceeded,
+                    retry.named_reset_seconds(),
+                ));
             }
 
             let read = self
