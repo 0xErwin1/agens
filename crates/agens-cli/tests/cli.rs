@@ -6190,3 +6190,68 @@ fn journey_runs_without_any_real_credential_in_its_environment() {
     provider.assert_script_consumed();
     NetworkTripwire::shared().assert_no_connections();
 }
+
+/// The operator's one verb for authorizing a repository's provisioning hooks,
+/// which run with the daemon's environment.
+///
+/// It reaches the same register the daemon reads, and it refuses a checkout the
+/// daemon does not serve: a grant nothing could ever apply is worse than no
+/// grant, because the operator walks away believing hooks will run.
+#[test]
+fn serve_trust_grants_a_served_repository_and_refuses_one_outside_the_configured_roots() {
+    let temporary = TemporaryDirectory::new("serve-trust");
+    let config_home = temporary.path().join("config");
+    let project_root = temporary.path().join("project");
+    let served = temporary.path().join("checkouts");
+    let repository = served.join("agens");
+    let unserved = temporary.path().join("elsewhere");
+
+    for path in [&repository, &unserved] {
+        std::fs::create_dir_all(path).expect("the fixture checkout should exist");
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(path)
+                .status()
+                .expect("git should be on the path")
+                .success()
+        );
+    }
+
+    let dependencies = CliDependencies::for_test(
+        project_root,
+        Some(temporary.path().join("home")),
+        BTreeMap::from([(
+            "AGENS_CONFIG_HOME".to_owned(),
+            config_home.display().to_string(),
+        )]),
+        BTreeMap::from([(
+            config_home.join("config.toml"),
+            format!("[team]\nproject_roots = [\"{}\"]\n", served.display()),
+        )]),
+    );
+
+    let granted = execute(
+        ["serve", "trust", &repository.display().to_string()],
+        &dependencies,
+    );
+
+    assert_eq!(granted.status, ExitStatus::Success);
+    assert!(
+        granted.stdout.contains("may now run with the daemon"),
+        "the grant says what it authorized: {}",
+        granted.stdout
+    );
+
+    let refused = execute(
+        ["serve", "trust", &unserved.display().to_string()],
+        &dependencies,
+    );
+
+    assert_eq!(refused.status, ExitStatus::Configuration);
+    assert!(
+        refused.stderr.contains("team.project_roots"),
+        "the refusal names the key that would serve it: {}",
+        refused.stderr
+    );
+}

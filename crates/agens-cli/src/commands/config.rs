@@ -136,6 +136,7 @@ fn effective_settings_report(settings: &ResolvedSettings) -> String {
             ConfiguredValue::Bool(value) => value.to_string(),
             ConfiguredValue::Integer(value) => value.to_string(),
             ConfiguredValue::Text(value) => value.clone(),
+            ConfiguredValue::TextList(values) => values.join(", "),
             ConfiguredValue::Absent => "-".to_owned(),
         };
         let origin = match setting.origin {

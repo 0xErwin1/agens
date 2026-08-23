@@ -9,6 +9,8 @@
 //! mutual-exclusion guard) and their own exact `CliError` messages for
 //! those cases; every other parse failure carries clap's own wording.
 
+use std::path::PathBuf;
+
 use clap::error::ErrorKind;
 use clap::{Args, CommandFactory, Parser, Subcommand};
 
@@ -46,7 +48,10 @@ pub(crate) enum Command {
     #[command(about = "list provider models")]
     Models,
     #[command(about = "run the headless daemon for this machine")]
-    Serve,
+    Serve {
+        #[command(subcommand)]
+        action: Option<ServeAction>,
+    },
     #[command(about = "inspect completed turns")]
     Sessions {
         #[command(subcommand)]
@@ -122,6 +127,18 @@ pub(crate) enum LoginMethod {
         provider: String,
         #[arg(long)]
         api_key: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum ServeAction {
+    #[command(
+        about = "authorize a repository's provisioning hooks, which run with the daemon's environment"
+    )]
+    Trust {
+        /// The checkout to trust. It has to be one the daemon serves, which is
+        /// what `team.project_roots` says.
+        repository: PathBuf,
     },
 }
 

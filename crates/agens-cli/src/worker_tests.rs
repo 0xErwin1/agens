@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 use agens_core::HeadlessTurnCancellation;
 use agens_fixtures::{Script, ScriptedDialect, ScriptedProvider, ScriptedTurn};
 use agens_server::grpc::proto::{self, feed_client::FeedClient, team_client::TeamClient};
-use agens_server::{CoordinatorSettings, SchedulerLimits, TimerSettings};
+use agens_server::{CoordinatorSettings, PolicySettings, SchedulerLimits, TimerSettings};
 use agens_store::{AttemptOutcome, ControlPlaneStore, QuotaState};
 use tonic::transport::{Channel, Endpoint, Uri};
 
@@ -384,15 +384,6 @@ fn the_daemon_executes_a_run_through_a_real_turn_that_checkpoints_asks_and_finis
     );
     let bootstrap = bootstrap(&dependencies).expect("the production bootstrap is valid");
 
-    // The daemon serves the checkouts its operator wrote down, and nothing
-    // else: a repository nobody named is a repository whose hooks it would be
-    // executing on a caller's say-so.
-    std::fs::write(
-        data_directory.join("worktree-policy.toml"),
-        format!("project_roots = [\"{}\"]\n", checkout.display()),
-    )
-    .expect("write the daemon's repository policy");
-
     let shutdown = HeadlessTurnCancellation::new();
     let socket = agens_server::socket_path(&data_directory);
     let stopper = Stopper(shutdown.clone());
@@ -470,6 +461,13 @@ fn the_daemon_executes_a_run_through_a_real_turn_that_checkpoints_asks_and_finis
     let report = agens_server::serve_until_shutdown(
         &data_directory,
         &CoordinatorSettings {
+            // The daemon serves the checkouts its operator wrote down, and
+            // nothing else: a repository nobody named is a repository whose
+            // hooks it would be executing on a caller's say-so.
+            policy: PolicySettings {
+                project_roots: vec![checkout.clone()],
+                ..PolicySettings::default()
+            },
             heartbeat: Duration::from_millis(25),
             // No grace at all, so the deadline is the moment the worker
             // promised and the wheel raises the exception on its next tick.
@@ -664,12 +662,6 @@ fn a_provider_that_refuses_for_quota_parks_the_run_and_the_wheel_brings_it_back(
     );
     let bootstrap = bootstrap(&dependencies).expect("the production bootstrap is valid");
 
-    std::fs::write(
-        data_directory.join("worktree-policy.toml"),
-        format!("project_roots = [\"{}\"]\n", checkout.display()),
-    )
-    .expect("write the daemon's repository policy");
-
     let shutdown = HeadlessTurnCancellation::new();
     let socket = agens_server::socket_path(&data_directory);
     let stopper = Stopper(shutdown.clone());
@@ -741,6 +733,13 @@ fn a_provider_that_refuses_for_quota_parks_the_run_and_the_wheel_brings_it_back(
     let report = agens_server::serve_until_shutdown(
         &data_directory,
         &CoordinatorSettings {
+            // The daemon serves the checkouts its operator wrote down, and
+            // nothing else: a repository nobody named is a repository whose
+            // hooks it would be executing on a caller's say-so.
+            policy: PolicySettings {
+                project_roots: vec![checkout.clone()],
+                ..PolicySettings::default()
+            },
             heartbeat: Duration::from_millis(25),
             scheduler: SchedulerLimits {
                 max_concurrent: 1,
