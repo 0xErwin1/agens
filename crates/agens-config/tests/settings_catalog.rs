@@ -2,7 +2,7 @@ use agens_config::{
     DEFAULT_MCP_CONNECT_TIMEOUT_MS, McpDefaultSettings, SETTINGS, SettingKind, SettingSpec,
     SettingValue, mcp_servers, mcp_servers_with_defaults,
 };
-use agens_config::{parse_toml_document, validate_toml_document};
+use agens_config::{TeamSettings, parse_toml_document, resolve_settings, validate_toml_document};
 
 fn document_for(path: &str, literal: &str) -> toml::Table {
     let (table, key) = path
@@ -22,6 +22,7 @@ fn sample_literal(spec: &SettingSpec) -> String {
         SettingKind::Integer { minimum, .. } => minimum.to_string(),
         SettingKind::Text { .. } => "\"sample\"".to_owned(),
         SettingKind::Choice(choices) => format!("\"{}\"", choices[0]),
+        SettingKind::TextList { .. } => "[\"sample\"]".to_owned(),
     }
 }
 
@@ -74,6 +75,7 @@ fn rejects_every_setting_given_the_wrong_type() {
             SettingKind::Bool => "1",
             SettingKind::Integer { .. } => "true",
             SettingKind::Text { .. } | SettingKind::Choice(_) => "1",
+            SettingKind::TextList { .. } => "\"sample\"",
         };
 
         assert!(
@@ -229,4 +231,54 @@ fn rejects_a_retired_setting_by_name_with_its_replacement() {
 
     assert!(message.contains("provider.type"), "{message}");
     assert!(message.contains("provider/model"), "{message}");
+}
+
+#[test]
+fn rejects_a_list_setting_beyond_its_documented_bounds() {
+    for spec in SETTINGS {
+        let SettingKind::TextList {
+            max_items,
+            max_chars,
+        } = spec.kind
+        else {
+            continue;
+        };
+
+        let too_many = (0..=max_items)
+            .map(|index| format!("\"{index}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert!(
+            !accepts(spec.path, &format!("[{too_many}]")),
+            "{} must reject {} entries",
+            spec.path,
+            max_items + 1
+        );
+
+        let overlong = format!("[\"{}\"]", "a".repeat(max_chars + 1));
+        assert!(
+            !accepts(spec.path, &overlong),
+            "{} must reject an entry of {} characters",
+            spec.path,
+            max_chars + 1
+        );
+    }
+}
+
+#[test]
+fn reads_project_roots_and_hook_exports_as_the_lists_the_daemon_serves() {
+    let document = parse_toml_document(
+        "[team]\nproject_roots = [\"/srv/checkouts\"]\nhook_exports = [\"PATH\"]\n",
+    )
+    .expect("the fixture is valid TOML");
+    validate_toml_document(&document).expect("a list of strings is what both keys hold");
+
+    let resolved = resolve_settings(&toml::Table::new(), &document, &document);
+    let team = TeamSettings::from(&resolved);
+
+    assert_eq!(
+        team.project_roots,
+        vec![std::path::PathBuf::from("/srv/checkouts")]
+    );
+    assert_eq!(team.hook_exports, vec!["PATH".to_owned()]);
 }

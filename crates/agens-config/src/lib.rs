@@ -361,9 +361,20 @@ pub fn parse_toml_document(input: &str) -> Result<toml::Table, toml::de::Error> 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SettingKind {
     Bool,
-    Integer { minimum: i64, maximum: i64 },
-    Text { max_chars: usize },
+    Integer {
+        minimum: i64,
+        maximum: i64,
+    },
+    Text {
+        max_chars: usize,
+    },
     Choice(&'static [&'static str]),
+    /// An array of strings, bounded so a hostile or mistaken file cannot make
+    /// the catalog carry an unbounded document.
+    TextList {
+        max_items: usize,
+        max_chars: usize,
+    },
 }
 
 impl SettingKind {
@@ -377,6 +388,17 @@ impl SettingKind {
                 .as_str()
                 .is_some_and(|text| text.chars().count() <= max_chars),
             Self::Choice(choices) => value.as_str().is_some_and(|text| choices.contains(&text)),
+            Self::TextList {
+                max_items,
+                max_chars,
+            } => value.as_array().is_some_and(|values| {
+                values.len() <= max_items
+                    && values.iter().all(|entry| {
+                        entry
+                            .as_str()
+                            .is_some_and(|text| text.chars().count() <= max_chars)
+                    })
+            }),
         }
     }
 }
@@ -642,6 +664,24 @@ pub const SETTINGS: &[SettingSpec] = &[
         default: SettingValue::Integer(DEFAULT_QUOTA_WINDOW_SECONDS),
         doc: "How long a provider cap that named no reset time is honoured before the parked runs try it again.",
     },
+    SettingSpec {
+        path: "team.project_roots",
+        kind: SettingKind::TextList {
+            max_items: 256,
+            max_chars: 4_096,
+        },
+        default: SettingValue::Absent,
+        doc: "Checkouts, or directories holding them, the daemon accepts runs against. Empty serves nothing.",
+    },
+    SettingSpec {
+        path: "team.hook_exports",
+        kind: SettingKind::TextList {
+            max_items: 256,
+            max_chars: 256,
+        },
+        default: SettingValue::Absent,
+        doc: "Environment names a repository's provisioning hook may export into the hooks after it.",
+    },
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -689,6 +729,7 @@ pub enum ConfiguredValue {
     Bool(bool),
     Integer(i64),
     Text(String),
+    TextList(Vec<String>),
     Absent,
 }
 
@@ -700,6 +741,14 @@ impl ConfiguredValue {
             SettingKind::Text { .. } | SettingKind::Choice(_) => {
                 value.as_str().map(|text| Self::Text(text.to_owned()))
             }
+            SettingKind::TextList { .. } => value.as_array().map(|values| {
+                Self::TextList(
+                    values
+                        .iter()
+                        .filter_map(|entry| entry.as_str().map(str::to_owned))
+                        .collect(),
+                )
+            }),
         }
     }
 }
@@ -765,6 +814,13 @@ impl ResolvedSettings {
     pub fn text(&self, path: &str) -> Option<&str> {
         match self.value(path) {
             Some(ConfiguredValue::Text(value)) => Some(value.as_str()),
+            _ => None,
+        }
+    }
+
+    pub fn text_list(&self, path: &str) -> Option<&[String]> {
+        match self.value(path) {
+            Some(ConfiguredValue::TextList(values)) => Some(values.as_slice()),
             _ => None,
         }
     }
@@ -869,10 +925,16 @@ impl From<&ResolvedSettings> for SubagentSettings {
 
 /// Team-mode thresholds as configured. The coordinator's timer wheel reads the
 /// grace; converting it into a deadline is the daemon's, not this crate's.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TeamSettings {
     pub checkpoint_grace_percent: i64,
     pub quota_window_seconds: i64,
+    /// The checkouts this daemon serves. Written by hand: a root is the
+    /// operator's statement about which repositories exist, and nothing the
+    /// daemon runs may add to it.
+    pub project_roots: Vec<PathBuf>,
+    /// The environment names a provisioning hook may export.
+    pub hook_exports: Vec<String>,
 }
 
 impl Default for TeamSettings {
@@ -886,6 +948,16 @@ impl From<&ResolvedSettings> for TeamSettings {
         Self {
             checkpoint_grace_percent: integer_setting(resolved, "team.checkpoint_grace_percent"),
             quota_window_seconds: integer_setting(resolved, "team.quota_window_seconds"),
+            project_roots: resolved
+                .text_list("team.project_roots")
+                .unwrap_or_default()
+                .iter()
+                .map(PathBuf::from)
+                .collect(),
+            hook_exports: resolved
+                .text_list("team.hook_exports")
+                .unwrap_or_default()
+                .to_vec(),
         }
     }
 }
@@ -959,6 +1031,9 @@ pub fn starter_document() -> String {
             }
             SettingValue::Text(value) => {
                 document.push_str(&format!("# {} = \"{value}\"\n", spec.key()));
+            }
+            SettingValue::Absent if matches!(spec.kind, SettingKind::TextList { .. }) => {
+                document.push_str(&format!("# {} = []\n", spec.key()));
             }
             SettingValue::Absent => {
                 document.push_str(&format!("# {} =\n", spec.key()));
