@@ -27,8 +27,15 @@ use std::sync::Arc;
 
 use agens_store::{EventClass, EventRow};
 
-use crate::fsm::{Principal, StateMachines, TransitionRejection};
+use agens_store::RunState;
+
+use crate::fsm::{
+    Principal, RunEffect, RunFacts, RunTrigger, StateMachines, TransitionOutcome,
+    TransitionRejection,
+};
 use crate::policy::RepositoryPolicy;
+use crate::scheduler::{QueueReport, RunLauncher, Scheduler, SchedulerError, SchedulerLoad};
+use crate::timers::{TimerTick, TimerWheel};
 
 pub use authorization::{
     DetailQuestionRefusal, OPERATION_AUTHORIZATION, Operation, OperationAuthorization,
@@ -165,13 +172,79 @@ impl ApiCore {
         &self.machines
     }
 
-    /// The state machines, for the coordinator's own writers: the scheduler's
-    /// tick, the timer wheel, the gates and the worker's introspection. The
+    /// The state machines, for the coordinator's own writers inside this
+    /// crate: boot reconciliation, the gates and the introspection surface. The
     /// core is their single owner, so each of them borrows through here rather
     /// than holding a second handle on the same tables.
+    ///
+    /// Crate-private on purpose. A caller outside the daemon reaching the
+    /// machines directly would be a second path to a transition, which is a
+    /// path around the authorization table this core exists to run. What such a
+    /// caller needs instead is a named operation below.
     #[must_use]
-    pub const fn machines_mut(&mut self) -> &mut StateMachines {
+    pub(crate) const fn machines_mut(&mut self) -> &mut StateMachines {
         &mut self.machines
+    }
+
+    /// One scheduler tick: offers every eligible queued run a slot and moves
+    /// the ones that were launched.
+    ///
+    /// A named operation rather than a borrow of the machines because the
+    /// admission loop is a writer of the control plane, and every writer the
+    /// core has is one the core can name.
+    pub fn admit_queued_runs(
+        &mut self,
+        scheduler: &Scheduler,
+        launcher: &dyn RunLauncher,
+        load: &SchedulerLoad,
+    ) -> Result<QueueReport, SchedulerError> {
+        scheduler.tick(&mut self.machines, launcher, load)
+    }
+
+    /// One turn of the timer wheel: every deadline that came due, applied and
+    /// journaled.
+    ///
+    /// The wheel raises signals and reports to nobody, so what it found is
+    /// returned for the caller to carry.
+    pub fn advance_timers(&mut self, wheel: &TimerWheel) -> Result<TimerTick, TransitionRejection> {
+        wheel.tick(&mut self.machines)
+    }
+
+    /// One of a run's own lifecycle transitions, as reported by the harness
+    /// executing it.
+    ///
+    /// The principal is pinned to the coordinator here and read from nothing:
+    /// this is what the run machine's `reported_by_harness` guard admits, and a
+    /// caller that could name its own principal would be able to claim a run's
+    /// lifecycle for a party that is not executing it.
+    pub fn report_run_lifecycle(
+        &mut self,
+        run_id: i64,
+        trigger: RunTrigger,
+        facts: &RunFacts,
+    ) -> Result<TransitionOutcome<RunState, RunEffect>, TransitionRejection> {
+        self.machines.apply_run(
+            run_id,
+            trigger,
+            &RunFacts {
+                principal: Principal::Coordinator,
+                ..facts.clone()
+            },
+        )
+    }
+
+    /// Names the physical execution one of a run's attempts is running as.
+    ///
+    /// Not a transition — the attempt stays where it is — but still a write of
+    /// the control plane, so the harness reaches it by name rather than by
+    /// borrowing the machines.
+    pub fn correlate_attempt(
+        &mut self,
+        attempt_id: i64,
+        session_attempt_id: i64,
+    ) -> Result<(), TransitionRejection> {
+        self.machines
+            .correlate_attempt(attempt_id, session_attempt_id)
     }
 
     #[must_use]

@@ -18,9 +18,10 @@ use agens_server::{
     CleaningDisposition, CreateRun, Delivery, DeliveryGrain, DeliveryPayload, DeliveryQueue,
     DetailQuestionRefusal, EventFeed, EventFilter, HookPolicy, HookTrust, MergeAuthorization,
     OPERATION_AUTHORIZATION, Operation, PendingHookTrust, PortError, Ports, Principal,
-    ProvisionedWorktree, RepositoryIdentity, RepositoryPolicy, RetryRequest, RunRef, SchedulerPort,
-    SessionControl, StateMachines, StopRequest, StopScope, Subscription, TakeoverHandle,
-    TransitionRejection, WorktreeDerivation, WorktreeGate, WorktreeRequest, praetor_may_answer,
+    ProvisionedWorktree, RepositoryIdentity, RepositoryPolicy, RetryRequest, RunFacts, RunRef,
+    RunTrigger, SchedulerPort, SessionControl, StateMachines, StopRequest, StopScope, Subscription,
+    TakeoverHandle, TransitionRejection, WorktreeDerivation, WorktreeGate, WorktreeRequest,
+    praetor_may_answer,
 };
 use agens_store::{
     ControlPlaneStore, QuestionAuthor, QuestionKind, QuestionRow, QuestionState, RetryTrigger,
@@ -1111,6 +1112,33 @@ fn answering_a_question_the_run_is_not_parked_on_moves_no_run() {
     assert!(answered.run.is_none());
     assert_eq!(harness.run_state(run_id), RunState::Running);
     assert_eq!(harness.delivery.queued.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn the_harness_lifecycle_operation_pins_the_principal_it_reports_as() {
+    let mut store = store();
+    let run_id = store
+        .insert_run(&run_in(RunState::Running, Some(WorktreeStatus::Active)))
+        .unwrap();
+    let mut harness = Harness::build(store, RecordingWorktrees::new(false, true));
+
+    // A caller naming somebody else is not a caller the guard sees: the
+    // operation overwrites the principal, so a client that reached this could
+    // still not claim a run's lifecycle for a party that is not executing it.
+    harness
+        .core
+        .report_run_lifecycle(
+            run_id,
+            RunTrigger::Finished,
+            &RunFacts {
+                now: NOW,
+                principal: Principal::User,
+                ..RunFacts::default()
+            },
+        )
+        .unwrap();
+
+    assert_eq!(harness.run_state(run_id), RunState::Done);
 }
 
 #[test]

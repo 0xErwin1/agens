@@ -46,7 +46,7 @@ use agens_headless::{
 };
 use agens_permissions::{PermissionPromptAnswer, PermissionPromptContext, PermissionPrompter};
 use agens_server::{
-    ApiCore, FactSender, LaunchError, Principal, RunFacts, RunIntrospection, RunLaunch, RunSession,
+    ApiCore, FactSender, LaunchError, RunFacts, RunIntrospection, RunLaunch, RunSession,
     RunTrigger, RunWorkerFactory, SessionAdmission, SessionBudget, SessionId, SessionOutcome,
     SessionProvider, SessionRuntime,
 };
@@ -361,12 +361,11 @@ fn report(
         return SessionOutcome::Failed;
     };
 
-    let applied = core.machines_mut().apply_run(
+    let applied = core.report_run_lifecycle(
         run_id,
         trigger,
         &RunFacts {
             now: now(),
-            principal: Principal::Coordinator,
             ..RunFacts::default()
         },
     );

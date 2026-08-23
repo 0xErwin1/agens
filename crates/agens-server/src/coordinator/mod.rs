@@ -416,8 +416,8 @@ fn admission_loop(
                 // A tick that could not read the queue did nothing and is not
                 // fatal: the next occasion reads it again, and the runs it
                 // would have admitted are still queued where they were.
-                Ok(mut core) => scheduler
-                    .tick(core.machines_mut(), &launcher, &load)
+                Ok(mut core) => core
+                    .admit_queued_runs(&scheduler, &launcher, &load)
                     .map_or(true, |report| !report.failures.is_empty()),
                 Err(_) => true,
             };
@@ -464,7 +464,7 @@ fn timer_loop(
     std::thread::spawn(move || {
         while !stopping.load(Ordering::Acquire) {
             let (requeued, expired) = match core.lock() {
-                Ok(mut core) => match wheel.tick(core.machines_mut()) {
+                Ok(mut core) => match core.advance_timers(&wheel) {
                     Ok(tick) => (
                         !tick.quota_resets.is_empty(),
                         // Attributed while the core is still held, from the

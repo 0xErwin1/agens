@@ -415,14 +415,14 @@ fn the_deadline_a_checkpoint_declares_is_the_one_the_timer_wheel_holds_it_to() {
 
     let (wheel, clock) = TimerWheel::with_manual_clock_for_test(TimerSettings::default(), NOW);
 
-    let tick = wheel.tick(core.lock().unwrap().machines_mut()).unwrap();
+    let tick = core.lock().unwrap().advance_timers(&wheel).unwrap();
     assert!(
         tick.overdue_checkpoints.is_empty(),
         "a promise that has not come due yet is not overdue: {tick:?}"
     );
 
     clock.set(NOW + 100_000);
-    let tick = wheel.tick(core.lock().unwrap().machines_mut()).unwrap();
+    let tick = core.lock().unwrap().advance_timers(&wheel).unwrap();
 
     assert_eq!(
         tick.overdue_checkpoints
