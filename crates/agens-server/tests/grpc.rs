@@ -138,6 +138,10 @@ impl SessionControl for StubSessions {
         Ok(())
     }
 
+    fn suspend(&self, _run_id: i64) -> Result<(), PortError> {
+        Ok(())
+    }
+
     fn take_over(&self, run_id: i64) -> Result<TakeoverHandle, PortError> {
         Ok(TakeoverHandle {
             run_id,

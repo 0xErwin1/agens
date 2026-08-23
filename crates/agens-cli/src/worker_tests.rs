@@ -175,16 +175,19 @@ fn script(promised_at: i64) -> Script {
             "ask",
             r#"{"blocked_decision":"keep the options as JSON or split them into a table","options":[{"id":"keep","label":"keep the JSON array"},{"id":"split","label":"split it into its own table"}],"recommendation":"split"}"#,
         ),
-        ScriptedTurn::text("parked on the question"),
+        // One turn after the ask, and only one: parking suspends the session
+        // the run parked from, so the worker that asked makes no further call
+        // and the next one comes from the session the answer resumes.
         ScriptedTurn::text("the options now live in their own table"),
     ])
 }
 
 /// How many requests the script spends before the run parks: the write, the
-/// checkpoint, the bash call, the `ask` and the text the parked turn ends on.
-/// The next one is the resumed turn's.
+/// checkpoint, the bash call and the `ask`. The next one is the resumed turn's,
+/// because parking suspends the session that asked rather than letting it end
+/// its turn on one more call.
 const fn requests_before_the_answer() -> usize {
-    5
+    4
 }
 
 /// Whether this request carries the answer as its own message.

@@ -27,7 +27,7 @@ use agens_store::{
 };
 
 use crate::api::ApiCore;
-use crate::fsm::{Principal, RunFacts, RunTrigger, TransitionRejection};
+use crate::fsm::{Principal, RunEffect, RunFacts, RunTrigger, TransitionRejection};
 use crate::ingest::{
     Attribution, CheckpointClaim, FactSender, IngestFact, ReportedCheckpoint, ReportedFact,
 };
@@ -35,6 +35,9 @@ use crate::timers::CHECKPOINT_EVENT;
 
 /// Reads the current time as epoch seconds.
 pub type Clock = Arc<dyn Fn() -> i64 + Send + Sync>;
+
+/// The journal entry a suspension the sessions port refused is recorded as.
+pub const SESSION_SUSPEND_REFUSED_EVENT: &str = "session_suspend_refused";
 
 /// Resolves the physical execution the reports are coming from.
 ///
@@ -297,8 +300,9 @@ impl RunIntrospectionPort for RunIntrospection {
         let now = self.now();
         let question = self.question_row(ask, now);
 
-        let outcome = self
-            .core()?
+        let mut core = self.core()?;
+
+        let outcome = core
             .machines_mut()
             .apply_run(
                 self.run_id,
@@ -313,6 +317,32 @@ impl RunIntrospectionPort for RunIntrospection {
                 },
             )
             .map_err(refused)?;
+
+        // The run parked, so the session behind it is asked to stop. It is
+        // asked rather than fails the call: the worker is inside this very tool
+        // call, cancellation is cooperative, and the question is already
+        // durable — the ask succeeded whether or not the session hears about it
+        // before the turn ends.
+        if outcome
+            .applied()
+            .is_some_and(|applied| applied.effects.contains(&RunEffect::SuspendSession))
+            && let Err(error) = core.ports().sessions.suspend(self.run_id)
+        {
+            // A suspension that could not be performed leaves a session
+            // running behind a parked run, which is the state this exists to
+            // end. It is journaled rather than raised, so the record of it
+            // outlives the turn that failed to stop.
+            let _ = core.machines_mut().journal(&[EventRow {
+                id: None,
+                run_id: Some(self.run_id),
+                event_type: SESSION_SUSPEND_REFUSED_EVENT.to_owned(),
+                class: EventClass::Infra,
+                payload: serde_json::json!({ "reason": error.to_string() }).to_string(),
+                ts: now,
+            }]);
+        }
+
+        drop(core);
 
         let question_id = outcome
             .applied()

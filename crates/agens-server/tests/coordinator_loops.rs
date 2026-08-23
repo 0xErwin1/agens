@@ -125,11 +125,13 @@ fn a_shutdown_does_not_wait_out_the_failed_launch_backoff() {
 
     let runtime = runtime();
     let (worker, attempts) = counting_refusals();
+    let shutdown = agens_core::HeadlessTurnCancellation::new();
     let coordinator = Coordinator::start(
         &directory,
         &CoordinatorSettings::default(),
         SessionSupervisor::new(runtime.handle().clone()),
         worker,
+        &shutdown,
     )
     .expect("the coordinator composes over the data directory");
 
@@ -198,11 +200,13 @@ fn the_facts_of_the_last_window_are_ingested_on_the_way_out() {
 
     let runtime = runtime();
     let (worker, _) = counting_refusals();
+    let shutdown = agens_core::HeadlessTurnCancellation::new();
     let coordinator = Coordinator::start(
         &directory,
         &settings,
         SessionSupervisor::new(runtime.handle().clone()),
         worker,
+        &shutdown,
     )
     .expect("the coordinator composes over the data directory");
 

@@ -15,7 +15,7 @@ use agens_server::{
     CORE_POISONED_EVENT, Coordinator, CoordinatorSettings, LaunchError, RunLaunch, RunSession,
     RunWorkerFactory, SessionSupervisor,
 };
-use agens_store::{ControlPlaneStore, EventRow, RunRow, RunState};
+use agens_store::{ControlPlaneStore, EventRow, RunRow, RunState, WorktreeStatus};
 
 const REPO: &str = "a1b2c3d4e5f60718";
 const PROVIDER: &str = "scripted";
@@ -42,7 +42,13 @@ fn now() -> i64 {
         .map_or(0, |elapsed| i64::try_from(elapsed.as_secs()).unwrap_or(0))
 }
 
-fn queued_run() -> RunRow {
+/// A queued run with the worktree `CreateRun` provisions: admission reads that
+/// column, and a run whose directory is not `active` is never offered a slot,
+/// so the launcher this test needs to reach would never be called.
+fn queued_run(directory: &std::path::Path) -> RunRow {
+    let worktree = directory.join("worktrees").join(REPO).join("agn-186");
+    fs::create_dir_all(&worktree).unwrap();
+
     RunRow {
         id: None,
         repo_id: REPO.to_owned(),
@@ -59,8 +65,8 @@ fn queued_run() -> RunRow {
         dep_run_id: None,
         provider: PROVIDER.to_owned(),
         budget_tokens: None,
-        worktree_path: None,
-        worktree_status: None,
+        worktree_path: Some(worktree.display().to_string()),
+        worktree_status: Some(WorktreeStatus::Active),
         created_at: now(),
         result: None,
     }
@@ -106,7 +112,7 @@ fn a_poisoned_core_stops_the_daemon_instead_of_being_slept_through() {
 
     ControlPlaneStore::open(&directory)
         .expect("open the control plane")
-        .insert_run(&queued_run())
+        .insert_run(&queued_run(&directory))
         .expect("insert the run");
 
     let runtime = tokio::runtime::Builder::new_multi_thread()

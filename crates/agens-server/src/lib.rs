@@ -84,7 +84,9 @@ pub use ingest::{
     ReportedCheckpoint, ReportedFact, channel as ingest_channel,
 };
 pub use instance::{ServeInstance, ServeInstanceError, socket_path};
-pub use introspection::{AttemptResolver, CheckpointReporting, Clock, RunIntrospection};
+pub use introspection::{
+    AttemptResolver, CheckpointReporting, Clock, RunIntrospection, SESSION_SUSPEND_REFUSED_EVENT,
+};
 pub use policy::{HookTrust, PendingHookTrust, PolicyError, PolicyStore, RepositoryPolicy};
 pub use ports::GitWorktreeGate;
 pub use scheduler::{

@@ -61,6 +61,25 @@ impl SupervisedSessions {
             .map(SessionId::new))
     }
 
+    /// The session a run was last executing in, whatever state the run is in
+    /// now.
+    ///
+    /// Read without the liveness filter [`Self::live_session`] applies, because
+    /// a suspension is performed after the transition that parked the run: by
+    /// then the run has left `running` and the attempt it ran under is closed,
+    /// and the session that is still burning a provider is precisely the one
+    /// that attempt names.
+    fn last_session(&self, run_id: i64) -> Result<Option<SessionId>, PortError> {
+        let store = self.locked()?;
+
+        Ok(store
+            .attempts_for_run(run_id)
+            .map_err(storage)?
+            .last()
+            .and_then(|attempt| attempt.session_id)
+            .map(SessionId::new))
+    }
+
     /// Every run of one repository that is executing right now.
     fn live_sessions_in(&self, repo_id: &str) -> Result<Vec<SessionId>, PortError> {
         let runs = self
@@ -106,6 +125,15 @@ impl SessionControl for SupervisedSessions {
     /// stopped as cancelling it would make it, so nothing is reported.
     fn cancel(&self, run_id: i64) -> Result<(), PortError> {
         match self.live_session(run_id)? {
+            Some(session) => self.cancel_session(session),
+            None => Ok(()),
+        }
+    }
+
+    /// Stops the session a parked run left behind. A run whose session already
+    /// ended is already as suspended as this would make it.
+    fn suspend(&self, run_id: i64) -> Result<(), PortError> {
+        match self.last_session(run_id)? {
             Some(session) => self.cancel_session(session),
             None => Ok(()),
         }

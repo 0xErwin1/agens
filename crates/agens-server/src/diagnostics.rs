@@ -191,6 +191,7 @@ fn text<'a>(payload: &'a serde_json::Value, field: &str) -> &'a str {
 const fn deferral_reason(deferral: &Deferral) -> &'static str {
     match deferral {
         Deferral::Ineligible(Ineligible::ProviderCapped { .. }) => "provider_capped",
+        Deferral::Ineligible(Ineligible::WorktreeNotReady { .. }) => "worktree_not_ready",
         Deferral::Ineligible(Ineligible::DependencyPending { .. }) => "dependency_pending",
         Deferral::MaxConcurrent { .. } => "max_concurrent",
         Deferral::WorktreeCeiling { .. } => "worktree_ceiling",
