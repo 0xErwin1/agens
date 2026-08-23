@@ -7,15 +7,18 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agens_core::HeadlessTurnCancellation;
+use agens_server::grpc::proto::{self, feed_client::FeedClient};
 use agens_server::{
     CORE_POISONED_EVENT, Coordinator, CoordinatorSettings, LaunchError, RunLaunch, RunSession,
     RunWorkerFactory, SessionSupervisor,
 };
 use agens_store::{ControlPlaneStore, EventRow, RunRow, RunState, WorktreeStatus};
+use tonic::transport::{Endpoint, Uri};
 
 const REPO: &str = "a1b2c3d4e5f60718";
 const PROVIDER: &str = "scripted";
@@ -85,6 +88,73 @@ fn panicking_worker() -> RunWorkerFactory {
     ) as RunWorkerFactory
 }
 
+/// A port that refuses every launch until it is armed, and panics after that.
+///
+/// Refusing keeps the run queued, so the tick that panics is one the test
+/// chose: an admission loop offers the same queued run a slot on every
+/// heartbeat, and a launch that succeeded would leave nothing to launch again.
+fn worker_that_panics_once_armed(armed: Arc<AtomicBool>) -> RunWorkerFactory {
+    std::sync::Arc::new(
+        move |_launch: &RunLaunch<'_>| -> Result<RunSession, LaunchError> {
+            assert!(
+                !armed.load(Ordering::Acquire),
+                "an effects port gave up while holding the core"
+            );
+
+            Err(LaunchError(
+                "this launch is not the one under test".to_owned(),
+            ))
+        },
+    ) as RunWorkerFactory
+}
+
+/// Waits until the facade answers one request, which is the moment the daemon
+/// is serving rather than composing.
+fn answer_one_client(socket: &Path) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a client runtime");
+
+    runtime.block_on(async {
+        let deadline = Instant::now() + PATIENCE;
+
+        while Instant::now() < deadline {
+            if let Ok(channel) = connect(socket).await
+                && FeedClient::new(channel)
+                    .tree(proto::TreeRequest {
+                        repo_id: REPO.to_owned(),
+                    })
+                    .await
+                    .is_ok()
+            {
+                return;
+            }
+
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        panic!("the facade never answered a client");
+    });
+}
+
+async fn connect(socket: &Path) -> Result<tonic::transport::Channel, tonic::transport::Error> {
+    let path = socket.to_path_buf();
+
+    Endpoint::try_from("http://localhost")
+        .expect("a well-formed authority")
+        .connect_with_connector(tower::service_fn(move |_: Uri| {
+            let path = path.clone();
+
+            async move {
+                let stream = tokio::net::UnixStream::connect(path).await?;
+
+                Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(stream))
+            }
+        }))
+        .await
+}
+
 fn journalled_poisonings(directory: &Path) -> Vec<EventRow> {
     ControlPlaneStore::open(directory)
         .expect("reopen the control plane")
@@ -104,6 +174,78 @@ fn recorded_diagnostics(directory: &Path) -> String {
         .flatten()
         .filter_map(|entry| fs::read_to_string(entry.path()).ok())
         .collect()
+}
+
+/// A daemon that came down on a poisoned core did not stop cleanly, and a
+/// process supervisor is the only party that can put a working one back.
+///
+/// The exit is what reaches it: `Restart=on-failure` reads a status, not a
+/// journal, so a fatal stop that returned the same success a clean shutdown
+/// returns leaves the machine with no daemon and nothing restarting it. The
+/// socket is still released on the way out, because the next daemon has to be
+/// able to bind it.
+#[test]
+fn a_daemon_that_stopped_on_a_poisoned_core_says_so_to_whoever_started_it() {
+    let directory = scratch_directory("serve");
+
+    ControlPlaneStore::open(&directory)
+        .expect("open the control plane")
+        .insert_run(&queued_run(&directory))
+        .expect("insert the run");
+
+    let shutdown = HeadlessTurnCancellation::new();
+    let poison = Arc::new(AtomicBool::new(false));
+
+    // Held back until the facade has answered a client, so the poisoning is
+    // the one this test is about — a core taken from under a serving daemon —
+    // rather than one taken during composition, which is a refusal to start.
+    let arming = std::thread::spawn({
+        let socket = agens_server::socket_path(&directory);
+        let poison = Arc::clone(&poison);
+
+        move || {
+            answer_one_client(&socket);
+            poison.store(true, Ordering::Release);
+        }
+    });
+
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+
+    let refused = agens_server::serve_until_shutdown(
+        &directory,
+        &CoordinatorSettings {
+            heartbeat: Duration::from_millis(25),
+            ..CoordinatorSettings::default()
+        },
+        worker_that_panics_once_armed(poison),
+        &shutdown,
+    )
+    .expect_err("a daemon whose core was poisoned did not stop cleanly");
+
+    std::panic::set_hook(previous);
+    arming.join().expect("the client thread finishes");
+
+    let cause = match &refused {
+        agens_server::ServerError::Unavailable(cause) => cause.clone(),
+        other => panic!("{other:?}"),
+    };
+
+    assert!(
+        cause.contains("poisoned"),
+        "what stopped the daemon travels to its supervisor: {cause}"
+    );
+    assert!(
+        !agens_server::socket_path(&directory).exists(),
+        "the socket is released, so the daemon a supervisor starts next can bind it"
+    );
+    assert_eq!(
+        journalled_poisonings(&directory).len(),
+        1,
+        "one poisoning is one entry"
+    );
+
+    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]

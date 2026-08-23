@@ -51,7 +51,7 @@ use agens_permissions::{PermissionPromptAnswer, PermissionPromptContext, Permiss
 use agens_server::{
     ApiCore, FactSender, LaunchError, RunFacts, RunIntrospection, RunLaunch, RunSession,
     RunTrigger, RunWorkerFactory, SessionAdmission, SessionBudget, SessionId, SessionOutcome,
-    SessionProvider, SessionRuntime,
+    SessionProvider, SessionRuntime, TurnFailure,
 };
 use agens_store::{ControlPlaneStore, RunRow, RunState, SessionStore};
 
@@ -67,6 +67,35 @@ const ADMISSION_PATIENCE: Duration = Duration::from_secs(30);
 
 /// How often that wait looks again.
 const ADMISSION_POLL: Duration = Duration::from_millis(20);
+
+/// The longest a run parks on one refusal, unless the operator configured a
+/// longer window.
+///
+/// A named reset arrives from the provider's own headers and nothing between
+/// the socket and here bounds it: the header is read with no cap, its seconds
+/// saturate at `u32::MAX`, and a refusal that named a century would park the
+/// provider for one. A day is the far side of what any subscription cap is
+/// worth waiting out, and coming back early costs one refused request.
+const QUOTA_PARK_CEILING_SECONDS: i64 = 86_400;
+
+/// The longest park this daemon honours: the fixed ceiling, or the operator's
+/// window when they configured a longer one.
+///
+/// The window is what lifts a cap that named no reset at all, so parking for
+/// less than it would bring runs back before the daemon's own idea of a cap
+/// has passed.
+const fn quota_park_ceiling(quota_window_seconds: i64) -> i64 {
+    if quota_window_seconds > QUOTA_PARK_CEILING_SECONDS {
+        quota_window_seconds
+    } else {
+        QUOTA_PARK_CEILING_SECONDS
+    }
+}
+
+/// The reset this daemon parks on, given what the provider named.
+fn honoured_reset(reset_after_seconds: u32, ceiling: i64) -> i64 {
+    i64::from(reset_after_seconds).min(ceiling)
+}
 
 /// The factory `agens serve` gives the daemon: how a run becomes a session.
 #[must_use]
@@ -96,6 +125,8 @@ fn build_session(bootstrap: &Bootstrap, launch: &RunLaunch<'_>) -> Result<RunSes
         model: model.clone(),
         facts: launch.facts.clone(),
         data_directory: launch.data_directory.clone(),
+        quota_window_seconds: agens_config::TeamSettings::from(bootstrap.settings())
+            .quota_window_seconds,
     };
     let core = Arc::clone(&launch.core);
 
@@ -136,6 +167,9 @@ struct ExecutingRun {
     /// evidence has into run health.
     facts: FactSender,
     data_directory: PathBuf,
+    /// `team.quota_window_seconds`, which is the floor of how long a park on
+    /// this run's provider may last.
+    quota_window_seconds: i64,
 }
 
 /// The provider client the registry lists this session under.
@@ -314,10 +348,15 @@ fn execute(
 
     match (completion, quota) {
         (Ok(completion), _) => finish(core, run.run_id, &completion.text),
-        (Err(_), Some(reset_after_seconds)) => {
-            park_on_quota(core, run, &reported, reset_after_seconds)
-        }
-        (Err(_), None) => stopped(core, run.run_id),
+        (Err(_), Some(reset_after_seconds)) => park_on_quota(
+            core,
+            run,
+            &reported,
+            reset_after_seconds.map(|seconds| {
+                honoured_reset(seconds, quota_park_ceiling(run.quota_window_seconds))
+            }),
+        ),
+        (Err(failure), None) => stopped(core, run.run_id, &failure.error),
     }
 }
 
@@ -352,7 +391,7 @@ fn park_on_quota(
     core: &Arc<Mutex<ApiCore>>,
     run: &ExecutingRun,
     reported: &Arc<WorkerFacts>,
-    reset_after_seconds: Option<u32>,
+    reset_after_seconds: Option<i64>,
 ) -> SessionOutcome {
     if state_of(core, run.run_id) != Some(RunState::Running) {
         // Cancelled, or already moved by something else. The run is where that
@@ -382,8 +421,7 @@ fn park_on_quota(
             // control plane stores deadlines and reads no clock of its own. A
             // refusal that named nothing records none, and the configured
             // window is what lifts that cap.
-            quota_reset_at: reset_after_seconds
-                .map(|seconds| now.saturating_add(i64::from(seconds))),
+            quota_reset_at: reset_after_seconds.map(|seconds| now.saturating_add(seconds)),
             ..RunFacts::default()
         },
     );
@@ -403,7 +441,7 @@ fn park_on_quota(
 /// does not already say.
 fn quota_checkpoint(
     run: &ExecutingRun,
-    reset_after_seconds: Option<u32>,
+    reset_after_seconds: Option<i64>,
 ) -> Result<Checkpoint, agens_core::run_introspection::CheckpointError> {
     let reset = reset_after_seconds.map_or_else(
         || "and named no reset time".to_owned(),
@@ -439,20 +477,88 @@ fn quota_checkpoint(
 /// successful park looks from here. A run that left `running` stopped where a
 /// transition put it, and calling that attempt a failure would both contradict
 /// the row and spend a retry the park does not cost.
-fn stopped(core: &Arc<Mutex<ApiCore>>, run_id: i64) -> SessionOutcome {
-    match state_of(core, run_id) {
-        // The failure is already recorded in the run's diagnostics and in the
-        // attempt the turn wrote; what the control plane needs is that this
-        // attempt did not succeed.
-        Some(RunState::Running) => report(
-            core,
-            run_id,
-            RunTrigger::AttemptFailed,
-            SessionOutcome::Failed,
-        ),
-        Some(_) => SessionOutcome::Completed,
-        None => SessionOutcome::Failed,
+///
+/// Which is only true of the two states a park leaves. Every other state the
+/// run could be in means the turn failed after something else moved it, and
+/// reporting that session completed would credit a failure to whatever moved
+/// the run. The cause goes in the journal first: it is the only account of why
+/// the turn ended, and the transition the session reports does not carry it.
+fn stopped(
+    core: &Arc<Mutex<ApiCore>>,
+    run_id: i64,
+    failure: &agens_error::CliError,
+) -> SessionOutcome {
+    let state = state_of(core, run_id);
+    let outcome = outcome_after_failed_turn(state, ended_itself(failure));
+
+    if outcome == SessionOutcome::Failed {
+        journal_turn_failure(core, run_id, state, failure);
     }
+
+    match state {
+        Some(RunState::Running) => report(core, run_id, RunTrigger::AttemptFailed, outcome),
+        _ => outcome,
+    }
+}
+
+/// Whether the turn ended because something inside the session ended it.
+///
+/// Both park paths look like this from here: an `ask` and a denylisted call
+/// each move the run and then cancel the turn, so a cancelled turn says the
+/// session did what it meant to and the run is wherever that left it.
+fn ended_itself(failure: &agens_error::CliError) -> bool {
+    matches!(
+        failure.runtime_error(),
+        Some(agens_core::HeadlessTurnError::Cancelled)
+    )
+}
+
+/// What the session's outcome is, given where the run's row ended up and
+/// whether the turn ended itself.
+///
+/// `awaiting_input` and `awaiting_quota` are the two states a turn parks the
+/// run in, and both are the session doing its job — as is any state the run has
+/// moved on to since, because an answer arriving while the turn was still
+/// returning requeues it. `cancelled` is not this session's failure either: it
+/// is what somebody asked for while the turn was running.
+///
+/// Every other state means the turn failed after something else had moved the
+/// run, and reporting that as completed would credit the failure to whatever
+/// moved it.
+const fn outcome_after_failed_turn(state: Option<RunState>, ended_itself: bool) -> SessionOutcome {
+    match state {
+        Some(RunState::AwaitingInput | RunState::AwaitingQuota) => SessionOutcome::Completed,
+        Some(RunState::Cancelled) => SessionOutcome::Cancelled,
+        Some(RunState::Running) | None => SessionOutcome::Failed,
+        Some(_) if ended_itself => SessionOutcome::Completed,
+        Some(_) => SessionOutcome::Failed,
+    }
+}
+
+/// Writes down what ended the turn.
+///
+/// Best effort, and deliberately not something the outcome depends on: a run
+/// whose cause could not be journaled is still a run whose session failed, and
+/// refusing to report that would leave the row saying the work is executing.
+fn journal_turn_failure(
+    core: &Arc<Mutex<ApiCore>>,
+    run_id: i64,
+    state: Option<RunState>,
+    failure: &agens_error::CliError,
+) {
+    let Ok(mut core) = core.lock() else {
+        return;
+    };
+
+    let _ = core.journal_turn_failure(
+        run_id,
+        &TurnFailure {
+            category: failure.category,
+            detail: &failure.message,
+            state,
+            now: now(),
+        },
+    );
 }
 
 /// Reports a turn that came back, given what the run's own row now says.
@@ -811,4 +917,104 @@ fn now() -> i64 {
         .map_or(0, |elapsed| {
             i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX)
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use agens_server::SessionOutcome;
+    use agens_store::RunState;
+
+    use super::{
+        QUOTA_PARK_CEILING_SECONDS, honoured_reset, outcome_after_failed_turn, quota_park_ceiling,
+    };
+
+    #[test]
+    fn a_turn_that_parked_the_run_is_a_session_that_did_its_job() {
+        for state in [RunState::AwaitingInput, RunState::AwaitingQuota] {
+            for ended_itself in [true, false] {
+                assert_eq!(
+                    outcome_after_failed_turn(Some(state), ended_itself),
+                    SessionOutcome::Completed,
+                    "{state:?} is where a turn parks the run on purpose"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_answer_that_arrived_before_the_parking_turn_returned_is_not_a_failure() {
+        assert_eq!(
+            outcome_after_failed_turn(Some(RunState::Queued), true),
+            SessionOutcome::Completed,
+            "the park worked and the answer requeued the run while the turn was returning"
+        );
+    }
+
+    #[test]
+    fn a_turn_that_failed_after_the_run_moved_is_not_reported_as_completed() {
+        for state in [
+            RunState::Running,
+            RunState::Queued,
+            RunState::Draft,
+            RunState::Done,
+            RunState::Failed,
+            RunState::Interrupted,
+        ] {
+            assert_eq!(
+                outcome_after_failed_turn(Some(state), false),
+                SessionOutcome::Failed,
+                "a provider that failed with the run in {state:?} failed this session"
+            );
+        }
+
+        assert_eq!(
+            outcome_after_failed_turn(Some(RunState::Running), true),
+            SessionOutcome::Failed,
+            "a turn that ended itself and left the run running failed its attempt"
+        );
+        assert_eq!(
+            outcome_after_failed_turn(None, true),
+            SessionOutcome::Failed,
+            "a run that cannot be read says nothing that would excuse the turn"
+        );
+    }
+
+    #[test]
+    fn a_run_somebody_cancelled_did_not_fail() {
+        assert_eq!(
+            outcome_after_failed_turn(Some(RunState::Cancelled), true),
+            SessionOutcome::Cancelled
+        );
+    }
+
+    #[test]
+    fn a_reset_within_the_ceiling_is_honoured_as_the_provider_named_it() {
+        assert_eq!(honoured_reset(900, QUOTA_PARK_CEILING_SECONDS), 900);
+    }
+
+    #[test]
+    fn a_forged_reset_parks_the_run_for_the_ceiling_rather_than_for_a_century() {
+        assert_eq!(
+            honoured_reset(u32::MAX, QUOTA_PARK_CEILING_SECONDS),
+            QUOTA_PARK_CEILING_SECONDS,
+            "a header nothing bounds cannot park a provider past what an operator would wait"
+        );
+    }
+
+    #[test]
+    fn a_window_longer_than_the_ceiling_is_what_the_ceiling_becomes() {
+        let window = QUOTA_PARK_CEILING_SECONDS * 2;
+
+        assert_eq!(
+            quota_park_ceiling(window),
+            window,
+            "an operator who configured a longer window meant it"
+        );
+        assert_eq!(honoured_reset(u32::MAX, quota_park_ceiling(window)), window);
+    }
+
+    #[test]
+    fn a_window_shorter_than_the_ceiling_does_not_shorten_it() {
+        assert_eq!(quota_park_ceiling(60), QUOTA_PARK_CEILING_SECONDS);
+    }
 }

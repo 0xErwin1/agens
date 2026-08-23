@@ -169,6 +169,12 @@ impl WorkerFacts {
     /// own facts: a turn that calls only `checkpoint` and `ask` reports no
     /// filesystem facts at all, and a correlation that waited for one would
     /// leave exactly the runs that behave well unattributable.
+    ///
+    /// Only an attempt that is still open. A turn that says something after
+    /// its own leg was closed — one still finishing while a transition ended
+    /// the attempt — would otherwise point the closed leg at this execution,
+    /// and every fact after that would be accepted against a leg the control
+    /// plane has already accounted for.
     fn correlate(&self) -> Option<Attribution> {
         let session_attempt_id = SessionStore::open(&self.data_directory)
             .ok()?
@@ -184,7 +190,8 @@ impl WorkerFacts {
             .store()
             .attempts_for_run(self.run_id)
             .ok()?
-            .pop()?;
+            .pop()
+            .filter(|attempt| attempt.ended_at.is_none())?;
         let attempt_id = attempt.id?;
 
         core.correlate_attempt(attempt_id, session_attempt_id)

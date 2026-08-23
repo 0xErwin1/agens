@@ -111,6 +111,110 @@ fn a_refused_stage_is_journaled_and_the_other_two_still_run() {
     );
 }
 
+/// The wheel ticks four times a second, and a condition that refuses a stage
+/// refuses it on every one of those ticks.
+///
+/// Journaling each occurrence buries the journal under the same sentence, which
+/// is the rule the queue journal already holds itself to: what an operator
+/// needs is the condition and the moment it started. The refusal is still
+/// carried back on every tick, because the wheel's caller decides what to do
+/// about a stage that is not running.
+#[test]
+fn a_refusal_that_stands_is_journaled_once_rather_than_on_every_tick() {
+    let (directory, mut store) = store_in_its_own_directory();
+
+    let parked = store
+        .insert_run(&run_in(RunState::AwaitingQuota, "anthropic"))
+        .unwrap();
+    store
+        .record_provider(&capped("anthropic", Some(START + 600)))
+        .unwrap();
+
+    refuse_leaving_awaiting_quota(&directory);
+
+    let mut machines = StateMachines::new(store);
+    let (wheel, clock) = TimerWheel::with_manual_clock_for_test(TimerSettings::default(), START);
+    clock.set(START + 900);
+
+    let first = wheel.tick(&mut machines);
+    let second = wheel.tick(&mut machines);
+    let third = wheel.tick(&mut machines);
+
+    assert_eq!(first.rejections.len(), 1);
+    assert_eq!(
+        second.rejections.len(),
+        1,
+        "the caller hears about the stage on every tick it did not run"
+    );
+    assert_eq!(
+        [
+            first.rejections[0].event_id,
+            second.rejections[0].event_id,
+            third.rejections[0].event_id
+        ],
+        [first.rejections[0].event_id; 3],
+        "every tick points at the entry that already stands"
+    );
+    assert_eq!(
+        rejection_entries(&machines).len(),
+        1,
+        "one standing condition is one entry"
+    );
+
+    // The condition passes, and comes back. What comes back is a new condition:
+    // an operator reading the journal sees when it started, both times.
+    allow_leaving_awaiting_quota(&directory);
+    let recovered = wheel.tick(&mut machines);
+    assert!(recovered.rejections.is_empty());
+    assert_eq!(state_of(&machines, parked), RunState::Queued);
+
+    park_again(&directory, parked);
+    refuse_leaving_awaiting_quota(&directory);
+    let again = wheel.tick(&mut machines);
+
+    assert_eq!(again.rejections.len(), 1);
+    assert_eq!(
+        rejection_entries(&machines).len(),
+        2,
+        "a condition that ended and started again is a second entry"
+    );
+}
+
+fn rejection_entries(machines: &StateMachines) -> Vec<agens_store::EventRow> {
+    machines
+        .store()
+        .events_after(0, 256)
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.event_type == TIMER_STAGE_REJECTED_EVENT)
+        .collect()
+}
+
+fn allow_leaving_awaiting_quota(directory: &std::path::Path) {
+    rusqlite::Connection::open(directory.join("agens.db"))
+        .unwrap()
+        .execute_batch("DROP TRIGGER refuse_quota_reset;")
+        .unwrap();
+}
+
+/// Puts the run and its provider back where the wheel finds them, without a
+/// transition: what this test needs is the same refusal a second time, not a
+/// lifecycle.
+fn park_again(directory: &std::path::Path, run_id: i64) {
+    ControlPlaneStore::open(directory)
+        .unwrap()
+        .record_provider(&capped("anthropic", Some(START + 600)))
+        .unwrap();
+
+    rusqlite::Connection::open(directory.join("agens.db"))
+        .unwrap()
+        .execute(
+            "UPDATE runs SET state = 'awaiting_quota' WHERE id = ?1",
+            [run_id],
+        )
+        .unwrap();
+}
+
 /// Aborts the one write the quota stage makes, which is what a run leaving
 /// `awaiting_quota` between the wheel's read and its apply does to it.
 fn refuse_leaving_awaiting_quota(directory: &std::path::Path) {

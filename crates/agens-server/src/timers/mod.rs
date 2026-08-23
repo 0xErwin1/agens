@@ -29,8 +29,9 @@
 //! production clock is the system's, in epoch seconds, matching every timestamp
 //! the control-plane tables store.
 
+use std::collections::BTreeMap;
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicI64, Ordering},
 };
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -203,7 +204,7 @@ pub struct TimerTick {
 }
 
 /// One of the three things a tick does, named so a refusal can say which.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TimerStage {
     QuotaResets,
     ExpiredQuestions,
@@ -231,10 +232,26 @@ pub struct RejectedStage {
     pub event_id: Option<i64>,
 }
 
+/// What the wheel has already written down about a stage that is not running.
+#[derive(Clone, Debug)]
+struct StandingRejection {
+    reason: String,
+    /// The entry that recorded it, or `None` when the journal itself could not
+    /// be written.
+    event_id: Option<i64>,
+}
+
 /// The single wheel.
 pub struct TimerWheel {
     clock: TimerClock,
     settings: TimerSettings,
+    /// The refusal standing against each stage, so a condition that holds is
+    /// journaled when it starts rather than on every tick it keeps holding.
+    ///
+    /// The one thing the wheel keeps between ticks, and it decides nothing: no
+    /// deadline is held here, and losing it to a restart costs one repeated
+    /// entry.
+    standing: Mutex<BTreeMap<TimerStage, StandingRejection>>,
 }
 
 impl TimerWheel {
@@ -243,6 +260,7 @@ impl TimerWheel {
         Self {
             clock: TimerClock::System,
             settings,
+            standing: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -259,6 +277,7 @@ impl TimerWheel {
             Self {
                 clock: TimerClock::Manual(Arc::clone(&state)),
                 settings,
+                standing: Mutex::new(BTreeMap::new()),
             },
             ManualTimerClock { state },
         )
@@ -291,9 +310,12 @@ impl TimerWheel {
         };
 
         match self.lift_elapsed_quota_caps(machines, now) {
-            Ok(resets) => tick.quota_resets = resets,
+            Ok(resets) => {
+                tick.quota_resets = resets;
+                self.stage_ran(TimerStage::QuotaResets);
+            }
             Err(rejection) => {
-                tick.rejections.push(record_rejection(
+                tick.rejections.push(self.record_rejection(
                     machines,
                     TimerStage::QuotaResets,
                     rejection,
@@ -303,9 +325,12 @@ impl TimerWheel {
         }
 
         match void_expired_questions(machines, now) {
-            Ok(expired) => tick.expired_questions = expired,
+            Ok(expired) => {
+                tick.expired_questions = expired;
+                self.stage_ran(TimerStage::ExpiredQuestions);
+            }
             Err(rejection) => {
-                tick.rejections.push(record_rejection(
+                tick.rejections.push(self.record_rejection(
                     machines,
                     TimerStage::ExpiredQuestions,
                     rejection,
@@ -315,9 +340,12 @@ impl TimerWheel {
         }
 
         match self.raise_overdue_checkpoints(machines, now) {
-            Ok(overdue) => tick.overdue_checkpoints = overdue,
+            Ok(overdue) => {
+                tick.overdue_checkpoints = overdue;
+                self.stage_ran(TimerStage::OverdueCheckpoints);
+            }
             Err(rejection) => {
-                tick.rejections.push(record_rejection(
+                tick.rejections.push(self.record_rejection(
                     machines,
                     TimerStage::OverdueCheckpoints,
                     rejection,
@@ -327,6 +355,84 @@ impl TimerWheel {
         }
 
         tick
+    }
+
+    /// Journals one refused stage and returns it for the caller to carry.
+    ///
+    /// Only what changed reaches the journal. The wheel ticks four times a
+    /// second and a condition that refuses a stage refuses it on every one of
+    /// those ticks, so an entry per occurrence would bury the feed under the
+    /// same sentence. A refusal that already stands is carried back pointing at
+    /// the entry that recorded it.
+    ///
+    /// A journal that cannot be written is recorded as such rather than turned
+    /// into a second failure: the rejection is what the caller has to hear
+    /// about, and losing it because the record of it could not be stored would
+    /// be the same silence this exists to end. Nothing stands after that, so
+    /// the next tick tries the entry again.
+    fn record_rejection(
+        &self,
+        machines: &mut StateMachines,
+        stage: TimerStage,
+        rejection: TransitionRejection,
+        now: i64,
+    ) -> RejectedStage {
+        let reason = rejection.to_string();
+
+        if let Some(standing) = self.standing_rejection(stage, &reason) {
+            return RejectedStage {
+                stage,
+                rejection,
+                event_id: standing.event_id,
+            };
+        }
+
+        let payload = serde_json::json!({
+            "stage": stage.as_str(),
+            "reason": reason,
+        });
+
+        let event_id = machines
+            .journal(&[EventRow {
+                id: None,
+                run_id: None,
+                event_type: TIMER_STAGE_REJECTED_EVENT.to_owned(),
+                class: EventClass::Infra,
+                payload: payload.to_string(),
+                ts: now,
+            }])
+            .ok()
+            .and_then(|ids| ids.first().copied());
+
+        if let Ok(mut standing) = self.standing.lock()
+            && event_id.is_some()
+        {
+            standing.insert(stage, StandingRejection { reason, event_id });
+        }
+
+        RejectedStage {
+            stage,
+            rejection,
+            event_id,
+        }
+    }
+
+    /// The refusal already recorded for `stage`, when it is this same one.
+    fn standing_rejection(&self, stage: TimerStage, reason: &str) -> Option<StandingRejection> {
+        self.standing
+            .lock()
+            .ok()?
+            .get(&stage)
+            .filter(|standing| standing.reason == reason)
+            .cloned()
+    }
+
+    /// A stage that ran ends whatever was standing against it, so the same
+    /// condition arriving again is a new one with its own moment.
+    fn stage_ran(&self, stage: TimerStage) {
+        if let Ok(mut standing) = self.standing.lock() {
+            standing.remove(&stage);
+        }
     }
 
     /// Requeues every run parked on a provider whose reset has arrived.
@@ -535,42 +641,6 @@ impl TimerWheel {
             .checked_div(100)?;
 
         i64::try_from(i128::from(checkpoint_ts).checked_add(granted)?).ok()
-    }
-}
-
-/// Journals one refused stage and returns it for the caller to carry.
-///
-/// A journal that cannot be written is recorded as such rather than turned into
-/// a second failure: the rejection is what the caller has to hear about, and
-/// losing it because the record of it could not be stored would be the same
-/// silence this exists to end.
-fn record_rejection(
-    machines: &mut StateMachines,
-    stage: TimerStage,
-    rejection: TransitionRejection,
-    now: i64,
-) -> RejectedStage {
-    let payload = serde_json::json!({
-        "stage": stage.as_str(),
-        "reason": rejection.to_string(),
-    });
-
-    let event_id = machines
-        .journal(&[EventRow {
-            id: None,
-            run_id: None,
-            event_type: TIMER_STAGE_REJECTED_EVENT.to_owned(),
-            class: EventClass::Infra,
-            payload: payload.to_string(),
-            ts: now,
-        }])
-        .ok()
-        .and_then(|ids| ids.first().copied());
-
-    RejectedStage {
-        stage,
-        rejection,
-        event_id,
     }
 }
 

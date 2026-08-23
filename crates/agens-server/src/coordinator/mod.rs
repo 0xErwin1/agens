@@ -205,6 +205,9 @@ pub struct Coordinator {
     admissions: Arc<Admissions>,
     facts: FactSender,
     stopping: Arc<AtomicBool>,
+    /// Read on the way out: what the loops were stopped by is not something
+    /// the stop flag itself records.
+    fatal: Arc<FatalCore>,
     loops: Vec<JoinHandle<()>>,
 }
 
@@ -295,7 +298,13 @@ impl Coordinator {
                 diagnostics.clone(),
                 Arc::clone(&fatal),
             ),
-            gates_loop(data_directory, settings, &core, &stopping, fatal),
+            gates_loop(
+                data_directory,
+                settings,
+                &core,
+                &stopping,
+                Arc::clone(&fatal),
+            ),
             ingest_loop(
                 data_directory,
                 settings,
@@ -312,17 +321,18 @@ impl Coordinator {
             admissions,
             facts,
             stopping,
+            fatal,
             loops,
         };
 
-        // Step 6, after the loops are up: a run coming back is something a
-        // watcher sees happen rather than finds already done. Assembled first
-        // so that a resume which cannot be applied stops the loops it would
-        // otherwise leave ticking behind a composition that failed.
+        // Step 5, after the loops are up and before the facade answers anyone.
+        // Assembled first so that a resume which cannot be applied stops the
+        // loops it would otherwise leave ticking behind a composition that
+        // failed.
         coordinator.resume_reconciled()
     }
 
-    /// Step 6, through the same core the loops tick against.
+    /// Step 5, through the same core the loops tick against.
     fn resume_reconciled(mut self) -> Result<Self, CoordinatorError> {
         let resumed = match self.core.lock() {
             Ok(mut core) => reconcile::resume_interrupted(core.machines_mut(), now())
@@ -344,7 +354,7 @@ impl Coordinator {
                 Ok(self)
             }
             Err(error) => {
-                self.stop();
+                let _ = self.stop();
 
                 Err(error)
             }
@@ -369,18 +379,25 @@ impl Coordinator {
         &self.facts
     }
 
-    /// Stops the loops and waits for them.
+    /// Stops the loops, waits for them, and reports whether the core was left
+    /// poisoned.
     ///
     /// Takes the coordinator by value: after this the core is still readable
     /// through the handles already given out, and nothing is ticking against
     /// it, which is exactly the state a shutdown wants.
-    pub fn stop(self) {
+    ///
+    /// The poisoning is read after the loops are joined rather than before,
+    /// because a loop that discovers it while the shutdown is already running
+    /// discovers it all the same.
+    pub fn stop(self) -> bool {
         self.stopping.store(true, Ordering::Release);
         self.admissions.wake();
 
         for handle in self.loops {
             let _ = handle.join();
         }
+
+        self.fatal.reported()
     }
 }
 

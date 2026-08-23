@@ -6,6 +6,8 @@
 //! of every project on the machine.
 
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
 use std::time::{Duration, Instant};
 
@@ -33,14 +35,95 @@ const FORWARD_PATIENCE: Duration = Duration::from_secs(30);
 /// How often the forwarder looks again at a client whose buffer is full.
 const FORWARD_POLL: Duration = Duration::from_millis(10);
 
+/// How many subscriptions the daemon forwards at once.
+///
+/// One forwarder is one operating-system thread, so an unbounded number of
+/// subscriptions is an unbounded number of threads: a client that opens them
+/// in a loop costs the daemon a stack apiece until the process cannot spawn
+/// another, and what fails then is whatever asked for a thread next, not the
+/// client that took them. Well past what any number of attached clients wants,
+/// and far short of what a machine will not give.
+const LIVE_SUBSCRIPTIONS: usize = 64;
+
+/// The ceiling on live forwarders, and the slots taken against it.
+///
+/// A slot is held by the forwarder rather than by the subscription: what costs
+/// the thread is the forwarding, and it is over exactly when the thread ends,
+/// however it ends.
+#[derive(Debug)]
+struct SubscriptionSlots {
+    live: AtomicUsize,
+    ceiling: usize,
+}
+
+impl SubscriptionSlots {
+    const fn new(ceiling: usize) -> Self {
+        Self {
+            live: AtomicUsize::new(0),
+            ceiling,
+        }
+    }
+
+    /// Takes one slot, or `None` when the ceiling is already reached.
+    fn take(self: &Arc<Self>) -> Option<SubscriptionSlot> {
+        let mut live = self.live.load(Ordering::Acquire);
+
+        loop {
+            if live >= self.ceiling {
+                return None;
+            }
+
+            match self.live.compare_exchange_weak(
+                live,
+                live + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Some(SubscriptionSlot {
+                        slots: Arc::clone(self),
+                    });
+                }
+                Err(current) => live = current,
+            }
+        }
+    }
+}
+
+/// One live forwarder's claim on a slot, released when it ends.
+#[derive(Debug)]
+struct SubscriptionSlot {
+    slots: Arc<SubscriptionSlots>,
+}
+
+impl Drop for SubscriptionSlot {
+    fn drop(&mut self) {
+        self.slots.live.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 pub struct FeedFacade {
     core: CoreHandle,
+    slots: Arc<SubscriptionSlots>,
 }
 
 impl FeedFacade {
     #[must_use]
-    pub const fn new(core: CoreHandle) -> Self {
-        Self { core }
+    pub fn new(core: CoreHandle) -> Self {
+        Self::with_subscription_ceiling(core, LIVE_SUBSCRIPTIONS)
+    }
+
+    /// A facade that forwards at most `ceiling` subscriptions at once.
+    ///
+    /// Exists for the tests that drive the ceiling itself: reaching the
+    /// production one over the wire would mean opening sixty-four streams to
+    /// assert about the sixty-fifth.
+    #[must_use]
+    pub fn with_subscription_ceiling(core: CoreHandle, ceiling: usize) -> Self {
+        Self {
+            core,
+            slots: Arc::new(SubscriptionSlots::new(ceiling)),
+        }
     }
 }
 
@@ -71,6 +154,16 @@ impl Feed for FeedFacade {
         let request = request.into_inner();
         let classes = convert::event_classes(&request.classes)?;
 
+        // Before the subscription is opened rather than after: a subscription
+        // the core registered and nothing forwards is an entry queued for a
+        // reader that will never come, held against the fan-out's backlog.
+        let Some(slot) = self.slots.take() else {
+            return Err(Status::resource_exhausted(
+                "this daemon is forwarding as many subscriptions as it can; \
+                 close one before opening another",
+            ));
+        };
+
         let filter = EventFilter {
             repo_id: request.repo_id,
             run_id: request.run_id,
@@ -86,6 +179,10 @@ impl Feed for FeedFacade {
         let patience = FORWARD_PATIENCE;
 
         std::thread::spawn(move || {
+            // Moved into the forwarder so the slot is released by the thread
+            // ending, whichever of the three ways it ends.
+            let _slot = slot;
+
             loop {
                 match subscription.recv_timeout(patience) {
                     Ok(event) if forward(&sender, convert::event(&event), patience) => {}
@@ -193,6 +290,41 @@ fn repository(repo_id: String) -> Result<String, Status> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_daemon_forwards_for_as_many_subscriptions_as_it_has_threads_for() {
+        let slots = Arc::new(SubscriptionSlots::new(2));
+
+        let first = slots.take().expect("the first subscription fits");
+        let second = slots.take().expect("the second subscription fits");
+
+        assert!(
+            slots.take().is_none(),
+            "a subscription past the ceiling is refused rather than given a thread"
+        );
+
+        drop(first);
+
+        assert!(
+            slots.take().is_some(),
+            "a stream that ended gave its thread back"
+        );
+
+        drop(second);
+    }
+
+    #[test]
+    fn a_refused_subscription_takes_no_slot_with_it() {
+        let slots = Arc::new(SubscriptionSlots::new(1));
+        let held = slots.take().expect("the first subscription fits");
+
+        assert!(slots.take().is_none());
+        assert!(slots.take().is_none(), "a refusal is not a reservation");
+
+        drop(held);
+
+        assert!(slots.take().is_some());
+    }
 
     fn entry(id: i64) -> Result<proto::Event, Status> {
         Ok(proto::Event {

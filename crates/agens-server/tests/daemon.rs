@@ -503,6 +503,86 @@ async fn collect_streamed(events: &mut tonic::Streaming<proto::Event>) -> Vec<St
     seen
 }
 
+/// Work the last process left behind is already back in the queue by the time
+/// a client can ask about it.
+///
+/// The reconciliation is finished before the facade answers anything, so the
+/// first thing a client can read is a reconciled control plane rather than a
+/// row describing a session that no longer exists. Nothing about it reaches a
+/// subscriber: a subscription is live from the moment it is registered, and no
+/// client is attached while a daemon is still booting, which is why the run's
+/// own detail is where a watcher finds it.
+#[test]
+fn the_first_answer_a_client_gets_is_from_a_reconciled_control_plane() {
+    let directory = scratch_directory("reconciled");
+    let worktree = directory.join("worktrees").join(REPO).join("agn-192");
+    fs::create_dir_all(&worktree).expect("provision the run's worktree");
+
+    let run_id = {
+        let mut store = ControlPlaneStore::open(&directory).expect("open the control plane");
+        let run_id = store
+            .insert_run(&proposed_run(&worktree))
+            .expect("insert the run");
+
+        // What a killed daemon leaves: a row that says a session is executing
+        // this run, and no session anywhere executing it.
+        rusqlite::Connection::open(store.database_path())
+            .expect("open the control plane directly")
+            .execute("UPDATE runs SET state = 'running' WHERE id = ?1", [run_id])
+            .expect("leave the run where a killed daemon leaves it");
+
+        run_id
+    };
+
+    let shutdown = HeadlessTurnCancellation::new();
+    let socket = agens_server::socket_path(&directory);
+    let stopper = Stopper(shutdown.clone());
+
+    let asking = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let stopper = stopper;
+
+        runtime.block_on(async move {
+            let mut feed = FeedClient::new(connect(socket).await);
+            let first = run_state(&mut feed, run_id).await;
+
+            drop(stopper);
+
+            first
+        })
+    });
+
+    let report = agens_server::serve_until_shutdown(
+        &directory,
+        &CoordinatorSettings {
+            heartbeat: Duration::from_millis(25),
+            ..CoordinatorSettings::default()
+        },
+        // Refusing every launch keeps the resumed run where reconciliation put
+        // it, so what the client reads is the boot pass rather than a session.
+        std::sync::Arc::new(|_launch: &RunLaunch<'_>| {
+            Err(LaunchError("this test starts no sessions".to_owned()))
+        }) as RunWorkerFactory,
+        &shutdown,
+    )
+    .expect("the daemon serves");
+
+    let first = asking.join().expect("the client thread finishes");
+
+    assert!(report.is_clean(), "every session ended: {report:?}");
+    assert_eq!(
+        first, "queued",
+        "a run the last process left running is interrupted and requeued before \
+         the facade answers for it"
+    );
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
 /// A daemon that cannot compose says what stopped it.
 ///
 /// The whole of the operator's evidence is this one line: the refusal happens

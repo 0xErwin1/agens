@@ -14,7 +14,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use agens_core::HeadlessTurnCancellation;
 use agens_server::grpc::proto::{self, feed_client::FeedClient, team_client::TeamClient};
@@ -372,11 +372,23 @@ async fn connect_unix(path: PathBuf) -> tonic::transport::Channel {
         .unwrap()
 }
 
+/// The ceiling the wire is built with when a test is not about the ceiling.
+/// Higher than any test opens, so nothing else meets it.
+const SUBSCRIPTION_CEILING: usize = 16;
+
 async fn wire_for(principal: Principal) -> Wire {
     wire_with(principal, StubWorktrees::prompt()).await
 }
 
 async fn wire_with(principal: Principal, worktrees: StubWorktrees) -> Wire {
+    wire_forwarding(principal, worktrees, SUBSCRIPTION_CEILING).await
+}
+
+async fn wire_forwarding(
+    principal: Principal,
+    worktrees: StubWorktrees,
+    subscription_ceiling: usize,
+) -> Wire {
     let directory = scratch_directory(principal.as_str());
     let (store, fixture) = seeded_store(&directory);
     let repository = directory.join("checkout");
@@ -411,7 +423,9 @@ async fn wire_with(principal: Principal, worktrees: StubWorktrees) -> Wire {
             .add_service(proto::team_server::TeamServer::new(TeamFacade::new(
                 handle.clone(),
             )))
-            .add_service(proto::feed_server::FeedServer::new(FeedFacade::new(handle)))
+            .add_service(proto::feed_server::FeedServer::new(
+                FeedFacade::with_subscription_ceiling(handle, subscription_ceiling),
+            ))
             .serve_with_incoming_shutdown(
                 tokio_stream::wrappers::UnixListenerStream::new(listener),
                 async move {
@@ -911,6 +925,70 @@ async fn a_request_missing_what_scopes_it_is_refused_rather_than_widened() {
         .await
         .expect_err("an unknown class is neither dropped nor widened");
     assert_eq!(code(&unknown), Code::InvalidArgument);
+}
+
+/// A subscription costs the daemon a thread for as long as it is open, and a
+/// client can open them in a loop.
+///
+/// Refusing the one past the ceiling is what keeps the cost the client's: a
+/// daemon that spawned a thread for every request would fail at whatever asked
+/// for one next, which is the facade answering everybody else.
+#[tokio::test]
+async fn a_subscription_past_the_ceiling_is_refused_rather_than_given_a_thread() {
+    let mut wire = wire_forwarding(Principal::User, StubWorktrees::prompt(), 1).await;
+
+    let filter = proto::EventFilter {
+        repo_id: Some(REPO.to_owned()),
+        run_id: None,
+        classes: Vec::new(),
+    };
+
+    let held = wire
+        .feed
+        .subscribe(filter.clone())
+        .await
+        .expect("the first subscription is forwarded")
+        .into_inner();
+
+    while wire.events.subscribers() == 0 {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    let refused = wire
+        .feed
+        .subscribe(filter.clone())
+        .await
+        .expect_err("the ceiling is reached");
+    assert_eq!(code(&refused), Code::ResourceExhausted);
+
+    // Ending the stream is what gives the thread back. The forwarder finds out
+    // on the next entry it tries to hand over, so the test publishes one rather
+    // than waiting out the patience the forwarder would otherwise notice on.
+    drop(held);
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        wire.events.publish(&EventRow {
+            id: Some(11),
+            run_id: None,
+            event_type: "checkpoint".to_owned(),
+            class: EventClass::Agent,
+            payload: "{}".to_owned(),
+            ts: 1_700_000_500,
+        });
+
+        match wire.feed.subscribe(filter.clone()).await {
+            Ok(_) => break,
+            Err(status) => {
+                assert_eq!(code(&status), Code::ResourceExhausted);
+                assert!(
+                    Instant::now() < deadline,
+                    "a client that hung up never gave its slot back"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    }
 }
 
 #[test]
