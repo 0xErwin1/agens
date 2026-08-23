@@ -23,26 +23,18 @@
 //! provider refuses the turn for quota, and the run parks on the reset it
 //! named until the timer wheel brings it back.
 
-use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
-use agens_core::HeadlessTurnCancellation;
-use agens_fixtures::{Script, ScriptedDialect, ScriptedProvider, ScriptedTurn};
+use agens_fixtures::{Script, ScriptedTurn};
 use agens_server::grpc::proto::{self, feed_client::FeedClient, team_client::TeamClient};
-use agens_server::{CoordinatorSettings, PolicySettings, SchedulerLimits, TimerSettings};
+use agens_server::{CoordinatorSettings, TimerSettings};
 use agens_store::{AttemptOutcome, ControlPlaneStore, QuotaState};
-use tonic::transport::{Channel, Endpoint, Uri};
+use tonic::transport::Channel;
 
-use crate::CliDependencies;
-use crate::deps::bootstrap;
-use crate::worker::run_worker;
-
-/// How long an assertion waits for loops that tick on a heartbeat and for a
-/// turn that talks to a socket.
-const PATIENCE: Duration = Duration::from_secs(60);
+use crate::daemon_fixture::{
+    DaemonFixture, PATIENCE, await_reported_state, connect, daemon_settings, journal_of,
+};
 
 const ANSWER: &str = "split";
 
@@ -84,50 +76,6 @@ const EXPECTED_HEALTH_EVENTS: [&str; 7] = [
     "checkpoint_expired",
     "worker_lost",
 ];
-
-static NEXT_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
-
-pub(crate) fn scratch() -> PathBuf {
-    let suffix = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
-    let directory =
-        std::env::temp_dir().join(format!("agens-cli-worker-{}-{suffix}", std::process::id()));
-    std::fs::create_dir_all(&directory).expect("create the scratch directory");
-
-    directory
-}
-
-fn git(directory: &Path, arguments: &[&str]) {
-    let output = Command::new("git")
-        .args(arguments)
-        .current_dir(directory)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .output()
-        .expect("git runs");
-
-    assert!(
-        output.status.success(),
-        "git {arguments:?} failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-/// A checkout with one commit, which is all a worktree needs to be created
-/// from.
-pub(crate) fn checkout(root: &Path) -> PathBuf {
-    let checkout = root.join("repository");
-    std::fs::create_dir_all(&checkout).expect("create the checkout");
-
-    git(&checkout, &["init", "--quiet", "--initial-branch=main"]);
-    git(&checkout, &["config", "user.name", "Agens Test"]);
-    git(&checkout, &["config", "user.email", "agens-test@localhost"]);
-    std::fs::write(checkout.join("tracked.txt"), "initial\n").expect("write the tracked file");
-    git(&checkout, &["add", "tracked.txt"]);
-    git(&checkout, &["commit", "--quiet", "-m", "initial"]);
-
-    checkout
-}
 
 /// The model's side of both sessions.
 ///
@@ -216,87 +164,6 @@ fn now() -> i64 {
     .expect("epoch seconds fit")
 }
 
-pub(crate) async fn connect(socket: PathBuf) -> Channel {
-    for _ in 0..600 {
-        if tokio::net::UnixStream::connect(&socket).await.is_ok() {
-            let path = socket.clone();
-
-            return Endpoint::try_from("http://localhost")
-                .unwrap()
-                .connect_with_connector(tower::service_fn(move |_: Uri| {
-                    let path = path.clone();
-
-                    async move {
-                        let stream = tokio::net::UnixStream::connect(path).await?;
-
-                        Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(stream))
-                    }
-                }))
-                .await
-                .unwrap();
-        }
-
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-
-    panic!("the daemon never accepted on its socket");
-}
-
-/// Stops the daemon however the client thread ends, so a panicking client does
-/// not leave the test hanging on a join that never comes.
-pub(crate) struct Stopper(pub(crate) HeadlessTurnCancellation);
-
-impl Drop for Stopper {
-    fn drop(&mut self) {
-        self.0.cancel();
-    }
-}
-
-async fn run_state(client: &mut FeedClient<Channel>, run_id: i64) -> String {
-    client
-        .run_detail(proto::RunDetailRequest { run_id })
-        .await
-        .expect("the run is readable")
-        .into_inner()
-        .run
-        .expect("a run view carries its run")
-        .state
-}
-
-pub(crate) async fn await_reported_state(
-    client: &mut FeedClient<Channel>,
-    run_id: i64,
-    wanted: &str,
-) -> String {
-    let deadline = Instant::now() + PATIENCE;
-
-    loop {
-        let state = run_state(client, run_id).await;
-
-        if state == wanted || Instant::now() >= deadline {
-            return state;
-        }
-
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-}
-
-/// One run's journal, for an assertion that has to say what happened instead of
-/// only that it did not.
-pub(crate) async fn journal_of(client: &mut FeedClient<Channel>, run_id: i64) -> Vec<String> {
-    client
-        .run_detail(proto::RunDetailRequest { run_id })
-        .await
-        .map(|view| {
-            view.into_inner()
-                .events
-                .into_iter()
-                .map(|event| event.r#type)
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 /// The run's journal once every entry named has appeared, or once patience runs
 /// out and the assertion can say what was missing.
 ///
@@ -343,51 +210,29 @@ async fn findings_of(client: &mut FeedClient<Channel>, run_id: i64) -> Vec<Strin
 
 #[test]
 fn the_daemon_executes_a_run_through_a_real_turn_that_checkpoints_asks_and_finishes() {
-    let root = scratch();
-    let checkout = checkout(&root);
-    let config_home = root.join("config");
-    let data_directory = root.join("data");
-    std::fs::create_dir_all(&config_home).expect("create the config directory");
-    std::fs::create_dir_all(&data_directory).expect("create the data directory");
-
     // Comfortably ahead of the checkpoint, so the deadline the wheel derives is
     // a real one: a checkpoint promising a moment already past declares no
     // deadline at all.
     let promised_at = now() + 3600;
-    let provider = ScriptedProvider::start(ScriptedDialect::Responses, script(promised_at));
-    let base_url = provider.base_url();
 
-    let dependencies = CliDependencies::for_test(
-        checkout.clone(),
-        Some(root.join("home")),
-        BTreeMap::from([
-            (
-                "AGENS_CONFIG_HOME".to_owned(),
-                config_home.display().to_string(),
-            ),
-            ("OPENAI_API_KEY".to_owned(), "test-key".to_owned()),
-        ]),
-        BTreeMap::from([
-            (
-                config_home.join("config.toml"),
-                format!(
-                    "[provider]\nmodel = \"openai-api/gpt-4.1\"\nbase_url = \"{base_url}\"\n\n\
-                     [options]\ndata_dir = \"{}\"\n",
-                    data_directory.display()
-                ),
-            ),
-            (
-                config_home.join("auth.json"),
-                r#"{"openai-api": {"api_key": "fixture"}}"#.to_owned(),
-            ),
-        ]),
+    let daemon = DaemonFixture::start(
+        script(promised_at),
+        CoordinatorSettings {
+            // No grace at all, so the deadline is the moment the worker
+            // promised and the wheel raises the exception on its next tick.
+            // The default share of the promised span is measured in minutes,
+            // which is not a thing a test can wait for.
+            timers: TimerSettings {
+                checkpoint_grace_percent: 0,
+                ..TimerSettings::default()
+            },
+            ..daemon_settings()
+        },
     );
-    let bootstrap = bootstrap(&dependencies).expect("the production bootstrap is valid");
 
-    let shutdown = HeadlessTurnCancellation::new();
-    let socket = agens_server::socket_path(&data_directory);
-    let stopper = Stopper(shutdown.clone());
-    let repo_root = checkout.display().to_string();
+    let socket = daemon.socket.clone();
+    let stopper = daemon.stopper();
+    let repo_root = daemon.repo_root();
 
     // The daemon takes its own runtime with it, so the client drives another.
     let client = std::thread::spawn(move || {
@@ -458,37 +303,7 @@ fn the_daemon_executes_a_run_through_a_real_turn_that_checkpoints_asks_and_finis
         })
     });
 
-    let report = agens_server::serve_until_shutdown(
-        &data_directory,
-        &CoordinatorSettings {
-            // The daemon serves the checkouts its operator wrote down, and
-            // nothing else: a repository nobody named is a repository whose
-            // hooks it would be executing on a caller's say-so.
-            policy: PolicySettings {
-                project_roots: vec![checkout.clone()],
-                ..PolicySettings::default()
-            },
-            heartbeat: Duration::from_millis(25),
-            // No grace at all, so the deadline is the moment the worker
-            // promised and the wheel raises the exception on its next tick.
-            // The default share of the promised span is measured in minutes,
-            // which is not a thing a test can wait for.
-            timers: TimerSettings {
-                checkpoint_grace_percent: 0,
-                ..TimerSettings::default()
-            },
-            scheduler: SchedulerLimits {
-                max_concurrent: 1,
-                available_worktrees: 1,
-                provider_capacity: BTreeMap::new(),
-                default_provider_capacity: 1,
-            },
-            ..CoordinatorSettings::default()
-        },
-        run_worker(&bootstrap),
-        &shutdown,
-    )
-    .expect("the daemon serves");
+    let report = daemon.serve();
 
     let (created, parked, findings, question, finished, journal) =
         client.join().expect("the client thread finishes");
@@ -497,7 +312,8 @@ fn the_daemon_executes_a_run_through_a_real_turn_that_checkpoints_asks_and_finis
     // run that comes back without what it parked for is a run whose question
     // decided nothing. It arrives as a message of its own, so the assertion is
     // an exact string in the request rather than a substring of one.
-    let carrying: Vec<usize> = provider
+    let carrying: Vec<usize> = daemon
+        .provider
         .requests()
         .iter()
         .enumerate()
@@ -564,7 +380,8 @@ fn the_daemon_executes_a_run_through_a_real_turn_that_checkpoints_asks_and_finis
         );
     }
 
-    let control_plane = ControlPlaneStore::open(&data_directory).expect("the control plane opens");
+    let control_plane =
+        ControlPlaneStore::open(&daemon.data_directory).expect("the control plane opens");
     let health = control_plane
         .load_run_health(created.run_id)
         .expect("run health is readable")
@@ -587,9 +404,9 @@ fn the_daemon_executes_a_run_through_a_real_turn_that_checkpoints_asks_and_finis
         "the first checkpoint froze the paths the evidence ledger recorded for this run"
     );
 
-    provider.assert_script_consumed();
+    daemon.provider.assert_script_consumed();
 
-    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&daemon.root);
 }
 
 /// The model never speaks in a run that reaches its provider's cap.
@@ -625,47 +442,11 @@ const QUOTA_RESET_SECONDS: u32 = 1;
 /// the run back, with no person and no model involved in any of it.
 #[test]
 fn a_provider_that_refuses_for_quota_parks_the_run_and_the_wheel_brings_it_back() {
-    let root = scratch();
-    let checkout = checkout(&root);
-    let config_home = root.join("config");
-    let data_directory = root.join("data");
-    std::fs::create_dir_all(&config_home).expect("create the config directory");
-    std::fs::create_dir_all(&data_directory).expect("create the data directory");
+    let daemon = DaemonFixture::start(quota_script(), daemon_settings());
 
-    let provider = ScriptedProvider::start(ScriptedDialect::Responses, quota_script());
-    let base_url = provider.base_url();
-
-    let dependencies = CliDependencies::for_test(
-        checkout.clone(),
-        Some(root.join("home")),
-        BTreeMap::from([
-            (
-                "AGENS_CONFIG_HOME".to_owned(),
-                config_home.display().to_string(),
-            ),
-            ("OPENAI_API_KEY".to_owned(), "test-key".to_owned()),
-        ]),
-        BTreeMap::from([
-            (
-                config_home.join("config.toml"),
-                format!(
-                    "[provider]\nmodel = \"openai-api/gpt-4.1\"\nbase_url = \"{base_url}\"\n\n\
-                     [options]\ndata_dir = \"{}\"\n",
-                    data_directory.display()
-                ),
-            ),
-            (
-                config_home.join("auth.json"),
-                r#"{"openai-api": {"api_key": "fixture"}}"#.to_owned(),
-            ),
-        ]),
-    );
-    let bootstrap = bootstrap(&dependencies).expect("the production bootstrap is valid");
-
-    let shutdown = HeadlessTurnCancellation::new();
-    let socket = agens_server::socket_path(&data_directory);
-    let stopper = Stopper(shutdown.clone());
-    let repo_root = checkout.display().to_string();
+    let socket = daemon.socket.clone();
+    let stopper = daemon.stopper();
+    let repo_root = daemon.repo_root();
 
     let client = std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -730,29 +511,7 @@ fn a_provider_that_refuses_for_quota_parks_the_run_and_the_wheel_brings_it_back(
         })
     });
 
-    let report = agens_server::serve_until_shutdown(
-        &data_directory,
-        &CoordinatorSettings {
-            // The daemon serves the checkouts its operator wrote down, and
-            // nothing else: a repository nobody named is a repository whose
-            // hooks it would be executing on a caller's say-so.
-            policy: PolicySettings {
-                project_roots: vec![checkout.clone()],
-                ..PolicySettings::default()
-            },
-            heartbeat: Duration::from_millis(25),
-            scheduler: SchedulerLimits {
-                max_concurrent: 1,
-                available_worktrees: 1,
-                provider_capacity: BTreeMap::new(),
-                default_provider_capacity: 1,
-            },
-            ..CoordinatorSettings::default()
-        },
-        run_worker(&bootstrap),
-        &shutdown,
-    )
-    .expect("the daemon serves");
+    let report = daemon.serve();
 
     let (created, parked, findings, waiting, resumed, journal) =
         client.join().expect("the client thread finishes");
@@ -777,7 +536,8 @@ fn a_provider_that_refuses_for_quota_parks_the_run_and_the_wheel_brings_it_back(
         "the timer wheel requeued the run at the reset the provider named, journal: {journal:?}"
     );
 
-    let control_plane = ControlPlaneStore::open(&data_directory).expect("the control plane opens");
+    let control_plane =
+        ControlPlaneStore::open(&daemon.data_directory).expect("the control plane opens");
     let attempts = control_plane
         .attempts_for_run(created.run_id)
         .expect("the attempts are readable");
@@ -803,7 +563,7 @@ fn a_provider_that_refuses_for_quota_parks_the_run_and_the_wheel_brings_it_back(
         "the run that came back cleared the cap as it went"
     );
 
-    provider.assert_script_consumed();
+    daemon.provider.assert_script_consumed();
 
-    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&daemon.root);
 }

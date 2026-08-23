@@ -11,6 +11,8 @@ mod bootstrap_tests;
 mod cli;
 mod commands;
 #[cfg(test)]
+mod daemon_fixture;
+#[cfg(test)]
 mod denylist_gate_tests;
 #[cfg(test)]
 mod denylist_worker_tests;

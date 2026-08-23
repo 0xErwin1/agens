@@ -6,20 +6,15 @@
 //! — the call is stopped, the run parks on a durable question naming the class,
 //! a person answers it, and the resumed session finishes the run.
 
-use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::time::Duration;
 
-use agens_core::HeadlessTurnCancellation;
-use agens_fixtures::{Script, ScriptedDialect, ScriptedProvider, ScriptedTurn};
+use agens_fixtures::{Script, ScriptedTurn};
 use agens_server::grpc::proto::{self, feed_client::FeedClient, team_client::TeamClient};
-use agens_server::{CoordinatorSettings, PolicySettings, SchedulerLimits};
 use tonic::transport::Channel;
 
-use crate::CliDependencies;
-use crate::deps::bootstrap;
-use crate::worker::run_worker;
-use crate::worker_tests::{Stopper, await_reported_state, checkout, connect, journal_of, scratch};
+use crate::daemon_fixture::{
+    DaemonFixture, await_reported_state, connect, daemon_settings, journal_of,
+};
 
 /// The answer a person gives the parked question.
 const ANSWER: &str = "refuse";
@@ -55,47 +50,11 @@ async fn parked_question(
 
 #[test]
 fn a_denylisted_call_parks_the_run_on_a_durable_question_instead_of_running() {
-    let root = scratch();
-    let checkout = checkout(&root);
-    let config_home = root.join("config");
-    let data_directory = root.join("data");
-    std::fs::create_dir_all(&config_home).expect("create the config directory");
-    std::fs::create_dir_all(&data_directory).expect("create the data directory");
+    let daemon = DaemonFixture::start(script(), daemon_settings());
 
-    let provider = ScriptedProvider::start(ScriptedDialect::Responses, script());
-    let base_url = provider.base_url();
-
-    let dependencies = CliDependencies::for_test(
-        checkout.clone(),
-        Some(root.join("home")),
-        BTreeMap::from([
-            (
-                "AGENS_CONFIG_HOME".to_owned(),
-                config_home.display().to_string(),
-            ),
-            ("OPENAI_API_KEY".to_owned(), "test-key".to_owned()),
-        ]),
-        BTreeMap::from([
-            (
-                config_home.join("config.toml"),
-                format!(
-                    "[provider]\nmodel = \"openai-api/gpt-4.1\"\nbase_url = \"{base_url}\"\n\n\
-                     [options]\ndata_dir = \"{}\"\n",
-                    data_directory.display()
-                ),
-            ),
-            (
-                config_home.join("auth.json"),
-                r#"{"openai-api": {"api_key": "fixture"}}"#.to_owned(),
-            ),
-        ]),
-    );
-    let bootstrap = bootstrap(&dependencies).expect("the production bootstrap is valid");
-
-    let shutdown = HeadlessTurnCancellation::new();
-    let socket = agens_server::socket_path(&data_directory);
-    let stopper = Stopper(shutdown.clone());
-    let repo_root = checkout.display().to_string();
+    let socket = daemon.socket.clone();
+    let stopper = daemon.stopper();
+    let repo_root = daemon.repo_root();
 
     let client = std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -155,29 +114,7 @@ fn a_denylisted_call_parks_the_run_on_a_durable_question_instead_of_running() {
         })
     });
 
-    let report = agens_server::serve_until_shutdown(
-        &data_directory,
-        &CoordinatorSettings {
-            // The daemon serves the checkouts its operator wrote down, and
-            // nothing else: a repository nobody named is a repository whose
-            // hooks it would be executing on a caller's say-so.
-            policy: PolicySettings {
-                project_roots: vec![checkout.clone()],
-                ..PolicySettings::default()
-            },
-            heartbeat: Duration::from_millis(25),
-            scheduler: SchedulerLimits {
-                max_concurrent: 1,
-                available_worktrees: 1,
-                provider_capacity: BTreeMap::new(),
-                default_provider_capacity: 1,
-            },
-            ..CoordinatorSettings::default()
-        },
-        run_worker(&bootstrap),
-        &shutdown,
-    )
-    .expect("the daemon serves");
+    let report = daemon.serve();
 
     let (created, parked, question, finished, journal) =
         client.join().expect("the client thread finishes");
@@ -206,7 +143,7 @@ fn a_denylisted_call_parks_the_run_on_a_durable_question_instead_of_running() {
         "parking is not a failed attempt, journal: {journal:?}"
     );
 
-    provider.assert_script_consumed();
+    daemon.provider.assert_script_consumed();
 
     let worktree = PathBuf::from(&created.worktree_path);
     assert!(
@@ -214,5 +151,5 @@ fn a_denylisted_call_parks_the_run_on_a_durable_question_instead_of_running() {
         "the run kept its worktree: {created:?}, journal: {journal:?}"
     );
 
-    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&daemon.root);
 }
