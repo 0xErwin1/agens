@@ -363,6 +363,7 @@ pub enum ProviderDiagnosticKind {
     AdmissionFailed,
     TimersTicked,
     HealthSignalRaised,
+    IngestBacklogged,
     CorePoisoned,
 }
 
@@ -393,6 +394,7 @@ impl ProviderDiagnosticKind {
             Self::AdmissionFailed => "admission_failed",
             Self::TimersTicked => "timers_ticked",
             Self::HealthSignalRaised => "health_signal_raised",
+            Self::IngestBacklogged => "ingest_backlogged",
             Self::CorePoisoned => "core_poisoned",
         }
     }

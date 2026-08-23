@@ -33,6 +33,7 @@ use crate::fsm::{
     Principal, RunEffect, RunFacts, RunTrigger, StateMachines, TransitionOutcome,
     TransitionRejection,
 };
+use crate::ingest::{RefusedReport, backlogged_event};
 use crate::policy::RepositoryPolicy;
 use crate::scheduler::{QueueReport, RunLauncher, Scheduler, SchedulerError, SchedulerLoad};
 use crate::timers::{TimerTick, TimerWheel};
@@ -290,6 +291,26 @@ impl ApiCore {
             .to_string(),
             ts: failure.now,
         }])?;
+
+        Ok(())
+    }
+
+    /// Records that a reported fact never reached ingest.
+    ///
+    /// The bounded queue turned "a fact is never lost" into "a fact is lost in
+    /// silence": every reporter dropped the refusal, so a run whose evidence
+    /// stopped arriving looked exactly like a run that had nothing to say. The
+    /// entry is the run's own record that a fact existed and was not folded.
+    ///
+    /// Deduplication belongs to the caller, which is the party that knows
+    /// whether the backlog it just met is the same one it already reported.
+    pub fn journal_backlogged_fact(
+        &mut self,
+        reporter: &str,
+        refused: &RefusedReport,
+    ) -> Result<(), TransitionRejection> {
+        self.machines
+            .journal(&[backlogged_event(reporter, refused)])?;
 
         Ok(())
     }

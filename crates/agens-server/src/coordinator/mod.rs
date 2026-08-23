@@ -70,7 +70,7 @@ use crate::gates::{
     SubAgentKind,
 };
 use crate::ingest::{
-    FactReceiver, FactSender, Ingest, IngestFact, ReportedFact, attribution_of,
+    FactReceiver, FactSender, Ingest, IngestFact, IngestRejection, ReportedFact, attribution_of,
     channel as ingest_channel,
 };
 use crate::policy::{PolicySettings, PolicyStore, RepositoryPolicy};
@@ -562,6 +562,9 @@ fn timer_loop(
     let stopping = Arc::clone(stopping);
     let wheel = TimerWheel::new(settings.timers);
     let heartbeat = settings.heartbeat;
+    // Which runs already have a standing entry for this backlog. A queue that
+    // stays full is one fact lost per run, not one per heartbeat.
+    let mut backlogged: std::collections::HashSet<i64> = std::collections::HashSet::new();
 
     std::thread::spawn(move || {
         while !stopping.load(Ordering::Acquire) {
@@ -599,16 +602,48 @@ fn timer_loop(
             }
 
             for fact in expired {
-                // A queue with no reader is the daemon shutting down. The
-                // signal is already journaled, and the wheel's own
-                // deduplication means this tick will not raise it again.
-                let _ = facts.report(fact);
+                let run_id = fact.run_id;
+
+                let Err(refused) = facts.report(fact) else {
+                    backlogged.remove(&run_id);
+                    continue;
+                };
+
+                // A queue with no reader is the daemon shutting down, and there
+                // is nothing to record about a control plane that is closing.
+                if refused.rejection != IngestRejection::Backlogged {
+                    continue;
+                }
+
+                // Nothing tells the wheel a run ended, so the set is capped:
+                // forgetting costs one repeated entry, and remembering without
+                // a bound costs memory the daemon never gets back.
+                if backlogged.len() >= BACKLOG_NOTICES {
+                    backlogged.clear();
+                }
+                if !backlogged.insert(run_id) {
+                    continue;
+                }
+
+                diagnostics.ingest_backlogged(run_id, WHEEL_REPORTER, refused.fact.fact.name());
+
+                if let Ok(mut core) = core.lock() {
+                    let _ = core.journal_backlogged_fact(WHEEL_REPORTER, &refused);
+                }
             }
 
             std::thread::sleep(heartbeat);
         }
     })
 }
+
+/// What the wheel calls itself in a record of a fact it could not report.
+const WHEEL_REPORTER: &str = "timer_wheel";
+
+/// How many runs the wheel remembers having reported a lost fact for. Well
+/// past the runs that can be executing at once, so a daemon in steady state
+/// never forgets one that still matters.
+const BACKLOG_NOTICES: usize = 256;
 
 /// One `CheckpointExpired` fact per overdue checkpoint this tick raised.
 ///

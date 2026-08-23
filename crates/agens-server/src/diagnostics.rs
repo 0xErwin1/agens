@@ -166,6 +166,19 @@ impl CoordinatorDiagnostics {
         });
     }
 
+    /// A fact a reporter could not hand to ingest.
+    ///
+    /// Written every occurrence the caller decides to record, which is once per
+    /// run while a backlog stands: the journal says a run lost evidence, and
+    /// this file says the queue is still full.
+    pub fn ingest_backlogged(&self, run_id: i64, reporter: &str, fact: &str) {
+        self.record(CoordinatorEvent::IngestBacklogged {
+            run_id,
+            reporter,
+            fact,
+        });
+    }
+
     /// The service core was left poisoned, so the daemon is stopping.
     pub fn core_poisoned(&self, component: &str) {
         self.record(CoordinatorEvent::CorePoisoned { component });

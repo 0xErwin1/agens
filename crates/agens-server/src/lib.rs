@@ -80,9 +80,10 @@ pub use gates::{
 };
 pub use grpc::{CoreHandle, FacadeBinding, FacadeError, FeedFacade, TeamFacade};
 pub use ingest::{
-    AcceptedFact, Attribution, CheckpointClaim, CheckpointStanding, DrainedFact, FactReceiver,
-    FactSender, HealthSignal, HealthThresholds, Ingest, IngestFact, IngestRejection, LostReason,
-    ReportedCheckpoint, ReportedFact, channel as ingest_channel,
+    AcceptedFact, Attribution, BACKLOGGED_EVENT, BacklogNotice, CheckpointClaim,
+    CheckpointStanding, DrainedFact, FactReceiver, FactSender, HealthSignal, HealthThresholds,
+    Ingest, IngestFact, IngestRejection, LostReason, RefusedReport, ReportedCheckpoint,
+    ReportedFact, backlogged_event, channel as ingest_channel, channel_with_backlog,
 };
 pub use instance::{ServeInstance, ServeInstanceError, socket_path};
 pub use introspection::{AttemptResolver, CheckpointReporting, Clock, RunIntrospection};

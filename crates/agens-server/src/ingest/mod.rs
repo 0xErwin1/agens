@@ -71,6 +71,24 @@ pub enum IngestFact {
     CheckpointExpired,
 }
 
+impl IngestFact {
+    /// What this fact is called in a record about the fact rather than about
+    /// what it observed. A refused report is journaled by its reporter, which
+    /// never folded it and so has nothing else to say about it.
+    #[must_use]
+    pub const fn name(&self) -> &'static str {
+        match self {
+            Self::ToolResult(_) => "tool_result",
+            Self::TurnStarted => "turn_started",
+            Self::TurnEnded { .. } => "turn_ended",
+            Self::ContextExhausted => "context_exhausted",
+            Self::QuotaReached => "quota_reached",
+            Self::Checkpoint(_) => "checkpoint",
+            Self::CheckpointExpired => "checkpoint_expired",
+        }
+    }
+}
+
 /// A fact with the identity that lets it be attributed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReportedFact {
@@ -222,6 +240,79 @@ const INGEST_PATIENCE: Duration = Duration::from_secs(5);
 /// How often a waiting reporter looks for room again.
 const INGEST_POLL: Duration = Duration::from_millis(10);
 
+/// A report the channel would not take, with the fact it was carrying.
+///
+/// The fact travels back because the reporter is the party that has to account
+/// for it: journaling that a run's evidence never reached the health plane
+/// means naming which fact it was, and the queue is the only place it existed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RefusedReport {
+    pub rejection: IngestRejection,
+    /// Boxed because this travels as the error half of every report, and a
+    /// tool result is the largest thing a worker reports.
+    pub fact: Box<ReportedFact>,
+}
+
+/// One reporter's memory of whether the backlog it last met is already
+/// recorded.
+///
+/// A reporter bound to a single run needs no more than this: a queue that stays
+/// full is one lost fact per run, not one per attempt to report, and what the
+/// entry says is that the run stopped being observable rather than how often
+/// somebody noticed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BacklogNotice(bool);
+
+impl BacklogNotice {
+    /// The refusal to journal, if this one is it.
+    ///
+    /// Only the first refusal of a standing backlog comes back. A report that
+    /// went through clears the standing, so the next backlog is recorded again.
+    /// A queue with no reader comes back as nothing: that is the daemon
+    /// shutting down, and the control plane is closing with it.
+    pub fn observe(&mut self, refused: Option<RefusedReport>) -> Option<RefusedReport> {
+        let Some(refused) = refused else {
+            self.0 = false;
+
+            return None;
+        };
+
+        if refused.rejection != IngestRejection::Backlogged {
+            return None;
+        }
+
+        let first = !self.0;
+        self.0 = true;
+
+        first.then_some(refused)
+    }
+}
+
+/// The journal entry a reporter writes for a fact the ingest queue refused.
+///
+/// Infra rather than agent: it says something about the daemon's own queue,
+/// not about what the worker did.
+pub const BACKLOGGED_EVENT: &str = "ingest_backlogged";
+
+/// The entry one refused report is recorded as.
+#[must_use]
+pub fn backlogged_event(reporter: &str, refused: &RefusedReport) -> EventRow {
+    EventRow {
+        id: None,
+        run_id: Some(refused.fact.run_id),
+        event_type: BACKLOGGED_EVENT.to_owned(),
+        class: EventClass::Infra,
+        payload: serde_json::json!({
+            "reporter": reporter,
+            "fact": refused.fact.fact.name(),
+            "attempt_id": refused.fact.attempt_id,
+            "turn": refused.fact.turn,
+        })
+        .to_string(),
+        ts: refused.fact.now,
+    }
+}
+
 /// The reporting end of the in-process ingest channel. Cloneable, so every
 /// session's sink holds one.
 #[derive(Clone, Debug)]
@@ -237,16 +328,24 @@ impl FactSender {
     /// A fact that could not be queued is refused rather than dropped
     /// silently: the reporter is the party that knows which run it belongs to,
     /// and a health plane missing a turn it was told about should say so.
-    pub fn report(&self, fact: ReportedFact) -> Result<(), IngestRejection> {
+    pub fn report(&self, fact: ReportedFact) -> Result<(), RefusedReport> {
         let deadline = Instant::now() + self.patience;
         let mut fact = fact;
 
         loop {
             match self.outbound.try_send(fact) {
                 Ok(()) => return Ok(()),
-                Err(TrySendError::Disconnected(_)) => return Err(IngestRejection::ChannelClosed),
-                Err(TrySendError::Full(_)) if Instant::now() >= deadline => {
-                    return Err(IngestRejection::Backlogged);
+                Err(TrySendError::Disconnected(returned)) => {
+                    return Err(RefusedReport {
+                        rejection: IngestRejection::ChannelClosed,
+                        fact: Box::new(returned),
+                    });
+                }
+                Err(TrySendError::Full(returned)) if Instant::now() >= deadline => {
+                    return Err(RefusedReport {
+                        rejection: IngestRejection::Backlogged,
+                        fact: Box::new(returned),
+                    });
                 }
                 Err(TrySendError::Full(returned)) => {
                     fact = returned;
@@ -267,7 +366,13 @@ pub fn channel() -> (FactSender, FactReceiver) {
     channel_with_backlog(INGEST_BACKLOG, INGEST_PATIENCE)
 }
 
-fn channel_with_backlog(backlog: usize, patience: Duration) -> (FactSender, FactReceiver) {
+/// The same channel with an explicit ceiling and patience.
+///
+/// The daemon opens [`channel`]. This is for a caller that has to meet the
+/// ceiling on purpose, which against the production one means queueing a
+/// thousand facts nothing is draining.
+#[must_use]
+pub fn channel_with_backlog(backlog: usize, patience: Duration) -> (FactSender, FactReceiver) {
     let (outbound, receiver) = sync_channel(backlog);
 
     (FactSender { outbound, patience }, FactReceiver(receiver))
@@ -549,7 +654,10 @@ fn signal_event(reported: &ReportedFact, signal: &HealthSignal) -> EventRow {
 mod channel_tests {
     use std::time::{Duration, Instant};
 
-    use super::{IngestFact, IngestRejection, ReportedFact, channel_with_backlog};
+    use super::{
+        BacklogNotice, IngestFact, IngestRejection, RefusedReport, ReportedFact,
+        channel_with_backlog,
+    };
 
     const PATIENCE: Duration = Duration::from_millis(50);
 
@@ -563,6 +671,59 @@ mod channel_tests {
         }
     }
 
+    fn refused(rejection: IngestRejection) -> RefusedReport {
+        RefusedReport {
+            rejection,
+            fact: Box::new(turn_started()),
+        }
+    }
+
+    /// The bounded queue turned "a fact is never lost" into "a fact is lost in
+    /// silence". What the entry says is that the run stopped being observable,
+    /// which is true once until a report gets through again.
+    #[test]
+    fn a_standing_backlog_is_recorded_once_and_again_after_it_clears() {
+        let mut notice = BacklogNotice::default();
+
+        assert!(
+            notice
+                .observe(Some(refused(IngestRejection::Backlogged)))
+                .is_some(),
+            "the first refusal is the one a run has nothing else to say about"
+        );
+        assert!(
+            notice
+                .observe(Some(refused(IngestRejection::Backlogged)))
+                .is_none(),
+            "the same backlog is one entry, not one per heartbeat"
+        );
+
+        assert!(
+            notice.observe(None).is_none(),
+            "a report that fits says nothing"
+        );
+
+        assert!(
+            notice
+                .observe(Some(refused(IngestRejection::Backlogged)))
+                .is_some(),
+            "a fresh backlog is a fresh loss"
+        );
+    }
+
+    /// A queue with no reader is the daemon shutting down, and the control
+    /// plane is closing with it.
+    #[test]
+    fn a_closed_channel_is_not_journaled_as_a_lost_fact() {
+        let mut notice = BacklogNotice::default();
+
+        assert!(
+            notice
+                .observe(Some(refused(IngestRejection::ChannelClosed)))
+                .is_none()
+        );
+    }
+
     #[test]
     fn a_reporter_waits_for_the_writer_rather_than_queueing_without_end() {
         let (sender, _receiver) = channel_with_backlog(1, PATIENCE);
@@ -571,10 +732,15 @@ mod channel_tests {
 
         let started = Instant::now();
 
+        let refused = sender
+            .report(turn_started())
+            .expect_err("a queue nothing is draining refuses the fact instead of growing");
+
+        assert_eq!(refused.rejection, IngestRejection::Backlogged);
         assert_eq!(
-            sender.report(turn_started()),
-            Err(IngestRejection::Backlogged),
-            "a queue nothing is draining refuses the fact instead of growing"
+            *refused.fact,
+            turn_started(),
+            "the reporter gets the fact back, which is what it journals"
         );
         assert!(
             started.elapsed() >= PATIENCE,
@@ -613,8 +779,11 @@ mod channel_tests {
         let started = Instant::now();
 
         assert_eq!(
-            sender.report(turn_started()),
-            Err(IngestRejection::ChannelClosed)
+            sender
+                .report(turn_started())
+                .expect_err("there is no reader")
+                .rejection,
+            IngestRejection::ChannelClosed
         );
         assert!(
             started.elapsed() < Duration::from_secs(1),
