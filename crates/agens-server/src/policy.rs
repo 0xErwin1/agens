@@ -15,27 +15,39 @@
 //!   every hook after it, so an unrestricted export is a hook rewriting the
 //!   next hook's `PATH`.
 //!
-//! The policy is a file rather than a section of the user's configuration for
-//! one reason: the daemon writes to it. Trust in a repository is granted by
-//! answering a durable question, and an answer that has to be transcribed into
-//! a hand-edited configuration file is an answer that never takes effect.
+//! The two halves have different writers, so they live in different places.
+//! The roots and the export allowlist are the operator's alone and are read
+//! from the configuration file (`team.project_roots`, `team.hook_exports`),
+//! where nothing the daemon runs can add to them. Trust in a repository's hooks
+//! moves while the daemon runs — a durable question is answered, or the
+//! operator runs `agens serve trust` — so it is recorded in the control plane,
+//! not in a document a run's own worktree could append its fingerprint to.
 
-use std::collections::BTreeMap;
-use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use agens_store::{
+    RepositoryPolicyStore, StoredHookTrust, StoredPendingTrust, unified_database_path,
+};
+use agens_tools::SessionWorktrees;
 use serde::{Deserialize, Serialize};
 
-use crate::api::PortError;
+use crate::api::{PortError, WorktreeGate};
+use crate::ports::GitWorktreeGate;
 
-/// The file, under the daemon's data directory, that holds all of it.
-const POLICY_FILE: &str = "worktree-policy.toml";
+/// The branch a gate built only to fingerprint a repository is pointed at.
+///
+/// Identity is derived from the git common directory and the `origin` URL, so
+/// nothing this gate does reads it. It is named rather than left empty so the
+/// value is not mistaken for configuration somebody has to keep in step.
+const MAIN_REF_FOR_IDENTITY: &str = "main";
 
-/// A policy larger than this is a corrupted or hostile file rather than a
-/// configuration somebody wrote.
-const MAX_POLICY_BYTES: u64 = 256 * 1024;
+/// The file earlier versions kept this policy in.
+///
+/// It is refused rather than ignored: an operator who wrote their project roots
+/// into it would otherwise get a daemon that serves nothing and says only that
+/// the checkout is not served.
+const RETIRED_POLICY_FILE: &str = "worktree-policy.toml";
 
 /// What the operator has said about one repository's provisioning hooks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -49,6 +61,27 @@ pub enum HookTrust {
     Unknown,
 }
 
+/// The half of the policy the operator writes by hand.
+///
+/// It arrives from the configuration rather than being read here because this
+/// crate composes a daemon and does not own the configuration surface: the
+/// keys, their validation and their file are `agens-config`'s.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PolicySettings {
+    /// The checkouts, or the directories containing them, that runs may be
+    /// created against. Empty admits nothing: a daemon reachable by any local
+    /// client is not a place for a permissive default.
+    pub project_roots: Vec<PathBuf>,
+    /// The environment names a provisioning hook may export. Empty exports
+    /// nothing, which is what a repository that never asked for an export
+    /// expects.
+    pub hook_exports: Vec<String>,
+    /// The configuration file the roots are written in, named in the refusal a
+    /// request against an unserved checkout gets. `None` when the caller
+    /// composed the policy without a file behind it.
+    pub config_path: Option<PathBuf>,
+}
+
 /// The operator's decisions, as the service core reads them.
 ///
 /// A trait rather than the concrete store because the core is built and tested
@@ -60,7 +93,7 @@ pub trait RepositoryPolicy: Send + Sync {
 
     /// A sentence naming what the operator would have to write down for
     /// [`Self::admits`] to accept this path. Returned rather than composed by
-    /// the caller so the refusal names the real file.
+    /// the caller so the refusal names the real key and the real file.
     fn admission_remedy(&self) -> String;
 
     fn hook_trust(&self, repo_id: &str) -> HookTrust;
@@ -86,73 +119,76 @@ pub trait RepositoryPolicy: Send + Sync {
 pub struct PendingHookTrust {
     pub question_id: i64,
     pub repo_id: String,
-    /// The canonical checkout, kept so a person reading the file knows what
+    /// The canonical checkout, kept so a person reading the question knows what
     /// they are being asked about.
     pub repository: PathBuf,
     pub asked_at: i64,
 }
 
-/// The policy file, read at start and written back whenever trust moves.
+/// The operator's configuration, over the control plane's trust register.
+///
+/// The register itself is not shown: it is a database handle, and what a caller
+/// would want to read is the settings behind the decisions.
 pub struct PolicyStore {
-    path: PathBuf,
-    document: Mutex<PolicyDocument>,
+    settings: PolicySettings,
+    register: Register,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
-struct PolicyDocument {
-    /// The checkouts, or the directories containing them, that runs may be
-    /// created against. Empty admits nothing: a daemon reachable by any local
-    /// client is not a place for a permissive default.
-    project_roots: Vec<PathBuf>,
-    /// The environment names a provisioning hook may export. Empty exports
-    /// nothing, which is what a repository that never asked for an export
-    /// expects.
-    hook_exports: Vec<String>,
-    /// Repositories whose hooks the operator authorized, by fingerprint.
-    granted: BTreeMap<String, TrustRecord>,
-    /// Repositories whose hooks the operator refused.
-    refused: BTreeMap<String, TrustRecord>,
-    /// Questions whose answers have not arrived yet.
+/// Where hook decisions are kept.
+///
+/// The in-memory arm exists for a caller that composes a core without a data
+/// directory behind it. It is not a cache of the other one: a store has exactly
+/// one of the two.
+enum Register {
+    Database(Mutex<RepositoryPolicyStore>),
+    Memory(Mutex<MemoryRegister>),
+}
+
+#[derive(Default)]
+struct MemoryRegister {
+    decided: Vec<(String, bool)>,
     pending: Vec<PendingHookTrust>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-struct TrustRecord {
-    repository: PathBuf,
-    decided_at: i64,
+impl std::fmt::Debug for PolicyStore {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PolicyStore")
+            .field("settings", &self.settings)
+            .finish_non_exhaustive()
+    }
 }
 
 impl PolicyStore {
-    /// Reads the policy the operator wrote, or an empty one when the daemon
-    /// has never been configured.
+    /// Opens the trust register the operator's configuration is read against.
     ///
-    /// A file that cannot be parsed is an error rather than an empty policy:
-    /// the empty policy admits nothing and refuses every hook, so silently
-    /// falling back to it would turn a typo into a daemon that answers every
-    /// request the same unhelpful way.
-    pub fn open(data_directory: &Path) -> Result<Self, PolicyError> {
-        let path = data_directory.join(POLICY_FILE);
+    /// The register's file is checked for ownership and mode before it is
+    /// opened, because opening it restores the mode the store's open contract
+    /// asks for and would erase the evidence. Every other table is recoverable
+    /// from the work it describes; this one decides whose code runs with the
+    /// daemon's credentials, so a file the daemon's user does not own, or that
+    /// anyone beyond that user can reach, stops the daemon instead of being
+    /// quietly repaired.
+    pub fn open(data_directory: &Path, settings: PolicySettings) -> Result<Self, PolicyError> {
+        let retired = data_directory.join(RETIRED_POLICY_FILE);
+        if retired.exists() {
+            return Err(PolicyError::new(
+                &retired,
+                "this file no longer configures anything: move its project_roots and hook_exports \
+                 into team.project_roots and team.hook_exports, grant hook trust with \
+                 `agens serve trust <repository>`, and delete it",
+            ));
+        }
 
-        let document = match fs::metadata(&path) {
-            Err(_) => PolicyDocument::default(),
-            Ok(metadata) if metadata.len() > MAX_POLICY_BYTES => {
-                return Err(PolicyError::new(
-                    &path,
-                    format!("the policy is larger than {MAX_POLICY_BYTES} bytes"),
-                ));
-            }
-            Ok(_) => {
-                let text =
-                    fs::read_to_string(&path).map_err(|error| PolicyError::new(&path, error))?;
+        let database = unified_database_path(data_directory);
+        verify_private(&database)?;
 
-                toml::from_str(&text).map_err(|error| PolicyError::new(&path, error))?
-            }
-        };
+        let store = RepositoryPolicyStore::open(data_directory)
+            .map_err(|error| PolicyError::new(&database, error))?;
 
         Ok(Self {
-            path,
-            document: Mutex::new(document),
+            settings,
+            register: Register::Database(Mutex::new(store)),
         })
     }
 
@@ -161,147 +197,218 @@ impl PolicyStore {
     #[must_use]
     pub fn in_memory(project_roots: Vec<PathBuf>, hook_exports: Vec<String>) -> Self {
         Self {
-            path: PathBuf::new(),
-            document: Mutex::new(PolicyDocument {
+            settings: PolicySettings {
                 project_roots,
                 hook_exports,
-                ..PolicyDocument::default()
-            }),
+                config_path: None,
+            },
+            register: Register::Memory(Mutex::new(MemoryRegister::default())),
         }
     }
 
-    /// Where the operator edits this policy.
-    #[must_use]
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
+    /// Records the operator's own decision about a repository's hooks, taken
+    /// without a question having been asked.
+    pub fn decide(
+        &self,
+        repo_id: &str,
+        repository: &Path,
+        granted: bool,
+        now: i64,
+    ) -> Result<(), PortError> {
+        match &self.register {
+            Register::Database(store) => lock(store)?
+                .decide(repo_id, repository, granted, now)
+                .map_err(|error| PortError::new("policy", error.to_string())),
+            Register::Memory(memory) => {
+                let mut memory = lock(memory)?;
+                memory.decided.retain(|(known, _)| known != repo_id);
+                memory.decided.push((repo_id.to_owned(), granted));
 
-    fn with_document<T>(&self, read: impl FnOnce(&PolicyDocument) -> T, fallback: T) -> T {
-        self.document
-            .lock()
-            .map_or(fallback, |document| read(&document))
-    }
-
-    /// Applies a change and writes the whole document back.
-    ///
-    /// Written in full rather than appended to because the file is also the
-    /// operator's to edit, and a merge of two writers over a hand-edited file
-    /// is a problem this does not need to have: the daemon is the only process
-    /// that writes it while it runs.
-    fn mutate(&self, change: impl FnOnce(&mut PolicyDocument)) -> Result<(), PortError> {
-        let mut document = self
-            .document
-            .lock()
-            .map_err(|_| PortError::new("policy", "the repository policy is unusable"))?;
-
-        change(&mut document);
-
-        if self.path.as_os_str().is_empty() {
-            return Ok(());
+                Ok(())
+            }
         }
-
-        let text = toml::to_string_pretty(&*document)
-            .map_err(|error| PortError::new("policy", error.to_string()))?;
-
-        write_private(&self.path, &text).map_err(|error| PortError::new("policy", error))
     }
+}
+
+fn lock<T>(held: &Mutex<T>) -> Result<std::sync::MutexGuard<'_, T>, PortError> {
+    held.lock()
+        .map_err(|_| PortError::new("policy", "the repository policy is unusable"))
 }
 
 impl RepositoryPolicy for PolicyStore {
     fn admits(&self, repository: &Path) -> bool {
-        self.with_document(
-            |document| {
-                document
-                    .project_roots
-                    .iter()
-                    .any(|root| is_within(repository, root))
-            },
-            false,
-        )
+        self.settings
+            .project_roots
+            .iter()
+            .any(|root| is_within(repository, root))
     }
 
     fn admission_remedy(&self) -> String {
-        if self.path.as_os_str().is_empty() {
+        let Some(config) = &self.settings.config_path else {
             return "the daemon serves no configured project root".to_owned();
-        }
+        };
 
         format!(
-            "add the checkout, or a directory above it, to project_roots in {}",
-            self.path.display()
+            "add the checkout, or a directory above it, to team.project_roots in {}, \
+             then restart the daemon",
+            config.display()
         )
     }
 
     fn hook_trust(&self, repo_id: &str) -> HookTrust {
-        self.with_document(
-            |document| {
-                if document.granted.contains_key(repo_id) {
-                    HookTrust::Granted
-                } else if document.refused.contains_key(repo_id) {
-                    HookTrust::Refused
-                } else {
-                    HookTrust::Unknown
-                }
-            },
-            HookTrust::Refused,
-        )
+        let stored = match &self.register {
+            Register::Database(store) => lock(store)
+                .ok()
+                .and_then(|store| store.hook_trust(repo_id).ok()),
+            Register::Memory(memory) => lock(memory).ok().map(|memory| {
+                memory
+                    .decided
+                    .iter()
+                    .find(|(known, _)| known == repo_id)
+                    .map_or(StoredHookTrust::Unknown, |(_, granted)| {
+                        if *granted {
+                            StoredHookTrust::Granted
+                        } else {
+                            StoredHookTrust::Refused
+                        }
+                    })
+            }),
+        };
+
+        // A register that could not be read has decided nothing, and nothing
+        // decided is not permission: an unreadable policy refuses hooks rather
+        // than falling through to the question that would ask about them again.
+        match stored {
+            Some(StoredHookTrust::Granted) => HookTrust::Granted,
+            Some(StoredHookTrust::Unknown) => HookTrust::Unknown,
+            Some(StoredHookTrust::Refused) | None => HookTrust::Refused,
+        }
     }
 
     fn hook_exports(&self) -> Vec<String> {
-        self.with_document(|document| document.hook_exports.clone(), Vec::new())
+        self.settings.hook_exports.clone()
     }
 
     fn record_pending(&self, pending: &PendingHookTrust) -> Result<(), PortError> {
-        self.mutate(|document| {
-            document
-                .pending
-                .retain(|other| other.question_id != pending.question_id);
-            document.pending.push(pending.clone());
-        })
+        match &self.register {
+            Register::Database(store) => lock(store)?
+                .record_pending(&StoredPendingTrust {
+                    question_id: pending.question_id,
+                    repo_id: pending.repo_id.clone(),
+                    repository: pending.repository.clone(),
+                    asked_at: pending.asked_at,
+                })
+                .map_err(|error| PortError::new("policy", error.to_string())),
+            Register::Memory(memory) => {
+                let mut memory = lock(memory)?;
+                memory
+                    .pending
+                    .retain(|other| other.question_id != pending.question_id);
+                memory.pending.push(pending.clone());
+
+                Ok(())
+            }
+        }
     }
 
     fn is_pending(&self, question_id: i64) -> bool {
-        self.with_document(
-            |document| {
-                document
+        match &self.register {
+            Register::Database(store) => lock(store)
+                .ok()
+                .and_then(|store| store.is_pending(question_id).ok())
+                .unwrap_or_default(),
+            Register::Memory(memory) => lock(memory).is_ok_and(|memory| {
+                memory
                     .pending
                     .iter()
                     .any(|pending| pending.question_id == question_id)
-            },
-            false,
-        )
+            }),
+        }
     }
 
     fn resolve_pending(&self, question_id: i64, granted: bool) -> Result<bool, PortError> {
-        let mut resolved = false;
+        match &self.register {
+            Register::Database(store) => lock(store)?
+                .resolve_pending(question_id, granted)
+                .map_err(|error| PortError::new("policy", error.to_string())),
+            Register::Memory(memory) => {
+                let mut memory = lock(memory)?;
+                let Some(position) = memory
+                    .pending
+                    .iter()
+                    .position(|pending| pending.question_id == question_id)
+                else {
+                    return Ok(false);
+                };
 
-        self.mutate(|document| {
-            let Some(position) = document
-                .pending
-                .iter()
-                .position(|pending| pending.question_id == question_id)
-            else {
-                return;
-            };
+                let pending = memory.pending.remove(position);
+                memory
+                    .decided
+                    .retain(|(known, _)| *known != pending.repo_id);
+                memory.decided.push((pending.repo_id, granted));
 
-            let pending = document.pending.remove(position);
-            let record = TrustRecord {
-                repository: pending.repository,
-                decided_at: pending.asked_at,
-            };
-
-            if granted {
-                document.refused.remove(&pending.repo_id);
-                document.granted.insert(pending.repo_id, record);
-            } else {
-                document.granted.remove(&pending.repo_id);
-                document.refused.insert(pending.repo_id, record);
+                Ok(true)
             }
-
-            resolved = true;
-        })?;
-
-        Ok(resolved)
+        }
     }
+}
+
+/// The repository one `trust` grant landed on.
+#[derive(Debug)]
+pub struct TrustedRepository {
+    pub repo_id: String,
+    /// The checkout as the daemon resolved it, which is what the grant is
+    /// recorded against.
+    pub repository: PathBuf,
+}
+
+/// Grants a repository's provisioning hooks the operator's trust, without a
+/// run having asked for it.
+///
+/// It is the operator's verb rather than the daemon's, so it writes the same
+/// register the daemon reads and takes effect on the next run of that
+/// repository: the daemon reads trust through to the control plane on every
+/// request and has no cached document to invalidate.
+///
+/// The checkout has to be one the daemon serves. A grant against a repository
+/// outside `team.project_roots` would be a decision that never applies to
+/// anything, and the refusal names the same remedy a run against it would get.
+pub fn trust_repository(
+    data_directory: &Path,
+    settings: PolicySettings,
+    repository: &Path,
+    now: i64,
+) -> Result<TrustedRepository, PolicyError> {
+    let canonical = repository
+        .canonicalize()
+        .map_err(|error| PolicyError::new(repository, error))?;
+
+    let policy = PolicyStore::open(data_directory, settings)?;
+
+    if !policy.admits(&canonical) {
+        return Err(PolicyError::detail(format!(
+            "the daemon does not serve {}: {}",
+            canonical.display(),
+            policy.admission_remedy()
+        )));
+    }
+
+    let identity = GitWorktreeGate::new(
+        SessionWorktrees::new(data_directory),
+        MAIN_REF_FOR_IDENTITY,
+        Vec::new(),
+    )
+    .identify(&canonical)
+    .map_err(|error| PolicyError::new(&canonical, error.detail()))?;
+
+    policy
+        .decide(&identity.repo_id, &canonical, true, now)
+        .map_err(|error| PolicyError::new(&canonical, error.detail()))?;
+
+    Ok(TrustedRepository {
+        repo_id: identity.repo_id,
+        repository: canonical,
+    })
 }
 
 /// Why the policy could not be read.
@@ -311,6 +418,10 @@ pub struct PolicyError(String);
 impl PolicyError {
     fn new(path: &Path, detail: impl std::fmt::Display) -> Self {
         Self(format!("{}: {detail}", path.display()))
+    }
+
+    fn detail(detail: impl Into<String>) -> Self {
+        Self(detail.into())
     }
 }
 
@@ -333,24 +444,38 @@ fn is_within(repository: &Path, root: &Path) -> bool {
     root.is_ok_and(|root| repository == root || repository.starts_with(&root))
 }
 
-/// Writes the policy so only its owner can read it.
-///
-/// It names every repository the daemon serves and every one whose code it is
-/// willing to execute, which is a map of what a local attacker would want to
-/// change rather than merely read.
-fn write_private(path: &Path, text: &str) -> Result<(), String> {
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+/// Refuses a register file the daemon's user does not own, or that anyone
+/// beyond that user can read or write.
+#[cfg(unix)]
+fn verify_private(path: &Path) -> Result<(), PolicyError> {
+    use std::os::unix::fs::MetadataExt;
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return Ok(());
+    };
+
+    // SAFETY: `geteuid` reads the calling process's effective user and cannot
+    // fail or touch memory the caller owns.
+    let effective = unsafe { libc::geteuid() };
+
+    if metadata.uid() != effective {
+        return Err(PolicyError::detail(format!(
+            "{} holds the repository policy and is owned by another user",
+            path.display()
+        )));
     }
 
-    let mut file = options.open(path).map_err(|error| error.to_string())?;
+    if metadata.mode() & 0o077 != 0 {
+        return Err(PolicyError::detail(format!(
+            "{} holds the repository policy and is reachable beyond its owner",
+            path.display()
+        )));
+    }
 
-    file.write_all(text.as_bytes())
-        .and_then(|()| file.sync_all())
-        .map_err(|error| error.to_string())
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn verify_private(_: &Path) -> Result<(), PolicyError> {
+    Ok(())
 }

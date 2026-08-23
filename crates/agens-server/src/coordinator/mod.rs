@@ -72,7 +72,7 @@ use crate::ingest::{
     FactReceiver, FactSender, Ingest, IngestFact, ReportedFact, attribution_of,
     channel as ingest_channel,
 };
-use crate::policy::{PolicyStore, RepositoryPolicy};
+use crate::policy::{PolicySettings, PolicyStore, RepositoryPolicy};
 use crate::ports::{
     Admissions, GitWorktreeGate, JournalFeed, RunDeliveries, SupervisedSessions, run_mailbox,
 };
@@ -128,6 +128,8 @@ pub struct CoordinatorSettings {
     pub heartbeat: Duration,
     /// How long the gates sweep waits between passes.
     pub gates_sweep: Duration,
+    /// What the operator wrote down about the repositories this daemon serves.
+    pub policy: PolicySettings,
     /// Whether the coordinator writes its own diagnostics log.
     ///
     /// Capture-gated like every other diagnostic, and off by default: the file
@@ -148,6 +150,7 @@ impl Default for CoordinatorSettings {
             timers: TimerSettings::default(),
             main_ref: "main".to_owned(),
             attempt_cap: 3,
+            policy: PolicySettings::default(),
             heartbeat: HEARTBEAT,
             gates_sweep: GATES_SWEEP,
             diagnostics: false,
@@ -227,7 +230,7 @@ impl Coordinator {
         let admissions = Arc::new(Admissions::new());
         let feed = Arc::new(JournalFeed::new());
         let policy = Arc::new(
-            PolicyStore::open(data_directory)
+            PolicyStore::open(data_directory, settings.policy.clone())
                 .map_err(|error| CoordinatorError::opening("the repository policy", error))?,
         );
 

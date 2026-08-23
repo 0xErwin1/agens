@@ -87,7 +87,10 @@ pub use instance::{ServeInstance, ServeInstanceError, socket_path};
 pub use introspection::{
     AttemptResolver, CheckpointReporting, Clock, RunIntrospection, SESSION_SUSPEND_REFUSED_EVENT,
 };
-pub use policy::{HookTrust, PendingHookTrust, PolicyError, PolicyStore, RepositoryPolicy};
+pub use policy::{
+    HookTrust, PendingHookTrust, PolicyError, PolicySettings, PolicyStore, RepositoryPolicy,
+    TrustedRepository, trust_repository,
+};
 pub use ports::GitWorktreeGate;
 pub use scheduler::{
     Admission, AdmissionFailure, Candidate, Deferral, Ineligible, LaunchError, LaunchedSession,

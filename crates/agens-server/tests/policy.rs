@@ -1,16 +1,23 @@
-//! The operator's own file: which checkouts the daemon serves, whose hooks it
+//! The operator's decisions: which checkouts the daemon serves, whose hooks it
 //! will execute, and what those hooks may export.
 //!
 //! Every default here is the closed one. A daemon that has never been
 //! configured serves nothing and runs nobody's hooks, because the alternative
 //! is a socket any local process can reach deciding to execute a repository's
 //! code on the strength of the request naming it.
+//!
+//! The two halves are proved separately because they have different writers:
+//! the roots come from the operator's configuration and nothing the daemon runs
+//! can add to them, and the hook decisions live in the control plane, where a
+//! run's own worktree has no file to append itself to.
 
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use agens_server::{HookTrust, PendingHookTrust, PolicyStore, RepositoryPolicy};
+use agens_server::{
+    HookTrust, PendingHookTrust, PolicySettings, PolicyStore, RepositoryPolicy, trust_repository,
+};
 
 static NEXT_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
 
@@ -35,10 +42,33 @@ fn checkout(under: &std::path::Path, name: &str) -> PathBuf {
     path.canonicalize().unwrap()
 }
 
+fn serving(roots: Vec<PathBuf>) -> PolicySettings {
+    PolicySettings {
+        project_roots: roots,
+        hook_exports: Vec::new(),
+        config_path: Some(PathBuf::from("/home/dev/.config/agens/config.toml")),
+    }
+}
+
+/// A checkout with a git common directory, which is what the fingerprint the
+/// register keys on is derived from.
+fn repository(under: &std::path::Path, name: &str) -> PathBuf {
+    let path = checkout(under, name);
+    let status = std::process::Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(&path)
+        .status()
+        .expect("git is on the path");
+    assert!(status.success(), "the fixture repository was initialized");
+
+    path
+}
+
 #[test]
 fn a_daemon_with_no_policy_serves_no_checkout_and_trusts_no_repository() {
     let directory = data_directory();
-    let policy = PolicyStore::open(&directory).expect("an absent policy is not an error");
+    let policy = PolicyStore::open(&directory, serving(Vec::new()))
+        .expect("an absent policy is not an error");
 
     assert!(
         !policy.admits(&checkout(&directory, "anywhere")),
@@ -46,9 +76,11 @@ fn a_daemon_with_no_policy_serves_no_checkout_and_trusts_no_repository() {
     );
     assert_eq!(policy.hook_trust(REPO), HookTrust::Unknown);
     assert!(policy.hook_exports().is_empty());
+
+    let remedy = policy.admission_remedy();
     assert!(
-        policy.admission_remedy().contains("project_roots"),
-        "the refusal tells the operator what to write and where"
+        remedy.contains("team.project_roots") && remedy.contains("config.toml"),
+        "the refusal names the key and the file the operator has to write it in: {remedy}"
     );
 }
 
@@ -59,13 +91,8 @@ fn a_configured_root_admits_what_is_under_it_and_nothing_beside_it() {
     let inside = checkout(&served, "agens");
     let beside = checkout(&directory, "development");
 
-    fs::write(
-        directory.join("worktree-policy.toml"),
-        format!("project_roots = [\"{}\"]\n", served.display()),
-    )
-    .unwrap();
-
-    let policy = PolicyStore::open(&directory).expect("the policy parses");
+    let policy = PolicyStore::open(&directory, serving(vec![served.clone()]))
+        .expect("the configured roots need no file");
 
     assert!(policy.admits(&served), "the root itself is served");
     assert!(policy.admits(&inside), "so is a checkout under it");
@@ -76,13 +103,41 @@ fn a_configured_root_admits_what_is_under_it_and_nothing_beside_it() {
 }
 
 #[test]
-fn a_policy_that_cannot_be_read_is_an_error_rather_than_an_empty_one() {
+fn the_retired_policy_file_stops_the_daemon_rather_than_being_ignored() {
     let directory = data_directory();
-    fs::write(directory.join("worktree-policy.toml"), "project_roots = \n").unwrap();
+    fs::write(
+        directory.join("worktree-policy.toml"),
+        "project_roots = [\"/srv/checkouts\"]\n",
+    )
+    .unwrap();
+
+    let error = PolicyStore::open(&directory, serving(Vec::new()))
+        .expect_err("a file that configures nothing is not silently obeyed");
 
     assert!(
-        PolicyStore::open(&directory).is_err(),
-        "a typo becomes a daemon that refuses everything for a reason nobody can see"
+        error.to_string().contains("team.project_roots"),
+        "the refusal says where the roots moved to: {error}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_register_anyone_can_reach_stops_the_daemon() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = data_directory();
+    let policy = PolicyStore::open(&directory, serving(Vec::new())).expect("the register opens");
+    drop(policy);
+
+    let database = agens_store::unified_database_path(&directory);
+    fs::set_permissions(&database, fs::Permissions::from_mode(0o666)).unwrap();
+
+    let error = PolicyStore::open(&directory, serving(Vec::new()))
+        .expect_err("a register the whole machine can write decides nothing");
+
+    assert!(
+        error.to_string().contains("beyond its owner"),
+        "the refusal says what is wrong with the file: {error}"
     );
 }
 
@@ -91,7 +146,7 @@ fn answering_a_pending_question_grants_the_repository_durably() {
     let directory = data_directory();
     let repository = checkout(&directory, "agens");
 
-    let policy = PolicyStore::open(&directory).unwrap();
+    let policy = PolicyStore::open(&directory, serving(Vec::new())).unwrap();
     policy
         .record_pending(&PendingHookTrust {
             question_id: 7,
@@ -109,7 +164,9 @@ fn answering_a_pending_question_grants_the_repository_durably() {
         "a question answered once is not answered again"
     );
 
-    let reopened = PolicyStore::open(&directory).expect("the policy was written back");
+    drop(policy);
+    let reopened = PolicyStore::open(&directory, serving(Vec::new()))
+        .expect("the grant was written to the control plane");
 
     assert_eq!(
         reopened.hook_trust(REPO),
@@ -123,7 +180,7 @@ fn a_refusal_is_recorded_so_the_operator_is_not_asked_again() {
     let directory = data_directory();
     let repository = checkout(&directory, "agens");
 
-    let policy = PolicyStore::open(&directory).unwrap();
+    let policy = PolicyStore::open(&directory, serving(Vec::new())).unwrap();
     policy
         .record_pending(&PendingHookTrust {
             question_id: 9,
@@ -140,11 +197,50 @@ fn a_refusal_is_recorded_so_the_operator_is_not_asked_again() {
 #[test]
 fn an_answer_to_a_question_the_policy_never_asked_grants_nothing() {
     let directory = data_directory();
-    let policy = PolicyStore::open(&directory).unwrap();
+    let policy = PolicyStore::open(&directory, serving(Vec::new())).unwrap();
 
     assert!(
         !policy.resolve_pending(11, true).unwrap(),
         "only a question the policy recorded can grant what that question was about"
     );
     assert_eq!(policy.hook_trust(REPO), HookTrust::Unknown);
+}
+
+#[test]
+fn the_operators_trust_verb_grants_a_served_repository_without_a_question() {
+    let directory = data_directory();
+    let served = checkout(&directory, "dev");
+    let repository = repository(&served, "agens");
+
+    let trusted = trust_repository(
+        &directory,
+        serving(vec![served]),
+        &repository,
+        1_700_000_000,
+    )
+    .expect("a served checkout can be trusted");
+
+    assert_eq!(trusted.repository, repository);
+
+    let policy = PolicyStore::open(&directory, serving(Vec::new())).unwrap();
+
+    assert_eq!(
+        policy.hook_trust(&trusted.repo_id),
+        HookTrust::Granted,
+        "the daemon reads the grant the operator wrote"
+    );
+}
+
+#[test]
+fn the_trust_verb_refuses_a_repository_the_daemon_does_not_serve() {
+    let directory = data_directory();
+    let repository = repository(&directory, "elsewhere");
+
+    let error = trust_repository(&directory, serving(Vec::new()), &repository, 1_700_000_000)
+        .expect_err("a grant that could never apply is not recorded");
+
+    assert!(
+        error.to_string().contains("team.project_roots"),
+        "the refusal names the same remedy a run against it would get: {error}"
+    );
 }
