@@ -47,6 +47,7 @@ pub use questions::{
 pub use runs::{
     AppliedRunTransition, RUN_TRANSITIONS, RunEffect, RunFacts, RunGuard, RunTransition, RunTrigger,
 };
+pub(crate) use runs::charged_attempts;
 pub use worktrees::{
     AppliedWorktreeTransition, WORKTREE_HOLDING_RUN_STATES, WORKTREE_TRANSITIONS, WorktreeEffect,
     WorktreeFacts, WorktreeGuard, WorktreeTransition, WorktreeTrigger,

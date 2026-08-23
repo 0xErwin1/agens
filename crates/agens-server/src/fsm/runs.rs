@@ -655,7 +655,7 @@ impl StateMachines {
             ));
         }
 
-        let chargeable = self.chargeable_attempts(run_id)?;
+        let chargeable = charged_attempts(&self.store.attempts_for_run(run_id)?);
 
         if chargeable >= facts.retry_budget {
             return Err(guard_refused(
@@ -668,25 +668,6 @@ impl StateMachines {
         }
 
         Ok(())
-    }
-
-    /// Attempts that spend the retry budget.
-    ///
-    /// A leg that ended `interrupted` does not: parking for quota, waiting on a
-    /// person and being interrupted by a restart are none of them the agent's
-    /// failure, and charging them would let a run exhaust its budget without
-    /// ever having been retried.
-    fn chargeable_attempts(&self, run_id: i64) -> Result<i64, TransitionRejection> {
-        let chargeable = self
-            .store
-            .attempts_for_run(run_id)?
-            .into_iter()
-            .filter(|attempt| attempt.outcome != Some(agens_store::AttemptOutcome::Interrupted))
-            .count();
-
-        i64::try_from(chargeable).map_err(|_| {
-            TransitionRejection::Storage(format!("run {run_id} has more attempts than countable"))
-        })
     }
 
     fn next_attempt(
@@ -739,6 +720,26 @@ impl StateMachines {
             updated_at: facts.now,
         })
     }
+}
+
+/// The attempts that spend a run's budget.
+///
+/// A leg that ended `interrupted` does not: parking for quota, waiting on a
+/// person and being interrupted by a restart are none of them the agent's
+/// failure, and charging them would let a run exhaust its budget without ever
+/// having been retried.
+///
+/// The retry guard and the pre-merge gate both count this way, and a rule with
+/// two implementations is a rule that can be changed in one of them. A count
+/// that does not fit an `i64` saturates rather than refusing: both callers
+/// compare it against a cap, and a saturated count is over every cap there is.
+pub(crate) fn charged_attempts(attempts: &[AttemptRow]) -> i64 {
+    attempts
+        .iter()
+        .filter(|attempt| attempt.outcome != Some(AttemptOutcome::Interrupted))
+        .count()
+        .try_into()
+        .unwrap_or(i64::MAX)
 }
 
 /// The refusal a failed guard produces, so every check below names the guard it
