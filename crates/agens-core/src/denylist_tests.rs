@@ -278,3 +278,73 @@ fn every_class_carries_a_distinct_identifier() {
     assert_eq!(unique.len(), classes.len());
     assert!(classes.iter().all(|class| !class.headline().is_empty()));
 }
+
+/// A relative path carrying a glob, a brace expansion or a variable is still
+/// the path it names. Those characters stop the argument from reading as one
+/// path, so what the argument names has to be read as the paths written inside
+/// it or the escape goes unseen.
+#[test]
+fn a_relative_path_written_with_shell_syntax_is_judged_as_a_path() {
+    assert_eq!(
+        command("rm -rf ../victim/*"),
+        Some(DenylistClass::DeletionOutsideWorktree)
+    );
+    assert_eq!(
+        command("rm -rf ../{a,b}"),
+        Some(DenylistClass::DeletionOutsideWorktree)
+    );
+    assert_eq!(
+        command("cat $HOME/.ssh/id_rsa"),
+        Some(DenylistClass::SecretsAccess)
+    );
+    assert_eq!(
+        command("cat ~/.ssh/id_rsa*"),
+        Some(DenylistClass::SecretsAccess)
+    );
+
+    // The same syntax over something the worktree contains stays ordinary.
+    assert_eq!(command("rm -rf target/{debug,release}"), None);
+    assert_eq!(command("rm -rf ./target/debug/*"), None);
+}
+
+/// Every way a line moves its own working directory, not only the one spelling
+/// the matcher can resolve. A move it cannot resolve is a move out: reading it
+/// as staying put leaves every operand after it judged against a directory the
+/// line is no longer in.
+#[test]
+fn a_directory_change_the_matcher_cannot_resolve_is_read_as_leaving_the_worktree() {
+    for line in [
+        "pushd .. && rm -rf victim",
+        "pushd ../.. && cargo run",
+        "popd && rm -rf victim",
+        "cd \"$HOME\" && rm -rf victim",
+        "cd $PARENT && rm -rf victim",
+        "cd `dirname $PWD` && rm -rf victim",
+        "cd ~worker && rm -rf victim",
+    ] {
+        assert_eq!(
+            command(line),
+            Some(DenylistClass::OutOfScope),
+            "{line} leaves the worktree"
+        );
+    }
+
+    assert_eq!(command("pushd crates/agens-core && cargo test"), None);
+}
+
+/// `eval` runs the line written inside it, so the matcher has to read that line
+/// rather than the opaque argument carrying it.
+#[test]
+fn a_line_running_through_eval_is_read_as_the_line_it_runs() {
+    assert_eq!(
+        command("eval \"cd .. && rm -rf x\""),
+        Some(DenylistClass::OutOfScope)
+    );
+    assert_eq!(command("eval 'git push origin main'"), Some(DenylistClass::GitPush));
+    assert_eq!(
+        command("eval \"cat /home/worker/.ssh/id_rsa\""),
+        Some(DenylistClass::SecretsAccess)
+    );
+
+    assert_eq!(command("eval 'cargo test --workspace'"), None);
+}

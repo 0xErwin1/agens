@@ -323,8 +323,13 @@ impl DirectoryChange {
 /// is an ordinary command.
 fn directory_change(tokens: &[String]) -> Option<DirectoryChange> {
     let tokens = permission_target::without_wrapper_prefixes(tokens);
-    if program_of(tokens)? != "cd" {
+    let program = program_of(tokens)?;
+    if !DIRECTORY_PROGRAMS.contains(&program) {
         return None;
+    }
+
+    if program == "popd" {
+        return Some(DirectoryChange::Away);
     }
 
     let operand = tokens
@@ -333,11 +338,29 @@ fn directory_change(tokens: &[String]) -> Option<DirectoryChange> {
         .find(|argument| !argument.starts_with('-'));
 
     Some(match operand {
-        Some(operand) if !names_the_home_directory(Path::new(operand)) => {
+        Some(operand) if !resolves_outside_the_line(operand) => {
             DirectoryChange::To(PathBuf::from(operand))
         }
         _ => DirectoryChange::Away,
     })
+}
+
+/// Programs that move the working directory of the line they are part of.
+///
+/// `pushd` moves it exactly as `cd` does. `popd` moves it back to a directory
+/// held on a stack the matcher never sees, which is why it resolves to nowhere
+/// nameable rather than to the worktree.
+const DIRECTORY_PROGRAMS: [&str; 3] = ["cd", "pushd", "popd"];
+
+/// Whether a directory operand names a place this line cannot resolve.
+///
+/// The home directory is one: no worktree contains it. A word the shell expands
+/// before the directory exists as text is the other — `cd "$HOME"` and
+/// `` cd `dirname $PWD` `` are directories chosen at run time, and joining the
+/// unexpanded word onto the working directory would answer that the line never
+/// left, which is the one thing that cannot be concluded from it.
+fn resolves_outside_the_line(operand: &str) -> bool {
+    operand.starts_with('~') || operand.contains('$') || operand.contains('`')
 }
 
 /// Whether a path is written against the home directory, which no worktree
@@ -565,25 +588,38 @@ fn program_of(tokens: &[String]) -> Option<&str> {
 fn looks_like_a_path(argument: &str) -> bool {
     !argument.starts_with('-')
         && !argument.chars().any(is_not_path_syntax)
-        && (argument.starts_with('/')
-            || argument.starts_with('~')
-            || argument.starts_with("./")
-            || argument.starts_with("../")
-            || argument.contains('/'))
+        && is_path_shaped(argument)
 }
 
-/// The absolute paths written inside an argument that is not itself a path.
+/// The paths written inside an argument that is not itself a path.
 ///
-/// Only absolute ones: a bare word inside a quoted program is prose as often as
-/// it is a file, and re-basing it onto the working directory would invent a
-/// path the argument never named. A `/etc/passwd` written anywhere names
-/// `/etc/passwd`, whichever interpreter is about to read it.
+/// A fragment is kept when it is spelled as a path — rooted at `/` or `~`,
+/// written against the working directory with `./` or `../`, or carrying a
+/// separator anywhere. A bare word is dropped: inside a quoted program it is
+/// prose as often as it is a file, and re-basing it onto the working directory
+/// would invent a path the argument never named.
+///
+/// The relative ones matter as much as the absolute ones. `rm -rf ../victim/*`
+/// carries a glob, so it is not one path the matcher can read whole, and the
+/// only thing left saying it leaves the worktree is the `../victim/` inside it.
+/// What each fragment names is decided against the same working directory the
+/// invocation runs in, by [`Denylist::classify_operand`].
 fn embedded_paths(argument: &str) -> Vec<&str> {
     argument
         .split(is_not_path_syntax)
         .map(|fragment| fragment.trim_end_matches(['.', ':', ',']))
-        .filter(|fragment| fragment.len() > 1 && fragment.starts_with('/'))
+        .filter(|fragment| fragment.len() > 1 && is_path_shaped(fragment))
         .collect()
+}
+
+/// Whether text is spelled the way a path is spelled, leaving aside whatever
+/// shell syntax stands around it.
+fn is_path_shaped(value: &str) -> bool {
+    value.starts_with('/')
+        || value.starts_with('~')
+        || value.starts_with("./")
+        || value.starts_with("../")
+        || value.contains('/')
 }
 
 /// Whether a character separates a path from the program text around it rather
