@@ -216,3 +216,56 @@ fn a_coordinator_started_over_a_running_row_puts_it_back_in_the_queue() {
 
     fs::remove_dir_all(directory).unwrap();
 }
+
+/// Cancellation moves the run and never touches its directory, so a cancelled
+/// run still claims one.
+///
+/// Boot reconciliation used to leave `cancelled` out of the states it walked,
+/// and so reported that directory as work nobody claimed while the scheduler's
+/// ceiling went on counting it against admission. Both now read one list.
+#[test]
+fn a_cancelled_run_still_claims_its_worktree() {
+    let directory = scratch_directory("cancelled-claim");
+    let worktree = directory.join("worktrees").join(REPO).join("agn-191");
+    fs::create_dir_all(&worktree).unwrap();
+
+    {
+        let mut store = ControlPlaneStore::open(&directory).expect("open the control plane");
+        store
+            .insert_run(&RunRow {
+                state: RunState::Cancelled,
+                ..interrupted_run(&worktree)
+            })
+            .expect("insert the run");
+    }
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let supervisor = SessionSupervisor::new(runtime.handle().clone());
+
+    let shutdown = agens_core::HeadlessTurnCancellation::new();
+    let coordinator = Coordinator::start(
+        &directory,
+        &CoordinatorSettings::default(),
+        supervisor,
+        refusing_worker(),
+        &shutdown,
+    )
+    .expect("the coordinator composes over the data directory");
+
+    let reconciliation = coordinator.reconciliation().clone();
+
+    coordinator.stop();
+    runtime.shutdown_timeout(Duration::ZERO);
+
+    assert!(
+        reconciliation.orphan_worktrees.is_empty(),
+        "a cancelled run's directory is claimed, not orphaned: {:?}",
+        reconciliation.orphan_worktrees
+    );
+    assert!(reconciliation.missing_worktrees.is_empty());
+
+    fs::remove_dir_all(directory).unwrap();
+}

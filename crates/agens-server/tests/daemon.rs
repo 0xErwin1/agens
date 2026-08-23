@@ -541,3 +541,141 @@ fn a_coordinator_that_cannot_open_its_store_carries_the_cause_out() {
 
     fs::remove_dir_all(directory).unwrap();
 }
+
+/// The other end of a run's life, over the same composed daemon: a finished run
+/// whose branch landed has its directory reclaimed and disposed of, with nobody
+/// calling a gate by hand.
+///
+/// Nothing here reaches into the coordinator either. The repository is real, the
+/// run is written the way `CreateRun` would leave it, and what the sweep did is
+/// read back through the Feed plane and off the filesystem.
+#[test]
+fn the_daemon_reclaims_the_worktree_of_a_finished_run_whose_branch_landed() {
+    let directory = scratch_directory("reclaim");
+    let checkout = directory.join("repository");
+    fs::create_dir_all(&checkout).unwrap();
+
+    git(&checkout, &["init", "--quiet", "--initial-branch=main"]);
+    git(&checkout, &["config", "user.name", "Agens Test"]);
+    git(&checkout, &["config", "user.email", "agens-test@localhost"]);
+    fs::write(checkout.join("tracked.txt"), "initial\n").unwrap();
+    git(&checkout, &["add", "."]);
+    git(&checkout, &["commit", "--quiet", "-m", "initial"]);
+
+    let worktree = agens_tools::SessionWorktrees::new(&directory)
+        .create(&checkout, REPO, "agn-191", "feature/agn-191", "main")
+        .expect("provision the session worktree");
+
+    fs::write(worktree.join("feature.txt"), "work\n").unwrap();
+    git(&worktree, &["add", "."]);
+    git(&worktree, &["commit", "--quiet", "-m", "feature"]);
+    git(&checkout, &["merge", "--quiet", "feature/agn-191"]);
+
+    let run_id = {
+        let mut store = ControlPlaneStore::open(&directory).expect("open the control plane");
+
+        store
+            .insert_run(&RunRow {
+                repo_root: checkout.display().to_string(),
+                state: RunState::Done,
+                ..proposed_run(&worktree)
+            })
+            .expect("insert the run")
+    };
+
+    let shutdown = HeadlessTurnCancellation::new();
+    let socket = agens_server::socket_path(&directory);
+    let stopper = Stopper(shutdown.clone());
+
+    let watching = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let stopper = stopper;
+
+        runtime.block_on(async move {
+            let channel = connect(socket).await;
+            let mut feed = FeedClient::new(channel);
+
+            let deadline = Instant::now() + PATIENCE;
+            let mut journal = Vec::new();
+
+            while Instant::now() < deadline {
+                journal = journal_of(&mut feed, run_id).await;
+
+                if journal
+                    .iter()
+                    .any(|entry| entry.starts_with("worktree_cleaned"))
+                {
+                    break;
+                }
+
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+
+            drop(stopper);
+
+            journal
+        })
+    });
+
+    let report = agens_server::serve_until_shutdown(
+        &directory,
+        &CoordinatorSettings {
+            heartbeat: Duration::from_millis(25),
+            gates_sweep: Duration::from_millis(50),
+            ..CoordinatorSettings::default()
+        },
+        std::sync::Arc::new(|_launch: &RunLaunch<'_>| {
+            Err(LaunchError("this test starts no sessions".to_owned()))
+        }) as RunWorkerFactory,
+        &shutdown,
+    )
+    .expect("the daemon serves");
+
+    let journal = watching.join().expect("the client thread finishes");
+
+    assert!(report.is_clean(), "every session ended: {report:?}");
+
+    let store = ControlPlaneStore::open(&directory).expect("reopen the control plane");
+    let status = store
+        .load_run(run_id)
+        .expect("load the run")
+        .expect("the run exists")
+        .worktree_status;
+
+    assert_eq!(
+        status,
+        Some(WorktreeStatus::Cleaned),
+        "the sweep releases and then disposes; a row that stopped at reclaimable \
+         would hold its place in the worktree ceiling for good, journal: {journal:?}"
+    );
+    assert!(
+        journal
+            .iter()
+            .any(|entry| entry.starts_with("worktree_reclaimable")),
+        "the release is announced before the disposal: {journal:?}"
+    );
+    assert!(
+        !worktree.is_dir(),
+        "the directory is gone, not only the row"
+    );
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+fn git(directory: &Path, arguments: &[&str]) {
+    let output = std::process::Command::new("git")
+        .current_dir(directory)
+        .args(arguments)
+        .output()
+        .expect("git runs");
+
+    assert!(
+        output.status.success(),
+        "git {arguments:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

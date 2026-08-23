@@ -679,6 +679,45 @@ fn a_cleaned_worktree_is_not_held_against_the_ceiling() {
     assert_eq!(admitted_runs(&report), vec![queued]);
 }
 
+/// Cancellation moves the run and never touches its directory, so a cancelled
+/// run is still holding one. Boot reconciliation reported that directory as an
+/// orphan while the ceiling counted it; both now read the same list.
+#[test]
+fn a_cancelled_run_still_holds_its_worktree_against_the_ceiling() {
+    let mut harness = Harness::new();
+    harness.insert(&Draft::in_state(RunState::Cancelled, "anthropic"));
+    let queued = harness.insert(&Draft::queued("anthropic"));
+
+    let (report, _) = harness.tick(limits(8, 1, 8));
+
+    assert!(admitted_runs(&report).is_empty());
+    assert_eq!(
+        deferral_for(&report, queued),
+        &Deferral::WorktreeCeiling { held: 1, limit: 1 }
+    );
+}
+
+/// A finished run holds its directory until the reclaim sweep disposes of it,
+/// so `done` and `failed` are charged for theirs too.
+#[test]
+fn a_finished_run_holds_its_worktree_until_it_is_cleaned() {
+    let mut harness = Harness::new();
+    harness.insert(&Draft::in_state(RunState::Done, "anthropic"));
+    harness.insert(
+        &Draft::in_state(RunState::Failed, "anthropic").worktree(Some(WorktreeStatus::Reclaimable)),
+    );
+    let queued = harness.insert(&Draft::queued("anthropic"));
+
+    let (report, _) = harness.tick(limits(8, 2, 8));
+
+    assert!(admitted_runs(&report).is_empty());
+    assert_eq!(
+        deferral_for(&report, queued),
+        &Deferral::WorktreeCeiling { held: 2, limit: 2 },
+        "a released worktree is still a directory on disk"
+    );
+}
+
 #[test]
 fn provider_headroom_bounds_one_provider_without_holding_up_the_others() {
     let mut harness = Harness::new();

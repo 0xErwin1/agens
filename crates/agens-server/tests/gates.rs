@@ -15,9 +15,9 @@ use std::{
 };
 
 use agens_server::{
-    ApiCore, AuthorizeMerge, Coordinator, CoordinatorSettings, GateRefusal, Gates, LaunchError,
-    MergeAuthorization, MergePath, PreMergeRequest, PreMergeVerdict, Principal, Receipt,
-    ReclaimRequest, ReclaimVerdict, RunWorkerFactory, SessionSupervisor, StateMachines,
+    ApiCore, AuthorizeMerge, Coordinator, CoordinatorSettings, DisposeVerdict, GateRefusal, Gates,
+    LaunchError, MergeAuthorization, MergePath, PreMergeRequest, PreMergeVerdict, Principal,
+    Receipt, ReclaimRequest, ReclaimVerdict, RunWorkerFactory, SessionSupervisor, StateMachines,
     SubAgentKind, freeze_receipt,
 };
 use agens_store::{
@@ -216,6 +216,17 @@ impl Gated {
             .expect("load approval")
             .expect("the approval exists")
             .state
+    }
+
+    fn gate_payloads(&self) -> Vec<String> {
+        self.machines
+            .store()
+            .events_for_run(self.run_id)
+            .expect("read events")
+            .into_iter()
+            .filter(|event| event.event_type == "gate_result")
+            .map(|event| event.payload)
+            .collect()
     }
 
     fn worktree_status(&self) -> Option<WorktreeStatus> {
@@ -831,6 +842,154 @@ fn a_worktree_outside_the_data_directory_is_refused_rather_than_derived_from() {
         "the refusal names the path, got {error}"
     );
 }
+/// A worktree the reclaim gate released, whose directory something else has
+/// already taken away. The row is what costs the machine a slot, so the
+/// disposal finishes rather than refusing over a directory it wanted gone.
+#[test]
+fn dispose_finishes_a_released_worktree_whose_directory_is_already_gone() {
+    let mut gated = Gated::new(GENESIS);
+    git(&gated.fixture.checkout, &["merge", "--quiet", BRANCH]);
+
+    let released = gated.reclaim();
+    assert!(
+        matches!(released, ReclaimVerdict::Released { .. }),
+        "got {released:?}"
+    );
+    assert_eq!(gated.worktree_status(), Some(WorktreeStatus::Cleaned));
+
+    // A second disposal of the same run has nothing left to move: the row is
+    // already past `reclaimable`, which is the answer a sweep that runs every
+    // interval needs rather than a refusal it would journal every time.
+    let request = ReclaimRequest {
+        run_id: gated.run_id,
+        main_ref: "main".to_owned(),
+        now: NOW,
+    };
+    let verdict = gated.gates().dispose(&request).expect("dispose runs");
+
+    assert!(
+        matches!(verdict, DisposeVerdict::NotReleased),
+        "got {verdict:?}"
+    );
+}
+
+/// The row is what holds the slot, so a directory that vanished under the
+/// daemon still has to be retired.
+#[test]
+fn dispose_retires_a_row_whose_directory_vanished() {
+    let mut gated = Gated::new(GENESIS);
+    git(&gated.fixture.checkout, &["merge", "--quiet", BRANCH]);
+
+    let request = ReclaimRequest {
+        run_id: gated.run_id,
+        main_ref: "main".to_owned(),
+        now: NOW,
+    };
+
+    // Released, then the directory removed behind the control plane's back.
+    let released = gated
+        .gates()
+        .machines_mut()
+        .apply_worktree(
+            request.run_id,
+            agens_server::WorktreeTrigger::MergeDetected,
+            &agens_server::WorktreeFacts {
+                now: NOW,
+                merge_re_derived: true,
+                worktree_clean: true,
+                manual_disposition_confirmed: false,
+            },
+        )
+        .expect("release the worktree");
+    assert!(released.applied().is_some());
+    std::fs::remove_dir_all(&gated.fixture.worktree).expect("remove the directory");
+
+    let verdict = gated.gates().dispose(&request).expect("dispose runs");
+
+    assert!(
+        matches!(verdict, DisposeVerdict::Cleaned(_)),
+        "a directory that is already gone is not a reason to keep the row, got {verdict:?}"
+    );
+    assert_eq!(gated.worktree_status(), Some(WorktreeStatus::Cleaned));
+}
+
+/// The merge is irreversible, so everything that records it has to land with
+/// it. A settlement whose authorization cannot be delivered writes nothing at
+/// all: no verdict naming the approval, no `merged`, and a worktree still
+/// active for the next sweep to reach.
+#[test]
+fn a_settlement_that_cannot_spend_its_authorization_writes_nothing() {
+    let mut gated = Gated::with_approval(GENESIS, QuestionState::Answered, Some(NOW + 600));
+
+    // Delivered out from under the gate: the question machine has no
+    // transition out of `delivered`, so the settlement's guard refuses.
+    let approval_id = gated.approval_id;
+    gated
+        .gates()
+        .machines_mut()
+        .apply_question(
+            approval_id,
+            agens_server::QuestionTrigger::Deliver,
+            &agens_server::QuestionFacts {
+                now: NOW,
+                ..agens_server::QuestionFacts::default()
+            },
+        )
+        .expect("deliver the approval");
+
+    let before = gated.events();
+    let verdict = gated.pre_merge(MergePath::Integrate);
+
+    assert_eq!(
+        refusal(verdict),
+        GateRefusal::NotAuthorized { state: "delivered" },
+        "a spent authorization is refused before anything is merged"
+    );
+    assert_eq!(gated.worktree_status(), Some(WorktreeStatus::Active));
+    assert_eq!(
+        gated
+            .events()
+            .into_iter()
+            .filter(|event| event == "merged")
+            .count(),
+        0,
+        "nothing landed, so nothing says it did: {before:?}"
+    );
+}
+
+/// Git that cannot be asked at all is not a verdict, and it used to leave no
+/// trace: the sweep re-ran the same invocation every interval with nothing to
+/// show for it.
+#[test]
+fn a_derivation_git_refuses_is_journaled_before_the_failure_travels() {
+    let mut gated = Gated::new(GENESIS);
+    std::fs::remove_dir_all(&gated.fixture.worktree).expect("remove the worktree");
+
+    let request = gated.request(MergePath::Integrate);
+    let error = gated
+        .gates()
+        .pre_merge(&request)
+        .expect_err("a worktree that is not there cannot be derived from");
+
+    assert!(
+        matches!(error, agens_server::GateError::Derivation(_)),
+        "got {error:?}"
+    );
+    assert_eq!(
+        gated.events(),
+        ["gate_result"],
+        "the failure leaves a record behind it"
+    );
+    assert!(
+        gated
+            .gate_payloads()
+            .iter()
+            .any(|payload| payload.contains("derivation_failed")),
+        "the entry names what went wrong: {:?}",
+        gated.gate_payloads()
+    );
+}
+
 /// How long an assertion waits for a sweep that runs on its own interval.
 const PATIENCE: Duration = Duration::from_secs(20);
 
