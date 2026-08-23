@@ -26,6 +26,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use agens_core::HeadlessTurnCancellation;
+use agens_diagnostics::best_effort;
 use agens_store::{ControlPlaneStore, EventClass, EventRow};
 
 use crate::diagnostics::CoordinatorDiagnostics;
@@ -93,7 +94,7 @@ impl FatalCore {
             return;
         };
 
-        let _ = store.append_event(&EventRow {
+        best_effort(store.append_event(&EventRow {
             id: None,
             // No run: the core being unusable is a fact about the daemon, and
             // attributing it to whichever run happened to be executing would
@@ -103,6 +104,6 @@ impl FatalCore {
             class: EventClass::Infra,
             payload: serde_json::json!({ "component": component }).to_string(),
             ts: super::now(),
-        });
+        }));
     }
 }

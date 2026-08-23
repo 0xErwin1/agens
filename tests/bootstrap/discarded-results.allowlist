@@ -37,7 +37,6 @@ crates/agens-providers/src/lib.rs	let _ = fs::remove_file(&temporary_path);	seco
 crates/agens-server/src/api/runs.rs	let _ = self.ports.worktrees.remove(&row);	secondary_cleanup
 crates/agens-server/src/api/runs.rs	let _ = self.machines.journal(&[EventRow {	documented_no_op
 crates/agens-server/src/coordinator/mod.rs	let _ = handle.join();	secondary_cleanup
-crates/agens-server/src/coordinator/mod.rs	let _ = ingest.drain_available(&reports);	documented_no_op
 crates/agens-server/src/coordinator/mod.rs	let _ = facts.report(fact);	closed_channel
 crates/agens-server/src/instance.rs	let _ = fs::remove_file(&self.socket_path);	secondary_cleanup
 crates/agens-server/src/instance.rs	let _ = &self.lock;	documented_no_op
