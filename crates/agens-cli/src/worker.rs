@@ -39,7 +39,10 @@ use agens_bootstrap::Bootstrap;
 use agens_core::{
     DenylistClass, HeadlessTurnCancellation, HeadlessTurnPortError, PermissionMode,
     SessionMetadata,
-    run_introspection::{Ask, AskOption, WORKER_CHECKPOINT_PROMPT},
+    run_introspection::{
+        Ask, AskOption, CausalDisposition, Checkpoint, EvidenceClaim, EvidenceClass,
+        WORKER_CHECKPOINT_PROMPT,
+    },
 };
 use agens_headless::{
     HeadlessChatRequest, RunExecution, run_production_headless_chat_executing_run,
@@ -83,6 +86,7 @@ fn build_session(bootstrap: &Bootstrap, launch: &RunLaunch<'_>) -> Result<RunSes
     let run = ExecutingRun {
         run_id: launch.run_id,
         resumed: launch.resumed,
+        provider: launch.run.provider.clone(),
         task: launch.run.task.clone(),
         scope: launch.run.scope.clone(),
         dod: launch.run.dod.clone(),
@@ -116,6 +120,9 @@ fn build_session(bootstrap: &Bootstrap, launch: &RunLaunch<'_>) -> Result<RunSes
 struct ExecutingRun {
     run_id: i64,
     resumed: bool,
+    /// The provider this run's turns speak to, which is the granularity a
+    /// quota cap is held at.
+    provider: String,
     task: String,
     scope: String,
     dod: String,
@@ -289,16 +296,137 @@ fn execute(
         }),
     );
 
+    // Read before the turn's ending is reported, because that ordering is what
+    // tells the health plane a parked turn from an idle one.
+    let quota = completion
+        .as_ref()
+        .err()
+        .and_then(|failure| quota_refusal(&failure.error));
+    if quota.is_some() {
+        reported.report_quota_reached();
+    }
+
     // Reported for a turn that failed as well as for one that worked: a turn
     // that spent tokens and moved nothing is exactly the shape the lost-worker
     // detector counts, and a failure that reported no ending would leave the
     // run looking like it is still thinking.
     reported.report_turn_ended();
 
-    match completion {
-        Ok(completion) => finish(core, run.run_id, &completion.text),
-        Err(_) => stopped(core, run.run_id),
+    match (completion, quota) {
+        (Ok(completion), _) => finish(core, run.run_id, &completion.text),
+        (Err(_), Some(reset_after_seconds)) => {
+            park_on_quota(core, run, &reported, reset_after_seconds)
+        }
+        (Err(_), None) => stopped(core, run.run_id),
     }
+}
+
+/// The reset a quota refusal names, when the turn ended in one.
+///
+/// The class is the provider's own rather than anything read off the text: a
+/// turn that failed because the subscription is spent and one that failed
+/// because the model refused look the same in prose and are not the same fact.
+/// `Some(None)` is a refusal that named no reset.
+fn quota_refusal(error: &agens_error::CliError) -> Option<Option<u32>> {
+    match error.runtime_error()? {
+        agens_core::HeadlessTurnError::ProviderRateLimited {
+            reset_after_seconds,
+        } => Some(reset_after_seconds),
+        _ => None,
+    }
+}
+
+/// Parks the run on its provider's quota rather than failing the attempt.
+///
+/// Reaching a subscription's cap is a wall with a time on it, not a failure of
+/// the work: retrying against it only spends the retry budget on refusals. The
+/// run keeps its worktree, releases its slot by leaving `running`, and its leg
+/// closes `interrupted`, which is the outcome the budget does not count.
+///
+/// A checkpoint goes in first, and it is the worker's rather than the model's:
+/// the model is not there to write one, and a run that parked for an hour with
+/// nothing said about why would come back to a person who cannot tell it from
+/// a stall. What it claims never credits progress — nothing was established by
+/// being refused.
+fn park_on_quota(
+    core: &Arc<Mutex<ApiCore>>,
+    run: &ExecutingRun,
+    reported: &Arc<WorkerFacts>,
+    reset_after_seconds: Option<u32>,
+) -> SessionOutcome {
+    if state_of(core, run.run_id) != Some(RunState::Running) {
+        // Cancelled, or already moved by something else. The run is where that
+        // transition left it, and parking it on top would contradict the row.
+        return SessionOutcome::Completed;
+    }
+
+    let now = now();
+
+    if let Ok(checkpoint) = quota_checkpoint(run, reset_after_seconds) {
+        let _ = introspection_factory(core, run, reported)().checkpoint(&checkpoint);
+    }
+
+    let Ok(mut core) = core.lock() else {
+        return SessionOutcome::Failed;
+    };
+
+    let applied = core.report_run_lifecycle(
+        run.run_id,
+        RunTrigger::QuotaReached,
+        &RunFacts {
+            now,
+            // What the provider named, as a moment rather than a duration: the
+            // control plane stores deadlines and reads no clock of its own. A
+            // refusal that named nothing records none, and the configured
+            // window is what lifts that cap.
+            quota_reset_at: reset_after_seconds
+                .map(|seconds| now.saturating_add(i64::from(seconds))),
+            ..RunFacts::default()
+        },
+    );
+
+    if applied.is_ok() {
+        SessionOutcome::Completed
+    } else {
+        SessionOutcome::Failed
+    }
+}
+
+/// What the worker writes down before the run stops.
+///
+/// The evidence is the refusal itself, classed insufficient: it is true, it is
+/// what stopped the work, and it establishes nothing about the task. The next
+/// goal is the only thing a person reading the parked run needs that the state
+/// does not already say.
+fn quota_checkpoint(
+    run: &ExecutingRun,
+    reset_after_seconds: Option<u32>,
+) -> Result<Checkpoint, agens_core::run_introspection::CheckpointError> {
+    let reset = reset_after_seconds.map_or_else(
+        || "and named no reset time".to_owned(),
+        |seconds| format!("and named a reset in {seconds}s"),
+    );
+
+    Checkpoint::new(
+        vec![EvidenceClaim::new(
+            format!(
+                "the {} provider refused this turn for quota {reset}",
+                run.provider
+            ),
+            Vec::new(),
+            EvidenceClass::Insufficient,
+            CausalDisposition::PreExisting,
+        )],
+        None,
+        "continue this run's task when its provider is serving again".to_owned(),
+        None,
+        vec![format!("the {} provider is out of quota", run.provider)],
+        // No deadline: the worker is not running to one, and a promise it
+        // cannot keep while parked would only reach the wheel as an overdue
+        // checkpoint the moment the run came back.
+        None,
+        Vec::new(),
+    )
 }
 
 /// Reports a turn that did not come back with a completion.

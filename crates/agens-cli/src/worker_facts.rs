@@ -100,6 +100,19 @@ impl WorkerFacts {
         self.report(attribution, IngestFact::TurnEnded { tokens });
     }
 
+    /// Reports that the provider refused this turn for quota.
+    ///
+    /// Reported before the turn's ending, because that is what tells the fold
+    /// the turn apart from an idle one: a worker waiting on a reset made no
+    /// progress and is not thereby a stalled worker.
+    pub(crate) fn report_quota_reached(&self) {
+        let Some(attribution) = self.resolved() else {
+            return;
+        };
+
+        self.report(attribution, IngestFact::QuotaReached);
+    }
+
     fn observe(&self, event: &TurnEvent) {
         // Every event is an occasion to establish the correlation, because the
         // first one is the earliest moment the physical attempt exists.

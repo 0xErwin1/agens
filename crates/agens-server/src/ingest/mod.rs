@@ -61,6 +61,10 @@ pub enum IngestFact {
         tokens: u64,
     },
     ContextExhausted,
+    /// The provider refused the turn for quota. The run parks on the reset, so
+    /// the turn is not the idle one its lack of progress would otherwise make
+    /// it look like.
+    QuotaReached,
     Checkpoint(ReportedCheckpoint),
     /// The promised checkpoint's grace elapsed. Reported by the timer wheel,
     /// which is the only component that recomputes deadlines from the database.
@@ -388,6 +392,7 @@ fn normalize(fact: &IngestFact) -> Result<Observation, IngestRejection> {
             tokens: i64::try_from(*tokens).unwrap_or(i64::MAX),
         },
         IngestFact::ContextExhausted => Observation::ContextExhausted,
+        IngestFact::QuotaReached => Observation::QuotaReached,
         IngestFact::Checkpoint(claim) => Observation::Checkpoint {
             evidence_class: claim.evidence_class,
             claims_progress: claim.claims_progress,
