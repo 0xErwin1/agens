@@ -381,9 +381,12 @@ impl<'a> Gates<'a> {
         if let Some(refusal) = topology_refusal(&derivation) {
             return self.refuse_pre_merge(request, Some(&derivation), refusal);
         }
-        if let Some(refusal) = self.authorization_refusal(request, &derivation)? {
-            return self.refuse_pre_merge(request, Some(&derivation), refusal);
-        }
+        let authorized = match self.authorization_refusal(request, &derivation)? {
+            Authorization::Refused(refusal) => {
+                return self.refuse_pre_merge(request, Some(&derivation), refusal);
+            }
+            Authorization::Granted { expired_at } => expired_at,
+        };
         if let Some(refusal) = self.transaction_refusal(request, &run, &derivation)? {
             return self.refuse_pre_merge(request, Some(&derivation), refusal);
         }
@@ -394,7 +397,7 @@ impl<'a> Gates<'a> {
             Integration::Refused(verdict) => return Ok(verdict),
         };
 
-        let settled = self.settle(request, &derivation, &branch, commit.as_deref())?;
+        let settled = self.settle(request, &derivation, &branch, commit.as_deref(), authorized)?;
 
         Ok(PreMergeVerdict::Merged {
             commit,
@@ -416,6 +419,7 @@ impl<'a> Gates<'a> {
         derivation: &GateDerivation,
         branch: &str,
         commit: Option<&str>,
+        expired_at: Option<i64>,
     ) -> Result<SettledMerge, GateError> {
         let verdict = self.gate_event(
             request.run_id,
@@ -432,6 +436,7 @@ impl<'a> Gates<'a> {
                 "into": request.main_ref,
                 "path": request.path.as_str(),
                 "commit": commit,
+                "authorization_expired_at": expired_at,
             })
             .to_string(),
             ts: request.now,
@@ -444,6 +449,7 @@ impl<'a> Gates<'a> {
             verdict: &verdict,
             merged: &merged,
             worktree_clean: !derivation.dirty,
+            landed: derivation.merged,
         })?)
     }
 
@@ -651,7 +657,7 @@ impl<'a> Gates<'a> {
         &self,
         request: &PreMergeRequest,
         derivation: &GateDerivation,
-    ) -> Result<Option<GateRefusal>, GateError> {
+    ) -> Result<Authorization, GateError> {
         let question = self
             .machines
             .store()
@@ -659,29 +665,37 @@ impl<'a> Gates<'a> {
             .map_err(|error| GateError::Malformed(error.to_string()))?;
 
         let Some(question) = question else {
-            return Ok(Some(GateRefusal::ApprovalMissing));
+            return Ok(Authorization::Refused(GateRefusal::ApprovalMissing));
         };
         if question.run_id != request.run_id || question.kind != QuestionKind::Approval {
-            return Ok(Some(GateRefusal::ApprovalMissing));
+            return Ok(Authorization::Refused(GateRefusal::ApprovalMissing));
         }
         if question.state != QuestionState::Answered
             || question.author != Some(QuestionAuthor::User)
         {
-            return Ok(Some(GateRefusal::NotAuthorized {
+            return Ok(Authorization::Refused(GateRefusal::NotAuthorized {
                 state: question.state.as_str(),
             }));
         }
-        if let Some(expires_at) = question.expires_at
-            && expires_at <= request.now
+
+        // An expiry that passed before anything landed authorizes nothing. One
+        // that passed after the branch went in is a settlement this gate owes
+        // the journal: the merge is irreversible, and refusing it here is what
+        // left a merged branch with no `merged` entry and an approval that
+        // reads as never used. The receipt below still has to name the exact
+        // tree the user approved.
+        let expired_at = question.expires_at.filter(|at| *at <= request.now);
+        if let Some(expired_at) = expired_at
+            && !derivation.merged
         {
-            return Ok(Some(GateRefusal::ApprovalExpired {
-                expired_at: expires_at,
+            return Ok(Authorization::Refused(GateRefusal::ApprovalExpired {
+                expired_at,
             }));
         }
 
         let (Some(tree_hash), Some(paths_digest)) = (question.tree_hash, question.paths_digest)
         else {
-            return Ok(Some(GateRefusal::ReceiptMissing));
+            return Ok(Authorization::Refused(GateRefusal::ReceiptMissing));
         };
 
         let frozen = Receipt {
@@ -691,9 +705,12 @@ impl<'a> Gates<'a> {
         let derived = receipt_of(derivation);
 
         if receipt_holds(&frozen, &derived, derivation.merged) {
-            Ok(None)
+            Ok(Authorization::Granted { expired_at })
         } else {
-            Ok(Some(GateRefusal::ReceiptStale { frozen, derived }))
+            Ok(Authorization::Refused(GateRefusal::ReceiptStale {
+                frozen,
+                derived,
+            }))
         }
     }
 
@@ -927,6 +944,17 @@ pub fn freeze_receipt(
     main_ref: &str,
 ) -> Result<Receipt, GateError> {
     Ok(receipt_of(&worktrees.derive(worktree, main_ref)?))
+}
+
+/// What the authorization check made of the approval presented.
+enum Authorization {
+    Refused(GateRefusal),
+    /// The approval is the user's and names the bytes in front of the gate.
+    /// `expired_at` is set when its date had already passed, which is only
+    /// reached for a merge that already landed.
+    Granted {
+        expired_at: Option<i64>,
+    },
 }
 
 /// Whether the merge ran, or why the gate stopped instead.

@@ -183,6 +183,7 @@ impl Harness {
                     now: NOW,
                     answer: Some("main".to_owned()),
                     author: Some(QuestionAuthor::User),
+                    ..QuestionFacts::default()
                 },
             )
             .unwrap();

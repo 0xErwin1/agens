@@ -218,6 +218,17 @@ impl Gated {
             .state
     }
 
+    fn events_of(&self, event_type: &str) -> Vec<String> {
+        self.machines
+            .store()
+            .events_for_run(self.run_id)
+            .expect("read events")
+            .into_iter()
+            .filter(|event| event.event_type == event_type)
+            .map(|event| event.payload)
+            .collect()
+    }
+
     fn gate_payloads(&self) -> Vec<String> {
         self.machines
             .store()
@@ -383,8 +394,59 @@ fn a_commit_that_only_moves_bytes_within_the_same_paths_still_refuses() {
     );
 }
 
+/// The git merge is outside the transaction that records it, so an approval can
+/// expire between the branch landing and the next sweep reaching it. Refused
+/// there, the run kept a merged branch with no `merged` entry, an approval that
+/// read as never used, and a worktree nothing released.
 #[test]
-fn an_expired_approval_authorizes_nothing() {
+fn an_approval_that_expired_after_its_merge_landed_still_settles_it() {
+    let mut gated = Gated::with_approval(GENESIS, QuestionState::Answered, Some(NOW + 600));
+
+    // The branch lands under a live authorization, exactly as the sweep does
+    // it, and the settlement is then taken away.
+    git(
+        &gated.fixture.checkout,
+        &["merge", "--quiet", "--no-ff", "-m", "landed", BRANCH],
+    );
+
+    let request = PreMergeRequest {
+        now: NOW + 1_200,
+        ..gated.request(MergePath::Attested)
+    };
+    let verdict = gated.gates().pre_merge(&request).expect("gate runs");
+
+    let PreMergeVerdict::Merged { worktree, .. } = verdict else {
+        panic!("a landed merge is settled, not refused: {verdict:?}");
+    };
+    assert_eq!(
+        worktree.expect("the worktree moved").to,
+        WorktreeStatus::Reclaimable,
+        "the settlement is what releases the directory"
+    );
+    assert_eq!(
+        gated.question_state(),
+        QuestionState::Delivered,
+        "the authorization the merge went through is spent, not left standing"
+    );
+    assert!(
+        gated.events().contains(&"merged".to_owned()),
+        "the control plane records a merge that is already in main: {:?}",
+        gated.events()
+    );
+    assert!(
+        gated
+            .events_of("merged")
+            .iter()
+            .any(|payload| payload.contains(&format!("\"authorization_expired_at\":{}", NOW + 600))),
+        "and says the authorization was past its date when it was settled: {:?}",
+        gated.events_of("merged")
+    );
+}
+
+/// An expiry that passed before anything landed is still a refusal: there is no
+/// merge to record and nothing irreversible has happened.
+#[test]
+fn an_approval_that_expired_before_anything_landed_authorizes_nothing() {
     let mut gated = Gated::with_approval(GENESIS, QuestionState::Answered, Some(NOW - 1));
 
     assert_eq!(
@@ -393,6 +455,7 @@ fn an_expired_approval_authorizes_nothing() {
             expired_at: NOW - 1
         }
     );
+    assert_eq!(gated.worktree_status(), Some(WorktreeStatus::Active));
 }
 
 #[test]

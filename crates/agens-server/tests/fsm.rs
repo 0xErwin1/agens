@@ -168,6 +168,7 @@ fn question_facts_for(transition: &QuestionTransition) -> QuestionFacts {
             now: NOW,
             answer: Some("yes".to_owned()),
             author: Some(QuestionAuthor::User),
+            ..QuestionFacts::default()
         },
         QuestionGuard::NotExpired | QuestionGuard::Expired => QuestionFacts {
             now: NOW,
@@ -1022,6 +1023,7 @@ fn an_authorization_is_the_users_alone() {
                 now: NOW,
                 answer: Some("yes".to_owned()),
                 author: Some(QuestionAuthor::Praetor),
+                ..QuestionFacts::default()
             },
         )
         .unwrap_err();
@@ -1082,6 +1084,7 @@ fn an_expired_authorization_cannot_be_granted_or_handed_over() {
                 now: NOW,
                 answer: Some("yes".to_owned()),
                 author: Some(QuestionAuthor::User),
+                ..QuestionFacts::default()
             },
         )
         .unwrap_err();
@@ -1147,6 +1150,7 @@ fn a_consumed_authorization_cannot_be_used_again() {
                 now: NOW,
                 answer: Some("yes".to_owned()),
                 author: Some(QuestionAuthor::User),
+                ..QuestionFacts::default()
             },
         )
         .unwrap();
@@ -1221,6 +1225,7 @@ fn an_answer_records_its_author_and_unblocks_the_run_that_asked() {
                 now: NOW,
                 answer: Some("the server crate".to_owned()),
                 author: None,
+                ..QuestionFacts::default()
             },
         )
         .unwrap_err();
@@ -1243,6 +1248,7 @@ fn an_answer_records_its_author_and_unblocks_the_run_that_asked() {
                 now: NOW,
                 answer: Some("the server crate".to_owned()),
                 author: Some(QuestionAuthor::Praetor),
+                ..QuestionFacts::default()
             },
         )
         .unwrap();
@@ -1515,6 +1521,7 @@ fn a_run_that_only_ever_parked_keeps_its_whole_retry_budget() {
                 now: NOW,
                 answer: Some("keep it".to_owned()),
                 author: Some(QuestionAuthor::User),
+                ..QuestionFacts::default()
             },
         )
         .unwrap();
