@@ -42,6 +42,7 @@
 //! confinement root, its own MCP connections — belongs to the surface that
 //! knows about models, and admission must not have to know any of it.
 
+mod queue_journal;
 mod reconcile;
 
 use std::path::{Path, PathBuf};
@@ -58,6 +59,7 @@ use agens_tools::SessionWorktrees;
 
 use crate::api::{ApiCore, Ports};
 use crate::cache::RunCache;
+use crate::coordinator::queue_journal::QueueJournal;
 use crate::fsm::StateMachines;
 use crate::gates::{
     Gates, MergePath, PreMergeRequest, ReclaimRequest, SUB_AGENT_EVENT, SubAgentKind,
@@ -77,6 +79,7 @@ use crate::scheduler::{
 use crate::sessions::SessionSupervisor;
 use crate::timers::{TimerSettings, TimerWheel};
 
+pub use queue_journal::{ADMISSION_FAILED_EVENT, RUN_DEFERRED_EVENT};
 pub use reconcile::{
     BootReconciliation, MissingWorktree, OrphanWorktree, WORKTREE_MISSING_EVENT,
     WORKTREE_ORPHANED_EVENT,
@@ -389,6 +392,7 @@ fn admission_loop(
     let data_directory = data_directory.to_path_buf();
 
     std::thread::spawn(move || {
+        let mut queue_journal = QueueJournal::default();
         let launcher = SupervisorLauncher::new(supervisor, |pending: &PendingRun<'_>| {
             worker(&RunLaunch {
                 run_id: pending.run_id,
@@ -417,9 +421,14 @@ fn admission_loop(
                 // A tick that could not read the queue did nothing and is not
                 // fatal: the next occasion reads it again, and the runs it
                 // would have admitted are still queued where they were.
-                Ok(mut core) => core
-                    .admit_queued_runs(&scheduler, &launcher, &load)
-                    .map_or(true, |report| !report.failures.is_empty()),
+                Ok(mut core) => match core.admit_queued_runs(&scheduler, &launcher, &load) {
+                    Ok(report) => {
+                        queue_journal.record(core.machines_mut(), &report, load.now);
+
+                        !report.failures.is_empty()
+                    }
+                    Err(_) => true,
+                },
                 Err(_) => true,
             };
 

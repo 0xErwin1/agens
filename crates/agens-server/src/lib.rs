@@ -59,8 +59,9 @@ pub use api::{
 };
 pub use blocking::{BlockingBoundary, BlockingError};
 pub use coordinator::{
-    BootReconciliation, Coordinator, CoordinatorError, CoordinatorSettings, MissingWorktree,
-    OrphanWorktree, RunLaunch, RunWorkerFactory, WORKTREE_MISSING_EVENT, WORKTREE_ORPHANED_EVENT,
+    ADMISSION_FAILED_EVENT, BootReconciliation, Coordinator, CoordinatorError, CoordinatorSettings,
+    MissingWorktree, OrphanWorktree, RUN_DEFERRED_EVENT, RunLaunch, RunWorkerFactory,
+    WORKTREE_MISSING_EVENT, WORKTREE_ORPHANED_EVENT,
 };
 pub use fsm::{
     AppliedQuestionTransition, AppliedRunTransition, AppliedTransition, AppliedWorktreeTransition,
