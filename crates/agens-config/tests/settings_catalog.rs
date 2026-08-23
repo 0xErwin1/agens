@@ -3,8 +3,7 @@ use agens_config::{
     SettingValue, TextListEntry, mcp_servers, mcp_servers_with_defaults,
 };
 use agens_config::{
-    TeamSettings, expand_home_prefix, parse_toml_document, resolve_settings,
-    validate_toml_document,
+    TeamSettings, expand_home_prefix, parse_toml_document, resolve_settings, validate_toml_document,
 };
 
 fn document_for(path: &str, literal: &str) -> toml::Table {

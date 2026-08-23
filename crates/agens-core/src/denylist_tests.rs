@@ -340,7 +340,10 @@ fn a_line_running_through_eval_is_read_as_the_line_it_runs() {
         command("eval \"cd .. && rm -rf x\""),
         Some(DenylistClass::OutOfScope)
     );
-    assert_eq!(command("eval 'git push origin main'"), Some(DenylistClass::GitPush));
+    assert_eq!(
+        command("eval 'git push origin main'"),
+        Some(DenylistClass::GitPush)
+    );
     assert_eq!(
         command("eval \"cat /home/worker/.ssh/id_rsa\""),
         Some(DenylistClass::SecretsAccess)

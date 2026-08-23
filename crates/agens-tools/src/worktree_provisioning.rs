@@ -43,10 +43,10 @@
 //! states the inheritance. A hook exports environment to the hooks that follow
 //! it by appending `KEY=value` lines to the file named by
 //! `AGENS_WORKTREE_ENV`, and only names the caller allowed are accepted: an
-//! export is a hook writing the next hook's environment, and `PATH` or
-//! `LD_PRELOAD` written there would decide what the next command even is. The
-//! exports are reported, and nothing carries them into the worker's own
-//! session yet.
+//! export is a hook writing the next hook's environment. `PATH` and the loader
+//! variables are refused whatever the caller allowed, because those decide what
+//! the next command even is rather than what it reads. The exports are
+//! reported, and nothing carries them into the worker's own session yet.
 //!
 //! A hook failure is never resolved here. The caller decides between
 //! continuing — in which case the failure is recorded so the worker can be
@@ -563,9 +563,8 @@ impl WorktreeProvisioner {
     /// the allowlist says.
     #[must_use]
     pub fn with_export_allowlist(mut self, names: Vec<String>) -> Self {
-        let (rejected, allowed): (Vec<String>, Vec<String>) = names
-            .into_iter()
-            .partition(|name| admits_every_name(name));
+        let (rejected, allowed): (Vec<String>, Vec<String>) =
+            names.into_iter().partition(|name| admits_every_name(name));
 
         self.export_allowlist = allowed;
         self.rejected_export_patterns = rejected;
