@@ -15,11 +15,12 @@
 //! the composition root leaves open: what a run's session is made of belongs to
 //! the surface that knows about models, and nothing fills it in yet.
 
+mod common;
+
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use agens_core::HeadlessTurnCancellation;
 use agens_core::run_introspection::{Ask, AskOption, RunIntrospectionPort};
@@ -34,31 +35,12 @@ use agens_store::{
 };
 use tonic::transport::{Endpoint, Uri};
 
-const REPO: &str = "a1b2c3d4e5f60718";
-const PROVIDER: &str = "scripted";
+use common::{REPO, REPO_ROOT, now, run_in, scratch_directory, worktree_in};
+
 const ANSWER: &str = "keep";
 
 /// How long an assertion waits for a loop that ticks on a heartbeat.
 const PATIENCE: Duration = Duration::from_secs(20);
-
-static NEXT_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
-
-fn scratch_directory(kind: &str) -> PathBuf {
-    let suffix = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
-    let directory = std::env::temp_dir().join(format!(
-        "agens-server-daemon-{kind}-{}-{suffix}",
-        std::process::id()
-    ));
-    fs::create_dir_all(&directory).unwrap();
-
-    directory
-}
-
-fn now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| i64::try_from(elapsed.as_secs()).unwrap_or(0))
-}
 
 /// A proposed run, which is where a client's approval finds one.
 ///
@@ -68,25 +50,11 @@ fn now() -> i64 {
 /// of going through the call that would have provisioned it.
 fn proposed_run(worktree: &Path) -> RunRow {
     RunRow {
-        id: None,
-        repo_id: REPO.to_owned(),
-        repo_root: "/home/dev/agens".to_owned(),
-        remote_url: None,
         external_ref: Some("agens/AGN-180".to_owned()),
-        parent_run_id: None,
         task: "wire the daemon to the core".to_owned(),
         scope: "crates/agens-server".to_owned(),
         dod: "serve runs the composed daemon".to_owned(),
-        genesis_paths: None,
-        state: RunState::Draft,
-        priority: 5,
-        dep_run_id: None,
-        provider: PROVIDER.to_owned(),
-        budget_tokens: None,
-        worktree_path: Some(worktree.display().to_string()),
-        worktree_status: Some(WorktreeStatus::Active),
-        created_at: now(),
-        result: None,
+        ..run_in(RunState::Draft, worktree)
     }
 }
 
@@ -122,7 +90,7 @@ fn open_session_row(data_directory: &Path, run_id: i64) -> Result<SessionId, Lau
         .execute(
             "INSERT INTO sessions (project, title, active_agent, created_at, updated_at)
              VALUES (?1, ?2, 'primary', ?3, ?3)",
-            rusqlite::params!["/home/dev/agens", format!("run {run_id}"), now()],
+            rusqlite::params![REPO_ROOT, format!("run {run_id}"), now()],
         )
         .map_err(|error| LaunchError(error.to_string()))?;
 
@@ -330,8 +298,8 @@ async fn await_reported_state(
 
 #[test]
 fn the_daemon_runs_a_run_from_approval_to_a_question_and_back() {
-    let directory = scratch_directory("lifecycle");
-    let worktree = directory.join("worktrees").join(REPO).join("agn-180");
+    let directory = scratch_directory("daemon", "lifecycle");
+    let worktree = worktree_in(&directory, "agn-180");
     fs::create_dir_all(&worktree).expect("provision the run's worktree");
 
     let run_id = {
@@ -514,7 +482,7 @@ async fn collect_streamed(events: &mut tonic::Streaming<proto::Event>) -> Vec<St
 /// own detail is where a watcher finds it.
 #[test]
 fn the_first_answer_a_client_gets_is_from_a_reconciled_control_plane() {
-    let directory = scratch_directory("reconciled");
+    let directory = scratch_directory("daemon", "reconciled");
     let worktree = directory.join("worktrees").join(REPO).join("agn-192");
     fs::create_dir_all(&worktree).expect("provision the run's worktree");
 
@@ -591,7 +559,7 @@ fn the_first_answer_a_client_gets_is_from_a_reconciled_control_plane() {
 /// about why.
 #[test]
 fn a_coordinator_that_cannot_open_its_store_carries_the_cause_out() {
-    let directory = scratch_directory("unopenable");
+    let directory = scratch_directory("daemon", "unopenable");
 
     // A directory where the control plane's file belongs: the store cannot open
     // it, and the failure is the store's own rather than one this test wrote.
@@ -631,7 +599,7 @@ fn a_coordinator_that_cannot_open_its_store_carries_the_cause_out() {
 /// read back through the Feed plane and off the filesystem.
 #[test]
 fn the_daemon_reclaims_the_worktree_of_a_finished_run_whose_branch_landed() {
-    let directory = scratch_directory("reclaim");
+    let directory = scratch_directory("daemon", "reclaim");
     let checkout = directory.join("repository");
     fs::create_dir_all(&checkout).unwrap();
 

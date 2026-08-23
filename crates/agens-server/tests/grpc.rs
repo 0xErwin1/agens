@@ -10,9 +10,11 @@
 //! authorization table keeps for a person — over the wire, not in a unit test —
 //! because that is the property a new transport could otherwise quietly widen.
 
+mod common;
+
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -32,20 +34,9 @@ use agens_store::{
 use tonic::Code;
 use tonic::transport::{Endpoint, Server, Uri};
 
-const REPO: &str = "a1b2c3d4e5f60718";
+use common::{REPO, scratch_directory};
+
 const OTHER_REPO: &str = "0000111122223333";
-
-static NEXT_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
-
-fn scratch_directory(kind: &str) -> PathBuf {
-    let suffix = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
-    let directory = std::env::temp_dir().join(format!(
-        "agens-server-grpc-{kind}-{}-{suffix}",
-        std::process::id()
-    ));
-    fs::create_dir_all(&directory).unwrap();
-    directory
-}
 
 // The doubles. They record nothing the wire tests need to read back: what is
 // under test is the crossing, and the core's own suite already proves which
@@ -389,7 +380,7 @@ async fn wire_forwarding(
     worktrees: StubWorktrees,
     subscription_ceiling: usize,
 ) -> Wire {
-    let directory = scratch_directory(principal.as_str());
+    let directory = scratch_directory("grpc", principal.as_str());
     let (store, fixture) = seeded_store(&directory);
     let repository = directory.join("checkout");
     fs::create_dir_all(&repository).unwrap();
@@ -997,7 +988,7 @@ fn serving_no_address_is_refused_rather_than_treated_as_serving_nothing() {
         .enable_all()
         .build()
         .unwrap();
-    let directory = scratch_directory("no-address");
+    let directory = scratch_directory("grpc", "no-address");
     let (store, _) = seeded_store(&directory);
 
     let core = Arc::new(Mutex::new(ApiCore::new(
@@ -1029,7 +1020,7 @@ fn serving_no_address_is_refused_rather_than_treated_as_serving_nothing() {
 /// facade on the socket it owns, and that socket answers.
 #[test]
 fn the_daemon_serves_the_facade_on_its_socket() {
-    let directory = scratch_directory("daemon");
+    let directory = scratch_directory("grpc", "daemon");
     let (store, _) = seeded_store(&directory);
 
     let core = ApiCore::new(
