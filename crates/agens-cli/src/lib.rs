@@ -8,6 +8,9 @@ use agens_core::HeadlessTurnCancellation;
 mod attempt_tests;
 #[cfg(test)]
 mod bootstrap_tests;
+mod chat_session;
+#[cfg(test)]
+mod chat_session_tests;
 mod cli;
 mod commands;
 #[cfg(test)]

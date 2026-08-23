@@ -185,6 +185,7 @@ fn a_daemon_that_stopped_on_a_poisoned_core_says_so_to_whoever_started_it() {
             ..CoordinatorSettings::default()
         },
         worker_that_panics_once_armed(poison),
+        common::refusing_chat(),
         &shutdown,
     )
     .expect_err("a daemon whose core was poisoned did not stop cleanly");

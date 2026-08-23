@@ -22,6 +22,7 @@ use agens_server::{CoordinatorSettings, SchedulerLimits, SessionShutdown};
 use tonic::transport::{Channel, Endpoint, Uri};
 
 use crate::CliDependencies;
+use crate::chat_session::hosted_chat;
 use crate::deps::bootstrap;
 use crate::worker::run_worker;
 
@@ -183,6 +184,7 @@ impl DaemonFixture {
             &self.data_directory,
             &self.settings,
             run_worker(&self.bootstrap),
+            hosted_chat(&self.bootstrap),
             &self.shutdown,
         )
         .expect("the daemon serves")
