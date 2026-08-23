@@ -396,10 +396,23 @@ impl Ingest {
         }
     }
 
+    /// Rebuilds one run's fold from its journal.
+    ///
+    /// The signals this module raised are part of what is replayed, not only
+    /// the observations it folded: a lost worker is reported once while it
+    /// stands, and the entry that recorded it is the only record of that
+    /// standing after the memo is gone. Progress clears it, here as in the
+    /// live path, because the fold reads the entries in the order they were
+    /// written.
     fn replay(&self, run_id: i64) -> Result<HealthState, IngestRejection> {
         let mut state = HealthState::default();
 
         for event in self.store.events_for_run(run_id)? {
+            if event.event_type == detectors::WORKER_LOST_EVENT {
+                state.mark_lost_reported();
+                continue;
+            }
+
             if let Some((observation, turn)) = Observation::from_event(&event) {
                 state.fold(turn, &observation);
             }

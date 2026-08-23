@@ -328,6 +328,58 @@ fn a_checkpoint_claiming_progress_over_a_stall_reports_a_lost_worker_once() {
     harness.finish();
 }
 
+/// The fold is memoized, and a memo is evicted by another run's arrival or by
+/// the daemon restarting.
+///
+/// Everything else the fold holds is rebuilt from the journal, and the standing
+/// lost-worker signal has to be too: a run whose fold was evicted would
+/// otherwise raise `worker_lost` again for the same stall, once per eviction,
+/// and Praetor would be activated for a condition already reported.
+#[test]
+fn a_lost_worker_the_journal_already_records_is_not_raised_again_by_a_replay() {
+    let directory = data_directory();
+    let mut harness = Harness::in_directory(&directory);
+    let run_id = harness.seed_run();
+    harness.stall(run_id, 5);
+
+    let claiming = harness.accept(
+        run_id,
+        6,
+        IngestFact::Checkpoint(ReportedCheckpoint::new(EvidenceClass::Inferential, true)),
+    );
+    assert_eq!(
+        claiming.signals,
+        vec![HealthSignal::WorkerLost {
+            reason: LostReason::ProgressClaimedWhileStalled,
+            noop_turns: 5,
+        }]
+    );
+    drop(harness);
+
+    let mut replayed = Harness::in_directory(&directory);
+    let again = replayed.accept(
+        run_id,
+        7,
+        IngestFact::Checkpoint(ReportedCheckpoint::new(EvidenceClass::Inferential, true)),
+    );
+
+    assert!(
+        again.signals.is_empty(),
+        "the signal the journal already carries is not raised a second time"
+    );
+    assert_eq!(
+        replayed
+            .event_types(run_id)
+            .iter()
+            .filter(|event| *event == "worker_lost")
+            .count(),
+        1,
+        "one standing stall is one entry"
+    );
+
+    replayed.finish();
+}
+
 #[test]
 fn a_stall_under_the_threshold_and_a_run_with_no_checkpoint_report_nothing() {
     let mut harness = Harness::open();

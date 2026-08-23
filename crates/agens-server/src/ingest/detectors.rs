@@ -64,12 +64,19 @@ pub enum HealthSignal {
     UnrepresentableMutation,
 }
 
+/// The journal entry a lost worker is recorded as.
+///
+/// Named because it is read as well as written: it is what a replay of the
+/// journal reads the standing signal back from, so the fold a restart rebuilds
+/// does not raise it a second time.
+pub(super) const WORKER_LOST_EVENT: &str = "worker_lost";
+
 impl HealthSignal {
     /// The journal entry name this signal is recorded under.
     #[must_use]
     pub const fn event_type(&self) -> &'static str {
         match self {
-            Self::WorkerLost { .. } => "worker_lost",
+            Self::WorkerLost { .. } => WORKER_LOST_EVENT,
             Self::Divergence { .. } | Self::UnrepresentableMutation => "divergence_detected",
         }
     }
