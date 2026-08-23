@@ -84,7 +84,9 @@ pub use ingest::{
     ReportedCheckpoint, ReportedFact, channel as ingest_channel,
 };
 pub use instance::{ServeInstance, ServeInstanceError, socket_path};
-pub use introspection::{AttemptResolver, CheckpointReporting, Clock, RunIntrospection};
+pub use introspection::{
+    AttemptResolver, CheckpointReporting, Clock, RunIntrospection, SESSION_SUSPEND_REFUSED_EVENT,
+};
 pub use policy::{HookTrust, PendingHookTrust, PolicyError, PolicyStore, RepositoryPolicy};
 pub use ports::GitWorktreeGate;
 pub use scheduler::{
@@ -100,7 +102,7 @@ pub use sessions::{
 pub use timers::{
     CHECKPOINT_EVENT, CHECKPOINT_OVERDUE_EVENT, DEFAULT_CHECKPOINT_GRACE_PERCENT,
     DEFAULT_QUOTA_WINDOW_SECONDS, ExpiredQuestion, ManualTimerClock, OverdueCheckpoint, QuotaReset,
-    TimerSettings, TimerTick, TimerWheel,
+    RejectedStage, TIMER_STAGE_REJECTED_EVENT, TimerSettings, TimerStage, TimerTick, TimerWheel,
 };
 
 #[derive(Debug)]

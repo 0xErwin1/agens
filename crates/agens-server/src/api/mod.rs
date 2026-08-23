@@ -205,8 +205,11 @@ impl ApiCore {
     /// journaled.
     ///
     /// The wheel raises signals and reports to nobody, so what it found is
-    /// returned for the caller to carry.
-    pub fn advance_timers(&mut self, wheel: &TimerWheel) -> Result<TimerTick, TransitionRejection> {
+    /// returned for the caller to carry. Infallible by construction: the
+    /// wheel's three stages are refused independently, and a refusal comes back
+    /// journaled in [`TimerTick::rejections`] rather than as an error that
+    /// would speak for the stages that ran.
+    pub fn advance_timers(&mut self, wheel: &TimerWheel) -> TimerTick {
         wheel.tick(&mut self.machines)
     }
 

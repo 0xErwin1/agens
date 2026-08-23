@@ -30,6 +30,7 @@ use agens_server::{
 };
 use agens_store::{
     ControlPlaneStore, DirectiveGrain, DirectiveStore, DirectiveTarget, RunRow, RunState,
+    WorktreeStatus,
 };
 use tonic::transport::{Endpoint, Uri};
 
@@ -60,7 +61,12 @@ fn now() -> i64 {
 }
 
 /// A proposed run, which is where a client's approval finds one.
-fn proposed_run() -> RunRow {
+///
+/// It carries the worktree `CreateRun` provisions, because admission reads that
+/// column rather than assuming it: a run whose directory is not `active` is one
+/// no session can be started in, and this test writes the row directly instead
+/// of going through the call that would have provisioned it.
+fn proposed_run(worktree: &Path) -> RunRow {
     RunRow {
         id: None,
         repo_id: REPO.to_owned(),
@@ -77,8 +83,8 @@ fn proposed_run() -> RunRow {
         dep_run_id: None,
         provider: PROVIDER.to_owned(),
         budget_tokens: None,
-        worktree_path: None,
-        worktree_status: None,
+        worktree_path: Some(worktree.display().to_string()),
+        worktree_status: Some(WorktreeStatus::Active),
         created_at: now(),
         result: None,
     }
@@ -325,10 +331,15 @@ async fn await_reported_state(
 #[test]
 fn the_daemon_runs_a_run_from_approval_to_a_question_and_back() {
     let directory = scratch_directory("lifecycle");
+    let worktree = directory.join("worktrees").join(REPO).join("agn-180");
+    fs::create_dir_all(&worktree).expect("provision the run's worktree");
+
     let run_id = {
         let mut store = ControlPlaneStore::open(&directory).expect("open the control plane");
 
-        store.insert_run(&proposed_run()).expect("insert the run")
+        store
+            .insert_run(&proposed_run(&worktree))
+            .expect("insert the run")
     };
 
     let script = Arc::new(Script::default());

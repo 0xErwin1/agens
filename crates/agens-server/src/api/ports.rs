@@ -276,6 +276,21 @@ pub trait SessionControl: Send + Sync {
     /// The one signal that waits for no edge.
     fn cancel(&self, run_id: i64) -> Result<(), PortError>;
 
+    /// Stops the session of a run that has just parked.
+    ///
+    /// Separate from [`SessionControl::cancel`] because of where each is
+    /// called from and what the run is by then: a cancelled run is executing
+    /// and is being stopped for good, and a suspended one has already left
+    /// `running` under the transition that parked it. The session behind it is
+    /// what the state machine calls a suspension, and until something performs
+    /// it the worker keeps its worktree and its provider for the rest of the
+    /// turn while the run reads as parked.
+    ///
+    /// The work is not lost: what the run is resumed from is its last
+    /// checkpoint, which is durable, and a worker held resident for an
+    /// hours-long wait is state a restart could not rebuild anyway.
+    fn suspend(&self, run_id: i64) -> Result<(), PortError>;
+
     fn take_over(&self, run_id: i64) -> Result<TakeoverHandle, PortError>;
 
     fn stop(&self, scope: &StopScope) -> Result<(), PortError>;

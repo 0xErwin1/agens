@@ -62,10 +62,10 @@ fn run_in(state: RunState) -> RunRow {
 
 /// Ports nothing in this file reaches.
 ///
-/// A worker's checkpoint and its question are written through the state
-/// machines alone: neither declares an effect outside the transaction, so a
-/// port that answered anything here would be answering a call that never
-/// happens.
+/// A worker's checkpoint is written through the state machines alone, and so is
+/// the question its `ask` opens. The one effect either declares outside the
+/// transaction is the suspension the park owes its session, and that goes to
+/// [`RecordingSuspensions`] rather than here.
 struct Unreached;
 
 impl AdmissionControl for Unreached {
@@ -104,9 +104,27 @@ impl DeliveryQueue for Unreached {
     }
 }
 
-impl SessionControl for Unreached {
+/// The sessions port, recording the suspensions a parked run asks it for.
+#[derive(Default)]
+struct RecordingSuspensions {
+    suspended: Mutex<Vec<i64>>,
+}
+
+impl RecordingSuspensions {
+    fn suspended(&self) -> Vec<i64> {
+        self.suspended.lock().unwrap().clone()
+    }
+}
+
+impl SessionControl for RecordingSuspensions {
     fn cancel(&self, _run_id: i64) -> Result<(), PortError> {
         Err(unreached("sessions"))
+    }
+
+    fn suspend(&self, run_id: i64) -> Result<(), PortError> {
+        self.suspended.lock().unwrap().push(run_id);
+
+        Ok(())
     }
 
     fn take_over(&self, _run_id: i64) -> Result<TakeoverHandle, PortError> {
@@ -158,14 +176,14 @@ fn unreached(port: &'static str) -> PortError {
     PortError::new(port, "no introspection write reaches a port")
 }
 
-fn ports() -> Ports {
+fn ports(sessions: Arc<RecordingSuspensions>) -> Ports {
     let unreached = Arc::new(Unreached);
 
     Ports {
         scheduler: Arc::clone(&unreached) as Arc<dyn AdmissionControl>,
         worktrees: Arc::clone(&unreached) as Arc<dyn WorktreeGate>,
         delivery: Arc::clone(&unreached) as Arc<dyn DeliveryQueue>,
-        sessions: Arc::clone(&unreached) as Arc<dyn SessionControl>,
+        sessions: sessions as Arc<dyn SessionControl>,
         feed: unreached as Arc<dyn EventFeed>,
     }
 }
@@ -179,18 +197,35 @@ fn fixture(
     i64,
     RunIntrospection,
 ) {
+    let (directory, core, run_id, introspection, _) = fixture_with_sessions(state);
+
+    (directory, core, run_id, introspection)
+}
+
+/// The same fixture, handing back the sessions port so a test can assert what
+/// the run asked of it.
+fn fixture_with_sessions(
+    state: RunState,
+) -> (
+    std::path::PathBuf,
+    Arc<Mutex<ApiCore>>,
+    i64,
+    RunIntrospection,
+    Arc<RecordingSuspensions>,
+) {
     let directory = data_directory();
     let mut store = ControlPlaneStore::open(&directory).unwrap();
     let run_id = store.insert_run(&run_in(state)).unwrap();
+    let sessions = Arc::new(RecordingSuspensions::default());
     let core = Arc::new(Mutex::new(ApiCore::new(
         StateMachines::new(store),
-        ports(),
+        ports(Arc::clone(&sessions)),
         Arc::new(Unreached) as Arc<dyn RepositoryPolicy>,
     )));
     let introspection = RunIntrospection::new(Arc::clone(&core), run_id, Arc::new(|| NOW))
         .for_attempt(Some(11), Some(22));
 
-    (directory, core, run_id, introspection)
+    (directory, core, run_id, introspection, sessions)
 }
 
 fn claim(description: &str, class: EvidenceClass, proofs: &[&str]) -> EvidenceClaim {
@@ -415,14 +450,14 @@ fn the_deadline_a_checkpoint_declares_is_the_one_the_timer_wheel_holds_it_to() {
 
     let (wheel, clock) = TimerWheel::with_manual_clock_for_test(TimerSettings::default(), NOW);
 
-    let tick = core.lock().unwrap().advance_timers(&wheel).unwrap();
+    let tick = core.lock().unwrap().advance_timers(&wheel);
     assert!(
         tick.overdue_checkpoints.is_empty(),
         "a promise that has not come due yet is not overdue: {tick:?}"
     );
 
     clock.set(NOW + 100_000);
-    let tick = core.lock().unwrap().advance_timers(&wheel).unwrap();
+    let tick = core.lock().unwrap().advance_timers(&wheel);
 
     assert_eq!(
         tick.overdue_checkpoints
@@ -561,6 +596,37 @@ fn ask_opens_a_durable_question_and_parks_the_run_on_it() {
         ],
         "no transition is silent"
     );
+
+    drop(core);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+/// A run that parked has returned its slot, and the session it parked from is
+/// asked to stop in the same breath. Left running, that session keeps editing
+/// the worktree and spending the provider for the rest of its turn, against a
+/// run the control plane reads as waiting on a person.
+#[test]
+fn parking_on_a_question_suspends_the_session_the_run_parked_from() {
+    let (directory, core, run_id, mut introspection, sessions) =
+        fixture_with_sessions(RunState::Running);
+
+    introspection.ask(&ask()).expect("a running run can ask");
+
+    assert_eq!(sessions.suspended(), vec![run_id]);
+
+    drop(core);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+/// A refused park suspends nothing: the run is still executing, and stopping
+/// its session over a question it never opened would end the work it is doing.
+#[test]
+fn a_refused_ask_suspends_no_session() {
+    let (directory, core, _, mut introspection, sessions) = fixture_with_sessions(RunState::Queued);
+
+    introspection.ask(&ask()).unwrap_err();
+
+    assert!(sessions.suspended().is_empty());
 
     drop(core);
     fs::remove_dir_all(directory).unwrap();

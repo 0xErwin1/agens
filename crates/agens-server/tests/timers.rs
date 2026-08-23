@@ -12,7 +12,7 @@ use std::{
 
 use agens_server::{
     CHECKPOINT_EVENT, CHECKPOINT_OVERDUE_EVENT, QuestionEffect, RunEffect, StateMachines,
-    TimerSettings, TimerWheel,
+    TIMER_STAGE_REJECTED_EVENT, TimerSettings, TimerStage, TimerWheel,
 };
 use agens_store::{
     ControlPlaneStore, EventClass, EventRow, ProviderRow, QuestionAuthor, QuestionKind,
@@ -39,6 +39,98 @@ fn data_directory() -> std::path::PathBuf {
 
 fn store() -> ControlPlaneStore {
     ControlPlaneStore::open(data_directory()).unwrap()
+}
+
+/// The three stages of a tick answer to different deadlines and are refused
+/// independently.
+///
+/// Chained through `?`, one refused stage suspended the other two on every
+/// tick: a run that left `awaiting_quota` between the read and the apply was
+/// enough to stop every question from expiring and every overdue checkpoint
+/// from being raised, for as long as the row disagreed. Here that refusal is
+/// forced with a trigger that aborts exactly the write the quota stage makes.
+#[test]
+fn a_refused_stage_is_journaled_and_the_other_two_still_run() {
+    let (directory, mut store) = store_in_its_own_directory();
+
+    let working = working_run(&mut store);
+    let question = store
+        .insert_question(&question_in(
+            working,
+            QuestionKind::Approval,
+            QuestionState::Open,
+            Some(START + 600),
+        ))
+        .unwrap();
+    let parked = store
+        .insert_run(&run_in(RunState::AwaitingQuota, "anthropic"))
+        .unwrap();
+    store
+        .record_provider(&capped("anthropic", Some(START + 600)))
+        .unwrap();
+
+    refuse_leaving_awaiting_quota(&directory);
+
+    let mut machines = StateMachines::new(store);
+    let (wheel, clock) = TimerWheel::with_manual_clock_for_test(TimerSettings::default(), START);
+    clock.set(START + 900);
+
+    let tick = wheel.tick(&mut machines);
+
+    assert!(tick.quota_resets.is_empty());
+    assert_eq!(state_of(&machines, parked), RunState::AwaitingQuota);
+    assert_eq!(tick.rejections.len(), 1);
+
+    let refused = tick.rejections.first().expect("the stage was refused");
+    assert_eq!(refused.stage, TimerStage::QuotaResets);
+    assert!(
+        refused.event_id.is_some(),
+        "the refusal reached the journal"
+    );
+
+    // The two stages behind it ran all the same.
+    assert_eq!(tick.expired_questions.len(), 1);
+    assert_eq!(question_state(&machines, question), QuestionState::Expired);
+    assert_eq!(tick.overdue_checkpoints.len(), 1);
+    assert_eq!(overdue_signals(&machines, working), 1);
+
+    let journaled = machines
+        .store()
+        .events_after(0, 256)
+        .unwrap()
+        .into_iter()
+        .find(|event| event.event_type == TIMER_STAGE_REJECTED_EVENT)
+        .expect("the refusal is in the journal");
+    let payload: serde_json::Value = serde_json::from_str(&journaled.payload).unwrap();
+
+    assert_eq!(payload["stage"], "quota_resets");
+    assert!(
+        payload["reason"]
+            .as_str()
+            .is_some_and(|reason| !reason.is_empty())
+    );
+}
+
+/// Aborts the one write the quota stage makes, which is what a run leaving
+/// `awaiting_quota` between the wheel's read and its apply does to it.
+fn refuse_leaving_awaiting_quota(directory: &std::path::Path) {
+    rusqlite::Connection::open(directory.join("agens.db"))
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER refuse_quota_reset BEFORE UPDATE ON runs
+             WHEN old.state = 'awaiting_quota'
+             BEGIN SELECT RAISE(ABORT, 'the run already left awaiting_quota'); END;",
+        )
+        .unwrap();
+}
+
+/// A store whose directory the test keeps, for the one test that reaches the
+/// database file itself.
+fn store_in_its_own_directory() -> (std::path::PathBuf, ControlPlaneStore) {
+    let directory = data_directory();
+    let store = ControlPlaneStore::open(&directory).unwrap();
+
+    (directory, store)
 }
 
 fn run_in(state: RunState, provider: &str) -> RunRow {
@@ -161,16 +253,10 @@ fn a_checkpoint_is_overdue_only_once_the_promised_span_plus_its_grace_has_passed
     let (wheel, clock) = TimerWheel::with_manual_clock_for_test(TimerSettings::default(), START);
 
     clock.set(START + 899);
-    assert!(
-        wheel
-            .tick(&mut machines)
-            .unwrap()
-            .overdue_checkpoints
-            .is_empty()
-    );
+    assert!(wheel.tick(&mut machines).overdue_checkpoints.is_empty());
 
     clock.set(START + 900);
-    let tick = wheel.tick(&mut machines).unwrap();
+    let tick = wheel.tick(&mut machines);
 
     let overdue = tick.overdue_checkpoints.first().unwrap();
     assert_eq!(overdue.run_id, run_id);
@@ -192,16 +278,10 @@ fn a_configured_grace_replaces_the_default_one_and_a_half_promised_spans() {
     let (wheel, clock) = TimerWheel::with_manual_clock_for_test(settings, START);
 
     clock.set(START + 900);
-    assert!(
-        wheel
-            .tick(&mut machines)
-            .unwrap()
-            .overdue_checkpoints
-            .is_empty()
-    );
+    assert!(wheel.tick(&mut machines).overdue_checkpoints.is_empty());
 
     clock.set(START + 1_800);
-    let tick = wheel.tick(&mut machines).unwrap();
+    let tick = wheel.tick(&mut machines);
 
     assert_eq!(
         tick.overdue_checkpoints.first().unwrap().deadline,
@@ -218,28 +298,13 @@ fn an_overdue_checkpoint_is_signalled_once_however_many_ticks_pass() {
     let (wheel, clock) = TimerWheel::with_manual_clock_for_test(TimerSettings::default(), START);
 
     clock.set(START + 1_000);
-    assert_eq!(
-        wheel.tick(&mut machines).unwrap().overdue_checkpoints.len(),
-        1
-    );
+    assert_eq!(wheel.tick(&mut machines).overdue_checkpoints.len(), 1);
 
     clock.set(START + 2_000);
-    assert!(
-        wheel
-            .tick(&mut machines)
-            .unwrap()
-            .overdue_checkpoints
-            .is_empty()
-    );
+    assert!(wheel.tick(&mut machines).overdue_checkpoints.is_empty());
 
     clock.set(START + 3_000);
-    assert!(
-        wheel
-            .tick(&mut machines)
-            .unwrap()
-            .overdue_checkpoints
-            .is_empty()
-    );
+    assert!(wheel.tick(&mut machines).overdue_checkpoints.is_empty());
 
     assert_eq!(overdue_signals(&machines, run_id), 1);
 }
@@ -253,26 +318,17 @@ fn a_fresh_checkpoint_earns_its_own_deadline_and_its_own_signal() {
     let (wheel, clock) = TimerWheel::with_manual_clock_for_test(TimerSettings::default(), START);
 
     clock.set(START + 1_000);
-    wheel.tick(&mut machines).unwrap();
+    wheel.tick(&mut machines);
 
     machines
         .journal(&[checkpoint(run_id, START + 1_100, Some(START + 1_700))])
         .unwrap();
 
     clock.set(START + 1_500);
-    assert!(
-        wheel
-            .tick(&mut machines)
-            .unwrap()
-            .overdue_checkpoints
-            .is_empty()
-    );
+    assert!(wheel.tick(&mut machines).overdue_checkpoints.is_empty());
 
     clock.set(START + 2_000);
-    assert_eq!(
-        wheel.tick(&mut machines).unwrap().overdue_checkpoints.len(),
-        1
-    );
+    assert_eq!(wheel.tick(&mut machines).overdue_checkpoints.len(), 1);
     assert_eq!(overdue_signals(&machines, run_id), 2);
 }
 
@@ -285,38 +341,19 @@ fn a_restarted_wheel_still_owes_the_checkpoint_its_deadline_and_never_signals_tw
     let (first, first_clock) =
         TimerWheel::with_manual_clock_for_test(TimerSettings::default(), START);
     first_clock.set(START + 100);
-    assert!(
-        first
-            .tick(&mut machines)
-            .unwrap()
-            .overdue_checkpoints
-            .is_empty()
-    );
+    assert!(first.tick(&mut machines).overdue_checkpoints.is_empty());
     drop(first);
 
     let (second, second_clock) =
         TimerWheel::with_manual_clock_for_test(TimerSettings::default(), START);
     second_clock.set(START + 1_000);
-    assert_eq!(
-        second
-            .tick(&mut machines)
-            .unwrap()
-            .overdue_checkpoints
-            .len(),
-        1
-    );
+    assert_eq!(second.tick(&mut machines).overdue_checkpoints.len(), 1);
     drop(second);
 
     let (third, third_clock) =
         TimerWheel::with_manual_clock_for_test(TimerSettings::default(), START);
     third_clock.set(START + 2_000);
-    assert!(
-        third
-            .tick(&mut machines)
-            .unwrap()
-            .overdue_checkpoints
-            .is_empty()
-    );
+    assert!(third.tick(&mut machines).overdue_checkpoints.is_empty());
 
     assert_eq!(overdue_signals(&machines, run_id), 1);
 }
@@ -341,7 +378,7 @@ fn a_checkpoint_that_promised_nothing_measurable_has_no_deadline() {
     let (wheel, clock) = TimerWheel::with_manual_clock_for_test(TimerSettings::default(), START);
     clock.set(START + 100_000);
 
-    let tick = wheel.tick(&mut machines).unwrap();
+    let tick = wheel.tick(&mut machines);
 
     assert!(tick.overdue_checkpoints.is_empty());
     assert_eq!(overdue_signals(&machines, silent), 0);
@@ -362,13 +399,7 @@ fn only_a_running_run_owes_a_checkpoint() {
     let (wheel, clock) = TimerWheel::with_manual_clock_for_test(TimerSettings::default(), START);
     clock.set(START + 100_000);
 
-    assert!(
-        wheel
-            .tick(&mut machines)
-            .unwrap()
-            .overdue_checkpoints
-            .is_empty()
-    );
+    assert!(wheel.tick(&mut machines).overdue_checkpoints.is_empty());
     assert_eq!(overdue_signals(&machines, parked), 0);
 }
 
@@ -395,7 +426,7 @@ fn an_elapsed_reset_requeues_every_run_parked_on_that_provider_and_lifts_the_cap
     let (wheel, clock) = TimerWheel::with_manual_clock_for_test(TimerSettings::default(), START);
     clock.set(START + 600);
 
-    let tick = wheel.tick(&mut machines).unwrap();
+    let tick = wheel.tick(&mut machines);
 
     let requeued: Vec<i64> = tick.quota_resets.iter().map(|reset| reset.run_id).collect();
     assert_eq!(requeued, vec![first, second]);
@@ -433,7 +464,7 @@ fn a_reset_that_has_not_arrived_wakes_nothing() {
     let (wheel, clock) = TimerWheel::with_manual_clock_for_test(TimerSettings::default(), START);
     clock.set(START + 599);
 
-    assert!(wheel.tick(&mut machines).unwrap().quota_resets.is_empty());
+    assert!(wheel.tick(&mut machines).quota_resets.is_empty());
     assert_eq!(state_of(&machines, parked), RunState::AwaitingQuota);
 }
 
@@ -457,11 +488,11 @@ fn a_cap_with_no_reset_time_waits_out_the_configured_window() {
     let (wheel, clock) = TimerWheel::with_manual_clock_for_test(settings, START);
 
     clock.set(START + 899);
-    assert!(wheel.tick(&mut machines).unwrap().quota_resets.is_empty());
+    assert!(wheel.tick(&mut machines).quota_resets.is_empty());
     assert_eq!(state_of(&machines, parked), RunState::AwaitingQuota);
 
     clock.set(START + 900);
-    assert_eq!(wheel.tick(&mut machines).unwrap().quota_resets.len(), 1);
+    assert_eq!(wheel.tick(&mut machines).quota_resets.len(), 1);
     assert_eq!(state_of(&machines, parked), RunState::Queued);
 }
 
@@ -484,16 +515,10 @@ fn an_expired_approval_is_voided_rather_than_granted() {
     let (wheel, clock) = TimerWheel::with_manual_clock_for_test(TimerSettings::default(), START);
 
     clock.set(START + 599);
-    assert!(
-        wheel
-            .tick(&mut machines)
-            .unwrap()
-            .expired_questions
-            .is_empty()
-    );
+    assert!(wheel.tick(&mut machines).expired_questions.is_empty());
 
     clock.set(START + 600);
-    let tick = wheel.tick(&mut machines).unwrap();
+    let tick = wheel.tick(&mut machines);
 
     let expired = tick.expired_questions.first().unwrap();
     assert_eq!(expired.question_id, approval);
@@ -534,10 +559,7 @@ fn an_authorization_already_granted_still_expires_unconsumed() {
     let (wheel, clock) = TimerWheel::with_manual_clock_for_test(TimerSettings::default(), START);
     clock.set(START + 601);
 
-    assert_eq!(
-        wheel.tick(&mut machines).unwrap().expired_questions.len(),
-        1
-    );
+    assert_eq!(wheel.tick(&mut machines).expired_questions.len(), 1);
     assert_eq!(question_state(&machines, approval), QuestionState::Expired);
 }
 
@@ -568,7 +590,7 @@ fn a_plain_question_past_its_expiry_expires_and_an_undated_one_waits() {
     let (wheel, clock) = TimerWheel::with_manual_clock_for_test(TimerSettings::default(), START);
     clock.set(START + 100_000);
 
-    let tick = wheel.tick(&mut machines).unwrap();
+    let tick = wheel.tick(&mut machines);
 
     assert_eq!(tick.expired_questions.len(), 1);
     assert_eq!(question_state(&machines, dated), QuestionState::Expired);
@@ -594,7 +616,7 @@ fn an_answered_question_the_table_cannot_expire_is_left_where_it_is() {
     let (wheel, clock) = TimerWheel::with_manual_clock_for_test(TimerSettings::default(), START);
     clock.set(START + 100_000);
 
-    let tick = wheel.tick(&mut machines).unwrap();
+    let tick = wheel.tick(&mut machines);
 
     assert!(tick.expired_questions.is_empty());
     assert_eq!(question_state(&machines, answered), QuestionState::Answered);
@@ -623,7 +645,7 @@ fn one_tick_carries_all_three_kinds_of_expiry() {
     let (wheel, clock) = TimerWheel::with_manual_clock_for_test(TimerSettings::default(), START);
     clock.set(START + 1_000);
 
-    let tick = wheel.tick(&mut machines).unwrap();
+    let tick = wheel.tick(&mut machines);
 
     assert_eq!(tick.now, START + 1_000);
     assert_eq!(tick.overdue_checkpoints.len(), 1);
@@ -657,7 +679,7 @@ fn nothing_at_all_is_due_before_the_clock_moves() {
 
     let (wheel, _clock) = TimerWheel::with_manual_clock_for_test(TimerSettings::default(), START);
 
-    let tick = wheel.tick(&mut machines).unwrap();
+    let tick = wheel.tick(&mut machines);
 
     assert_eq!(tick.now, START);
     assert!(tick.overdue_checkpoints.is_empty());

@@ -431,7 +431,6 @@ fn admission_loop(
     let stopping = Arc::clone(stopping);
     let scheduler = Scheduler::new(settings.scheduler.clone());
     let heartbeat = settings.heartbeat;
-    let backoff = settings.heartbeat * FAILED_LAUNCH_BACKOFF;
     let data_directory = data_directory.to_path_buf();
 
     std::thread::spawn(move || {
@@ -460,10 +459,13 @@ fn admission_loop(
                 ..SchedulerLoad::default()
             };
 
-            let failed = match core.lock() {
-                // A tick that could not read the queue did nothing and is not
-                // fatal: the next occasion reads it again, and the runs it
-                // would have admitted are still queued where they were.
+            // Only a launch that was accepted and then did not work earns the
+            // pause. A tick that could not read the queue launched nothing and
+            // started nothing: it is a condition of the store rather than of a
+            // run, the next heartbeat reads it again, and pausing twenty of
+            // them over a transient `SQLITE_BUSY` would hold the whole queue
+            // for something that passed on its own.
+            let failed_launch = match core.lock() {
                 Ok(mut core) => match core.admit_queued_runs(&scheduler, &launcher, &load) {
                     Ok(report) => {
                         queue_journal.record(core.machines_mut(), &report, load.now);
@@ -471,15 +473,15 @@ fn admission_loop(
 
                         !report.failures.is_empty()
                     }
-                    Err(_) => true,
+                    Err(_) => false,
                 },
                 // A poisoned core is not a tick that did nothing: it is a core
-                // no later tick will take either, so the daemon stops here
-                // rather than sleeping the backoff forever.
+                // no later tick will take either. The daemon stops here, and
+                // there is nothing to pause for on the way out.
                 Err(_) => {
                     fatal.poisoned("admission");
 
-                    true
+                    false
                 }
             };
 
@@ -487,11 +489,27 @@ fn admission_loop(
             // occasion offers it the same slot and it fails the same way. The
             // pause is what keeps that from spending a session per heartbeat
             // on a run nothing has changed about.
-            if failed {
-                std::thread::sleep(backoff);
+            if failed_launch {
+                pause(&stopping, heartbeat, FAILED_LAUNCH_BACKOFF);
             }
         }
     })
+}
+
+/// Waits for a number of heartbeats, and gives up the moment the daemon is
+/// stopping.
+///
+/// One long sleep would be simpler and would make `stop()` wait out whatever
+/// remained of it. A shutdown that has to sit through a backoff is a shutdown
+/// whose duration is set by the last thing that went wrong.
+fn pause(stopping: &AtomicBool, heartbeat: Duration, heartbeats: u32) {
+    for _ in 0..heartbeats {
+        if stopping.load(Ordering::Acquire) {
+            return;
+        }
+
+        std::thread::sleep(heartbeat);
+    }
 }
 
 /// The timer wheel, recomputing every deadline from the database.
@@ -527,21 +545,20 @@ fn timer_loop(
     std::thread::spawn(move || {
         while !stopping.load(Ordering::Acquire) {
             let (requeued, expired) = match core.lock() {
-                Ok(mut core) => match core.advance_timers(&wheel) {
-                    Ok(tick) => {
-                        diagnostics.timers(&tick);
+                Ok(mut core) => {
+                    let tick = core.advance_timers(&wheel);
 
-                        (
-                            !tick.quota_resets.is_empty(),
-                            // Attributed while the core is still held, from the
-                            // same rows the tick read: a fact attributed to an
-                            // attempt the run left between the two would be
-                            // refused as a straggler.
-                            expired_checkpoint_facts(&core, &tick),
-                        )
-                    }
-                    Err(_) => (false, Vec::new()),
-                },
+                    diagnostics.timers(&tick);
+
+                    (
+                        !tick.quota_resets.is_empty(),
+                        // Attributed while the core is still held, from the
+                        // same rows the tick read: a fact attributed to an
+                        // attempt the run left between the two would be
+                        // refused as a straggler.
+                        expired_checkpoint_facts(&core, &tick),
+                    )
+                }
                 // The wheel reading a poisoned core as "nothing was due" is how
                 // a daemon goes on ticking against a core it will never take
                 // again. It is fatal here for the same reason it is in
@@ -848,21 +865,39 @@ fn ingest_loop(
 
     Ok(std::thread::spawn(move || {
         while !stopping.load(Ordering::Acquire) {
-            // A refused fact is already carried back on its own outcome, and
-            // the reporter is the party that can do something about it.
-            for drained in ingest.drain_available(&reports) {
-                let Ok(accepted) = &drained.outcome else {
-                    continue;
-                };
-
-                for signal in &accepted.signals {
-                    diagnostics.health_signal(drained.fact.run_id, signal);
-                }
-            }
+            fold_reported_facts(&mut ingest, &reports, &diagnostics);
 
             std::thread::sleep(heartbeat);
         }
+
+        // Whatever was reported in the last window before the stop, folded
+        // before the loop ends. A worker's evidence is already journaled by
+        // then and the run it belongs to is not: dropping it would leave the
+        // run's health describing a window the daemon had the facts for and
+        // never read.
+        fold_reported_facts(&mut ingest, &reports, &diagnostics);
     }))
+}
+
+/// Folds every fact waiting right now and reports the health signals they
+/// raised.
+///
+/// A refused fact is already carried back on its own outcome, and the reporter
+/// is the party that can do something about it.
+fn fold_reported_facts(
+    ingest: &mut Ingest,
+    reports: &FactReceiver,
+    diagnostics: &CoordinatorDiagnostics,
+) {
+    for drained in ingest.drain_available(reports) {
+        let Ok(accepted) = &drained.outcome else {
+            continue;
+        };
+
+        for signal in &accepted.signals {
+            diagnostics.health_signal(drained.fact.run_id, signal);
+        }
+    }
 }
 
 /// The journal publisher: the tail of the journal, once, for every subscriber.

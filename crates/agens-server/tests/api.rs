@@ -223,6 +223,7 @@ impl DeliveryQueue for RecordingDelivery {
 #[derive(Default)]
 struct RecordingSessions {
     cancelled: Mutex<Vec<i64>>,
+    suspended: Mutex<Vec<i64>>,
     taken_over: Mutex<Vec<i64>>,
     stopped: Mutex<Vec<StopScope>>,
 }
@@ -230,6 +231,11 @@ struct RecordingSessions {
 impl SessionControl for RecordingSessions {
     fn cancel(&self, run_id: i64) -> Result<(), PortError> {
         self.cancelled.lock().unwrap().push(run_id);
+        Ok(())
+    }
+
+    fn suspend(&self, run_id: i64) -> Result<(), PortError> {
+        self.suspended.lock().unwrap().push(run_id);
         Ok(())
     }
 

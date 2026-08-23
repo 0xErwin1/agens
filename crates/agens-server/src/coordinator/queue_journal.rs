@@ -116,6 +116,12 @@ fn deferral_payload(deferral: &Deferral) -> serde_json::Value {
         Deferral::Ineligible(Ineligible::ProviderCapped { provider }) => {
             serde_json::json!({ "reason": "provider_capped", "provider": provider })
         }
+        Deferral::Ineligible(Ineligible::WorktreeNotReady { worktree_status }) => {
+            serde_json::json!({
+                "reason": "worktree_not_ready",
+                "worktree_status": worktree_status.map(|status| status.as_str()),
+            })
+        }
         Deferral::Ineligible(Ineligible::DependencyPending {
             dep_run_id,
             worktree_status,
@@ -129,9 +135,9 @@ fn deferral_payload(deferral: &Deferral) -> serde_json::Value {
             "running": running,
             "limit": limit,
         }),
-        Deferral::WorktreeCeiling { running, limit } => serde_json::json!({
+        Deferral::WorktreeCeiling { held, limit } => serde_json::json!({
             "reason": "worktree_ceiling",
-            "running": running,
+            "held": held,
             "limit": limit,
         }),
         Deferral::ProviderHeadroom {
