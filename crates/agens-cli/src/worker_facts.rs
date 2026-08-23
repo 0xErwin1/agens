@@ -24,9 +24,13 @@ use std::sync::{Arc, Mutex};
 
 use agens_core::{SessionMetadata, TurnEvent, TurnProgressSink};
 use agens_server::{
-    ApiCore, AttemptResolver, Attribution, CheckpointReporting, FactSender, IngestFact,
-    ReportedFact,
+    ApiCore, AttemptResolver, Attribution, BacklogNotice, CheckpointReporting, FactSender,
+    IngestFact, RefusedReport, ReportedFact,
 };
+
+/// What the worker's progress sink calls itself in a record of a fact it could
+/// not report.
+const WORKER_REPORTER: &str = "worker_sink";
 use agens_store::SessionStore;
 
 /// One turn's reporting surface, shared between the progress sink and the run's
@@ -48,6 +52,8 @@ struct State {
     attribution: Option<Attribution>,
     /// Tokens the provider reported for this turn, as they arrive.
     tokens: u64,
+    /// Whether this run already has an entry for the backlog it last met.
+    backlog: BacklogNotice,
 }
 
 impl WorkerFacts {
@@ -198,21 +204,46 @@ impl WorkerFacts {
             .ok()?;
 
         Some(Attribution {
-            attempt_id: session_attempt_id,
+            attempt_id: Some(session_attempt_id),
             turn: attempt.n,
         })
     }
 
     /// Queues one fact. A queue with no reader is the daemon shutting down, and
     /// a worker is not the party that acts on that.
+    ///
+    /// A queue that is merely full is: the fact is gone, the health plane will
+    /// never see the turn it described, and nothing else in the run would say
+    /// so. The refusal is journaled once while the backlog stands.
     fn report(&self, attribution: Attribution, fact: IngestFact) {
-        let _ = self.facts.report(ReportedFact {
+        let refused = self.facts.report(ReportedFact {
             run_id: self.run_id,
             attempt_id: attribution.attempt_id,
             turn: attribution.turn,
             now: now(),
             fact,
         });
+
+        self.observe_report(refused.err());
+    }
+
+    /// Records a fact the ingest queue would not take, once per backlog.
+    ///
+    /// Best effort: it is already reporting that a write did not happen, and a
+    /// second failure has nowhere to go.
+    fn observe_report(&self, refused: Option<RefusedReport>) {
+        let Some(refused) = self
+            .state
+            .lock()
+            .ok()
+            .and_then(|mut state| state.backlog.observe(refused))
+        else {
+            return;
+        };
+
+        if let Ok(mut core) = self.core.lock() {
+            let _ = core.journal_backlogged_fact(WORKER_REPORTER, &refused);
+        }
     }
 }
 

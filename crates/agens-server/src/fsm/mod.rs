@@ -267,7 +267,14 @@ impl StateMachines {
         settlement: &MergeSettlement<'_>,
     ) -> Result<SettledMerge, TransitionRejection> {
         let question = self.load_question(settlement.approval_id)?;
-        let approval = questions::deliverable(&question, settlement.now)?;
+        let approval = questions::deliverable(
+            &question,
+            &QuestionFacts {
+                now: settlement.now,
+                merge_already_landed: settlement.landed,
+                ..QuestionFacts::default()
+            },
+        )?;
 
         let run = self.load_run(settlement.run_id)?;
         let release = worktrees::releasable(&run, settlement.now, settlement.worktree_clean)?;
@@ -404,6 +411,10 @@ pub struct MergeSettlement<'a> {
     pub merged: &'a EventRow,
     /// Whether git reported nothing uncommitted left behind.
     pub worktree_clean: bool,
+    /// Whether the merge is already in the target's history, re-derived by the
+    /// caller. It is what lets an authorization that expired after its bytes
+    /// went in still be spent on the merge it allowed.
+    pub landed: bool,
 }
 
 /// What one settled merge wrote.

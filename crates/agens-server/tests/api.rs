@@ -20,8 +20,8 @@ use agens_server::{
     MergeAuthorization, OPERATION_AUTHORIZATION, Operation, PendingHookTrust, PortError, Ports,
     Principal, ProvisionedWorktree, RepositoryIdentity, RepositoryPolicy, RetryRequest, RunFacts,
     RunRef, RunTrigger, SessionControl, StateMachines, StopRequest, StopScope, Subscription,
-    TURN_FAILED_EVENT, TakeoverHandle, TransitionRejection, TurnFailure, WorktreeDerivation,
-    WorktreeGate, WorktreeRequest, praetor_may_answer,
+    TURN_FAILED_EVENT, TakeoverHandle, TransitionRejection, TrustReadFailure, TurnFailure,
+    WorktreeDerivation, WorktreeGate, WorktreeRequest, praetor_may_answer,
 };
 use agens_store::{
     ControlPlaneStore, QuestionAuthor, QuestionKind, QuestionRow, QuestionState, RetryTrigger,
@@ -351,6 +351,16 @@ impl Harness {
             .unwrap()
             .unwrap()
             .state
+    }
+
+    fn worktree_status(&self, run_id: i64) -> Option<WorktreeStatus> {
+        self.core
+            .machines()
+            .store()
+            .load_run(run_id)
+            .unwrap()
+            .unwrap()
+            .worktree_status
     }
 
     fn event_types(&self, run_id: i64) -> Vec<String> {
@@ -1994,6 +2004,61 @@ fn a_repository_whose_hooks_the_operator_refused_is_not_asked_again() {
     assert_eq!(created.hook_authorization_question, None);
 }
 
+/// A poisoned lock or a failing query made every repository this daemon serves
+/// permanently untrusted, in a way indistinguishable from the operator having
+/// said no and with nothing written down. The refusal stands, and now it says
+/// so.
+#[test]
+fn a_hook_trust_register_that_cannot_be_read_refuses_and_says_why() {
+    let repository = checkout();
+    let mut harness = Harness::with_policy(
+        store(),
+        RecordingWorktrees::new(false, true).declaring_hooks(&["devshell"]),
+        Arc::new(
+            RecordingPolicy::serving(&repository)
+                .trusting(HookTrust::Unreadable(TrustReadFailure::Poisoned)),
+        ),
+        repository.clone(),
+    );
+
+    let created = harness
+        .core
+        .create_run(Principal::User, &create_run(&repository))
+        .unwrap();
+
+    assert_eq!(
+        *harness.worktrees.hook_policies.lock().unwrap(),
+        vec![HookPolicy::Deny],
+        "a register nothing can read grants nothing"
+    );
+    assert_eq!(created.hook_authorization_question, None);
+
+    let recorded: Vec<_> = harness
+        .core
+        .machines()
+        .store()
+        .events_after(0, 256)
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.event_type == "hook_trust_unreadable")
+        .collect();
+
+    assert_eq!(
+        recorded.len(),
+        1,
+        "the read failure leaves a record behind it"
+    );
+    assert!(
+        recorded[0].run_id.is_none(),
+        "a register the daemon cannot read is not a fact about one run"
+    );
+    assert!(
+        recorded[0].payload.contains("\"reason\":\"poisoned\""),
+        "the entry names which failure it was: {}",
+        recorded[0].payload
+    );
+}
+
 #[test]
 fn a_run_praetor_proposed_never_runs_a_repositorys_hooks() {
     let repository = checkout();
@@ -2168,5 +2233,26 @@ fn a_creation_that_fails_after_the_row_exists_leaves_no_run_and_no_worktree() {
         harness.run_state(run_id),
         RunState::Cancelled,
         "the row the failed creation opened is not left as a draft anything could approve"
+    );
+    assert_eq!(
+        harness.worktree_status(run_id),
+        Some(WorktreeStatus::Cleaned),
+        "the directory is gone, so nothing counts it against the ceiling or looks for it at boot"
+    );
+
+    let questions = harness
+        .core
+        .machines()
+        .store()
+        .questions_for_run(run_id)
+        .unwrap();
+
+    assert_eq!(
+        questions
+            .iter()
+            .map(|question| question.state)
+            .collect::<Vec<_>>(),
+        vec![QuestionState::Expired],
+        "the question was opened, and one whose answer nothing recorded is not left standing"
     );
 }

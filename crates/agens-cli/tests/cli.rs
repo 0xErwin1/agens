@@ -21,7 +21,7 @@ use agens_core::{
     Message, MessagePart, PermissionDecision, ReasoningEffort, Role, SessionMessage,
     SessionMetadata, TurnEvent, TurnProvider, run_headless_turn,
 };
-use agens_store::{PermissionGrantStore, SessionStore};
+use agens_store::{PermissionGrantStore, RepositoryPolicyStore, SessionStore, StoredHookTrust};
 use agens_tools::McpTransport;
 
 fn assert_diagnostic_error(actual: &[u8], expected_without_reference: &str) {
@@ -6201,6 +6201,7 @@ fn journey_runs_without_any_real_credential_in_its_environment() {
 fn serve_trust_grants_a_served_repository_and_refuses_one_outside_the_configured_roots() {
     let temporary = TemporaryDirectory::new("serve-trust");
     let config_home = temporary.path().join("config");
+    let data_directory = temporary.path().join("data");
     let project_root = temporary.path().join("project");
     let served = temporary.path().join("checkouts");
     let repository = served.join("agens");
@@ -6227,7 +6228,11 @@ fn serve_trust_grants_a_served_repository_and_refuses_one_outside_the_configured
         )]),
         BTreeMap::from([(
             config_home.join("config.toml"),
-            format!("[team]\nproject_roots = [\"{}\"]\n", served.display()),
+            format!(
+                "[options]\ndata_dir = \"{}\"\n\n[team]\nproject_roots = [\"{}\"]\n",
+                data_directory.display(),
+                served.display()
+            ),
         )]),
     );
 
@@ -6241,6 +6246,24 @@ fn serve_trust_grants_a_served_repository_and_refuses_one_outside_the_configured
         granted.stdout.contains("may now run with the daemon"),
         "the grant says what it authorized: {}",
         granted.stdout
+    );
+
+    // Read back through the register the daemon reads, not through the words
+    // the command printed: a grant the daemon never sees is the one failure
+    // this verb has, and stdout cannot tell the two apart.
+    let repo_id = granted
+        .stdout
+        .split_once('(')
+        .and_then(|(_, rest)| rest.split_once(')'))
+        .map(|(id, _)| id.to_owned())
+        .expect("the grant names the repository it decided about");
+    let register =
+        RepositoryPolicyStore::open(&data_directory).expect("the register the daemon reads");
+
+    assert_eq!(
+        register.hook_trust(&repo_id).expect("read the register"),
+        StoredHookTrust::Granted,
+        "the daemon reads a grant, not a message"
     );
 
     let refused = execute(

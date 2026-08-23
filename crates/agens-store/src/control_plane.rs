@@ -697,6 +697,7 @@ impl ControlPlaneStore {
     /// turn itself once the session starts. Until they are joined, every fact
     /// the harness reports is unattributable and the evidence ledger cannot be
     /// reached from a run at all.
+    ///
     /// Only an attempt that is still open, and only once.
     ///
     /// A closed leg is finished accounting: pointing it at a later execution

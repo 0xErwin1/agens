@@ -59,6 +59,34 @@ pub enum HookTrust {
     Refused,
     /// Nothing has been decided, so the first run of this repository asks.
     Unknown,
+    /// The register could not be read, so nothing is known and nothing is
+    /// permitted.
+    ///
+    /// It is separate from [`Self::Refused`] because the two are refusals for
+    /// opposite reasons: one is the operator's decision, and the other is the
+    /// daemon unable to reach it. Collapsing them made a poisoned mutex or a
+    /// SQLite error look exactly like a repository somebody had said no to,
+    /// permanently and with nothing written down.
+    Unreadable(TrustReadFailure),
+}
+
+/// Why the hook-trust register could not be read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrustReadFailure {
+    /// The register's lock was left poisoned by a panicking operation.
+    Poisoned,
+    /// The query itself failed.
+    Storage,
+}
+
+impl TrustReadFailure {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Poisoned => "poisoned",
+            Self::Storage => "storage",
+        }
+    }
 }
 
 /// The half of the policy the operator writes by hand.
@@ -256,32 +284,42 @@ impl RepositoryPolicy for PolicyStore {
     }
 
     fn hook_trust(&self, repo_id: &str) -> HookTrust {
-        let stored = match &self.register {
-            Register::Database(store) => lock(store)
-                .ok()
-                .and_then(|store| store.hook_trust(repo_id).ok()),
-            Register::Memory(memory) => lock(memory).ok().map(|memory| {
-                memory
-                    .decided
-                    .iter()
-                    .find(|(known, _)| known == repo_id)
-                    .map_or(StoredHookTrust::Unknown, |(_, granted)| {
-                        if *granted {
-                            StoredHookTrust::Granted
-                        } else {
-                            StoredHookTrust::Refused
-                        }
-                    })
-            }),
-        };
+        let stored =
+            match &self.register {
+                Register::Database(store) => lock(store)
+                    .map_err(|_| TrustReadFailure::Poisoned)
+                    .and_then(|store| {
+                        store
+                            .hook_trust(repo_id)
+                            .map_err(|_| TrustReadFailure::Storage)
+                    }),
+                Register::Memory(memory) => lock(memory)
+                    .map_err(|_| TrustReadFailure::Poisoned)
+                    .map(|memory| {
+                        memory
+                            .decided
+                            .iter()
+                            .find(|(known, _)| known == repo_id)
+                            .map_or(StoredHookTrust::Unknown, |(_, granted)| {
+                                if *granted {
+                                    StoredHookTrust::Granted
+                                } else {
+                                    StoredHookTrust::Refused
+                                }
+                            })
+                    }),
+            };
 
         // A register that could not be read has decided nothing, and nothing
         // decided is not permission: an unreadable policy refuses hooks rather
         // than falling through to the question that would ask about them again.
+        // It says which of the two it is, because a caller that cannot tell
+        // them apart cannot say anything either.
         match stored {
-            Some(StoredHookTrust::Granted) => HookTrust::Granted,
-            Some(StoredHookTrust::Unknown) => HookTrust::Unknown,
-            Some(StoredHookTrust::Refused) | None => HookTrust::Refused,
+            Ok(StoredHookTrust::Granted) => HookTrust::Granted,
+            Ok(StoredHookTrust::Unknown) => HookTrust::Unknown,
+            Ok(StoredHookTrust::Refused) => HookTrust::Refused,
+            Err(failure) => HookTrust::Unreadable(failure),
         }
     }
 

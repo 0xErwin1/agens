@@ -7,6 +7,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
+    time::Duration,
 };
 
 use agens_core::run_introspection::{
@@ -14,11 +15,12 @@ use agens_core::run_introspection::{
     RunIntrospectionError, RunIntrospectionPort,
 };
 use agens_server::{
-    AdmissionControl, ApiCore, CHECKPOINT_EVENT, CheckpointClaim, Delivery, DeliveryQueue,
-    EventFeed, EventFilter, HookTrust, PendingHookTrust, PortError, Ports, ProvisionedWorktree,
-    ReportedCheckpoint, RepositoryIdentity, RepositoryPolicy, RunIntrospection, SessionControl,
-    StateMachines, StopScope, Subscription, TakeoverHandle, TimerSettings, TimerWheel,
-    WorktreeDerivation, WorktreeGate, WorktreeRequest,
+    AdmissionControl, ApiCore, AttemptResolver, Attribution, BACKLOGGED_EVENT, CHECKPOINT_EVENT,
+    CheckpointClaim, CheckpointReporting, Delivery, DeliveryQueue, EventFeed, EventFilter,
+    HookTrust, IngestFact, PendingHookTrust, PortError, Ports, ProvisionedWorktree,
+    ReportedCheckpoint, ReportedFact, RepositoryIdentity, RepositoryPolicy, RunIntrospection,
+    SessionControl, StateMachines, StopScope, Subscription, TakeoverHandle, TimerSettings,
+    TimerWheel, WorktreeDerivation, WorktreeGate, WorktreeRequest, channel_with_backlog,
 };
 use agens_store::{ControlPlaneStore, QuestionKind, QuestionState, RunRow, RunState};
 
@@ -263,6 +265,73 @@ fn payload(core: &Arc<Mutex<ApiCore>>, run_id: i64) -> serde_json::Value {
         .expect("the checkpoint was journaled");
 
     serde_json::from_str(&event.payload).expect("the journal payload is JSON")
+}
+
+/// The checkpoint reached the journal and the health plane will never hear
+/// about it. Every reporter used to drop that refusal, so a run whose evidence
+/// stopped arriving looked exactly like a run that had nothing to say.
+#[test]
+fn a_checkpoint_the_ingest_queue_refuses_is_journaled_once() {
+    let (directory, core, run_id, introspection) = fixture(RunState::Running);
+    let (facts, _receiver) = channel_with_backlog(1, Duration::from_millis(0));
+
+    facts
+        .report(ReportedFact {
+            run_id,
+            attempt_id: Some(22),
+            turn: 1,
+            now: NOW,
+            fact: IngestFact::TurnStarted,
+        })
+        .expect("the one slot is free");
+
+    let resolver: AttemptResolver = Arc::new(|| {
+        Some(Attribution {
+            attempt_id: Some(22),
+            turn: 1,
+        })
+    });
+    let mut introspection = introspection.reporting_to(CheckpointReporting::new(facts, resolver));
+
+    for _ in 0..2 {
+        introspection
+            .checkpoint(&checkpoint(
+                vec![claim("proved", EvidenceClass::Deterministic, &["exit 0"])],
+                Vec::new(),
+            ))
+            .expect("a full queue is not a reason to fail the tool call");
+    }
+
+    let core = core.lock().unwrap();
+    let backlogged: Vec<_> = core
+        .machines()
+        .store()
+        .events_for_run(run_id)
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.event_type == BACKLOGGED_EVENT)
+        .collect();
+
+    assert_eq!(
+        backlogged.len(),
+        1,
+        "a standing backlog is one entry, not one per checkpoint"
+    );
+    assert!(
+        backlogged[0]
+            .payload
+            .contains("\"reporter\":\"checkpoint_tool\""),
+        "the entry names the reporter that lost the fact: {}",
+        backlogged[0].payload
+    );
+    assert!(
+        backlogged[0].payload.contains("\"fact\":\"checkpoint\""),
+        "and which fact it was: {}",
+        backlogged[0].payload
+    );
+
+    drop(core);
+    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]

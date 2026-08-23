@@ -361,6 +361,19 @@ struct Slots {
     subagents: BTreeMap<String, usize>,
 }
 
+/// The worktree-holding states, less the one this tick is deciding on.
+///
+/// Queued runs are left out on purpose: each admission reserves a worktree of
+/// its own, and counting a queued run here as well would charge it against the
+/// ceiling it is asking to pass.
+fn holding_states_outside_the_queue() -> Vec<RunState> {
+    WORKTREE_HOLDING_RUN_STATES
+        .iter()
+        .copied()
+        .filter(|state| *state != RunState::Queued)
+        .collect()
+}
+
 impl Slots {
     /// Counts what is already running and what already holds a worktree, from
     /// the store rather than from memory.
@@ -407,19 +420,6 @@ impl Slots {
             subagents: load.subagents.clone(),
         })
     }
-}
-
-/// The worktree-holding states, less the one this tick is deciding on.
-///
-/// Queued runs are left out on purpose: each admission below reserves a
-/// worktree of its own, and counting a queued run here as well would charge it
-/// against the ceiling it is asking to pass.
-fn holding_states_outside_the_queue() -> Vec<RunState> {
-    WORKTREE_HOLDING_RUN_STATES
-        .iter()
-        .copied()
-        .filter(|state| *state != RunState::Queued)
-        .collect()
 }
 
 impl Slots {

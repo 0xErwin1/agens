@@ -29,14 +29,19 @@ use agens_store::{
 
 use super::{ApiCore, ApiError, Operation};
 use crate::api::ports::{HookPolicy, ProvisionedWorktree, WorktreeRequest};
-use crate::fsm::{Principal, RunFacts, RunTrigger};
-use crate::policy::{HookTrust, PendingHookTrust};
+use crate::fsm::{
+    Principal, QuestionFacts, QuestionTrigger, RunFacts, RunTrigger, WorktreeFacts, WorktreeTrigger,
+};
+use crate::policy::{HookTrust, PendingHookTrust, TrustReadFailure};
 
 /// How many characters of a task's own words the worktree directory carries.
 ///
 /// Long enough to recognize at a `cd`, short enough that the path stays one
 /// terminal line beside the repository segment and the data directory.
 const SLUG_CHARS: usize = 32;
+
+/// The journal entry an unreadable hook-trust register is recorded as.
+const HOOK_TRUST_UNREADABLE_EVENT: &str = "hook_trust_unreadable";
 
 /// What the operator is asked when a repository's hooks have never been
 /// decided on.
@@ -165,7 +170,7 @@ impl ApiCore {
         let identity = self.ports.worktrees.identify(&repository)?;
         let name = worktree_name(&request.task, &identity.repo_id, request.now);
         let branch = format!("agens/{name}");
-        let hooks = self.hook_policy(principal, &identity.repo_id);
+        let hooks = self.hook_policy(principal, &identity.repo_id, request.now);
 
         Ok(PreparedRun {
             repository,
@@ -189,7 +194,7 @@ impl ApiCore {
         prepared: &PreparedRun,
         provisioned: ProvisionedWorktree,
     ) -> Result<CreatedRun, ApiError> {
-        let row = RunRow {
+        let mut row = RunRow {
             id: None,
             repo_id: prepared.repo_id.clone(),
             repo_root: prepared.repository.display().to_string(),
@@ -211,7 +216,6 @@ impl ApiCore {
             result: None,
         };
 
-        let mut row = row;
         let run_id = match self.machines.open_run(&row) {
             Ok(run_id) => run_id,
             Err(error) => {
@@ -259,8 +263,23 @@ impl ApiCore {
     /// the outcome — the directory goes first, so a rollback that only got
     /// halfway leaves a cancelled run naming a worktree the sweep can reclaim
     /// rather than a live draft holding one.
+    ///
+    /// The worktree is let go before the run is cancelled. `Discard` carries no
+    /// effects, so a rollback that stopped after it left a `cancelled` row with
+    /// `worktree_status = active` naming a directory that no longer exists:
+    /// counted against the ceiling for the life of the daemon, and reported as
+    /// a missing worktree on every boot.
     fn discard_created_run(&mut self, run_id: i64, row: &RunRow, now: i64) {
         let _ = self.ports.worktrees.remove(row);
+        let _ = self.machines.apply_worktree(
+            run_id,
+            WorktreeTrigger::ManualDisposition,
+            &WorktreeFacts {
+                now,
+                manual_disposition_confirmed: true,
+                ..WorktreeFacts::default()
+            },
+        );
         let _ = self.machines.apply_run(
             run_id,
             RunTrigger::Discard,
@@ -305,7 +324,7 @@ impl ApiCore {
     /// A hook is repository code executed with the daemon's environment, and a
     /// run proposed by the manager is exactly the path where nobody looked at
     /// the repository first.
-    fn hook_policy(&self, principal: Principal, repo_id: &str) -> HookPolicy {
+    fn hook_policy(&mut self, principal: Principal, repo_id: &str, now: i64) -> HookPolicy {
         if principal == Principal::Praetor {
             return HookPolicy::Deny;
         }
@@ -314,7 +333,34 @@ impl ApiCore {
             HookTrust::Granted => HookPolicy::Allow,
             HookTrust::Refused => HookPolicy::Deny,
             HookTrust::Unknown => HookPolicy::Ask,
+            HookTrust::Unreadable(failure) => {
+                self.journal_unreadable_trust(repo_id, failure, now);
+
+                HookPolicy::Deny
+            }
         }
+    }
+
+    /// Records that the hook-trust register could not be read.
+    ///
+    /// The refusal it produces is indistinguishable from an operator saying no,
+    /// and it lasts as long as the register stays unreadable: every repository
+    /// this daemon serves becomes permanently untrusted, with nothing anywhere
+    /// saying why. The entry is that record, and it hangs off no run because a
+    /// register the daemon cannot read is not a fact about one.
+    fn journal_unreadable_trust(&mut self, repo_id: &str, failure: TrustReadFailure, now: i64) {
+        let _ = self.machines.journal(&[EventRow {
+            id: None,
+            run_id: None,
+            event_type: HOOK_TRUST_UNREADABLE_EVENT.to_owned(),
+            class: EventClass::Infra,
+            payload: serde_json::json!({
+                "repo_id": repo_id,
+                "reason": failure.as_str(),
+            })
+            .to_string(),
+            ts: now,
+        }]);
     }
 
     /// Opens the durable question a repository whose hooks nobody has decided
@@ -355,12 +401,28 @@ impl ApiCore {
             &[],
         )?;
 
-        self.policy.record_pending(&PendingHookTrust {
+        // The question and the record of what answering it decides live in
+        // two stores, so they cannot be one statement. What they can be is all
+        // or nothing: a question whose answer nothing would act on is a run
+        // parked on a decision that has no consequence, and it used to be left
+        // open against a run this failure is about to cancel.
+        if let Err(error) = self.policy.record_pending(&PendingHookTrust {
             question_id,
             repo_id: prepared.repo_id.clone(),
             repository: prepared.repository.clone(),
             asked_at: now,
-        })?;
+        }) {
+            let _ = self.machines.apply_question(
+                question_id,
+                QuestionTrigger::Void,
+                &QuestionFacts {
+                    now,
+                    ..QuestionFacts::default()
+                },
+            );
+
+            return Err(error.into());
+        }
 
         Ok(Some(question_id))
     }

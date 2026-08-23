@@ -29,7 +29,8 @@ use agens_store::{
 use crate::api::ApiCore;
 use crate::fsm::{Principal, RunEffect, RunFacts, RunTrigger, TransitionRejection};
 use crate::ingest::{
-    Attribution, CheckpointClaim, FactSender, IngestFact, ReportedCheckpoint, ReportedFact,
+    Attribution, BacklogNotice, CheckpointClaim, FactSender, IngestFact, RefusedReport,
+    ReportedCheckpoint, ReportedFact,
 };
 use crate::timers::CHECKPOINT_EVENT;
 
@@ -38,6 +39,10 @@ pub type Clock = Arc<dyn Fn() -> i64 + Send + Sync>;
 
 /// The journal entry a suspension the sessions port refused is recorded as.
 const SESSION_SUSPEND_REFUSED_EVENT: &str = "session_suspend_refused";
+
+/// What a run's checkpoint tool calls itself in a record of a fact it could
+/// not report.
+const CHECKPOINT_REPORTER: &str = "checkpoint_tool";
 
 /// Resolves the physical execution the reports are coming from.
 ///
@@ -89,6 +94,8 @@ pub struct RunIntrospection {
     session_attempt_id: Option<i64>,
     clock: Clock,
     reporting: Option<CheckpointReporting>,
+    /// Whether this run already has an entry for the backlog it last met.
+    backlog: BacklogNotice,
 }
 
 impl RunIntrospection {
@@ -101,6 +108,7 @@ impl RunIntrospection {
             session_attempt_id: None,
             clock,
             reporting: None,
+            backlog: BacklogNotice::default(),
         }
     }
 
@@ -237,6 +245,21 @@ impl RunIntrospection {
         }
     }
 
+    /// Records a checkpoint the ingest queue would not take, once while the
+    /// backlog stands.
+    ///
+    /// Best effort: it is already reporting that a write did not happen, and a
+    /// second failure has nowhere to go.
+    fn observe_report(&mut self, refused: Option<RefusedReport>) {
+        let Some(refused) = self.backlog.observe(refused) else {
+            return;
+        };
+
+        if let Ok(mut core) = self.core.lock() {
+            let _ = core.journal_backlogged_fact(CHECKPOINT_REPORTER, &refused);
+        }
+    }
+
     /// The service core, locked for the span of one write.
     ///
     /// A poisoned lock is refused rather than recovered: the core's invariants
@@ -264,7 +287,7 @@ impl RunIntrospectionPort for RunIntrospection {
             .and_then(CheckpointReporting::attribution);
         let session_attempt_id = self
             .session_attempt_id
-            .or_else(|| attribution.map(|attempt| attempt.attempt_id));
+            .or_else(|| attribution.and_then(|attempt| attempt.attempt_id));
 
         let event = self.checkpoint_event(checkpoint, session_attempt_id, now);
         let findings = self.finding_rows(checkpoint, now);
@@ -278,15 +301,19 @@ impl RunIntrospectionPort for RunIntrospection {
         // A checkpoint that reached the journal happened, whatever ingest makes
         // of the fact. A queue with no reader is the daemon shutting down, and
         // failing the worker's tool call over it would turn an orderly stop
-        // into a failed attempt.
+        // into a failed attempt. A queue that is merely full is a different
+        // thing: the checkpoint is in the journal and the health plane will
+        // never hear about it, so the run says so.
         if let (Some(reporting), Some(attribution)) = (self.reporting.as_ref(), attribution) {
-            let _ = reporting.facts.report(ReportedFact {
+            let refused = reporting.facts.report(ReportedFact {
                 run_id: self.run_id,
                 attempt_id: attribution.attempt_id,
                 turn: attribution.turn,
                 now,
                 fact: IngestFact::Checkpoint(reported_checkpoint(checkpoint)),
             });
+
+            self.observe_report(refused.err());
         }
 
         Ok(CheckpointReceipt {

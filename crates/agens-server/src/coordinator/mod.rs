@@ -70,7 +70,7 @@ use crate::gates::{
     SubAgentKind,
 };
 use crate::ingest::{
-    FactReceiver, FactSender, Ingest, IngestFact, ReportedFact, attribution_of,
+    FactReceiver, FactSender, Ingest, IngestFact, IngestRejection, ReportedFact, attribution_of,
     channel as ingest_channel,
 };
 use crate::policy::{PolicySettings, PolicyStore, RepositoryPolicy};
@@ -230,37 +230,16 @@ impl Coordinator {
         worker: RunWorkerFactory,
         shutdown: &HeadlessTurnCancellation,
     ) -> Result<Self, CoordinatorError> {
-        let machines = StateMachines::new(open_control_plane(data_directory)?);
         let admissions = Arc::new(Admissions::new());
         let feed = Arc::new(JournalFeed::new());
-        let policy = Arc::new(
-            PolicyStore::open(data_directory, settings.policy.clone())
-                .map_err(|error| CoordinatorError::opening("the repository policy", error))?,
-        );
+        let core = Arc::new(Mutex::new(compose_core(
+            data_directory,
+            settings,
+            &admissions,
+            &feed,
+            &supervisor,
+        )?));
 
-        let ports = Ports {
-            scheduler: Arc::clone(&admissions) as Arc<dyn crate::api::AdmissionControl>,
-            worktrees: Arc::new(GitWorktreeGate::new(
-                SessionWorktrees::new(data_directory),
-                settings.main_ref.clone(),
-                policy.hook_exports(),
-            )),
-            delivery: Arc::new(RunDeliveries::new(
-                DirectiveStore::open(data_directory)
-                    .map_err(|error| CoordinatorError::opening("the delivery queue", error))?,
-            )),
-            sessions: Arc::new(SupervisedSessions::new(
-                supervisor.clone(),
-                open_control_plane(data_directory)?,
-            )),
-            feed: Arc::clone(&feed) as Arc<dyn crate::api::EventFeed>,
-        };
-
-        let core = Arc::new(Mutex::new(ApiCore::new(
-            machines,
-            ports,
-            policy as Arc<dyn RepositoryPolicy>,
-        )));
         let (facts, reports) = ingest_channel();
         let stopping = Arc::new(AtomicBool::new(false));
         let diagnostics = CoordinatorDiagnostics::new(data_directory, settings.diagnostics);
@@ -276,44 +255,20 @@ impl Coordinator {
         // loops are about to schedule against.
         let reconciliation = reconcile_boot(&core, data_directory, settings)?;
 
-        let loops = vec![
-            admission_loop(
-                data_directory,
-                settings,
-                &core,
-                &admissions,
-                &stopping,
-                supervisor,
-                worker,
-                facts.clone(),
-                diagnostics.clone(),
-                Arc::clone(&fatal),
-            ),
-            timer_loop(
-                settings,
-                &core,
-                &admissions,
-                &stopping,
-                facts.clone(),
-                diagnostics.clone(),
-                Arc::clone(&fatal),
-            ),
-            gates_loop(
-                data_directory,
-                settings,
-                &core,
-                &stopping,
-                Arc::clone(&fatal),
-            ),
-            ingest_loop(
-                data_directory,
-                settings,
-                reports,
-                &stopping,
-                diagnostics.clone(),
-            )?,
-            publisher_loop(data_directory, settings, feed, &stopping, diagnostics)?,
-        ];
+        let loops = spawn_loops(Composition {
+            data_directory,
+            settings,
+            core: &core,
+            admissions: &admissions,
+            feed,
+            stopping: &stopping,
+            supervisor,
+            worker,
+            facts: &facts,
+            reports,
+            diagnostics,
+            fatal: &fatal,
+        })?;
 
         let coordinator = Self {
             core,
@@ -430,6 +385,115 @@ fn reconcile_boot(
 
     reconcile::reconcile_before_surface(core.machines_mut(), data_directory, &wheel, now())
         .map_err(|error| CoordinatorError::opening("boot reconciliation", error))
+}
+
+/// The service core over one data directory: the state machines, the ports the
+/// operations perform effects through, and the repository policy they are
+/// authorized against.
+fn compose_core(
+    data_directory: &Path,
+    settings: &CoordinatorSettings,
+    admissions: &Arc<Admissions>,
+    feed: &Arc<JournalFeed>,
+    supervisor: &SessionSupervisor,
+) -> Result<ApiCore, CoordinatorError> {
+    let machines = StateMachines::new(open_control_plane(data_directory)?);
+    let policy = Arc::new(
+        PolicyStore::open(data_directory, settings.policy.clone())
+            .map_err(|error| CoordinatorError::opening("the repository policy", error))?,
+    );
+
+    let ports = Ports {
+        scheduler: Arc::clone(admissions) as Arc<dyn crate::api::AdmissionControl>,
+        worktrees: Arc::new(GitWorktreeGate::new(
+            SessionWorktrees::new(data_directory),
+            settings.main_ref.clone(),
+            policy.hook_exports(),
+        )),
+        delivery: Arc::new(RunDeliveries::new(
+            DirectiveStore::open(data_directory)
+                .map_err(|error| CoordinatorError::opening("the delivery queue", error))?,
+        )),
+        sessions: Arc::new(SupervisedSessions::new(
+            supervisor.clone(),
+            open_control_plane(data_directory)?,
+        )),
+        feed: Arc::clone(feed) as Arc<dyn crate::api::EventFeed>,
+    };
+
+    Ok(ApiCore::new(
+        machines,
+        ports,
+        policy as Arc<dyn RepositoryPolicy>,
+    ))
+}
+
+/// Everything the five loops are built from, gathered so starting them is one
+/// call rather than five argument lists that have to stay in step.
+struct Composition<'a> {
+    data_directory: &'a Path,
+    settings: &'a CoordinatorSettings,
+    core: &'a Arc<Mutex<ApiCore>>,
+    admissions: &'a Arc<Admissions>,
+    feed: Arc<JournalFeed>,
+    stopping: &'a Arc<AtomicBool>,
+    supervisor: SessionSupervisor,
+    worker: RunWorkerFactory,
+    facts: &'a FactSender,
+    reports: FactReceiver,
+    diagnostics: CoordinatorDiagnostics,
+    fatal: &'a Arc<FatalCore>,
+}
+
+/// Starts the five loops, in the order the daemon depends on them being up.
+fn spawn_loops(composition: Composition<'_>) -> Result<Vec<JoinHandle<()>>, CoordinatorError> {
+    let Composition {
+        data_directory,
+        settings,
+        core,
+        admissions,
+        feed,
+        stopping,
+        supervisor,
+        worker,
+        facts,
+        reports,
+        diagnostics,
+        fatal,
+    } = composition;
+
+    Ok(vec![
+        admission_loop(
+            data_directory,
+            settings,
+            core,
+            admissions,
+            stopping,
+            supervisor,
+            worker,
+            facts.clone(),
+            diagnostics.clone(),
+            Arc::clone(fatal),
+        ),
+        timer_loop(
+            settings,
+            core,
+            admissions,
+            stopping,
+            facts.clone(),
+            diagnostics.clone(),
+            Arc::clone(fatal),
+        ),
+        gates_loop(data_directory, settings, core, stopping, Arc::clone(fatal)),
+        ingest_loop(
+            data_directory,
+            settings,
+            reports,
+            stopping,
+            diagnostics.clone(),
+        )?,
+        publisher_loop(data_directory, settings, feed, stopping, diagnostics)?,
+    ])
 }
 
 /// Admission: a tick when a run enters the queue, and one on every heartbeat
@@ -562,6 +626,12 @@ fn timer_loop(
     let stopping = Arc::clone(stopping);
     let wheel = TimerWheel::new(settings.timers);
     let heartbeat = settings.heartbeat;
+    // The wheel is the one reporter that never waits: a tick that parks on a
+    // full queue stops every other deadline it was about to raise.
+    let facts = facts.impatient();
+    // Which runs already have a standing entry for this backlog. A queue that
+    // stays full is one fact lost per run, not one per heartbeat.
+    let mut backlogged: std::collections::HashSet<i64> = std::collections::HashSet::new();
 
     std::thread::spawn(move || {
         while !stopping.load(Ordering::Acquire) {
@@ -577,7 +647,7 @@ fn timer_loop(
                         // same rows the tick read: a fact attributed to an
                         // attempt the run left between the two would be
                         // refused as a straggler.
-                        expired_checkpoint_facts(&core, &tick),
+                        expired_checkpoint_facts(core.machines().store(), &tick),
                     )
                 }
                 // The wheel reading a poisoned core as "nothing was due" is how
@@ -599,10 +669,34 @@ fn timer_loop(
             }
 
             for fact in expired {
-                // A queue with no reader is the daemon shutting down. The
-                // signal is already journaled, and the wheel's own
-                // deduplication means this tick will not raise it again.
-                let _ = facts.report(fact);
+                let run_id = fact.run_id;
+
+                let Err(refused) = facts.report(fact) else {
+                    backlogged.remove(&run_id);
+                    continue;
+                };
+
+                // A queue with no reader is the daemon shutting down, and there
+                // is nothing to record about a control plane that is closing.
+                if refused.rejection != IngestRejection::Backlogged {
+                    continue;
+                }
+
+                // Nothing tells the wheel a run ended, so the set is capped:
+                // forgetting costs one repeated entry, and remembering without
+                // a bound costs memory the daemon never gets back.
+                if backlogged.len() >= BACKLOG_NOTICES {
+                    backlogged.clear();
+                }
+                if !backlogged.insert(run_id) {
+                    continue;
+                }
+
+                diagnostics.ingest_backlogged(run_id, WHEEL_REPORTER, refused.fact.fact.name());
+
+                if let Ok(mut core) = core.lock() {
+                    let _ = core.journal_backlogged_fact(WHEEL_REPORTER, &refused);
+                }
             }
 
             std::thread::sleep(heartbeat);
@@ -610,14 +704,25 @@ fn timer_loop(
     })
 }
 
+/// What the wheel calls itself in a record of a fact it could not report.
+const WHEEL_REPORTER: &str = "timer_wheel";
+
+/// How many runs the wheel remembers having reported a lost fact for. Well
+/// past the runs that can be executing at once, so a daemon in steady state
+/// never forgets one that still matters.
+const BACKLOG_NOTICES: usize = 256;
+
 /// One `CheckpointExpired` fact per overdue checkpoint this tick raised.
 ///
-/// A run whose live attempt is not correlated with a physical execution yet
-/// produces none: there is nothing for the fact to be attributed to, and ingest
-/// would refuse it.
-fn expired_checkpoint_facts(core: &ApiCore, tick: &crate::timers::TimerTick) -> Vec<ReportedFact> {
-    let store = core.machines().store();
-
+/// A run whose live attempt has not been correlated with a physical execution
+/// still produces one, attributed to that attempt with no ledger row named: a
+/// worker that died during provisioning never correlates, and it is the case
+/// the first checkpoint's deadline exists to catch. Only a run with no attempt
+/// at all produces nothing.
+fn expired_checkpoint_facts(
+    store: &ControlPlaneStore,
+    tick: &crate::timers::TimerTick,
+) -> Vec<ReportedFact> {
     tick.overdue_checkpoints
         .iter()
         .filter_map(|overdue| {
@@ -711,7 +816,10 @@ impl GatesSweep {
     /// One pass over every run whose work is finished and whose worktree is
     /// still active.
     fn pass(&self, core: &Mutex<ApiCore>, now: i64) {
-        let Some(candidates) = self.taken(core).map(|core| candidates(&core)) else {
+        let Some(candidates) = self
+            .taken(core)
+            .map(|core| candidates(core.machines().store()))
+        else {
             return;
         };
 
@@ -842,11 +950,15 @@ impl GatesSweep {
 ///
 /// A run in any other state is not one the gates have anything to say about:
 /// its work is still moving, or its worktree has already been let go.
-fn candidates(core: &ApiCore) -> Vec<GateCandidate> {
-    let store = core.machines().store();
+///
+/// `Cancelled` is one of them. Cancellation moves the run and never touches
+/// `worktree_status`, so the directory and its place in the ceiling stay taken;
+/// a sweep that skipped it counted the worktree forever and reclaimed it on
+/// every boot without anything ever reaching `cleaned`.
+fn candidates(store: &ControlPlaneStore) -> Vec<GateCandidate> {
     let mut candidates = Vec::new();
 
-    for state in [RunState::Done, RunState::Failed] {
+    for state in [RunState::Done, RunState::Failed, RunState::Cancelled] {
         let Ok(runs) = store.runs_in_state(state) else {
             continue;
         };
@@ -1062,4 +1174,204 @@ fn now() -> i64 {
         .map_or(0, |elapsed| {
             i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX)
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use agens_store::{AttemptRow, RunRow, RunState, WorktreeStatus};
+
+    use super::{ControlPlaneStore, IngestFact, candidates, expired_checkpoint_facts};
+    use crate::timers::{OverdueCheckpoint, TimerTick};
+
+    const NOW: i64 = 1_700_000_000;
+
+    fn scratch() -> std::path::PathBuf {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let suffix = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "agens-server-wheel-{}-{suffix}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+
+        directory
+    }
+
+    /// A run that was admitted, opened its attempt, and died before the worker
+    /// ever named the physical execution it was running as.
+    fn uncorrelated_run(store: &mut ControlPlaneStore) -> i64 {
+        let run_id = store
+            .insert_run(&RunRow {
+                id: None,
+                repo_id: "a1b2c3d4e5f60718".to_owned(),
+                repo_root: "/home/dev/agens".to_owned(),
+                remote_url: None,
+                external_ref: None,
+                parent_run_id: None,
+                task: "the deadline reaches a worker that never correlated".to_owned(),
+                scope: "crates/agens-server/src/coordinator".to_owned(),
+                dod: "the wheel raises the fact anyway".to_owned(),
+                genesis_paths: None,
+                state: RunState::Running,
+                priority: 5,
+                dep_run_id: None,
+                provider: "scripted".to_owned(),
+                budget_tokens: None,
+                worktree_path: None,
+                worktree_status: Some(WorktreeStatus::Active),
+                created_at: NOW,
+                result: None,
+            })
+            .unwrap();
+
+        store
+            .insert_attempt(&AttemptRow {
+                id: None,
+                run_id,
+                n: 1,
+                session_id: None,
+                session_attempt_id: None,
+                started_at: NOW,
+                ended_at: None,
+                outcome: None,
+                retry_trigger: None,
+                tokens: None,
+                cost_micros: None,
+            })
+            .unwrap();
+
+        run_id
+    }
+
+    fn overdue_tick(run_id: i64) -> TimerTick {
+        TimerTick {
+            now: NOW + 1_800,
+            quota_resets: Vec::new(),
+            expired_questions: Vec::new(),
+            overdue_checkpoints: vec![OverdueCheckpoint {
+                run_id,
+                checkpoint_event_id: 1,
+                promised_at: None,
+                deadline: NOW + 1_800,
+                signal_event_id: 2,
+            }],
+            rejections: Vec::new(),
+        }
+    }
+
+    /// The whole point of the first checkpoint's deadline is the worker that
+    /// died before it reported anything, and that worker never correlated. A
+    /// wheel that produced no fact for it left the detector unreached and the
+    /// slot held.
+    #[test]
+    fn an_overdue_checkpoint_is_reported_for_a_run_that_never_correlated() {
+        let directory = scratch();
+        let mut store = ControlPlaneStore::open(&directory).unwrap();
+        let run_id = uncorrelated_run(&mut store);
+
+        let facts = expired_checkpoint_facts(&store, &overdue_tick(run_id));
+
+        let [fact] = facts.as_slice() else {
+            panic!("expected one fact, got {facts:?}");
+        };
+        assert_eq!(fact.run_id, run_id);
+        assert_eq!(
+            fact.attempt_id, None,
+            "the fact belongs to the attempt, which has no physical execution"
+        );
+        assert_eq!(fact.turn, 1);
+        assert_eq!(fact.fact, IngestFact::CheckpointExpired);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A run that was never admitted has no attempt for a fact to belong to.
+    #[test]
+    fn an_overdue_checkpoint_for_a_run_without_an_attempt_reports_nothing() {
+        let directory = scratch();
+        let mut store = ControlPlaneStore::open(&directory).unwrap();
+        let run_id = uncorrelated_run(&mut store);
+        let orphan = store
+            .insert_run(&RunRow {
+                id: None,
+                task: "no attempt was ever opened".to_owned(),
+                ..store.load_run(run_id).unwrap().unwrap()
+            })
+            .unwrap();
+
+        assert!(expired_checkpoint_facts(&store, &overdue_tick(orphan)).is_empty());
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A run whose worktree is still held, with nothing else in it that a
+    /// candidate is chosen by.
+    fn held_run() -> RunRow {
+        RunRow {
+            id: None,
+            repo_id: "a1b2c3d4e5f60718".to_owned(),
+            repo_root: "/home/dev/agens".to_owned(),
+            remote_url: None,
+            external_ref: None,
+            parent_run_id: None,
+            task: "a cancelled run still holds its worktree".to_owned(),
+            scope: "crates/agens-server/src/coordinator".to_owned(),
+            dod: "the sweep reaches it".to_owned(),
+            genesis_paths: None,
+            state: RunState::Cancelled,
+            priority: 5,
+            dep_run_id: None,
+            provider: "scripted".to_owned(),
+            budget_tokens: None,
+            worktree_path: None,
+            worktree_status: None,
+            created_at: NOW,
+            result: None,
+        }
+    }
+
+    /// Cancellation moves the run and never touches `worktree_status`. A sweep
+    /// that only looked at `done` and `failed` therefore counted a cancelled
+    /// run's directory against the ceiling forever and reclaimed it on every
+    /// boot, with nothing ever taking it to `cleaned`.
+    #[test]
+    fn a_cancelled_run_still_holding_its_worktree_is_a_candidate() {
+        let directory = scratch();
+        let mut store = ControlPlaneStore::open(&directory).unwrap();
+        let cancelled = store
+            .insert_run(&RunRow {
+                worktree_path: Some("/data/worktrees/agens-a1b2c3d4/agn-196".to_owned()),
+                worktree_status: Some(WorktreeStatus::Reclaimable),
+                ..held_run()
+            })
+            .unwrap();
+        store
+            .insert_run(&RunRow {
+                state: RunState::Running,
+                worktree_path: Some("/data/worktrees/agens-a1b2c3d4/agn-197".to_owned()),
+                worktree_status: Some(WorktreeStatus::Reclaimable),
+                ..held_run()
+            })
+            .unwrap();
+        store
+            .insert_run(&RunRow {
+                worktree_path: Some("/data/worktrees/agens-a1b2c3d4/agn-198".to_owned()),
+                worktree_status: Some(WorktreeStatus::Cleaned),
+                ..held_run()
+            })
+            .unwrap();
+
+        let swept: Vec<i64> = candidates(&store)
+            .into_iter()
+            .map(|candidate| candidate.run_id)
+            .collect();
+
+        assert_eq!(
+            swept,
+            vec![cancelled],
+            "a run still working holds its worktree by right, and a cleaned one holds nothing"
+        );
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 }

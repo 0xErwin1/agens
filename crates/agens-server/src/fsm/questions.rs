@@ -31,6 +31,10 @@ pub enum QuestionTrigger {
     Deliver,
     /// The timer wheel found it past its expiry.
     Expire,
+    /// The write the question was opened for did not complete, so nothing will
+    /// ever act on the answer. Only the opener uses it, and only while it is
+    /// unwinding its own failure.
+    Void,
 }
 
 impl QuestionTrigger {
@@ -40,6 +44,7 @@ impl QuestionTrigger {
             Self::Answer => "answer",
             Self::Deliver => "deliver",
             Self::Expire => "expire",
+            Self::Void => "void",
         }
     }
 }
@@ -52,11 +57,17 @@ pub enum QuestionGuard {
     AuthorRecorded,
     /// An authorization: the user's, and still in date.
     UserAuthorizationInDate,
-    /// Still in date at the moment of delivery. An authorization that expired
-    /// between being granted and being handed over authorizes nothing.
+    /// Still in date at the moment of delivery, or already spent on a merge
+    /// that landed. An authorization that expired before anything went in
+    /// authorizes nothing; one whose merge is already in the target's history
+    /// is a different case, and refusing it there records nothing about a
+    /// merge that cannot be undone.
     NotExpired,
     /// Past its expiry.
     Expired,
+    /// Nothing to check. The opener of a question is the one party that knows
+    /// the write it was opened for did not complete.
+    None,
 }
 
 impl QuestionGuard {
@@ -67,6 +78,7 @@ impl QuestionGuard {
             Self::UserAuthorizationInDate => "user_authorization_in_date",
             Self::NotExpired => "not_expired",
             Self::Expired => "expired",
+            Self::None => "none",
         }
     }
 }
@@ -118,6 +130,16 @@ pub static QUESTION_TRANSITIONS: &[QuestionTransition] = &[
         guard: QuestionGuard::NotExpired,
         effects: &[],
         domain_event: "question_delivered",
+        class: EventClass::Infra,
+    },
+    QuestionTransition {
+        kind: QuestionKind::Question,
+        from: QuestionState::Open,
+        trigger: QuestionTrigger::Void,
+        to: QuestionState::Expired,
+        guard: QuestionGuard::None,
+        effects: &[],
+        domain_event: "question_voided",
         class: EventClass::Infra,
     },
     QuestionTransition {
@@ -179,6 +201,14 @@ pub struct QuestionFacts {
     pub now: i64,
     pub answer: Option<String>,
     pub author: Option<QuestionAuthor>,
+    /// The merge this authorization allowed is already in the target's
+    /// history, re-derived from git by the gate that is about to record it.
+    ///
+    /// Set by the settlement alone. A merge cannot be undone by a later clock
+    /// reading: an approval refused for expiry after its bytes went in leaves
+    /// a merged branch with no `merged` entry, an authorization that reads as
+    /// never used, and a worktree nothing releases.
+    pub merge_already_landed: bool,
 }
 
 /// One applied question transition.
@@ -279,8 +309,10 @@ pub(super) type PreparedQuestion =
 /// records the merge.
 pub(super) fn deliverable(
     question: &QuestionRow,
-    now: i64,
+    facts: &QuestionFacts,
 ) -> Result<PreparedQuestion, TransitionRejection> {
+    let now = facts.now;
+
     let transition = QUESTION_TRANSITIONS
         .iter()
         .find(|candidate| {
@@ -294,11 +326,7 @@ pub(super) fn deliverable(
             trigger: QuestionTrigger::Deliver.as_str(),
         })?;
 
-    let facts = QuestionFacts {
-        now,
-        ..QuestionFacts::default()
-    };
-    check_question_guard(transition, question, &facts)?;
+    check_question_guard(transition, question, facts)?;
 
     let question_id = question.id.ok_or_else(|| {
         TransitionRejection::Storage("a stored question must carry an id".to_owned())
@@ -375,7 +403,7 @@ fn check_question_guard(
             }
         }
         QuestionGuard::NotExpired => {
-            if in_date {
+            if in_date || facts.merge_already_landed {
                 Ok(())
             } else {
                 refuse(format!(
@@ -391,6 +419,7 @@ fn check_question_guard(
                 Ok(())
             }
         }
+        QuestionGuard::None => Ok(()),
     }
 }
 

@@ -205,6 +205,16 @@ pub enum CoordinatorEvent<'a> {
         signal: &'a str,
         reason: &'a str,
     },
+    /// A reporter gave up on a fact the ingest queue would not take. Raised
+    /// once per run while the backlog stands, not once per attempt to report.
+    IngestBacklogged {
+        run_id: i64,
+        /// Which reporter was refused: the timer wheel, a run's checkpoint
+        /// tool, or the worker's own progress sink.
+        reporter: &'a str,
+        /// The kind of fact that was lost.
+        fact: &'a str,
+    },
     /// The service core was left poisoned by an operation that panicked while
     /// holding it, so the daemon is stopping for a supervisor to restart.
     ///
@@ -224,6 +234,7 @@ impl CoordinatorEvent<'_> {
             Self::AdmissionFailed { .. } => ProviderDiagnosticKind::AdmissionFailed,
             Self::TimersTicked { .. } => ProviderDiagnosticKind::TimersTicked,
             Self::HealthSignalRaised { .. } => ProviderDiagnosticKind::HealthSignalRaised,
+            Self::IngestBacklogged { .. } => ProviderDiagnosticKind::IngestBacklogged,
             Self::CorePoisoned { .. } => ProviderDiagnosticKind::CorePoisoned,
         }
     }
@@ -274,6 +285,11 @@ impl CoordinatorEvent<'_> {
                 signal,
                 reason,
             } => serde_json::json!({ "run": run_id, "signal": signal, "reason": reason }),
+            Self::IngestBacklogged {
+                run_id,
+                reporter,
+                fact,
+            } => serde_json::json!({ "run": run_id, "reporter": reporter, "fact": fact }),
             Self::CorePoisoned { component } => serde_json::json!({ "component": component }),
         }
     }

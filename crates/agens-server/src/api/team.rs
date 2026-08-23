@@ -257,6 +257,7 @@ impl ApiCore {
                 now: request.now,
                 answer: Some(request.answer.clone()),
                 author: Some(author),
+                ..QuestionFacts::default()
             },
         )?;
 
@@ -346,6 +347,7 @@ impl ApiCore {
                 now: request.now,
                 answer: Some(request.answer.clone()),
                 author: Some(author),
+                ..QuestionFacts::default()
             },
         )?;
 

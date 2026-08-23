@@ -146,7 +146,7 @@ impl Observation {
     pub(crate) fn to_event(
         &self,
         run_id: i64,
-        attempt_id: i64,
+        attempt_id: Option<i64>,
         turn: i64,
         ts: i64,
         credited: bool,

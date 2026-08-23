@@ -83,6 +83,12 @@ impl Fixture {
         git(&self.worktree, &["commit", "--quiet", "-m", path]);
     }
 
+    /// Whether the worktree's branch is in the checkout's history, asked of
+    /// git rather than of the control plane.
+    fn branch_is_merged(&self) -> bool {
+        git(&self.checkout, &["branch", "--merged", "HEAD"]).contains(BRANCH)
+    }
+
     fn worktrees(&self) -> SessionWorktrees {
         SessionWorktrees::new(&self.data_directory)
     }
@@ -199,6 +205,24 @@ impl Gated {
         self.gates().reclaim(&request).expect("reclaim runs")
     }
 
+    /// Makes every journal write fail until the guard is lifted.
+    ///
+    /// A trigger rather than a fake store: the settlement's whole claim is that
+    /// its four writes are one SQLite transaction, and only the real one can
+    /// roll that transaction back.
+    fn refuse_journal_writes(&self) -> RefusedWrites {
+        let connection =
+            rusqlite::Connection::open(self.machines.store().database_path()).expect("open");
+        connection
+            .execute_batch(
+                "CREATE TRIGGER refuse_events BEFORE INSERT ON events
+                 BEGIN SELECT RAISE(ABORT, 'injected'); END",
+            )
+            .expect("install the refusal");
+
+        RefusedWrites(connection)
+    }
+
     fn events(&self) -> Vec<String> {
         self.machines
             .store()
@@ -216,6 +240,17 @@ impl Gated {
             .expect("load approval")
             .expect("the approval exists")
             .state
+    }
+
+    fn events_of(&self, event_type: &str) -> Vec<String> {
+        self.machines
+            .store()
+            .events_for_run(self.run_id)
+            .expect("read events")
+            .into_iter()
+            .filter(|event| event.event_type == event_type)
+            .map(|event| event.payload)
+            .collect()
     }
 
     fn gate_payloads(&self) -> Vec<String> {
@@ -236,6 +271,17 @@ impl Gated {
             .expect("load run")
             .expect("the run exists")
             .worktree_status
+    }
+}
+
+/// A control plane that refuses every journal write while it is held.
+struct RefusedWrites(rusqlite::Connection);
+
+impl RefusedWrites {
+    fn lift(self) {
+        self.0
+            .execute_batch("DROP TRIGGER refuse_events")
+            .expect("lift the refusal");
     }
 }
 
@@ -383,8 +429,59 @@ fn a_commit_that_only_moves_bytes_within_the_same_paths_still_refuses() {
     );
 }
 
+/// The git merge is outside the transaction that records it, so an approval can
+/// expire between the branch landing and the next sweep reaching it. Refused
+/// there, the run kept a merged branch with no `merged` entry, an approval that
+/// read as never used, and a worktree nothing released.
 #[test]
-fn an_expired_approval_authorizes_nothing() {
+fn an_approval_that_expired_after_its_merge_landed_still_settles_it() {
+    let mut gated = Gated::with_approval(GENESIS, QuestionState::Answered, Some(NOW + 600));
+
+    // The branch lands under a live authorization, exactly as the sweep does
+    // it, and the settlement is then taken away.
+    git(
+        &gated.fixture.checkout,
+        &["merge", "--quiet", "--no-ff", "-m", "landed", BRANCH],
+    );
+
+    let request = PreMergeRequest {
+        now: NOW + 1_200,
+        ..gated.request(MergePath::Attested)
+    };
+    let verdict = gated.gates().pre_merge(&request).expect("gate runs");
+
+    let PreMergeVerdict::Merged { worktree, .. } = verdict else {
+        panic!("a landed merge is settled, not refused: {verdict:?}");
+    };
+    assert_eq!(
+        worktree.expect("the worktree moved").to,
+        WorktreeStatus::Reclaimable,
+        "the settlement is what releases the directory"
+    );
+    assert_eq!(
+        gated.question_state(),
+        QuestionState::Delivered,
+        "the authorization the merge went through is spent, not left standing"
+    );
+    assert!(
+        gated.events().contains(&"merged".to_owned()),
+        "the control plane records a merge that is already in main: {:?}",
+        gated.events()
+    );
+    assert!(
+        gated
+            .events_of("merged")
+            .iter()
+            .any(|payload| payload.contains(&format!("\"authorization_expired_at\":{}", NOW + 600))),
+        "and says the authorization was past its date when it was settled: {:?}",
+        gated.events_of("merged")
+    );
+}
+
+/// An expiry that passed before anything landed is still a refusal: there is no
+/// merge to record and nothing irreversible has happened.
+#[test]
+fn an_approval_that_expired_before_anything_landed_authorizes_nothing() {
     let mut gated = Gated::with_approval(GENESIS, QuestionState::Answered, Some(NOW - 1));
 
     assert_eq!(
@@ -393,6 +490,7 @@ fn an_expired_approval_authorizes_nothing() {
             expired_at: NOW - 1
         }
     );
+    assert_eq!(gated.worktree_status(), Some(WorktreeStatus::Active));
 }
 
 #[test]
@@ -914,46 +1012,51 @@ fn dispose_retires_a_row_whose_directory_vanished() {
 }
 
 /// The merge is irreversible, so everything that records it has to land with
-/// it. A settlement whose authorization cannot be delivered writes nothing at
-/// all: no verdict naming the approval, no `merged`, and a worktree still
-/// active for the next sweep to reach.
+/// it. A settlement whose write fails writes nothing at all: no verdict naming
+/// the approval, no `merged`, the authorization still standing, and a worktree
+/// still active for the next sweep to reach against a branch git now reports as
+/// merged.
+///
+/// The failure is injected at the settlement's own write rather than at the
+/// authorization check in front of it. A test that never reaches
+/// `settle_merge` passes against a settlement that was four separate
+/// statements, which is the arrangement this one exists to rule out.
 #[test]
-fn a_settlement_that_cannot_spend_its_authorization_writes_nothing() {
-    let mut gated = Gated::with_approval(GENESIS, QuestionState::Answered, Some(NOW + 600));
+fn a_settlement_whose_write_fails_writes_nothing() {
+    let mut gated = Gated::new(GENESIS);
+    let refuse_writes = gated.refuse_journal_writes();
 
-    // Delivered out from under the gate: the question machine has no
-    // transition out of `delivered`, so the settlement's guard refuses.
-    let approval_id = gated.approval_id;
-    gated
+    let request = gated.request(MergePath::Integrate);
+    let error = gated
         .gates()
-        .machines_mut()
-        .apply_question(
-            approval_id,
-            agens_server::QuestionTrigger::Deliver,
-            &agens_server::QuestionFacts {
-                now: NOW,
-                ..agens_server::QuestionFacts::default()
-            },
-        )
-        .expect("deliver the approval");
+        .pre_merge(&request)
+        .expect_err("the settlement cannot be written");
 
-    let before = gated.events();
-    let verdict = gated.pre_merge(MergePath::Integrate);
-
-    assert_eq!(
-        refusal(verdict),
-        GateRefusal::NotAuthorized { state: "delivered" },
-        "a spent authorization is refused before anything is merged"
+    assert!(
+        matches!(error, agens_server::GateError::Transition(_)),
+        "the write is what failed, got {error:?}"
     );
-    assert_eq!(gated.worktree_status(), Some(WorktreeStatus::Active));
+
+    refuse_writes.lift();
+
+    assert!(
+        gated.fixture.branch_is_merged(),
+        "the merge itself did happen, which is what makes the rest matter"
+    );
     assert_eq!(
-        gated
-            .events()
-            .into_iter()
-            .filter(|event| event == "merged")
-            .count(),
-        0,
-        "nothing landed, so nothing says it did: {before:?}"
+        gated.events(),
+        Vec::<String>::new(),
+        "the verdict, the merge and the release travel together or not at all"
+    );
+    assert_eq!(
+        gated.question_state(),
+        QuestionState::Answered,
+        "the authorization is still standing for the next sweep to spend"
+    );
+    assert_eq!(
+        gated.worktree_status(),
+        Some(WorktreeStatus::Active),
+        "and the directory is still there to be released"
     );
 }
 

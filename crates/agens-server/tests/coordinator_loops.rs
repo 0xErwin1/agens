@@ -176,7 +176,7 @@ fn the_facts_of_the_last_window_are_ingested_on_the_way_out() {
         .facts()
         .report(ReportedFact {
             run_id,
-            attempt_id: SESSION_ATTEMPT,
+            attempt_id: Some(SESSION_ATTEMPT),
             turn: 1,
             now: now(),
             fact: IngestFact::TurnStarted,
