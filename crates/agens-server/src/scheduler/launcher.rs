@@ -25,10 +25,11 @@ pub struct RunSession {
 
 /// A [`RunLauncher`] over the daemon's supervisor.
 ///
-/// Takes a factory rather than building sessions itself: the factory is where
-/// AGN-63/64 puts everything that only the API core can resolve, and it stays
-/// outside admission so that adding a wire surface does not change who decides
-/// what runs.
+/// Takes a factory rather than building sessions itself. Everything a session
+/// needs that only the composition root can resolve — the bootstrap, the
+/// provider client, the worktree the run executes in — is decided there, and
+/// keeping it outside admission is what makes adding a wire surface a change to
+/// who asks rather than to who decides what runs.
 pub struct SupervisorLauncher<F> {
     supervisor: SessionSupervisor,
     session_for: F,

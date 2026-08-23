@@ -9,9 +9,10 @@
 //!
 //! There is no authentication layer, by design. Identity and network
 //! authorization are Custos's territory and are not reinvented here; the reach
-//! of the socket is the reach of the facade, which is why it binds a unix socket
-//! in the daemon's own data directory and a loopback address, and why remote
-//! access is an SSH tunnel rather than a listener on the world.
+//! of the socket is the reach of the facade, which is why the one address it
+//! accepts on is a unix socket in the daemon's own data directory, whose mode
+//! decides who may connect, and why remote access is an SSH tunnel rather than a
+//! listener anything else can route to.
 //!
 //! Two things the facade decides rather than accepts:
 //!

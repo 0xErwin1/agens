@@ -113,14 +113,13 @@ pub enum ServerError {
 /// closes, and only then does the instance release the slot and remove the
 /// socket file a client could still be looking at.
 ///
-/// Nothing admits a session into this daemon yet. When something does, the one
-/// place it belongs is between accepting a client and
-/// [`SessionSupervisor::start`]: a session admitted there must be given its OWN
-/// per-session state — its own provider client, which [`SessionAdmission`]
-/// already enforces by ownership, and its own MCP connections, which
-/// `agens-bootstrap` exposes as `Bootstrap::for_new_session`. Handing a peer a
-/// bootstrap CLONE instead would put every session's MCP servers behind one
-/// lock and let one session's close reach another's.
+/// The scheduler's admission tick is what admits a session into this daemon,
+/// through the supervisor the daemon owns rather than one of its own. Every
+/// session it starts is given its OWN per-session state: its own provider
+/// client, which [`SessionAdmission`] enforces by ownership, and its own MCP
+/// connections, which the worker takes from `Bootstrap::for_new_session`.
+/// Handing a peer a bootstrap CLONE instead would put every session's MCP
+/// servers behind one lock and let one session's close reach another's.
 pub struct Daemon {
     runtime: tokio::runtime::Runtime,
     sessions: SessionSupervisor,
@@ -287,8 +286,9 @@ pub fn serve_until_shutdown(
     report
 }
 
-/// The daemon has no admission surface of its own yet, so it parks on the shared
-/// cancellation rather than inventing a second stop path.
+/// Parks on the shared cancellation rather than inventing a second stop path:
+/// the daemon is stopped from outside, by the same flag every other loop in the
+/// process is watching.
 async fn park_until_shutdown(shutdown: &HeadlessTurnCancellation) {
     const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
