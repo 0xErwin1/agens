@@ -57,7 +57,7 @@ struct Migration {
     preserved_tables: &'static [&'static str],
 }
 
-const MIGRATIONS: [Migration; 17] = [
+const MIGRATIONS: [Migration; 18] = [
     Migration {
         id: "0001_permission_grants",
         ddl: permission_grants_ddl,
@@ -149,7 +149,21 @@ const MIGRATIONS: [Migration; 17] = [
         ddl: session_compactions_ddl,
         preserved_tables: &[],
     },
+    Migration {
+        id: "0018_repository_policy",
+        ddl: repository_policy_ddl,
+        preserved_tables: &[],
+    },
 ];
+
+/// Where the single database file lives inside a data directory.
+///
+/// Exposed because a caller that has to inspect the file before it is opened —
+/// the daemon's check that its policy register is not writable by anyone but
+/// its owner — must not have to spell the name out a second time.
+pub fn unified_database_path(data_directory: &Path) -> PathBuf {
+    data_directory.join(UNIFIED_DATABASE)
+}
 
 /// Opens the single `agens.db` file inside `data_directory`, applying the full open contract on
 /// every call: directory and file permissions, `busy_timeout`, `foreign_keys`, the layout guard,
@@ -161,7 +175,7 @@ pub(crate) fn open_unified_database(
         .map_err(|error| DatabaseError::new("create data directory", data_directory, error))?;
     restrict_permissions(data_directory, 0o700)?;
 
-    let database_path = data_directory.join(UNIFIED_DATABASE);
+    let database_path = unified_database_path(data_directory);
     let mut connection = Connection::open(&database_path)
         .map_err(|error| DatabaseError::new("open database", &database_path, error))?;
     restrict_permissions(&database_path, 0o600)?;
@@ -529,6 +543,35 @@ fn session_compactions_ddl() -> String {
     );
     CREATE INDEX session_compactions_latest
         ON session_compactions(session_id, id DESC);
+    "
+    .to_owned()
+}
+
+/// The operator's decisions about a repository's provisioning hooks.
+///
+/// They live in the database rather than in a file under the data directory
+/// because a hook is repository code executed with the daemon's credentials,
+/// and the register that says which repository has earned that is not something
+/// a run's own worktree may rewrite by dropping a line into a TOML file.
+///
+/// No foreign key onto `runs`: a decision outlives every run that prompted it,
+/// and the question a pending row names is the durable one the operator has not
+/// answered yet.
+fn repository_policy_ddl() -> String {
+    "
+    CREATE TABLE repository_hook_trust (
+        repo_id TEXT PRIMARY KEY,
+        repository TEXT NOT NULL CHECK(repository <> ''),
+        granted INTEGER NOT NULL CHECK(granted IN (0, 1)),
+        decided_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE repository_hook_questions (
+        question_id INTEGER PRIMARY KEY,
+        repo_id TEXT NOT NULL CHECK(repo_id <> ''),
+        repository TEXT NOT NULL CHECK(repository <> ''),
+        asked_at INTEGER NOT NULL
+    );
     "
     .to_owned()
 }

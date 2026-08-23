@@ -97,7 +97,8 @@ fn the_ledger_records_each_applied_migration_once() {
             "0014_directive_child_target",
             "0015_control_plane",
             "0016_directive_kind",
-            "0017_session_compactions"
+            "0017_session_compactions",
+            "0018_repository_policy"
         ]
     );
 
@@ -170,6 +171,7 @@ fn an_unknown_ledger_id_is_tolerated_and_known_missing_migrations_still_apply() 
             ("0015_control_plane".to_owned(), rows[14].1),
             ("0016_directive_kind".to_owned(), rows[15].1),
             ("0017_session_compactions".to_owned(), rows[16].1),
+            ("0018_repository_policy".to_owned(), rows[17].1),
             ("9999_unknown".to_owned(), 0),
         ]
     );
@@ -423,7 +425,8 @@ fn a_partially_applied_database_is_completed() {
             "0014_directive_child_target",
             "0015_control_plane",
             "0016_directive_kind",
-            "0017_session_compactions"
+            "0017_session_compactions",
+            "0018_repository_policy"
         ]
     );
 
@@ -514,7 +517,8 @@ fn all_three_domains_share_one_database_file() {
             "0014_directive_child_target",
             "0015_control_plane",
             "0016_directive_kind",
-            "0017_session_compactions"
+            "0017_session_compactions",
+            "0018_repository_policy"
         ]
     );
 
@@ -600,7 +604,8 @@ fn a_bootstrap_only_ledger_with_no_user_tables_is_accepted() {
             "0014_directive_child_target",
             "0015_control_plane",
             "0016_directive_kind",
-            "0017_session_compactions"
+            "0017_session_compactions",
+            "0018_repository_policy"
         ]
     );
 
