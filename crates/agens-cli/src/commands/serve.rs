@@ -43,7 +43,12 @@ pub(crate) fn run_serve(
         ServerError::AlreadyRunning => CliError::unavailable(
             "a daemon is already running for this machine; attach to it instead of starting another",
         ),
-        ServerError::Unavailable(_) => CliError::unavailable("the daemon is unavailable"),
+        // The cause travels: a daemon that refused to start has no journal,
+        // no facade and no diagnostics file for an operator to read it from
+        // instead, so this line is the only place the reason appears.
+        ServerError::Unavailable(cause) => {
+            CliError::unavailable(format!("the daemon is unavailable: {cause}"))
+        }
     })?;
 
     // A clean shutdown says nothing, so the ordinary case stays silent and the
