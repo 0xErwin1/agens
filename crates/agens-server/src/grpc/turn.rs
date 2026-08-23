@@ -15,7 +15,9 @@
 //! run's health is readable through the Feed. It is dropped at the boundary
 //! rather than mapped onto a shape that does not mean it.
 
-use agens_core::{IntraTurnInputSource, MessagePart, TurnEvent, TurnRetryReason, TurnState, Usage};
+use agens_core::{
+    IntraTurnInputSource, Message, MessagePart, Role, TurnEvent, TurnRetryReason, TurnState, Usage,
+};
 
 use crate::chat::ChatEvent;
 
@@ -46,6 +48,24 @@ pub(super) fn session_event(session_id: i64, event: &ChatEvent) -> Option<proto:
         session_id,
         event: Some(event),
     })
+}
+
+/// One stored message, as the wire carries it.
+pub(super) fn message(message: &Message) -> proto::Message {
+    proto::Message {
+        role: role_name(message.role).to_owned(),
+        parts: message.parts.iter().map(message_part).collect(),
+    }
+}
+
+const fn role_name(role: Role) -> &'static str {
+    match role {
+        Role::System => "system",
+        Role::User => "user",
+        Role::Assistant => "assistant",
+        Role::Tool => "tool",
+        Role::Supervisor => "supervisor",
+    }
 }
 
 fn turn_progress(event: &TurnEvent) -> Option<proto::TurnProgress> {

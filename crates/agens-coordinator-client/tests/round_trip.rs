@@ -136,6 +136,9 @@ async fn served(events: Vec<TurnEvent>) -> Served {
                 }),
             })
         }),
+        // No test here reads a chat back, so reaching this is a test asking for
+        // something it did not set up.
+        Arc::new(|_| Err(agens_server::ChatError::Unknown)),
     ));
 
     let suffix = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);

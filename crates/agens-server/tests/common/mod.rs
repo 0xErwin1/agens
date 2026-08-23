@@ -16,8 +16,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agens_server::{
-    ChatError, ChatSessionFactory, ChatSessionRequest, ChatSessions, LaunchError, RunLaunch,
-    RunWorkerFactory, SessionSupervisor,
+    ChatError, ChatHistorySource, ChatSessionFactory, ChatSessionRequest, ChatSessions,
+    LaunchError, RunLaunch, RunWorkerFactory, SessionSupervisor,
 };
 use agens_store::{RunRow, RunState, WorktreeStatus};
 
@@ -111,6 +111,12 @@ pub(crate) fn refusing_worker() -> RunWorkerFactory {
     Arc::new(|_launch: &RunLaunch<'_>| Err(LaunchError(REFUSAL.to_owned()))) as RunWorkerFactory
 }
 
+/// The conversation source for the tests that compose a daemon without opening
+/// a chat. Reaching it means a test asked to read one back.
+pub(crate) fn refusing_chat_history() -> ChatHistorySource {
+    Arc::new(|_| Err(ChatError::Unavailable(REFUSAL.to_owned()))) as ChatHistorySource
+}
+
 /// A chat factory for the tests that compose a daemon without opening a chat.
 ///
 /// It refuses rather than building anything: reaching it would mean a test
@@ -126,5 +132,9 @@ pub(crate) fn refusing_chat() -> ChatSessionFactory {
 /// held by the same registry its runs are, which is what the production
 /// composition does.
 pub(crate) fn no_chats(supervisor: SessionSupervisor) -> Arc<ChatSessions> {
-    Arc::new(ChatSessions::new(supervisor, refusing_chat()))
+    Arc::new(ChatSessions::new(
+        supervisor,
+        refusing_chat(),
+        refusing_chat_history(),
+    ))
 }

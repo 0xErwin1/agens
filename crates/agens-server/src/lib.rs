@@ -62,8 +62,8 @@ pub use api::{
 };
 pub use blocking::{BlockingBoundary, BlockingError};
 pub use chat::{
-    ChatError, ChatEvent, ChatSession, ChatSessionFactory, ChatSessionRequest, ChatSessions,
-    ChatTurnOutcome, ChatTurns, OpenChatSummary,
+    ChatError, ChatEvent, ChatHistorySource, ChatSession, ChatSessionFactory, ChatSessionRequest,
+    ChatSessions, ChatTurnOutcome, ChatTurns, OpenChatSummary,
 };
 pub use coordinator::{
     ADMISSION_FAILED_EVENT, BootReconciliation, CORE_POISONED_EVENT, Coordinator, CoordinatorError,
@@ -321,6 +321,7 @@ pub fn serve_until_shutdown(
     settings: &CoordinatorSettings,
     worker: RunWorkerFactory,
     chat: ChatSessionFactory,
+    chat_history: ChatHistorySource,
     shutdown: &HeadlessTurnCancellation,
 ) -> Result<SessionShutdown, ServerError> {
     let daemon = Daemon::start(data_directory)?;
@@ -339,7 +340,11 @@ pub fn serve_until_shutdown(
     // The same supervisor the scheduler launches into, so a hosted chat is a
     // peer of the runs rather than a session the daemon does not know it has:
     // one capacity, one shutdown, one drain.
-    let chats = Arc::new(ChatSessions::new(daemon.sessions().clone(), chat));
+    let chats = Arc::new(ChatSessions::new(
+        daemon.sessions().clone(),
+        chat,
+        chat_history,
+    ));
 
     let report = daemon.serve_until_shutdown(coordinator.core(), chats, shutdown);
 

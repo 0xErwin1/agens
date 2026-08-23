@@ -34,8 +34,9 @@ use agens_core::{
 use agens_headless::{HeadlessChatRequest, run_production_headless_chat_with_progress};
 use agens_permissions::{PermissionPromptAnswer, PermissionPromptContext, PermissionPrompter};
 use agens_server::{
-    ChatError, ChatSession, ChatSessionFactory, ChatSessionRequest, ChatTurnOutcome, ChatTurns,
-    SessionAdmission, SessionBudget, SessionId, SessionProvider, SessionRuntime,
+    ChatError, ChatHistorySource, ChatSession, ChatSessionFactory, ChatSessionRequest,
+    ChatTurnOutcome, ChatTurns, SessionAdmission, SessionBudget, SessionId, SessionProvider,
+    SessionRuntime,
 };
 use agens_store::SessionStore;
 
@@ -46,6 +47,23 @@ pub(crate) fn hosted_chat(bootstrap: &Bootstrap) -> ChatSessionFactory {
     let bootstrap = bootstrap.clone();
 
     Arc::new(move |request: &ChatSessionRequest| build_chat(&bootstrap, request))
+}
+
+/// Where the daemon reads a chat's conversation back from.
+///
+/// The store rather than the running chat's own memory: the turn owns that
+/// memory while it runs, and a reader that waited for it would wait as long as
+/// the answer takes.
+#[must_use]
+pub(crate) fn hosted_chat_history(bootstrap: &Bootstrap) -> ChatHistorySource {
+    let data_directory = bootstrap.data_directory().to_path_buf();
+
+    Arc::new(move |session: SessionId| {
+        SessionStore::open(&data_directory)
+            .and_then(|store| store.load_session_for_resume(session.value()))
+            .map(|stored| stored.messages)
+            .map_err(|error| ChatError::Unavailable(error.to_string()))
+    })
 }
 
 fn build_chat(
