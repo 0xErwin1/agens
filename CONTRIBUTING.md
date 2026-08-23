@@ -95,6 +95,29 @@ Pull requests must make claims that reviewers can verify. Use `.github/pull_requ
 
 Do not check a validation item based on expectation. If a platform, provider, live network, or full gate was not exercised, say so explicitly.
 
+## Running the daemon
+
+`agens serve` runs the headless daemon for the machine. Two operator decisions gate it, and both are closed by default.
+
+Name the checkouts it may create runs against:
+
+```toml
+[team]
+project_roots = ["/home/dev/checkouts"]
+```
+
+A root admits itself and everything under it, compared as whole path components. With none configured, every `CreateRun` is refused and the refusal names this key and the file it belongs in. The daemon reads the roots at start, so a new one takes effect on the next `agens serve`.
+
+Provisioning hooks are repository code run with the daemon's whole environment, so they run only for a repository somebody decided about. The first run of an undecided repository proceeds with its hooks unrun and opens a durable question; answering it decides that repository for good. To decide ahead of the first run:
+
+```sh
+agens serve trust /home/dev/checkouts/agens
+```
+
+That writes the control plane the daemon reads, so it works whether or not a daemon is running and needs no restart. The checkout has to be one `team.project_roots` already serves.
+
+`team.hook_exports` lists the environment names a hook may export into the hooks after it. It is empty by default, which is what a repository that never asked for an export expects.
+
 ## Documentation ownership
 
 - `README.md` is the current product and development portal.
