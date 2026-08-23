@@ -230,37 +230,16 @@ impl Coordinator {
         worker: RunWorkerFactory,
         shutdown: &HeadlessTurnCancellation,
     ) -> Result<Self, CoordinatorError> {
-        let machines = StateMachines::new(open_control_plane(data_directory)?);
         let admissions = Arc::new(Admissions::new());
         let feed = Arc::new(JournalFeed::new());
-        let policy = Arc::new(
-            PolicyStore::open(data_directory, settings.policy.clone())
-                .map_err(|error| CoordinatorError::opening("the repository policy", error))?,
-        );
+        let core = Arc::new(Mutex::new(compose_core(
+            data_directory,
+            settings,
+            &admissions,
+            &feed,
+            &supervisor,
+        )?));
 
-        let ports = Ports {
-            scheduler: Arc::clone(&admissions) as Arc<dyn crate::api::AdmissionControl>,
-            worktrees: Arc::new(GitWorktreeGate::new(
-                SessionWorktrees::new(data_directory),
-                settings.main_ref.clone(),
-                policy.hook_exports(),
-            )),
-            delivery: Arc::new(RunDeliveries::new(
-                DirectiveStore::open(data_directory)
-                    .map_err(|error| CoordinatorError::opening("the delivery queue", error))?,
-            )),
-            sessions: Arc::new(SupervisedSessions::new(
-                supervisor.clone(),
-                open_control_plane(data_directory)?,
-            )),
-            feed: Arc::clone(&feed) as Arc<dyn crate::api::EventFeed>,
-        };
-
-        let core = Arc::new(Mutex::new(ApiCore::new(
-            machines,
-            ports,
-            policy as Arc<dyn RepositoryPolicy>,
-        )));
         let (facts, reports) = ingest_channel();
         let stopping = Arc::new(AtomicBool::new(false));
         let diagnostics = CoordinatorDiagnostics::new(data_directory, settings.diagnostics);
@@ -276,44 +255,20 @@ impl Coordinator {
         // loops are about to schedule against.
         let reconciliation = reconcile_boot(&core, data_directory, settings)?;
 
-        let loops = vec![
-            admission_loop(
-                data_directory,
-                settings,
-                &core,
-                &admissions,
-                &stopping,
-                supervisor,
-                worker,
-                facts.clone(),
-                diagnostics.clone(),
-                Arc::clone(&fatal),
-            ),
-            timer_loop(
-                settings,
-                &core,
-                &admissions,
-                &stopping,
-                facts.clone(),
-                diagnostics.clone(),
-                Arc::clone(&fatal),
-            ),
-            gates_loop(
-                data_directory,
-                settings,
-                &core,
-                &stopping,
-                Arc::clone(&fatal),
-            ),
-            ingest_loop(
-                data_directory,
-                settings,
-                reports,
-                &stopping,
-                diagnostics.clone(),
-            )?,
-            publisher_loop(data_directory, settings, feed, &stopping, diagnostics)?,
-        ];
+        let loops = spawn_loops(Composition {
+            data_directory,
+            settings,
+            core: &core,
+            admissions: &admissions,
+            feed,
+            stopping: &stopping,
+            supervisor,
+            worker,
+            facts: &facts,
+            reports,
+            diagnostics,
+            fatal: &fatal,
+        })?;
 
         let coordinator = Self {
             core,
@@ -430,6 +385,115 @@ fn reconcile_boot(
 
     reconcile::reconcile_before_surface(core.machines_mut(), data_directory, &wheel, now())
         .map_err(|error| CoordinatorError::opening("boot reconciliation", error))
+}
+
+/// The service core over one data directory: the state machines, the ports the
+/// operations perform effects through, and the repository policy they are
+/// authorized against.
+fn compose_core(
+    data_directory: &Path,
+    settings: &CoordinatorSettings,
+    admissions: &Arc<Admissions>,
+    feed: &Arc<JournalFeed>,
+    supervisor: &SessionSupervisor,
+) -> Result<ApiCore, CoordinatorError> {
+    let machines = StateMachines::new(open_control_plane(data_directory)?);
+    let policy = Arc::new(
+        PolicyStore::open(data_directory, settings.policy.clone())
+            .map_err(|error| CoordinatorError::opening("the repository policy", error))?,
+    );
+
+    let ports = Ports {
+        scheduler: Arc::clone(admissions) as Arc<dyn crate::api::AdmissionControl>,
+        worktrees: Arc::new(GitWorktreeGate::new(
+            SessionWorktrees::new(data_directory),
+            settings.main_ref.clone(),
+            policy.hook_exports(),
+        )),
+        delivery: Arc::new(RunDeliveries::new(
+            DirectiveStore::open(data_directory)
+                .map_err(|error| CoordinatorError::opening("the delivery queue", error))?,
+        )),
+        sessions: Arc::new(SupervisedSessions::new(
+            supervisor.clone(),
+            open_control_plane(data_directory)?,
+        )),
+        feed: Arc::clone(feed) as Arc<dyn crate::api::EventFeed>,
+    };
+
+    Ok(ApiCore::new(
+        machines,
+        ports,
+        policy as Arc<dyn RepositoryPolicy>,
+    ))
+}
+
+/// Everything the five loops are built from, gathered so starting them is one
+/// call rather than five argument lists that have to stay in step.
+struct Composition<'a> {
+    data_directory: &'a Path,
+    settings: &'a CoordinatorSettings,
+    core: &'a Arc<Mutex<ApiCore>>,
+    admissions: &'a Arc<Admissions>,
+    feed: Arc<JournalFeed>,
+    stopping: &'a Arc<AtomicBool>,
+    supervisor: SessionSupervisor,
+    worker: RunWorkerFactory,
+    facts: &'a FactSender,
+    reports: FactReceiver,
+    diagnostics: CoordinatorDiagnostics,
+    fatal: &'a Arc<FatalCore>,
+}
+
+/// Starts the five loops, in the order the daemon depends on them being up.
+fn spawn_loops(composition: Composition<'_>) -> Result<Vec<JoinHandle<()>>, CoordinatorError> {
+    let Composition {
+        data_directory,
+        settings,
+        core,
+        admissions,
+        feed,
+        stopping,
+        supervisor,
+        worker,
+        facts,
+        reports,
+        diagnostics,
+        fatal,
+    } = composition;
+
+    Ok(vec![
+        admission_loop(
+            data_directory,
+            settings,
+            core,
+            admissions,
+            stopping,
+            supervisor,
+            worker,
+            facts.clone(),
+            diagnostics.clone(),
+            Arc::clone(fatal),
+        ),
+        timer_loop(
+            settings,
+            core,
+            admissions,
+            stopping,
+            facts.clone(),
+            diagnostics.clone(),
+            Arc::clone(fatal),
+        ),
+        gates_loop(data_directory, settings, core, stopping, Arc::clone(fatal)),
+        ingest_loop(
+            data_directory,
+            settings,
+            reports,
+            stopping,
+            diagnostics.clone(),
+        )?,
+        publisher_loop(data_directory, settings, feed, stopping, diagnostics)?,
+    ])
 }
 
 /// Admission: a tick when a run enters the queue, and one on every heartbeat

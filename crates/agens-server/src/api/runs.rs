@@ -194,7 +194,7 @@ impl ApiCore {
         prepared: &PreparedRun,
         provisioned: ProvisionedWorktree,
     ) -> Result<CreatedRun, ApiError> {
-        let row = RunRow {
+        let mut row = RunRow {
             id: None,
             repo_id: prepared.repo_id.clone(),
             repo_root: prepared.repository.display().to_string(),
@@ -216,7 +216,6 @@ impl ApiCore {
             result: None,
         };
 
-        let mut row = row;
         let run_id = match self.machines.open_run(&row) {
             Ok(run_id) => run_id,
             Err(error) => {

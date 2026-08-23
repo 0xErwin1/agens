@@ -25,6 +25,7 @@ use agens_diagnostics::{CoordinatorEvent, SafeDiagnosticStore, next_diagnostic_r
 use agens_providers::DiagnosticRef;
 use agens_store::EventRow;
 
+use crate::gates::GATE_RESULT_EVENT;
 use crate::ingest::HealthSignal;
 use crate::scheduler::{AdmissionFailure, Deferral, Ineligible, QueueReport};
 use crate::timers::TimerTick;
@@ -89,7 +90,7 @@ impl CoordinatorDiagnostics {
                 to: text(&payload, "to"),
                 trigger: text(&payload, "trigger"),
             }),
-            "gate_result" => self.record(CoordinatorEvent::GateResult {
+            GATE_RESULT_EVENT => self.record(CoordinatorEvent::GateResult {
                 run_id,
                 gate: text(&payload, "gate"),
                 passed: payload
