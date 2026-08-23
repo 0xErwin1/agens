@@ -433,6 +433,17 @@ pub const DEFAULT_CHECKPOINT_GRACE_PERCENT: i64 = 150;
 /// lifted does not hold the team.
 pub const DEFAULT_QUOTA_WINDOW_SECONDS: i64 = 900;
 
+/// How long a run has from the moment it starts executing to its first
+/// checkpoint before the wheel reports the worker lost.
+///
+/// A fixed span rather than a share of one, because there is nothing to take a
+/// share of: the run has promised nothing yet. An hour is deliberately generous
+/// -- provisioning, a cold build and a long first read all happen before a
+/// worker has anything worth checkpointing -- and it is still bounded, which is
+/// the whole point: a worker that never checkpoints at all held its slot and its
+/// directory for the life of the installation.
+pub const DEFAULT_FIRST_CHECKPOINT_SECONDS: i64 = 3_600;
+
 const REASONING_EFFORTS: &[&str] = &["none", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 const UNBOUNDED_TEXT: SettingKind = SettingKind::Text {
@@ -632,6 +643,15 @@ pub const SETTINGS: &[SettingSpec] = &[
         },
         default: SettingValue::Integer(DEFAULT_CHECKPOINT_GRACE_PERCENT),
         doc: "Share of the span a worker promised its next checkpoint in, as a percentage, before the checkpoint counts as overdue.",
+    },
+    SettingSpec {
+        path: "team.first_checkpoint_seconds",
+        kind: SettingKind::Integer {
+            minimum: 60,
+            maximum: 86_400,
+        },
+        default: SettingValue::Integer(DEFAULT_FIRST_CHECKPOINT_SECONDS),
+        doc: "How long a run that has just started executing has to produce its first checkpoint before the worker is reported lost.",
     },
     SettingSpec {
         path: "team.quota_window_seconds",
@@ -872,6 +892,7 @@ impl From<&ResolvedSettings> for SubagentSettings {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TeamSettings {
     pub checkpoint_grace_percent: i64,
+    pub first_checkpoint_seconds: i64,
     pub quota_window_seconds: i64,
 }
 
@@ -885,6 +906,7 @@ impl From<&ResolvedSettings> for TeamSettings {
     fn from(resolved: &ResolvedSettings) -> Self {
         Self {
             checkpoint_grace_percent: integer_setting(resolved, "team.checkpoint_grace_percent"),
+            first_checkpoint_seconds: integer_setting(resolved, "team.first_checkpoint_seconds"),
             quota_window_seconds: integer_setting(resolved, "team.quota_window_seconds"),
         }
     }

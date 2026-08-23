@@ -9,11 +9,11 @@
 //! guarded because nothing else should be able to: reaching `cleaned` from
 //! `active` discards a worktree whose branch was never shown to be merged.
 
-use agens_store::{EventClass, StateChange, TransitionWrite, WorktreeStatus};
+use agens_store::{EventClass, RunRow, RunState, StateChange, TransitionWrite, WorktreeStatus};
 
 use super::{
-    AppliedTransition, JournaledMove, StateMachines, TransitionOutcome, TransitionRejection,
-    event_pair, transition_events,
+    AppliedTransition, JournaledMove, PreparedTransition, StateMachines, TransitionOutcome,
+    TransitionRejection, event_pair, transition_events,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -112,6 +112,30 @@ pub static WORKTREE_TRANSITIONS: &[WorktreeTransition] = &[
     },
 ];
 
+/// The run states in which a run still has a claim on its worktree.
+///
+/// It lives next to the transition table because it is the same fact the table
+/// describes from the other side: a worktree costs the machine a directory and
+/// a slot in the ceiling until it reaches `cleaned`, and no run state releases
+/// it on its own. `done` and `failed` claim theirs because the reclaim pass has
+/// yet to run, and `cancelled` claims one because cancellation moves the run
+/// and never touches `worktree_status`.
+///
+/// Every reader of "which runs hold a worktree" reads this list. Two readers
+/// with two lists is what let boot reconciliation report a cancelled run's
+/// directory as an orphan while the scheduler was still counting it.
+pub const WORKTREE_HOLDING_RUN_STATES: &[RunState] = &[
+    RunState::Draft,
+    RunState::Queued,
+    RunState::Running,
+    RunState::AwaitingInput,
+    RunState::AwaitingQuota,
+    RunState::Interrupted,
+    RunState::Done,
+    RunState::Failed,
+    RunState::Cancelled,
+];
+
 /// What the caller re-derived, and what a person confirmed.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct WorktreeFacts {
@@ -196,6 +220,70 @@ impl StateMachines {
             opened_question_id: None,
         }))
     }
+}
+
+/// One worktree transition prepared but not yet written.
+pub(super) type PreparedWorktree =
+    PreparedTransition<WorktreeStatus, StateChange<WorktreeStatus>, WorktreeEffect>;
+
+/// Prepares the release of a run's directory without writing it.
+///
+/// `None` when the row is already past `active`, which is the same answer
+/// [`StateMachines::apply_worktree`] gives that caller: a branch somebody else
+/// landed and released is still one a gate can verify, and refusing the whole
+/// settlement over it would refuse the verdict too.
+pub(super) fn releasable(
+    run: &RunRow,
+    now: i64,
+    worktree_clean: bool,
+) -> Result<Option<PreparedWorktree>, TransitionRejection> {
+    let Some(status) = run.worktree_status else {
+        return Ok(None);
+    };
+
+    let Some(transition) = WORKTREE_TRANSITIONS.iter().find(|candidate| {
+        candidate.from == status && candidate.trigger == WorktreeTrigger::MergeDetected
+    }) else {
+        return Ok(None);
+    };
+
+    let facts = WorktreeFacts {
+        now,
+        merge_re_derived: true,
+        worktree_clean,
+        manual_disposition_confirmed: false,
+    };
+    check_worktree_guard(transition, &facts)?;
+
+    let run_id = run
+        .id
+        .ok_or_else(|| TransitionRejection::Storage("a stored run must carry an id".to_owned()))?;
+
+    let events = transition_events(
+        &JournaledMove {
+            run_id,
+            ts: now,
+            class: transition.class,
+            machine: "worktree",
+            from: status.as_str(),
+            to: transition.to.as_str(),
+            trigger: WorktreeTrigger::MergeDetected.as_str(),
+            domain_event: transition.domain_event,
+        },
+        &serde_json::json!({ "worktree_path": run.worktree_path }),
+    );
+
+    Ok(Some(PreparedWorktree {
+        change: StateChange {
+            expected: status,
+            next: transition.to,
+        },
+        from: status,
+        to: transition.to,
+        effects: transition.effects,
+        domain_event: transition.domain_event,
+        events,
+    }))
 }
 
 fn check_worktree_guard(

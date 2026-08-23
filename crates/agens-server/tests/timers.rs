@@ -244,6 +244,129 @@ fn working_run(store: &mut ControlPlaneStore) -> i64 {
     run_id
 }
 
+/// A running run that was admitted and has never checkpointed.
+fn silent_run(store: &mut ControlPlaneStore) -> i64 {
+    let run_id = store
+        .insert_run(&run_in(RunState::Running, "anthropic"))
+        .unwrap();
+    store.append_event(&run_started(run_id, START)).unwrap();
+
+    run_id
+}
+
+fn run_started(run_id: i64, ts: i64) -> EventRow {
+    EventRow {
+        id: None,
+        run_id: Some(run_id),
+        event_type: "run_started".to_owned(),
+        class: EventClass::Infra,
+        payload: "{\"machine\":\"run\",\"to\":\"running\"}".to_owned(),
+        ts,
+    }
+}
+
+/// A worker that never checkpoints declares no deadline of its own, so nothing
+/// measured it: it held a slot and a worktree for as long as the daemon lived.
+/// The admission is what the wheel measures it from instead.
+#[test]
+fn a_run_that_never_checkpoints_is_overdue_once_the_first_checkpoint_span_passes() {
+    let mut store = store();
+    let run_id = silent_run(&mut store);
+    let mut machines = StateMachines::new(store);
+
+    let settings = TimerSettings {
+        first_checkpoint_seconds: 1_800,
+        ..TimerSettings::default()
+    };
+    let (wheel, clock) = TimerWheel::with_manual_clock_for_test(settings, START);
+
+    clock.set(START + 1_799);
+    assert!(
+        wheel.tick(&mut machines).overdue_checkpoints.is_empty(),
+        "everything before the first checkpoint is setup the worker cannot report on"
+    );
+
+    clock.set(START + 1_800);
+    let tick = wheel.tick(&mut machines);
+
+    let overdue = tick.overdue_checkpoints.first().unwrap();
+    assert_eq!(overdue.run_id, run_id);
+    assert_eq!(
+        overdue.promised_at, None,
+        "a worker that has said nothing has promised nothing"
+    );
+    assert_eq!(overdue.deadline, START + 1_800);
+    assert_eq!(overdue_signals(&machines, run_id), 1);
+}
+
+/// The signal is deduplicated on the entry it was raised for, and the entry
+/// itself is what carries that across a restart.
+#[test]
+fn a_missed_first_checkpoint_is_signalled_once_however_many_ticks_pass() {
+    let mut store = store();
+    let run_id = silent_run(&mut store);
+    let mut machines = StateMachines::new(store);
+
+    let (wheel, clock) = TimerWheel::with_manual_clock_for_test(TimerSettings::default(), START);
+
+    clock.set(START + 100_000);
+    assert_eq!(wheel.tick(&mut machines).overdue_checkpoints.len(), 1);
+
+    clock.set(START + 200_000);
+    assert!(
+        wheel.tick(&mut machines).overdue_checkpoints.is_empty(),
+        "a wheel that raised it every tick would bury the feed it draws attention in"
+    );
+    assert_eq!(overdue_signals(&machines, run_id), 1);
+}
+
+/// A run that has not executed has nothing to be late for.
+#[test]
+fn a_run_that_never_started_has_no_first_checkpoint_deadline() {
+    let mut store = store();
+    let run_id = store
+        .insert_run(&run_in(RunState::Running, "anthropic"))
+        .unwrap();
+    let mut machines = StateMachines::new(store);
+
+    let (wheel, clock) = TimerWheel::with_manual_clock_for_test(TimerSettings::default(), START);
+    clock.set(START + 1_000_000);
+
+    assert!(wheel.tick(&mut machines).overdue_checkpoints.is_empty());
+    assert_eq!(overdue_signals(&machines, run_id), 0);
+}
+
+/// The first checkpoint replaces the admission as what the run is measured
+/// against: it carries a promise, and the promise is the more specific claim.
+#[test]
+fn the_first_checkpoint_replaces_the_admission_as_the_deadline() {
+    let mut store = store();
+    let run_id = silent_run(&mut store);
+    store
+        .append_event(&checkpoint(
+            run_id,
+            START + 60,
+            Some(START + 60 + PROMISED_SPAN),
+        ))
+        .unwrap();
+    let mut machines = StateMachines::new(store);
+
+    let (wheel, clock) = TimerWheel::with_manual_clock_for_test(TimerSettings::default(), START);
+
+    clock.set(START + 959);
+    assert!(wheel.tick(&mut machines).overdue_checkpoints.is_empty());
+
+    clock.set(START + 960);
+    let tick = wheel.tick(&mut machines);
+
+    assert_eq!(
+        tick.overdue_checkpoints
+            .first()
+            .and_then(|overdue| overdue.promised_at),
+        Some(START + 60 + PROMISED_SPAN)
+    );
+}
+
 #[test]
 fn a_checkpoint_is_overdue_only_once_the_promised_span_plus_its_grace_has_passed() {
     let mut store = store();
@@ -260,7 +383,7 @@ fn a_checkpoint_is_overdue_only_once_the_promised_span_plus_its_grace_has_passed
 
     let overdue = tick.overdue_checkpoints.first().unwrap();
     assert_eq!(overdue.run_id, run_id);
-    assert_eq!(overdue.promised_at, START + PROMISED_SPAN);
+    assert_eq!(overdue.promised_at, Some(START + PROMISED_SPAN));
     assert_eq!(overdue.deadline, START + 900);
     assert_eq!(overdue_signals(&machines, run_id), 1);
 }
