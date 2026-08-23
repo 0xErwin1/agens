@@ -140,6 +140,9 @@ struct RecordingPolicy {
     pending: Mutex<Vec<PendingHookTrust>>,
     /// Every decision an answer applied, as `(repo_id, granted)`.
     decided: Mutex<Vec<(String, bool)>>,
+    /// Whether recording a pending question fails, which is how a test reaches
+    /// the half of creation that runs after the run's row exists.
+    refuses_to_record: bool,
 }
 
 impl RecordingPolicy {
@@ -149,7 +152,13 @@ impl RecordingPolicy {
             trust: Mutex::new(HookTrust::Unknown),
             pending: Mutex::new(Vec::new()),
             decided: Mutex::new(Vec::new()),
+            refuses_to_record: false,
         }
+    }
+
+    fn refusing_to_record(mut self) -> Self {
+        self.refuses_to_record = true;
+        self
     }
 
     fn trusting(self, trust: HookTrust) -> Self {
@@ -180,6 +189,13 @@ impl RepositoryPolicy for RecordingPolicy {
     }
 
     fn record_pending(&self, pending: &PendingHookTrust) -> Result<(), PortError> {
+        if self.refuses_to_record {
+            return Err(PortError::new(
+                "policy",
+                "the repository policy is unusable",
+            ));
+        }
+
         self.pending.lock().unwrap().push(pending.clone());
         Ok(())
     }
@@ -2059,5 +2075,47 @@ fn praetor_may_not_authorize_a_repositorys_hooks() {
     assert!(
         harness.policy.decided.lock().unwrap().is_empty(),
         "a refused answer grants nothing"
+    );
+}
+
+/// Creation is one operation, so a failure in its second half leaves nothing of
+/// its first behind.
+///
+/// The question a repository nobody has decided on earns is opened after the
+/// run's row is written. A failure there used to reach the client as a failed
+/// `CreateRun` over a draft run that existed and a worktree on disk that no
+/// approval would ever consume.
+#[test]
+fn a_creation_that_fails_after_the_row_exists_leaves_no_run_and_no_worktree() {
+    let repository = checkout();
+    let mut harness = Harness::with_policy(
+        store(),
+        RecordingWorktrees::new(false, true).declaring_hooks(&["devshell"]),
+        Arc::new(RecordingPolicy::serving(&repository).refusing_to_record()),
+        repository.clone(),
+    );
+
+    let error = harness
+        .core
+        .create_run(Principal::User, &create_run(&repository))
+        .expect_err("a creation that cannot record its question has not created anything");
+
+    assert!(
+        format!("{error:?}").contains("policy"),
+        "the caller is told what failed: {error:?}"
+    );
+
+    let removed = harness.worktrees.removed.lock().unwrap().clone();
+    assert_eq!(
+        removed.len(),
+        1,
+        "the worktree the failed creation provisioned is removed"
+    );
+
+    let run_id = removed[0];
+    assert_eq!(
+        harness.run_state(run_id),
+        RunState::Cancelled,
+        "the row the failed creation opened is not left as a draft anything could approve"
     );
 }

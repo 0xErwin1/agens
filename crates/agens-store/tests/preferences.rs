@@ -62,7 +62,8 @@ fn a_remembered_model_and_effort_survive_a_reopen_as_one_selection() {
             "0014_directive_child_target",
             "0015_control_plane",
             "0016_directive_kind",
-            "0017_session_compactions"
+            "0017_session_compactions",
+            "0018_repository_policy"
         ]
     );
     drop(connection);

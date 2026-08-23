@@ -151,6 +151,8 @@ const CONFIG_DOCTOR_DEFAULT_SETTINGS: &str = concat!(
     "  team.checkpoint_grace_percent    150           default\n",
     "  team.first_checkpoint_seconds    3600          default\n",
     "  team.quota_window_seconds        900           default\n",
+    "  team.project_roots               -             default\n",
+    "  team.hook_exports                -             default\n",
 );
 
 fn config_global_config_path(temporary: &TemporaryDirectory) -> PathBuf {

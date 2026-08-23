@@ -97,6 +97,21 @@ A **surface** is anything a user interacts with: argument parsing, terminal rend
 
 The CLI and TUI submit work through one cancellation-aware engine. Providers emit ordered turn events; tool dispatch evaluates permissions before execution; completed turns and grants are persisted by `agens-store` in clean Rust SQLite databases. Adapters add actionable context while typed errors remain distinct from cancellation.
 
+## Repository policy (daemon)
+
+One daemon serves N projects, and every one of them arrives by name from a client over a socket that authenticates nobody. Two decisions therefore cannot be derived from a request, and they are stored apart because they have different writers.
+
+| Decision | Where it lives | Who writes it |
+|---|---|---|
+| Which checkouts are servable, and what a provisioning hook may export | `team.project_roots` and `team.hook_exports` in the configuration file | the operator, by hand |
+| Whether a repository's provisioning hooks may run | `repository_hook_trust` and `repository_hook_questions` in the control plane (`agens.db`) | the daemon, answering a durable question, and `agens serve trust` |
+
+The roots are configuration because nothing the daemon runs may add to them: a run whose worktree could append a line to the register that admits it would be deciding which repositories the daemon serves. `team.project_roots` is empty by default, so an unconfigured daemon refuses every `CreateRun` and names the key and the file in the refusal.
+
+Hook trust moves while the daemon runs, so it is a table rather than a document. A provisioning hook is repository code executed with the daemon's whole environment, provider credentials included, so a repository nobody has decided on gets its first run with hooks unrun and a durable question attached. Answering that question, or running `agens serve trust <repository>`, records the decision; the daemon reads it through to the control plane on every request and needs no restart. `agens serve trust` refuses a checkout outside `team.project_roots`, since a grant that can never apply is worse than none.
+
+`PolicyStore::open` refuses to start against an `agens.db` the daemon's user does not own, or that anyone beyond that user can reach. Every other table is recoverable from the work it describes; this one decides whose code runs with the daemon's credentials.
+
 ## Agent instructions (AGENTS.md)
 
 Every agent's system prompt is assembled in a fixed layer order, each layer separated by a blank line:

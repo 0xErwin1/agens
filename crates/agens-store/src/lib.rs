@@ -17,6 +17,7 @@ mod directives;
 mod fact_store;
 mod media;
 mod prompt_memory;
+mod repository_policy;
 mod session_writer;
 pub use compaction::{CompactionStore, CompactionStoreError, StoredCompaction};
 pub use control_plane::{
@@ -26,6 +27,7 @@ pub use control_plane::{
     QuestionKind, QuestionRow, QuestionState, QuotaState, RetryTrigger, RunHealthRow, RunRow,
     RunState, StateChange, TransitionOutcome, TransitionWrite, WorktreeStatus,
 };
+pub use database::unified_database_path;
 pub use directives::{
     DirectiveGrain, DirectiveInbox, DirectiveKind, DirectiveStore, DirectiveStoreError,
     DirectiveTarget,
@@ -36,6 +38,9 @@ pub use media::{
     ingest_media_bytes, ingest_media_path, is_media_mime, media_chip_label, media_mime, open_media,
 };
 pub use prompt_memory::{PromptMemoryStore, PromptMemoryStoreError, StoredPrompt};
+pub use repository_policy::{
+    RepositoryPolicyStore, RepositoryPolicyStoreError, StoredHookTrust, StoredPendingTrust,
+};
 pub use session_writer::{
     ForkSessionError, SessionCursor, SessionPage, StoredSession, TranscriptCursor, TranscriptPage,
 };
