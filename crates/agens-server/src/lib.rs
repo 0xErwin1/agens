@@ -60,9 +60,9 @@ pub use api::{
 };
 pub use blocking::{BlockingBoundary, BlockingError};
 pub use coordinator::{
-    ADMISSION_FAILED_EVENT, BootReconciliation, Coordinator, CoordinatorError, CoordinatorSettings,
-    MissingWorktree, OrphanWorktree, RUN_DEFERRED_EVENT, RunLaunch, RunWorkerFactory,
-    WORKTREE_MISSING_EVENT, WORKTREE_ORPHANED_EVENT,
+    ADMISSION_FAILED_EVENT, BootReconciliation, CORE_POISONED_EVENT, Coordinator, CoordinatorError,
+    CoordinatorSettings, MissingWorktree, OrphanWorktree, RUN_DEFERRED_EVENT, RunLaunch,
+    RunWorkerFactory, WORKTREE_MISSING_EVENT, WORKTREE_ORPHANED_EVENT,
 };
 pub use diagnostics::CoordinatorDiagnostics;
 pub use fsm::{
@@ -301,9 +301,14 @@ pub fn serve_until_shutdown(
 
     // The supervisor is the daemon's, so the sessions the scheduler starts are
     // the ones the daemon stops on its way out.
-    let coordinator =
-        Coordinator::start(data_directory, settings, daemon.sessions().clone(), worker)
-            .map_err(|error| ServerError::Unavailable(error.to_string()))?;
+    let coordinator = Coordinator::start(
+        data_directory,
+        settings,
+        daemon.sessions().clone(),
+        worker,
+        shutdown,
+    )
+    .map_err(|error| ServerError::Unavailable(error.to_string()))?;
 
     let report = daemon.serve_until_shutdown(coordinator.core(), shutdown);
 

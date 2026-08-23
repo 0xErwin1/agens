@@ -42,6 +42,7 @@
 //! confinement root, its own MCP connections — belongs to the surface that
 //! knows about models, and admission must not have to know any of it.
 
+mod fatal;
 mod queue_journal;
 mod reconcile;
 
@@ -51,6 +52,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use agens_core::HeadlessTurnCancellation;
 use agens_store::{
     ControlPlaneStore, DirectiveStore, EventRow, QuestionAuthor, QuestionKind, QuestionState,
     RunRow, RunState, WorktreeStatus,
@@ -59,6 +61,7 @@ use agens_tools::SessionWorktrees;
 
 use crate::api::{ApiCore, Ports};
 use crate::cache::RunCache;
+use crate::coordinator::fatal::FatalCore;
 use crate::coordinator::queue_journal::QueueJournal;
 use crate::diagnostics::CoordinatorDiagnostics;
 use crate::fsm::StateMachines;
@@ -80,6 +83,7 @@ use crate::scheduler::{
 use crate::sessions::SessionSupervisor;
 use crate::timers::{TimerSettings, TimerWheel};
 
+pub use fatal::CORE_POISONED_EVENT;
 pub use queue_journal::{ADMISSION_FAILED_EVENT, RUN_DEFERRED_EVENT};
 pub use reconcile::{
     BootReconciliation, MissingWorktree, OrphanWorktree, WORKTREE_MISSING_EVENT,
@@ -207,11 +211,17 @@ impl Coordinator {
     /// The supervisor arrives from the daemon rather than being built here: the
     /// sessions the scheduler starts and the sessions the daemon stops on its
     /// way out have to be the same ones.
+    ///
+    /// The daemon's own stop arrives for the same reason. A service core left
+    /// poisoned has no recovery and no owner: the loops that find it can stop
+    /// themselves, and only this can stop the facade that would otherwise keep
+    /// answering clients from behind it.
     pub fn start(
         data_directory: &Path,
         settings: &CoordinatorSettings,
         supervisor: SessionSupervisor,
         worker: RunWorkerFactory,
+        shutdown: &HeadlessTurnCancellation,
     ) -> Result<Self, CoordinatorError> {
         let machines = StateMachines::new(open_control_plane(data_directory)?);
         let admissions = Arc::new(Admissions::new());
@@ -247,6 +257,12 @@ impl Coordinator {
         let (facts, reports) = ingest_channel();
         let stopping = Arc::new(AtomicBool::new(false));
         let diagnostics = CoordinatorDiagnostics::new(data_directory, settings.diagnostics);
+        let fatal = Arc::new(FatalCore::new(
+            data_directory,
+            &stopping,
+            shutdown,
+            diagnostics.clone(),
+        ));
 
         // Steps 2 to 4, before anything is ticking or serving. Nothing else
         // holds the core yet, so the pass reads and moves the same rows the
@@ -264,6 +280,7 @@ impl Coordinator {
                 worker,
                 facts.clone(),
                 diagnostics.clone(),
+                Arc::clone(&fatal),
             ),
             timer_loop(
                 settings,
@@ -272,8 +289,9 @@ impl Coordinator {
                 &stopping,
                 facts.clone(),
                 diagnostics.clone(),
+                Arc::clone(&fatal),
             ),
-            gates_loop(data_directory, settings, &core, &stopping),
+            gates_loop(data_directory, settings, &core, &stopping, fatal),
             ingest_loop(
                 data_directory,
                 settings,
@@ -406,6 +424,7 @@ fn admission_loop(
     worker: RunWorkerFactory,
     facts: FactSender,
     diagnostics: CoordinatorDiagnostics,
+    fatal: Arc<FatalCore>,
 ) -> JoinHandle<()> {
     let core = Arc::clone(core);
     let admissions = Arc::clone(admissions);
@@ -454,7 +473,14 @@ fn admission_loop(
                     }
                     Err(_) => true,
                 },
-                Err(_) => true,
+                // A poisoned core is not a tick that did nothing: it is a core
+                // no later tick will take either, so the daemon stops here
+                // rather than sleeping the backoff forever.
+                Err(_) => {
+                    fatal.poisoned("admission");
+
+                    true
+                }
             };
 
             // A launch that did not work leaves its run queued, so the next
@@ -490,6 +516,7 @@ fn timer_loop(
     stopping: &Arc<AtomicBool>,
     facts: FactSender,
     diagnostics: CoordinatorDiagnostics,
+    fatal: Arc<FatalCore>,
 ) -> JoinHandle<()> {
     let core = Arc::clone(core);
     let admissions = Arc::clone(admissions);
@@ -515,7 +542,15 @@ fn timer_loop(
                     }
                     Err(_) => (false, Vec::new()),
                 },
-                Err(_) => (false, Vec::new()),
+                // The wheel reading a poisoned core as "nothing was due" is how
+                // a daemon goes on ticking against a core it will never take
+                // again. It is fatal here for the same reason it is in
+                // admission.
+                Err(_) => {
+                    fatal.poisoned("timers");
+
+                    (false, Vec::new())
+                }
             };
 
             // A provider whose reset arrived put its runs back in the queue,
@@ -576,6 +611,7 @@ fn gates_loop(
     settings: &CoordinatorSettings,
     core: &Arc<Mutex<ApiCore>>,
     stopping: &Arc<AtomicBool>,
+    fatal: Arc<FatalCore>,
 ) -> JoinHandle<()> {
     let core = Arc::clone(core);
     let stopping = Arc::clone(stopping);
@@ -583,6 +619,7 @@ fn gates_loop(
         worktrees: SessionWorktrees::new(data_directory),
         main_ref: settings.main_ref.clone(),
         attempt_cap: settings.attempt_cap,
+        fatal,
     };
     let interval = settings.gates_sweep;
     let heartbeat = settings.heartbeat;
@@ -618,13 +655,14 @@ struct GatesSweep {
     worktrees: SessionWorktrees,
     main_ref: String,
     attempt_cap: i64,
+    fatal: Arc<FatalCore>,
 }
 
 impl GatesSweep {
     /// One pass over every run whose work is finished and whose worktree is
     /// still active.
     fn pass(&self, core: &Mutex<ApiCore>, now: i64) {
-        let Ok(candidates) = core.lock().map(|core| candidates(&core)) else {
+        let Some(candidates) = self.taken(core).map(|core| candidates(&core)) else {
             return;
         };
 
@@ -652,7 +690,7 @@ impl GatesSweep {
             now,
         };
 
-        let Ok(mut core) = core.lock() else {
+        let Some(mut core) = self.taken(core) else {
             return;
         };
 
@@ -688,10 +726,26 @@ impl GatesSweep {
             now,
         };
 
-        let Ok(mut core) = core.lock() else {
+        let Some(mut core) = self.taken(core) else {
             return;
         };
         let _verdict = Gates::new(core.machines_mut(), self.worktrees.clone()).reclaim(&request);
+    }
+
+    /// The core, or nothing and a daemon on its way down.
+    ///
+    /// A sweep that skipped a poisoned core would go on passing over the same
+    /// candidates forever, presenting each of them to a gate that can no longer
+    /// be reached.
+    fn taken<'a>(&self, core: &'a Mutex<ApiCore>) -> Option<std::sync::MutexGuard<'a, ApiCore>> {
+        match core.lock() {
+            Ok(core) => Some(core),
+            Err(_) => {
+                self.fatal.poisoned("gates");
+
+                None
+            }
+        }
     }
 }
 

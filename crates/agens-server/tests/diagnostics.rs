@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use agens_core::HeadlessTurnCancellation;
 use agens_server::{
     Coordinator, CoordinatorSettings, LaunchError, RunLaunch, RunWorkerFactory, SessionSupervisor,
 };
@@ -142,7 +143,14 @@ fn await_event(directory: &Path, event: &str) -> Vec<serde_json::Value> {
     }
 }
 
-fn coordinator_over(directory: &Path, diagnostics: bool) -> (Coordinator, tokio::runtime::Runtime) {
+fn coordinator_over(
+    directory: &Path,
+    diagnostics: bool,
+) -> (
+    Coordinator,
+    tokio::runtime::Runtime,
+    HeadlessTurnCancellation,
+) {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -153,16 +161,23 @@ fn coordinator_over(directory: &Path, diagnostics: bool) -> (Coordinator, tokio:
         diagnostics,
         ..CoordinatorSettings::default()
     };
-    let coordinator = Coordinator::start(directory, &settings, supervisor, refusing_worker())
-        .expect("the coordinator composes over the data directory");
+    let shutdown = HeadlessTurnCancellation::new();
+    let coordinator = Coordinator::start(
+        directory,
+        &settings,
+        supervisor,
+        refusing_worker(),
+        &shutdown,
+    )
+    .expect("the coordinator composes over the data directory");
 
-    (coordinator, runtime)
+    (coordinator, runtime, shutdown)
 }
 
 #[test]
 fn the_coordinator_records_what_it_moved_and_what_it_could_not_start() {
     let directory = seeded_directory("recording");
-    let (coordinator, runtime) = coordinator_over(&directory, true);
+    let (coordinator, runtime, _shutdown) = coordinator_over(&directory, true);
 
     let moved = await_event(&directory, "run_state_changed");
     let failed = await_event(&directory, "admission_failed");
@@ -214,7 +229,7 @@ fn the_coordinator_records_what_it_moved_and_what_it_could_not_start() {
 #[test]
 fn a_daemon_that_did_not_ask_for_capture_writes_no_file() {
     let directory = seeded_directory("silent");
-    let (coordinator, runtime) = coordinator_over(&directory, false);
+    let (coordinator, runtime, _shutdown) = coordinator_over(&directory, false);
 
     // Long enough for every loop to have ticked several times.
     std::thread::sleep(Duration::from_millis(1_500));

@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use agens_core::HeadlessTurnCancellation;
 use agens_server::{
     ADMISSION_FAILED_EVENT, Coordinator, CoordinatorSettings, LaunchError, RUN_DEFERRED_EVENT,
     RunLaunch, RunWorkerFactory, SchedulerLimits, SessionSupervisor,
@@ -94,17 +95,28 @@ fn settled_entries(directory: &Path, run_id: i64, event_type: &str) -> Vec<Event
 fn coordinator_over(
     directory: &Path,
     settings: &CoordinatorSettings,
-) -> (Coordinator, tokio::runtime::Runtime) {
+) -> (
+    Coordinator,
+    tokio::runtime::Runtime,
+    HeadlessTurnCancellation,
+) {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .unwrap();
     let supervisor = SessionSupervisor::new(runtime.handle().clone());
 
-    let coordinator = Coordinator::start(directory, settings, supervisor, refusing_worker())
-        .expect("the coordinator composes over the data directory");
+    let shutdown = HeadlessTurnCancellation::new();
+    let coordinator = Coordinator::start(
+        directory,
+        settings,
+        supervisor,
+        refusing_worker(),
+        &shutdown,
+    )
+    .expect("the coordinator composes over the data directory");
 
-    (coordinator, runtime)
+    (coordinator, runtime, shutdown)
 }
 
 #[test]
@@ -123,7 +135,7 @@ fn a_run_held_by_a_ceiling_says_so_once_rather_than_on_every_tick() {
         },
         ..CoordinatorSettings::default()
     };
-    let (coordinator, runtime) = coordinator_over(&directory, &settings);
+    let (coordinator, runtime, _shutdown) = coordinator_over(&directory, &settings);
 
     let deferred = settled_entries(&directory, run_id, RUN_DEFERRED_EVENT);
 
@@ -151,7 +163,8 @@ fn a_launch_that_keeps_failing_says_why_and_says_it_once() {
         .insert_run(&queued_run())
         .expect("insert the run");
 
-    let (coordinator, runtime) = coordinator_over(&directory, &CoordinatorSettings::default());
+    let (coordinator, runtime, _shutdown) =
+        coordinator_over(&directory, &CoordinatorSettings::default());
 
     let failures = settled_entries(&directory, run_id, ADMISSION_FAILED_EVENT);
 
