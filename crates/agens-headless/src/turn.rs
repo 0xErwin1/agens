@@ -112,6 +112,9 @@ pub struct RunExecution {
     /// the session, because an answer is queued while the run is parked and no
     /// session is executing it.
     pub mailbox: String,
+    /// The worktree this run's work lives in, and therefore what "outside the
+    /// declared scope" is measured against by the hard denylist.
+    pub worktree: std::path::PathBuf,
 }
 
 struct HeadlessProviderContext<'a> {
@@ -1009,6 +1012,16 @@ where
             runtime
         }
     };
+    // A run's dispatcher carries the hard denylist for every call made through
+    // it, this turn's and every sub-agent's. Set only when this turn is the
+    // run's own: a sub-agent turn reuses the dispatcher it inherited, which is
+    // already carrying it.
+    if let Some(run) = context.run {
+        tool_runtime
+            .lock()
+            .map_err(|_| CliError::configuration("tool catalog is invalid"))?
+            .enforce_denylist(run.worktree.clone());
+    }
     let task_registry = context
         .task_runtime
         .map(|runtime| runtime.task_registry.clone());
