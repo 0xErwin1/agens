@@ -423,6 +423,16 @@ impl SettingSpec {
 /// the same absolute delay.
 pub const DEFAULT_CHECKPOINT_GRACE_PERCENT: i64 = 150;
 
+/// How long a provider cap that named no reset time is honoured before the
+/// runs parked on it try that provider again.
+///
+/// A provider that refuses without saying when it will serve again has said
+/// nothing about whether this is a burst or a subscription wall, and fifteen
+/// minutes is the conservative reading of that silence: long enough not to
+/// walk back into the same wall every minute, short enough that a cap already
+/// lifted does not hold the team.
+pub const DEFAULT_QUOTA_WINDOW_SECONDS: i64 = 900;
+
 const REASONING_EFFORTS: &[&str] = &["none", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 const UNBOUNDED_TEXT: SettingKind = SettingKind::Text {
@@ -613,6 +623,15 @@ pub const SETTINGS: &[SettingSpec] = &[
         },
         default: SettingValue::Integer(0),
         doc: "Retry budget for servers that omit their own.",
+    },
+    SettingSpec {
+        path: "team.quota_window_seconds",
+        kind: SettingKind::Integer {
+            minimum: 60,
+            maximum: 86_400,
+        },
+        default: SettingValue::Integer(DEFAULT_QUOTA_WINDOW_SECONDS),
+        doc: "How long a provider cap that named no reset time is honoured before the parked runs try it again.",
     },
     SettingSpec {
         path: "team.checkpoint_grace_percent",
@@ -853,6 +872,7 @@ impl From<&ResolvedSettings> for SubagentSettings {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TeamSettings {
     pub checkpoint_grace_percent: i64,
+    pub quota_window_seconds: i64,
 }
 
 impl Default for TeamSettings {
@@ -865,6 +885,7 @@ impl From<&ResolvedSettings> for TeamSettings {
     fn from(resolved: &ResolvedSettings) -> Self {
         Self {
             checkpoint_grace_percent: integer_setting(resolved, "team.checkpoint_grace_percent"),
+            quota_window_seconds: integer_setting(resolved, "team.quota_window_seconds"),
         }
     }
 }

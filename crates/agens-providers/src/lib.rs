@@ -458,9 +458,7 @@ pub struct ProviderDiagnosticEvent {
 enum ChatGptResponseError {
     Authentication(u16),
     Rejected,
-    RateLimited {
-        reset_after_seconds: Option<u32>,
-    },
+    RateLimited { reset_after_seconds: Option<u32> },
     Server,
     Protocol,
     Other(HeadlessTurnPortError),
@@ -1822,7 +1820,10 @@ fn parse_retry_after_ms(value: Option<&str>, cap: Duration) -> Option<Duration> 
     (!delay.is_zero()).then(|| delay.min(cap))
 }
 
-fn retry_after_from_headers(headers: &reqwest::header::HeaderMap, cap: Duration) -> Option<Duration> {
+fn retry_after_from_headers(
+    headers: &reqwest::header::HeaderMap,
+    cap: Duration,
+) -> Option<Duration> {
     let header = |name: &str| {
         headers
             .get(name)
@@ -1950,7 +1951,8 @@ impl<'a> RetryLoop<'a> {
                 self.component,
                 kind,
                 self.attempt_number(),
-                self.named_reset.map(|seconds| Duration::from_secs(seconds.into())),
+                self.named_reset
+                    .map(|seconds| Duration::from_secs(seconds.into())),
                 status,
                 class,
             );

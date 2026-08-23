@@ -788,19 +788,28 @@ impl ControlPlaneStore {
         )
     }
 
-    /// Providers whose cap has a reset time that has arrived.
+    /// Providers whose cap has arrived at the moment it is due to lift.
     ///
-    /// A capped provider that named no reset is deliberately absent: nothing
-    /// can wake its parked runs on a timer, and it takes a fresh report from
-    /// the provider to lift.
-    pub fn providers_due(&self, now: i64) -> Result<Vec<ProviderRow>> {
+    /// A provider that named a reset is due at it. One that named none is due
+    /// a configured window after the cap was recorded: a cap nothing can
+    /// re-derive would otherwise hold its runs in `awaiting_quota` forever,
+    /// because the only thing that ever lifts it is a report from a run that
+    /// is no longer allowed to start. Passing no window keeps such a cap
+    /// waiting for a fresh report instead.
+    pub fn providers_due(
+        &self,
+        now: i64,
+        fallback_window: Option<i64>,
+    ) -> Result<Vec<ProviderRow>> {
         self.load_all(
             "load providers due",
             &format!(
                 "{PROVIDER_SELECT} WHERE quota_state = 'capped'
-                 AND reset_at IS NOT NULL AND reset_at <= ?1 ORDER BY provider"
+                 AND ((reset_at IS NOT NULL AND reset_at <= ?1)
+                      OR (reset_at IS NULL AND ?2 IS NOT NULL AND updated_at + ?2 <= ?1))
+                 ORDER BY provider"
             ),
-            params![now],
+            params![now, fallback_window],
         )
     }
 

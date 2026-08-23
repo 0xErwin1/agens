@@ -187,6 +187,7 @@ fn a_configured_grace_replaces_the_default_one_and_a_half_promised_spans() {
 
     let settings = TimerSettings {
         checkpoint_grace_percent: 300,
+        ..TimerSettings::default()
     };
     let (wheel, clock) = TimerWheel::with_manual_clock_for_test(settings, START);
 

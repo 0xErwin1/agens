@@ -58,6 +58,11 @@ const CHECKPOINT_ID_FIELD: &str = "checkpoint_id";
 /// activation for a worker that was only slow.
 pub const DEFAULT_CHECKPOINT_GRACE_PERCENT: i64 = 150;
 
+/// How long a cap the provider named no reset for is honoured before the
+/// provider is tried again. The run costs no retry budget either way, so being
+/// early is paid for in one refused request.
+pub const DEFAULT_QUOTA_WINDOW_SECONDS: i64 = 900;
+
 /// What the wheel needs configured. Deliberately not read from configuration
 /// here: this crate owns the daemon, and resolving hand-authored TOML belongs
 /// to the configuration crate and the composition root that wires the two.
@@ -65,12 +70,15 @@ pub const DEFAULT_CHECKPOINT_GRACE_PERCENT: i64 = 150;
 pub struct TimerSettings {
     /// `team.checkpoint_grace_percent`.
     pub checkpoint_grace_percent: i64,
+    /// `team.quota_window_seconds`.
+    pub quota_window_seconds: i64,
 }
 
 impl Default for TimerSettings {
     fn default() -> Self {
         Self {
             checkpoint_grace_percent: DEFAULT_CHECKPOINT_GRACE_PERCENT,
+            quota_window_seconds: DEFAULT_QUOTA_WINDOW_SECONDS,
         }
     }
 }
@@ -230,7 +238,7 @@ impl TimerWheel {
     ) -> Result<Vec<QuotaReset>, TransitionRejection> {
         let due: Vec<String> = machines
             .store()
-            .providers_due(now)?
+            .providers_due(now, Some(self.settings.quota_window_seconds))?
             .into_iter()
             .map(|provider| provider.provider)
             .collect();
@@ -253,6 +261,7 @@ impl TimerWheel {
 
             let facts = RunFacts {
                 now,
+                quota_window_seconds: Some(self.settings.quota_window_seconds),
                 ..RunFacts::default()
             };
 

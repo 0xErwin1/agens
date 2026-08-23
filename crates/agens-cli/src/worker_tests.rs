@@ -462,6 +462,7 @@ fn the_daemon_executes_a_run_through_a_real_turn_that_checkpoints_asks_and_finis
             // which is not a thing a test can wait for.
             timers: TimerSettings {
                 checkpoint_grace_percent: 0,
+                ..TimerSettings::default()
             },
             scheduler: SchedulerLimits {
                 max_concurrent: 1,

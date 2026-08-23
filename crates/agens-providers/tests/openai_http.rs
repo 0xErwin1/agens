@@ -799,9 +799,8 @@ fn openai_stops_retrying_when_the_total_wait_budget_is_spent() {
 /// instead of asking again on a schedule of its own.
 #[test]
 fn openai_stops_at_a_named_delay_it_cannot_honour_and_reports_the_reset() {
-    let server = RetryResponsesServer::start(vec![RetryResponse::StatusWithRetryAfter(
-        429, "3600",
-    )]);
+    let server =
+        RetryResponsesServer::start(vec![RetryResponse::StatusWithRetryAfter(429, "3600")]);
 
     assert_eq!(
         run_provider_with_retry_policy(
