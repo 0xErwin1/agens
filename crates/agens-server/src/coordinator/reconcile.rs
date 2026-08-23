@@ -16,11 +16,16 @@
 //! 3. Recompute every timer from the database.
 //! 4. Check the worktrees on disk against the runs that claim them, and hand
 //!    what nothing claims to the cleaning flow.
-//! 5. Raise the surface clients attach to.
-//! 6. Move `interrupted → queued`, with resume priority.
+//! 5. Move `interrupted → queued`, with resume priority.
+//! 6. Answer clients.
 //!
-//! Steps 5 and 6 are in that order on purpose: the runs coming back are visible
-//! to whoever is watching before they start executing again.
+//! The resume is finished before the facade answers anything, so the first
+//! thing any client can read is a reconciled control plane rather than rows
+//! describing sessions that no longer exist. It is not visible as it happens:
+//! a subscription is live from the moment it is registered and no client is
+//! attached while a daemon is still booting, so no ordering of these two steps
+//! could put the resume's entries on a stream. What a watcher reads them from
+//! is the run's own detail, which is where the journal is.
 //!
 //! **`interrupted` is not a failed attempt.** The turn in flight was lost, and
 //! losing it is not the worker's doing, so the attempt it was executing is
@@ -109,11 +114,13 @@ pub(super) fn reconcile_before_surface(
     })
 }
 
-/// Step 6: the interrupted runs go back to the queue, ahead of fresh work.
+/// Step 5: the interrupted runs go back to the queue, ahead of fresh work.
 ///
-/// Separate from the pass above because it runs after the client surface is up,
-/// which is the whole point of the order: a run resuming is something a person
-/// watching can see happen rather than find already done.
+/// Separate from the pass above because it runs after the loops are up, so a
+/// resume that cannot be applied stops the loops it would otherwise leave
+/// ticking behind a composition that failed. It still runs before the facade
+/// answers anything, which is what makes a client's first read a reconciled
+/// one.
 pub(super) fn resume_interrupted(
     machines: &mut StateMachines,
     now: i64,

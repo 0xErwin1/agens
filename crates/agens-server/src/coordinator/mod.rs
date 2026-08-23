@@ -322,14 +322,14 @@ impl Coordinator {
             loops,
         };
 
-        // Step 6, after the loops are up: a run coming back is something a
-        // watcher sees happen rather than finds already done. Assembled first
-        // so that a resume which cannot be applied stops the loops it would
-        // otherwise leave ticking behind a composition that failed.
+        // Step 5, after the loops are up and before the facade answers anyone.
+        // Assembled first so that a resume which cannot be applied stops the
+        // loops it would otherwise leave ticking behind a composition that
+        // failed.
         coordinator.resume_reconciled()
     }
 
-    /// Step 6, through the same core the loops tick against.
+    /// Step 5, through the same core the loops tick against.
     fn resume_reconciled(mut self) -> Result<Self, CoordinatorError> {
         let resumed = match self.core.lock() {
             Ok(mut core) => reconcile::resume_interrupted(core.machines_mut(), now())
