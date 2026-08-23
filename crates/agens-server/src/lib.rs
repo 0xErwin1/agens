@@ -318,7 +318,17 @@ pub fn serve_until_shutdown(
 
     // After the facade has stopped: nothing is admitting, ticking or publishing
     // against a core the sessions behind it have already been stopped.
-    coordinator.stop();
+    let poisoned = coordinator.stop();
+
+    // A daemon that came down on a poisoned core did not stop cleanly, and the
+    // exit status is the only part of that a process supervisor reads. The
+    // socket and the machine's slot are already released by the line above, so
+    // what this refuses is the report, not the shutdown.
+    if poisoned {
+        return Err(ServerError::Unavailable(
+            "the service core was left poisoned and the daemon stopped".to_owned(),
+        ));
+    }
 
     report
 }

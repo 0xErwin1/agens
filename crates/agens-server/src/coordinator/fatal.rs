@@ -83,6 +83,16 @@ impl FatalCore {
         self.shutdown.cancel();
     }
 
+    /// Whether a loop found the core poisoned.
+    ///
+    /// Read on the way out, because the flag every loop was watching is the
+    /// daemon's ordinary stop and says nothing about why it was raised. A
+    /// caller that reported success for this would leave a process supervisor
+    /// with a machine that has no daemon and no reason to start one.
+    pub(super) fn reported(&self) -> bool {
+        self.reported.load(Ordering::Acquire)
+    }
+
     /// Appends the one entry that says why this daemon stopped.
     ///
     /// Through a store opened here rather than the machines', because the
