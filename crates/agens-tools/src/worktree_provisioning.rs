@@ -541,9 +541,17 @@ impl WorktreeProvisioner {
     /// `CARGO_TARGET_DIR` without admitting `CARGOX`. A dropped export is
     /// recorded rather than refused: a contract that exports one name the
     /// operator has not granted is still a contract worth applying.
+    ///
+    /// An entry that would admit every name is rejected here rather than
+    /// carried: the allowlist exists to keep `PATH` and `LD_PRELOAD` out of the
+    /// environment the following hooks execute in, and a pattern with nothing
+    /// before its `*` admits exactly those.
     #[must_use]
     pub fn with_export_allowlist(mut self, names: Vec<String>) -> Self {
-        self.export_allowlist = names;
+        self.export_allowlist = names
+            .into_iter()
+            .filter(|name| !admits_every_name(name))
+            .collect();
         self
     }
 
@@ -704,6 +712,7 @@ impl WorktreeProvisioner {
     fn admits_export(&self, name: &str) -> bool {
         self.export_allowlist
             .iter()
+            .filter(|allowed| !admits_every_name(allowed))
             .any(|allowed| match allowed.strip_suffix('*') {
                 Some(prefix) => name.starts_with(prefix),
                 None => name == allowed,
@@ -1154,6 +1163,12 @@ fn read_exported_environment(path: &Path) -> Result<BTreeMap<String, String>, Pr
     }
 
     Ok(exported)
+}
+
+/// Whether an allowlist entry selects every exported name, which is what a
+/// bare `*` and an empty entry both do once the `*` is stripped off.
+fn admits_every_name(entry: &str) -> bool {
+    entry.strip_suffix('*').unwrap_or(entry).is_empty()
 }
 
 fn is_environment_name(name: &str) -> bool {

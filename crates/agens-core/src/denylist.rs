@@ -171,14 +171,37 @@ impl Denylist {
         None
     }
 
+    /// Reads a command line as the sequence of invocations it runs, carrying
+    /// the working directory forward across it.
+    ///
+    /// `bash` runs the whole line with the worktree as its working directory,
+    /// so a `cd` inside the line moves every operand that follows it. Judging
+    /// each invocation against the worktree instead would read
+    /// `cd .. && rm -rf victim` as a deletion of something the worktree
+    /// contains, which is the one thing it is not.
     fn classify_command(&self, command: &str) -> Option<DenylistClass> {
-        permission_target::command_invocation_tokens(command)
-            .iter()
-            .find_map(|tokens| self.classify_invocation(tokens))
-            .or_else(|| classify_embedded_statement(command))
+        let mut directory = self.worktree.clone();
+
+        for tokens in permission_target::command_invocation_tokens(command) {
+            if let Some(class) = self.classify_invocation(&directory, &tokens) {
+                return Some(class);
+            }
+
+            if let Some(change) = directory_change(&tokens) {
+                let moved = change.applied_to(&directory);
+
+                if self.escapes_from(&directory, &moved) {
+                    return Some(DenylistClass::OutOfScope);
+                }
+
+                directory = lexically_resolved(&moved);
+            }
+        }
+
+        classify_embedded_statement(command)
     }
 
-    fn classify_invocation(&self, tokens: &[String]) -> Option<DenylistClass> {
+    fn classify_invocation(&self, directory: &Path, tokens: &[String]) -> Option<DenylistClass> {
         if let Some(program) = program_of(tokens)
             && PRIVILEGE_ESCALATION.contains(&program)
         {
@@ -193,56 +216,136 @@ impl Denylist {
             return Some(class);
         }
 
-        self.classify_operands(program, arguments)
+        self.classify_operands(directory, program, arguments)
     }
 
     /// What the paths an invocation names say about it, once its program has
     /// said nothing on its own.
-    fn classify_operands(&self, program: &str, arguments: &[String]) -> Option<DenylistClass> {
+    ///
+    /// An argument that does not read as a path is not silently taken for one
+    /// relative to the working directory. `python -c "os.remove('/etc/passwd')"`
+    /// is a program the matcher cannot read, but the absolute paths written
+    /// inside it are still paths, and those are what it is judged by.
+    fn classify_operands(
+        &self,
+        directory: &Path,
+        program: &str,
+        arguments: &[String],
+    ) -> Option<DenylistClass> {
         arguments
             .iter()
-            .filter(|argument| looks_like_a_path(argument))
-            .find_map(|operand| {
-                if names_a_secret(operand) {
-                    return Some(DenylistClass::SecretsAccess);
-                }
-                if names_a_service_unit(operand) {
-                    return Some(DenylistClass::ServerLifecycle);
-                }
-                if !self.escapes(operand) {
-                    return None;
+            .filter(|argument| !argument.starts_with('-'))
+            .find_map(|argument| {
+                if looks_like_a_path(argument) {
+                    return self.classify_operand(directory, program, argument);
                 }
 
-                Some(if DELETION_PROGRAMS.contains(&program) {
-                    DenylistClass::DeletionOutsideWorktree
-                } else {
-                    DenylistClass::OutOfScope
-                })
+                embedded_paths(argument)
+                    .into_iter()
+                    .find_map(|embedded| self.classify_operand(directory, program, embedded))
             })
     }
 
-    /// Whether `value` names something the worktree does not contain.
+    fn classify_operand(
+        &self,
+        directory: &Path,
+        program: &str,
+        operand: &str,
+    ) -> Option<DenylistClass> {
+        if names_a_secret(operand) {
+            return Some(DenylistClass::SecretsAccess);
+        }
+        if names_a_service_unit(operand) {
+            return Some(DenylistClass::ServerLifecycle);
+        }
+        if !self.escapes_from(directory, Path::new(operand)) {
+            return None;
+        }
+
+        Some(if DELETION_PROGRAMS.contains(&program) {
+            DenylistClass::DeletionOutsideWorktree
+        } else {
+            DenylistClass::OutOfScope
+        })
+    }
+
+    /// Whether `value` names something the worktree does not contain, read
+    /// from `directory` the way the shell would read it.
     ///
     /// Decided lexically, without touching the filesystem: the answer has to be
     /// the same for a path that does not exist yet as for one that does, and a
     /// worker naming a path is frequently naming the first.
-    fn escapes(&self, value: &str) -> bool {
-        if value.is_empty() {
+    fn escapes_from(&self, directory: &Path, value: &Path) -> bool {
+        if value.as_os_str().is_empty() {
             return false;
         }
-        if value == "~" || value.starts_with("~/") {
+        if names_the_home_directory(value) {
             return true;
         }
 
-        let path = Path::new(value);
-        let joined = if path.is_absolute() {
-            path.to_path_buf()
+        let joined = if value.is_absolute() {
+            value.to_path_buf()
         } else {
-            self.worktree.join(path)
+            directory.join(value)
         };
 
         !lexically_resolved(&joined).starts_with(lexically_resolved(&self.worktree))
     }
+
+    fn escapes(&self, value: &str) -> bool {
+        self.escapes_from(&self.worktree, Path::new(value))
+    }
+}
+
+/// Where a `cd` invocation leaves the working directory of the line it is part
+/// of.
+enum DirectoryChange {
+    /// A `cd` with an operand, which the shell resolves the same way it
+    /// resolves any other path.
+    To(PathBuf),
+    /// A `cd` with nothing to resolve — bare, or back to a directory only the
+    /// shell remembers. Neither is a place inside the worktree that can be
+    /// named, so both are read as leaving it.
+    Away,
+}
+
+impl DirectoryChange {
+    fn applied_to(&self, directory: &Path) -> PathBuf {
+        match self {
+            Self::To(target) if target.is_absolute() => target.clone(),
+            Self::To(target) => directory.join(target),
+            Self::Away => PathBuf::from("~"),
+        }
+    }
+}
+
+/// Reads an invocation as a change of working directory, or as nothing when it
+/// is an ordinary command.
+fn directory_change(tokens: &[String]) -> Option<DirectoryChange> {
+    let tokens = permission_target::without_wrapper_prefixes(tokens);
+    if program_of(tokens)? != "cd" {
+        return None;
+    }
+
+    let operand = tokens
+        .iter()
+        .skip(1)
+        .find(|argument| !argument.starts_with('-'));
+
+    Some(match operand {
+        Some(operand) if !names_the_home_directory(Path::new(operand)) => {
+            DirectoryChange::To(PathBuf::from(operand))
+        }
+        _ => DirectoryChange::Away,
+    })
+}
+
+/// Whether a path is written against the home directory, which no worktree
+/// contains and which cannot be resolved lexically.
+fn names_the_home_directory(value: &Path) -> bool {
+    let value = value.to_string_lossy();
+
+    value == "~" || value.starts_with("~/")
 }
 
 /// Programs that acquire authority the session did not start with.
@@ -447,18 +550,68 @@ fn program_of(tokens: &[String]) -> Option<&str> {
         .map(|token| permission_target::command_name(token))
 }
 
-/// Whether an argument is naming a path rather than a flag or a bare word.
+/// Whether an argument is naming a path rather than a flag, a bare word, or a
+/// program written for another interpreter.
 ///
 /// A bare word is deliberately excluded: `rm build` inside the worktree names
 /// something the worktree contains, and reading it as a path would say nothing
 /// this module acts on anyway.
+///
+/// So is anything carrying shell or source syntax. `-c "os.remove('/etc/passwd')"`
+/// contains a separator and would otherwise be joined onto the working
+/// directory whole, which resolves to a path inside the worktree and says the
+/// opposite of what the argument does. What such an argument names is read by
+/// [`embedded_paths`] instead.
 fn looks_like_a_path(argument: &str) -> bool {
     !argument.starts_with('-')
+        && !argument.chars().any(is_not_path_syntax)
         && (argument.starts_with('/')
             || argument.starts_with('~')
             || argument.starts_with("./")
             || argument.starts_with("../")
             || argument.contains('/'))
+}
+
+/// The absolute paths written inside an argument that is not itself a path.
+///
+/// Only absolute ones: a bare word inside a quoted program is prose as often as
+/// it is a file, and re-basing it onto the working directory would invent a
+/// path the argument never named. A `/etc/passwd` written anywhere names
+/// `/etc/passwd`, whichever interpreter is about to read it.
+fn embedded_paths(argument: &str) -> Vec<&str> {
+    argument
+        .split(is_not_path_syntax)
+        .map(|fragment| fragment.trim_end_matches(['.', ':', ',']))
+        .filter(|fragment| fragment.len() > 1 && fragment.starts_with('/'))
+        .collect()
+}
+
+/// Whether a character separates a path from the program text around it rather
+/// than belonging to the path.
+fn is_not_path_syntax(character: char) -> bool {
+    character.is_whitespace()
+        || matches!(
+            character,
+            '\'' | '"'
+                | '`'
+                | '('
+                | ')'
+                | '['
+                | ']'
+                | '{'
+                | '}'
+                | ';'
+                | ','
+                | '='
+                | '<'
+                | '>'
+                | '|'
+                | '&'
+                | '$'
+                | '*'
+                | '?'
+                | '!'
+        )
 }
 
 /// Resolves `.` and `..` lexically, leaving whatever the path walks through

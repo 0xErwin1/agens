@@ -528,6 +528,34 @@ command = ["/bin/sh", "-c", "printf 'AGENS_RUN_MODE=fast\nAGENS_RUNTIME=other\n'
     assert_eq!(report.dropped_exports, vec!["AGENS_RUNTIME".to_owned()]);
 }
 
+/// The allowlist exists to keep `PATH` and `LD_PRELOAD` out of the environment
+/// the following hooks execute in. An entry with nothing before its `*` admits
+/// exactly those, so it is rejected when the allowlist is set rather than
+/// carried into the match.
+#[test]
+fn an_allowlist_entry_that_would_admit_every_name_is_rejected() {
+    let repository = Repository::new().exporting(&["*", "", "AGENS_RUN_*"]);
+    repository.declare(
+        r#"
+[[hooks]]
+name = "export"
+command = ["/bin/sh", "-c", "printf 'PATH=/evil\nLD_PRELOAD=/evil.so\nAGENS_RUN_MODE=fast\n' >> \"$AGENS_WORKTREE_ENV\""]
+"#,
+    );
+
+    repository.create_worktree();
+    let report = applied(repository.provision(&Permissive::new()));
+
+    assert_eq!(
+        report.environment,
+        BTreeMap::from([("AGENS_RUN_MODE".to_owned(), "fast".to_owned())])
+    );
+    assert_eq!(
+        report.dropped_exports,
+        vec!["LD_PRELOAD".to_owned(), "PATH".to_owned()]
+    );
+}
+
 #[test]
 fn a_failure_the_caller_continues_past_is_recorded_for_the_run_preamble() {
     let repository = Repository::new();
