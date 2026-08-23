@@ -173,6 +173,74 @@ fn reaching_outside_the_worktree_is_out_of_scope_for_a_tool_and_for_a_command() 
     );
 }
 
+/// `bash` runs the whole line with the worktree as its working directory, so a
+/// `cd` inside the line is what decides where every operand after it lands. A
+/// line that leaves the worktree has left it whatever it does next, and the
+/// operands of a line that stays inside are read from where they were written.
+#[test]
+fn a_directory_change_inside_a_command_line_moves_the_operands_that_follow_it() {
+    for line in [
+        "cd .. && rm -rf victim",
+        "cd ../.. && sqlite3 control.db \"UPDATE runs SET state = 'done'\"",
+        "cd ../.. && cat x >> worktree-policy.toml",
+        "cd /tmp && rm -rf victim",
+        "cd && rm -rf victim",
+        "cd ~ && rm -rf victim",
+        "cd - && rm -rf victim",
+        "cd src/.. && cd .. && cargo run",
+    ] {
+        assert_eq!(
+            command(line),
+            Some(DenylistClass::OutOfScope),
+            "{line} leaves the worktree"
+        );
+    }
+
+    assert_eq!(command("cd crates/agens-core && cargo test"), None);
+    // A directory change is still an invocation, and what it names is still
+    // read: moving into a credential store is reaching one.
+    assert_eq!(
+        command("cd ./deploy/.aws && cat config"),
+        Some(DenylistClass::SecretsAccess)
+    );
+    assert_eq!(command("cd ./src && rm -rf ../target"), None);
+    assert_eq!(
+        command("cd src && rm -rf ../../victim"),
+        Some(DenylistClass::DeletionOutsideWorktree)
+    );
+}
+
+/// An argument the matcher cannot read as a program is still read for the
+/// paths written inside it. Joining the whole argument onto the working
+/// directory instead resolves to something the worktree contains, which is the
+/// opposite of what the argument does.
+#[test]
+fn a_path_written_inside_an_interpreter_argument_is_judged_as_a_path() {
+    assert_eq!(
+        command("python -c \"import os; os.remove('/etc/passwd')\""),
+        Some(DenylistClass::OutOfScope)
+    );
+    assert_eq!(
+        command("python3 -c 'open(\"/work/runs/41/out\", \"w\")'"),
+        Some(DenylistClass::OutOfScope)
+    );
+    assert_eq!(
+        command("node -e \"require('fs').readFileSync('/home/worker/.ssh/id_rsa')\""),
+        Some(DenylistClass::SecretsAccess)
+    );
+    assert_eq!(
+        command("rm -rf /work/runs/41/*"),
+        Some(DenylistClass::DeletionOutsideWorktree)
+    );
+
+    // A program that only names paths the worktree contains stays ordinary.
+    assert_eq!(
+        command("python -c \"import os; os.remove('target/debug/x')\""),
+        None
+    );
+    assert_eq!(command("echo 'a && b'"), None);
+}
+
 /// A sub-agent launch is one more call through the same dispatcher, so the
 /// class it is stopped with is the class its own target earns. Delegating buys
 /// nothing the caller did not already have, and it costs nothing either.
