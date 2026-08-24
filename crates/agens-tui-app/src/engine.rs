@@ -486,6 +486,21 @@ pub fn run_production_tui_with_options(
                 },
             );
 
+            if matches!(&result, Err(error) if error.category == "cancelled") {
+                let abandoned = prompt.chars().take(8_000).collect::<String>();
+                if submit_task_controls
+                    .0
+                    .notify_main_supervisor(format!(
+                        "The user cancelled the previous turn and abandoned: {abandoned}"
+                    ))
+                    .is_err()
+                    && let Ok(metrics) = metrics.lock()
+                {
+                    metrics.publish_failure_notice(
+                        "The cancellation notice could not be queued for the next turn.".into(),
+                    );
+                }
+            }
             finish_tui_metrics(&metrics, &result);
 
             if let Ok(mut active) = cancellation.lock() {

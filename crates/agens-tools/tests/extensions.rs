@@ -18,9 +18,9 @@ use agens_core::{
 use agens_tools::{
     AgentCatalog, AgentModelValidationError, AgentModelValidator, CommandCatalog,
     CommandDefinition, DispatchTool, EffectiveCapabilityDescriptor, EffectiveCapabilitySet,
-    SkillCatalog, TaskControlAction, TaskControlTool, TaskExecutionEvent, TaskExecutionId,
-    TaskExecutionLifecycle, TaskExecutionRegistry, TaskExecutionSnapshot, TaskInvocation,
-    TaskLaunchMode, TaskMessageSource, TaskMessageTarget, TaskMessageTool,
+    SkillCatalog, TaskCancellationCause, TaskControlAction, TaskControlTool, TaskExecutionEvent,
+    TaskExecutionId, TaskExecutionLifecycle, TaskExecutionRegistry, TaskExecutionSnapshot,
+    TaskInvocation, TaskLaunchMode, TaskMessageSource, TaskMessageTarget, TaskMessageTool,
     TaskModelResolutionError, TaskRunContext, TaskRunner, TaskRunnerError, TaskSkill,
     TaskTerminalState, TaskTool, TaskTurnRequest, TaskTurnResult, ToolDispatchRequest,
     ToolDispatcher, ToolEvaluationOutcome, ToolExecutionContext, ToolOutput,
@@ -672,7 +672,7 @@ fn task_dispatch_resolves_only_subagents_and_validated_requested_configuration()
     );
     assert_eq!(
         TaskTool::<RecordingTaskRunner>::input_schema(),
-        serde_json::json!({"type":"object","additionalProperties":false,"required":["description"],"properties":{"agent":{"type":"string","minLength":1,"maxLength":64},"background":{"type":"boolean","description":"Run this call in the background and return immediately. Only background calls run concurrently: several foreground calls issued together are executed one after another."},"description":{"type":"string","minLength":1,"maxLength":16384},"model":{"type":"string","minLength":1,"maxLength":64,"description":"Omit this. The agent's configured profile then decides the model, falling back to this thread's model. Send it only when the user explicitly asked for a specific model for this call: an explicit value overrides the configured profile. A model this run cannot reach falls back to this thread's model and says so."},"skills":{"type":"array","maxItems":128,"uniqueItems":true,"items":{"type":"string","minLength":1,"maxLength":64}}}})
+        serde_json::json!({"type":"object","additionalProperties":false,"required":["description"],"properties":{"agent":{"type":"string","minLength":1,"maxLength":64},"background":{"type":"boolean","description":"Use background only when you can do other work or should return control to the user. For one delegation whose result is needed now, use foreground: it waits in this turn and avoids a follow-up turn. After a background call, end this turn; its terminal notice is delivered on the next turn. Use task_message to steer the child while it runs. Only background calls run concurrently: several foreground calls issued together are executed one after another."},"description":{"type":"string","minLength":1,"maxLength":16384},"model":{"type":"string","minLength":1,"maxLength":64,"description":"Omit this. The agent's configured profile then decides the model, falling back to this thread's model. Send it only when the user explicitly asked for a specific model for this call: an explicit value overrides the configured profile. A model this run cannot reach falls back to this thread's model and says so."},"skills":{"type":"array","maxItems":128,"uniqueItems":true,"items":{"type":"string","minLength":1,"maxLength":64}}}})
     );
     assert_eq!(
         task.catalog_input_schema()["properties"]["agent"]["enum"],
@@ -1576,48 +1576,49 @@ fn background_task_retains_the_inherited_parent_deadline() {
 }
 
 #[test]
-fn background_task_retains_inherited_parent_cancellation() {
-    let (observed_sender, observed_receiver) = mpsc::channel();
-    let mut task = task_tool(DeadlineAwareTaskRunner {
-        observed: observed_sender,
+fn background_task_owns_its_cancellation_after_the_parent_turn_stops() {
+    let (started_sender, started_receiver) = mpsc::channel();
+    let (release_sender, release_receiver) = mpsc::channel();
+    let task = task_tool(BlockingTaskRunner {
+        started: started_sender,
+        release: Mutex::new(release_receiver),
     });
     let parent_cancellation = Arc::new(AtomicBool::new(false));
+    let mut background = task.clone();
 
-    let output = task
-        .execute_with_launch_mode(
-            &ToolExecutionContext::new(Arc::clone(&parent_cancellation), Duration::from_secs(1)),
-            task_arguments(),
-            TaskLaunchMode::Background,
-        )
-        .unwrap();
     assert_eq!(
-        output,
-        ToolOutput::success("Subagent #1 running in background")
+        background
+            .execute_with_launch_mode(
+                &ToolExecutionContext::new(
+                    Arc::clone(&parent_cancellation),
+                    PARKED_CHILD_DEADLINE,
+                ),
+                task_arguments(),
+                TaskLaunchMode::Background,
+            )
+            .unwrap(),
+        ToolOutput::success("Subagent #1 running in background"),
     );
-    observed_receiver
-        .recv_timeout(Duration::from_secs(1))
-        .unwrap();
-    parent_cancellation.store(true, Ordering::Release);
+    started_receiver.recv().unwrap();
 
-    let deadline = Instant::now() + Duration::from_secs(1);
-    loop {
-        let snapshot = task
+    parent_cancellation.store(true, Ordering::Release);
+    assert!(
+        !task
             .execution_registry()
+            .is_cancelled(TaskExecutionId::from_value(1))
+    );
+    release_sender.send(()).unwrap();
+    assert!(
+        task.execution_registry()
+            .wait_for_idle(PARKED_CHILD_DEADLINE)
+    );
+    assert_eq!(
+        task.execution_registry()
             .snapshot(TaskExecutionId::from_value(1))
-            .unwrap();
-        if snapshot.terminal == Some(TaskTerminalState::Cancelled) {
-            assert_eq!(
-                snapshot.result,
-                Some(ToolOutput::failure("task: cancelled"))
-            );
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "background task did not inherit cancellation"
-        );
-        thread::sleep(Duration::from_millis(1));
-    }
+            .unwrap()
+            .terminal,
+        Some(TaskTerminalState::Completed),
+    );
 }
 
 #[test]
@@ -1836,6 +1837,7 @@ fn task_registry_snapshots_keep_active_work_ordered_and_report_pending_cancellat
                 id: foreground,
                 mode: TaskLaunchMode::Foreground,
                 cancellation_requested: false,
+                cancellation_cause: None,
                 terminal: None,
                 result: None,
             },
@@ -1843,6 +1845,7 @@ fn task_registry_snapshots_keep_active_work_ordered_and_report_pending_cancellat
                 id: background,
                 mode: TaskLaunchMode::Background,
                 cancellation_requested: true,
+                cancellation_cause: Some(TaskCancellationCause::TaskControl),
                 terminal: None,
                 result: None,
             },
@@ -2129,11 +2132,86 @@ fn task_control_and_message_tools_share_registry_and_enforce_caller_routes() {
     );
     assert_eq!(
         TaskControlTool::input_schema()["properties"]["action"]["enum"],
-        serde_json::json!(["background", "cancel", "status"]),
+        serde_json::json!(["background", "cancel", "status", "wait"]),
     );
     assert_eq!(
         TaskMessageTool::input_schema()["properties"]["message"]["maxLength"],
         8192,
+    );
+}
+
+#[test]
+fn task_control_wait_reports_two_terminal_children_without_cancelling_them() {
+    let registry = TaskExecutionRegistry::new();
+    let first = registry.admit(TaskLaunchMode::Background).unwrap();
+    let second = registry.admit(TaskLaunchMode::Background).unwrap();
+    assert!(registry.finish(
+        first,
+        TaskTerminalState::Completed,
+        ToolOutput::success("first result"),
+    ));
+    assert!(registry.finish(
+        second,
+        TaskTerminalState::Failed,
+        ToolOutput::failure("second result"),
+    ));
+    let mut control = TaskControlTool::new(registry.clone(), TaskMessageSource::Main);
+
+    assert_eq!(
+        control
+            .execute(
+                &task_context(),
+                serde_json::json!({
+                    "action": "wait",
+                    "ids": [first.value(), second.value()],
+                    "deadline_ms": 0,
+                }),
+            )
+            .unwrap(),
+        ToolOutput::success(format!(
+            "Subagent #{}: completed\nfirst result\nSubagent #{}: failed\nsecond result",
+            first.value(),
+            second.value(),
+        )),
+    );
+    assert!(!registry.is_cancelled(first));
+    assert!(!registry.is_cancelled(second));
+}
+
+#[test]
+fn task_control_wait_expiry_reports_a_live_child_without_cancelling_it() {
+    let registry = TaskExecutionRegistry::new();
+    let child = registry.admit(TaskLaunchMode::Background).unwrap();
+    let mut control = TaskControlTool::new(registry.clone(), TaskMessageSource::Main);
+
+    assert_eq!(
+        control
+            .execute(
+                &task_context(),
+                serde_json::json!({
+                    "action": "wait",
+                    "id": child.value(),
+                    "deadline_ms": 0,
+                }),
+            )
+            .unwrap(),
+        ToolOutput::success(format!("Subagent #{}: background running", child.value())),
+    );
+    assert!(!registry.is_cancelled(child));
+}
+
+#[test]
+fn task_schemas_explain_background_delegation_and_waiting() {
+    let task = TaskTool::<RecordingTaskRunner>::input_schema();
+    let background = task["properties"]["background"]["description"]
+        .as_str()
+        .expect("background has a description");
+    assert!(background.contains("end this turn"));
+    assert!(background.contains("task_message"));
+    assert!(background.contains("use foreground"));
+    assert_eq!(
+        TaskControlTool::input_schema()["properties"]["action"]["enum"],
+        serde_json::json!(["background", "cancel", "status", "wait"]),
     );
 }
 
