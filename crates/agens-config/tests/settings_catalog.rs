@@ -138,6 +138,32 @@ fn bypass_permission_prompts_is_a_global_bool_defaulting_off() {
 }
 
 #[test]
+fn unattended_permission_questions_wait_by_default_and_can_restore_immediate_denial() {
+    let wait = SETTINGS
+        .iter()
+        .find(|spec| spec.path == "agent.unattended_permission_wait_ms")
+        .expect("the catalog must declare agent.unattended_permission_wait_ms");
+    assert!(matches!(
+        wait.kind,
+        SettingKind::Integer {
+            minimum: 1_000,
+            maximum: 600_000
+        }
+    ));
+    assert!(matches!(wait.default, SettingValue::Integer(300_000)));
+
+    let legacy = SETTINGS
+        .iter()
+        .find(|spec| spec.path == "agent.deny_unattended_permission_prompts")
+        .expect("the catalog must declare agent.deny_unattended_permission_prompts");
+    assert!(matches!(legacy.kind, SettingKind::Bool));
+    assert!(matches!(legacy.default, SettingValue::Bool(false)));
+
+    assert!(accepts("agent.unattended_permission_wait_ms", "1_000"));
+    assert!(accepts("agent.deny_unattended_permission_prompts", "true"));
+}
+
+#[test]
 fn rejects_an_unknown_top_level_table() {
     let document = parse_toml_document("[toolz]\nmax_search_depth = 8\n").unwrap();
 

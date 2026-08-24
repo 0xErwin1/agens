@@ -1653,6 +1653,9 @@ pub enum HeadlessTurnPortError {
     ProviderNetwork,
     ProviderProtocol,
     Permission,
+    /// An unattended permission question reached its configured waiting limit.
+    /// The caller reports this as a single tool refusal so the turn may recover.
+    PermissionExpired,
     Tool,
     /// A call naming a registered tool and carrying well-formed arguments
     /// that the permission layer still could not resolve into a decision,
@@ -2213,6 +2216,7 @@ enum PreflightAuthorization {
     /// (grant re-auth quirk, surface error). The call is refused as a tool
     /// result so the turn continues — it must not abort the agent.
     PermissionResolutionFailed,
+    PermissionPromptExpired,
     UnknownTool,
     Decided(PermissionDecision),
     UnreachablePromptDenial,
@@ -2381,6 +2385,9 @@ async fn run_headless_turn_with_iteration_limit(
                             HeadlessTurnError::TimedOut,
                         ));
                     }
+                    Err(HeadlessTurnPortError::PermissionExpired) => {
+                        PreflightAuthorization::PermissionPromptExpired
+                    }
                     Err(_) => PreflightAuthorization::PermissionResolutionFailed,
                 }
             };
@@ -2410,6 +2417,9 @@ async fn run_headless_turn_with_iteration_limit(
                 PreflightAuthorization::PermissionResolutionFailed => HeadlessToolOutput::failure(
                     "tool call refused: the permission approval for this call could not be \
                          completed; try the call again, or use a simpler single command",
+                ),
+                PreflightAuthorization::PermissionPromptExpired => HeadlessToolOutput::failure(
+                    "tool call refused: the unattended permission question expired before anyone answered",
                 ),
                 PreflightAuthorization::UnknownTool => HeadlessToolOutput::failure(
                     "tool call refused: this session has no tool by that name; it was not denied \

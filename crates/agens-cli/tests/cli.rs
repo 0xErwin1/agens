@@ -3159,7 +3159,7 @@ fn production_binary_denies_unrelated_static_list_and_search_targets_and_continu
         std::fs::write(
             config_home.join("config.toml"),
             format!(
-                "[provider]\nmodel = \"openai-api/test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[permissions]\nallow = [{rule:?}]\n",
+                "[provider]\nmodel = \"openai-api/test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[agent]\ndeny_unattended_permission_prompts = true\n\n[permissions]\nallow = [{rule:?}]\n",
                 server.base_url(),
                 data_directory.display(),
             ),
@@ -3302,7 +3302,7 @@ fn production_binary_denies_unresolved_native_call_without_dispatching_and_conti
     std::fs::write(
         config_home.join("config.toml"),
         format!(
-            "[provider]\nmodel = \"openai-api/test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n",
+            "[provider]\nmodel = \"openai-api/test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[agent]\ndeny_unattended_permission_prompts = true\n",
             server.base_url(),
             data_directory.display(),
         ),
@@ -4666,7 +4666,7 @@ fn production_binary_enforces_mcp_permission_matrix_and_executes_allowed_calls_o
         std::fs::write(
             config_home.join("config.toml"),
             format!(
-                "[provider]\nmodel = \"openai-api/test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n{permissions}\n[mcp.files]\ntransport = \"stdio\"\ncommand = \"{}\"\nargs = [\"success\"]\ntimeout_ms = 1000\n[mcp.files.env]\nFAKE_MCP_CALL_READY = \"{}\"\n",
+                "[provider]\nmodel = \"openai-api/test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[agent]\ndeny_unattended_permission_prompts = true\n{permissions}\n[mcp.files]\ntransport = \"stdio\"\ncommand = \"{}\"\nargs = [\"success\"]\ntimeout_ms = 1000\n[mcp.files.env]\nFAKE_MCP_CALL_READY = \"{}\"\n",
                 server.base_url(),
                 data_directory.display(),
                 env!("CARGO_BIN_EXE_agens-cli-fake-mcp-child"),

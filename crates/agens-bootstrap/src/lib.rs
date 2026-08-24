@@ -16,9 +16,10 @@ use std::sync::Arc;
 
 use agens_config::{
     ConfigPaths, ConfigPermissionRule, McpDefaultSettings, McpTransport, ResolvedSettings,
-    SubagentSettings, ToolLimitSettings, expand_environment, expand_environment_with_commands,
-    extract_permission_rules, mcp_servers_with_defaults, merge_toml_documents, parse_toml_document,
-    resolve_paths, resolve_settings, validate_toml_document,
+    SubagentSettings, ToolLimitSettings, UnattendedPermissionSettings, expand_environment,
+    expand_environment_with_commands, extract_permission_rules, mcp_servers_with_defaults,
+    merge_toml_documents, parse_toml_document, resolve_paths, resolve_settings,
+    validate_toml_document,
 };
 use agens_tools::{McpStatusHandle, McpStdioTransport, McpStdioTransportConfig, SharedMcpRegistry};
 
@@ -37,6 +38,7 @@ pub struct Bootstrap {
     pub reasoning_effort: Option<String>,
     pub tool_limits: ToolLimitSettings,
     pub subagent_limits: SubagentSettings,
+    pub unattended_permission: UnattendedPermissionSettings,
     pub mcp_defaults: McpDefaultSettings,
     pub settings: ResolvedSettings,
     /// The environment this run resolved against, retained so a per-provider
@@ -90,6 +92,7 @@ impl Clone for Bootstrap {
             reasoning_effort: self.reasoning_effort.clone(),
             tool_limits: self.tool_limits,
             subagent_limits: self.subagent_limits,
+            unattended_permission: self.unattended_permission,
             mcp_defaults: self.mcp_defaults,
             settings: self.settings.clone(),
             environment: self.environment.clone(),
@@ -151,6 +154,10 @@ impl Bootstrap {
 
     pub fn subagent_limits(&self) -> SubagentSettings {
         self.subagent_limits
+    }
+
+    pub fn unattended_permission_settings(&self) -> UnattendedPermissionSettings {
+        self.unattended_permission
     }
 
     pub fn mcp_defaults(&self) -> McpDefaultSettings {
@@ -313,6 +320,7 @@ pub fn resolve(host: &HostEnvironment) -> Result<Bootstrap, CliError> {
             .map(ToOwned::to_owned),
         tool_limits: ToolLimitSettings::from(&settings),
         subagent_limits: SubagentSettings::from(&settings),
+        unattended_permission: UnattendedPermissionSettings::from(&settings),
         mcp_defaults,
         settings,
         data_directory: data_directory(&document, home_directory.as_deref(), &environment),

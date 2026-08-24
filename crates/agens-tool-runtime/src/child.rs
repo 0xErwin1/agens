@@ -23,6 +23,7 @@ use agens_tools::{
 
 use crate::block_on_headless_turn;
 use crate::child_catalog::{ChildSurfaceRejection, resolve_child_surface};
+use crate::external_permission::unattended_permission_prompter_for_target;
 use crate::runtime::production_child_tool_runtime;
 use agens_bootstrap::Bootstrap;
 use agens_bootstrap::session_config::SessionConfig;
@@ -41,7 +42,7 @@ use agens_permissions::{
 use agens_session::provider::{
     ProviderKind, ResolvedProvider, bootstrap_authentication, resolve_provider_for_model,
 };
-use agens_store::{DirectiveInbox, PermissionGrantStore};
+use agens_store::{DirectiveInbox, DirectiveTarget, PermissionGrantStore};
 use std::path::PathBuf;
 
 /// Why a delegated child turn ended without a result.
@@ -364,6 +365,7 @@ pub fn run_production_task(
                 provider,
                 tool_runtime,
                 IsolatedTaskTurnContext {
+                    bootstrap: Some(bootstrap),
                     project_root,
                     dangerous_mode,
                     cancellation,
@@ -405,6 +407,7 @@ pub fn run_production_task(
                 provider,
                 tool_runtime,
                 IsolatedTaskTurnContext {
+                    bootstrap: Some(bootstrap),
                     project_root,
                     dangerous_mode,
                     cancellation,
@@ -445,6 +448,7 @@ pub fn run_production_task(
                 provider,
                 tool_runtime,
                 IsolatedTaskTurnContext {
+                    bootstrap: Some(bootstrap),
                     project_root,
                     dangerous_mode,
                     cancellation,
@@ -615,6 +619,7 @@ struct TaskMailboxContext {
 }
 
 struct IsolatedTaskTurnContext<'a> {
+    bootstrap: Option<&'a Bootstrap>,
     project_root: &'a Path,
     dangerous_mode: bool,
     cancellation: &'a HeadlessTurnCancellation,
@@ -640,6 +645,7 @@ where
     P: ProgressAwareProvider + Send,
 {
     let IsolatedTaskTurnContext {
+        bootstrap,
         project_root,
         dangerous_mode,
         cancellation,
@@ -675,17 +681,19 @@ where
         Arc::clone(&prompts),
     )
     .with_dangerous_override(dangerous_mode);
-    let mut resolver = match permission_prompter.and_then(|build| {
-        PermissionGrantStore::open(&data_directory)
-            .ok()
-            .map(|store| {
-                (
-                    build(origin.clone().unwrap_or_else(main_thread_origin)),
-                    store,
+    let prompter = permission_prompter
+        .map(|build| build(origin.clone().unwrap_or_else(main_thread_origin)))
+        .or_else(|| {
+            bootstrap.map(|bootstrap| {
+                unattended_permission_prompter_for_target(
+                    bootstrap,
+                    DirectiveTarget::Child(reference.clone()),
+                    ProviderDiagnosticScope::Subagent,
                 )
             })
-    }) {
-        Some((prompter, store)) => {
+        });
+    let mut resolver = match (prompter, PermissionGrantStore::open(&data_directory)) {
+        (Some(prompter), Ok(store)) => {
             ChildPermissionResolver::Prompting(Box::new(ProductionPermissionResolver::new(
                 prompter,
                 store,
@@ -700,7 +708,7 @@ where
                 },
             )))
         }
-        None => ChildPermissionResolver::Unreachable,
+        _ => ChildPermissionResolver::Unreachable,
     };
     let mut dispatcher = ProductionToolDispatcher::new(tool_runtime, pending);
     // Addressed to this child alone. A child that drained its parent's queue
@@ -768,12 +776,10 @@ fn main_thread_origin() -> crate::runner::PromptOrigin {
 
 /// How a delegated execution answers a call the policy left undecided.
 ///
-/// [`Self::Unreachable`] is the honest answer when nobody is listening: a
-/// delegation with no surface behind it cannot ask, so it denies. It is not
-/// the honest answer when there IS a surface — the parent is sitting at one,
-/// the child runs on a thread of the parent's own process, and the prompt
-/// bridge it would use is the same object. Denying there answered a question
-/// on the user's behalf that they were available to answer themselves.
+/// [`Self::Unreachable`] is retained only when this runner cannot open its
+/// permission storage or a test deliberately omits a production bootstrap.
+/// An ordinary unattended child instead opens a durable question addressed to
+/// its own child reference; a child with a surface uses that same surface.
 enum ChildPermissionResolver {
     Unreachable,
     /// Boxed because the production resolver carries a grant store and a
@@ -1141,6 +1147,7 @@ mod tests {
             },
             Arc::new(Mutex::new(dispatcher)),
             IsolatedTaskTurnContext {
+                bootstrap: None,
                 project_root: Path::new("."),
                 dangerous_mode: false,
                 cancellation: &HeadlessTurnCancellation::new(),
@@ -1276,6 +1283,7 @@ mod tests {
             },
             Arc::new(Mutex::new(dispatcher)),
             IsolatedTaskTurnContext {
+                bootstrap: None,
                 project_root: Path::new("."),
                 dangerous_mode: false,
                 cancellation: &HeadlessTurnCancellation::new(),
@@ -1457,6 +1465,7 @@ mod tests {
                 },
                 Arc::new(Mutex::new(dispatcher)),
                 IsolatedTaskTurnContext {
+                    bootstrap: None,
                     project_root: Path::new("."),
                     dangerous_mode: false,
                     cancellation: &HeadlessTurnCancellation::new(),
@@ -1598,6 +1607,7 @@ mod tests {
             },
             tool_runtime,
             IsolatedTaskTurnContext {
+                bootstrap: None,
                 project_root,
                 dangerous_mode,
                 cancellation: &HeadlessTurnCancellation::new(),

@@ -248,8 +248,13 @@ impl ChatTurns for HostedChat {
             &self.bootstrap,
             cancellation,
             Some(progress),
-            Box::new(AttachedPrompter {
-                asks: Arc::clone(asks),
+            Box::new({
+                let asks = Arc::clone(asks);
+                move |_| {
+                    Box::new(AttachedPrompter {
+                        asks: Arc::clone(&asks),
+                    }) as Box<dyn PermissionPrompter>
+                }
             }),
             None,
             None,

@@ -559,6 +559,21 @@ pub const SETTINGS: &[SettingSpec] = &[
         doc: "Bypass permission prompts for the whole session.",
     },
     SettingSpec {
+        path: "agent.unattended_permission_wait_ms",
+        kind: SettingKind::Integer {
+            minimum: 1_000,
+            maximum: 600_000,
+        },
+        default: SettingValue::Integer(300_000),
+        doc: "How long an unattended permission question waits for a direct answer.",
+    },
+    SettingSpec {
+        path: "agent.deny_unattended_permission_prompts",
+        kind: SettingKind::Bool,
+        default: SettingValue::Bool(false),
+        doc: "Immediately deny unattended permission prompts instead of opening question events.",
+    },
+    SettingSpec {
         path: "agent.default_agent",
         kind: SettingKind::Text { max_chars: 64 },
         default: SettingValue::Absent,
@@ -968,6 +983,24 @@ impl From<&ResolvedSettings> for SubagentSettings {
             check_interval: size_setting(resolved, "subagents.check_interval"),
             max_concurrency: size_setting(resolved, "subagents.max_concurrency"),
             max_output_chars: size_setting(resolved, "subagents.max_output_chars"),
+        }
+    }
+}
+
+/// How a process with no interactive permission surface reaches an operator.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnattendedPermissionSettings {
+    pub wait_ms: u64,
+    pub deny_immediately: bool,
+}
+
+impl From<&ResolvedSettings> for UnattendedPermissionSettings {
+    fn from(resolved: &ResolvedSettings) -> Self {
+        Self {
+            wait_ms: unsigned_setting(resolved, "agent.unattended_permission_wait_ms"),
+            deny_immediately: resolved
+                .boolean("agent.deny_unattended_permission_prompts")
+                .unwrap_or(false),
         }
     }
 }

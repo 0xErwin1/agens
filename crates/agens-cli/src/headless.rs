@@ -11,7 +11,8 @@ use agens_headless::{
     HeadlessChatFailure, HeadlessChatRequest, run_production_headless_chat_with_progress,
 };
 
-use agens_tui_app::permission_prompt::TtyPermissionPrompter;
+use agens_providers::ProviderDiagnosticScope;
+use agens_tool_runtime::external_permission::unattended_permission_prompter_for_target;
 
 pub(crate) fn run_production_headless_chat(
     request: HeadlessChatRequest,
@@ -23,7 +24,16 @@ pub(crate) fn run_production_headless_chat(
         bootstrap,
         cancellation,
         None,
-        Box::new(TtyPermissionPrompter),
+        Box::new({
+            let bootstrap = bootstrap.clone();
+            move |target| {
+                unattended_permission_prompter_for_target(
+                    &bootstrap,
+                    target,
+                    ProviderDiagnosticScope::Parent,
+                )
+            }
+        }),
         None,
         None,
     )
