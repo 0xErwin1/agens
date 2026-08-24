@@ -48,12 +48,14 @@ use agens_headless::{
     HeadlessChatRequest, RunExecution, run_production_headless_chat_executing_run,
 };
 use agens_permissions::{PermissionPromptAnswer, PermissionPromptContext, PermissionPrompter};
+use agens_providers::ProviderDiagnosticScope;
 use agens_server::{
     ApiCore, FactSender, LaunchError, RunFacts, RunIntrospection, RunLaunch, RunSession,
     RunTrigger, RunWorkerFactory, SessionAdmission, SessionBudget, SessionId, SessionOutcome,
     SessionProvider, SessionRuntime, TurnFailure,
 };
 use agens_store::{ControlPlaneStore, RunRow, RunState, SessionStore};
+use agens_tool_runtime::external_permission::unattended_permission_prompter_for_target;
 
 use crate::worker_facts::WorkerFacts;
 
@@ -201,6 +203,7 @@ impl SessionProvider for WorkerProvider {
 ///   other answer does.
 struct UnattendedPrompter {
     introspection: agens_tool_runtime::runtime::RunIntrospectionFactory,
+    fallback: Box<dyn PermissionPrompter>,
 }
 
 impl PermissionPrompter for UnattendedPrompter {
@@ -210,7 +213,7 @@ impl PermissionPrompter for UnattendedPrompter {
         _cancellation: &HeadlessTurnCancellation,
     ) -> Result<PermissionPromptAnswer, HeadlessTurnPortError> {
         let Some(class) = context.denylist else {
-            return Ok(PermissionPromptAnswer::DenyOnce);
+            return self.fallback.prompt(context, _cancellation);
         };
 
         // A question that could not be opened leaves the call exactly where an
@@ -219,6 +222,10 @@ impl PermissionPrompter for UnattendedPrompter {
             Ok(()) => Ok(PermissionPromptAnswer::Cancel),
             Err(()) => Ok(PermissionPromptAnswer::DenyOnce),
         }
+    }
+
+    fn records_question_lifecycle(&self) -> bool {
+        true
     }
 }
 
@@ -318,8 +325,19 @@ fn execute(
         bootstrap,
         runtime.cancellation(),
         Some(&progress),
-        Box::new(UnattendedPrompter {
-            introspection: introspection_factory(core, run, &reported),
+        Box::new({
+            let bootstrap = bootstrap.clone();
+            let introspection = introspection_factory(core, run, &reported);
+            move |target| {
+                Box::new(UnattendedPrompter {
+                    fallback: unattended_permission_prompter_for_target(
+                        &bootstrap,
+                        target,
+                        ProviderDiagnosticScope::Parent,
+                    ),
+                    introspection: Arc::clone(&introspection),
+                }) as Box<dyn PermissionPrompter>
+            }
         }),
         None,
         None,

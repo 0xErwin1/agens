@@ -937,6 +937,52 @@ fn resolver_permission_errors_refuse_the_call_and_let_the_agent_continue() {
 }
 
 #[test]
+fn an_expired_unattended_permission_question_names_the_cause_to_the_agent() {
+    struct ExpiredResolver;
+
+    impl HeadlessPermissionResolver for ExpiredResolver {
+        fn resolve(
+            &mut self,
+            _call: &HeadlessToolCall,
+            _cancellation: &HeadlessTurnCancellation,
+        ) -> impl Future<Output = Result<PermissionDecision, HeadlessTurnPortError>> + Send
+        {
+            ready(Err(HeadlessTurnPortError::PermissionExpired))
+        }
+    }
+
+    let mut provider = Provider::new(vec![
+        Ok(vec![MessagePart::ToolCall {
+            id: "expired-question".into(),
+            name: "write".into(),
+            input: r#"{"path":"notes.md","contents":"hi"}"#.into(),
+        }]),
+        Ok(vec![MessagePart::Text("recovered".into())]),
+    ]);
+    let mut repository = Repository::default();
+    let mut gate = PermissionGate {
+        decisions: vec![PermissionDecision::Ask],
+        denial_facts: None,
+    };
+
+    let snapshot = block_on_ready(run_headless_turn(
+        &mut provider,
+        &mut gate,
+        &mut ExpiredResolver,
+        &mut ToolDispatcher::default(),
+        &mut repository,
+        &HeadlessTurnCancellation::new(),
+    ))
+    .expect("an expired question must be a recoverable tool refusal");
+
+    assert!(snapshot.events().iter().any(|event| matches!(
+        event,
+        TurnEvent::ToolResult(MessagePart::ToolResult { content, is_error: true, .. })
+            if content.contains("unattended permission question expired")
+    )));
+}
+
+#[test]
 fn max_iterations_stops_before_a_second_provider_request_without_persisting() {
     let mut provider = Provider::new(vec![
         Ok(vec![MessagePart::ToolCall {

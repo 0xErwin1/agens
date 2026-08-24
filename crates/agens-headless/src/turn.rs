@@ -118,6 +118,11 @@ pub struct RunExecution {
     pub worktree: std::path::PathBuf,
 }
 
+/// Builds the permission prompter after the attempt has an address. A run uses
+/// its durable mailbox while an ordinary session uses its newly assigned id.
+pub type PermissionPrompterFactory =
+    Box<dyn FnOnce(DirectiveTarget) -> Box<dyn PermissionPrompter> + Send>;
+
 struct HeadlessProviderContext<'a> {
     bootstrap: &'a Bootstrap,
     /// The provider this turn resolved from its own model, rather than a
@@ -125,7 +130,7 @@ struct HeadlessProviderContext<'a> {
     provider: ProviderKind,
     cancellation: &'a HeadlessTurnCancellation,
     progress: Option<&'a TurnProgressSink>,
-    prompter: Box<dyn PermissionPrompter>,
+    prompter_factory: PermissionPrompterFactory,
     ask_user: Option<Box<dyn agens_core::ask_user::AskUserPort>>,
     task_runtime: Option<&'a ProductionTuiTaskRuntime>,
     diagnostic_reference: &'a str,
@@ -170,7 +175,7 @@ pub fn run_production_headless_chat_with_progress(
     bootstrap: &Bootstrap,
     cancellation: &HeadlessTurnCancellation,
     progress: Option<&TurnProgressSink>,
-    prompter: Box<dyn PermissionPrompter>,
+    prompter_factory: PermissionPrompterFactory,
     task_runtime: Option<&ProductionTuiTaskRuntime>,
     operation_reference: Option<&str>,
 ) -> Result<HeadlessChatCompletion, HeadlessChatFailure> {
@@ -179,7 +184,7 @@ pub fn run_production_headless_chat_with_progress(
         bootstrap,
         cancellation,
         progress,
-        prompter,
+        prompter_factory,
         task_runtime,
         operation_reference,
         None,
@@ -192,7 +197,7 @@ pub fn run_production_headless_chat_with_progress_and_ask_user(
     bootstrap: &Bootstrap,
     cancellation: &HeadlessTurnCancellation,
     progress: Option<&TurnProgressSink>,
-    prompter: Box<dyn PermissionPrompter>,
+    prompter_factory: PermissionPrompterFactory,
     task_runtime: Option<&ProductionTuiTaskRuntime>,
     operation_reference: Option<&str>,
     ask_user: Option<Box<dyn agens_core::ask_user::AskUserPort>>,
@@ -202,7 +207,7 @@ pub fn run_production_headless_chat_with_progress_and_ask_user(
         bootstrap,
         cancellation,
         progress,
-        prompter,
+        prompter_factory,
         task_runtime,
         operation_reference,
         ask_user,
@@ -221,7 +226,7 @@ pub fn run_production_headless_chat_executing_run(
     bootstrap: &Bootstrap,
     cancellation: &HeadlessTurnCancellation,
     progress: Option<&TurnProgressSink>,
-    prompter: Box<dyn PermissionPrompter>,
+    prompter_factory: PermissionPrompterFactory,
     task_runtime: Option<&ProductionTuiTaskRuntime>,
     operation_reference: Option<&str>,
     ask_user: Option<Box<dyn agens_core::ask_user::AskUserPort>>,
@@ -309,7 +314,7 @@ pub fn run_production_headless_chat_executing_run(
                     provider: resolved.provider,
                     cancellation,
                     progress,
-                    prompter,
+                    prompter_factory,
                     ask_user,
                     task_runtime,
                     diagnostic_reference: &diagnostic_reference,
@@ -354,7 +359,7 @@ pub fn run_production_headless_chat_executing_run(
                     provider: resolved.provider,
                     cancellation,
                     progress,
-                    prompter,
+                    prompter_factory,
                     ask_user,
                     task_runtime,
                     diagnostic_reference: &diagnostic_reference,
@@ -404,7 +409,7 @@ pub fn run_production_headless_chat_executing_run(
                     provider: resolved.provider,
                     cancellation,
                     progress,
-                    prompter,
+                    prompter_factory,
                     ask_user,
                     task_runtime,
                     diagnostic_reference: &diagnostic_reference,
@@ -620,35 +625,40 @@ impl PermissionPrompter for RecordingPrompter {
                 },
             },
         );
-        let question_id = next_diagnostic_reference();
-        let admissible_answers = ["allow_once", "allow_always", "deny_once", "deny_always"];
-        self.store.record_session_lifecycle(
-            &self.reference,
-            ProviderDiagnosticScope::Parent,
-            SessionLifecycle::QuestionOpened {
-                question_id: &question_id,
-                class: "permission",
-                origin: tool.as_ref(),
-                admissible_answers: &admissible_answers,
-            },
-        );
+        let question_id =
+            (!self.inner.records_question_lifecycle()).then(next_diagnostic_reference);
+        if let Some(question_id) = question_id.as_deref() {
+            let admissible_answers = ["allow_once", "allow_always", "deny_once", "deny_always"];
+            self.store.record_session_lifecycle(
+                &self.reference,
+                ProviderDiagnosticScope::Parent,
+                SessionLifecycle::QuestionOpened {
+                    question_id,
+                    class: "permission",
+                    origin: tool.as_ref(),
+                    admissible_answers: &admissible_answers,
+                },
+            );
+        }
 
         let answer = self.inner.prompt(context, cancellation)?;
-        self.store.record_session_lifecycle(
-            &self.reference,
-            ProviderDiagnosticScope::Parent,
-            SessionLifecycle::QuestionClosed {
-                question_id: &question_id,
-                selected_answer: match answer {
-                    agens_permissions::PermissionPromptAnswer::AllowOnce => "allow_once",
-                    agens_permissions::PermissionPromptAnswer::AllowAlways => "allow_always",
-                    agens_permissions::PermissionPromptAnswer::DenyOnce => "deny_once",
-                    agens_permissions::PermissionPromptAnswer::DenyAlways => "deny_always",
-                    agens_permissions::PermissionPromptAnswer::Cancel => "cancelled",
+        if let Some(question_id) = question_id.as_deref() {
+            self.store.record_session_lifecycle(
+                &self.reference,
+                ProviderDiagnosticScope::Parent,
+                SessionLifecycle::QuestionClosed {
+                    question_id,
+                    selected_answer: match answer {
+                        agens_permissions::PermissionPromptAnswer::AllowOnce => "allow_once",
+                        agens_permissions::PermissionPromptAnswer::AllowAlways => "allow_always",
+                        agens_permissions::PermissionPromptAnswer::DenyOnce => "deny_once",
+                        agens_permissions::PermissionPromptAnswer::DenyAlways => "deny_always",
+                        agens_permissions::PermissionPromptAnswer::Cancel => "cancelled",
+                    },
+                    answered_by: "human",
                 },
-                answered_by: "human",
-            },
-        );
+            );
+        }
 
         Ok(answer)
     }
@@ -1124,24 +1134,8 @@ where
     let prompt_diagnostic_reference =
         DiagnosticRef::new(context.diagnostic_reference.to_owned())
             .map_err(|_| CliError::configuration("diagnostic reference is invalid"))?;
-    let mut resolver = ProductionPermissionResolver::new(
-        Box::new(RecordingPrompter {
-            inner: context.prompter,
-            store: diagnostic_store(context.bootstrap),
-            reference: prompt_diagnostic_reference.clone(),
-        }) as Box<dyn PermissionPrompter>,
-        grant_store,
-        grants,
-        prompts,
-        ProductionPromptAuthorization {
-            policy,
-            session,
-            project,
-            dispatcher: Arc::clone(&tool_runtime),
-            allowed: Arc::clone(&pending),
-        },
-    );
-    let mut dispatcher = ProductionToolDispatcher::new(tool_runtime, pending);
+    let mut dispatcher =
+        ProductionToolDispatcher::new(Arc::clone(&tool_runtime), Arc::clone(&pending));
     let mut store = SessionStore::open(context.bootstrap.data_directory())
         .map_err(|_| CliError::storage("sessions database is unavailable"))?;
     // The evidence ledger gets its own connection: the attempt lifecycle below
@@ -1209,6 +1203,24 @@ where
             // delivered, so a turn that stops early still has to persist them
             // or the queue has consumed a message no history carries.
             let mailbox = mailbox_of(context.run, attempt_key.session_id());
+            let prompter = (context.prompter_factory)(mailbox.clone());
+            let mut resolver = ProductionPermissionResolver::new(
+                Box::new(RecordingPrompter {
+                    inner: prompter,
+                    store: diagnostic_store(context.bootstrap),
+                    reference: prompt_diagnostic_reference.clone(),
+                }) as Box<dyn PermissionPrompter>,
+                grant_store,
+                Arc::clone(&grants),
+                Arc::clone(&prompts),
+                ProductionPromptAuthorization {
+                    policy: policy.clone(),
+                    session,
+                    project: project.clone(),
+                    dispatcher: Arc::clone(&tool_runtime),
+                    allowed: Arc::clone(&pending),
+                },
+            );
             let directives = if context.run.is_some() {
                 drain_run_directives_for(context.bootstrap.data_directory(), &mailbox)?
             } else {

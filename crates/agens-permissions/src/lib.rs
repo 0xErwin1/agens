@@ -432,6 +432,14 @@ pub trait PermissionPrompter: Send {
         context: &PermissionPromptContext,
         cancellation: &HeadlessTurnCancellation,
     ) -> Result<PermissionPromptAnswer, HeadlessTurnPortError>;
+
+    /// Whether this prompter publishes its own question-opened and question-closed
+    /// lifecycle records. Surface prompters use the default so the turn decorator
+    /// reports their questions; the durable unattended adapter owns the same
+    /// records as the row an external responder addresses.
+    fn records_question_lifecycle(&self) -> bool {
+        false
+    }
 }
 
 /// Lets the engine hold the port without naming any implementation of it.
@@ -442,6 +450,10 @@ impl PermissionPrompter for Box<dyn PermissionPrompter> {
         cancellation: &HeadlessTurnCancellation,
     ) -> Result<PermissionPromptAnswer, HeadlessTurnPortError> {
         self.as_mut().prompt(context, cancellation)
+    }
+
+    fn records_question_lifecycle(&self) -> bool {
+        self.as_ref().records_question_lifecycle()
     }
 }
 

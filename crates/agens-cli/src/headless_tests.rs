@@ -958,17 +958,35 @@ fn production_headless_turn_persists_the_turn_directives_it_delivered_before_the
             media_mimes: Vec::new(),
         },
     );
+    let targets = Arc::new(Mutex::new(Vec::new()));
     run_production_headless_chat_with_progress(
         request,
         &bootstrap,
         &HeadlessTurnCancellation::new(),
         None,
-        Box::new(TtyPermissionPrompter),
+        Box::new({
+            let targets = Arc::clone(&targets);
+            move |target| {
+                targets
+                    .lock()
+                    .expect("target record must be available")
+                    .push(target);
+                Box::new(TtyPermissionPrompter)
+            }
+        }),
         None,
         None,
     )
     .expect("directive turn should complete");
 
+    assert_eq!(
+        targets
+            .lock()
+            .expect("target record must be available")
+            .as_slice(),
+        &[DirectiveTarget::Session(1)],
+        "the prompter factory must bind after the resumed attempt resolves its session target"
+    );
     let requests = provider.wait_for_requests(1);
     provider.assert_script_consumed();
     assert_eq!(requests[0].target(), "/responses");
@@ -1162,7 +1180,7 @@ fn production_resumed_headless_turn_replays_typed_history_and_appends_to_the_sam
         &bootstrap,
         &HeadlessTurnCancellation::new(),
         None,
-        Box::new(TtyPermissionPrompter),
+        Box::new(|_| Box::new(TtyPermissionPrompter)),
         None,
         None,
     )
@@ -1326,7 +1344,7 @@ fn a_context_overflow_compacts_the_history_once_and_retries_the_request() {
         &bootstrap,
         &HeadlessTurnCancellation::new(),
         None,
-        Box::new(TtyPermissionPrompter),
+        Box::new(|_| Box::new(TtyPermissionPrompter)),
         None,
         None,
     )
@@ -1484,7 +1502,7 @@ fn an_overflow_that_survives_the_compaction_ends_the_turn_with_its_own_error() {
         &bootstrap,
         &HeadlessTurnCancellation::new(),
         None,
-        Box::new(TtyPermissionPrompter),
+        Box::new(|_| Box::new(TtyPermissionPrompter)),
         None,
         None,
     ) else {
@@ -1593,7 +1611,7 @@ fn an_overflow_with_no_history_to_compact_never_issues_a_summarizing_call() {
             &bootstrap,
             &HeadlessTurnCancellation::new(),
             None,
-            Box::new(TtyPermissionPrompter),
+            Box::new(|_| Box::new(TtyPermissionPrompter)),
             None,
             None,
         )

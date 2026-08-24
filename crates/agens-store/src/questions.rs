@@ -212,6 +212,29 @@ impl QuestionStore {
         Ok(())
     }
 
+    /// Closes a question that received no admissible external answer. The outcome
+    /// is deliberately outside every answer domain, so a later direct answer is
+    /// refused rather than reviving an expired or cancelled wait.
+    pub fn close_unanswered(
+        &mut self,
+        target: &DirectiveTarget,
+        question_id: &str,
+        outcome: &str,
+    ) -> Result<(), QuestionStoreError> {
+        let (session_id, child) = target_columns(target);
+        self.connection
+            .execute(
+                "UPDATE open_questions
+                 SET answer = ?4, answered_at = ?5, delivered_at = ?5
+                 WHERE question_id = ?1
+                   AND session_id IS ?2 AND child IS ?3
+                   AND answer IS NULL",
+                params![question_id, session_id, child, outcome, timestamp()],
+            )
+            .map_err(|error| QuestionStoreError::operation("close", &self.database_path, error))?;
+        Ok(())
+    }
+
     pub fn take_answer(
         &mut self,
         target: &DirectiveTarget,

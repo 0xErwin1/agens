@@ -9,6 +9,7 @@
 
 pub mod child;
 pub mod child_catalog;
+pub mod external_permission;
 pub mod mcp;
 pub mod rotation;
 pub mod runner;

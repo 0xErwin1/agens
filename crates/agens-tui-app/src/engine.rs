@@ -480,7 +480,13 @@ pub fn run_production_tui_with_options(
                         &runtime_bootstrap,
                         &turn_cancellation,
                         Some(&sink),
-                        Box::new(TuiPermissionPrompter(prompt_bridge.clone(), None)),
+                        Box::new({
+                            let bridge = prompt_bridge.clone();
+                            move |_| {
+                                Box::new(TuiPermissionPrompter(bridge.clone(), None))
+                                    as Box<dyn agens_permissions::PermissionPrompter>
+                            }
+                        }),
                         Some(&task_runtime),
                         Some(&task_diagnostic_reference),
                     )
@@ -604,7 +610,7 @@ pub fn run_tui_prompt(
                 bootstrap,
                 cancellation,
                 progress,
-                Box::new(TtyPermissionPrompter),
+                Box::new(|_| Box::new(TtyPermissionPrompter)),
                 None,
                 None,
             )

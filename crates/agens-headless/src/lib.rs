@@ -23,8 +23,9 @@ pub use subagents::{
     RequestedSubagent, interrupted_turn_note, record_requested_subagent, record_tool_result_fact,
 };
 pub use turn::{
-    RunExecution, headless_turn_own_system_prompt, headless_turn_permission_policy,
-    headless_turn_project_root, headless_turn_provider_base_url, headless_turn_system_prompt,
-    run_production_headless_chat_executing_run, run_production_headless_chat_with_progress,
+    PermissionPrompterFactory, RunExecution, headless_turn_own_system_prompt,
+    headless_turn_permission_policy, headless_turn_project_root, headless_turn_provider_base_url,
+    headless_turn_system_prompt, run_production_headless_chat_executing_run,
+    run_production_headless_chat_with_progress,
     run_production_headless_chat_with_progress_and_ask_user,
 };

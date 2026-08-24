@@ -12,7 +12,7 @@ Agens is a Rust coding-agent CLI with a terminal interface, one-shot chat, guard
 - Cancellation-only CLI turns with optional inherited deadlines and finite provider/tool operation timeouts.
 - Project-confined native tools: `read`, `write`, `list`, `search`, and bounded `bash`.
 - A session that can move: `worktree` creates a git worktree for the work and moves into it, `cd` moves the session to another reachable directory, and every later call resolves relative paths and runs commands there.
-- Permission evaluation before tool execution, including global/project TOML rules, temporary unsafe bypass, and persisted project grants. Unresolved approval requests fail closed.
+- Permission evaluation before tool execution, including global/project TOML rules, temporary unsafe bypass, persisted project grants, and externally answerable unattended questions. Unresolved approval requests fail closed.
 - MCP tools loaded from global configuration over stdio, streamable HTTP, or SSE transports.
 - Completed-turn and project-grant persistence in SQLite.
 - Nix-first development and one canonical verification gate.
@@ -116,7 +116,7 @@ deny = ["bash(rm *)"]
 
 The optional `[options].data_dir` changes the runtime-state directory. Environment expressions are supported by the configuration parser. MCP server definitions are global-only; project configuration cannot define them.
 
-Beyond the keys above, `[tools]` bounds the native tools (`max_list_entries`, `max_search_entries`, `max_search_results`, `max_search_depth`, `operation_timeout_ms`, `bash_timeout_ms`), `[subagents]` configures advisory progress checks and task-tool resource bounds (`check_interval`, `max_concurrency`, `max_output_chars`), `[mcp_defaults]` supplies `timeout_ms` and `max_retries` to servers that omit their own (`timeout_ms` bounds a single MCP tool call; the connect handshake and the tool listing keep their own floors of 10s and only widen when `timeout_ms` is larger), and `[agent]` also accepts `default_agent`, `reasoning_effort`, and `bypass_permission_prompts` (bool, default `false`; global configuration only — see "Command surface" for the runtime `/bypass` toggle). Setting `[options].debug = false` stops agens from capturing diagnostics to disk.
+Beyond the keys above, `[tools]` bounds the native tools (`max_list_entries`, `max_search_entries`, `max_search_results`, `max_search_depth`, `operation_timeout_ms`, `bash_timeout_ms`), `[subagents]` configures advisory progress checks and task-tool resource bounds (`check_interval`, `max_concurrency`, `max_output_chars`), `[mcp_defaults]` supplies `timeout_ms` and `max_retries` to servers that omit their own (`timeout_ms` bounds a single MCP tool call; the connect handshake and the tool listing keep their own floors of 10s and only widen when `timeout_ms` is larger), and `[agent]` also accepts `default_agent`, `reasoning_effort`, `bypass_permission_prompts`, `unattended_permission_wait_ms` (5 minutes by default), and `deny_unattended_permission_prompts` (bool, default `false`). Headless parents and unattended children open a durable permission question and wait up to that budget for `agens direct --answer`; setting `deny_unattended_permission_prompts = true` explicitly restores the prior immediate-denial behavior. Setting `[options].debug = false` stops agens from capturing diagnostics to disk.
 
 Each provider operation has a fixed 10-minute timeout, capped by any earlier inherited deadline.
 
