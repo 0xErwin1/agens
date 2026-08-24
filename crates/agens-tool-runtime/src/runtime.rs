@@ -1613,7 +1613,7 @@ mod tests {
             .expect("eligible catalog should expose task");
         assert_eq!(
             task.description(),
-            "Dispatch an isolated eligible subagent task. After background delegation, end the turn; its completion notice arrives on the next turn."
+            "Dispatch an isolated eligible subagent task. Name `agent` whenever an eligible definition fits; the field lists their names and descriptions. Agens ignores Claude's `subagent_type` vocabulary in instructions, so choose an eligible `agent` by description. After background delegation, end the turn; its completion notice arrives on the next turn."
         );
         assert_eq!(
             task.parameters()["properties"]["agent"]["enum"],

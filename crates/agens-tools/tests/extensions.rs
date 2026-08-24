@@ -680,7 +680,7 @@ fn task_dispatch_resolves_only_subagents_and_validated_requested_configuration()
     );
     assert_eq!(
         task.catalog_input_schema()["properties"]["agent"]["description"],
-        "Eligible subagents:\n- worker: worker agent\n- zfallback: fallback agent\n- zmissing: missing skill"
+        "Choose an eligible subagent whenever one fits the delegation; omission runs general. Agens uses `agent`, not Claude's `subagent_type`; choose by description.\nEligible subagents:\n- worker: worker agent\n- zfallback: fallback agent\n- zmissing: missing skill"
     );
 }
 

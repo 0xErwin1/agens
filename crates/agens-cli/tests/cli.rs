@@ -6039,7 +6039,7 @@ fn journey_delegation_serves_the_child_its_own_script_within_its_own_scope() {
         .expect("agents directory should exist");
     std::fs::write(
         journey.config_home.join("agents/reviewer.md"),
-        "---\nname: reviewer\ndescription: Review implementation\nmode: subagent\nmodel: gpt-4o\npermissions: []\n---\nYou are the isolated reviewer.\n",
+        "---\nname: reviewer\ndescription: Review implementation\nmode: subagent\nmodel: gpt-4o\npermissions:\n  - deny write\n  - deny bash\n  - deny webfetch\n---\nYou are the isolated reviewer.\n",
     )
     .expect("subagent definition should be written");
 
@@ -6071,6 +6071,22 @@ fn journey_delegation_serves_the_child_its_own_script_within_its_own_scope() {
     assert_eq!(journey_stdout(&result, &provider), "parent answer\n");
     provider.assert_script_consumed();
 
+    let requests = provider.requests();
+    let parent_opening = requests
+        .first()
+        .expect("the parent should receive its opening request")
+        .body();
+    for required in [
+        "Name `agent` whenever an eligible definition fits",
+        "Agens ignores Claude's `subagent_type` vocabulary",
+        "reviewer: Review implementation",
+    ] {
+        assert!(
+            parent_opening.contains(required),
+            "the task tool should guide the parent to select an eligible agent: {parent_opening}"
+        );
+    }
+
     let child_requests = provider.child_requests();
     assert_eq!(
         child_requests.len(),
@@ -6087,9 +6103,15 @@ fn journey_delegation_serves_the_child_its_own_script_within_its_own_scope() {
         "the child should not inherit the parent's prompt: {opening}"
     );
     assert!(
-        !opening.contains("\"name\":\"mcp"),
-        "the child should not reach the parent's MCP surface: {opening}"
+        opening.contains("\"name\":\"read\""),
+        "the reviewer should retain the read tool it was delegated: {opening}"
     );
+    for forbidden in ["write", "bash", "webfetch", "mcp"] {
+        assert!(
+            !opening.contains(&format!("\"name\":\"{forbidden}")),
+            "the reviewer's declared permissions should remove {forbidden}: {opening}"
+        );
+    }
     assert!(
         child_requests[1].body().contains("the note the child read"),
         "the child's own tool result should reach it: {}",
