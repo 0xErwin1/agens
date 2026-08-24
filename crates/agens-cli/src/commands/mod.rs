@@ -5,6 +5,7 @@ pub(crate) mod direct;
 pub(crate) mod models;
 pub(crate) mod serve;
 pub(crate) mod sessions;
+pub(crate) mod team;
 
 use agens_core::HeadlessTurnCancellation;
 
@@ -19,6 +20,7 @@ use direct::run_direct;
 use models::run_models;
 use serve::run_serve;
 use sessions::run_sessions;
+use team::run_team_ls;
 
 pub(crate) fn dispatch(
     parsed: cli::Cli,
@@ -51,6 +53,15 @@ pub(crate) fn dispatch(
             None,
             None,
         ),
+        Some(cli::Command::Team { prompt })
+            if matches!(prompt.as_slice(), [action] if action == "ls")
+                || matches!(prompt.as_slice(), [action, json] if action == "ls" && json == "--json") =>
+        {
+            run_team_ls(
+                matches!(prompt.as_slice(), [_, json] if json == "--json"),
+                dependencies,
+            )
+        }
         Some(cli::Command::Team { prompt }) => run_tui(
             dependencies,
             None,

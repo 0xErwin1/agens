@@ -626,6 +626,11 @@ fn help_and_version_are_successful_without_bootstrapping_configuration() {
             .stdout
             .contains("Usage: agens [OPTIONS] [COMMAND]\n")
     );
+    assert!(
+        root_help
+            .stdout
+            .contains("team      enter team mode or inspect the machine fleet\n")
+    );
     assert_eq!(chat_help.status, ExitStatus::Success);
     assert_eq!(
         chat_help.stdout,

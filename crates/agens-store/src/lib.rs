@@ -40,7 +40,8 @@ pub use media::{
 };
 pub use prompt_memory::{PromptMemoryStore, PromptMemoryStoreError, StoredPrompt};
 pub use questions::{
-    ExternalQuestionAnswer, OpenQuestion, QuestionClass, QuestionStore, QuestionStoreError,
+    ExternalQuestionAnswer, OpenQuestion, OpenQuestionStatus, QuestionClass, QuestionStore,
+    QuestionStoreError,
 };
 pub use repository_policy::{
     RepositoryPolicyStore, RepositoryPolicyStoreError, StoredHookTrust, StoredPendingTrust,
