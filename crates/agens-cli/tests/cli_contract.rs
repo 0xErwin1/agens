@@ -349,10 +349,27 @@ fn team_and_attach_are_first_class_attached_entry_points() {
     assert_eq!(
         team_help,
         success(
-            "enter team mode through the machine daemon\n\nUsage: agens team [PROMPT]...\n\nArguments:\n  [PROMPT]...  An optional first prompt for the attached chat\n\nOptions:\n  -h, --help  Print help\n"
+            "enter team mode or inspect the machine fleet\n\nUsage: agens team [PROMPT]...\n\nArguments:\n  [PROMPT]...  An optional first prompt for the attached chat; use `ls [--json]` to inspect the fleet\n\nOptions:\n  -h, --help  Print help\n"
         )
     );
     assert_eq!(*starts.lock().expect("start count lock"), 1);
+}
+
+#[test]
+fn team_ls_reports_an_absent_daemon_without_starting_the_tui() {
+    let temporary = TemporaryDirectory::new("team-ls-no-daemon");
+    let dependencies = base_dependencies(&temporary).with_tui_launcher(|_, _| {
+        panic!("team ls is a non-interactive fleet command, not a TUI launch")
+    });
+
+    assert_eq!(
+        execute(["team", "ls"], &dependencies),
+        success("No daemon is running.\n")
+    );
+    assert_eq!(
+        execute(["team", "ls", "--json"], &dependencies),
+        success("{\"daemon\":\"not_running\",\"items\":[]}\n")
+    );
 }
 
 #[test]
@@ -1119,7 +1136,7 @@ fn table_a_models_and_sessions_hold() {
 mod parser_surface_baseline {
     pub(crate) const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-    pub(crate) const ROOT_HELP: &str = "Agens is a coding agent CLI\n\nUsage: agens [OPTIONS] [COMMAND]\n\nCommands:\n  config    inspect configuration\n  auth      inspect supported authentication\n  chat      run a headless agent turn\n  models    list provider models\n  attach    attach the terminal to a chat in the machine daemon\n  team      enter team mode through the machine daemon\n  serve     run the headless daemon for this machine\n  sessions  inspect completed turns\n  direct    queue a message for a running session, delivered at its next safe point\n\nOptions:\n      --resume [<SESSION_ID>]  Resume the most recent session, or the given session id\n      --local                  Run the turn in this process\n      --attach                 Run the turn in the machine's daemon\n  -h, --help                   Print help\n  -V, --version                Print version\n";
+    pub(crate) const ROOT_HELP: &str = "Agens is a coding agent CLI\n\nUsage: agens [OPTIONS] [COMMAND]\n\nCommands:\n  config    inspect configuration\n  auth      inspect supported authentication\n  chat      run a headless agent turn\n  models    list provider models\n  attach    attach the terminal to a chat in the machine daemon\n  team      enter team mode or inspect the machine fleet\n  serve     run the headless daemon for this machine\n  sessions  inspect completed turns\n  direct    queue a message for a running session, delivered at its next safe point\n\nOptions:\n      --resume [<SESSION_ID>]  Resume the most recent session, or the given session id\n      --local                  Run the turn in this process\n      --attach                 Run the turn in the machine's daemon\n  -h, --help                   Print help\n  -V, --version                Print version\n";
 
     pub(crate) fn version_line() -> String {
         format!("agens {VERSION}\n")

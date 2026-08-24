@@ -79,9 +79,9 @@ pub(crate) enum Command {
         /// The hosted session to resume. Without one, attach to this checkout's latest chat.
         target: Option<i64>,
     },
-    #[command(about = "enter team mode through the machine daemon")]
+    #[command(about = "enter team mode or inspect the machine fleet")]
     Team {
-        /// An optional first prompt for the attached chat.
+        /// An optional first prompt for the attached chat; use `ls [--json]` to inspect the fleet.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         prompt: Vec<String>,
     },

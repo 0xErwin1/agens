@@ -28,11 +28,31 @@ impl QuestionClass {
             Self::Consent => "consent",
         }
     }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "ask_user" => Some(Self::AskUser),
+            "permission" => Some(Self::Permission),
+            "consent" => Some(Self::Consent),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OpenQuestion {
     pub target: DirectiveTarget,
+    pub question_id: String,
+    pub class: QuestionClass,
+    pub origin: String,
+    pub admissible_answers: Vec<String>,
+}
+
+/// A question still waiting for a response, as an external surface can render it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenQuestionStatus {
+    pub session_id: Option<i64>,
+    pub child: Option<String>,
     pub question_id: String,
     pub class: QuestionClass,
     pub origin: String,
@@ -124,6 +144,51 @@ impl QuestionStore {
             .map_err(|error| QuestionStoreError::operation("open", &self.database_path, error))?;
 
         Ok(())
+    }
+
+    /// Every unanswered question, including permission and consent requests.
+    pub fn open_questions(&self) -> Result<Vec<OpenQuestionStatus>, QuestionStoreError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT session_id, child, question_id, class, origin, admissible_answers
+                 FROM open_questions WHERE answer IS NULL ORDER BY opened_at, question_id",
+            )
+            .map_err(|error| QuestionStoreError::operation("read", &self.database_path, error))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, Option<i64>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            })
+            .map_err(|error| QuestionStoreError::operation("read", &self.database_path, error))?;
+        let rows = rows
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| QuestionStoreError::operation("read", &self.database_path, error))?;
+
+        rows.into_iter()
+            .map(|(session_id, child, question_id, class, origin, answers)| {
+                let class = QuestionClass::parse(&class).ok_or_else(|| {
+                    QuestionStoreError::detail("an open question has an unknown class")
+                })?;
+                let admissible_answers = serde_json::from_str(&answers).map_err(|error| {
+                    QuestionStoreError::operation("decode", &self.database_path, error)
+                })?;
+                Ok(OpenQuestionStatus {
+                    session_id,
+                    child,
+                    question_id,
+                    class,
+                    origin,
+                    admissible_answers,
+                })
+            })
+            .collect()
     }
 
     pub fn answer(

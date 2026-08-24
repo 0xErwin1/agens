@@ -49,6 +49,28 @@ fn a_valid_external_answer_closes_the_question_for_delivery() {
 }
 
 #[test]
+fn open_questions_preserve_the_session_and_question_class_for_a_fleet_view() {
+    let directory = temporary_directory("open-questions");
+    let mut store = QuestionStore::open(&directory).expect("the store opens");
+    store
+        .open_question(&OpenQuestion {
+            target: DirectiveTarget::Session(42),
+            question_id: "7".into(),
+            class: QuestionClass::Permission,
+            origin: "bash".into(),
+            admissible_answers: vec!["allow_once".into(), "deny_once".into()],
+        })
+        .expect("the question opens");
+
+    let open = store.open_questions().expect("open questions are readable");
+
+    assert_eq!(open.len(), 1);
+    assert_eq!(open[0].session_id, Some(42));
+    assert_eq!(open[0].class, QuestionClass::Permission);
+    std::fs::remove_dir_all(directory).ok();
+}
+
+#[test]
 fn a_question_can_only_be_answered_by_its_addressed_child() {
     let directory = temporary_directory("child-address");
     let addressed = DirectiveTarget::Child("child-a".into());
