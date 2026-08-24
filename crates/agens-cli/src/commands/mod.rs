@@ -20,7 +20,7 @@ use direct::run_direct;
 use models::run_models;
 use serve::run_serve;
 use sessions::run_sessions;
-use team::run_team_ls;
+use team::{run_team_ls, run_team_show};
 
 pub(crate) fn dispatch(
     parsed: cli::Cli,
@@ -59,6 +59,16 @@ pub(crate) fn dispatch(
         {
             run_team_ls(
                 matches!(prompt.as_slice(), [_, json] if json == "--json"),
+                dependencies,
+            )
+        }
+        Some(cli::Command::Team { prompt })
+            if matches!(prompt.as_slice(), [action, _] if action == "show")
+                || matches!(prompt.as_slice(), [action, _, follow] if action == "show" && follow == "--follow") =>
+        {
+            run_team_show(
+                &prompt[1],
+                matches!(prompt.as_slice(), [_, _, follow] if follow == "--follow"),
                 dependencies,
             )
         }

@@ -370,6 +370,15 @@ fn team_ls_reports_an_absent_daemon_without_starting_the_tui() {
         execute(["team", "ls", "--json"], &dependencies),
         success("{\"daemon\":\"not_running\",\"items\":[]}\n")
     );
+
+    assert_eq!(
+        execute(["team", "show", "17"], &dependencies),
+        success("No daemon is running.\n")
+    );
+    assert_eq!(
+        execute(["team", "show", "17", "--follow"], &dependencies),
+        success("No daemon is running.\n")
+    );
 }
 
 #[test]
