@@ -1474,7 +1474,11 @@ impl<R: TaskRunner> TaskTool<R> {
             .map(|(name, description)| format!("- {name}: {description}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let agent_description = format!("Eligible subagents:\n{descriptions}");
+        let agent_description = format!(
+            "Choose an eligible subagent whenever one fits the delegation; omission runs general. \
+             Agens uses `agent`, not Claude's `subagent_type`; choose by description.\n\
+             Eligible subagents:\n{descriptions}"
+        );
 
         let mut schema = Self::input_schema();
         let agent = &mut schema["properties"]["agent"];

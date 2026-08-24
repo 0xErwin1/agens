@@ -127,6 +127,10 @@ Every agent's system prompt is assembled in a fixed layer order, each layer sepa
 3. **AGENTS.md instructions** — two optional instruction files, appended global-then-project (see table below).
 4. **Delegation block** — the subagent routing-discipline text, appended only when the catalog reports a subagent.
 
+The `task` tool selects definitions only through its `agent` field. Claude-shaped
+`subagent_type` vocabulary in an instruction is not translated: Agens ignores it,
+and the caller chooses one of the eligible `agent` names by its advertised description.
+
 **Breaking change**: a configured `[agent].system_prompt` now composes after the built-in base (`agens_core::prompt::base_system_prompt`) instead of replacing it. An unconfigured agent is unaffected — it still resolves to the base alone. A configured agent's effective prompt gained a new leading paragraph it did not have before.
 
 The headless `--system` flag is the one exception: it fully **replaces** the base for that invocation — the resolver in `agens_core::prompt` is not consulted at all when `--system` is supplied. Layers 3 and 4 still apply on top of the replaced text. This means "the user supplied a prompt" carries two different semantics depending on the source — `[agent].system_prompt` composes, `--system` replaces — which is a discoverability wart worth knowing before reaching for either.

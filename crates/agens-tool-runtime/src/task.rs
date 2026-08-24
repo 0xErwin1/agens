@@ -333,7 +333,7 @@ fn register_task_tool<R: TaskRunner>(
         "task".into(),
         OpenAiFunctionTool::new(
             "task",
-            "Dispatch an isolated eligible subagent task. After background delegation, end the turn; its completion notice arrives on the next turn.",
+            "Dispatch an isolated eligible subagent task. Name `agent` whenever an eligible definition fits; the field lists their names and descriptions. Agens ignores Claude's `subagent_type` vocabulary in instructions, so choose an eligible `agent` by description. After background delegation, end the turn; its completion notice arrives on the next turn.",
             input_schema,
         )
         .map_err(|_| CliError::configuration("task tool is unavailable"))?,
