@@ -3927,6 +3927,58 @@ fn resume_projects_user_media_parts_as_path_free_chips() {
 }
 
 #[test]
+fn attachment_inserts_at_the_captured_cursor_and_deletes_atomically() {
+    for (key, move_before_token) in [(Key::Backspace, false), (Key::Delete, true)] {
+        let mut tui = Tui::new(FakeEngine::default());
+        typed(&mut tui, "leftright");
+        for _ in 0..5 {
+            tui.handle(Event::Key(Key::Left));
+        }
+
+        tui.apply_submission_outcome(TuiSubmissionOutcome::MediaAttached {
+            message: "attached".into(),
+            staged_media: vec![PromptAttachment::new(7, "image/png")],
+        });
+
+        assert_eq!(
+            tui.input(),
+            "left[Image #1]right",
+            "the attachment token must be inserted where the cursor was captured"
+        );
+        assert_eq!(tui.view().input_cursor, "left[Image #1]".chars().count());
+        if move_before_token {
+            tui.handle(Event::Key(Key::Left));
+            assert_eq!(tui.view().input_cursor, "left".chars().count());
+        }
+
+        let action = tui.handle(Event::Key(key));
+        assert_eq!(tui.input(), "leftright");
+        assert!(tui.staged_media().is_empty());
+        assert!(tui.media_chips().is_empty());
+        assert_eq!(action, Action::SyncStagedMedia(Vec::new()));
+    }
+}
+
+#[test]
+fn attachment_token_is_not_provider_prompt_content() {
+    let mut tui = Tui::new(FakeEngine::default());
+    typed(&mut tui, "leftright");
+    for _ in 0..5 {
+        tui.handle(Event::Key(Key::Left));
+    }
+    tui.apply_submission_outcome(TuiSubmissionOutcome::MediaAttached {
+        message: "attached".into(),
+        staged_media: vec![PromptAttachment::new(7, "image/png")],
+    });
+
+    assert_eq!(
+        tui.handle(Event::Key(Key::Enter)),
+        Action::Submit("leftright".into())
+    );
+    assert_eq!(tui.staged_media(), &[PromptAttachment::new(7, "image/png")]);
+}
+
+#[test]
 fn media_only_composer_submit_with_empty_text() {
     let mut tui = Tui::new(FakeEngine::default());
     tui.set_staged_media(vec![PromptAttachment::new(1, "image/png")]);

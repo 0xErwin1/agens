@@ -23,7 +23,7 @@ use agens_providers::{
 };
 use agens_store::{
     CompactionStore, DirectiveInbox, DirectiveTarget, PermissionGrantStore, SessionStore,
-    ToolFactStore, open_media,
+    StoredCompaction, ToolFactStore, open_media,
 };
 use agens_tools::{
     EffectiveCapabilitySet, McpErrorCategory, McpLifecycleState, McpLoadPhase, McpStatusHandle,
@@ -984,6 +984,51 @@ where
         .collect())
 }
 
+fn is_compactable_history_overflow(error: HeadlessTurnError) -> bool {
+    matches!(
+        error,
+        HeadlessTurnError::ProviderContext | HeadlessTurnError::ProviderHistoryBudget
+    )
+}
+
+fn effective_replay_with_compaction(
+    messages: &[Message],
+    compaction: &StoredCompaction,
+    pinned: usize,
+) -> Result<Vec<Message>, ()> {
+    let first_kept = usize::try_from(compaction.first_kept_message_index).map_err(|_| ())?;
+    if first_kept < pinned || first_kept >= messages.len() {
+        return Err(());
+    }
+
+    let mut replay = Vec::with_capacity(pinned + 1 + messages.len() - first_kept);
+    replay.extend_from_slice(&messages[..pinned]);
+    replay.push(Message {
+        role: Role::System,
+        parts: vec![MessagePart::Text(format!(
+            "Summary of the earlier part of this session:\n\n{}",
+            compaction.summary
+        ))],
+    });
+    replay.extend_from_slice(&messages[first_kept..]);
+    Ok(replay)
+}
+
+fn effective_replay_with_compactions(
+    messages: &[Message],
+    compactions: &[StoredCompaction],
+) -> Result<Vec<Message>, ()> {
+    let pinned = messages
+        .iter()
+        .take_while(|message| message.role == Role::System)
+        .count();
+    compactions
+        .iter()
+        .try_fold(messages.to_vec(), |replay, compaction| {
+            effective_replay_with_compaction(&replay, compaction, pinned)
+        })
+}
+
 /// Runs one compaction of a request the provider refused for context, or
 /// reports that there was nothing compaction could do.
 ///
@@ -1231,7 +1276,13 @@ where
             }
             let mut provider_request = request.clone();
             provider_request.history.extend(directives.iter().cloned());
-            let mut history = provider_messages(&provider_request, context.include_system_prompt);
+            let durable_history =
+                provider_messages(&provider_request, context.include_system_prompt);
+            let compactions = CompactionStore::open(context.bootstrap.data_directory())
+                .and_then(|store| store.list(attempt_key.session_id()))
+                .map_err(|_| CliError::storage("session compaction is unavailable"))?;
+            let mut history = effective_replay_with_compactions(&durable_history, &compactions)
+                .map_err(|_| CliError::storage("session compaction is invalid"))?;
             // Live SSE already emits ProviderPart/Usage through the provider sink.
             // Headless flush_progress would re-send those and double TUI text/tools.
             let forwarded_progress = context.progress.map(|progress| {
@@ -1353,7 +1404,9 @@ where
                 // has already been summarized is not a history the summary can
                 // shrink further, and retrying it forever would keep a failing
                 // turn alive at the operator's expense.
-                if compacted_once || !matches!(&outcome, Err(HeadlessTurnError::ProviderContext)) {
+                if compacted_once
+                    || !matches!(&outcome, Err(error) if is_compactable_history_overflow(*error))
+                {
                     break outcome;
                 }
                 compacted_once = true;
@@ -1510,6 +1563,107 @@ mod tests {
         };
 
         assert!(matches!(error, agens_core::Error::Auth(_)));
+    }
+
+    #[test]
+    fn provider_history_budget_overflow_is_eligible_for_compaction_recovery() {
+        assert!(super::is_compactable_history_overflow(
+            HeadlessTurnError::ProviderContext
+        ));
+        assert!(super::is_compactable_history_overflow(
+            HeadlessTurnError::ProviderHistoryBudget
+        ));
+        assert!(!super::is_compactable_history_overflow(
+            HeadlessTurnError::ProviderRejected
+        ));
+    }
+
+    #[test]
+    fn persisted_compaction_replaces_only_effective_replay_history() {
+        let durable = vec![
+            Message {
+                role: Role::System,
+                parts: vec![MessagePart::Text("instructions".into())],
+            },
+            Message {
+                role: Role::User,
+                parts: vec![MessagePart::Media {
+                    media_id: 7,
+                    mime: "image/png".into(),
+                }],
+            },
+            Message {
+                role: Role::Assistant,
+                parts: vec![MessagePart::Text("description".into())],
+            },
+            Message {
+                role: Role::User,
+                parts: vec![MessagePart::Text("continue".into())],
+            },
+        ];
+        let stored = agens_store::StoredCompaction {
+            id: 1,
+            summary: "earlier image work".into(),
+            first_kept_message_index: 2,
+        };
+
+        let replay = super::effective_replay_with_compactions(&durable, &[stored])
+            .expect("stored boundary is valid");
+
+        assert_eq!(
+            durable.len(),
+            4,
+            "the durable transcript remains append-only"
+        );
+        assert_eq!(replay.len(), 4);
+        assert_eq!(replay[0], durable[0]);
+        assert!(
+            matches!(&replay[1].parts[..], [MessagePart::Text(text)] if text.contains("earlier image work"))
+        );
+        assert_eq!(replay[2..], durable[2..]);
+    }
+
+    #[test]
+    fn repeated_persisted_compactions_apply_in_recorded_order() {
+        let durable = vec![
+            Message {
+                role: Role::System,
+                parts: vec![MessagePart::Text("instructions".into())],
+            },
+            Message {
+                role: Role::User,
+                parts: vec![MessagePart::Text("oldest".into())],
+            },
+            Message {
+                role: Role::Assistant,
+                parts: vec![MessagePart::Text("middle".into())],
+            },
+            Message {
+                role: Role::User,
+                parts: vec![MessagePart::Text("current".into())],
+            },
+        ];
+        let compactions = vec![
+            agens_store::StoredCompaction {
+                id: 1,
+                summary: "first summary".into(),
+                first_kept_message_index: 2,
+            },
+            agens_store::StoredCompaction {
+                id: 2,
+                summary: "latest summary".into(),
+                first_kept_message_index: 3,
+            },
+        ];
+
+        let replay = super::effective_replay_with_compactions(&durable, &compactions)
+            .expect("recorded boundaries are valid in sequence");
+
+        assert_eq!(replay.len(), 3);
+        assert!(
+            matches!(&replay[1].parts[..], [MessagePart::Text(text)] if text.contains("latest summary"))
+        );
+        assert_eq!(replay[2], durable[3]);
     }
 
     #[test]

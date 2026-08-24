@@ -213,7 +213,9 @@ impl Conversation {
                 conversation.user.push(' ');
             }
             conversation.user.push_str(&chip);
-            conversation.items.push(ConversationItem::User(chip));
+        }
+        if !conversation.user.is_empty() {
+            conversation.items = vec![ConversationItem::User(conversation.user.clone())];
         }
 
         conversation
@@ -314,9 +316,6 @@ impl Conversation {
                                     continue;
                                 }
                                 conversation.user.push_str(text);
-                                conversation
-                                    .items
-                                    .push(ConversationItem::User(text.clone()));
                             }
                             MessagePart::Media { mime, .. } => {
                                 media_ordinal += 1;
@@ -325,7 +324,6 @@ impl Conversation {
                                     conversation.user.push(' ');
                                 }
                                 conversation.user.push_str(&chip);
-                                conversation.items.push(ConversationItem::User(chip));
                             }
                             // Unexpected roles on a user row: keep text surface via info.
                             MessagePart::Reasoning(text) => {
@@ -354,6 +352,11 @@ impl Conversation {
                                 );
                             }
                         }
+                    }
+                    if !conversation.user.is_empty() {
+                        conversation
+                            .items
+                            .push(ConversationItem::User(conversation.user.clone()));
                     }
                     current = Some(conversation);
                 }
@@ -969,6 +972,37 @@ mod tests {
                     .is_some_and(|result| { result.output.contains("still visible output") }))),
             "orphan tool result kept under a synthetic call"
         );
+    }
+
+    #[test]
+    fn live_and_restored_text_with_media_project_as_one_user_block() {
+        let live = Conversation::new_with_media("look", ["image/png"]);
+        let restored = Conversation::from_messages(&[Message {
+            role: Role::User,
+            parts: vec![
+                MessagePart::Text("look".into()),
+                MessagePart::Media {
+                    media_id: 7,
+                    mime: "image/png".into(),
+                },
+            ],
+        }])
+        .expect("text and media should restore")
+        .pop()
+        .expect("one restored conversation");
+
+        for conversation in [&live, &restored] {
+            let user_blocks = conversation
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    ConversationItem::User(content) => Some(content.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(user_blocks, ["look [Image #1]"]);
+            assert_eq!(conversation.user, "look [Image #1]");
+        }
     }
 
     /// Parallel batches announce every call before any result. The transcript

@@ -2054,6 +2054,45 @@ fn subscription_tool_replay_rejects_replayed_or_malformed_wire_items_without_ret
 }
 
 #[test]
+fn oversized_initial_subscription_replay_returns_history_budget_before_http() {
+    let directory = temporary_directory("oversized-initial-replay");
+    let credentials = write_credentials(&directory);
+    let mut server = LocalServer::start(ServerBehavior::Sse(completed_text_sse("unexpected")));
+    let observed_request = server.take_observed_request();
+    let large_text = "x".repeat(50_000);
+    let messages = (0..96)
+        .map(|index| Message {
+            role: if index % 2 == 0 {
+                Role::User
+            } else {
+                Role::Assistant
+            },
+            parts: vec![MessagePart::Text(large_text.clone())],
+        })
+        .collect();
+    let mut provider =
+        ChatGptResponsesProvider::from_credentials_with_messages_and_tools_and_timeout_and_auth_url(
+            &credentials,
+            Some(&server.base_url()),
+            None,
+            "test-model".into(),
+            "test instructions".into(),
+            messages,
+            Vec::new(),
+            Duration::from_secs(1),
+        )
+        .expect("initial replay should be classified by the turn port");
+
+    let result = run(&mut provider, HeadlessTurnCancellation::new());
+    let request_was_sent = observed_request.try_recv().is_ok();
+    server.join();
+    fs::remove_dir_all(directory).expect("temporary directory should be removed");
+
+    assert_eq!(result, Err(HeadlessTurnPortError::ProviderHistoryBudget));
+    assert!(!request_was_sent, "oversized replay must fail before HTTP");
+}
+
+#[test]
 fn subscription_tool_replay_forwards_errors_enforces_history_bounds_and_allows_long_round_sequences()
  {
     let directory = temporary_directory("error-output");

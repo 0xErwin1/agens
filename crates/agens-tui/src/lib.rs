@@ -6193,6 +6193,19 @@ impl Renderer for PlainRenderer {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AttachmentToken {
+    attachment: PromptAttachment,
+    start: usize,
+    length: usize,
+}
+
+impl AttachmentToken {
+    fn end(&self) -> usize {
+        self.start + self.length
+    }
+}
+
 /// Small event engine shared by the terminal lifecycle and future TUI components.
 pub struct Tui<E> {
     engine: E,
@@ -6202,6 +6215,7 @@ pub struct Tui<E> {
     queue_selected: Option<usize>,
     input: String,
     input_cursor: usize,
+    attachment_tokens: Vec<AttachmentToken>,
     /// Path-free media chips staged for the next turn (`[Image #N]`, …).
     media_chips: Vec<String>,
     /// The staged attachments behind `media_chips` (durable ids + mimes, no paths).
@@ -6319,6 +6333,7 @@ where
             unicode_level: widgets::UnicodeLevel::default(),
             input: String::new(),
             input_cursor: 0,
+            attachment_tokens: Vec::new(),
             media_chips: Vec::new(),
             staged_media: Vec::new(),
             submitted_media: Vec::new(),
@@ -7077,6 +7092,7 @@ where
                 message,
                 staged_media,
             } => {
+                self.insert_new_attachment_tokens(&staged_media);
                 self.set_staged_media(staged_media);
                 self.add_info(message);
                 None
@@ -7272,6 +7288,74 @@ where
         record.focus = TranscriptFocus::Composer;
         record.following_bottom = true;
         record.scroll_offset = scroll_offset;
+    }
+
+    fn insert_new_attachment_tokens(&mut self, attachments: &[PromptAttachment]) {
+        let mut existing = self.staged_media.clone();
+        for (index, attachment) in attachments.iter().enumerate() {
+            if let Some(position) = existing
+                .iter()
+                .position(|candidate| candidate == attachment)
+            {
+                existing.remove(position);
+                continue;
+            }
+
+            let label = media_chip_label(index + 1, &attachment.mime);
+            let start = self.input_cursor;
+            let length = label.chars().count();
+            for token in &mut self.attachment_tokens {
+                if token.start >= start {
+                    token.start += length;
+                }
+            }
+            let byte = byte_index(&self.input, start);
+            self.input.insert_str(byte, &label);
+            self.input_cursor += length;
+            self.attachment_tokens.push(AttachmentToken {
+                attachment: attachment.clone(),
+                start,
+                length,
+            });
+        }
+        self.attachment_tokens.sort_by_key(|token| token.start);
+    }
+
+    fn delete_adjacent_attachment(&mut self, key: Key) -> Option<Action> {
+        let position = self.attachment_tokens.iter().position(|token| match key {
+            Key::Backspace => token.end() == self.input_cursor,
+            Key::Delete => token.start == self.input_cursor,
+            _ => false,
+        })?;
+        let token = self.attachment_tokens.remove(position);
+        let start_byte = byte_index(&self.input, token.start);
+        let end_byte = byte_index(&self.input, token.end());
+        self.input.replace_range(start_byte..end_byte, "");
+        self.input_cursor = token.start;
+        for remaining in &mut self.attachment_tokens {
+            if remaining.start >= token.end() {
+                remaining.start -= token.length;
+            }
+        }
+        if let Some(position) = self
+            .staged_media
+            .iter()
+            .position(|attachment| attachment == &token.attachment)
+        {
+            self.staged_media.remove(position);
+        }
+        self.media_chips = attachment_chip_labels(&self.staged_media);
+        Some(Action::SyncStagedMedia(self.staged_media.clone()))
+    }
+
+    fn provider_prompt(&self) -> String {
+        let mut prompt = self.input.clone();
+        for token in self.attachment_tokens.iter().rev() {
+            let start = byte_index(&prompt, token.start);
+            let end = byte_index(&prompt, token.end());
+            prompt.replace_range(start..end, "");
+        }
+        prompt
     }
 
     /// Replaces the staged attachments; chip labels derive from the mimes.
@@ -9542,9 +9626,9 @@ where
         self.palette_open = false;
 
         if self.foreground_running() && self.busy_policy_routing {
-            let draft = self.input.clone();
-            self.record_prompt_history(&draft);
-            return Action::SubmitBusy(draft);
+            let prompt = self.provider_prompt();
+            self.record_prompt_history(&prompt);
+            return Action::SubmitBusy(prompt);
         }
         if self.foreground_running() {
             return self.enqueue_composer();
@@ -9554,7 +9638,9 @@ where
         self.recovered_failed_prompt = false;
         // Keep media_chips until the provider turn completes successfully so a
         // preflight / early failure can leave staged chips visible for retry.
-        let prompt = std::mem::take(&mut self.input);
+        let prompt = self.provider_prompt();
+        self.input.clear();
+        self.attachment_tokens.clear();
         self.record_prompt_history(&prompt);
         Action::Submit(prompt)
     }
@@ -9639,6 +9725,7 @@ where
     fn clear_composer(&mut self) {
         self.input.clear();
         self.input_cursor = 0;
+        self.attachment_tokens.clear();
         self.recovered_failed_prompt = false;
     }
 
@@ -9804,8 +9891,15 @@ where
     }
 
     fn handle_composer_key(&mut self, key: Key) -> Option<Action> {
+        let key = key.composer_equivalent();
+        if let Some(action) = self.delete_adjacent_attachment(key) {
+            self.clamp_palette_selection();
+            self.refresh_file_picker();
+            self.active_record_mut().focus = TranscriptFocus::Composer;
+            return Some(action);
+        }
         let cursor = self.input_cursor;
-        match key.composer_equivalent() {
+        match key {
             Key::Char(character) => self.insert_text(&character.to_string()),
             Key::ShiftEnter => self.insert_text("\n"),
             Key::Backspace if cursor > 0 => {
@@ -9826,8 +9920,26 @@ where
             Key::DeleteToLineEnd => {
                 self.replace_chars(cursor, line_end(&self.input, cursor), "");
             }
-            Key::Left => self.input_cursor = previous_grapheme_boundary(&self.input, cursor),
-            Key::Right => self.input_cursor = next_grapheme_boundary(&self.input, cursor),
+            Key::Left => {
+                self.input_cursor = self
+                    .attachment_tokens
+                    .iter()
+                    .find(|token| token.end() == cursor)
+                    .map_or_else(
+                        || previous_grapheme_boundary(&self.input, cursor),
+                        |token| token.start,
+                    );
+            }
+            Key::Right => {
+                self.input_cursor = self
+                    .attachment_tokens
+                    .iter()
+                    .find(|token| token.start == cursor)
+                    .map_or_else(
+                        || next_grapheme_boundary(&self.input, cursor),
+                        AttachmentToken::end,
+                    );
+            }
             Key::PreviousWord => {
                 self.input_cursor = previous_word_boundary(&self.input, cursor);
             }
@@ -10071,8 +10183,25 @@ where
         let end = grapheme_boundary_at_or_after(&self.input, end.min(character_count)).max(start);
         let start_byte = byte_index(&self.input, start);
         let end_byte = byte_index(&self.input, end);
+        let replacement_length = replacement.chars().count();
+        let removed_length = end - start;
         self.input.replace_range(start_byte..end_byte, replacement);
-        self.input_cursor = start + replacement.chars().count();
+        if replacement_length >= removed_length {
+            let shift = replacement_length - removed_length;
+            for token in &mut self.attachment_tokens {
+                if token.start >= end {
+                    token.start += shift;
+                }
+            }
+        } else {
+            let shift = removed_length - replacement_length;
+            for token in &mut self.attachment_tokens {
+                if token.start >= end {
+                    token.start = token.start.saturating_sub(shift);
+                }
+            }
+        }
+        self.input_cursor = start + replacement_length;
         // Composer edits abandon history browse while keeping the current input.
         if let Some(memory) = self.prompt_memory.as_mut() {
             memory.clear_browse();

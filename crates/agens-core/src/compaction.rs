@@ -31,6 +31,11 @@ use crate::{Message, MessagePart, Role};
 /// The default budget, in estimated tokens, for the tail kept verbatim.
 pub const DEFAULT_KEEP_RECENT_TOKENS: usize = 8_000;
 
+/// Conservative token weight for media whose encoded wire bytes are unavailable here.
+/// A single attachment may carry megabytes after base64 encoding, so counting only
+/// its MIME string can incorrectly refuse the compaction that a replay-byte overflow needs.
+const ESTIMATED_MEDIA_TOKENS: usize = DEFAULT_KEEP_RECENT_TOKENS + 1;
+
 /// Estimated tokens for a stretch of text.
 ///
 /// A deliberate approximation: no tokenizer for the served models exists in
@@ -59,7 +64,9 @@ fn message_tokens(message: &Message) -> usize {
                     .nth(MAX_TOOL_RESULT_CHARS)
                     .map_or(content.as_str(), |(boundary, _)| &content[..boundary]),
             ),
-            MessagePart::Media { mime, .. } => estimated_tokens(mime),
+            MessagePart::Media { mime, .. } => {
+                estimated_tokens(mime).saturating_add(ESTIMATED_MEDIA_TOKENS)
+            }
         })
         .sum()
 }
@@ -553,6 +560,30 @@ mod tests {
         assert_eq!(
             plan_compaction(&messages, CompactionBudget::default()),
             Err(CompactionError::NothingToCompact)
+        );
+    }
+
+    #[test]
+    fn old_media_is_conservatively_compacted_even_when_its_mime_is_tiny() {
+        let messages = vec![
+            Message {
+                role: Role::User,
+                parts: vec![MessagePart::Media {
+                    media_id: 7,
+                    mime: "image/png".into(),
+                }],
+            },
+            text(Role::Assistant, "described"),
+            text(Role::User, "continue"),
+        ];
+
+        let plan = plan_compaction(&messages, CompactionBudget::default())
+            .expect("wire-heavy old media should be removable");
+
+        assert_eq!(plan.first_kept(), 1);
+        assert_eq!(
+            messages.last().unwrap().parts,
+            [MessagePart::Text("continue".into())]
         );
     }
 

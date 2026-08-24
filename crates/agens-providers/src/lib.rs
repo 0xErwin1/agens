@@ -2307,16 +2307,6 @@ impl TurnProvider for ChatGptResponsesProvider {
                         )
                     })?;
                 replay_history.extend(outputs);
-                if let Some(exceeded) = replay_budget_exceeded(&replay_history) {
-                    if let Some(diagnostics) = &self.diagnostics {
-                        diagnostics.emit_replay_budget(
-                            exceeded.dimension,
-                            exceeded.observed,
-                            exceeded.limit,
-                        );
-                    }
-                    return Err(HeadlessTurnPortError::ProviderHistoryBudget);
-                }
                 (self.request_payload(replay_history.clone()), replay_history)
             }
             ChatGptContinuationState::Completed | ChatGptContinuationState::Failed => {
@@ -2327,6 +2317,16 @@ impl TurnProvider for ChatGptResponsesProvider {
                 ));
             }
         };
+        if let Some(exceeded) = replay_budget_exceeded(&replay_history) {
+            if let Some(diagnostics) = &self.diagnostics {
+                diagnostics.emit_replay_budget(
+                    exceeded.dimension,
+                    exceeded.observed,
+                    exceeded.limit,
+                );
+            }
+            return Err(HeadlessTurnPortError::ProviderHistoryBudget);
+        }
 
         self.refresh_if_needed(cancellation).await?;
         let response = match self.request_response(payload, cancellation).await {
