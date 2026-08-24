@@ -25,7 +25,7 @@ use super::subscriptions::{
 };
 use super::{proto, turn};
 use crate::blocking::{BlockingBoundary, BlockingError};
-use crate::chat::{ChatError, ChatPermissionAnswer, ChatSessionRequest, ChatSessions};
+use crate::chat::{ChatError, ChatSessionRequest, ChatSessions};
 use crate::sessions::SessionId;
 
 pub struct ChatFacade {
@@ -171,14 +171,8 @@ impl Chat for ChatFacade {
         let session = SessionId::new(request.session_id);
         let prompt_id = request.prompt_id;
 
-        // Refused rather than read as a denial: a name this daemon does not
-        // know is a client saying something this one cannot interpret, and
-        // guessing at it decides a permission on the person's behalf.
-        let answer = ChatPermissionAnswer::parse(&request.answer).ok_or_else(|| {
-            Status::invalid_argument(format!("`{}` is not an answer", request.answer))
-        })?;
-
-        self.off_runtime(move |chats| chats.answer(session, prompt_id, answer))
+        let answer = request.answer;
+        self.off_runtime(move |chats| chats.answer_value(session, prompt_id, &answer))
             .await?;
 
         Ok(Response::new(proto::ChatAck {}))

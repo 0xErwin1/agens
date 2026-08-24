@@ -65,12 +65,14 @@ pub(crate) fn dispatch(
         Some(cli::Command::Direct {
             session,
             child,
+            answer,
             at_turn_end,
             as_supervisor,
             message,
         }) => run_direct(
             session,
             child,
+            answer,
             at_turn_end,
             as_supervisor,
             message,

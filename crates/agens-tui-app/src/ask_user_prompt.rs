@@ -7,11 +7,20 @@
 //! answered — is already a variant of `AskUserReply`, so this adapter has
 //! nothing left to translate.
 
+use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
+use std::sync::{Arc, Mutex};
 
-use agens_core::HeadlessTurnCancellation;
-use agens_core::ask_user::{AskUserPort, AskUserReply, AskUserRequest};
-use agens_tui::{PromptOrigin, TuiAskUserBridge, TuiAskUserRequest};
+use agens_core::ask_user::{AskUserAnswer, AskUserPort, AskUserReply, AskUserRequest};
+use agens_core::{HeadlessTurnCancellation, IntraTurnInputSource};
+use agens_diagnostics::{SessionLifecycle, next_diagnostic_reference, record_session_lifecycle};
+use agens_providers::ProviderDiagnosticScope;
+use agens_session::context::SessionContext;
+use agens_store::{DirectiveTarget, OpenQuestion, QuestionClass, QuestionStore};
+use agens_tui::{
+    ExternalAskUserAnswer, PromptOrigin, TuiAskUserBridge, TuiAskUserObserver, TuiAskUserRequest,
+};
 
 /// The terminal UI's implementation of the ask-user port. Each surface owns
 /// its own, so the engine never chooses between them.
@@ -32,6 +41,193 @@ impl AskUserPort for TuiAskUserPort {
 
 pub fn production_tui_ask_user_bridge() -> (TuiAskUserBridge, Receiver<TuiAskUserRequest>) {
     TuiAskUserBridge::channel()
+}
+
+pub fn externally_answerable_tui_ask_user_bridge(
+    bootstrap: agens_bootstrap::Bootstrap,
+    session: Arc<Mutex<SessionContext>>,
+) -> (TuiAskUserBridge, Receiver<TuiAskUserRequest>) {
+    let (bridge, requests) = TuiAskUserBridge::channel();
+    let observer = Arc::new(ExternalQuestionObserver {
+        data_directory: bootstrap.data_directory().to_path_buf(),
+        bootstrap,
+        session,
+        questions: Mutex::new(BTreeMap::new()),
+    });
+
+    (bridge.with_observer(observer), requests)
+}
+
+struct ObservedQuestion {
+    external_id: String,
+    target: Option<DirectiveTarget>,
+}
+
+struct ExternalQuestionObserver {
+    bootstrap: agens_bootstrap::Bootstrap,
+    data_directory: PathBuf,
+    session: Arc<Mutex<SessionContext>>,
+    questions: Mutex<BTreeMap<u64, ObservedQuestion>>,
+}
+
+impl TuiAskUserObserver for ExternalQuestionObserver {
+    fn opened(&self, id: u64, request: &AskUserRequest, origin: Option<&PromptOrigin>) {
+        let external_id = next_diagnostic_reference();
+        let class = question_class(request);
+        let admissible_answers = admissible_answers(request);
+        let target = origin.map_or_else(
+            || {
+                self.session
+                    .lock()
+                    .ok()
+                    .and_then(|session| session.identifier)
+                    .map(DirectiveTarget::Session)
+            },
+            |origin| Some(DirectiveTarget::Child(origin.execution.to_string())),
+        );
+        let target = target.and_then(|target| {
+            let question = OpenQuestion {
+                target: target.clone(),
+                question_id: external_id.clone(),
+                class,
+                origin: "ask_user".into(),
+                admissible_answers: admissible_answers.clone(),
+            };
+            QuestionStore::open(&self.data_directory)
+                .and_then(|mut store| store.open_question(&question))
+                .ok()
+                .map(|()| target)
+        });
+        if let Ok(mut questions) = self.questions.lock() {
+            questions.insert(
+                id,
+                ObservedQuestion {
+                    external_id: external_id.clone(),
+                    target,
+                },
+            );
+        }
+
+        let answers = admissible_answers
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        record_session_lifecycle(
+            &self.bootstrap,
+            &external_id,
+            ProviderDiagnosticScope::Parent,
+            SessionLifecycle::QuestionOpened {
+                question_id: &external_id,
+                class: class.as_str(),
+                origin: "ask_user",
+                admissible_answers: &answers,
+            },
+        );
+    }
+
+    fn answer(&self, id: u64, request: &AskUserRequest) -> Option<ExternalAskUserAnswer> {
+        let questions = self.questions.lock().ok()?;
+        let observed = questions.get(&id)?;
+        let target = observed.target.as_ref()?;
+        let answer = QuestionStore::open(&self.data_directory)
+            .ok()?
+            .take_answer(target, &observed.external_id)
+            .ok()??;
+        let question = request.questions().first()?;
+        if request.questions().len() != 1 {
+            return None;
+        }
+        let reply = AskUserReply::Answered(vec![AskUserAnswer {
+            question_id: question.id().to_owned(),
+            selected: vec![answer.value],
+            other: None,
+            note: None,
+        }]);
+        request.validate_reply(&reply).ok()?;
+
+        Some(ExternalAskUserAnswer {
+            reply,
+            answered_by: match answer.source {
+                IntraTurnInputSource::Human => "human",
+                IntraTurnInputSource::Supervisor => "supervisor",
+            },
+        })
+    }
+
+    fn closed(&self, id: u64, reply: &AskUserReply, answered_by: &'static str) {
+        let Some(observed) = self
+            .questions
+            .lock()
+            .ok()
+            .and_then(|mut questions| questions.remove(&id))
+        else {
+            return;
+        };
+        let selected = selected_answer(reply);
+        let source = if answered_by == "supervisor" {
+            IntraTurnInputSource::Supervisor
+        } else {
+            IntraTurnInputSource::Human
+        };
+        if let Some(target) = observed.target.as_ref() {
+            let _ = QuestionStore::open(&self.data_directory).and_then(|mut store| {
+                store.close(target, &observed.external_id, &selected, source)
+            });
+        }
+        record_session_lifecycle(
+            &self.bootstrap,
+            &observed.external_id,
+            ProviderDiagnosticScope::Parent,
+            SessionLifecycle::QuestionClosed {
+                question_id: &observed.external_id,
+                selected_answer: &selected,
+                answered_by,
+            },
+        );
+    }
+}
+
+fn question_class(request: &AskUserRequest) -> QuestionClass {
+    let consent_title = request
+        .title()
+        .is_some_and(|title| title.to_ascii_lowercase().contains("consent"));
+    let consent_domain = admissible_answers(request).iter().any(|answer| {
+        matches!(
+            answer.as_str(),
+            "granted" | "declined" | "report_and_continue" | "stop_here"
+        )
+    });
+    if consent_title || consent_domain {
+        QuestionClass::Consent
+    } else {
+        QuestionClass::AskUser
+    }
+}
+
+fn admissible_answers(request: &AskUserRequest) -> Vec<String> {
+    request
+        .questions()
+        .iter()
+        .flat_map(|question| {
+            question
+                .options()
+                .iter()
+                .map(|option| option.id().to_owned())
+        })
+        .collect()
+}
+
+fn selected_answer(reply: &AskUserReply) -> String {
+    match reply {
+        AskUserReply::Answered(answers) => answers
+            .iter()
+            .flat_map(|answer| answer.selected.iter().cloned())
+            .collect::<Vec<_>>()
+            .join(","),
+        AskUserReply::Discuss { .. } => "discuss".into(),
+        AskUserReply::Cancelled => "cancelled".into(),
+        AskUserReply::Unavailable(_) => "unavailable".into(),
+    }
 }
 
 #[cfg(test)]

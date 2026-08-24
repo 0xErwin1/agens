@@ -24,8 +24,8 @@ pub use app::{
 };
 pub use ask_user::{AskUserEditing, AskUserRowSnapshot, AskUserSnapshot};
 pub use bridge::{
-    PromptOrigin, TuiAskUserBridge, TuiAskUserRequest, TuiPermissionBridge, TuiPermissionReply,
-    TuiPermissionRequest,
+    ExternalAskUserAnswer, PromptOrigin, TuiAskUserBridge, TuiAskUserObserver, TuiAskUserRequest,
+    TuiPermissionBridge, TuiPermissionReply, TuiPermissionRequest,
 };
 pub use conversation::{
     ActionableError, Conversation, ConversationError, ConversationEvent, SubagentCard, ToolBatch,

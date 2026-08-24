@@ -6,6 +6,9 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use agens_core::ask_user::{
+    AskUserMode, AskUserOption, AskUserQuestion, AskUserReply, AskUserRequest,
+};
 use agens_core::{HeadlessTurnCancellation, TurnEvent, TurnState};
 use agens_server::{
     ChatAsks, ChatError, ChatEvent, ChatPermissionAnswer, ChatPermissionRequest, ChatSession,
@@ -34,6 +37,7 @@ struct ScriptedTurns {
     /// A question this turn asks before doing anything else, when the test gave
     /// it one. The answer becomes the turn's own outcome, so a test can read it.
     question: Option<ChatPermissionRequest>,
+    ask_user: Option<AskUserRequest>,
 }
 
 impl ChatTurns for ScriptedTurns {
@@ -54,6 +58,19 @@ impl ChatTurns for ScriptedTurns {
             let answer = asks.permission(&question);
 
             return ChatTurnOutcome::Completed(answer.as_str().to_owned());
+        }
+        if let Some(question) = self.ask_user.take() {
+            let answer = asks.ask_user(&question);
+            let selected = match answer {
+                AskUserReply::Answered(answers) => answers
+                    .first()
+                    .and_then(|answer| answer.selected.first())
+                    .cloned()
+                    .unwrap_or_else(|| "unavailable".to_owned()),
+                _ => "unavailable".to_owned(),
+            };
+
+            return ChatTurnOutcome::Completed(format!("continued:{selected}"));
         }
 
         let release = self
@@ -101,7 +118,19 @@ fn harness() -> Harness {
 }
 
 fn harness_asking(question: Option<ChatPermissionRequest>) -> Harness {
+    harness_with_questions(question, None)
+}
+
+fn harness_asking_user(question: AskUserRequest) -> Harness {
+    harness_with_questions(None, Some(question))
+}
+
+fn harness_with_questions(
+    question: Option<ChatPermissionRequest>,
+    ask_user: Option<AskUserRequest>,
+) -> Harness {
     let asked = Arc::new(Mutex::new(question));
+    let ask_user = Arc::new(Mutex::new(ask_user));
     let runtime = Runtime::new().expect("a runtime is available");
     let supervisor = SessionSupervisor::new(runtime.handle().clone());
 
@@ -124,6 +153,7 @@ fn harness_asking(question: Option<ChatPermissionRequest>) -> Harness {
                     started: started.clone(),
                     release: Arc::clone(&release_rx),
                     question: asked.lock().expect("the script is readable").clone(),
+                    ask_user: ask_user.lock().expect("the script is readable").clone(),
                 }),
             })
         }),
@@ -529,6 +559,68 @@ fn a_question_the_turn_asks_reaches_a_subscriber_and_the_answer_reaches_the_turn
         )),
         ChatEvent::TurnCompleted {
             text: "allow_once".to_owned(),
+        },
+    );
+}
+
+fn an_ask_user_question() -> AskUserRequest {
+    let question = AskUserQuestion::new(
+        "approval",
+        "Choose an outcome",
+        None,
+        AskUserMode::Single,
+        vec![
+            AskUserOption::new("approve", "Approve", None, None),
+            AskUserOption::new("decline", "Decline", None, None),
+        ],
+        false,
+        false,
+        false,
+    );
+
+    AskUserRequest::new(None, vec![question]).expect("the question is valid")
+}
+
+#[test]
+fn an_external_ask_user_answer_is_validated_then_continues_the_same_turn() {
+    let harness = harness_asking_user(an_ask_user_question());
+    let session = harness.chats.open(&request(1)).expect("the chat opens");
+    let events = harness.chats.subscribe(session).expect("the chat is open");
+
+    harness
+        .chats
+        .prompt(session, "ask before continuing".to_owned())
+        .expect("the prompt is accepted");
+    assert_eq!(
+        harness.started.recv_timeout(PATIENCE),
+        Ok("ask before continuing".to_owned()),
+    );
+
+    let asked = wait_for(&events, |event| {
+        matches!(event, ChatEvent::PermissionAsked { .. })
+    });
+    let ChatEvent::PermissionAsked { prompt_id, .. } = asked else {
+        panic!("the chat published something else");
+    };
+
+    assert_eq!(
+        harness
+            .chats
+            .answer_value(session, prompt_id, "outside-domain"),
+        Err(ChatError::NotAsked),
+    );
+    harness
+        .chats
+        .answer_value(session, prompt_id, "approve")
+        .expect("an admissible external answer is accepted");
+
+    assert_eq!(
+        wait_for(&events, |event| matches!(
+            event,
+            ChatEvent::TurnCompleted { .. }
+        )),
+        ChatEvent::TurnCompleted {
+            text: "continued:approve".to_owned(),
         },
     );
 }

@@ -35,7 +35,8 @@ use agens_bootstrap::Bootstrap;
 use agens_bootstrap::effective_max_iterations;
 use agens_diagnostics::{
     CompactionReason, SafeDiagnosticStore, SessionLifecycle, TurnOutcome, diagnostic_store,
-    operation_diagnostics_with_progress, record_parent_terminal, record_session_lifecycle,
+    next_diagnostic_reference, operation_diagnostics_with_progress, record_parent_terminal,
+    record_session_lifecycle,
 };
 use agens_dispatch::ProductionToolDispatcher;
 use agens_error::{CliError, ExitStatus, cancellation_result};
@@ -60,7 +61,7 @@ use agens_session::turns::{
 use agens_tool_runtime::block_on_headless_turn;
 use agens_tool_runtime::child::TaskMailboxProvider;
 use agens_tool_runtime::runtime::{
-    RunIntrospectionFactory, production_tool_runtime_for_parent_executing_run,
+    RunIntrospectionFactory, production_tool_runtime_for_parent_executing_run_with_ask_user,
 };
 use agens_tool_runtime::task::ProductionTuiTaskRuntime;
 
@@ -125,6 +126,7 @@ struct HeadlessProviderContext<'a> {
     cancellation: &'a HeadlessTurnCancellation,
     progress: Option<&'a TurnProgressSink>,
     prompter: Box<dyn PermissionPrompter>,
+    ask_user: Option<Box<dyn agens_core::ask_user::AskUserPort>>,
     task_runtime: Option<&'a ProductionTuiTaskRuntime>,
     diagnostic_reference: &'a str,
     include_system_prompt: bool,
@@ -172,6 +174,29 @@ pub fn run_production_headless_chat_with_progress(
     task_runtime: Option<&ProductionTuiTaskRuntime>,
     operation_reference: Option<&str>,
 ) -> Result<HeadlessChatCompletion, HeadlessChatFailure> {
+    run_production_headless_chat_with_progress_and_ask_user(
+        request,
+        bootstrap,
+        cancellation,
+        progress,
+        prompter,
+        task_runtime,
+        operation_reference,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_production_headless_chat_with_progress_and_ask_user(
+    request: HeadlessChatRequest,
+    bootstrap: &Bootstrap,
+    cancellation: &HeadlessTurnCancellation,
+    progress: Option<&TurnProgressSink>,
+    prompter: Box<dyn PermissionPrompter>,
+    task_runtime: Option<&ProductionTuiTaskRuntime>,
+    operation_reference: Option<&str>,
+    ask_user: Option<Box<dyn agens_core::ask_user::AskUserPort>>,
+) -> Result<HeadlessChatCompletion, HeadlessChatFailure> {
     run_production_headless_chat_executing_run(
         request,
         bootstrap,
@@ -180,6 +205,7 @@ pub fn run_production_headless_chat_with_progress(
         prompter,
         task_runtime,
         operation_reference,
+        ask_user,
         None,
     )
 }
@@ -198,6 +224,7 @@ pub fn run_production_headless_chat_executing_run(
     prompter: Box<dyn PermissionPrompter>,
     task_runtime: Option<&ProductionTuiTaskRuntime>,
     operation_reference: Option<&str>,
+    ask_user: Option<Box<dyn agens_core::ask_user::AskUserPort>>,
     run: Option<&RunExecution>,
 ) -> Result<HeadlessChatCompletion, HeadlessChatFailure> {
     agens_callcount::note_provider_runtime_build();
@@ -283,6 +310,7 @@ pub fn run_production_headless_chat_executing_run(
                     cancellation,
                     progress,
                     prompter,
+                    ask_user,
                     task_runtime,
                     diagnostic_reference: &diagnostic_reference,
                     include_system_prompt: true,
@@ -327,6 +355,7 @@ pub fn run_production_headless_chat_executing_run(
                     cancellation,
                     progress,
                     prompter,
+                    ask_user,
                     task_runtime,
                     diagnostic_reference: &diagnostic_reference,
                     include_system_prompt: true,
@@ -376,6 +405,7 @@ pub fn run_production_headless_chat_executing_run(
                     cancellation,
                     progress,
                     prompter,
+                    ask_user,
                     task_runtime,
                     diagnostic_reference: &diagnostic_reference,
                     include_system_prompt: false,
@@ -578,19 +608,49 @@ impl PermissionPrompter for RecordingPrompter {
         context: &agens_permissions::PermissionPromptContext,
         cancellation: &agens_core::HeadlessTurnCancellation,
     ) -> Result<agens_permissions::PermissionPromptAnswer, agens_core::HeadlessTurnPortError> {
+        let tool = agens_core::bare_tool_name(&context.tool_identity);
         self.store.record_session_lifecycle(
             &self.reference,
             ProviderDiagnosticScope::Parent,
             SessionLifecycle::PermissionBlocked {
-                tool: agens_core::bare_tool_name(&context.tool_identity).as_ref(),
+                tool: tool.as_ref(),
                 access: match context.access {
                     agens_core::ToolAccess::ReadOnly => "read_only",
                     agens_core::ToolAccess::Write => "write",
                 },
             },
         );
+        let question_id = next_diagnostic_reference();
+        let admissible_answers = ["allow_once", "allow_always", "deny_once", "deny_always"];
+        self.store.record_session_lifecycle(
+            &self.reference,
+            ProviderDiagnosticScope::Parent,
+            SessionLifecycle::QuestionOpened {
+                question_id: &question_id,
+                class: "permission",
+                origin: tool.as_ref(),
+                admissible_answers: &admissible_answers,
+            },
+        );
 
-        self.inner.prompt(context, cancellation)
+        let answer = self.inner.prompt(context, cancellation)?;
+        self.store.record_session_lifecycle(
+            &self.reference,
+            ProviderDiagnosticScope::Parent,
+            SessionLifecycle::QuestionClosed {
+                question_id: &question_id,
+                selected_answer: match answer {
+                    agens_permissions::PermissionPromptAnswer::AllowOnce => "allow_once",
+                    agens_permissions::PermissionPromptAnswer::AllowAlways => "allow_always",
+                    agens_permissions::PermissionPromptAnswer::DenyOnce => "deny_once",
+                    agens_permissions::PermissionPromptAnswer::DenyAlways => "deny_always",
+                    agens_permissions::PermissionPromptAnswer::Cancel => "cancelled",
+                },
+                answered_by: "human",
+            },
+        );
+
+        Ok(answer)
     }
 }
 
@@ -954,7 +1014,7 @@ fn mailbox_of(run: Option<&RunExecution>, session_id: i64) -> DirectiveTarget {
 
 fn run_production_headless_chat_with_provider<P>(
     request: HeadlessChatRequest,
-    context: HeadlessProviderContext<'_>,
+    mut context: HeadlessProviderContext<'_>,
     build_provider: impl Fn(
         String,
         Vec<Message>,
@@ -987,7 +1047,7 @@ where
             Arc::clone(&task_runtime.dispatcher),
         ),
         None => {
-            let runtime = production_tool_runtime_for_parent_executing_run(
+            let runtime = production_tool_runtime_for_parent_executing_run_with_ask_user(
                 context.bootstrap,
                 project_root,
                 request.skills.as_deref(),
@@ -998,6 +1058,10 @@ where
                 context
                     .run
                     .map(|run| std::sync::Arc::clone(&run.introspection)),
+                context
+                    .ask_user
+                    .take()
+                    .unwrap_or_else(|| Box::new(agens_core::ask_user::UnavailableAskUserPort)),
             )?;
             // Discovery for this turn's own registry has already run
             // synchronously inside `production_tool_runtime_for_parent`, so

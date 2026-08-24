@@ -17,7 +17,7 @@ use agens_tui::{
     run_with_default_progress_submit_with_permissions_task_controls_and_ask_user,
 };
 
-use crate::ask_user_prompt::{TuiAskUserPort, production_tui_ask_user_bridge};
+use crate::ask_user_prompt::{TuiAskUserPort, externally_answerable_tui_ask_user_bridge};
 use crate::extensions::{start_tui_commands, start_tui_skills};
 use crate::files::{expand_tui_prompt_with_media, tui_picker_file_candidates};
 use crate::metrics::{TuiMetricsPublisher, finish_tui_metrics};
@@ -262,7 +262,8 @@ pub fn run_production_tui_with_options(
     let mcp_noticed: Arc<Mutex<std::collections::BTreeSet<String>>> =
         Arc::new(Mutex::new(std::collections::BTreeSet::new()));
     let (permission_bridge, permission_requests) = production_tui_permission_bridge();
-    let (ask_user_bridge, ask_user_requests) = production_tui_ask_user_bridge();
+    let (ask_user_bridge, ask_user_requests) =
+        externally_answerable_tui_ask_user_bridge(bootstrap.clone(), Arc::clone(&router.session));
     let transition_controls = task_controls.clone();
     let cancel_controls = task_controls.clone();
     let cancel_all_controls = task_controls.clone();

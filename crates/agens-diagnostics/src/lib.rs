@@ -116,6 +116,21 @@ pub enum SessionLifecycle<'a> {
         tool: &'a str,
         access: &'a str,
     },
+    /// A bounded question opened and the turn is waiting for one of its
+    /// admissible answers. Raw arguments and prompt text are deliberately
+    /// absent for the same reason as [`Self::PermissionBlocked`].
+    QuestionOpened {
+        question_id: &'a str,
+        class: &'a str,
+        origin: &'a str,
+        admissible_answers: &'a [&'a str],
+    },
+    /// A previously opened question received its answer.
+    QuestionClosed {
+        question_id: &'a str,
+        selected_answer: &'a str,
+        answered_by: &'a str,
+    },
     /// A tool moved the session out of the directory it was working in.
     ///
     /// The directory is recorded, unlike a permission target, because it is
@@ -337,6 +352,8 @@ impl SessionLifecycle<'_> {
                 ProviderDiagnosticKind::ToolFailed
             }
             Self::PermissionBlocked { .. } => ProviderDiagnosticKind::PermissionBlocked,
+            Self::QuestionOpened { .. } => ProviderDiagnosticKind::QuestionOpened,
+            Self::QuestionClosed { .. } => ProviderDiagnosticKind::QuestionClosed,
             Self::WorkingDirectoryChanged { .. } => ProviderDiagnosticKind::WorkingDirectoryChanged,
             Self::ContextExhausted { .. } => ProviderDiagnosticKind::ContextExhausted,
             Self::CompactionStarted { .. } => ProviderDiagnosticKind::CompactionStarted,
@@ -372,6 +389,26 @@ impl SessionLifecycle<'_> {
             Self::PermissionBlocked { tool, access } => {
                 serde_json::json!({ "tool": tool, "access": access })
             }
+            Self::QuestionOpened {
+                question_id,
+                class,
+                origin,
+                admissible_answers,
+            } => serde_json::json!({
+                "question_id": question_id,
+                "class": class,
+                "origin": origin,
+                "admissible_answers": admissible_answers,
+            }),
+            Self::QuestionClosed {
+                question_id,
+                selected_answer,
+                answered_by,
+            } => serde_json::json!({
+                "question_id": question_id,
+                "selected_answer": selected_answer,
+                "answered_by": answered_by,
+            }),
             Self::WorkingDirectoryChanged { directory } => {
                 serde_json::json!({ "directory": directory })
             }
@@ -1453,6 +1490,25 @@ mod tests {
         store.record_session_lifecycle(
             &reference,
             ProviderDiagnosticScope::Parent,
+            SessionLifecycle::QuestionOpened {
+                question_id: "7",
+                class: "ask_user",
+                origin: "ask_user",
+                admissible_answers: &["approve", "decline"],
+            },
+        );
+        store.record_session_lifecycle(
+            &reference,
+            ProviderDiagnosticScope::Parent,
+            SessionLifecycle::QuestionClosed {
+                question_id: "7",
+                selected_answer: "approve",
+                answered_by: "supervisor",
+            },
+        );
+        store.record_session_lifecycle(
+            &reference,
+            ProviderDiagnosticScope::Parent,
             SessionLifecycle::TurnEnded {
                 outcome: TurnOutcome::Failed,
             },
@@ -1470,6 +1526,8 @@ mod tests {
                 "turn_started",
                 "tool_failed",
                 "permission_blocked",
+                "question_opened",
+                "question_closed",
                 "turn_ended"
             ]
         );
@@ -1489,7 +1547,21 @@ mod tests {
             "a permission target can carry a secret and is never recorded: {:?}",
             recorded[2]
         );
-        assert_eq!(recorded[3]["outcome"], "failed");
+        assert_eq!(recorded[3]["question_id"], "7");
+        assert_eq!(recorded[3]["class"], "ask_user");
+        assert_eq!(recorded[3]["origin"], "ask_user");
+        assert_eq!(
+            recorded[3]["admissible_answers"],
+            serde_json::json!(["approve", "decline"])
+        );
+        assert!(
+            recorded[3].get("arguments").is_none() && recorded[3].get("target").is_none(),
+            "question events must never publish raw arguments: {:?}",
+            recorded[3]
+        );
+        assert_eq!(recorded[4]["selected_answer"], "approve");
+        assert_eq!(recorded[4]["answered_by"], "supervisor");
+        assert_eq!(recorded[5]["outcome"], "failed");
 
         std::fs::remove_dir_all(&temporary).ok();
     }

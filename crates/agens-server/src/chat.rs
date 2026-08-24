@@ -24,6 +24,7 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
+use agens_core::ask_user::{AskUserAnswer, AskUserReply, AskUserRequest, AskUserUnavailable};
 use agens_core::{HeadlessTurnCancellation, Message, TurnEvent, TurnProgressSink};
 
 use crate::sessions::{
@@ -141,6 +142,8 @@ pub trait ChatAsks: Send + Sync {
     /// one going away — a question nobody can hear is refused rather than left
     /// holding the turn forever.
     fn permission(&self, request: &ChatPermissionRequest) -> ChatPermissionAnswer;
+
+    fn ask_user(&self, request: &AskUserRequest) -> AskUserReply;
 }
 
 pub trait ChatTurns: Send {
@@ -337,7 +340,8 @@ pub struct OpenChatSummary {
 
 /// A question this chat is waiting on an answer to.
 struct PendingQuestion {
-    answer: SyncSender<ChatPermissionAnswer>,
+    answer: SyncSender<String>,
+    admissible_answers: Vec<String>,
 }
 
 /// One open chat, as the daemon holds it.
@@ -479,6 +483,15 @@ impl ChatSessions {
         prompt_id: u64,
         answer: ChatPermissionAnswer,
     ) -> Result<(), ChatError> {
+        self.answer_value(session, prompt_id, answer.as_str())
+    }
+
+    pub fn answer_value(
+        &self,
+        session: SessionId,
+        prompt_id: u64,
+        answer: &str,
+    ) -> Result<(), ChatError> {
         let open = self.locked()?;
         let chat = open.get(&session).ok_or(ChatError::Unknown)?;
 
@@ -486,13 +499,20 @@ impl ChatSessions {
             .asked
             .lock()
             .map_err(|_| unusable("the chat's open questions"))?;
+        let admissible = asked
+            .get(&prompt_id)
+            .ok_or(ChatError::NotAsked)?
+            .admissible_answers
+            .iter()
+            .any(|candidate| candidate == answer);
+        if !admissible {
+            return Err(ChatError::NotAsked);
+        }
         let question = asked.remove(&prompt_id).ok_or(ChatError::NotAsked)?;
 
-        // A full or closed channel means the turn stopped waiting between the
-        // lookup and now, which is the same thing as never having asked.
         question
             .answer
-            .try_send(answer)
+            .try_send(answer.to_owned())
             .map_err(|_| ChatError::NotAsked)
     }
 
@@ -607,11 +627,23 @@ impl ChatAsks for ChatQuestions {
     fn permission(&self, request: &ChatPermissionRequest) -> ChatPermissionAnswer {
         let prompt_id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (answer, answered) = sync_channel(1);
+        let admissible_answers = vec![
+            ChatPermissionAnswer::AllowOnce.as_str().to_owned(),
+            ChatPermissionAnswer::AllowAlways.as_str().to_owned(),
+            ChatPermissionAnswer::DenyOnce.as_str().to_owned(),
+            ChatPermissionAnswer::DenyAlways.as_str().to_owned(),
+        ];
 
         let Ok(mut asked) = self.asked.lock() else {
             return ChatPermissionAnswer::Unheard;
         };
-        asked.insert(prompt_id, PendingQuestion { answer });
+        asked.insert(
+            prompt_id,
+            PendingQuestion {
+                answer,
+                admissible_answers,
+            },
+        );
         drop(asked);
 
         self.subscribers.publish(&ChatEvent::PermissionAsked {
@@ -619,12 +651,67 @@ impl ChatAsks for ChatQuestions {
             request: request.clone(),
         });
 
-        let outcome = self.wait_for(&answered);
+        let outcome = self
+            .wait_for(&answered)
+            .and_then(|answer| ChatPermissionAnswer::parse(&answer))
+            .unwrap_or(ChatPermissionAnswer::Unheard);
 
         if let Ok(mut asked) = self.asked.lock() {
             asked.remove(&prompt_id);
         }
 
+        outcome
+    }
+
+    fn ask_user(&self, request: &AskUserRequest) -> AskUserReply {
+        let [question] = request.questions() else {
+            return AskUserReply::Unavailable(AskUserUnavailable::NoInteractiveSurface);
+        };
+        let admissible_answers = question
+            .options()
+            .iter()
+            .map(|option| option.id().to_owned())
+            .collect::<Vec<_>>();
+        if admissible_answers.is_empty() {
+            return AskUserReply::Unavailable(AskUserUnavailable::NoInteractiveSurface);
+        }
+        let prompt_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (answer, answered) = sync_channel(1);
+        let Ok(mut asked) = self.asked.lock() else {
+            return AskUserReply::Unavailable(AskUserUnavailable::SurfaceClosed);
+        };
+        asked.insert(
+            prompt_id,
+            PendingQuestion {
+                answer,
+                admissible_answers,
+            },
+        );
+        drop(asked);
+        self.subscribers.publish(&ChatEvent::PermissionAsked {
+            prompt_id,
+            request: ChatPermissionRequest {
+                tool: "ask_user".into(),
+                target: String::new(),
+                access: "ask_user".into(),
+                reason: String::new(),
+            },
+        });
+
+        let outcome = self.wait_for(&answered).map_or(
+            AskUserReply::Unavailable(AskUserUnavailable::SurfaceClosed),
+            |value| {
+                AskUserReply::Answered(vec![AskUserAnswer {
+                    question_id: question.id().to_owned(),
+                    selected: vec![value],
+                    other: None,
+                    note: None,
+                }])
+            },
+        );
+        if let Ok(mut asked) = self.asked.lock() {
+            asked.remove(&prompt_id);
+        }
         outcome
     }
 }
@@ -636,13 +723,13 @@ impl ChatQuestions {
     /// The subscriber count is read after the publish that would have dropped a
     /// client that went away, so it is the count of clients that could still
     /// answer rather than the count that existed when the question was asked.
-    fn wait_for(&self, answered: &Receiver<ChatPermissionAnswer>) -> ChatPermissionAnswer {
+    fn wait_for(&self, answered: &Receiver<String>) -> Option<String> {
         loop {
             match answered.recv_timeout(ANSWER_POLL) {
-                Ok(answer) => return answer,
-                Err(RecvTimeoutError::Disconnected) => return ChatPermissionAnswer::Unheard,
+                Ok(answer) => return Some(answer),
+                Err(RecvTimeoutError::Disconnected) => return None,
                 Err(RecvTimeoutError::Timeout) if self.subscribers.listeners() == 0 => {
-                    return ChatPermissionAnswer::Unheard;
+                    return None;
                 }
                 Err(RecvTimeoutError::Timeout) => {}
             }
