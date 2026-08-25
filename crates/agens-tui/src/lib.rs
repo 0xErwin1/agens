@@ -2214,12 +2214,7 @@ fn render_frame_content(frame: &mut ratatui::Frame<'_>, state: &ViewState<'_>) {
     let notice = notice_spans(state);
     let layout = {
         let _perf_layout = agens_perf::span!("tui.frame.layout");
-        screen_layout(
-            area,
-            state.input,
-            state.media_chips.len(),
-            state.queue.len(),
-        )
+        screen_layout(area, state.input, state.queue.len())
     };
 
     let row_width = layout
@@ -2338,14 +2333,11 @@ fn render_frame_content(frame: &mut ratatui::Frame<'_>, state: &ViewState<'_>) {
         let visible_inner_height = layout.composer.height.saturating_sub(2);
         let inner_width = usize::from(visible_inner_width.max(1));
         let inner_height = usize::from(visible_inner_height.max(1));
-        let attachment_rows = attachment_preview_lines(state.media_chips, inner_width);
         let composer_layout = composer_layout(state.input, state.input_cursor, inner_width);
         let cursor_line = composer_layout.cursor_line;
         let cursor_column = composer_layout.cursor_column;
-        let attachment_row_count = attachment_rows.len();
-        let cursor_content_line = attachment_row_count.saturating_add(cursor_line);
-        let vertical_scroll = cursor_content_line.saturating_sub(inner_height.saturating_sub(1));
-        let content_rows = attachment_row_count.saturating_add(composer_layout.rows);
+        let vertical_scroll = cursor_line.saturating_sub(inner_height.saturating_sub(1));
+        let content_rows = composer_layout.rows;
         let mut composer = Block::default()
             .borders(Borders::ALL)
             .padding(padding)
@@ -2361,16 +2353,11 @@ fn render_frame_content(frame: &mut ratatui::Frame<'_>, state: &ViewState<'_>) {
         ) {
             composer = composer.title_top(hidden);
         }
-        let mut composer_text = attachment_rows
-            .into_iter()
-            .map(|line| Line::styled(line, Style::default().fg(widgets::RolePalette::muted())))
+        let composer_text = composer_layout
+            .text
+            .lines()
+            .map(|line| Line::from(line.to_owned()))
             .collect::<Vec<_>>();
-        composer_text.extend(
-            composer_layout
-                .text
-                .lines()
-                .map(|line| Line::from(line.to_owned())),
-        );
         frame.render_widget(
             Paragraph::new(Text::from(composer_text))
                 .block(composer)
@@ -2389,9 +2376,7 @@ fn render_frame_content(frame: &mut ratatui::Frame<'_>, state: &ViewState<'_>) {
                 .composer
                 .y
                 .saturating_add(1)
-                .saturating_add(saturating_u16(
-                    cursor_content_line.saturating_sub(vertical_scroll),
-                ));
+                .saturating_add(saturating_u16(cursor_line.saturating_sub(vertical_scroll)));
             let cursor_x = layout
                 .composer
                 .x
@@ -4547,13 +4532,6 @@ fn bottom_chrome(width: u16, height: u16) -> BottomChrome {
     }
 }
 
-fn attachment_preview_lines(media_chips: &[String], width: usize) -> Vec<String> {
-    media_chips
-        .iter()
-        .map(|label| widgets::truncate_columns(label.trim_matches(['[', ']']), width))
-        .collect()
-}
-
 /// Columns the composer frame takes from the text when it can afford them:
 /// both borders and the blank column inside each of them.
 const COMPOSER_FRAME_COLUMNS: u16 = 4;
@@ -4595,7 +4573,7 @@ fn composer_ceiling(height: u16) -> u16 {
     (height / COMPOSER_VIEWPORT_SHARE).clamp(MIN_COMPOSER_ROWS, MAX_COMPOSER_ROWS)
 }
 
-fn composer_rows(height: u16, input: &str, media_count: usize, width: usize) -> u16 {
+fn composer_rows(height: u16, input: &str, width: usize) -> u16 {
     match height {
         0 => 0,
         1 => 1,
@@ -4604,14 +4582,13 @@ fn composer_rows(height: u16, input: &str, media_count: usize, width: usize) -> 
         _ => saturating_u16(
             composer_layout(input, input.chars().count(), width)
                 .rows
-                .saturating_add(media_count)
                 .saturating_add(2),
         )
         .clamp(MIN_COMPOSER_ROWS, composer_ceiling(height)),
     }
 }
 
-fn screen_layout(area: Rect, input: &str, media_count: usize, queue_len: usize) -> ScreenLayout {
+fn screen_layout(area: Rect, input: &str, queue_len: usize) -> ScreenLayout {
     let area = conversation_surface(area);
     let gutter = chrome_gutter(area.width);
     let composer_width = area.width.saturating_sub(gutter.saturating_mul(2));
@@ -4620,8 +4597,7 @@ fn screen_layout(area: Rect, input: &str, media_count: usize, queue_len: usize) 
             .saturating_sub(composer_frame_columns(composer_width))
             .max(1),
     );
-    let composer_rows =
-        composer_rows(area.height, input, media_count, inner_width).min(area.height);
+    let composer_rows = composer_rows(area.height, input, inner_width).min(area.height);
     let after_composer = area.height.saturating_sub(composer_rows);
     let chrome = bottom_chrome(area.width, area.height).fitted(after_composer);
     let remaining = after_composer.saturating_sub(chrome.rows());
@@ -6870,14 +6846,22 @@ where
         }
         self.runtime_events.clear();
         self.turn_duration = None;
-        self.submitted_media = self.staged_media.clone();
+        self.submitted_media = std::mem::take(&mut self.staged_media);
+        self.media_chips.clear();
         self.transcript.push(TranscriptEntry::User(prompt.clone()));
-        self.conversation = Some(Conversation::new_with_media(
-            prompt,
+        let mut conversation = Conversation::new_with_media(
+            prompt.clone(),
             self.submitted_media
                 .iter()
                 .map(|attachment| attachment.mime.as_str()),
-        ));
+        );
+        if !prompt.is_empty() && !self.submitted_media.is_empty() {
+            conversation
+                .user
+                .replace_range(prompt.len()..=prompt.len(), "\n");
+            conversation = Conversation::new(conversation.user);
+        }
+        self.conversation = Some(conversation);
         {
             let record = self.active_record_mut();
             record.collapse_thinking = false;
@@ -7101,7 +7085,7 @@ where
                 staged_media,
                 notice,
             } => {
-                self.set_staged_media(staged_media);
+                self.replace_staged_media_with_tokens(staged_media);
                 if let Some(notice) = notice {
                     self.add_info(notice);
                 }
@@ -7146,10 +7130,10 @@ where
                 self.input.clear();
                 self.input_cursor = 0;
                 self.recovered_failed_prompt = false;
-                self.set_staged_media(staged_media);
                 if let Some(draft) = draft {
                     self.restore_resume_draft(draft);
                 }
+                self.replace_staged_media_with_tokens(staged_media);
                 self.highlight_restored_syntax = false;
                 self.restored_syntax_ready_at =
                     Some(self.now.saturating_add(ACTIVE_FRAME_HEARTBEAT));
@@ -7358,6 +7342,23 @@ where
         prompt
     }
 
+    fn replace_staged_media_with_tokens(&mut self, attachments: Vec<PromptAttachment>) {
+        for token in self.attachment_tokens.iter().rev() {
+            let start = byte_index(&self.input, token.start);
+            let end = byte_index(&self.input, token.end());
+            self.input.replace_range(start..end, "");
+            self.input_cursor = if self.input_cursor >= token.end() {
+                self.input_cursor.saturating_sub(token.length)
+            } else {
+                self.input_cursor.min(token.start)
+            };
+        }
+        self.attachment_tokens.clear();
+        self.staged_media.clear();
+        self.insert_new_attachment_tokens(&attachments);
+        self.set_staged_media(attachments);
+    }
+
     /// Replaces the staged attachments; chip labels derive from the mimes.
     pub fn set_staged_media(&mut self, attachments: Vec<PromptAttachment>) {
         self.media_chips = attachment_chip_labels(&attachments);
@@ -7381,27 +7382,8 @@ where
         self.submitted_media.clear();
     }
 
-    /// Drops only the chips the finished turn carried, keeping anything staged since.
-    ///
-    /// A stash pop or clipboard attach mid-turn stages media for the NEXT prompt and,
-    /// in the stash case, has already deleted the durable row it came from; clearing
-    /// every chip on completion would destroy it with nothing left to restore from.
-    /// The app side removes the same consumed set from its session staging, so the two
-    /// views stay in step without a further sync round-trip.
     fn clear_submitted_media(&mut self) {
-        let consumed = std::mem::take(&mut self.submitted_media);
-        if consumed.is_empty() {
-            return;
-        }
-
-        let mut remaining = std::mem::take(&mut self.staged_media);
-        for attachment in &consumed {
-            if let Some(index) = remaining.iter().position(|staged| staged == attachment) {
-                remaining.remove(index);
-            }
-        }
-
-        self.set_staged_media(remaining);
+        self.submitted_media.clear();
     }
 
     pub fn finish_provider_turn(&mut self, outcome: TuiProviderOutcome) -> Option<String> {
@@ -7720,12 +7702,7 @@ where
     /// same rows the renderer paints.
     fn screen_layout(&self) -> ScreenLayout {
         let area = Rect::new(0, 0, self.size.0.max(1), self.size.1.max(1));
-        screen_layout(
-            area,
-            &self.input,
-            self.media_chips.len(),
-            self.scheduler.queued_entries().len(),
-        )
+        screen_layout(area, &self.input, self.scheduler.queued_entries().len())
     }
 
     /// Selects a transcript from a click on the subagent tree.
@@ -9778,13 +9755,14 @@ where
             return Action::Render;
         }
 
-        self.set_staged_media(attachments.clone());
+        self.replace_staged_media_with_tokens(attachments.clone());
         Action::SyncStagedMedia(attachments)
     }
 
     fn apply_composer_text(&mut self, text: String) {
         self.input = text;
         self.input_cursor = self.input.chars().count();
+        self.attachment_tokens.clear();
         self.recovered_failed_prompt = false;
         self.clamp_palette_selection();
         self.refresh_file_picker();
@@ -16099,7 +16077,7 @@ mod runtime_tests {
 
     #[test]
     fn bottom_chrome_bands_share_one_gutter_that_collapses_on_narrow_terminals() {
-        let layout = screen_layout(Rect::new(0, 0, 120, 24), "", 0, 0);
+        let layout = screen_layout(Rect::new(0, 0, 120, 24), "", 0);
         for band in [
             layout.composer,
             layout.notice,
@@ -16127,7 +16105,7 @@ mod runtime_tests {
         );
 
         for width in 0..=64_u16 {
-            let layout = screen_layout(Rect::new(0, 0, width, 24), "", 0, 0);
+            let layout = screen_layout(Rect::new(0, 0, width, 24), "", 0);
             assert!(layout.composer.right() <= width, "width {width}");
             assert!(
                 layout.composer.width >= width.min(MIN_GUTTERED_COMPOSER_WIDTH),
@@ -16136,7 +16114,7 @@ mod runtime_tests {
             );
         }
 
-        let with_queue = screen_layout(Rect::new(0, 0, 120, 24), "", 0, 3);
+        let with_queue = screen_layout(Rect::new(0, 0, 120, 24), "", 3);
         // Three message rows plus the muted Queued status line.
         assert_eq!(with_queue.queue.height, 4);
         assert_eq!(with_queue.queue.x, CHROME_GUTTER);
@@ -16186,7 +16164,7 @@ mod runtime_tests {
         );
         assert_eq!(windows_lines.rows, 2);
 
-        let layout = screen_layout(Rect::new(0, 0, 30, 12), input, 0, 0);
+        let layout = screen_layout(Rect::new(0, 0, 30, 12), input, 0);
         assert_eq!(layout.composer.height, 4);
 
         let mut tui = Tui::new(NoopEngine);
@@ -16211,20 +16189,16 @@ mod runtime_tests {
     fn composer_stops_growing_at_its_ceiling() {
         let long = "x".repeat(700);
 
-        let tall = screen_layout(Rect::new(0, 0, 80, 40), &long, 0, 0);
+        let tall = screen_layout(Rect::new(0, 0, 80, 40), &long, 0);
         assert_eq!(tall.composer.height, MAX_COMPOSER_ROWS);
         assert!(tall.transcript.height > 0);
 
         // A short terminal caps the composer below the absolute ceiling so the
         // transcript keeps most of the screen.
-        let short = screen_layout(Rect::new(0, 0, 80, 15), &long, 0, 0);
+        let short = screen_layout(Rect::new(0, 0, 80, 15), &long, 0);
         assert_eq!(short.composer.height, composer_ceiling(15));
         assert!(short.composer.height < MAX_COMPOSER_ROWS);
         assert!(short.transcript.height > short.composer.height);
-
-        // Attachments scroll inside the box instead of lifting the ceiling.
-        let with_attachments = screen_layout(Rect::new(0, 0, 80, 40), &long, 12, 0);
-        assert_eq!(with_attachments.composer.height, MAX_COMPOSER_ROWS);
     }
 
     #[test]

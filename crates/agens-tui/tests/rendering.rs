@@ -561,97 +561,66 @@ fn empty_composer_renders_a_complete_dock() {
 }
 
 #[test]
-fn staged_images_render_inline_inside_the_composer_at_narrow_width() {
+fn staged_image_renders_exactly_once_as_the_inline_editable_token() {
     let width = 30_u16;
     let height = 18_u16;
     let mut renderer =
         RatatuiRenderer::new(Terminal::new(TestBackend::new(width, height)).unwrap());
     let mut tui = Tui::new(FakeEngine);
-    tui.set_staged_media(vec![
-        PromptAttachment::new(1, "image/png"),
-        PromptAttachment::new(2, "image/jpeg"),
-        PromptAttachment::new(3, "image/webp"),
-    ]);
+    tui.apply_submission_outcome(TuiSubmissionOutcome::MediaAttached {
+        message: "attached".into(),
+        staged_media: vec![PromptAttachment::new(1, "image/png")],
+    });
 
     renderer.render(tui.view()).unwrap();
 
-    let buffer = renderer.terminal().backend().buffer();
-    let (composer_left, top) = (0..height)
-        .find_map(|row| {
-            (0..width)
-                .find(|column| buffer[(*column, row)].symbol() == "┌")
-                .map(|column| (column, row))
-        })
-        .expect("narrow composer top");
-    let bottom = (top + 1..height)
-        .find(|row| buffer[(composer_left, *row)].symbol() == "└")
-        .expect("narrow composer bottom");
     let text = rendered_text(&renderer);
-
-    assert!(text.contains("Image #1"), "{text:?}");
-    assert!(text.contains("Image #2"), "{text:?}");
-    assert!(text.contains("Image #3"), "{text:?}");
-    assert!(
-        rendered_line(&renderer, top as usize)
-            .trim_matches(' ')
-            .starts_with('┌')
-            && !rendered_line(&renderer, top as usize).contains("Image #"),
-        "attachment labels must not occupy the border: {:?}",
-        rendered_line(&renderer, top as usize)
+    assert_eq!(tui.input(), "[Image #1]");
+    assert_eq!(
+        text.matches("Image #1").count(),
+        1,
+        "the detached attachment preview must not duplicate the editable token: {text:?}"
     );
-    for ordinal in 1..=3 {
-        let row = rendered_row(&renderer, &format!("Image #{ordinal}")) as u16;
-        assert!(
-            row > top && row < bottom,
-            "preview {ordinal} is outside composer"
-        );
-    }
+    assert!(text.contains("[Image #1]"), "{text:?}");
 }
 
 #[test]
-fn composer_scroll_accounts_for_attachment_rows_when_input_exceeds_visible_height() {
+fn composer_scroll_and_layout_ignore_detached_attachment_preview_rows() {
     let width = 30_u16;
     let height = 14_u16;
-    let mut renderer =
+    let input = "line-1\nline-2\nline-3\nline-4\nline-5\nline-6\nline-7\nline-8";
+
+    let mut baseline_renderer =
         RatatuiRenderer::new(Terminal::new(TestBackend::new(width, height)).unwrap());
-    let mut tui = Tui::new(FakeEngine);
-    tui.set_staged_media(vec![
+    let mut baseline = Tui::new(FakeEngine);
+    for character in input.chars() {
+        baseline.handle(Event::Key(Key::Char(character)));
+    }
+    baseline_renderer.render(baseline.view()).unwrap();
+
+    let mut attached_renderer =
+        RatatuiRenderer::new(Terminal::new(TestBackend::new(width, height)).unwrap());
+    let mut attached = Tui::new(FakeEngine);
+    attached.set_staged_media(vec![
         PromptAttachment::new(1, "image/png"),
         PromptAttachment::new(2, "image/jpeg"),
         PromptAttachment::new(3, "image/webp"),
     ]);
-    for character in "line-1\nline-2\nline-3\nline-4\nline-5\nline-6\nline-7\nline-8".chars() {
-        tui.handle(Event::Key(Key::Char(character)));
+    for character in input.chars() {
+        attached.handle(Event::Key(Key::Char(character)));
     }
+    attached_renderer.render(attached.view()).unwrap();
 
-    renderer.render(tui.view()).unwrap();
-
-    let buffer = renderer.terminal().backend().buffer();
-    let (composer_left, top) = (0..height)
-        .find_map(|row| {
-            (0..width)
-                .find(|column| buffer[(*column, row)].symbol() == "┌")
-                .map(|column| (column, row))
-        })
-        .expect("composer top");
-    let bottom = (top + 1..height)
-        .find(|row| buffer[(composer_left, *row)].symbol() == "└")
-        .expect("composer bottom");
-    let cursor = renderer.terminal().backend().cursor_position();
-    let text = rendered_text(&renderer);
-
-    assert!(cursor.y > top && cursor.y < bottom, "cursor: {cursor:?}");
-    assert_eq!(cursor.y, bottom - 1, "cursor: {cursor:?}");
-    // Attachments and text share one bounded box: both scroll, and the box
-    // keeps at most a third of the screen instead of pushing the transcript out.
-    assert!(bottom - top < height / 3, "composer: {top}..={bottom}");
-    for chip in ["Image #1", "Image #2", "Image #3"] {
-        assert!(!text.contains(chip), "{text:?}");
-    }
-    assert!(!text.contains("line-1"), "{text:?}");
-    assert!(text.contains("line-8"), "{text:?}");
-    assert!(text.contains("↑9"), "hidden-row marker missing: {text:?}");
-    assert_eq!(rendered_row(&renderer, "line-8") as u16, cursor.y);
+    assert_eq!(
+        attached_renderer.terminal().backend().cursor_position(),
+        baseline_renderer.terminal().backend().cursor_position(),
+        "detached preview rows must not change composer scrolling"
+    );
+    assert_eq!(
+        rendered_text(&attached_renderer),
+        rendered_text(&baseline_renderer),
+        "staged metadata without an inline token must add no detached rendering"
+    );
 }
 
 #[test]

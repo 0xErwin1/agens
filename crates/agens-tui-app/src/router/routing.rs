@@ -142,9 +142,8 @@ impl TuiRuntimeRouter {
     /// Driven by stash pop, overlay paste, and history browse: the composer
     /// chips changed on the surface, and what the next submit sends must match.
     ///
-    /// A recorded id proven unreachable is dropped rather than staged, the same way a
-    /// resume drops one: staging it would fail the preflight of every later submit, with
-    /// no way to take a chip back off the composer.
+    /// A recorded id proven unreachable is dropped rather than staged: staging it would fail
+    /// the preflight of every later submit, with no way to take a chip back off the composer.
     ///
     /// A lookup that merely fails — a database that will not open, a busy writer, a blob whose
     /// existence could not even be checked — proves nothing, so the attachment stays staged and
@@ -172,7 +171,7 @@ impl TuiRuntimeRouter {
                     bootstrap.data_directory(),
                     attachment.media_id,
                 ) {
-                    crate::files::RestoredMediaCheck::Reachable { .. } => staged.push(attachment),
+                    crate::files::RestoredMediaCheck::Reachable => staged.push(attachment),
                     crate::files::RestoredMediaCheck::ProvenGone => dropped += 1,
                     crate::files::RestoredMediaCheck::Unverified => {
                         unverified += 1;

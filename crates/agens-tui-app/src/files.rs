@@ -27,16 +27,15 @@ pub(crate) fn session_staged_media(context: &SessionContext) -> Vec<agens_core::
 /// provably gone proves an attachment unreachable; every other failure proves nothing, so the
 /// attachment must be kept and reported as unchecked instead of being dropped as gone.
 pub(crate) enum RestoredMediaCheck {
-    Reachable { mime: String },
+    Reachable,
     ProvenGone,
     Unverified,
 }
 
-/// Classifies a recorded media id for the restore paths (resume and staged-media replacement),
-/// which must agree on what counts as proof that an attachment is gone.
+/// Classifies a recorded media id for staged-media replacement.
 pub(crate) fn check_restored_media(data_directory: &Path, media_id: i64) -> RestoredMediaCheck {
     match agens_store::open_media(data_directory, media_id) {
-        Ok((mime, _path)) => RestoredMediaCheck::Reachable { mime },
+        Ok((_mime, _path)) => RestoredMediaCheck::Reachable,
         Err(
             agens_store::MediaStoreError::NotFound { .. } | agens_store::MediaStoreError::Io { .. },
         ) => RestoredMediaCheck::ProvenGone,

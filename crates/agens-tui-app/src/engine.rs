@@ -632,19 +632,14 @@ pub fn run_tui_prompt_with(
             .map_err(|_| CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable"))?;
         expand_tui_prompt_with_media(&context, bootstrap, prompt)?
     };
-    let (request, snapshot_root, previous_messages, consumed_media_ids) = {
+    let (request, snapshot_root, previous_messages) = {
         let mut session = session
             .lock()
             .map_err(|_| CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable"))?;
         if session.running {
             return Err(CliError::runtime(HeadlessTurnError::State));
         }
-        // Snapshot staged media into the request without clearing yet. Preflight and other
-        // early failures must leave chips staged; clear only after success or after the
-        // attempt has produced partial history (media then lives on the session/retry path).
-        let consumed_media_ids = session.pending_media_ids.clone();
-        let mut media_ids = session.pending_media_ids.clone();
-        let mut media_mimes = session.pending_media_mimes.clone();
+        let (mut media_ids, mut media_mimes) = session.take_pending_media();
         media_ids.extend(expanded.media_ids);
         media_mimes.extend(expanded.media_mimes);
         let mut request = agens_headless::apply_session_to_request(
@@ -691,12 +686,7 @@ pub fn run_tui_prompt_with(
         // that never starts must not leave the session marked running.
         session.running = true;
 
-        (
-            request,
-            snapshot_root,
-            session.messages.clone(),
-            consumed_media_ids,
-        )
+        (request, snapshot_root, session.messages.clone())
     };
 
     // Bracketing the turn is what makes it undoable at all; a project that
@@ -747,14 +737,6 @@ pub fn run_tui_prompt_with(
         .lock()
         .map_err(|_| CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable"))?;
     session.running = false;
-    let clear_pending_media = match &completion {
-        Ok(_) => true,
-        Err(failure) => failure.partial.is_some(),
-        // Preflight / begin failures keep staged media so chips remain for retry.
-    };
-    if clear_pending_media {
-        drop_consumed_pending_media(&mut session, &consumed_media_ids);
-    }
     let result = complete_tui_turn(&mut session, completion, consumed_reminder);
     match snapshot_failure {
         Some(reason) => session.snapshot_degraded = Some(reason),
@@ -781,29 +763,6 @@ fn failed_bypass_persist_notice(result: Result<(), CliError>) -> Option<String> 
     result.err().map(|_| {
         "Permission bypass state could not be saved and may not persist across resume.".to_owned()
     })
-}
-
-/// Removes exactly the attachments the finished turn carried from the session staging.
-///
-/// Anything staged after the turn started — a stash pop, a history restore, a clipboard attach
-/// while the model was answering — belongs to the next prompt, so a blanket clear here would
-/// destroy media the finished turn never sent and whose stash row is already gone. Matching is
-/// positional per id so a set that stages the same media twice loses only what it consumed.
-fn drop_consumed_pending_media(session: &mut SessionContext, consumed: &[i64]) {
-    for media_id in consumed {
-        let Some(index) = session
-            .pending_media_ids
-            .iter()
-            .position(|staged| staged == media_id)
-        else {
-            continue;
-        };
-
-        session.pending_media_ids.remove(index);
-        if index < session.pending_media_mimes.len() {
-            session.pending_media_mimes.remove(index);
-        }
-    }
 }
 
 /// Drops the turns an undo held back, from the session in hand and from what it persisted.
@@ -1122,38 +1081,63 @@ mod tests {
     }
 
     #[test]
-    fn preflight_failure_keeps_pending_media_staged() {
-        let temporary = tui_session_directory("pending-media-preflight");
+    fn accepted_media_is_consumed_even_when_the_provider_fails_without_partial_history() {
+        let temporary = tui_session_directory("pending-media-provider-failure");
         let bootstrap = tui_session_bootstrap(&temporary, &[]);
         let _store = SessionStore::open(bootstrap.data_directory()).unwrap();
         let session = Arc::new(Mutex::new(SessionContext::fresh()));
-        {
-            let mut locked = session.lock().unwrap();
-            locked.push_pending_media(42, "image/png".into());
-        }
+        session
+            .lock()
+            .unwrap()
+            .push_pending_media(42, "image/png".into());
 
-        let result = run_tui_prompt_with(&bootstrap, "describe", &session, None, None, |_| {
+        let accepted_session = Arc::clone(&session);
+        let result = run_tui_prompt_with(
+            &bootstrap,
+            "describe",
+            &session,
+            None,
+            None,
+            move |request| {
+                assert_eq!(
+                    request.media_ids,
+                    vec![42],
+                    "accepted request owns the snapshot"
+                );
+                assert!(
+                    accepted_session
+                        .lock()
+                        .unwrap()
+                        .pending_media_ids
+                        .is_empty(),
+                    "accepted media must leave session staging before the provider runs"
+                );
+                Err(HeadlessChatFailure::from(CliError::configuration(
+                    "provider rejected the request",
+                )))
+            },
+        );
+        assert!(result.is_err(), "provider failure must surface");
+        assert!(session.lock().unwrap().pending_media_ids.is_empty());
+
+        let next = run_tui_prompt_with(&bootstrap, "text only", &session, None, None, |request| {
+            assert!(
+                request.media_ids.is_empty(),
+                "failed media must not be sent twice"
+            );
             Err(HeadlessChatFailure::from(CliError::configuration(
-                "model gpt-4.1-nano does not accept attachment mime application/pdf",
+                "stop after inspecting the next request",
             )))
         });
-        assert!(result.is_err(), "preflight-style failure must surface");
-        let locked = session.lock().unwrap();
-        assert_eq!(
-            locked.pending_media_ids,
-            vec![42],
-            "staged media must remain after early failure"
-        );
-        assert_eq!(locked.pending_media_mimes, vec!["image/png".to_owned()]);
+        assert!(next.is_err());
 
         std::fs::remove_dir_all(temporary).unwrap();
     }
 
-    /// Media staged while the model was answering belongs to the next prompt. A stash pop is
-    /// the destructive case: its durable row is already deleted, so clearing it on completion
-    /// would leave nothing anywhere.
+    /// Media staged while the model is answering belongs to the next prompt, even when it has the
+    /// same durable id as media already consumed by the accepted request.
     #[test]
-    fn a_completed_turn_clears_only_the_media_it_carried() {
+    fn accepted_media_consumption_does_not_subtract_media_staged_mid_turn() {
         let temporary = tui_session_directory("pending-media-mid-turn");
         let bootstrap = tui_session_bootstrap(&temporary, &[]);
         let store = SessionStore::open(bootstrap.data_directory()).unwrap();
@@ -1166,42 +1150,50 @@ mod tests {
         }
 
         let staged_mid_turn = Arc::clone(&session);
-        let result = run_tui_prompt_with(&bootstrap, "describe", &session, None, None, move |_| {
-            let mut locked = staged_mid_turn.lock().unwrap();
-            locked.pending_media_ids = vec![77];
-            locked.pending_media_mimes = vec!["application/pdf".to_owned()];
-            Ok(HeadlessChatCompletion {
-                text: "answered".into(),
-                metadata: SessionMetadata {
-                    id: 1,
-                    project,
-                    title: "conversation".into(),
-                    active_agent: "primary".into(),
-                    provider_id: None,
-                    model_id: None,
-                    reasoning_effort: None,
-                    created_at: 1,
-                    updated_at: 1,
-                    completed_turn_count: 1,
-                    resumable: true,
-                    parent_session_id: None,
-                    fork_message_count: None,
-                },
-                messages: Vec::new(),
-            })
-        });
+        let result = run_tui_prompt_with(
+            &bootstrap,
+            "describe",
+            &session,
+            None,
+            None,
+            move |request| {
+                assert_eq!(request.media_ids, vec![42]);
+                let mut locked = staged_mid_turn.lock().unwrap();
+                assert!(
+                    locked.pending_media_ids.is_empty(),
+                    "the accepted set must be consumed before the provider runs"
+                );
+                locked.push_pending_media(42, "image/png".to_owned());
+                Ok(HeadlessChatCompletion {
+                    text: "answered".into(),
+                    metadata: SessionMetadata {
+                        id: 1,
+                        project,
+                        title: "conversation".into(),
+                        active_agent: "primary".into(),
+                        provider_id: None,
+                        model_id: None,
+                        reasoning_effort: None,
+                        created_at: 1,
+                        updated_at: 1,
+                        completed_turn_count: 1,
+                        resumable: true,
+                        parent_session_id: None,
+                        fork_message_count: None,
+                    },
+                    messages: Vec::new(),
+                })
+            },
+        );
         assert!(result.is_ok(), "turn must complete: {result:?}");
 
         let locked = session.lock().unwrap();
         assert_eq!(
             locked.pending_media_ids,
-            vec![77],
+            vec![42],
             "media staged mid-turn must survive completion"
         );
-        assert_eq!(
-            locked.pending_media_mimes,
-            vec!["application/pdf".to_owned()]
-        );
+        assert_eq!(locked.pending_media_mimes, vec!["image/png".to_owned()]);
 
         drop(locked);
         std::fs::remove_dir_all(temporary).unwrap();

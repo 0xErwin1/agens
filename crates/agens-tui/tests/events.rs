@@ -3979,7 +3979,7 @@ fn attachment_token_is_not_provider_prompt_content() {
 }
 
 #[test]
-fn media_only_composer_submit_with_empty_text() {
+fn accepted_media_only_submit_consumes_staging_but_keeps_the_turn_snapshot() {
     let mut tui = Tui::new(FakeEngine::default());
     tui.set_staged_media(vec![PromptAttachment::new(1, "image/png")]);
     assert!(tui.input().is_empty());
@@ -3989,11 +3989,45 @@ fn media_only_composer_submit_with_empty_text() {
         matches!(action, Action::Submit(ref prompt) if prompt.is_empty()),
         "empty text with staged media must submit, got {action:?}"
     );
-    assert_eq!(
-        tui.media_chips(),
-        &["[Image #1]".to_owned()][..],
-        "chips stay until the provider turn succeeds"
+    tui.begin_submission("");
+
+    assert!(
+        tui.staged_media().is_empty(),
+        "accepted media must be consumed before completion"
     );
+    assert!(tui.media_chips().is_empty());
+    assert_eq!(
+        tui.view().conversation.expect("accepted live turn").user,
+        "[Image #1]",
+        "the accepted turn keeps its immutable media snapshot"
+    );
+}
+
+#[test]
+fn failed_or_cancelled_turn_does_not_restage_submitted_media() {
+    for outcome in [
+        TuiProviderOutcome::Failed {
+            message: "provider failed".into(),
+            action: "retry text only".into(),
+        },
+        TuiProviderOutcome::Cancelled {
+            message: "cancelled".into(),
+            action: "submit another prompt".into(),
+        },
+    ] {
+        let mut tui = Tui::new(FakeEngine::default());
+        tui.set_staged_media(vec![PromptAttachment::new(1, "image/png")]);
+        tui.begin_submission("first");
+        assert!(tui.staged_media().is_empty());
+
+        tui.finish_provider_turn(outcome);
+        assert!(tui.staged_media().is_empty());
+        assert!(tui.media_chips().is_empty());
+        assert_eq!(
+            submit_text(&mut tui, "text only"),
+            Action::Submit("text only".into())
+        );
+    }
 }
 
 #[test]
@@ -5937,7 +5971,7 @@ fn prompt_stash_push_and_pop_round_trip_restores_text_and_chips() {
         tui.handle(Event::Key(Key::CtrlS)),
         Action::SyncStagedMedia(chips.clone())
     );
-    assert_eq!(tui.input(), "draft with media");
+    assert_eq!(tui.input(), "draft with media[Image #1][File #2]");
     assert_eq!(tui.staged_media(), &chips[..]);
     assert_eq!(
         tui.media_chips(),
@@ -5972,7 +6006,7 @@ fn prompt_stash_ctrl_s_with_only_staged_attachments_pushes_instead_of_popping() 
         tui.handle(Event::Key(Key::CtrlS)),
         Action::SyncStagedMedia(chip.clone())
     );
-    assert!(tui.input().is_empty());
+    assert_eq!(tui.input(), "[Image #1]");
     assert_eq!(tui.staged_media(), &chip[..]);
     assert_eq!(tui.media_chips(), &["[Image #1]".to_owned()][..]);
 }
@@ -6012,11 +6046,11 @@ fn a_turn_completing_keeps_media_staged_after_it_started() {
         "the popped attachments must survive the turn that never carried them"
     );
     assert_eq!(tui.media_chips(), &["[File #1]".to_owned()][..]);
-    assert_eq!(tui.input(), "parked draft");
+    assert_eq!(tui.input(), "parked draft[File #1]");
 }
 
 #[test]
-fn a_turn_completing_clears_exactly_the_media_it_carried() {
+fn media_staged_while_a_turn_runs_survives_for_the_next_turn() {
     let mut tui = tui_with_prompt_memory();
     let sent = PromptAttachment::new(1, "image/png");
     let attached_mid_turn = PromptAttachment::new(4, "application/pdf");
@@ -6027,11 +6061,18 @@ fn a_turn_completing_clears_exactly_the_media_it_carried() {
         Action::Submit("with media".into())
     );
     tui.begin_submission("with media");
-    assert_eq!(tui.media_chips(), &["[Image #1]".to_owned()][..]);
+    assert!(
+        tui.staged_media().is_empty(),
+        "the accepted set is consumed before a new attachment is staged"
+    );
+    assert_eq!(
+        tui.view().conversation.expect("accepted live turn").user,
+        "with media\n[Image #1]"
+    );
 
     tui.apply_submission_outcome(TuiSubmissionOutcome::MediaAttached {
-        message: "Attached [File #2] from clipboard.".into(),
-        staged_media: vec![sent, attached_mid_turn.clone()],
+        message: "Attached [File #1] from clipboard.".into(),
+        staged_media: vec![attached_mid_turn.clone()],
     });
 
     tui.finish_provider_turn(TuiProviderOutcome::Completed("answer".into()));
@@ -6039,15 +6080,14 @@ fn a_turn_completing_clears_exactly_the_media_it_carried() {
     assert_eq!(
         tui.staged_media(),
         &[attached_mid_turn][..],
-        "only the attachment the turn carried is released"
+        "the newly staged attachment belongs only to the next turn"
     );
     assert_eq!(tui.media_chips(), &["[File #1]".to_owned()][..]);
 }
 
-/// A busy dialog or overlay clears the composer text; the chips belong to the session's
-/// staging and must not vanish from the surface behind its back.
+/// A busy dialog cannot restore attachments already consumed by the running turn.
 #[test]
-fn a_busy_overlay_leaves_staged_chips_alone() {
+fn a_busy_overlay_does_not_restage_the_running_turns_media() {
     let mut tui = tui_with_prompt_memory();
     let staged = vec![PromptAttachment::new(3, "image/png")];
 
@@ -6058,8 +6098,8 @@ fn a_busy_overlay_leaves_staged_chips_alone() {
     tui.apply_busy_submission_outcome(TuiSubmissionOutcome::PromptStashOverlay);
 
     assert!(tui.input().is_empty());
-    assert_eq!(tui.staged_media(), &staged[..]);
-    assert_eq!(tui.media_chips(), &["[Image #1]".to_owned()][..]);
+    assert!(tui.staged_media().is_empty());
+    assert!(tui.media_chips().is_empty());
 }
 
 #[test]
@@ -6073,7 +6113,6 @@ fn history_browse_restores_attachments_and_returns_staged_chips_with_draft() {
         submit_text(&mut tui, "with media"),
         Action::Submit("with media".into())
     );
-    // Chips stay staged until the turn completes; clear as a completed turn would.
     tui.clear_media_chips();
     assert_eq!(
         submit_text(&mut tui, "text only"),
@@ -6093,7 +6132,7 @@ fn history_browse_restores_attachments_and_returns_staged_chips_with_draft() {
         tui.handle(Event::Key(Key::Up)),
         Action::SyncStagedMedia(sent.clone())
     );
-    assert_eq!(tui.input(), "with media");
+    assert_eq!(tui.input(), "with media[Image #1]");
     assert_eq!(tui.media_chips(), &["[Image #1]".to_owned()][..]);
 
     assert_eq!(
@@ -6107,7 +6146,7 @@ fn history_browse_restores_attachments_and_returns_staged_chips_with_draft() {
         tui.handle(Event::Key(Key::Down)),
         Action::SyncStagedMedia(draft_chip.clone())
     );
-    assert_eq!(tui.input(), "");
+    assert_eq!(tui.input(), "[File #1]");
     assert_eq!(tui.staged_media(), &draft_chip[..]);
     assert_eq!(tui.media_chips(), &["[File #1]".to_owned()][..]);
 }
@@ -6132,7 +6171,7 @@ fn history_dedupe_treats_same_text_with_different_attachments_as_distinct() {
         tui.handle(Event::Key(Key::Up)),
         Action::SyncStagedMedia(vec![PromptAttachment::new(2, "image/png")])
     );
-    assert_eq!(tui.input(), "hello");
+    assert_eq!(tui.input(), "hello[Image #1]");
     let action = tui.handle(Event::Key(Key::Up));
     assert_eq!(action, Action::SyncStagedMedia(Vec::new()));
     assert_eq!(tui.input(), "hello");
@@ -6176,7 +6215,7 @@ fn prompt_overlay_paste_restores_chips_and_rows_mark_attachments() {
         tui.handle(Event::Key(Key::Enter)),
         Action::SyncStagedMedia(chips.clone())
     );
-    assert_eq!(tui.input(), "stash with media");
+    assert_eq!(tui.input(), "stash with media[Image #1]");
     assert_eq!(tui.staged_media(), &chips[..]);
     assert_eq!(tui.media_chips(), &["[Image #1]".to_owned()][..]);
     assert!(tui.view().dialog.is_none());
