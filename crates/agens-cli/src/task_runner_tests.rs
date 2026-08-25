@@ -11,12 +11,12 @@ use std::sync::{Arc, Mutex};
 use agens_bus::BridgeTx;
 use agens_core::ask_user::UnavailableAskUserPort;
 use agens_core::{
-    HeadlessTaskTerminal, HeadlessToolOutput, HeadlessTurnCancellation, HeadlessTurnError,
+    HeadlessTaskTerminal, HeadlessToolOutput, HeadlessTurnCancellation, HeadlessTurnError, Message,
     MessagePart, PermissionDecision, PermissionMode, PermissionPattern, PermissionPolicy,
-    PermissionRule, PermissionSession, SubagentErrorKind, SubagentStatus, TuiExecutionEvent,
-    TuiRuntimeEvent, TuiSubagentEvent, TurnEvent,
+    PermissionRule, PermissionSession, Role, SessionMessage, SubagentErrorKind, SubagentStatus,
+    TuiExecutionEvent, TuiRuntimeEvent, TuiSubagentEvent, TurnEvent,
 };
-use agens_dispatch::{TaskLaunchOutcome, TuiSelectedTaskLaunch};
+use agens_dispatch::{TaskLaunchOutcome, TaskLaunchRequest, TuiSelectedTaskLaunch};
 use agens_session::context::CompletedSubagentTurn;
 use agens_session::context::SessionContext;
 use agens_tool_runtime::child::ChildRunError;
@@ -425,6 +425,122 @@ fn p1c1_p1b_authorized_runner_persists_one_completed_background_subagent_turn() 
     std::fs::remove_dir_all(temporary).unwrap();
 }
 
+#[test]
+fn selected_background_multimodal_completion_persists_once_from_fresh_and_notifies_once() {
+    let temporary = tui_session_directory("selected-background-multimodal-fresh");
+    let bootstrap = tui_session_bootstrap(
+        &temporary,
+        &[(
+            "reviewer",
+            "---\nname: reviewer\ndescription: reviewer\nmode: subagent\npermissions: []\n---\nReview work.\n",
+        )],
+    );
+    let first =
+        agens_store::ingest_media_bytes(bootstrap.data_directory(), b"first", "image/png").unwrap();
+    let second =
+        agens_store::ingest_media_bytes(bootstrap.data_directory(), b"second", "image/jpeg")
+            .unwrap();
+    let user = SessionMessage::try_from(Message {
+        role: Role::User,
+        parts: vec![
+            MessagePart::Media {
+                media_id: first.id,
+                mime: first.mime,
+            },
+            MessagePart::Text("between".into()),
+            MessagePart::Media {
+                media_id: second.id,
+                mime: second.mime,
+            },
+        ],
+    })
+    .unwrap();
+    let (events, _receiver) = BridgeTx::bounded(16);
+    let controls = TuiTaskControls::default();
+    let session = Arc::new(Mutex::new(SessionContext {
+        selected_subagent: Some("reviewer".into()),
+        ..SessionContext::fresh()
+    }));
+    let lifecycle_bridge = TuiTaskLifecycleBridge::new(events, controls.clone())
+        .with_session_writer(bootstrap.clone(), Arc::clone(&session));
+    let mut runtime = production_tui_task_runtime_with_runner(
+        &bootstrap,
+        &agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap),
+        &SkillCatalog::default(),
+        Box::new(TuiPermissionPrompter(
+            production_tui_permission_bridge().0,
+            None,
+        )),
+        ProductionTaskRunner::with_progress_probe(
+            bootstrap.clone(),
+            agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap),
+            Arc::new(Mutex::new(Vec::new())),
+            vec![TurnEvent::ProviderPart(MessagePart::Text("done".into()))],
+        )
+        .with_lifecycle_bridge(lifecycle_bridge),
+        Box::new(UnavailableAskUserPort),
+    )
+    .unwrap();
+    runtime.authorized.gate.policy = PermissionPolicy::new(
+        PermissionMode::Edit,
+        vec![PermissionRule::global(
+            PermissionDecision::Allow,
+            PermissionPattern::Exact("native::task".into()),
+            PermissionPattern::Any,
+        )],
+    );
+    let cancellation = HeadlessTurnCancellation::new();
+
+    assert!(matches!(
+        runtime.authorized.launch(
+            TaskLaunchRequest {
+                agent: "reviewer",
+                description: "between",
+                background: true,
+                user_message: user.clone(),
+            },
+            &cancellation,
+        ),
+        Ok(TaskLaunchOutcome::Dispatched(output)) if !output.is_error
+    ));
+
+    let identifier =
+        agens_tui_app::test_support::wait_for("fresh selected completion to persist", || {
+            session.lock().unwrap().identifier
+        });
+    let stored = SessionStore::open(bootstrap.data_directory())
+        .unwrap()
+        .load_session_for_resume(identifier)
+        .unwrap();
+    assert_eq!(stored.metadata.completed_turn_count, 1);
+    assert_eq!(stored.messages[0], *user.as_message());
+    assert_eq!(
+        stored
+            .messages
+            .iter()
+            .filter(|message| message.role == Role::User)
+            .count(),
+        1
+    );
+
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let notices = controls
+        .0
+        .drain_messages(agens_tools::TaskMessageTarget::Main);
+    assert_eq!(
+        notices.len(),
+        1,
+        "the selected background completion notice is exact-once"
+    );
+    assert!(
+        notices[0]
+            .content()
+            .contains("subagent #1 (reviewer) finished")
+    );
+
+    std::fs::remove_dir_all(temporary).unwrap();
+}
+
 /// A foreground parent already holds the result inline. Persisting a synthetic
 /// copy of the exchange it is about to record itself doubles the context every
 /// later turn and every resume replays, and the mailbox notice asks the parent
@@ -475,6 +591,7 @@ fn a_foreground_subagent_neither_persists_a_turn_nor_notifies_the_main_thread() 
         .persist_completed
         .clone()
         .expect("the counting writer is installed");
+    let lifecycle_probe = lifecycle_bridge.clone();
     let mut runtime = production_tui_task_runtime_with_runner(
         &bootstrap,
         &agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap),
@@ -546,6 +663,11 @@ fn a_foreground_subagent_neither_persists_a_turn_nor_notifies_the_main_thread() 
         persist_calls.load(std::sync::atomic::Ordering::Acquire),
         0,
         "a foreground subagent must not persist a turn of its own"
+    );
+    assert_eq!(
+        lifecycle_probe.trusted_message_count(),
+        0,
+        "terminal foreground execution must release its trusted message"
     );
     let stored = SessionStore::open(bootstrap.data_directory())
         .unwrap()

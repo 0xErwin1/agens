@@ -8,7 +8,7 @@
 use agens_core::{
     HeadlessPermissionGate, HeadlessPermissionResolver, HeadlessToolCall, HeadlessToolDispatcher,
     HeadlessToolOutput, HeadlessTurnCancellation, HeadlessTurnPortError, PermissionDecision,
-    SubmitOrigin,
+    SessionMessage, SubmitOrigin,
 };
 use agens_permissions::{
     PermissionPrompter, ProductionPermissionGate, ProductionPermissionResolver,
@@ -20,6 +20,7 @@ pub struct TaskLaunchRequest<'a> {
     pub agent: &'a str,
     pub description: &'a str,
     pub background: bool,
+    pub user_message: SessionMessage,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -50,7 +51,7 @@ impl<P: PermissionPrompter> AuthorizedNativeTaskRuntime<P> {
         request: TaskLaunchRequest<'_>,
         cancellation: &HeadlessTurnCancellation,
     ) -> Result<TaskLaunchOutcome, HeadlessTurnPortError> {
-        if request.agent.trim().is_empty() || request.description.trim().is_empty() {
+        if request.agent.trim().is_empty() {
             return Ok(TaskLaunchOutcome::RejectedEmptyInput);
         }
         if cancellation.is_cancelled() {
@@ -66,7 +67,11 @@ impl<P: PermissionPrompter> AuthorizedNativeTaskRuntime<P> {
             name: "native::task".into(),
             input: serde_json::json!({
                 "agent": request.agent,
-                "description": request.description,
+                "description": if request.description.is_empty() {
+                    "[selected media-only submission]"
+                } else {
+                    request.description
+                },
                 "background": request.background,
             })
             .to_string(),
@@ -82,6 +87,8 @@ impl<P: PermissionPrompter> AuthorizedNativeTaskRuntime<P> {
             return Ok(TaskLaunchOutcome::Denied);
         }
 
+        self.dispatcher
+            .bind_trusted_task(&call, request.user_message)?;
         poll_permission_port(self.dispatcher.dispatch(call, cancellation))
             .map(TaskLaunchOutcome::Dispatched)
     }

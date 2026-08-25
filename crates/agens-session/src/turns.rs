@@ -301,6 +301,22 @@ pub fn completed_subagent_session_turn(
     turn: &CompletedSubagentTurn,
     call_id: &str,
 ) -> Result<CompletedSessionTurn, CliError> {
+    completed_subagent_session_turn_with_user_message(turn, call_id, None)
+}
+
+pub fn completed_selected_subagent_session_turn(
+    turn: &CompletedSubagentTurn,
+    call_id: &str,
+    user: &SessionMessage,
+) -> Result<CompletedSessionTurn, CliError> {
+    completed_subagent_session_turn_with_user_message(turn, call_id, Some(user))
+}
+
+fn completed_subagent_session_turn_with_user_message(
+    turn: &CompletedSubagentTurn,
+    call_id: &str,
+    user: Option<&SessionMessage>,
+) -> Result<CompletedSessionTurn, CliError> {
     let call_id = call_id.to_owned();
     let agent = sanitize_subagent_summary(&turn.agent);
     let task = sanitize_subagent_summary(&turn.task);
@@ -316,10 +332,13 @@ pub fn completed_subagent_session_turn(
         is_error: false,
     });
     let messages = vec![
-        Message {
-            role: Role::User,
-            parts: vec![MessagePart::Text(task)],
-        },
+        user.map_or_else(
+            || Message {
+                role: Role::User,
+                parts: vec![MessagePart::Text(task)],
+            },
+            |message| message.as_message().clone(),
+        ),
         Message {
             role: Role::Assistant,
             parts: vec![
@@ -435,19 +454,42 @@ pub fn persist_completed_subagent_turn(
     session: &Arc<Mutex<SessionContext>>,
     turn: CompletedSubagentTurn,
 ) -> Result<(), CliError> {
+    persist_completed_subagent_turn_inner(bootstrap, session, turn, None)
+}
+
+pub fn persist_completed_selected_subagent_turn(
+    bootstrap: &Bootstrap,
+    session: &Arc<Mutex<SessionContext>>,
+    turn: CompletedSubagentTurn,
+    user: SessionMessage,
+) -> Result<(), CliError> {
+    persist_completed_subagent_turn_inner(bootstrap, session, turn, Some(user))
+}
+
+fn persist_completed_subagent_turn_inner(
+    bootstrap: &Bootstrap,
+    session: &Arc<Mutex<SessionContext>>,
+    turn: CompletedSubagentTurn,
+    user: Option<SessionMessage>,
+) -> Result<(), CliError> {
     let mut context = session
         .lock()
         .map_err(|_| CliError::storage("TUI session is unavailable"))?;
-    let Some(identifier) = context.identifier else {
+    if context.identifier.is_none() && user.is_none() {
         return Err(CliError::storage(
             "this session has no persisted turn to append a subagent result to",
         ));
-    };
+    }
     let mut store = SessionStore::open(bootstrap.data_directory())
         .map_err(|_| CliError::storage("sessions database is unavailable"))?;
-    let persisted = store
-        .load_session_for_resume(identifier)
-        .map_err(|_| CliError::storage("completed session could not be loaded"))?;
+    let persisted = context
+        .identifier
+        .map(|identifier| {
+            store
+                .load_session_for_resume(identifier)
+                .map_err(|_| CliError::storage("completed session could not be loaded"))
+        })
+        .transpose()?;
     let provider = context.provider.map(persisted_provider_identifier);
     let model = context
         .selection
@@ -463,25 +505,28 @@ pub fn persist_completed_subagent_turn(
         .active_agent
         .as_ref()
         .map(|agent| agent.name.as_str());
-    // The row this session already occupies, resolved from the store rather
-    // than from the in-memory context: an empty `metadata` beside a live
-    // identifier would otherwise be read as "no session yet" and mint a second
-    // one, which is the fork this guard exists to prevent.
     let metadata = next_session_metadata(
         bootstrap,
         &turn.task,
-        Some(context.metadata.as_ref().unwrap_or(&persisted.metadata)),
+        context
+            .metadata
+            .as_ref()
+            .or_else(|| persisted.as_ref().map(|persisted| &persisted.metadata)),
         active_agent,
         provider,
         model,
         None,
     )?;
-    let call_id = next_subagent_call_id(&persisted.messages);
+    let history = persisted
+        .as_ref()
+        .map_or(&[][..], |persisted| persisted.messages.as_slice());
+    let call_id = next_subagent_call_id(history);
+    let completed = match user.as_ref() {
+        Some(user) => completed_selected_subagent_session_turn(&turn, &call_id, user)?,
+        None => completed_subagent_session_turn(&turn, &call_id)?,
+    };
     let metadata = store
-        .persist_completed_session_turn(
-            &metadata,
-            &completed_subagent_session_turn(&turn, &call_id)?,
-        )
+        .persist_completed_session_turn(&metadata, &completed)
         .map_err(|_| CliError::storage("completed session could not be saved"))?;
     let messages = store
         .load_session_for_resume(metadata.id)
@@ -724,6 +769,106 @@ mod tests {
                 is_error: false,
             }]
         );
+    }
+
+    #[test]
+    fn completed_selected_background_turn_starts_a_fresh_session_with_canonical_user_once() {
+        let temporary = agens_fixtures::session_directory("selected-background-fresh");
+        let bootstrap = agens_fixtures::session_bootstrap(&temporary, &[]);
+        let session = Arc::new(Mutex::new(SessionContext::fresh()));
+        let first =
+            agens_store::ingest_media_bytes(bootstrap.data_directory(), b"first", "image/png")
+                .unwrap();
+        let second =
+            agens_store::ingest_media_bytes(bootstrap.data_directory(), b"second", "image/jpeg")
+                .unwrap();
+        let user = SessionMessage::try_from(Message {
+            role: Role::User,
+            parts: vec![
+                MessagePart::Media {
+                    media_id: first.id,
+                    mime: first.mime,
+                },
+                MessagePart::Text("between".into()),
+                MessagePart::Media {
+                    media_id: second.id,
+                    mime: second.mime,
+                },
+            ],
+        })
+        .unwrap();
+        let turn = CompletedSubagentTurn {
+            id: 1,
+            agent: "reviewer".into(),
+            task: "between".into(),
+            final_result: "done".into(),
+            tool_uses: 0,
+        };
+
+        persist_completed_selected_subagent_turn(&bootstrap, &session, turn, user.clone()).unwrap();
+
+        let identifier = session
+            .lock()
+            .unwrap()
+            .identifier
+            .expect("fresh selected completion should establish a session");
+        let stored = SessionStore::open(bootstrap.data_directory())
+            .unwrap()
+            .load_session_for_resume(identifier)
+            .unwrap();
+        assert_eq!(stored.messages[0], *user.as_message());
+        assert_eq!(
+            stored
+                .messages
+                .iter()
+                .filter(|message| message.role == Role::User)
+                .count(),
+            1
+        );
+        assert_eq!(stored.messages[1].role, Role::Assistant);
+        assert_eq!(stored.messages[2].role, Role::Tool);
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn selected_subagent_turn_persists_canonical_user_once_before_completion() {
+        let user = SessionMessage::try_from(Message {
+            role: Role::User,
+            parts: vec![
+                MessagePart::Media {
+                    media_id: 3,
+                    mime: "image/png".into(),
+                },
+                MessagePart::Text("between".into()),
+                MessagePart::Media {
+                    media_id: 4,
+                    mime: "image/jpeg".into(),
+                },
+            ],
+        })
+        .unwrap();
+        let turn = CompletedSubagentTurn {
+            id: 1,
+            agent: "reviewer".into(),
+            task: "between".into(),
+            final_result: "done".into(),
+            tool_uses: 0,
+        };
+
+        let completed =
+            completed_selected_subagent_session_turn(&turn, "subagent:1", &user).unwrap();
+        assert_eq!(&completed.messages()[0], user.as_message());
+        assert_eq!(
+            completed
+                .messages()
+                .iter()
+                .filter(|message| message.role == Role::User)
+                .count(),
+            1
+        );
+        assert_eq!(completed.messages()[1].role, Role::Assistant);
+        assert_eq!(completed.messages()[2].role, Role::Tool);
     }
 
     #[test]

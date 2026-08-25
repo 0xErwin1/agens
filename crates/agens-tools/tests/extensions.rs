@@ -670,6 +670,15 @@ fn task_dispatch_resolves_only_subagents_and_validated_requested_configuration()
         TaskInvocation::from_value(serde_json::json!({"description":"x","unexpected":true}))
             .is_err()
     );
+    for forbidden in ["media_ids", "message"] {
+        assert!(
+            TaskInvocation::from_value(serde_json::json!({
+                "description": "x",
+                forbidden: [7]
+            }))
+            .is_err()
+        );
+    }
     assert_eq!(
         TaskTool::<RecordingTaskRunner>::input_schema(),
         serde_json::json!({"type":"object","additionalProperties":false,"required":["description"],"properties":{"agent":{"type":"string","minLength":1,"maxLength":64},"background":{"type":"boolean","description":"Use background only when you can do other work or should return control to the user. For one delegation whose result is needed now, use foreground: it waits in this turn and avoids a follow-up turn. After a background call, end this turn; its terminal notice is delivered on the next turn. Use task_message to steer the child while it runs. Only background calls run concurrently: several foreground calls issued together are executed one after another."},"description":{"type":"string","minLength":1,"maxLength":16384},"model":{"type":"string","minLength":1,"maxLength":64,"description":"Omit this. The agent's configured profile then decides the model, falling back to this thread's model. Send it only when the user explicitly asked for a specific model for this call: an explicit value overrides the configured profile. A model this run cannot reach falls back to this thread's model and says so."},"skills":{"type":"array","maxItems":128,"uniqueItems":true,"items":{"type":"string","minLength":1,"maxLength":64}}}})
@@ -2639,7 +2648,11 @@ impl TaskRunner for RecordingTaskRunner {
                     .map(TaskSkill::name)
                     .unwrap_or("none"),
                 request.description()
-            ),
+            ) + if request.user_message().is_some() {
+                ":trusted"
+            } else {
+                ""
+            },
         })
     }
 }

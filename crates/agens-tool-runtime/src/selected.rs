@@ -7,7 +7,9 @@
 
 use std::sync::{Arc, Mutex};
 
-use agens_core::{HeadlessTurnCancellation, HeadlessTurnError, HeadlessTurnPortError};
+use agens_core::{
+    HeadlessTurnCancellation, HeadlessTurnError, HeadlessTurnPortError, SessionMessage,
+};
 use agens_dispatch::{TaskLaunchOutcome, TaskLaunchRequest, TuiSelectedTaskLaunch};
 use agens_error::{CliError, ExitStatus};
 use agens_session::context::SessionContext;
@@ -20,6 +22,34 @@ pub fn launch_selected_task(
     runtime: &mut ProductionTuiTaskRuntime,
     session: &Arc<Mutex<SessionContext>>,
     description: &str,
+    background: bool,
+    cancellation: &HeadlessTurnCancellation,
+) -> Result<TuiSelectedTaskLaunch, CliError> {
+    if description.trim().is_empty() {
+        return Ok(TuiSelectedTaskLaunch::Rejected(
+            TaskLaunchOutcome::RejectedEmptyInput,
+        ));
+    }
+    let user_message = SessionMessage::try_from(agens_core::Message {
+        role: agens_core::Role::User,
+        parts: vec![agens_core::MessagePart::Text(description.to_owned())],
+    })
+    .map_err(|_| CliError::usage("subagent task is empty"))?;
+    launch_selected_task_message(
+        runtime,
+        session,
+        description,
+        user_message,
+        background,
+        cancellation,
+    )
+}
+
+fn launch_selected_task_message(
+    runtime: &mut ProductionTuiTaskRuntime,
+    session: &Arc<Mutex<SessionContext>>,
+    description: &str,
+    user_message: SessionMessage,
     background: bool,
     cancellation: &HeadlessTurnCancellation,
 ) -> Result<TuiSelectedTaskLaunch, CliError> {
@@ -37,6 +67,7 @@ pub fn launch_selected_task(
             agent: &agent,
             description,
             background,
+            user_message,
         },
         cancellation,
     ) {

@@ -2,14 +2,14 @@
 //! that drives an isolated subagent turn to completion, reporting progress
 //! and terminal results back to the TUI.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use agens_bus::{BridgeCancel, BridgeTx};
 #[cfg(any(test, feature = "probe"))]
 use agens_core::HeadlessTurnError;
-use agens_core::{MessagePart, TurnEvent, TurnProgressSink};
+use agens_core::{MessagePart, SessionMessage, TurnEvent, TurnProgressSink};
 use agens_core::{SubagentErrorKind, SubagentStatus};
 use agens_core::{TuiExecutionEvent, TuiRuntimeEvent, TuiSubagentEvent};
 use agens_tools::{
@@ -24,7 +24,9 @@ use agens_permissions::ParseToolInput;
 use agens_permissions::sanitize_metric;
 use agens_session::context::SessionContext;
 use agens_session::context::{CompletedSubagentTurn, current_session_timestamp};
-use agens_session::turns::persist_completed_subagent_turn;
+use agens_session::turns::{
+    persist_completed_selected_subagent_turn, persist_completed_subagent_turn,
+};
 
 #[cfg(any(test, feature = "probe"))]
 type ProductionTaskProbe = Arc<
@@ -77,7 +79,11 @@ pub struct TuiTaskLifecycleBridge {
     lifecycle: Arc<Mutex<Option<TaskExecutionLifecycle>>>,
     terminal_results: Arc<Mutex<BTreeMap<u64, String>>>,
     completed_turns: Arc<Mutex<BTreeMap<u64, CompletedSubagentTurn>>>,
+    trusted_messages: Arc<Mutex<BTreeMap<u64, SessionMessage>>>,
+    observed_executions: Arc<Mutex<BTreeSet<u64>>>,
     pub persist_completed: Option<Arc<dyn Fn(CompletedSubagentTurn) -> bool + Send + Sync>>,
+    persist_selected_completed:
+        Option<Arc<dyn Fn(CompletedSubagentTurn, SessionMessage) -> bool + Send + Sync>>,
 }
 
 impl TuiTaskLifecycleBridge {
@@ -88,7 +94,10 @@ impl TuiTaskLifecycleBridge {
             lifecycle: Arc::new(Mutex::new(None)),
             terminal_results: Arc::new(Mutex::new(BTreeMap::new())),
             completed_turns: Arc::new(Mutex::new(BTreeMap::new())),
+            trusted_messages: Arc::new(Mutex::new(BTreeMap::new())),
+            observed_executions: Arc::new(Mutex::new(BTreeSet::new())),
             persist_completed: None,
+            persist_selected_completed: None,
         }
     }
 
@@ -98,6 +107,31 @@ impl TuiTaskLifecycleBridge {
         session: Arc<Mutex<SessionContext>>,
     ) -> Self {
         let events = self.events.clone();
+        let selected_events = events.clone();
+        let selected_bootstrap = bootstrap.clone();
+        let selected_session = Arc::clone(&session);
+        self.persist_selected_completed = Some(Arc::new(move |turn, user| {
+            let id = turn.id;
+            if persist_completed_selected_subagent_turn(
+                &selected_bootstrap,
+                &selected_session,
+                turn,
+                user,
+            )
+            .is_err()
+            {
+                let _publish_outcome = selected_events.publish(
+                    TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::error(
+                        id,
+                        SubagentErrorKind::ResultDelivery,
+                    )),
+                    &BridgeCancel::new(),
+                    None,
+                );
+                return false;
+            }
+            true
+        }));
         self.persist_completed = Some(Arc::new(move |turn: CompletedSubagentTurn| {
             let id = turn.id;
             if persist_completed_subagent_turn(&bootstrap, &session, turn).is_err() {
@@ -121,8 +155,22 @@ impl TuiTaskLifecycleBridge {
         Some(lifecycle.as_ref()?.mode())
     }
 
+    #[cfg(any(test, feature = "probe"))]
+    pub fn trusted_message_count(&self) -> usize {
+        self.trusted_messages
+            .lock()
+            .map_or(0, |messages| messages.len())
+    }
+
     fn observe(&self, request: &TaskTurnRequest, lifecycle: TaskExecutionLifecycle) {
         let id = lifecycle.id().value();
+        let first_observer = self
+            .observed_executions
+            .lock()
+            .is_ok_and(|mut observed| observed.insert(id));
+        if !first_observer {
+            return;
+        }
         if let Ok(mut current) = self.lifecycle.lock() {
             *current = Some(lifecycle.clone());
         }
@@ -131,6 +179,11 @@ impl TuiTaskLifecycleBridge {
             TaskLaunchMode::Background => agens_core::TuiExecutionState::BackgroundRunning,
         };
         let agent = request.agent_name().to_owned();
+        if let Some(message) = request.user_message()
+            && let Ok(mut messages) = self.trusted_messages.lock()
+        {
+            messages.insert(id, message.clone());
+        }
         if let Ok(mut turns) = self.completed_turns.lock() {
             turns.insert(
                 id,
@@ -172,7 +225,9 @@ impl TuiTaskLifecycleBridge {
         let registry = self.controls.0.clone();
         let terminal_results = Arc::clone(&self.terminal_results);
         let completed_turns = Arc::clone(&self.completed_turns);
+        let trusted_messages = Arc::clone(&self.trusted_messages);
         let persist_completed = self.persist_completed.clone();
+        let persist_selected_completed = self.persist_selected_completed.clone();
         std::thread::spawn(move || {
             let mut seen = 1;
             let mut cancellation_requested = false;
@@ -254,6 +309,10 @@ impl TuiTaskLifecycleBridge {
                             .lock()
                             .ok()
                             .and_then(|mut turns| turns.remove(&id));
+                        let trusted_message = trusted_messages
+                            .lock()
+                            .ok()
+                            .and_then(|mut messages| messages.remove(&id));
                         // Both of these exist to tell a parent about work it
                         // was not waiting for. A foreground parent already
                         // holds this result inline, so the notice asks it to
@@ -262,8 +321,16 @@ impl TuiTaskLifecycleBridge {
                         // is about to persist itself.
                         if lifecycle.mode() == TaskLaunchMode::Background {
                             let persisted = matches!(event, TuiExecutionEvent::Completed { .. })
-                                && match (completed_turn, &persist_completed) {
-                                    (Some(turn), Some(persist)) => persist(turn),
+                                && match (
+                                    completed_turn,
+                                    trusted_message,
+                                    &persist_selected_completed,
+                                    &persist_completed,
+                                ) {
+                                    (Some(turn), Some(user), Some(persist), _) => {
+                                        persist(turn, user)
+                                    }
+                                    (Some(turn), None, _, Some(persist)) => persist(turn),
                                     _ => false,
                                 };
                             notify_main_of_terminal_subagent(

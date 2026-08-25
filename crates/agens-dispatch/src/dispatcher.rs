@@ -9,7 +9,7 @@ use agens_core::mcp_failure::McpFailure;
 use agens_core::redaction::{bounded_detail, redact_absolute_paths, redact_credential_values};
 use agens_core::{
     HeadlessToolCall, HeadlessToolDispatcher, HeadlessToolOutput, HeadlessTurnCancellation,
-    HeadlessTurnPortError,
+    HeadlessTurnPortError, SessionMessage,
 };
 use agens_permissions::{AllowedNativeCall, SharedToolDispatcher};
 use agens_tools::{ToolExecutionContext, ToolOutput};
@@ -29,6 +29,66 @@ impl ProductionToolDispatcher {
             allowed,
         }
     }
+
+    /// Attaches canonical selected-subagent content to the already-authorized,
+    /// one-shot call before dispatcher execution. The payload cannot be supplied
+    /// through task JSON and is consumed with the authorization.
+    pub fn bind_trusted_task(
+        &mut self,
+        call: &HeadlessToolCall,
+        message: SessionMessage,
+    ) -> Result<(), HeadlessTurnPortError> {
+        let mut allowed = self
+            .allowed
+            .lock()
+            .map_err(|_| HeadlessTurnPortError::Tool)?;
+        let allowed_call = allowed
+            .get_mut(&call.id)
+            .ok_or(HeadlessTurnPortError::Tool)?;
+        if allowed_call.name != call.name || allowed_call.input != call.input {
+            return Err(HeadlessTurnPortError::Tool);
+        }
+        let handle = allowed
+            .remove(&call.id)
+            .ok_or(HeadlessTurnPortError::Tool)?
+            .handle
+            .bind_trusted_task_message(message);
+        allowed.insert(
+            call.id.clone(),
+            AllowedNativeCall {
+                name: call.name.clone(),
+                input: call.input.clone(),
+                handle,
+            },
+        );
+        Ok(())
+    }
+
+    fn dispatch_call(
+        &mut self,
+        call: HeadlessToolCall,
+        cancellation: &HeadlessTurnCancellation,
+    ) -> Result<HeadlessToolOutput, HeadlessTurnPortError> {
+        // Acquire the execution lock before consuming the one-shot authorization.
+        // Therefore every error returned before `execute` leaves dispatch unstarted.
+        let mut dispatcher = self
+            .dispatcher
+            .lock()
+            .map_err(|_| HeadlessTurnPortError::Tool)?;
+        let allowed_call = self
+            .allowed
+            .lock()
+            .map_err(|_| HeadlessTurnPortError::Tool)
+            .and_then(|mut allowed| {
+                let allowed_call = allowed.get(&call.id).ok_or(HeadlessTurnPortError::Tool)?;
+                if allowed_call.name != call.name || allowed_call.input != call.input {
+                    return Err(HeadlessTurnPortError::Tool);
+                }
+                allowed.remove(&call.id).ok_or(HeadlessTurnPortError::Tool)
+            })?;
+        let context = ToolExecutionContext::from_headless_adapter(cancellation.adapter_view());
+        headless_execution_result(dispatcher.execute(allowed_call.handle, &context))
+    }
 }
 
 impl HeadlessToolDispatcher for ProductionToolDispatcher {
@@ -38,30 +98,7 @@ impl HeadlessToolDispatcher for ProductionToolDispatcher {
         cancellation: &HeadlessTurnCancellation,
     ) -> impl std::future::Future<Output = Result<HeadlessToolOutput, HeadlessTurnPortError>> + Send
     {
-        let allowed = self
-            .allowed
-            .lock()
-            .map_err(|_| HeadlessTurnPortError::Tool)
-            .and_then(|mut allowed| {
-                let allowed_call = allowed.get(&call.id).ok_or(HeadlessTurnPortError::Tool)?;
-
-                if allowed_call.name != call.name || allowed_call.input != call.input {
-                    return Err(HeadlessTurnPortError::Tool);
-                }
-
-                allowed.remove(&call.id).ok_or(HeadlessTurnPortError::Tool)
-            });
-        let output = allowed.and_then(|allowed| {
-            let result = self
-                .dispatcher
-                .lock()
-                .map_err(|_| HeadlessTurnPortError::Tool)?
-                .execute(
-                    allowed.handle,
-                    &ToolExecutionContext::from_headless_adapter(cancellation.adapter_view()),
-                );
-            headless_execution_result(result)
-        });
+        let output = self.dispatch_call(call, cancellation);
         std::future::ready(output)
     }
 }

@@ -51,13 +51,10 @@ use agens_session::undo::{
 use agens_store::{PromptMemoryStore, SessionStore};
 use agens_tool_runtime::runner::{ProductionTaskRunner, TuiTaskControls, TuiTaskLifecycleBridge};
 use agens_tool_runtime::runtime::task_execution_limits;
+use agens_tool_runtime::selected_task_skips_parent as selected_tui_task_skips_parent;
 use agens_tool_runtime::task::{
     production_tui_task_runtime_with_cancellation,
     production_tui_task_runtime_with_runner_parent_config_and_cancellation,
-};
-use agens_tool_runtime::{
-    launch_selected_task as launch_selected_tui_task,
-    selected_task_skips_parent as selected_tui_task_skips_parent,
 };
 
 pub struct ProductionTuiEngine {
@@ -394,24 +391,45 @@ pub fn run_production_tui_with_options(
             {
                 return tui_provider_outcome(Err(error));
             }
-            let selected_launch = if let Some(task_runtime) = selected_runtime.as_mut() {
-                selected_tui_task_skips_parent(
-                    launch_selected_tui_task(
-                        task_runtime,
-                        &router.session,
-                        &prompt,
-                        matches!(origin, SubmitOrigin::Background),
-                        &turn_cancellation,
-                    ),
-                    &lifecycle_bridge,
-                )
+            let selected_payload = if selected_runtime.is_some() {
+                match claim_selected_submission(&runtime_bootstrap, &router.session, &message) {
+                    Ok(payload) => payload,
+                    Err(error) => return tui_provider_outcome(Err(error)),
+                }
             } else {
-                Ok(false)
+                None
             };
-            match selected_launch {
-                Ok(true) => return TuiProviderOutcome::Backgrounded,
-                Ok(false) => {}
-                Err(error) => return tui_provider_outcome(Err(error)),
+            if let (Some(task_runtime), Some(claimed)) =
+                (selected_runtime.as_mut(), selected_payload)
+            {
+                let (launch, dispatch_began) = launch_selected_tui_task_with_message(
+                    task_runtime,
+                    &router.session,
+                    &prompt,
+                    claimed.message,
+                    matches!(origin, SubmitOrigin::Background),
+                    &turn_cancellation,
+                );
+                if !dispatch_began
+                    && let Err(error) = restore_claimed_media(&router.session, claimed.media)
+                {
+                    return tui_provider_outcome(Err(error));
+                }
+                let background = match (origin, launch) {
+                    (
+                        SubmitOrigin::Background,
+                        Ok(agens_dispatch::TuiSelectedTaskLaunch::Dispatched),
+                    ) => Ok(true),
+                    (_, launch) => selected_tui_task_skips_parent(launch, &lifecycle_bridge),
+                };
+                match background {
+                    Ok(true) => return TuiProviderOutcome::Backgrounded,
+                    Ok(false) if dispatch_began => {
+                        return TuiProviderOutcome::Completed(String::new());
+                    }
+                    Ok(false) => {}
+                    Err(error) => return tui_provider_outcome(Err(error)),
+                }
             }
             let notice_metrics = Arc::clone(&metrics);
             let snapshot_notice = move |text: String| {
@@ -619,6 +637,135 @@ pub fn run_tui_prompt(
             )
         }),
     }
+}
+
+fn launch_selected_tui_task_with_message(
+    runtime: &mut agens_tool_runtime::task::ProductionTuiTaskRuntime,
+    session: &Arc<Mutex<SessionContext>>,
+    description: &str,
+    user_message: agens_core::SessionMessage,
+    background: bool,
+    cancellation: &HeadlessTurnCancellation,
+) -> (
+    Result<agens_dispatch::TuiSelectedTaskLaunch, CliError>,
+    bool,
+) {
+    let agent = match session.lock() {
+        Ok(mut session) => session.selected_subagent.take(),
+        Err(_) => {
+            return (
+                Err(CliError::new(
+                    ExitStatus::Failure,
+                    "ui",
+                    "TUI session is unavailable",
+                )),
+                false,
+            );
+        }
+    };
+    let Some(agent) = agent else {
+        return (
+            Ok(agens_dispatch::TuiSelectedTaskLaunch::NotSelected),
+            false,
+        );
+    };
+    let outcome = runtime.authorized.launch(
+        agens_dispatch::TaskLaunchRequest {
+            agent: &agent,
+            description,
+            background,
+            user_message,
+        },
+        cancellation,
+    );
+    let dispatch_began = matches!(
+        outcome,
+        Ok(agens_dispatch::TaskLaunchOutcome::Dispatched(_))
+    );
+    let launch = match outcome {
+        Ok(agens_dispatch::TaskLaunchOutcome::Dispatched(output)) if !output.is_error => {
+            Ok(agens_dispatch::TuiSelectedTaskLaunch::Dispatched)
+        }
+        Ok(agens_dispatch::TaskLaunchOutcome::Dispatched(_)) if cancellation.is_cancelled() => {
+            Err(CliError::runtime(HeadlessTurnError::Cancelled))
+        }
+        Ok(agens_dispatch::TaskLaunchOutcome::Dispatched(_)) if cancellation.is_expired() => {
+            Err(CliError::runtime(HeadlessTurnError::TimedOut))
+        }
+        Ok(agens_dispatch::TaskLaunchOutcome::Dispatched(_)) => {
+            Err(CliError::runtime(HeadlessTurnError::Tool))
+        }
+        Ok(outcome) => Ok(agens_dispatch::TuiSelectedTaskLaunch::Rejected(outcome)),
+        Err(agens_core::HeadlessTurnPortError::Cancelled) => {
+            Err(CliError::runtime(HeadlessTurnError::Cancelled))
+        }
+        Err(agens_core::HeadlessTurnPortError::TimedOut) => {
+            Err(CliError::runtime(HeadlessTurnError::TimedOut))
+        }
+        Err(_) => Err(CliError::runtime(HeadlessTurnError::Tool)),
+    };
+    (launch, dispatch_began)
+}
+
+struct SelectedSubmissionClaim {
+    message: agens_core::SessionMessage,
+    media: Vec<(i64, String)>,
+}
+
+fn claim_selected_submission(
+    bootstrap: &Bootstrap,
+    session: &Arc<Mutex<SessionContext>>,
+    message: &agens_core::Message,
+) -> Result<Option<SelectedSubmissionClaim>, CliError> {
+    let mut context = session
+        .lock()
+        .map_err(|_| CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable"))?;
+    if context.selected_subagent.is_none() {
+        return Ok(None);
+    }
+    let expanded = expand_tui_message_with_media(&context, bootstrap, message)?;
+    let source_media = message
+        .parts
+        .iter()
+        .filter_map(|part| match part {
+            agens_core::MessagePart::Media { media_id, mime } => Some((*media_id, mime.clone())),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let staged = context
+        .pending_media_ids
+        .iter()
+        .copied()
+        .zip(context.pending_media_mimes.iter().cloned())
+        .collect::<Vec<_>>();
+    if source_media != staged {
+        return Err(CliError::usage(
+            "submitted media does not match the accepted staged snapshot",
+        ));
+    }
+    let (claimed_ids, claimed_mimes) = context.take_pending_media();
+    let claimed = claimed_ids.into_iter().zip(claimed_mimes).collect();
+    let user_message = agens_core::SessionMessage::try_from(expanded.message)
+        .map_err(|_| CliError::usage("submitted message is invalid"))?;
+    Ok(Some(SelectedSubmissionClaim {
+        message: user_message,
+        media: claimed,
+    }))
+}
+
+fn restore_claimed_media(
+    session: &Arc<Mutex<SessionContext>>,
+    claimed: Vec<(i64, String)>,
+) -> Result<(), CliError> {
+    let mut context = session
+        .lock()
+        .map_err(|_| CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable"))?;
+    let (later_ids, later_mimes) = context.take_pending_media();
+    let later = later_ids.into_iter().zip(later_mimes).collect::<Vec<_>>();
+    for (media_id, mime) in claimed.into_iter().chain(later) {
+        context.push_pending_media(media_id, mime);
+    }
+    Ok(())
 }
 
 pub fn run_tui_prompt_with(
@@ -1260,6 +1407,130 @@ mod tests {
             )))
         });
         assert!(next.is_err());
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn selected_pre_dispatch_denial_restores_exact_claim_once_before_later_staging() {
+        let temporary = tui_session_directory("selected-ordered-claim");
+        let bootstrap = tui_session_bootstrap(&temporary, &[]);
+        let session = Arc::new(Mutex::new(SessionContext::fresh()));
+        {
+            let mut context = session.lock().unwrap();
+            context.selected_subagent = Some("general".into());
+            context.push_pending_media(7, "image/png".into());
+            context.push_pending_media(8, "image/jpeg".into());
+        }
+        let source = agens_core::Message {
+            role: agens_core::Role::User,
+            parts: vec![
+                agens_core::MessagePart::Media {
+                    media_id: 7,
+                    mime: "image/png".into(),
+                },
+                agens_core::MessagePart::Text("between".into()),
+                agens_core::MessagePart::Media {
+                    media_id: 8,
+                    mime: "image/jpeg".into(),
+                },
+            ],
+        };
+
+        let claimed = claim_selected_submission(&bootstrap, &session, &source)
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.message.as_message(), &source);
+        assert_eq!(
+            claimed.media,
+            vec![(7, "image/png".into()), (8, "image/jpeg".into())]
+        );
+        session
+            .lock()
+            .unwrap()
+            .push_pending_media(9, "image/webp".into());
+        restore_claimed_media(&session, claimed.media).unwrap();
+        let context = session.lock().unwrap();
+        assert_eq!(context.pending_media_ids, vec![7, 8, 9]);
+        assert_eq!(
+            context.pending_media_mimes,
+            vec!["image/png", "image/jpeg", "image/webp"]
+        );
+
+        drop(context);
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn selected_post_dispatch_failure_consumes_claim_and_preserves_later_staging() {
+        let temporary = tui_session_directory("selected-post-dispatch-consumption");
+        let bootstrap = tui_session_bootstrap(&temporary, &[]);
+        let session = Arc::new(Mutex::new(SessionContext::fresh()));
+        {
+            let mut context = session.lock().unwrap();
+            context.selected_subagent = Some("general".into());
+            context.push_pending_media(7, "image/png".into());
+            context.push_pending_media(8, "image/jpeg".into());
+        }
+        let source = agens_core::Message {
+            role: agens_core::Role::User,
+            parts: vec![
+                agens_core::MessagePart::Media {
+                    media_id: 7,
+                    mime: "image/png".into(),
+                },
+                agens_core::MessagePart::Text("between".into()),
+                agens_core::MessagePart::Media {
+                    media_id: 8,
+                    mime: "image/jpeg".into(),
+                },
+            ],
+        };
+
+        let claimed = claim_selected_submission(&bootstrap, &session, &source)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            claimed.media,
+            vec![(7, "image/png".into()), (8, "image/jpeg".into())]
+        );
+        session
+            .lock()
+            .unwrap()
+            .push_pending_media(9, "image/webp".into());
+
+        // Once dispatch has begun, even an error or cancellation belongs to the
+        // child execution. The engine deliberately does not call restoration.
+        let context = session.lock().unwrap();
+        assert_eq!(context.pending_media_ids, vec![9]);
+        assert_eq!(context.pending_media_mimes, vec!["image/webp"]);
+
+        drop(context);
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn selected_media_only_submission_is_canonical() {
+        let temporary = tui_session_directory("selected-media-only");
+        let bootstrap = tui_session_bootstrap(&temporary, &[]);
+        let session = Arc::new(Mutex::new(SessionContext::fresh()));
+        {
+            let mut context = session.lock().unwrap();
+            context.selected_subagent = Some("general".into());
+            context.push_pending_media(7, "image/png".into());
+        }
+        let source = agens_core::Message {
+            role: agens_core::Role::User,
+            parts: vec![agens_core::MessagePart::Media {
+                media_id: 7,
+                mime: "image/png".into(),
+            }],
+        };
+
+        let claimed = claim_selected_submission(&bootstrap, &session, &source)
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.message.as_message(), &source);
 
         std::fs::remove_dir_all(temporary).unwrap();
     }

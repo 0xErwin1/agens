@@ -10,7 +10,7 @@ use std::future::ready;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use agens_core::{HeadlessTurnError, HeadlessTurnPortError};
+use agens_core::{HeadlessTurnError, HeadlessTurnPortError, Message, Role, SessionMessage};
 use agens_dispatch::{TaskLaunchOutcome, TaskLaunchRequest, TuiSelectedTaskLaunch};
 use agens_tool_runtime::runner::TuiTaskLifecycleBridge;
 use agens_tool_runtime::{
@@ -63,7 +63,10 @@ use std::path::Path;
 
 #[test]
 fn u15_authorization_model_and_tui_launch_share_one_native_task_path() {
-    struct RecordingTaskTool(Arc<std::sync::atomic::AtomicUsize>);
+    struct RecordingTaskTool {
+        executions: Arc<std::sync::atomic::AtomicUsize>,
+        trusted_messages: Arc<Mutex<Vec<Option<Message>>>>,
+    }
 
     impl DispatchTool for RecordingTaskTool {
         fn permission_target(
@@ -80,11 +83,25 @@ fn u15_authorization_model_and_tui_launch_share_one_native_task_path() {
 
         fn execute(
             &mut self,
-            _: &ToolExecutionContext,
-            _: serde_json::Value,
+            context: &ToolExecutionContext,
+            arguments: serde_json::Value,
         ) -> Result<ToolOutput, agens_core::Error> {
-            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(ToolOutput::success("executed"))
+            self.executions
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.trusted_messages.lock().unwrap().push(
+                context
+                    .trusted_task_message()
+                    .map(|message| message.as_message().clone()),
+            );
+            if arguments
+                .get("description")
+                .and_then(serde_json::Value::as_str)
+                == Some("fails after dispatch")
+            {
+                Ok(ToolOutput::failure("child failed"))
+            } else {
+                Ok(ToolOutput::success("executed"))
+            }
         }
     }
 
@@ -137,6 +154,18 @@ fn u15_authorization_model_and_tui_launch_share_one_native_task_path() {
             agent,
             description,
             background,
+            user_message: SessionMessage::try_from(Message {
+                role: Role::User,
+                parts: if description.is_empty() {
+                    vec![MessagePart::Media {
+                        media_id: 7,
+                        mime: "image/png".into(),
+                    }]
+                } else {
+                    vec![MessagePart::Text(description.into())]
+                },
+            })
+            .unwrap(),
         }
     }
 
@@ -144,6 +173,7 @@ fn u15_authorization_model_and_tui_launch_share_one_native_task_path() {
         std::env::temp_dir().join(format!("agens-u15-authorization-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&directory);
     let executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let trusted_messages = Arc::new(Mutex::new(Vec::new()));
     let dispatcher = Arc::new(Mutex::new(ToolDispatcher::new()));
     dispatcher
         .lock()
@@ -151,7 +181,10 @@ fn u15_authorization_model_and_tui_launch_share_one_native_task_path() {
         .register_native(
             "native::task",
             agens_core::ToolAccess::Write,
-            RecordingTaskTool(Arc::clone(&executions)),
+            RecordingTaskTool {
+                executions: Arc::clone(&executions),
+                trusted_messages: Arc::clone(&trusted_messages),
+            },
         )
         .unwrap();
 
@@ -184,7 +217,11 @@ fn u15_authorization_model_and_tui_launch_share_one_native_task_path() {
         ask_policy,
         Arc::clone(&dispatcher),
         RecordingPrompt {
-            answers: vec![PermissionPromptAnswer::AllowOnce],
+            answers: vec![
+                PermissionPromptAnswer::AllowOnce,
+                PermissionPromptAnswer::AllowOnce,
+                PermissionPromptAnswer::AllowOnce,
+            ],
             calls: Arc::new(Mutex::new(Vec::new())),
         },
     );
@@ -207,6 +244,25 @@ fn u15_authorization_model_and_tui_launch_share_one_native_task_path() {
         )))
     );
     assert_eq!(executions.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+    let ordinary_call = HeadlessToolCall {
+        id: "model-issued-task".into(),
+        name: "native::task".into(),
+        input: serde_json::json!({
+            "agent": "reviewer",
+            "description": "ordinary model call",
+            "background": false,
+        })
+        .to_string(),
+    };
+    assert_eq!(
+        poll_permission_port(model.gate.evaluate(&ordinary_call, &cancellation)),
+        Ok(PermissionDecision::Allow)
+    );
+    assert_eq!(
+        poll_permission_port(model.dispatcher.dispatch(ordinary_call, &cancellation)),
+        Ok(HeadlessToolOutput::success("executed"))
+    );
 
     let mut denied = authorized_native_task_runtime(
         &directory,
@@ -234,7 +290,20 @@ fn u15_authorization_model_and_tui_launch_share_one_native_task_path() {
     );
     assert_eq!(
         tui.launch(launch_request("reviewer", "", false), &cancellation),
-        Ok(TaskLaunchOutcome::RejectedEmptyInput)
+        Ok(TaskLaunchOutcome::Dispatched(HeadlessToolOutput::success(
+            "executed"
+        )))
+    );
+    assert_eq!(
+        tui.launch(
+            launch_request("reviewer", "fails after dispatch", false),
+            &cancellation,
+        ),
+        Ok(TaskLaunchOutcome::Dispatched(HeadlessToolOutput {
+            content: "child failed".into(),
+            is_error: true,
+            facts: None,
+        }))
     );
     cancellation.cancel();
     assert_eq!(
@@ -244,7 +313,32 @@ fn u15_authorization_model_and_tui_launch_share_one_native_task_path() {
         ),
         Ok(TaskLaunchOutcome::RejectedCancelled)
     );
-    assert_eq!(executions.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(executions.load(std::sync::atomic::Ordering::SeqCst), 5);
+    assert_eq!(
+        *trusted_messages.lock().unwrap(),
+        vec![
+            Some(Message {
+                role: Role::User,
+                parts: vec![MessagePart::Text("model task".into())],
+            }),
+            Some(Message {
+                role: Role::User,
+                parts: vec![MessagePart::Text("TUI task".into())],
+            }),
+            None,
+            Some(Message {
+                role: Role::User,
+                parts: vec![MessagePart::Media {
+                    media_id: 7,
+                    mime: "image/png".into(),
+                }],
+            }),
+            Some(Message {
+                role: Role::User,
+                parts: vec![MessagePart::Text("fails after dispatch".into())],
+            }),
+        ]
+    );
 
     std::fs::remove_dir_all(&directory).unwrap();
 }

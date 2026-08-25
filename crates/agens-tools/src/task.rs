@@ -1,6 +1,6 @@
 use agens_core::{
-    AgentDefinition, AgentMode, AgentModelSource, Error, HeadlessTaskTerminal, PermissionRule,
-    RequestConfig, TaskProviderFailure, TaskSkillRejection,
+    AgentDefinition, AgentMode, AgentModelSource, Error, HeadlessTaskTerminal, MessagePart,
+    PermissionRule, RequestConfig, SessionMessage, TaskProviderFailure, TaskSkillRejection,
 };
 use serde_json::Value;
 use std::{
@@ -1121,6 +1121,7 @@ pub struct TaskTurnRequest {
     /// a model the request already runs costs a whole child turn to change
     /// nothing.
     on_parent_model: bool,
+    user_message: Option<SessionMessage>,
 }
 
 impl TaskTurnRequest {
@@ -1150,6 +1151,11 @@ impl TaskTurnRequest {
 
     pub fn description(&self) -> &str {
         &self.description
+    }
+
+    /// Canonical user content bound by a selected-subagent launcher, never task JSON.
+    pub fn user_message(&self) -> Option<&SessionMessage> {
+        self.user_message.as_ref()
     }
 
     pub fn permission_rules(&self) -> &[PermissionRule] {
@@ -1608,6 +1614,7 @@ impl<R: TaskRunner> TaskTool<R> {
             model_notice,
             permission_rules: agent.permission_rules.clone(),
             on_parent_model,
+            user_message: None,
         })
     }
 
@@ -1717,10 +1724,22 @@ impl<R: TaskRunner> TaskTool<R> {
         if parent.is_expired() {
             return Ok(task_terminal(HeadlessTaskTerminal::TimedOut));
         }
-        let request = match self.resolve(invocation) {
+        let mut request = match self.resolve(invocation) {
             Ok(request) => request,
             Err(output) => return Ok(output),
         };
+        if let Some(message) = parent.trusted_task_message() {
+            request.description = message
+                .as_message()
+                .parts
+                .iter()
+                .filter_map(|part| match part {
+                    MessagePart::Text(text) => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            request.user_message = Some(message.clone());
+        }
         let Some(execution_id) = self.registry.admit(mode) else {
             return Ok(task_terminal(HeadlessTaskTerminal::ConcurrencyLimit));
         };

@@ -21,7 +21,8 @@ use agens_core::{
     Denylist, DenylistClass, EditMagnitude, Error, FactPath, HeadlessTaskTerminal,
     HeadlessTurnCancellationAdapter, MessagePart, PermissionAuthority, PermissionDecision,
     PermissionPolicy, PermissionReach, PermissionReadFilter, PermissionRequest, PermissionSession,
-    ProjectPermissionGrant, ToolAccess, ToolOutcome, ToolResultFacts, WriteMagnitude,
+    ProjectPermissionGrant, SessionMessage, ToolAccess, ToolOutcome, ToolResultFacts,
+    WriteMagnitude,
 };
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use ignore::WalkBuilder;
@@ -2156,6 +2157,7 @@ pub struct ToolExecutionContext {
     deadline: Option<Instant>,
     read_filter: Option<PermissionReadFilter>,
     authority: PermissionAuthority,
+    trusted_task_message: Option<SessionMessage>,
 }
 
 impl ToolExecutionContext {
@@ -2174,7 +2176,14 @@ impl ToolExecutionContext {
             deadline: Some(deadline),
             read_filter: None,
             authority: PermissionAuthority::Decided,
+            trusted_task_message: None,
         }
+    }
+
+    /// Returns canonical selected-subagent content carried by the consumed
+    /// authorization. Ordinary model-issued calls always return `None`.
+    pub fn trusted_task_message(&self) -> Option<&SessionMessage> {
+        self.trusted_task_message.as_ref()
     }
 
     /// Carries the per-file decision for one authorized call to the tool that
@@ -2237,6 +2246,7 @@ impl ToolExecutionContext {
             deadline,
             read_filter: None,
             authority: PermissionAuthority::Decided,
+            trusted_task_message: None,
         }
     }
 
@@ -2286,6 +2296,11 @@ impl ToolExecutionContext {
                     .expect("tool execution context has a cancellation source")
                     .cancellation_handle()
             })
+    }
+
+    fn with_authorized_task_message(mut self, message: Option<SessionMessage>) -> Self {
+        self.trusted_task_message = message;
+        self
     }
 
     fn mcp_context(&self) -> McpOperationContext {
@@ -4012,6 +4027,7 @@ impl PreparedEvaluation {
             arguments: self.arguments,
             read_filter,
             authority,
+            trusted_task_message: None,
         }
     }
 }
@@ -4033,6 +4049,19 @@ pub struct AuthorizedToolCall {
     /// Whether a decision authorized this call or dangerous mode's fallback
     /// did. See [`PermissionAuthority`].
     authority: PermissionAuthority,
+    /// Canonical selected-subagent input bound by the trusted launcher. This
+    /// is intentionally outside the model-authored argument object.
+    trusted_task_message: Option<Box<SessionMessage>>,
+}
+
+impl AuthorizedToolCall {
+    /// Binds trusted selected-subagent content to this one-shot authorization.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn bind_trusted_task_message(mut self, message: SessionMessage) -> Self {
+        self.trusted_task_message = Some(Box::new(message));
+        self
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -4471,7 +4500,8 @@ impl ToolDispatcher {
         let context = context
             .clone()
             .with_read_filter(handle.read_filter)
-            .with_authority(handle.authority);
+            .with_authority(handle.authority)
+            .with_authorized_task_message(handle.trusted_task_message.map(|message| *message));
 
         match registered.tool.execute(&context, handle.arguments) {
             Ok(output) => {

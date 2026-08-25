@@ -13,8 +13,9 @@ use agens_core::{
     TurnEvent, TurnProgressSink, TurnProvider, run_isolated_headless_turn_with_inbox,
 };
 use agens_providers::{
-    ChatGptResponsesProvider, MoonshotProvider, OpenAiResponsesProvider, ProgressAwareProvider,
-    ProviderDiagnosticClass, ProviderDiagnosticEvent, ProviderDiagnosticScope, ProviderDiagnostics,
+    ChatGptResponsesProvider, MediaBlobs, MoonshotProvider, OpenAiResponsesProvider,
+    ProgressAwareProvider, ProviderDiagnosticClass, ProviderDiagnosticEvent,
+    ProviderDiagnosticScope, ProviderDiagnostics,
 };
 use agens_tools::{
     TaskExecutionId, TaskExecutionRegistry, TaskMessageSource, TaskMessageTarget,
@@ -42,7 +43,7 @@ use agens_permissions::{
 use agens_session::provider::{
     ProviderKind, ResolvedProvider, bootstrap_authentication, resolve_provider_for_model,
 };
-use agens_store::{DirectiveInbox, DirectiveTarget, PermissionGrantStore};
+use agens_store::{DirectiveInbox, DirectiveTarget, PermissionGrantStore, open_media};
 use std::path::PathBuf;
 
 /// Why a delegated child turn ended without a result.
@@ -251,15 +252,13 @@ pub fn run_production_task(
         ask_user_port,
         depth,
     } = context;
+    let user_message = trusted_task_user_message(request.description(), request.user_message());
     let messages = vec![
         Message {
             role: Role::System,
             parts: vec![MessagePart::Text(task_system_prompt(&request))],
         },
-        Message {
-            role: Role::User,
-            parts: vec![MessagePart::Text(request.description().to_owned())],
-        },
+        user_message,
     ];
     let parent_rules = parent_configured_rules(bootstrap, project_root).map_err(|error| {
         record_subagent_surface_rejection(bootstrap, diagnostic_reference, &error.message);
@@ -323,6 +322,11 @@ pub fn run_production_task(
     .map_err(|_| ChildRunError::Runtime)?;
 
     let resolved = resolve_child_provider(bootstrap, request.model())?;
+    let media_blobs = load_trusted_media_blobs(
+        bootstrap.data_directory(),
+        request.user_message(),
+        matches!(resolved.provider, ProviderKind::Moonshot),
+    )?;
     let model = resolved.model.clone();
 
     // Published before the first provider call, because this line's reference
@@ -346,13 +350,14 @@ pub fn run_production_task(
             let base_url = task_provider_base_url(bootstrap, project_root)
                 .map_err(|_| ChildRunError::Runtime)?;
             let provider =
-                OpenAiResponsesProvider::from_api_key_with_messages_and_tools_and_timeout(
+                OpenAiResponsesProvider::from_api_key_with_messages_tools_timeout_and_media(
                     api_key,
                     base_url.as_deref(),
                     model.clone(),
                     messages,
                     provider_tools,
                     agens_providers::DEFAULT_PROVIDER_REQUEST_TIMEOUT,
+                    media_blobs,
                 )
                 .map(|provider| {
                     provider
@@ -401,6 +406,7 @@ pub fn run_production_task(
                     .with_parallel_tool_calls(bootstrap.parallel_tool_calls)
                     .with_request_config(request.request_config().clone())
                     .with_diagnostics(provider_diagnostics)
+                    .with_media_blobs(media_blobs)
             })
             .map_err(|_| ChildRunError::Runtime)?;
             run_isolated_task_turn(
@@ -427,7 +433,7 @@ pub fn run_production_task(
         ProviderKind::OpenAiChatGpt => {
             let base_url = task_provider_base_url(bootstrap, project_root)
                 .map_err(|_| ChildRunError::Runtime)?;
-            let provider = ChatGptResponsesProvider::from_credentials_with_messages_and_tools_and_timeout_and_auth_url(
+            let provider = ChatGptResponsesProvider::from_credentials_with_messages_tools_timeout_auth_and_media(
                 &bootstrap.paths.credentials,
                 base_url.as_deref(),
                 None,
@@ -436,6 +442,7 @@ pub fn run_production_task(
                 messages,
                 provider_tools,
                 agens_providers::DEFAULT_PROVIDER_REQUEST_TIMEOUT,
+                media_blobs,
             )
             .map(|provider| {
                 provider
@@ -466,6 +473,48 @@ pub fn run_production_task(
             )
         }
     }
+}
+
+fn trusted_task_user_message(
+    description: &str,
+    message: Option<&agens_core::SessionMessage>,
+) -> Message {
+    message.map_or_else(
+        || Message {
+            role: Role::User,
+            parts: vec![MessagePart::Text(description.to_owned())],
+        },
+        |message| message.as_message().clone(),
+    )
+}
+
+fn load_trusted_media_blobs(
+    data_directory: &Path,
+    message: Option<&agens_core::SessionMessage>,
+    images_only: bool,
+) -> Result<MediaBlobs, ChildRunError> {
+    let mut blobs = MediaBlobs::new();
+    let Some(message) = message else {
+        return Ok(blobs);
+    };
+    for part in &message.as_message().parts {
+        let MessagePart::Media { media_id, mime } = part else {
+            continue;
+        };
+        if (!mime.starts_with("image/") && mime != "application/pdf")
+            || (images_only && !mime.starts_with("image/"))
+        {
+            return Err(ChildRunError::Runtime);
+        }
+        let (stored_mime, path) =
+            open_media(data_directory, *media_id).map_err(|_| ChildRunError::Runtime)?;
+        if stored_mime != *mime {
+            return Err(ChildRunError::Runtime);
+        }
+        let bytes = std::fs::read(path).map_err(|_| ChildRunError::Runtime)?;
+        blobs.insert(*media_id, bytes);
+    }
+    Ok(blobs)
 }
 
 fn task_system_prompt(request: &TaskTurnRequest) -> String {
@@ -816,6 +865,79 @@ mod tests {
         ));
         std::fs::create_dir_all(&directory).expect("test data directory");
         directory
+    }
+
+    #[test]
+    fn trusted_child_media_loads_only_message_ids_and_rejects_missing_or_unsupported_blobs() {
+        let directory = test_data_directory("trusted-media");
+        let first = agens_store::ingest_media_bytes(&directory, b"first", "image/png").unwrap();
+        let second = agens_store::ingest_media_bytes(&directory, b"second", "image/jpeg").unwrap();
+        let guessed =
+            agens_store::ingest_media_bytes(&directory, b"guessed", "image/webp").unwrap();
+        let trusted = agens_core::SessionMessage::try_from(Message {
+            role: Role::User,
+            parts: vec![
+                MessagePart::Media {
+                    media_id: first.id,
+                    mime: first.mime.clone(),
+                },
+                MessagePart::Text("between".into()),
+                MessagePart::Media {
+                    media_id: second.id,
+                    mime: second.mime.clone(),
+                },
+            ],
+        })
+        .unwrap();
+
+        assert_eq!(
+            trusted_task_user_message("provider-authored placeholder", Some(&trusted)),
+            *trusted.as_message()
+        );
+        let Ok(blobs) = load_trusted_media_blobs(&directory, Some(&trusted), false) else {
+            panic!("trusted image should load");
+        };
+        assert_eq!(blobs.len(), 2);
+        assert_eq!(blobs.get(&first.id), Some(&b"first".to_vec()));
+        assert_eq!(blobs.get(&second.id), Some(&b"second".to_vec()));
+        assert!(!blobs.contains_key(&guessed.id));
+
+        let missing = agens_core::SessionMessage::try_from(Message {
+            role: Role::User,
+            parts: vec![MessagePart::Media {
+                media_id: i64::MAX,
+                mime: "image/png".into(),
+            }],
+        })
+        .unwrap();
+        assert!(load_trusted_media_blobs(&directory, Some(&missing), false).is_err());
+
+        let mismatch = agens_core::SessionMessage::try_from(Message {
+            role: Role::User,
+            parts: vec![MessagePart::Media {
+                media_id: first.id,
+                mime: "image/jpeg".into(),
+            }],
+        })
+        .unwrap();
+        assert!(load_trusted_media_blobs(&directory, Some(&mismatch), false).is_err());
+
+        let pdf = agens_store::ingest_media_bytes(&directory, b"pdf", "application/pdf").unwrap();
+        let pdf_message = agens_core::SessionMessage::try_from(Message {
+            role: Role::User,
+            parts: vec![MessagePart::Media {
+                media_id: pdf.id,
+                mime: pdf.mime,
+            }],
+        })
+        .unwrap();
+        let Ok(pdf_blobs) = load_trusted_media_blobs(&directory, Some(&pdf_message), false) else {
+            panic!("PDF media should load for providers that support it");
+        };
+        assert_eq!(pdf_blobs.get(&pdf.id), Some(&b"pdf".to_vec()));
+        assert!(load_trusted_media_blobs(&directory, Some(&pdf_message), true).is_err());
+
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     fn text(value: &str) -> TurnEvent {
