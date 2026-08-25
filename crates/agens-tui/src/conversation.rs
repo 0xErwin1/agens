@@ -4,9 +4,7 @@ use std::time::Duration;
 
 use crate::bridge::SubagentErrorPresentation;
 use agens_core::redaction::redact_credential_values;
-use agens_core::{
-    DiffLine, Message, MessagePart, Role, SubagentStatus, ToolInput, media_chip_label,
-};
+use agens_core::{DiffLine, Message, MessagePart, Role, SubagentStatus, ToolInput};
 use agens_core::{TuiExecutionState, TuiSubagentEvent, TuiSubagentUpdate};
 
 /// A source event accepted by the conversation projection.
@@ -201,25 +199,6 @@ impl Conversation {
         }
     }
 
-    pub(crate) fn new_with_media<'a>(
-        user: impl Into<String>,
-        media_mimes: impl IntoIterator<Item = &'a str>,
-    ) -> Self {
-        let mut conversation = Self::new(user);
-
-        for (index, mime) in media_mimes.into_iter().enumerate() {
-            let chip = media_chip_label(index + 1, mime);
-            if !conversation.user.is_empty() {
-                conversation.user.push(' ');
-            }
-            conversation.user.push_str(&chip);
-        }
-        if !conversation.user.is_empty() {
-            conversation.items = vec![ConversationItem::User(conversation.user.clone())];
-        }
-
-        conversation
-    }
     /// Reconstructs completed conversations from persisted messages.
     ///
     /// Restored tool calls degrade `parsed` to [`ToolInput::Other`] since no
@@ -307,24 +286,16 @@ impl Conversation {
                     for message in pending_system.drain(..) {
                         let _ = conversation.apply(ConversationEvent::Info(message));
                     }
-                    let mut media_ordinal = 0_usize;
+                    conversation.user = crate::present_user_message_parts(&message.parts);
                     for part in &message.parts {
                         match part {
                             MessagePart::Text(text) => {
                                 if let Some(notice) = crate::runtime_scheduled_notice(text) {
+                                    conversation.user.clear();
                                     let _ = conversation.apply(ConversationEvent::Info(notice));
-                                    continue;
                                 }
-                                conversation.user.push_str(text);
                             }
-                            MessagePart::Media { mime, .. } => {
-                                media_ordinal += 1;
-                                let chip = media_chip_label(media_ordinal, mime);
-                                if !conversation.user.is_empty() {
-                                    conversation.user.push(' ');
-                                }
-                                conversation.user.push_str(&chip);
-                            }
+                            MessagePart::Media { .. } => {}
                             // Unexpected roles on a user row: keep text surface via info.
                             MessagePart::Reasoning(text) => {
                                 let _ = conversation
@@ -976,7 +947,13 @@ mod tests {
 
     #[test]
     fn live_and_restored_text_with_media_project_as_one_user_block() {
-        let live = Conversation::new_with_media("look", ["image/png"]);
+        let live = Conversation::new(crate::present_user_message_parts(&[
+            MessagePart::Text("look".into()),
+            MessagePart::Media {
+                media_id: 9,
+                mime: "image/png".into(),
+            },
+        ]));
         let restored = Conversation::from_messages(&[Message {
             role: Role::User,
             parts: vec![
@@ -1000,8 +977,8 @@ mod tests {
                     _ => None,
                 })
                 .collect::<Vec<_>>();
-            assert_eq!(user_blocks, ["look [Image #1]"]);
-            assert_eq!(conversation.user, "look [Image #1]");
+            assert_eq!(user_blocks, ["look[Image #1]"]);
+            assert_eq!(conversation.user, "look[Image #1]");
         }
     }
 

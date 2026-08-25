@@ -401,6 +401,15 @@ impl PromptMemory for PromptMemoryStore {
             .map_err(PromptMemoryError::from)
     }
 
+    fn record_submission_parts(
+        &mut self,
+        parts: &[MessagePart],
+    ) -> Result<bool, PromptMemoryError> {
+        self.append_history_parts(parts)
+            .map(|row| row.is_some())
+            .map_err(PromptMemoryError::from)
+    }
+
     fn browse_up(
         &mut self,
         composer_input: &str,
@@ -431,12 +440,43 @@ impl PromptMemory for PromptMemoryStore {
             .map_err(PromptMemoryError::from)
     }
 
+    fn stash_push_parts(&mut self, parts: &[MessagePart]) -> Result<bool, PromptMemoryError> {
+        validate_parts(parts).map_err(PromptMemoryError::from)?;
+        let text = parts
+            .iter()
+            .filter_map(|part| match part {
+                MessagePart::Text(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        let created_at = unix_now_secs();
+        self.connection
+            .execute(
+                "INSERT INTO prompt_stash (text, created_at, attachments) VALUES (?1, ?2, ?3)",
+                params![
+                    text,
+                    created_at,
+                    encode_parts(parts).map_err(PromptMemoryError::from)?
+                ],
+            )
+            .map_err(|error| {
+                PromptMemoryError::from(PromptMemoryStoreError::operation(
+                    "push stash",
+                    &self.database_path,
+                    error,
+                ))
+            })?;
+        self.state.stash_push_parts_at(parts.to_vec(), created_at);
+        Ok(true)
+    }
+
     fn stash_pop(&mut self) -> Result<Option<PromptRecall>, PromptMemoryError> {
         self.pop_stash()
             .map(|row| {
                 row.map(|entry| PromptRecall {
                     text: entry.text,
                     attachments: entry.attachments,
+                    parts: entry.parts,
                 })
             })
             .map_err(PromptMemoryError::from)

@@ -13,7 +13,7 @@ use agens_tui::{
     SessionDialogRequest, SessionDialogScope, SessionTreeRequest, TranscriptEntry, TranscriptFocus,
     TranscriptId, Tui, TuiExecutionEvent, TuiExecutionState, TuiPermissionBridge,
     TuiPermissionReply, TuiPresentation, TuiProviderOutcome, TuiRouteProgress, TuiRuntimeEvent,
-    TuiSubagentEvent, TuiSubmissionOutcome, TurnLifecycle, UiEnvelope,
+    TuiSubagentEvent, TuiSubmissionOutcome, TurnLifecycle, UiEnvelope, user_message_text,
 };
 use ratatui::{Terminal, backend::TestBackend};
 use std::{
@@ -1635,6 +1635,39 @@ fn scheduler_exposes_typed_lifecycle_and_stable_queue_entries() {
     assert_eq!(queued[0].prompt(), "second");
     assert_eq!(queued[1].prompt(), "third");
     assert_ne!(queued[0].id(), queued[1].id());
+}
+
+#[test]
+fn scheduler_queue_owns_and_dispatches_an_immutable_ordered_message() {
+    let mut app = AppState::new(1);
+    app.reduce(AppEvent::SubmitPrompt("running".into()));
+    let message = Message {
+        role: Role::User,
+        parts: vec![
+            MessagePart::Text("left".into()),
+            MessagePart::Media {
+                media_id: 7,
+                mime: "image/png".into(),
+            },
+            MessagePart::Text("right".into()),
+        ],
+    };
+
+    assert!(
+        app.reduce(AppEvent::QueueMessage {
+            display: "left[Image #1]right".into(),
+            message: message.clone(),
+        })
+        .is_empty()
+    );
+    assert_eq!(app.queued_entries()[0].message(), &message);
+    assert_eq!(
+        app.reduce(AppEvent::TurnReleasedFor { generation: 1 }),
+        vec![Effect::StartQueuedMessage {
+            display: "left[Image #1]right".into(),
+            message,
+        }]
+    );
 }
 
 #[test]
@@ -3960,22 +3993,84 @@ fn attachment_inserts_at_the_captured_cursor_and_deletes_atomically() {
 }
 
 #[test]
-fn attachment_token_is_not_provider_prompt_content() {
-    let mut tui = Tui::new(FakeEngine::default());
-    typed(&mut tui, "leftright");
-    for _ in 0..5 {
-        tui.handle(Event::Key(Key::Left));
-    }
-    tui.apply_submission_outcome(TuiSubmissionOutcome::MediaAttached {
+fn composer_submit_preserves_image_before_text_and_text_image_text_parts() {
+    let image = PromptAttachment::new(7, "image/png");
+    let mut image_first = Tui::new(FakeEngine::default());
+    image_first.apply_submission_outcome(TuiSubmissionOutcome::MediaAttached {
         message: "attached".into(),
-        staged_media: vec![PromptAttachment::new(7, "image/png")],
+        staged_media: vec![image.clone()],
     });
-
+    typed(&mut image_first, "after");
     assert_eq!(
-        tui.handle(Event::Key(Key::Enter)),
-        Action::Submit("leftright".into())
+        image_first.handle(Event::Key(Key::Enter)),
+        Action::Submit(
+            Message {
+                role: Role::User,
+                parts: vec![
+                    MessagePart::Media {
+                        media_id: 7,
+                        mime: "image/png".into(),
+                    },
+                    MessagePart::Text("after".into()),
+                ],
+            }
+            .into()
+        )
     );
-    assert_eq!(tui.staged_media(), &[PromptAttachment::new(7, "image/png")]);
+
+    let mut interleaved = Tui::new(FakeEngine::default());
+    typed(&mut interleaved, "leftright");
+    for _ in 0..5 {
+        interleaved.handle(Event::Key(Key::Left));
+    }
+    interleaved.apply_submission_outcome(TuiSubmissionOutcome::MediaAttached {
+        message: "attached".into(),
+        staged_media: vec![image],
+    });
+    assert_eq!(
+        interleaved.handle(Event::Key(Key::Enter)),
+        Action::Submit(
+            Message {
+                role: Role::User,
+                parts: vec![
+                    MessagePart::Text("left".into()),
+                    MessagePart::Media {
+                        media_id: 7,
+                        mime: "image/png".into(),
+                    },
+                    MessagePart::Text("right".into()),
+                ],
+            }
+            .into()
+        )
+    );
+}
+
+#[test]
+fn composer_submit_preserves_three_adjacent_images_in_source_order() {
+    let mut tui = Tui::new(FakeEngine::default());
+    for media_id in [3, 1, 2] {
+        let mut staged = tui.staged_media().to_vec();
+        staged.push(PromptAttachment::new(media_id, "image/png"));
+        tui.apply_submission_outcome(TuiSubmissionOutcome::MediaAttached {
+            message: "attached".into(),
+            staged_media: staged,
+        });
+    }
+
+    let Action::Submit(message) = tui.handle(Event::Key(Key::Enter)) else {
+        panic!("three images must submit");
+    };
+    assert_eq!(
+        message.parts,
+        [3, 1, 2]
+            .into_iter()
+            .map(|media_id| MessagePart::Media {
+                media_id,
+                mime: "image/png".into(),
+            })
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -3986,7 +4081,7 @@ fn accepted_media_only_submit_consumes_staging_but_keeps_the_turn_snapshot() {
 
     let action = tui.handle(Event::Key(Key::Enter));
     assert!(
-        matches!(action, Action::Submit(ref prompt) if prompt.is_empty()),
+        matches!(action, Action::Submit(ref submission) if user_message_text(submission.as_message()).is_empty()),
         "empty text with staged media must submit, got {action:?}"
     );
     tui.begin_submission("");
@@ -4252,7 +4347,7 @@ fn selecting_a_file_inserts_its_relative_path_at_the_at_token() {
 
     assert_eq!(
         tui.handle(Event::Key(Key::Enter)),
-        Action::Submit("review @crates/agens-tui/src/lib.rs".to_owned())
+        Action::Submit("review @crates/agens-tui/src/lib.rs".to_owned().into())
     );
 }
 
@@ -6056,10 +6151,10 @@ fn media_staged_while_a_turn_runs_survives_for_the_next_turn() {
     let attached_mid_turn = PromptAttachment::new(4, "application/pdf");
 
     tui.set_staged_media(vec![sent.clone()]);
-    assert_eq!(
-        submit_text(&mut tui, "with media"),
-        Action::Submit("with media".into())
-    );
+    let Action::Submit(sent_message) = submit_text(&mut tui, "with media") else {
+        panic!("prompt with staged media must submit");
+    };
+    assert_eq!(user_message_text(sent_message.as_message()), "with media");
     tui.begin_submission("with media");
     assert!(
         tui.staged_media().is_empty(),
@@ -6109,10 +6204,10 @@ fn history_browse_restores_attachments_and_returns_staged_chips_with_draft() {
     let draft_chip = vec![PromptAttachment::new(9, "application/pdf")];
 
     tui.set_staged_media(sent.clone());
-    assert_eq!(
-        submit_text(&mut tui, "with media"),
-        Action::Submit("with media".into())
-    );
+    let Action::Submit(sent_message) = submit_text(&mut tui, "with media") else {
+        panic!("prompt with staged media must submit");
+    };
+    assert_eq!(user_message_text(sent_message.as_message()), "with media");
     tui.clear_media_chips();
     assert_eq!(
         submit_text(&mut tui, "text only"),
@@ -6160,10 +6255,10 @@ fn history_dedupe_treats_same_text_with_different_attachments_as_distinct() {
         Action::Submit("hello".into())
     );
     tui.set_staged_media(vec![PromptAttachment::new(2, "image/png")]);
-    assert_eq!(
-        submit_text(&mut tui, "hello"),
-        Action::Submit("hello".into())
-    );
+    let Action::Submit(sent_message) = submit_text(&mut tui, "hello") else {
+        panic!("prompt with staged media must submit");
+    };
+    assert_eq!(user_message_text(sent_message.as_message()), "hello");
     tui.clear_media_chips();
 
     // Two entries: Up shows the media one, Up again the text-only one.

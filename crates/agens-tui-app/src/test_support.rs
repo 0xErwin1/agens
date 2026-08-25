@@ -502,7 +502,7 @@ pub fn enter_tui_input(tui: &mut Tui<ProductionTuiEngine>, input: &str) -> Strin
     else {
         panic!("Enter should submit through the production TUI path");
     };
-    input
+    agens_tui::user_message_text(input.as_message())
 }
 
 pub fn tui_project(temporary: &Path) -> String {

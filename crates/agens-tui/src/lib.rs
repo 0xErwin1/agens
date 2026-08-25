@@ -54,7 +54,9 @@ use std::{
 use agens_core::SubagentStatus;
 use agens_core::SubmitOrigin;
 use agens_core::ask_user::{AskUserMode, AskUserQuestion, AskUserReply, AskUserRequest};
-use agens_core::{HistoryBrowseResult, PromptMemory, PromptRecall, media_chip_label};
+use agens_core::{
+    HistoryBrowseResult, Message, PromptMemory, PromptRecall, Role, media_chip_label,
+};
 use agens_core::{MessagePart, TurnEvent, TurnState, Usage};
 use ask_user::{AskUserEntry, AskUserOutcome, AskUserRow, AskUserState};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
@@ -351,7 +353,7 @@ pub enum Action {
     /// the cursor, where repainting shows exactly what was already on screen.
     Unchanged,
     /// Send this prompt to the composition layer.
-    Submit(String),
+    Submit(UserSubmission),
     /// Request OS clipboard image ingest (Ctrl+V when image data is available).
     AttachClipboardImage,
     /// Replace the app-side staged media with a restored attachment set.
@@ -361,7 +363,7 @@ pub enum Action {
     /// sends, so it must follow the restored set (possibly empty).
     SyncStagedMedia(Vec<PromptAttachment>),
     /// Classify this busy composer draft before mutating the prompt queue.
-    SubmitBusy(String),
+    SubmitBusy(UserSubmission),
     /// Submit a redacted credential through the dedicated route only.
     SubmitSecret {
         action_id: String,
@@ -405,6 +407,68 @@ pub enum Action {
     },
     /// End the terminal event loop.
     Quit,
+}
+
+/// Canonical user message carried by local submission actions.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UserSubmission(Message);
+
+impl UserSubmission {
+    pub fn as_message(&self) -> &Message {
+        &self.0
+    }
+
+    pub fn into_message(self) -> Message {
+        self.0
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.parts.is_empty()
+    }
+}
+
+impl std::ops::Deref for UserSubmission {
+    type Target = Message;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl From<Message> for UserSubmission {
+    fn from(message: Message) -> Self {
+        Self(message)
+    }
+}
+
+impl From<String> for UserSubmission {
+    fn from(text: String) -> Self {
+        Self(Message {
+            role: Role::User,
+            parts: (!text.is_empty())
+                .then_some(MessagePart::Text(text))
+                .into_iter()
+                .collect(),
+        })
+    }
+}
+
+impl From<&str> for UserSubmission {
+    fn from(text: &str) -> Self {
+        text.to_owned().into()
+    }
+}
+
+impl PartialEq<str> for UserSubmission {
+    fn eq(&self, other: &str) -> bool {
+        user_message_text(&self.0) == other
+    }
+}
+
+impl PartialEq<&str> for UserSubmission {
+    fn eq(&self, other: &&str) -> bool {
+        self == *other
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -467,10 +531,20 @@ pub enum TuiSubmissionOutcome {
         display: String,
         prompt: String,
     },
+    /// A provider turn carrying canonical ordered user content.
+    ProviderMessage {
+        display: String,
+        message: Message,
+    },
     /// A catalog-resolved provider turn accepted into the busy prompt queue.
     BusyProviderTurn {
         display: String,
         prompt: String,
+    },
+    /// A queued provider turn carrying canonical ordered user content.
+    BusyProviderMessage {
+        display: String,
+        message: Message,
     },
     /// A busy-session refusal that preserves the composer draft for editing.
     BusyRefusal(String),
@@ -554,8 +628,12 @@ pub enum TuiSubmissionOutcome {
 #[derive(Clone, Eq, PartialEq)]
 pub enum TuiRouteRequest {
     Input(String),
+    /// Canonical ordered input from the local composer.
+    InputMessage(Message),
     /// Resolve a busy input through the router before scheduler mutation.
     BusyInput(String),
+    /// Resolve canonical ordered busy input.
+    BusyMessage(Message),
     /// Opens a device-authentication URL through the application adapter.
     DeviceAuthOpenUrl(String),
     /// Ingest OS clipboard image bytes into the durable media store.
@@ -795,7 +873,11 @@ impl std::fmt::Debug for TuiRouteRequest {
                 .field("secret", &"<redacted>")
                 .finish(),
             Self::Input(value) => formatter.debug_tuple("Input").field(value).finish(),
+            Self::InputMessage(value) => {
+                formatter.debug_tuple("InputMessage").field(value).finish()
+            }
             Self::BusyInput(value) => formatter.debug_tuple("BusyInput").field(value).finish(),
+            Self::BusyMessage(value) => formatter.debug_tuple("BusyMessage").field(value).finish(),
             Self::DeviceAuthOpenUrl(_) => formatter.write_str("DeviceAuthOpenUrl(<redacted>)"),
             Self::AttachClipboardImage { bytes, mime } => formatter
                 .debug_struct("AttachClipboardImage")
@@ -2123,6 +2205,35 @@ fn attachment_chip_labels(attachments: &[PromptAttachment]) -> Vec<String> {
         .enumerate()
         .map(|(index, attachment)| media_chip_label(index + 1, &attachment.mime))
         .collect()
+}
+
+/// Legacy textual projection of ordered user content.
+pub fn user_message_text(message: &Message) -> String {
+    message
+        .parts
+        .iter()
+        .filter_map(|part| match part {
+            MessagePart::Text(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Shared live/restored presentation of ordered user parts.
+pub fn present_user_message_parts(parts: &[MessagePart]) -> String {
+    let mut presented = String::new();
+    let mut media_ordinal = 0;
+    for part in parts {
+        match part {
+            MessagePart::Text(text) => presented.push_str(text),
+            MessagePart::Media { mime, .. } => {
+                media_ordinal += 1;
+                presented.push_str(&media_chip_label(media_ordinal, mime));
+            }
+            _ => {}
+        }
+    }
+    presented
 }
 
 /// Right label for an overlay row: attachment count marker plus the date.
@@ -6831,10 +6942,36 @@ where
         self.bypass = enabled;
     }
 
-    /// Adds a user prompt before the composition layer starts the shared runtime.
+    /// Adds a legacy text-only user prompt before the shared runtime starts.
     pub fn begin_submission(&mut self, prompt: impl Into<String>) {
-        self.palette_open = false;
         let prompt = prompt.into();
+        let mut parts = Vec::new();
+        if !prompt.is_empty() {
+            parts.push(MessagePart::Text(if self.staged_media.is_empty() {
+                prompt
+            } else {
+                format!("{prompt}\n")
+            }));
+        }
+        parts.extend(
+            self.staged_media
+                .iter()
+                .map(|attachment| MessagePart::Media {
+                    media_id: attachment.media_id,
+                    mime: attachment.mime.clone(),
+                }),
+        );
+        self.begin_message_submission(Message {
+            role: Role::User,
+            parts,
+        });
+    }
+
+    /// Adds canonical ordered user content before the shared runtime starts.
+    pub fn begin_message_submission(&mut self, message: Message) {
+        self.palette_open = false;
+        let prompt = user_message_text(&message);
+        let presented = present_user_message_parts(&message.parts);
         self.status = None;
         if self.scheduler.lifecycle() == &TurnLifecycle::Idle {
             let _ = self
@@ -6848,20 +6985,9 @@ where
         self.turn_duration = None;
         self.submitted_media = std::mem::take(&mut self.staged_media);
         self.media_chips.clear();
-        self.transcript.push(TranscriptEntry::User(prompt.clone()));
-        let mut conversation = Conversation::new_with_media(
-            prompt.clone(),
-            self.submitted_media
-                .iter()
-                .map(|attachment| attachment.mime.as_str()),
-        );
-        if !prompt.is_empty() && !self.submitted_media.is_empty() {
-            conversation
-                .user
-                .replace_range(prompt.len()..=prompt.len(), "\n");
-            conversation = Conversation::new(conversation.user);
-        }
-        self.conversation = Some(conversation);
+        self.transcript
+            .push(TranscriptEntry::User(presented.clone()));
+        self.conversation = Some(Conversation::new(presented));
         {
             let record = self.active_record_mut();
             record.collapse_thinking = false;
@@ -7034,6 +7160,14 @@ where
     }
 
     pub fn apply_submission_outcome(&mut self, outcome: TuiSubmissionOutcome) -> Option<String> {
+        self.apply_submission_outcome_message(outcome)
+            .map(|message| user_message_text(&message))
+    }
+
+    pub fn apply_submission_outcome_message(
+        &mut self,
+        outcome: TuiSubmissionOutcome,
+    ) -> Option<Message> {
         self.palette_open = false;
         self.device_auth = None;
         if !matches!(&outcome, TuiSubmissionOutcome::SecretEntry(_)) {
@@ -7058,10 +7192,21 @@ where
             }
             TuiSubmissionOutcome::ProviderTurn { display, prompt } => {
                 self.begin_submission(display);
-                Some(prompt)
+                Some(UserSubmission::from(prompt).into_message())
+            }
+            TuiSubmissionOutcome::ProviderMessage {
+                display: _,
+                message,
+            } => {
+                self.begin_message_submission(message.clone());
+                Some(message)
             }
             TuiSubmissionOutcome::BusyProviderTurn { display, prompt } => {
                 self.enqueue_resolved_composer(display, prompt);
+                None
+            }
+            TuiSubmissionOutcome::BusyProviderMessage { display, message } => {
+                self.enqueue_resolved_composer_message(display, message);
                 None
             }
             TuiSubmissionOutcome::BusyRefusal(message) => {
@@ -7219,6 +7364,10 @@ where
                 self.enqueue_resolved_composer(display, prompt);
                 None
             }
+            TuiSubmissionOutcome::BusyProviderMessage { display, message } => {
+                self.enqueue_resolved_composer_message(display, message);
+                None
+            }
             TuiSubmissionOutcome::BusyRefusal(message) => {
                 self.status = Some(message);
                 None
@@ -7332,14 +7481,40 @@ where
         Some(Action::SyncStagedMedia(self.staged_media.clone()))
     }
 
-    fn provider_prompt(&self) -> String {
-        let mut prompt = self.input.clone();
-        for token in self.attachment_tokens.iter().rev() {
-            let start = byte_index(&prompt, token.start);
-            let end = byte_index(&prompt, token.end());
-            prompt.replace_range(start..end, "");
+    fn composer_message(&self) -> Message {
+        let mut parts = Vec::new();
+        let mut cursor = 0;
+        for token in &self.attachment_tokens {
+            let start = byte_index(&self.input, token.start);
+            if start > cursor {
+                parts.push(MessagePart::Text(self.input[cursor..start].to_owned()));
+            }
+            parts.push(MessagePart::Media {
+                media_id: token.attachment.media_id,
+                mime: token.attachment.mime.clone(),
+            });
+            cursor = byte_index(&self.input, token.end());
         }
-        prompt
+        if cursor < self.input.len() {
+            parts.push(MessagePart::Text(self.input[cursor..].to_owned()));
+        }
+        if parts.is_empty() && !self.input.is_empty() {
+            parts.push(MessagePart::Text(self.input.clone()));
+        }
+        if self.attachment_tokens.is_empty() {
+            parts.extend(
+                self.staged_media
+                    .iter()
+                    .map(|attachment| MessagePart::Media {
+                        media_id: attachment.media_id,
+                        mime: attachment.mime.clone(),
+                    }),
+            );
+        }
+        Message {
+            role: Role::User,
+            parts,
+        }
     }
 
     fn replace_staged_media_with_tokens(&mut self, attachments: Vec<PromptAttachment>) {
@@ -9603,9 +9778,9 @@ where
         self.palette_open = false;
 
         if self.foreground_running() && self.busy_policy_routing {
-            let prompt = self.provider_prompt();
-            self.record_prompt_history(&prompt);
-            return Action::SubmitBusy(prompt);
+            let message = self.composer_message();
+            self.record_prompt_history(&message);
+            return Action::SubmitBusy(message.into());
         }
         if self.foreground_running() {
             return self.enqueue_composer();
@@ -9615,11 +9790,11 @@ where
         self.recovered_failed_prompt = false;
         // Keep media_chips until the provider turn completes successfully so a
         // preflight / early failure can leave staged chips visible for retry.
-        let prompt = self.provider_prompt();
+        let message = self.composer_message();
         self.input.clear();
         self.attachment_tokens.clear();
-        self.record_prompt_history(&prompt);
-        Action::Submit(prompt)
+        self.record_prompt_history(&message);
+        Action::Submit(message.into())
     }
 
     fn move_selected_queue_entry(&mut self, offset: isize) {
@@ -9685,7 +9860,13 @@ where
             self.status = Some(message.clone());
             return Action::Render;
         }
-        self.record_prompt_history(&draft);
+        self.record_prompt_history(&Message {
+            role: Role::User,
+            parts: (!draft.is_empty())
+                .then_some(MessagePart::Text(draft))
+                .into_iter()
+                .collect(),
+        });
         self.input.clear();
         self.input_cursor = 0;
         self.recovered_failed_prompt = false;
@@ -9707,15 +9888,28 @@ where
     }
 
     fn enqueue_resolved_composer(&mut self, display: String, prompt: String) {
-        let effects = self.scheduler.reduce(AppEvent::QueuePrompt {
+        self.enqueue_resolved_composer_message(
             display,
-            prompt: prompt.clone(),
+            Message {
+                role: Role::User,
+                parts: (!prompt.is_empty())
+                    .then_some(MessagePart::Text(prompt))
+                    .into_iter()
+                    .collect(),
+            },
+        );
+    }
+
+    fn enqueue_resolved_composer_message(&mut self, display: String, message: Message) {
+        let effects = self.scheduler.reduce(AppEvent::QueueMessage {
+            display,
+            message: message.clone(),
         });
-        if let Some(Effect::RefusePrompt(message)) = effects.first() {
-            self.status = Some(message.clone());
+        if let Some(Effect::RefusePrompt(reason)) = effects.first() {
+            self.status = Some(reason.clone());
             return;
         }
-        self.record_prompt_history(&prompt);
+        self.record_prompt_history(&message);
         self.clear_composer();
         self.surface_focus = SurfaceFocus::Composer;
     }
@@ -9725,12 +9919,12 @@ where
     /// A failed durable write is reported once per session: the prompt itself still went
     /// through, so repeating the notice on every submit would bury the turn's own output,
     /// but staying silent would let history quietly stop recording after a loud open.
-    fn record_prompt_history(&mut self, text: &str) {
+    fn record_prompt_history(&mut self, message: &Message) {
         let Some(memory) = self.prompt_memory.as_mut() else {
             return;
         };
 
-        if memory.record_submission(text, &self.staged_media).is_err()
+        if memory.record_submission_parts(&message.parts).is_err()
             && !self.prompt_history_write_reported
         {
             self.prompt_history_write_reported = true;
@@ -9741,8 +9935,62 @@ where
     /// Applies restored composer content (text plus attachments) after a stash
     /// pop, overlay paste, or history browse step.
     fn apply_prompt_recall(&mut self, recall: PromptRecall) -> Action {
-        self.apply_composer_text(recall.text);
-        self.apply_restored_attachments(recall.attachments)
+        let previous_attachments = self.staged_media.clone();
+        let parts = if recall.parts.is_empty() {
+            let mut parts = (!recall.text.is_empty())
+                .then_some(MessagePart::Text(recall.text))
+                .into_iter()
+                .collect::<Vec<_>>();
+            parts.extend(
+                recall
+                    .attachments
+                    .iter()
+                    .map(|attachment| MessagePart::Media {
+                        media_id: attachment.media_id,
+                        mime: attachment.mime.clone(),
+                    }),
+            );
+            parts
+        } else {
+            recall.parts
+        };
+
+        self.input.clear();
+        self.attachment_tokens.clear();
+        self.staged_media.clear();
+        let mut media_ordinal = 0;
+        for part in parts {
+            match part {
+                MessagePart::Text(text) => self.input.push_str(&text),
+                MessagePart::Media { media_id, mime } => {
+                    media_ordinal += 1;
+                    let attachment = PromptAttachment::new(media_id, mime.clone());
+                    let start = self.input.chars().count();
+                    let chip = media_chip_label(media_ordinal, &mime);
+                    let length = chip.chars().count();
+                    self.input.push_str(&chip);
+                    self.attachment_tokens.push(AttachmentToken {
+                        attachment: attachment.clone(),
+                        start,
+                        length,
+                    });
+                    self.staged_media.push(attachment);
+                }
+                _ => {}
+            }
+        }
+        self.input_cursor = self.input.chars().count();
+        self.media_chips = attachment_chip_labels(&self.staged_media);
+        self.recovered_failed_prompt = false;
+        self.clamp_palette_selection();
+        self.refresh_file_picker();
+        self.active_record_mut().focus = TranscriptFocus::Composer;
+
+        if previous_attachments == self.staged_media {
+            Action::Render
+        } else {
+            Action::SyncStagedMedia(self.staged_media.clone())
+        }
     }
 
     /// Replaces the staged chips with a restored attachment set.
@@ -9810,25 +10058,27 @@ where
         }
 
         if !self.input.is_empty() || !self.staged_media.is_empty() {
+            let message = self.composer_message();
             let text = std::mem::take(&mut self.input);
             let chips = std::mem::take(&mut self.media_chips);
             let attachments = std::mem::take(&mut self.staged_media);
+            let attachment_tokens = std::mem::take(&mut self.attachment_tokens);
             self.input_cursor = 0;
             self.recovered_failed_prompt = false;
 
             let push_failed = {
                 let memory = self.prompt_memory.as_mut().expect("checked above");
                 memory.clear_browse();
-                memory.stash_push(&text, &attachments).is_err()
+                memory.stash_push_parts(&message.parts).is_err()
             };
 
             if push_failed {
-                // Restore draft text and chips when durable push fails so the
-                // user does not lose input.
+                // Restore the exact draft when durable push fails.
                 self.input = text;
                 self.input_cursor = self.input.chars().count();
                 self.media_chips = chips;
                 self.staged_media = attachments;
+                self.attachment_tokens = attachment_tokens;
                 self.add_info("Could not save to stash.");
                 self.clamp_palette_selection();
                 self.refresh_file_picker();
@@ -12111,7 +12361,7 @@ pub fn run_with_submit<E, R, F>(tui: &mut Tui<E>, renderer: &mut R, submit: F) -
 where
     E: Engine + Send,
     R: Renderer,
-    F: Fn(String) -> Result<String, String> + Send + Sync + 'static,
+    F: Fn(Message) -> Result<String, String> + Send + Sync + 'static,
 {
     let submit = Arc::new(submit);
     let (sender, receiver) = mpsc::channel();
@@ -12155,12 +12405,12 @@ where
                 terminal.copy_selection(&text)?;
                 renderer.render(tui.view())?;
             }
-            Action::Submit(prompt) => {
-                tui.begin_submission(prompt.clone());
+            Action::Submit(message) => {
+                tui.begin_message_submission(message.as_message().clone());
                 let submit = Arc::clone(&submit);
                 let sender = sender.clone();
                 thread::spawn(move || {
-                    let _ = sender.send(submit(prompt));
+                    let _ = sender.send(submit(message.into_message()));
                 });
                 renderer.render(tui.view())?;
             }
@@ -12198,7 +12448,7 @@ where
 pub fn run_with_default_submit<E, F>(tui: &mut Tui<E>, submit: F) -> io::Result<()>
 where
     E: Engine + Send,
-    F: Fn(String) -> Result<String, String> + Send + Sync + 'static,
+    F: Fn(Message) -> Result<String, String> + Send + Sync + 'static,
 {
     let terminal = RatatuiTerminal::new(CrosstermBackend::new(io::stdout()))?;
     let mut renderer = RatatuiRenderer::new(terminal);
@@ -12360,15 +12610,27 @@ struct ProviderDrain {
 struct ScheduledPrompt {
     display: String,
     prompt: String,
+    message: Message,
 }
 
 fn next_scheduled_prompt(effects: Vec<Effect>) -> Option<ScheduledPrompt> {
     effects.into_iter().find_map(|effect| match effect {
         Effect::StartPrompt(prompt) => Some(ScheduledPrompt {
             display: prompt.clone(),
+            message: Message {
+                role: Role::User,
+                parts: (!prompt.is_empty())
+                    .then_some(MessagePart::Text(prompt.clone()))
+                    .into_iter()
+                    .collect(),
+            },
             prompt,
         }),
-        Effect::StartQueuedPrompt { display, prompt } => Some(ScheduledPrompt { display, prompt }),
+        Effect::StartQueuedMessage { display, message } => Some(ScheduledPrompt {
+            prompt: user_message_text(&message),
+            display,
+            message,
+        }),
         _ => None,
     })
 }
@@ -12487,7 +12749,9 @@ where
     run_with_default_progress_submit_with_permissions_and_task_controls(
         tui,
         route,
-        submit,
+        move |message, origin, progress, metrics| {
+            submit(user_message_text(&message), origin, progress, metrics)
+        },
         transition,
         |_| false,
         |_, _| false,
@@ -12515,7 +12779,7 @@ where
         + Sync
         + 'static,
     F: Fn(
-            String,
+            Message,
             SubmitOrigin,
             mpsc::Sender<TurnEvent>,
             BridgeTx<TuiRuntimeEvent>,
@@ -12571,7 +12835,7 @@ where
         + Sync
         + 'static,
     F: Fn(
-            String,
+            Message,
             SubmitOrigin,
             mpsc::Sender<TurnEvent>,
             BridgeTx<TuiRuntimeEvent>,
@@ -12620,14 +12884,14 @@ where
         let mut dirty = std::mem::take(&mut render_requested) || provider.dirty;
         let mut backlog = provider.backlog;
         if let Some(next) = provider.next_prompt {
-            tui.begin_submission(next.display);
+            tui.begin_message_submission(next.message.clone());
             let generation = tui.active_generation();
             let submit = Arc::clone(&submit);
             let sender = sender.clone();
             let metrics = metrics_sender.clone();
             let completion_sender = completion_sender.clone();
             thread::spawn(move || {
-                let outcome = submit(next.prompt, SubmitOrigin::User, sender, metrics);
+                let outcome = submit(next.message, SubmitOrigin::User, sender, metrics);
                 let _ = completion_sender.send((generation, outcome));
             });
             dirty = true;
@@ -12655,7 +12919,7 @@ where
                     tui.finish_session_load();
                 }
                 let quit = matches!(outcome, TuiSubmissionOutcome::Quit);
-                let Some(prompt) = tui.apply_submission_outcome(outcome) else {
+                let Some(message) = tui.apply_submission_outcome_message(outcome) else {
                     if quit {
                         should_quit = true;
                     }
@@ -12667,7 +12931,7 @@ where
                 let metrics = metrics_sender.clone();
                 let completion_sender = completion_sender.clone();
                 thread::spawn(move || {
-                    let outcome = submit(prompt, SubmitOrigin::User, sender, metrics);
+                    let outcome = submit(message, SubmitOrigin::User, sender, metrics);
                     let _ = completion_sender.send((generation, outcome));
                 });
             })
@@ -12734,7 +12998,12 @@ where
             let metrics = metrics_sender.clone();
             let completion_sender = completion_sender.clone();
             thread::spawn(move || {
-                let outcome = submit(prompt, SubmitOrigin::SubagentCompletion, sender, metrics);
+                let outcome = submit(
+                    UserSubmission::from(prompt).into_message(),
+                    SubmitOrigin::SubagentCompletion,
+                    sender,
+                    metrics,
+                );
                 let _ = completion_sender.send((generation, outcome));
             });
             dirty = true;
@@ -12769,7 +13038,7 @@ where
                 return Ok(());
             }
             Action::Submit(prompt) => {
-                let request = TuiRouteRequest::Input(prompt);
+                let request = TuiRouteRequest::InputMessage(prompt.into_message());
                 let session_load = is_session_resume_request(&request);
                 if session_load {
                     if !tui.begin_session_load() {
@@ -12814,7 +13083,7 @@ where
             }
             Action::SubmitBusy(input) => {
                 let outcome = route(
-                    TuiRouteRequest::BusyInput(input),
+                    TuiRouteRequest::BusyMessage(input.into_message()),
                     route_progress_sender.clone(),
                     TuiRouteCancellation::new(),
                 );
@@ -12845,7 +13114,12 @@ where
                 let metrics = metrics_sender.clone();
                 let completion_sender = completion_sender.clone();
                 thread::spawn(move || {
-                    let outcome = submit(prompt, SubmitOrigin::Background, sender, metrics);
+                    let outcome = submit(
+                        UserSubmission::from(prompt).into_message(),
+                        SubmitOrigin::Background,
+                        sender,
+                        metrics,
+                    );
                     let _ = completion_sender.send((None, outcome));
                 });
             }
@@ -13193,7 +13467,11 @@ fn is_session_resume_request(request: &TuiRouteRequest) -> bool {
             .trim()
             .strip_prefix("/resume ")
             .is_some_and(|identifier| identifier.trim().parse::<i64>().is_ok()),
-        TuiRouteRequest::BusyInput(_) => false,
+        TuiRouteRequest::InputMessage(input) => user_message_text(input)
+            .trim()
+            .strip_prefix("/resume ")
+            .is_some_and(|identifier| identifier.trim().parse::<i64>().is_ok()),
+        TuiRouteRequest::BusyInput(_) | TuiRouteRequest::BusyMessage(_) => false,
         TuiRouteRequest::DialogAction(action_id) => is_session_resume_action(action_id),
         TuiRouteRequest::DeviceAuthOpenUrl(_)
         | TuiRouteRequest::AttachClipboardImage { .. }
@@ -13211,7 +13489,10 @@ fn is_session_resume_request(request: &TuiRouteRequest) -> bool {
 fn is_session_browser_request(request: &TuiRouteRequest) -> bool {
     match request {
         TuiRouteRequest::Input(input) => matches!(input.trim(), "/resume" | "/sessions"),
-        TuiRouteRequest::BusyInput(_) => false,
+        TuiRouteRequest::InputMessage(input) => {
+            matches!(user_message_text(input).trim(), "/resume" | "/sessions")
+        }
+        TuiRouteRequest::BusyInput(_) | TuiRouteRequest::BusyMessage(_) => false,
         TuiRouteRequest::DeviceAuthOpenUrl(_)
         | TuiRouteRequest::AttachClipboardImage { .. }
         | TuiRouteRequest::ReplaceStagedMedia { .. }
@@ -15737,7 +16018,13 @@ mod runtime_tests {
         press(&mut tui, KeyCode::Char('é'), KeyModifiers::NONE);
         assert_eq!(
             press(&mut tui, KeyCode::Enter, KeyModifiers::NONE),
-            Action::Submit("café!\né".into())
+            Action::Submit(
+                Message {
+                    role: Role::User,
+                    parts: vec![MessagePart::Text("café!\né".into())],
+                }
+                .into()
+            )
         );
 
         let mut running = Tui::new(NoopEngine);

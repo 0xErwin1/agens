@@ -19,7 +19,7 @@ use agens_tui::{
 
 use crate::ask_user_prompt::{TuiAskUserPort, externally_answerable_tui_ask_user_bridge};
 use crate::extensions::{start_tui_commands, start_tui_skills};
-use crate::files::{expand_tui_prompt_with_media, tui_picker_file_candidates};
+use crate::files::{expand_tui_message_with_media, tui_picker_file_candidates};
 use crate::metrics::{TuiMetricsPublisher, finish_tui_metrics};
 use crate::models::seed_remembered_tui_selection;
 #[cfg(any(test, feature = "test-support"))]
@@ -279,7 +279,8 @@ pub fn run_production_tui_with_options(
         move |request, progress, cancellation| {
             route_router.route_request_with_cancellation(request, progress, cancellation)
         },
-        move |prompt, origin, progress, metrics| {
+        move |message, origin, progress, metrics| {
+            let prompt = agens_tui::user_message_text(&message);
             let task_events = metrics.clone();
             let turn_cancellation = interactive_turn_cancellation();
             let Ok(mut active) = cancellation.lock() else {
@@ -418,9 +419,9 @@ pub fn run_production_tui_with_options(
                     metrics.publish_failure_notice(text);
                 }
             };
-            let result = run_tui_prompt_with(
+            let result = run_tui_submission_with(
                 &runtime_bootstrap,
-                &prompt,
+                message,
                 &router.session,
                 Some(Arc::clone(&skills)),
                 Some(&snapshot_notice),
@@ -587,7 +588,9 @@ pub fn run_tui_prompt(
                 | TuiSubmissionOutcome::HistoryRewritten { message, .. }
                 | TuiSubmissionOutcome::LocalActionableError { message, .. } => Ok(message),
                 TuiSubmissionOutcome::ProviderTurn { .. }
+                | TuiSubmissionOutcome::ProviderMessage { .. }
                 | TuiSubmissionOutcome::BusyProviderTurn { .. }
+                | TuiSubmissionOutcome::BusyProviderMessage { .. }
                 | TuiSubmissionOutcome::BusyRefusal(_)
                 | TuiSubmissionOutcome::StagedMediaReplaced { .. }
                 | TuiSubmissionOutcome::SecretEntry(_)
@@ -626,12 +629,51 @@ pub fn run_tui_prompt_with(
     notice: Option<&dyn Fn(String)>,
     run: impl FnOnce(HeadlessChatRequest) -> Result<HeadlessChatCompletion, HeadlessChatFailure>,
 ) -> Result<String, CliError> {
+    let mut parts = (!prompt.is_empty())
+        .then_some(agens_core::MessagePart::Text(prompt.to_owned()))
+        .into_iter()
+        .collect::<Vec<_>>();
+    {
+        let session = session
+            .lock()
+            .map_err(|_| CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable"))?;
+        parts.extend(
+            session
+                .pending_media_ids
+                .iter()
+                .copied()
+                .zip(session.pending_media_mimes.iter().cloned())
+                .map(|(media_id, mime)| agens_core::MessagePart::Media { media_id, mime }),
+        );
+    }
+    run_tui_submission_with(
+        bootstrap,
+        agens_core::Message {
+            role: agens_core::Role::User,
+            parts,
+        },
+        session,
+        skills,
+        notice,
+        run,
+    )
+}
+
+pub fn run_tui_submission_with(
+    bootstrap: &Bootstrap,
+    message: agens_core::Message,
+    session: &Arc<Mutex<SessionContext>>,
+    skills: Option<Arc<SkillCatalog>>,
+    notice: Option<&dyn Fn(String)>,
+    run: impl FnOnce(HeadlessChatRequest) -> Result<HeadlessChatCompletion, HeadlessChatFailure>,
+) -> Result<String, CliError> {
     let expanded = {
         let context = session
             .lock()
             .map_err(|_| CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable"))?;
-        expand_tui_prompt_with_media(&context, bootstrap, prompt)?
+        expand_tui_message_with_media(&context, bootstrap, &message)?
     };
+    let prompt_projection = expanded.text.clone();
     let (request, snapshot_root, previous_messages) = {
         let mut session = session
             .lock()
@@ -639,14 +681,36 @@ pub fn run_tui_prompt_with(
         if session.running {
             return Err(CliError::runtime(HeadlessTurnError::State));
         }
-        let (mut media_ids, mut media_mimes) = session.take_pending_media();
-        media_ids.extend(expanded.media_ids);
-        media_mimes.extend(expanded.media_mimes);
+        let (staged_media_ids, staged_media_mimes) = session.take_pending_media();
+        let source_media = message
+            .parts
+            .iter()
+            .filter_map(|part| match part {
+                agens_core::MessagePart::Media { media_id, mime } => {
+                    Some((*media_id, mime.as_str()))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if source_media
+            != staged_media_ids
+                .iter()
+                .copied()
+                .zip(staged_media_mimes.iter().map(String::as_str))
+                .collect::<Vec<_>>()
+        {
+            return Err(CliError::usage(
+                "submitted media does not match the accepted staged snapshot",
+            ));
+        }
         let mut request = agens_headless::apply_session_to_request(
             &session,
             HeadlessChatRequest {
                 prompt: expanded.text,
-                user_message: None,
+                user_message: Some(
+                    agens_core::SessionMessage::try_from(expanded.message)
+                        .map_err(|_| CliError::usage("submitted message is invalid"))?,
+                ),
                 history: Vec::new(),
                 model: None,
                 system_prompt: None,
@@ -661,8 +725,8 @@ pub fn run_tui_prompt_with(
                 effective_capabilities: None,
                 pending_system_reminder: None,
                 skills: skills.clone(),
-                media_ids,
-                media_mimes,
+                media_ids: expanded.media_ids,
+                media_mimes: expanded.media_mimes,
             },
         );
         if let Some(skills) = skills {
@@ -745,7 +809,7 @@ pub fn run_tui_prompt_with(
         None => {}
     }
     let boundary = turn_boundary(&previous_messages, &session.messages);
-    record_turn(&mut session, prompt, boundary, before, after);
+    record_turn(&mut session, &prompt_projection, boundary, before, after);
     if let Some(identifier) = session.identifier
         && let Some(message) =
             failed_bypass_persist_notice(write_through_bypass_permission_prompts(
@@ -1078,6 +1142,70 @@ mod tests {
             .expect("profile should select a model after reset");
         assert_eq!(selection.model(), "gpt-5.6-sol");
         assert_eq!(selection.reasoning_effort(), Some("high"));
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn composer_runtime_boundary_preserves_ordered_user_parts() {
+        let temporary = tui_session_directory("ordered-composer-runtime-boundary");
+        let bootstrap = tui_session_bootstrap(&temporary, &[]);
+        let compose = |text: &str, cursor_left: usize| {
+            let mut tui = Tui::new(ProductionTuiEngine {
+                cancellation: Arc::new(Mutex::new(None)),
+            });
+            for character in text.chars() {
+                tui.handle(Event::Key(Key::Char(character)));
+            }
+            for _ in 0..cursor_left {
+                tui.handle(Event::Key(Key::Left));
+            }
+            tui.apply_submission_outcome(TuiSubmissionOutcome::MediaAttached {
+                message: "attached".into(),
+                staged_media: vec![agens_core::PromptAttachment::new(7, "image/png")],
+            });
+            let Action::Submit(submission) = tui.handle(Event::Key(Key::Enter)) else {
+                panic!("composer input must submit");
+            };
+            submission.into_message()
+        };
+        let expected_messages = [compose("after", 5), compose("leftright", 5)];
+        assert!(matches!(
+            expected_messages[0].parts[0],
+            MessagePart::Media { .. }
+        ));
+        assert_eq!(expected_messages[1].parts.len(), 3);
+
+        for expected in expected_messages {
+            let session = Arc::new(Mutex::new(SessionContext::fresh()));
+            session
+                .lock()
+                .unwrap()
+                .push_pending_media(7, "image/png".into());
+            let captured = std::cell::RefCell::new(None);
+            let result = run_tui_submission_with(
+                &bootstrap,
+                expected.clone(),
+                &session,
+                None,
+                None,
+                |request| {
+                    *captured.borrow_mut() = Some(request);
+                    Err(HeadlessChatFailure::from(CliError::configuration(
+                        "captured",
+                    )))
+                },
+            );
+            assert!(result.is_err());
+            let request = captured
+                .into_inner()
+                .expect("runtime request must be captured");
+            assert_eq!(request.prompt, agens_tui::user_message_text(&expected));
+            assert_eq!(
+                request.user_message,
+                Some(agens_core::SessionMessage::try_from(expected).unwrap())
+            );
+        }
 
         std::fs::remove_dir_all(temporary).unwrap();
     }

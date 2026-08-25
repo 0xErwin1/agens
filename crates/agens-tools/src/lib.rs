@@ -19,8 +19,8 @@ use std::{
 use agens_core::mcp_failure::{McpFailure, McpFailureClass};
 use agens_core::{
     Denylist, DenylistClass, EditMagnitude, Error, FactPath, HeadlessTaskTerminal,
-    HeadlessTurnCancellationAdapter, PermissionAuthority, PermissionDecision, PermissionPolicy,
-    PermissionReach, PermissionReadFilter, PermissionRequest, PermissionSession,
+    HeadlessTurnCancellationAdapter, MessagePart, PermissionAuthority, PermissionDecision,
+    PermissionPolicy, PermissionReach, PermissionReadFilter, PermissionRequest, PermissionSession,
     ProjectPermissionGrant, ToolAccess, ToolOutcome, ToolResultFacts, WriteMagnitude,
 };
 use globset::{Glob, GlobSet, GlobSetBuilder};
@@ -325,6 +325,57 @@ impl CommandDefinition {
 
     pub fn expand(&self, arguments: &str) -> String {
         self.template.replace("$ARGUMENTS", arguments.trim())
+    }
+
+    /// Expands a command while splicing ordered argument parts at each placeholder.
+    pub fn expand_parts(&self, arguments: &[MessagePart]) -> Vec<MessagePart> {
+        let mut parts = Vec::new();
+        let mut remaining = self.template.as_str();
+        while let Some(position) = remaining.find("$ARGUMENTS") {
+            let (before, after_placeholder) = remaining.split_at(position);
+            if !before.is_empty() {
+                parts.push(MessagePart::Text(before.to_owned()));
+            }
+            parts.extend(arguments.iter().cloned());
+            remaining = &after_placeholder["$ARGUMENTS".len()..];
+        }
+        if !remaining.is_empty() {
+            parts.push(MessagePart::Text(remaining.to_owned()));
+        }
+        parts
+    }
+}
+
+#[cfg(test)]
+mod command_part_tests {
+    use super::*;
+
+    #[test]
+    fn command_expansion_splices_ordered_media_arguments_without_projection() {
+        let command = CommandDefinition::new("inspect", "inspect input", "before $ARGUMENTS after")
+            .expect("command is valid");
+        let arguments = vec![
+            MessagePart::Text("left".into()),
+            MessagePart::Media {
+                media_id: 7,
+                mime: "image/png".into(),
+            },
+            MessagePart::Text("right".into()),
+        ];
+
+        assert_eq!(
+            command.expand_parts(&arguments),
+            vec![
+                MessagePart::Text("before ".into()),
+                MessagePart::Text("left".into()),
+                MessagePart::Media {
+                    media_id: 7,
+                    mime: "image/png".into(),
+                },
+                MessagePart::Text("right".into()),
+                MessagePart::Text(" after".into()),
+            ]
+        );
     }
 }
 

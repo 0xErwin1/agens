@@ -14,6 +14,35 @@ use agens_session::provider::ProviderKind;
 
 use super::{TUI_ERROR_ACTION, TuiRuntimeRouter, auth_route_outcome};
 
+#[cfg(any(test, feature = "test-support"))]
+fn legacy_outcome(outcome: TuiSubmissionOutcome) -> TuiSubmissionOutcome {
+    match outcome {
+        TuiSubmissionOutcome::ProviderMessage { display, message } => {
+            TuiSubmissionOutcome::ProviderTurn {
+                display,
+                prompt: agens_tui::user_message_text(&message),
+            }
+        }
+        TuiSubmissionOutcome::BusyProviderMessage { display, message } => {
+            TuiSubmissionOutcome::BusyProviderTurn {
+                display,
+                prompt: agens_tui::user_message_text(&message),
+            }
+        }
+        outcome => outcome,
+    }
+}
+
+fn text_message(text: String) -> agens_core::Message {
+    agens_core::Message {
+        role: agens_core::Role::User,
+        parts: (!text.is_empty())
+            .then_some(agens_core::MessagePart::Text(text))
+            .into_iter()
+            .collect(),
+    }
+}
+
 impl TuiRuntimeRouter {
     #[cfg(any(test, feature = "test-support"))]
     pub fn route(&self, input: String) -> TuiSubmissionOutcome {
@@ -27,16 +56,21 @@ impl TuiRuntimeRouter {
         input: String,
         progress: std::sync::mpsc::Sender<TuiRouteProgress>,
     ) -> TuiSubmissionOutcome {
-        self.route_with_progress_cancellable(input, progress, TuiRouteCancellation::new())
+        legacy_outcome(self.route_with_progress_cancellable(
+            text_message(input),
+            progress,
+            TuiRouteCancellation::new(),
+        ))
     }
 
     fn route_with_progress_cancellable(
         &self,
-        input: String,
+        input: agens_core::Message,
         progress: std::sync::mpsc::Sender<TuiRouteProgress>,
         cancellation: TuiRouteCancellation,
     ) -> TuiSubmissionOutcome {
-        let command = input.trim();
+        let input_text = agens_tui::user_message_text(&input);
+        let command = input_text.trim();
         let auth = match command {
             "/connect --device-auth" => Some(self.connect(ChatGptAuthFlow::Device, progress)),
             _ => None,
@@ -71,9 +105,19 @@ impl TuiRuntimeRouter {
                 return auth_route_outcome(self.open_device_auth_url(&url));
             }
             TuiRouteRequest::Input(input) => {
+                return self.route_with_progress_cancellable(
+                    text_message(input),
+                    progress,
+                    cancellation,
+                );
+            }
+            TuiRouteRequest::InputMessage(input) => {
                 return self.route_with_progress_cancellable(input, progress, cancellation);
             }
             TuiRouteRequest::BusyInput(input) => {
+                return self.route_busy_input(text_message(input), cancellation);
+            }
+            TuiRouteRequest::BusyMessage(input) => {
                 return self.route_busy_input(input, cancellation);
             }
             TuiRouteRequest::AttachClipboardImage { bytes, mime } => {
@@ -236,12 +280,16 @@ impl TuiRuntimeRouter {
 
     fn route_busy_input(
         &self,
-        input: String,
+        input: agens_core::Message,
         cancellation: TuiRouteCancellation,
     ) -> TuiSubmissionOutcome {
-        match self.classify_busy_input(&input) {
+        let input_text = agens_tui::user_message_text(&input);
+        match self.classify_busy_input(&input_text) {
             super::BusyPolicy::Queue => {
                 match self.resolve_with_cancellation(input, &cancellation) {
+                    Ok(TuiSubmissionOutcome::ProviderMessage { display, message }) => {
+                        TuiSubmissionOutcome::BusyProviderMessage { display, message }
+                    }
                     Ok(TuiSubmissionOutcome::ProviderTurn { display, prompt }) => {
                         TuiSubmissionOutcome::BusyProviderTurn { display, prompt }
                     }

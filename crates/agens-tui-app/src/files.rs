@@ -144,6 +144,7 @@ pub fn tui_select_candidates(
 /// Result of expanding `@` tokens: UTF-8 text files are inlined; media files are ingested.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExpandedTuiPrompt {
+    pub message: agens_core::Message,
     pub text: String,
     pub media_ids: Vec<i64>,
     pub media_mimes: Vec<String>,
@@ -170,48 +171,96 @@ pub fn expand_tui_prompt_with_media(
     bootstrap: &Bootstrap,
     prompt: &str,
 ) -> Result<ExpandedTuiPrompt, CliError> {
+    expand_tui_message_with_media(
+        context,
+        bootstrap,
+        &agens_core::Message {
+            role: agens_core::Role::User,
+            parts: (!prompt.is_empty())
+                .then_some(agens_core::MessagePart::Text(prompt.to_owned()))
+                .into_iter()
+                .collect(),
+        },
+    )
+}
+
+/// Expands every Text part in place while preserving existing Media parts.
+pub fn expand_tui_message_with_media(
+    context: &SessionContext,
+    bootstrap: &Bootstrap,
+    message: &agens_core::Message,
+) -> Result<ExpandedTuiPrompt, CliError> {
     let project_root = agens_session::root::resolve_tui_session_root(context, bootstrap)?;
     let tools = open_native_tools(&project_root, bootstrap.tool_limits())?;
-    let mut expanded = String::with_capacity(prompt.len());
+    let mut parts = Vec::new();
     let mut media_ids = Vec::new();
     let mut media_mimes = Vec::new();
 
-    for segment in prompt.split_inclusive(char::is_whitespace) {
-        let token = segment.trim_end_matches(char::is_whitespace);
-        let whitespace = &segment[token.len()..];
-        if let Some(path) = token.strip_prefix('@').filter(|path| !path.is_empty()) {
-            if let Some(mime) = guess_mime_from_path(Path::new(path)).filter(|m| is_media_mime(m)) {
-                let absolute = confine_project_path(&project_root, Path::new(path))?;
-                let record = ingest_media_path(bootstrap.data_directory(), &absolute, &mime)
-                    .map_err(|error| {
-                        CliError::new(
-                            ExitStatus::Failure,
-                            "file",
-                            format!("attach failed: {error}"),
-                        )
-                    })?;
-                media_ids.push(record.id);
-                media_mimes.push(record.mime);
-            } else {
-                let output = tools
-                    .read_file(ReadFileInput::new(path))
-                    .map_err(|_| CliError::new(ExitStatus::Failure, "file", "read failed"))?;
-                if output.is_error {
-                    return Err(CliError::new(ExitStatus::Failure, "file", output.content));
-                }
-                expanded.push_str(&format!(
-                    "<file path=\"{path}\">\n{}\n</file>",
-                    output.content
-                ));
+    for source_part in &message.parts {
+        let agens_core::MessagePart::Text(prompt) = source_part else {
+            if let agens_core::MessagePart::Media { media_id, mime } = source_part {
+                media_ids.push(*media_id);
+                media_mimes.push(mime.clone());
+                parts.push(source_part.clone());
             }
-        } else {
-            expanded.push_str(token);
+            continue;
+        };
+        let mut expanded = String::with_capacity(prompt.len());
+        for segment in prompt.split_inclusive(char::is_whitespace) {
+            let token = segment.trim_end_matches(char::is_whitespace);
+            let whitespace = &segment[token.len()..];
+            if let Some(path) = token.strip_prefix('@').filter(|path| !path.is_empty()) {
+                if let Some(mime) =
+                    guess_mime_from_path(Path::new(path)).filter(|m| is_media_mime(m))
+                {
+                    let absolute = confine_project_path(&project_root, Path::new(path))?;
+                    let record = ingest_media_path(bootstrap.data_directory(), &absolute, &mime)
+                        .map_err(|error| {
+                            CliError::new(
+                                ExitStatus::Failure,
+                                "file",
+                                format!("attach failed: {error}"),
+                            )
+                        })?;
+                    if !expanded.is_empty() {
+                        parts.push(agens_core::MessagePart::Text(std::mem::take(&mut expanded)));
+                    }
+                    media_ids.push(record.id);
+                    media_mimes.push(record.mime.clone());
+                    parts.push(agens_core::MessagePart::Media {
+                        media_id: record.id,
+                        mime: record.mime,
+                    });
+                } else {
+                    let output = tools
+                        .read_file(ReadFileInput::new(path))
+                        .map_err(|_| CliError::new(ExitStatus::Failure, "file", "read failed"))?;
+                    if output.is_error {
+                        return Err(CliError::new(ExitStatus::Failure, "file", output.content));
+                    }
+                    expanded.push_str(&format!(
+                        "<file path=\"{path}\">\n{}\n</file>",
+                        output.content
+                    ));
+                }
+            } else {
+                expanded.push_str(token);
+            }
+            expanded.push_str(whitespace);
         }
-        expanded.push_str(whitespace);
+        if !expanded.is_empty() {
+            parts.push(agens_core::MessagePart::Text(expanded));
+        }
     }
 
+    let expanded_message = agens_core::Message {
+        role: agens_core::Role::User,
+        parts,
+    };
+    let text = agens_tui::user_message_text(&expanded_message);
     Ok(ExpandedTuiPrompt {
-        text: expanded,
+        message: expanded_message,
+        text,
         media_ids,
         media_mimes,
     })

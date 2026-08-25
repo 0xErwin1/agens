@@ -88,6 +88,7 @@ impl PromptMemoryEntry {
         PromptRecall {
             text: self.text.clone(),
             attachments: self.attachments.clone(),
+            parts: self.parts.clone(),
         }
     }
 }
@@ -97,6 +98,8 @@ impl PromptMemoryEntry {
 pub struct PromptRecall {
     pub text: String,
     pub attachments: Vec<PromptAttachment>,
+    /// Canonical ordered composer content.
+    pub parts: Vec<MessagePart>,
 }
 
 /// Result of moving toward newer history while browsing.
@@ -156,6 +159,15 @@ pub trait PromptMemory: Send {
         attachments: &[PromptAttachment],
     ) -> Result<bool, PromptMemoryError>;
 
+    /// Append canonical ordered Text/Media content.
+    fn record_submission_parts(
+        &mut self,
+        parts: &[MessagePart],
+    ) -> Result<bool, PromptMemoryError> {
+        let (text, attachments) = prompt_parts_projection(parts);
+        self.record_submission(&text, &attachments)
+    }
+
     /// Enter or move browse toward older entries when input is empty (or already browsing).
     ///
     /// `staged_attachments` is captured into the draft on browse entry so that
@@ -180,6 +192,12 @@ pub trait PromptMemory: Send {
         text: &str,
         attachments: &[PromptAttachment],
     ) -> Result<bool, PromptMemoryError>;
+
+    /// Push canonical ordered Text/Media content onto the LIFO top.
+    fn stash_push_parts(&mut self, parts: &[MessagePart]) -> Result<bool, PromptMemoryError> {
+        let (text, attachments) = prompt_parts_projection(parts);
+        self.stash_push(&text, &attachments)
+    }
 
     /// Pop the LIFO top, or `Ok(None)` when empty.
     fn stash_pop(&mut self) -> Result<Option<PromptRecall>, PromptMemoryError>;
@@ -257,19 +275,25 @@ impl PromptMemoryState {
         created_at: i64,
     ) -> bool {
         let text = text.into();
+        self.record_submission_parts_at(legacy_parts(&text, attachments), created_at)
+    }
+
+    pub fn record_submission_parts_at(&mut self, parts: Vec<MessagePart>, created_at: i64) -> bool {
+        let (text, attachments) = prompt_parts_projection(&parts);
         self.browse = None;
 
         if self
             .history
             .last()
-            .is_some_and(|entry| entry.text == text && entry.attachments == attachments)
+            .is_some_and(|entry| entry.parts == parts)
         {
             return false;
         }
 
         self.history.push(
             PromptMemoryEntry::with_created_at(text, created_at)
-                .with_attachments(attachments.to_vec()),
+                .with_attachments(attachments)
+                .with_parts(parts),
         );
         true
     }
@@ -329,6 +353,7 @@ impl PromptMemoryState {
             let draft = PromptRecall {
                 text: state.draft_text.clone(),
                 attachments: state.draft_attachments.clone(),
+                parts: legacy_parts(&state.draft_text, &state.draft_attachments),
             };
             self.browse = None;
             HistoryBrowseResult::RestoreDraft(draft)
@@ -349,9 +374,16 @@ impl PromptMemoryState {
         attachments: &[PromptAttachment],
         created_at: i64,
     ) {
+        let text = text.into();
+        self.stash_push_parts_at(legacy_parts(&text, attachments), created_at);
+    }
+
+    pub fn stash_push_parts_at(&mut self, parts: Vec<MessagePart>, created_at: i64) {
+        let (text, attachments) = prompt_parts_projection(&parts);
         self.stash.push(
             PromptMemoryEntry::with_created_at(text, created_at)
-                .with_attachments(attachments.to_vec()),
+                .with_attachments(attachments)
+                .with_parts(parts),
         );
     }
 
@@ -422,6 +454,38 @@ fn entry_matches_query(entry: &PromptMemoryEntry, query_lower: &str) -> bool {
         })
 }
 
+fn legacy_parts(text: &str, attachments: &[PromptAttachment]) -> Vec<MessagePart> {
+    let mut parts = Vec::new();
+    if !text.is_empty() {
+        parts.push(MessagePart::Text(text.to_owned()));
+    }
+    parts.extend(attachments.iter().map(|attachment| MessagePart::Media {
+        media_id: attachment.media_id,
+        mime: attachment.mime.clone(),
+    }));
+    parts
+}
+
+fn prompt_parts_projection(parts: &[MessagePart]) -> (String, Vec<PromptAttachment>) {
+    let text = parts
+        .iter()
+        .filter_map(|part| match part {
+            MessagePart::Text(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    let attachments = parts
+        .iter()
+        .filter_map(|part| match part {
+            MessagePart::Media { media_id, mime } => {
+                Some(PromptAttachment::new(*media_id, mime.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    (text, attachments)
+}
+
 fn unix_now_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -458,6 +522,15 @@ impl PromptMemory for EphemeralPromptMemory {
         Ok(self.state.record_submission(text, attachments))
     }
 
+    fn record_submission_parts(
+        &mut self,
+        parts: &[MessagePart],
+    ) -> Result<bool, PromptMemoryError> {
+        Ok(self
+            .state
+            .record_submission_parts_at(parts.to_vec(), unix_now_secs()))
+    }
+
     fn browse_up(
         &mut self,
         composer_input: &str,
@@ -484,6 +557,12 @@ impl PromptMemory for EphemeralPromptMemory {
         attachments: &[PromptAttachment],
     ) -> Result<bool, PromptMemoryError> {
         self.state.stash_push(text, attachments);
+        Ok(true)
+    }
+
+    fn stash_push_parts(&mut self, parts: &[MessagePart]) -> Result<bool, PromptMemoryError> {
+        self.state
+            .stash_push_parts_at(parts.to_vec(), unix_now_secs());
         Ok(true)
     }
 
@@ -522,6 +601,32 @@ mod tests {
 
         let with_media = PromptMemoryEntry::new("see this").with_attachments(vec![attachment(7)]);
         assert_eq!(with_media.attachments, vec![attachment(7)]);
+    }
+
+    #[test]
+    fn canonical_history_recall_preserves_order_and_adjacent_text_boundaries() {
+        let mut state = PromptMemoryState::new();
+        let parts = vec![
+            MessagePart::Media {
+                media_id: 1,
+                mime: "image/png".into(),
+            },
+            MessagePart::Text("left".into()),
+            MessagePart::Text("right".into()),
+            MessagePart::Media {
+                media_id: 2,
+                mime: "application/pdf".into(),
+            },
+        ];
+
+        assert!(state.record_submission_parts_at(parts.clone(), 42));
+        assert_eq!(state.history()[0].parts, parts);
+        assert_eq!(state.history()[0].text, "leftright");
+        assert_eq!(state.history()[0].attachments.len(), 2);
+        assert_eq!(
+            state.browse_up("", &[]).expect("history recall").parts,
+            parts
+        );
     }
 
     #[test]

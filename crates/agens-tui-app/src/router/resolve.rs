@@ -2,7 +2,7 @@
 
 use agens_session::model::current_provider;
 
-use agens_core::HeadlessTurnError;
+use agens_core::{HeadlessTurnError, Message, MessagePart, Role};
 use agens_tui::{TuiPresentation, TuiRouteCancellation, TuiSubmissionOutcome};
 
 use crate::engine::{seed_fresh_tui_context, write_through_bypass_permission_prompts};
@@ -56,30 +56,48 @@ impl TuiRuntimeRouter {
 
     #[cfg(any(test, feature = "test-support"))]
     pub fn resolve(&self, input: String) -> Result<TuiSubmissionOutcome, CliError> {
-        self.resolve_with_cancellation(input, &TuiRouteCancellation::new())
+        self.resolve_with_cancellation(
+            Message {
+                role: Role::User,
+                parts: (!input.is_empty())
+                    .then_some(MessagePart::Text(input))
+                    .into_iter()
+                    .collect(),
+            },
+            &TuiRouteCancellation::new(),
+        )
+        .map(|outcome| match outcome {
+            TuiSubmissionOutcome::ProviderMessage { display, message } => {
+                TuiSubmissionOutcome::ProviderTurn {
+                    display,
+                    prompt: agens_tui::user_message_text(&message),
+                }
+            }
+            outcome => outcome,
+        })
     }
 
     pub(super) fn resolve_with_cancellation(
         &self,
-        input: String,
+        input: Message,
         cancellation: &TuiRouteCancellation,
     ) -> Result<TuiSubmissionOutcome, CliError> {
-        if !input.starts_with('/') {
-            return Ok(TuiSubmissionOutcome::ProviderTurn {
-                display: input.clone(),
-                prompt: input,
+        let input_text = agens_tui::user_message_text(&input);
+        if !input_text.starts_with('/') {
+            return Ok(TuiSubmissionOutcome::ProviderMessage {
+                display: agens_tui::present_user_message_parts(&input.parts),
+                message: input,
             });
         }
 
-        let command = input.trim();
+        let command = input_text.trim();
         let invocation = command
             .strip_prefix('/')
             .expect("slash command input was checked");
         let name_end = invocation
             .find(char::is_whitespace)
             .unwrap_or(invocation.len());
-        let (name, arguments) = invocation.split_at(name_end);
-        let arguments = arguments.trim();
+        let (name, _) = invocation.split_at(name_end);
         let bootstrap = self.bootstrap()?;
         let outcome = match command {
             "/dangerous" => return self.toggle_dangerous_mode(),
@@ -192,19 +210,22 @@ impl TuiRuntimeRouter {
                 return Err(CliError::usage(format!("unknown TUI command: {command}")));
             }
             _ => match self.commands()?.command(name) {
-                Some(command) => self.expanded_turn(&input, command.expand(arguments))?,
+                Some(command) => self.expanded_turn_parts(
+                    &input_text,
+                    command.expand_parts(&argument_parts(&input, name)),
+                )?,
                 None => match self.skills()?.skill(name) {
-                    Some(skill) => self.expanded_turn(
-                        &input,
-                        format!(
-                            "## Skill: {}\n{}\n\n## User arguments\n{}",
+                    Some(skill) => {
+                        let mut parts = vec![MessagePart::Text(format!(
+                            "## Skill: {}\n{}\n\n## User arguments\n",
                             skill.name(),
                             skill.load_instructions().map_err(|_| {
                                 CliError::usage(format!("skill /{name} is unavailable"))
                             })?,
-                            arguments
-                        ),
-                    )?,
+                        ))];
+                        parts.extend(argument_parts(&input, name));
+                        self.expanded_turn_parts(&input_text, parts)?
+                    }
                     None => {
                         return Err(CliError::usage(format!("unknown TUI command: {command}")));
                     }
@@ -219,19 +240,29 @@ impl TuiRuntimeRouter {
     /// The session keeps the invocation alongside the expansion so that taking
     /// the turn back hands `/name arguments` to the composer rather than the
     /// command template or the whole inlined body of a skill.
-    fn expanded_turn(
+    fn expanded_turn_parts(
         &self,
         typed: &str,
-        expanded: String,
+        parts: Vec<MessagePart>,
     ) -> Result<TuiSubmissionOutcome, CliError> {
+        let expanded = parts
+            .iter()
+            .filter_map(|part| match part {
+                MessagePart::Text(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
         self.session
             .lock()
             .map_err(|_| CliError::storage("TUI session is unavailable"))?
-            .remember_expanded_prompt(typed.to_owned(), expanded.clone());
+            .remember_expanded_prompt(typed.to_owned(), expanded);
 
-        Ok(TuiSubmissionOutcome::ProviderTurn {
+        Ok(TuiSubmissionOutcome::ProviderMessage {
             display: typed.to_owned(),
-            prompt: expanded,
+            message: Message {
+                role: Role::User,
+                parts,
+            },
         })
     }
 
@@ -501,6 +532,45 @@ impl TuiRuntimeRouter {
                     .unwrap_or_default()
             })
     }
+}
+
+fn argument_parts(message: &Message, name: &str) -> Vec<MessagePart> {
+    let mut prefix = format!("/{name}");
+    let mut trimming = true;
+    let mut arguments = Vec::new();
+    for part in &message.parts {
+        match part {
+            MessagePart::Text(text) if !prefix.is_empty() => {
+                let consumed = text.len().min(prefix.len());
+                if text.get(..consumed) == prefix.get(..consumed) {
+                    prefix.drain(..consumed);
+                    let rest = &text[consumed..];
+                    let rest = if trimming { rest.trim_start() } else { rest };
+                    trimming = rest.is_empty();
+                    if !rest.is_empty() {
+                        arguments.push(MessagePart::Text(rest.to_owned()));
+                    }
+                }
+            }
+            MessagePart::Text(text) => {
+                let text = if trimming { text.trim_start() } else { text };
+                trimming = text.is_empty();
+                if !text.is_empty() {
+                    arguments.push(MessagePart::Text(text.to_owned()));
+                }
+            }
+            MessagePart::Media { .. } => arguments.push(part.clone()),
+            _ => {}
+        }
+    }
+    if let Some(MessagePart::Text(text)) = arguments.last_mut() {
+        let trimmed_len = text.trim_end().len();
+        text.truncate(trimmed_len);
+        if text.is_empty() {
+            arguments.pop();
+        }
+    }
+    arguments
 }
 
 fn command_name(input: &str) -> Option<&str> {

@@ -3102,7 +3102,7 @@ fn open_running_tui_select(tui: &mut Tui<ProductionTuiEngine>, router: &TuiRunti
         panic!("busy /select should route through catalog classification");
     };
     let outcome = router.route_request(
-        TuiRouteRequest::BusyInput(input),
+        TuiRouteRequest::BusyMessage(input.into_message()),
         std::sync::mpsc::channel().0,
     );
     assert!(

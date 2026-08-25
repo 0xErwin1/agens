@@ -3,9 +3,20 @@
 use std::{collections::VecDeque, time::Instant};
 
 use crate::Key;
+use agens_core::{Message, MessagePart, Role};
 
 const RUNNING_REFUSAL: &str = "This command is unavailable while a response is in progress.";
 const QUEUE_FULL_REFUSAL: &str = "Prompt queue is full; draft was kept unchanged.";
+
+fn text_message(text: String) -> Message {
+    Message {
+        role: Role::User,
+        parts: (!text.is_empty())
+            .then_some(MessagePart::Text(text))
+            .into_iter()
+            .collect(),
+    }
+}
 
 /// Whether the application currently owns an active runtime turn.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -68,7 +79,8 @@ impl TurnLifecycle {
 pub struct QueueEntry {
     id: u64,
     prompt: String,
-    resolved_prompt: Option<String>,
+    message: Message,
+    resolved: bool,
 }
 
 /// A prompt-scheduler transition safe to expose to local diagnostics.
@@ -140,18 +152,21 @@ impl PromptObservability {
 
 impl QueueEntry {
     fn new(id: u64, prompt: String) -> Self {
+        let message = text_message(prompt.clone());
         Self {
             id,
             prompt,
-            resolved_prompt: None,
+            message,
+            resolved: false,
         }
     }
 
-    fn resolved(id: u64, display: String, prompt: String) -> Self {
+    fn resolved_message(id: u64, display: String, message: Message) -> Self {
         Self {
             id,
             prompt: display,
-            resolved_prompt: Some(prompt),
+            message,
+            resolved: true,
         }
     }
 
@@ -163,6 +178,11 @@ impl QueueEntry {
     /// Returns the queued prompt without adopting it into history.
     pub fn prompt(&self) -> &str {
         &self.prompt
+    }
+
+    /// Returns the immutable canonical content owned by this queue entry.
+    pub fn message(&self) -> &Message {
+        &self.message
     }
 }
 
@@ -196,6 +216,11 @@ pub enum AppEvent {
         display: String,
         prompt: String,
     },
+    /// Queues canonical ordered provider content without flattening media.
+    QueueMessage {
+        display: String,
+        message: Message,
+    },
     /// The active turn completed successfully with its final output.
     TurnCompletedFor {
         generation: u64,
@@ -227,10 +252,10 @@ pub enum AppEvent {
 pub enum Effect {
     /// Begin a new runtime turn for this prompt.
     StartPrompt(String),
-    /// Begin a queued prompt whose catalog expansion differs from its display text.
-    StartQueuedPrompt {
+    /// Begin canonical ordered content owned by a queued entry.
+    StartQueuedMessage {
         display: String,
-        prompt: String,
+        message: Message,
     },
     /// Persist a successfully completed prompt and output pair.
     PersistCompleted {
@@ -310,6 +335,7 @@ impl AppState {
         match event {
             AppEvent::SubmitPrompt(prompt) => self.submit_prompt(prompt),
             AppEvent::QueuePrompt { display, prompt } => self.queue_prompt(display, prompt),
+            AppEvent::QueueMessage { display, message } => self.queue_message(display, message),
             AppEvent::TurnCompletedFor { generation, output } => {
                 self.complete_turn(generation, output)
             }
@@ -454,6 +480,10 @@ impl AppState {
     }
 
     fn queue_prompt(&mut self, display: String, prompt: String) -> Vec<Effect> {
+        self.queue_message(display, text_message(prompt))
+    }
+
+    fn queue_message(&mut self, display: String, message: Message) -> Vec<Effect> {
         self.disarm_exit();
         if self.lifecycle == TurnLifecycle::Idle {
             return vec![self.begin_turn(display)];
@@ -463,7 +493,7 @@ impl AppState {
             return vec![Effect::RefusePrompt(QUEUE_FULL_REFUSAL.into())];
         }
 
-        let entry = QueueEntry::resolved(self.next_queue_entry_id, display, prompt);
+        let entry = QueueEntry::resolved_message(self.next_queue_entry_id, display, message);
         self.next_queue_entry_id += 1;
         self.queued_prompts.push_back(entry);
         self.observability.record(PromptTransition::Queued);
@@ -518,9 +548,13 @@ impl AppState {
         self.observability.record(PromptTransition::Dequeued);
         let display = entry.prompt;
         let effect = self.begin_turn(display.clone());
-        match entry.resolved_prompt {
-            Some(prompt) => Some(Effect::StartQueuedPrompt { display, prompt }),
-            None => Some(effect),
+        if entry.resolved {
+            Some(Effect::StartQueuedMessage {
+                display,
+                message: entry.message,
+            })
+        } else {
+            Some(effect)
         }
     }
 
