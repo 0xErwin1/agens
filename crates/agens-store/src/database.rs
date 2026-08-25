@@ -57,7 +57,7 @@ struct Migration {
     preserved_tables: &'static [&'static str],
 }
 
-const MIGRATIONS: [Migration; 19] = [
+const MIGRATIONS: [Migration; 20] = [
     Migration {
         id: "0001_permission_grants",
         ddl: permission_grants_ddl,
@@ -157,6 +157,11 @@ const MIGRATIONS: [Migration; 19] = [
     Migration {
         id: "0019_open_questions",
         ddl: open_questions_ddl,
+        preserved_tables: &[],
+    },
+    Migration {
+        id: "0020_retry_user_parts",
+        ddl: retry_user_parts_ddl,
         preserved_tables: &[],
     },
 ];
@@ -576,6 +581,29 @@ fn repository_policy_ddl() -> String {
         repo_id TEXT NOT NULL CHECK(repo_id <> ''),
         repository TEXT NOT NULL CHECK(repository <> ''),
         asked_at INTEGER NOT NULL
+    );
+    "
+    .to_owned()
+}
+
+/// Canonical ordered user content retained while an attempt is retryable.
+///
+/// This is additive rather than another `session_attempts` rebuild: old retry columns remain the
+/// compatibility projection and rows without parts continue to load through that legacy path.
+fn retry_user_parts_ddl() -> String {
+    "
+    CREATE TABLE retry_user_parts (
+        attempt_id INTEGER NOT NULL,
+        sequence INTEGER NOT NULL CHECK(sequence >= 0),
+        kind TEXT NOT NULL CHECK(kind IN ('text', 'media')),
+        text TEXT,
+        media_id INTEGER,
+        mime TEXT,
+        PRIMARY KEY(attempt_id, sequence),
+        FOREIGN KEY(attempt_id) REFERENCES session_attempts(id) ON DELETE CASCADE,
+        FOREIGN KEY(media_id) REFERENCES media(id) ON DELETE RESTRICT,
+        CHECK((kind = 'text' AND text IS NOT NULL AND text <> '' AND media_id IS NULL AND mime IS NULL) OR
+              (kind = 'media' AND text IS NULL AND media_id IS NOT NULL AND media_id > 0 AND mime IS NOT NULL AND mime <> ''))
     );
     "
     .to_owned()

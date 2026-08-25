@@ -11,6 +11,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use crate::MessagePart;
+
 /// One staged media attachment carried by a recorded prompt (durable id, no source path).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PromptAttachment {
@@ -32,29 +34,53 @@ impl PromptAttachment {
 pub struct PromptMemoryEntry {
     pub text: String,
     pub attachments: Vec<PromptAttachment>,
+    /// Canonical ordered Text/Media content. Legacy fields are projections for surfaces.
+    pub parts: Vec<MessagePart>,
     /// Unix seconds (UTC).
     pub created_at: i64,
 }
 
 impl PromptMemoryEntry {
     pub fn new(text: impl Into<String>) -> Self {
+        let text = text.into();
+        let parts = (!text.is_empty())
+            .then(|| MessagePart::Text(text.clone()))
+            .into_iter()
+            .collect();
         Self {
-            text: text.into(),
+            text,
             attachments: Vec::new(),
+            parts,
             created_at: unix_now_secs(),
         }
     }
 
     pub fn with_created_at(text: impl Into<String>, created_at: i64) -> Self {
+        let text = text.into();
+        let parts = (!text.is_empty())
+            .then(|| MessagePart::Text(text.clone()))
+            .into_iter()
+            .collect();
         Self {
-            text: text.into(),
+            text,
             attachments: Vec::new(),
+            parts,
             created_at,
         }
     }
 
     pub fn with_attachments(mut self, attachments: Vec<PromptAttachment>) -> Self {
+        self.parts
+            .extend(attachments.iter().map(|attachment| MessagePart::Media {
+                media_id: attachment.media_id,
+                mime: attachment.mime.clone(),
+            }));
         self.attachments = attachments;
+        self
+    }
+
+    pub fn with_parts(mut self, parts: Vec<MessagePart>) -> Self {
+        self.parts = parts;
         self
     }
 

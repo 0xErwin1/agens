@@ -11,10 +11,10 @@
 //! had, because a run reaching this path is already failing and a half-applied
 //! compaction would turn a recoverable turn into an unrecoverable session.
 
-use agens_core::Message;
 use agens_core::compaction::{
     CompactionBudget, CompactionError, CompactionSummary, apply_compaction, plan_compaction,
 };
+use agens_core::{Message, MessagePart};
 use agens_diagnostics::{
     CompactionReason, CompactionRecord, SafeDiagnosticStore, SessionLifecycle,
 };
@@ -27,8 +27,21 @@ use agens_store::{CompactionStore, CompactionStoreError};
 /// turn against some model, and which model, on which credentials, is a
 /// decision this module has no business making.
 pub trait CompactionSummarizer {
-    /// Returns the summary text for `prompt`, or the reason it could not.
+    /// Legacy text-only summarizer entry point.
     fn summarize(&self, prompt: &str) -> Result<String, String>;
+
+    /// Ordered multimodal entry point. Implementations that support media override this.
+    fn summarize_message(&self, message: &Message) -> Result<String, String> {
+        let prompt = message
+            .parts
+            .iter()
+            .filter_map(|part| match part {
+                MessagePart::Text(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        self.summarize(&prompt)
+    }
 }
 
 /// Why a compaction did not happen.
@@ -166,7 +179,7 @@ impl<'a> SessionCompactor<'a> {
             .map(|entry| entry.summary);
 
         let text = summarizer
-            .summarize(&plan.prompt(previous.as_deref()))
+            .summarize_message(&plan.summary_message(previous.as_deref()))
             .map_err(CompactionFailure::Summarizer)?;
         let summary = CompactionSummary::new(text).map_err(CompactionFailure::Summary)?;
 

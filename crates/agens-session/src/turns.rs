@@ -151,6 +151,20 @@ pub fn completed_session_turn_with_media(
     )
 }
 
+pub fn completed_session_turn_with_user_message(
+    user: &SessionMessage,
+    directives: &[Message],
+    snapshot: &CompletedTurnSnapshot,
+    pending_system_reminder: Option<&str>,
+) -> Result<CompletedSessionTurn, CliError> {
+    completed_session_turn_from_events_with_user_message(
+        user,
+        directives,
+        snapshot.events(),
+        pending_system_reminder,
+    )
+}
+
 pub fn completed_session_turn_from_events(
     prompt: &str,
     events: &[TurnEvent],
@@ -173,6 +187,26 @@ pub fn completed_session_turn_from_events_with_media(
     events: &[TurnEvent],
     pending_system_reminder: Option<&str>,
 ) -> Result<CompletedSessionTurn, CliError> {
+    let user = SessionMessage::try_from(Message {
+        role: Role::User,
+        parts: durable_user_parts(prompt, media),
+    })
+    .map_err(|_| CliError::storage("completed session could not be encoded"))?;
+    completed_session_turn_from_events_with_user_message(
+        &user,
+        directives,
+        events,
+        pending_system_reminder,
+    )
+}
+
+/// Persists one already-validated ordered user message without reconstructing it.
+pub fn completed_session_turn_from_events_with_user_message(
+    user: &SessionMessage,
+    directives: &[Message],
+    events: &[TurnEvent],
+    pending_system_reminder: Option<&str>,
+) -> Result<CompletedSessionTurn, CliError> {
     let mut messages = pending_system_reminder
         .map(|reminder| Message {
             role: Role::System,
@@ -183,10 +217,7 @@ pub fn completed_session_turn_from_events_with_media(
 
     messages.extend(directives.iter().cloned());
 
-    messages.push(Message {
-        role: Role::User,
-        parts: durable_user_parts(prompt, media),
-    });
+    messages.push(user.as_message().clone());
     let mut role = None;
     let mut parts = Vec::new();
     for event in events {
@@ -493,6 +524,38 @@ fn flush_parts(messages: &mut Vec<Message>, role: Role, parts: &mut Vec<MessageP
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completed_turn_persists_explicit_ordered_user_parts_once() {
+        let user = SessionMessage::try_from(Message {
+            role: Role::User,
+            parts: vec![
+                MessagePart::Media {
+                    media_id: 3,
+                    mime: "image/png".into(),
+                },
+                MessagePart::Text("between".into()),
+                MessagePart::Media {
+                    media_id: 4,
+                    mime: "image/jpeg".into(),
+                },
+                MessagePart::Text("after".into()),
+            ],
+        })
+        .unwrap();
+        let events = [TurnEvent::ProviderPart(MessagePart::Text("done".into()))];
+
+        let turn = completed_session_turn_from_events_with_user_message(&user, &[], &events, None)
+            .unwrap();
+
+        let users = turn
+            .messages()
+            .iter()
+            .filter(|message| message.role == Role::User)
+            .collect::<Vec<_>>();
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0], user.as_message());
+    }
 
     #[test]
     fn completed_turn_with_media_persists_text_and_path_free_media_parts() {

@@ -798,6 +798,7 @@ fn request_for(
 
     Ok(HeadlessChatRequest {
         prompt: prompt_for(run, &fence),
+        user_message: None,
         history: resumed_history(bootstrap, run),
         model: Some(run.model.clone()),
         system_prompt: Some(worker_system_prompt(&fence)),

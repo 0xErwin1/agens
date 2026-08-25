@@ -71,11 +71,29 @@ impl AttemptActivityRegistry {
         prompt: String,
         media_ids: Vec<i64>,
     ) -> Result<agens_core::SessionAttemptSummary, BeginSessionAttemptError> {
+        let attempt = store.begin_session_attempt_with_media(metadata, prompt, media_ids)?;
+        self.register(store, attempt)
+    }
+
+    pub fn begin_and_register_with_user_message(
+        &self,
+        store: &mut SessionStore,
+        metadata: &SessionMetadata,
+        user_message: &SessionMessage,
+    ) -> Result<agens_core::SessionAttemptSummary, BeginSessionAttemptError> {
+        let attempt = store.begin_session_attempt_with_user_message(metadata, user_message)?;
+        self.register(store, attempt)
+    }
+
+    fn register(
+        &self,
+        store: &SessionStore,
+        attempt: agens_core::SessionAttemptSummary,
+    ) -> Result<agens_core::SessionAttemptSummary, BeginSessionAttemptError> {
         let mut active = self
             .active
             .lock()
             .map_err(|_| BeginSessionAttemptError::Store)?;
-        let attempt = store.begin_session_attempt_with_media(metadata, prompt, media_ids)?;
         active.push(ScopedAttemptKey {
             database_path: store.database_path(),
             key: attempt.key(),
@@ -285,7 +303,7 @@ pub struct TerminalAttemptWrite<'a> {
 pub fn run_session_attempt_lifecycle_with_terminal_writer(
     registry: &AttemptActivityRegistry,
     store: &mut SessionStore,
-    mut metadata: SessionMetadata,
+    metadata: SessionMetadata,
     prompt: String,
     media_ids: Vec<i64>,
     runtime: impl FnOnce(AttemptKey) -> Result<(CompletedTurnSnapshot, CompletedSessionTurn), CliError>,
@@ -294,9 +312,75 @@ pub fn run_session_attempt_lifecycle_with_terminal_writer(
         TerminalAttemptWrite<'_>,
     ) -> Result<Option<PartialTurnRecord>, AttemptStoreError>,
 ) -> Result<SessionAttemptCompletion, AttemptLifecycleError> {
-    let attempt = registry
-        .begin_and_register_with_media(store, &metadata, prompt.clone(), media_ids)
-        .map_err(AttemptLifecycleError::Begin)?;
+    run_session_attempt_lifecycle_inner(
+        registry,
+        store,
+        metadata,
+        AttemptUser::Legacy { prompt, media_ids },
+        runtime,
+        terminal_writer,
+    )
+}
+
+pub fn run_session_attempt_lifecycle_with_user_message(
+    registry: &AttemptActivityRegistry,
+    store: &mut SessionStore,
+    metadata: SessionMetadata,
+    user_message: &SessionMessage,
+    runtime: impl FnOnce(AttemptKey) -> Result<(CompletedTurnSnapshot, CompletedSessionTurn), CliError>,
+    terminal_writer: impl FnOnce(
+        &mut SessionStore,
+        TerminalAttemptWrite<'_>,
+    ) -> Result<Option<PartialTurnRecord>, AttemptStoreError>,
+) -> Result<SessionAttemptCompletion, AttemptLifecycleError> {
+    run_session_attempt_lifecycle_inner(
+        registry,
+        store,
+        metadata,
+        AttemptUser::Canonical(user_message),
+        runtime,
+        terminal_writer,
+    )
+}
+
+enum AttemptUser<'a> {
+    Legacy { prompt: String, media_ids: Vec<i64> },
+    Canonical(&'a SessionMessage),
+}
+
+fn run_session_attempt_lifecycle_inner(
+    registry: &AttemptActivityRegistry,
+    store: &mut SessionStore,
+    mut metadata: SessionMetadata,
+    user: AttemptUser<'_>,
+    runtime: impl FnOnce(AttemptKey) -> Result<(CompletedTurnSnapshot, CompletedSessionTurn), CliError>,
+    terminal_writer: impl FnOnce(
+        &mut SessionStore,
+        TerminalAttemptWrite<'_>,
+    ) -> Result<Option<PartialTurnRecord>, AttemptStoreError>,
+) -> Result<SessionAttemptCompletion, AttemptLifecycleError> {
+    let (attempt, prompt) = match user {
+        AttemptUser::Canonical(user_message) => {
+            let prompt = user_message
+                .as_message()
+                .parts
+                .iter()
+                .filter_map(|part| match part {
+                    MessagePart::Text(text) => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            (
+                registry.begin_and_register_with_user_message(store, &metadata, user_message),
+                prompt,
+            )
+        }
+        AttemptUser::Legacy { prompt, media_ids } => (
+            registry.begin_and_register_with_media(store, &metadata, prompt.clone(), media_ids),
+            prompt,
+        ),
+    };
+    let attempt = attempt.map_err(AttemptLifecycleError::Begin)?;
     let _registered = RegisteredAttempt {
         registry,
         database_path: store.database_path(),

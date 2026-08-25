@@ -3,7 +3,7 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-use agens_core::{PromptAttachment, PromptMemoryEntry};
+use agens_core::{MessagePart, PromptAttachment, PromptMemoryEntry};
 use agens_store::PromptMemoryStore;
 use rusqlite::Connection;
 
@@ -410,6 +410,88 @@ fn an_undecodable_attachments_row_loads_as_text_and_is_counted() {
     assert!(history[1].attachments.is_empty());
     assert_eq!(reopened.list_stash().unwrap()[0].text, "parked");
     assert_eq!(reopened.undecodable_attachment_rows(), 2);
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn versioned_prompt_codec_preserves_order_and_decodes_legacy_pairs() {
+    let directory = data_directory();
+    let ordered = vec![
+        MessagePart::Media {
+            media_id: 1,
+            mime: "image/png".into(),
+        },
+        MessagePart::Text("between".into()),
+        MessagePart::Media {
+            media_id: 2,
+            mime: "image/jpeg".into(),
+        },
+        MessagePart::Text("after".into()),
+    ];
+
+    {
+        let mut store = PromptMemoryStore::open(&directory).unwrap();
+        store
+            .append_history_parts(&ordered)
+            .unwrap()
+            .expect("inserted");
+    }
+
+    {
+        let connection = Connection::open(directory.join("agens.db")).unwrap();
+        let encoded: String = connection
+            .query_row(
+                "SELECT attachments FROM prompt_history WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(encoded.starts_with("[1,"));
+        connection
+            .execute(
+                "INSERT INTO prompt_history (text, created_at, attachments) VALUES ('legacy', 1, '[[9,\"image/webp\"]]')",
+                [],
+            )
+            .unwrap();
+    }
+
+    let reopened = PromptMemoryStore::open(&directory).unwrap();
+    let history = reopened.list_history().unwrap();
+    assert_eq!(history[0].parts, ordered);
+    assert_eq!(
+        history[1].parts,
+        vec![
+            MessagePart::Text("legacy".into()),
+            MessagePart::Media {
+                media_id: 9,
+                mime: "image/webp".into(),
+            },
+        ]
+    );
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn versioned_prompt_codec_preserves_adjacent_text_part_boundaries() {
+    let directory = data_directory();
+    let adjacent_text = vec![
+        MessagePart::Text("first".into()),
+        MessagePart::Text("second".into()),
+        MessagePart::Text("third".into()),
+    ];
+
+    {
+        let mut store = PromptMemoryStore::open(&directory).unwrap();
+        store
+            .append_history_parts(&adjacent_text)
+            .unwrap()
+            .expect("inserted");
+    }
+
+    let reopened = PromptMemoryStore::open(&directory).unwrap();
+    assert_eq!(reopened.list_history().unwrap()[0].parts, adjacent_text);
 
     fs::remove_dir_all(directory).unwrap();
 }

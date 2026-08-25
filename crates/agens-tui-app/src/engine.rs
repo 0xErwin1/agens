@@ -646,6 +646,7 @@ pub fn run_tui_prompt_with(
             &session,
             HeadlessChatRequest {
                 prompt: expanded.text,
+                user_message: None,
                 history: Vec::new(),
                 model: None,
                 system_prompt: None,
@@ -984,6 +985,7 @@ mod tests {
     fn bare_headless_request() -> HeadlessChatRequest {
         HeadlessChatRequest {
             prompt: "test".into(),
+            user_message: None,
             history: Vec::new(),
             model: None,
             system_prompt: None,

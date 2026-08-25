@@ -77,6 +77,7 @@ pub(crate) fn chat_request(arguments: cli::ChatArgs) -> Result<HeadlessChatReque
 
     Ok(HeadlessChatRequest {
         prompt,
+        user_message: None,
         history: Vec::new(),
         model: arguments.model,
         system_prompt: arguments.system,

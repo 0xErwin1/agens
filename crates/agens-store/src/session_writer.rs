@@ -2,7 +2,7 @@ use agens_core::{
     AttemptFinishOutcome, AttemptKey, BeginSessionAttemptError, CompletedSessionTurn,
     MAX_RETRY_PROMPT_BYTES, Message, MessagePart, ReasoningEffort, RecoveryOutcome, RequestConfig,
     RetryBoundary, Role, SessionAttemptFailureKind, SessionAttemptStatus, SessionAttemptSummary,
-    SessionMetadata,
+    SessionMessage, SessionMetadata,
 };
 use std::path::PathBuf;
 
@@ -151,6 +151,45 @@ impl SessionStore {
         retry_prompt: String,
         media_ids: Vec<i64>,
     ) -> Result<SessionAttemptSummary, BeginSessionAttemptError> {
+        self.begin_session_attempt_inner(metadata, retry_prompt, media_ids, None)
+    }
+
+    pub fn begin_session_attempt_with_user_message(
+        &mut self,
+        metadata: &SessionMetadata,
+        user_message: &SessionMessage,
+    ) -> Result<SessionAttemptSummary, BeginSessionAttemptError> {
+        if user_message.as_message().role != Role::User {
+            return Err(BeginSessionAttemptError::Store);
+        }
+        let retry_prompt = user_message
+            .as_message()
+            .parts
+            .iter()
+            .filter_map(|part| match part {
+                MessagePart::Text(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        let media_ids = user_message
+            .as_message()
+            .parts
+            .iter()
+            .filter_map(|part| match part {
+                MessagePart::Media { media_id, .. } => Some(*media_id),
+                _ => None,
+            })
+            .collect();
+        self.begin_session_attempt_inner(metadata, retry_prompt, media_ids, Some(user_message))
+    }
+
+    fn begin_session_attempt_inner(
+        &mut self,
+        metadata: &SessionMetadata,
+        retry_prompt: String,
+        media_ids: Vec<i64>,
+        user_message: Option<&SessionMessage>,
+    ) -> Result<SessionAttemptSummary, BeginSessionAttemptError> {
         if retry_prompt.len() > MAX_RETRY_PROMPT_BYTES {
             return Err(BeginSessionAttemptError::Store);
         }
@@ -190,6 +229,16 @@ impl SessionStore {
         }
         transaction
             .execute(
+                "DELETE FROM retry_user_parts
+                 WHERE attempt_id IN (
+                     SELECT id FROM session_attempts
+                     WHERE session_id = ?1 AND retry_prompt IS NOT NULL
+                 )",
+                [session_id],
+            )
+            .map_err(|_| BeginSessionAttemptError::Store)?;
+        transaction
+            .execute(
                 "UPDATE session_attempts SET retry_prompt = NULL, retry_media_ids = NULL
                  WHERE session_id = ?1 AND retry_prompt IS NOT NULL",
                 [session_id],
@@ -217,6 +266,10 @@ impl SessionStore {
             .map_err(|_| BeginSessionAttemptError::Store)?;
         let key = AttemptKey::new(session_id, transaction.last_insert_rowid())
             .map_err(|_| BeginSessionAttemptError::Store)?;
+        if let Some(user_message) = user_message {
+            insert_retry_user_parts(&transaction, key.attempt_id(), user_message)
+                .map_err(|_| BeginSessionAttemptError::Store)?;
+        }
         let summary = SessionAttemptSummary::new(
             key,
             sequence
@@ -370,6 +423,18 @@ impl SessionStore {
                 "running attempt changed during completion",
             ));
         }
+        transaction
+            .execute(
+                "DELETE FROM retry_user_parts WHERE attempt_id = ?1",
+                [key.attempt_id()],
+            )
+            .map_err(|error| {
+                SessionStoreError::operation(
+                    "clear completed attempt retry parts",
+                    &self.database_path,
+                    error,
+                )
+            })?;
         transaction.commit().map_err(|error| {
             SessionStoreError::operation(
                 "commit completed session attempt",
@@ -473,6 +538,18 @@ impl SessionStore {
                 "running attempt changed during persistence",
             ));
         }
+        transaction
+            .execute(
+                "DELETE FROM retry_user_parts WHERE attempt_id = ?1",
+                [key.attempt_id()],
+            )
+            .map_err(|error| {
+                SessionStoreError::operation(
+                    "clear partial attempt retry parts",
+                    &self.database_path,
+                    error,
+                )
+            })?;
 
         transaction.commit().map_err(|error| {
             SessionStoreError::operation(
@@ -912,7 +989,14 @@ impl SessionStore {
         };
 
         let media_ids = decode_retry_media_ids(media_ids_json.as_deref(), &self.database_path)?;
-        RetryBoundary::new(key, prompt, media_ids)
+        let user_message = load_retry_user_message(
+            &self.connection,
+            &self.database_path,
+            key.attempt_id(),
+            &prompt,
+            &media_ids,
+        )?;
+        RetryBoundary::with_user_message(key, user_message)
             .map(Some)
             .map_err(|error| {
                 SessionStoreError::operation(
@@ -2059,6 +2143,111 @@ fn decode_part(
     };
     part.ok_or_else(|| {
         SessionStoreError::operation("decode session message part", database_path, "invalid part")
+    })
+}
+
+fn insert_retry_user_parts(
+    transaction: &Transaction<'_>,
+    attempt_id: i64,
+    user_message: &SessionMessage,
+) -> rusqlite::Result<()> {
+    for (sequence, part) in user_message.as_message().parts.iter().enumerate() {
+        match part {
+            MessagePart::Text(text) => transaction.execute(
+                "INSERT INTO retry_user_parts(attempt_id, sequence, kind, text) VALUES (?1, ?2, 'text', ?3)",
+                params![attempt_id, sequence as i64, text],
+            )?,
+            MessagePart::Media { media_id, mime } => transaction.execute(
+                "INSERT INTO retry_user_parts(attempt_id, sequence, kind, media_id, mime) VALUES (?1, ?2, 'media', ?3, ?4)",
+                params![attempt_id, sequence as i64, media_id, mime],
+            )?,
+            _ => return Err(rusqlite::Error::InvalidQuery),
+        };
+    }
+    Ok(())
+}
+
+fn load_retry_user_message(
+    connection: &rusqlite::Connection,
+    database_path: &std::path::Path,
+    attempt_id: i64,
+    prompt: &str,
+    media_ids: &[i64],
+) -> Result<SessionMessage, SessionStoreError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT kind, text, media_id, mime FROM retry_user_parts
+             WHERE attempt_id = ?1 ORDER BY sequence",
+        )
+        .map_err(|error| {
+            SessionStoreError::operation("load retry user parts", database_path, error)
+        })?;
+    let rows = statement
+        .query_map([attempt_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })
+        .map_err(|error| {
+            SessionStoreError::operation("load retry user parts", database_path, error)
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|error| {
+            SessionStoreError::operation("load retry user parts", database_path, error)
+        })?;
+
+    let parts = if rows.is_empty() {
+        let mut parts = Vec::new();
+        if !prompt.is_empty() {
+            parts.push(MessagePart::Text(prompt.to_owned()));
+        }
+        for media_id in media_ids {
+            let mime = connection
+                .query_row("SELECT mime FROM media WHERE id = ?1", [media_id], |row| {
+                    row.get(0)
+                })
+                .optional()
+                .map_err(|error| {
+                    SessionStoreError::operation("load retry media MIME", database_path, error)
+                })?
+                .unwrap_or_else(|| "application/octet-stream".to_owned());
+            parts.push(MessagePart::Media {
+                media_id: *media_id,
+                mime,
+            });
+        }
+        parts
+    } else {
+        rows.into_iter()
+            .map(
+                |(kind, text, media_id, mime)| match (kind.as_str(), text, media_id, mime) {
+                    ("text", Some(text), None, None) => Ok(MessagePart::Text(text)),
+                    ("media", None, Some(media_id), Some(mime)) => {
+                        Ok(MessagePart::Media { media_id, mime })
+                    }
+                    _ => Err(SessionStoreError::operation(
+                        "decode retry user part",
+                        database_path,
+                        "invalid part",
+                    )),
+                },
+            )
+            .collect::<Result<Vec<_>, _>>()?
+    };
+
+    SessionMessage::try_from(Message {
+        role: Role::User,
+        parts,
+    })
+    .map_err(|error| {
+        SessionStoreError::operation(
+            "validate retry user message",
+            database_path,
+            format!("{error:?}"),
+        )
     })
 }
 

@@ -299,6 +299,7 @@ impl HostedChat {
 
         Ok(HeadlessChatRequest {
             prompt: prompt.to_owned(),
+            user_message: None,
             history: self.history.clone(),
             model: Some(self.model.clone()),
             // Left for the turn to resolve from the project root, which is how

@@ -4,7 +4,9 @@
 
 use crate::outcome::{HeadlessChatCompletion, HeadlessChatFailure};
 use crate::request::HeadlessChatRequest;
-use crate::request::{explicit_task_delegation_prompt, preflight_request_media, provider_messages};
+use crate::request::{
+    explicit_task_delegation_prompt, preflight_request_media, provider_messages, user_turn_message,
+};
 use crate::subagents::{interrupted_turn_note, record_tool_result_fact};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
@@ -13,8 +15,8 @@ use agens_core::compaction::CompactionBudget;
 use agens_core::mcp_failure::{McpFailure, McpFailureClass};
 use agens_core::{
     BeginSessionAttemptError, HeadlessTurnCancellation, HeadlessTurnError, Message, MessagePart,
-    PermissionMode, PermissionSession, Role, TurnEvent, TurnProgressSink, TurnProvider,
-    run_headless_turn_with_inbox,
+    PermissionMode, PermissionSession, Role, SessionMessage, TurnEvent, TurnProgressSink,
+    TurnProvider, run_headless_turn_with_inbox,
 };
 use agens_providers::{
     ChatGptResponsesProvider, DiagnosticRef, MediaBlobs, MoonshotProvider, OpenAiFunctionTool,
@@ -46,7 +48,7 @@ use agens_permissions::{
 };
 use agens_session::attempt::{
     AttemptLifecycleError, active_session_attempts,
-    run_session_attempt_lifecycle_with_terminal_writer, write_terminal_attempt,
+    run_session_attempt_lifecycle_with_user_message, write_terminal_attempt,
     write_terminal_attempt_with_history,
 };
 use agens_session::compaction::{CompactionSummarizer, SessionCompactor};
@@ -55,7 +57,7 @@ use agens_session::provider::{
     bootstrap_authentication, resolve_provider_for_model,
 };
 use agens_session::turns::{
-    completed_session_turn_from_events_with_media, completed_session_turn_with_media,
+    completed_session_turn_from_events_with_user_message, completed_session_turn_with_user_message,
     drain_run_directives_for, drain_turn_directives_for, next_session_metadata,
 };
 use agens_tool_runtime::block_on_headless_turn;
@@ -902,7 +904,15 @@ fn load_media_blobs_for_request(
     request: &HeadlessChatRequest,
 ) -> Result<MediaBlobs, CliError> {
     let mut ids = BTreeSet::new();
-    ids.extend(request.media_ids.iter().copied());
+    ids.extend(
+        user_turn_message(request)
+            .parts
+            .iter()
+            .filter_map(|part| match part {
+                MessagePart::Media { media_id, .. } => Some(*media_id),
+                _ => None,
+            }),
+    );
     for message in &request.history {
         for part in &message.parts {
             if let MessagePart::Media { media_id, .. } = part {
@@ -930,10 +940,17 @@ struct ClosureSummarizer<F>(F);
 
 impl<F> CompactionSummarizer for ClosureSummarizer<F>
 where
-    F: Fn(&str) -> Result<String, String>,
+    F: Fn(&Message) -> Result<String, String>,
 {
     fn summarize(&self, prompt: &str) -> Result<String, String> {
-        (self.0)(prompt)
+        (self.0)(&Message {
+            role: Role::User,
+            parts: vec![MessagePart::Text(prompt.to_owned())],
+        })
+    }
+
+    fn summarize_message(&self, message: &Message) -> Result<String, String> {
+        (self.0)(message)
     }
 }
 
@@ -943,7 +960,8 @@ where
 /// that could reach a tool would run one on a history the caller is in the
 /// middle of replacing.
 fn summarize_through_provider<P, F>(
-    prompt: &str,
+    message: &Message,
+    media_blobs: &MediaBlobs,
     build_provider: &F,
     model: &str,
     request_config: &agens_core::RequestConfig,
@@ -961,13 +979,10 @@ where
 {
     let mut provider = build_provider(
         model.to_owned(),
-        vec![Message {
-            role: Role::User,
-            parts: vec![MessagePart::Text(prompt.to_owned())],
-        }],
+        vec![message.clone()],
         Vec::new(),
         request_config.clone(),
-        MediaBlobs::new(),
+        media_blobs.clone(),
     )
     .map_err(|error| error.to_string())?;
 
@@ -1190,9 +1205,20 @@ where
         ToolFactStore::open(context.bootstrap.data_directory())
             .map_err(|_| CliError::storage("tool result facts ledger is unavailable"))?,
     ));
+    let user_message = SessionMessage::try_from(user_turn_message(&request))
+        .map_err(|_| CliError::configuration("current user message is invalid"))?;
+    let user_text = user_message
+        .as_message()
+        .parts
+        .iter()
+        .filter_map(|part| match part {
+            MessagePart::Text(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<String>();
     let metadata = next_session_metadata(
         context.bootstrap,
-        &request.prompt,
+        &user_text,
         request.session.as_ref(),
         request.active_agent.as_deref(),
         session_provider,
@@ -1208,23 +1234,16 @@ where
     let partial_events = Arc::new(Mutex::new(PartialTurnRecorder::default()));
     let runtime_partial_events = Arc::clone(&partial_events);
     let terminal_partial_events = Arc::clone(&partial_events);
-    let partial_prompt = request.prompt.clone();
+    let partial_user_message = user_message.clone();
     let partial_system_reminder = request.pending_system_reminder.clone();
-    let partial_media: Vec<(i64, String)> = request
-        .media_ids
-        .iter()
-        .copied()
-        .zip(request.media_mimes.iter().cloned())
-        .collect();
     let media_blobs = load_media_blobs_for_request(context.bootstrap.data_directory(), &request)
         .map_err(HeadlessChatFailure::from)?;
     let lifecycle_model = model.clone();
-    let completion = run_session_attempt_lifecycle_with_terminal_writer(
+    let completion = run_session_attempt_lifecycle_with_user_message(
         active_session_attempts(),
         &mut store,
         metadata,
-        request.prompt.clone(),
-        request.media_ids.clone(),
+        &user_message,
         |attempt_key| {
             // Recorded here rather than before the attempt begins because this is
             // the first moment the session has an id at all: a new session is
@@ -1374,9 +1393,11 @@ where
             );
             let max_iterations =
                 effective_max_iterations(request.max_iterations, context.bootstrap.max_iterations);
-            let summarizer = ClosureSummarizer(|prompt: &str| {
+            let summary_media_blobs = media_blobs.clone();
+            let summarizer = ClosureSummarizer(|message: &Message| {
                 summarize_through_provider(
-                    prompt,
+                    message,
+                    &summary_media_blobs,
                     &build_provider,
                     &model,
                     &request.request_config,
@@ -1423,9 +1444,8 @@ where
                 history = compacted;
             };
             let snapshot = attach_recorded_failure_detail(turn_outcome, &context.failure_detail)?;
-            let turn = completed_session_turn_with_media(
-                &request.prompt,
-                &partial_media,
+            let turn = completed_session_turn_with_user_message(
+                &user_message,
                 &directives,
                 &snapshot,
                 request.pending_system_reminder.as_deref(),
@@ -1441,7 +1461,9 @@ where
                 .lock()
                 .map_err(|_| agens_session::attempt::AttemptStoreError)?
                 .clone();
-            if !events.has_partial_history() {
+            if !events.has_partial_history()
+                && write.status != agens_core::SessionAttemptStatus::Cancelled
+            {
                 return write_terminal_attempt(
                     store,
                     write,
@@ -1449,11 +1471,19 @@ where
                     &interrupted_turn_note(&[]),
                 );
             }
-            let turn = completed_session_turn_from_events_with_media(
-                &partial_prompt,
-                &partial_media,
+            let interruption;
+            let terminal_events = if events.has_partial_history() {
+                events.events.as_slice()
+            } else {
+                interruption = vec![TurnEvent::ProviderPart(MessagePart::Text(
+                    interrupted_turn_note(&[]),
+                ))];
+                &interruption
+            };
+            let turn = completed_session_turn_from_events_with_user_message(
+                &partial_user_message,
                 &directives,
-                &events.events,
+                terminal_events,
                 partial_system_reminder.as_deref(),
             )
             .map_err(|_| agens_session::attempt::AttemptStoreError)?;

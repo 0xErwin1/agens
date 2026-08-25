@@ -437,6 +437,7 @@ mod tests {
     fn interrupted_turn_test_request(prompt: &str) -> HeadlessChatRequest {
         HeadlessChatRequest {
             prompt: prompt.to_owned(),
+            user_message: None,
             history: Vec::new(),
             model: None,
             system_prompt: None,

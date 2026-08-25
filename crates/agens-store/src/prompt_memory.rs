@@ -16,8 +16,8 @@ use std::{
 };
 
 use agens_core::{
-    HistoryBrowseResult, PromptAttachment, PromptMemory, PromptMemoryEntry, PromptMemoryError,
-    PromptMemoryState, PromptOverlayItem, PromptRecall,
+    HistoryBrowseResult, MessagePart, PromptAttachment, PromptMemory, PromptMemoryEntry,
+    PromptMemoryError, PromptMemoryState, PromptOverlayItem, PromptRecall,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -29,6 +29,7 @@ pub struct StoredPrompt {
     pub id: i64,
     pub text: String,
     pub attachments: Vec<PromptAttachment>,
+    pub parts: Vec<MessagePart>,
     pub created_at: i64,
 }
 
@@ -142,7 +143,11 @@ impl PromptMemoryStore {
         self.connection
             .execute(
                 "INSERT INTO prompt_history (text, created_at, attachments) VALUES (?1, ?2, ?3)",
-                params![text, created_at, encode_attachments(attachments)?],
+                params![
+                    text,
+                    created_at,
+                    encode_parts(&legacy_parts(text, attachments))?
+                ],
             )
             .map_err(|error| {
                 PromptMemoryStoreError::operation("append history", &self.database_path, error)
@@ -154,6 +159,42 @@ impl PromptMemoryStore {
             .record_submission_at(text, attachments, created_at);
         debug_assert!(recorded);
 
+        self.load_row("prompt_history", id).map(Some)
+    }
+
+    /// Appends canonical ordered Text/Media content.
+    pub fn append_history_parts(
+        &mut self,
+        parts: &[MessagePart],
+    ) -> Result<Option<StoredPrompt>, PromptMemoryStoreError> {
+        validate_parts(parts)?;
+        let text = parts
+            .iter()
+            .filter_map(|part| match part {
+                MessagePart::Text(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        let attachments = attachments_from_parts(parts);
+        let created_at = unix_now_secs();
+        let encoded_parts = encode_parts(parts)?;
+        self.connection
+            .execute(
+                "INSERT INTO prompt_history (text, created_at, attachments) VALUES (?1, ?2, ?3)",
+                params![text, created_at, encoded_parts],
+            )
+            .map_err(|error| {
+                PromptMemoryStoreError::operation("append history", &self.database_path, error)
+            })?;
+        let id = self.connection.last_insert_rowid();
+        if !self
+            .state
+            .record_submission_at(&text, &attachments, created_at)
+        {
+            // Ordered parts can be durably distinct while sharing the legacy text/media
+            // projection used for deduplication. Reload so the mirror retains the row.
+            self.reload_state_from_db()?;
+        }
         self.load_row("prompt_history", id).map(Some)
     }
 
@@ -174,7 +215,11 @@ impl PromptMemoryStore {
         self.connection
             .execute(
                 "INSERT INTO prompt_stash (text, created_at, attachments) VALUES (?1, ?2, ?3)",
-                params![text, created_at, encode_attachments(attachments)?],
+                params![
+                    text,
+                    created_at,
+                    encode_parts(&legacy_parts(text, attachments))?
+                ],
             )
             .map_err(|error| {
                 PromptMemoryStoreError::operation("push stash", &self.database_path, error)
@@ -256,11 +301,7 @@ impl PromptMemoryStore {
             transaction
                 .execute(
                     "INSERT INTO prompt_stash (text, created_at, attachments) VALUES (?1, ?2, ?3)",
-                    params![
-                        entry.text,
-                        entry.created_at,
-                        encode_attachments(&entry.attachments)?
-                    ],
+                    params![entry.text, entry.created_at, encode_parts(&entry.parts)?],
                 )
                 .map_err(|error| {
                     PromptMemoryStoreError::operation("rewrite stash", &self.database_path, error)
@@ -425,22 +466,28 @@ fn stored_prompt_with_decode_status(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<(StoredPrompt, bool)> {
     let raw: Option<String> = row.get(3)?;
-    let decoded = decode_attachments(raw.as_deref());
+    let text: String = row.get(1)?;
+    let decoded = decode_parts(raw.as_deref(), &text);
     let undecodable = decoded.is_none();
+    let parts = decoded.unwrap_or_else(|| legacy_parts(&text, &[]));
+    let attachments = attachments_from_parts(&parts);
 
     Ok((
         StoredPrompt {
             id: row.get(0)?,
-            text: row.get(1)?,
+            text,
             created_at: row.get(2)?,
-            attachments: decoded.unwrap_or_default(),
+            attachments,
+            parts,
         },
         undecodable,
     ))
 }
 
 fn stored_prompt_into_entry(row: StoredPrompt) -> PromptMemoryEntry {
-    PromptMemoryEntry::with_created_at(row.text, row.created_at).with_attachments(row.attachments)
+    PromptMemoryEntry::with_created_at(row.text, row.created_at)
+        .with_attachments(row.attachments)
+        .with_parts(row.parts)
 }
 
 fn validate_prompt_entry(
@@ -455,41 +502,91 @@ fn validate_prompt_entry(
     Ok(())
 }
 
-fn encode_attachments(
-    attachments: &[PromptAttachment],
-) -> Result<Option<String>, PromptMemoryStoreError> {
-    if attachments.is_empty() {
-        return Ok(None);
+fn validate_parts(parts: &[MessagePart]) -> Result<(), PromptMemoryStoreError> {
+    if parts.is_empty()
+        || parts.iter().any(|part| match part {
+            MessagePart::Text(text) => text.is_empty(),
+            MessagePart::Media { media_id, mime } => *media_id <= 0 || mime.is_empty(),
+            _ => true,
+        })
+    {
+        return Err(PromptMemoryStoreError::detail(
+            "prompt parts must be non-empty Text or Media",
+        ));
     }
-
-    let pairs: Vec<(i64, &str)> = attachments
-        .iter()
-        .map(|attachment| (attachment.media_id, attachment.mime.as_str()))
-        .collect();
-    serde_json::to_string(&pairs)
-        .map(Some)
-        .map_err(|error| PromptMemoryStoreError::detail(format!("encode attachments: {error}")))
+    Ok(())
 }
 
-/// Decodes stored `[media_id, mime]` pairs, or `None` when the column holds another shape.
-///
-/// The column CHECK admits any JSON array, so shapes this store never writes reach here: `[]`
-/// decodes to no attachments, while `[1, 2]` or `[{}]` decode to nothing at all. A row of that
-/// second kind must not be fatal: the load runs at open, and failing it would cost the reader
-/// every prompt they ever recorded, permanently, on every launch. The row loads as text-only
-/// and the caller counts it instead.
-fn decode_attachments(value: Option<&str>) -> Option<Vec<PromptAttachment>> {
-    let Some(value) = value else {
-        return Some(Vec::new());
-    };
+fn legacy_parts(text: &str, attachments: &[PromptAttachment]) -> Vec<MessagePart> {
+    let mut parts = Vec::new();
+    if !text.is_empty() {
+        parts.push(MessagePart::Text(text.to_owned()));
+    }
+    parts.extend(attachments.iter().map(|attachment| MessagePart::Media {
+        media_id: attachment.media_id,
+        mime: attachment.mime.clone(),
+    }));
+    parts
+}
 
-    let pairs: Vec<(i64, String)> = serde_json::from_str(value).ok()?;
-    Some(
-        pairs
-            .into_iter()
-            .map(|(media_id, mime)| PromptAttachment::new(media_id, mime))
-            .collect(),
-    )
+fn attachments_from_parts(parts: &[MessagePart]) -> Vec<PromptAttachment> {
+    parts
+        .iter()
+        .filter_map(|part| match part {
+            MessagePart::Media { media_id, mime } => {
+                Some(PromptAttachment::new(*media_id, mime.clone()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn encode_parts(parts: &[MessagePart]) -> Result<Option<String>, PromptMemoryStoreError> {
+    let encoded = parts
+        .iter()
+        .map(|part| match part {
+            MessagePart::Text(text) => serde_json::json!({"text": text}),
+            MessagePart::Media { media_id, mime } => {
+                serde_json::json!({"media": [media_id, mime]})
+            }
+            _ => unreachable!("validated prompt parts are Text or Media"),
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_string(&serde_json::json!([1, encoded]))
+        .map(Some)
+        .map_err(|error| PromptMemoryStoreError::detail(format!("encode prompt parts: {error}")))
+}
+
+/// Decodes version 1 ordered parts or legacy `[media_id, mime]` pairs.
+fn decode_parts(value: Option<&str>, text: &str) -> Option<Vec<MessagePart>> {
+    let Some(value) = value else {
+        return Some(legacy_parts(text, &[]));
+    };
+    let value: serde_json::Value = serde_json::from_str(value).ok()?;
+    let array = value.as_array()?;
+    if array.first().and_then(serde_json::Value::as_i64) == Some(1) {
+        let encoded = array.get(1)?.as_array()?;
+        let mut parts = Vec::with_capacity(encoded.len());
+        for value in encoded {
+            if let Some(text) = value.get("text").and_then(serde_json::Value::as_str) {
+                parts.push(MessagePart::Text(text.to_owned()));
+            } else {
+                let media = value.get("media").and_then(serde_json::Value::as_array)?;
+                let media_id = media.first()?.as_i64()?;
+                let mime = media.get(1)?.as_str()?.to_owned();
+                parts.push(MessagePart::Media { media_id, mime });
+            }
+        }
+        validate_parts(&parts).ok()?;
+        return Some(parts);
+    }
+
+    let pairs: Vec<(i64, String)> = serde_json::from_value(value).ok()?;
+    let attachments = pairs
+        .into_iter()
+        .map(|(media_id, mime)| PromptAttachment::new(media_id, mime))
+        .collect::<Vec<_>>();
+    Some(legacy_parts(text, &attachments))
 }
 
 fn unix_now_secs() -> i64 {

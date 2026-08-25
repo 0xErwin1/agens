@@ -453,6 +453,7 @@ mod tests {
     fn bare_headless_request() -> HeadlessChatRequest {
         HeadlessChatRequest {
             prompt: "test".into(),
+            user_message: None,
             history: Vec::new(),
             model: None,
             system_prompt: None,

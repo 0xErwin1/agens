@@ -356,6 +356,7 @@ mod tests {
             &context,
             HeadlessChatRequest {
                 prompt: "next".into(),
+                user_message: None,
                 history: Vec::new(),
                 model: None,
                 system_prompt: None,
@@ -614,6 +615,7 @@ mod tests {
             &context,
             HeadlessChatRequest {
                 prompt: "next question".into(),
+                user_message: None,
                 history: Vec::new(),
                 model: None,
                 system_prompt: None,
@@ -645,6 +647,7 @@ mod tests {
             &SessionContext::fresh(),
             HeadlessChatRequest {
                 prompt: "new question".into(),
+                user_message: None,
                 history: Vec::new(),
                 model: None,
                 system_prompt: None,

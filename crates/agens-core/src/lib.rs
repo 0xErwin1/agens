@@ -371,26 +371,75 @@ pub struct RetryBoundary {
     key: AttemptKey,
     prompt: String,
     media_ids: Vec<i64>,
+    user_message: SessionMessage,
 }
 
 impl RetryBoundary {
+    /// Builds the legacy text/media-id projection. Callers that know MIME types should use
+    /// [`Self::with_user_message`] so retries preserve the exact ordered content.
     pub fn new(
         key: AttemptKey,
         prompt: String,
         media_ids: Vec<i64>,
     ) -> Result<Self, RetryBoundaryError> {
+        let mut parts = Vec::new();
+        if !prompt.is_empty() {
+            parts.push(MessagePart::Text(prompt.clone()));
+        }
+        parts.extend(media_ids.iter().map(|media_id| MessagePart::Media {
+            media_id: *media_id,
+            mime: "application/octet-stream".to_owned(),
+        }));
+        let user_message = SessionMessage::try_from(Message {
+            role: Role::User,
+            parts,
+        })
+        .map_err(|_| RetryBoundaryError::InvalidPrompt)?;
+        Self::from_projections(key, prompt, media_ids, user_message)
+    }
+
+    pub fn with_user_message(
+        key: AttemptKey,
+        user_message: SessionMessage,
+    ) -> Result<Self, RetryBoundaryError> {
+        if user_message.as_message().role != Role::User {
+            return Err(RetryBoundaryError::InvalidPrompt);
+        }
+        let prompt = user_message
+            .as_message()
+            .parts
+            .iter()
+            .filter_map(|part| match part {
+                MessagePart::Text(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        let media_ids = user_message
+            .as_message()
+            .parts
+            .iter()
+            .filter_map(|part| match part {
+                MessagePart::Media { media_id, .. } => Some(*media_id),
+                _ => None,
+            })
+            .collect();
+        Self::from_projections(key, prompt, media_ids, user_message)
+    }
+
+    fn from_projections(
+        key: AttemptKey,
+        prompt: String,
+        media_ids: Vec<i64>,
+        user_message: SessionMessage,
+    ) -> Result<Self, RetryBoundaryError> {
         if prompt.len() > MAX_RETRY_PROMPT_BYTES {
             return Err(RetryBoundaryError::InvalidPrompt);
         }
-        // Media-only turns may carry an empty prompt when media_ids is non-empty.
-        if prompt.is_empty() && media_ids.is_empty() {
-            return Err(RetryBoundaryError::InvalidPrompt);
-        }
-
         Ok(Self {
             key,
             prompt,
             media_ids,
+            user_message,
         })
     }
 
@@ -404,6 +453,10 @@ impl RetryBoundary {
 
     pub fn media_ids(&self) -> &[i64] {
         &self.media_ids
+    }
+
+    pub fn user_message(&self) -> &Message {
+        self.user_message.as_message()
     }
 }
 

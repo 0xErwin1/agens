@@ -22,7 +22,10 @@ use agens_headless::{
     headless_turn_own_system_prompt, headless_turn_permission_policy, headless_turn_project_root,
     headless_turn_provider_base_url, headless_turn_system_prompt,
 };
-use agens_store::{DirectiveGrain, DirectiveStore, DirectiveTarget, SessionStore, ToolFactStore};
+use agens_store::{
+    DirectiveGrain, DirectiveStore, DirectiveTarget, SessionStore, ToolFactStore,
+    ingest_media_bytes,
+};
 use agens_tools::SkillCatalog;
 
 use agens_tui_app::permission_prompt::TtyPermissionPrompter;
@@ -940,6 +943,7 @@ fn production_headless_turn_persists_the_turn_directives_it_delivered_before_the
         &resumed,
         HeadlessChatRequest {
             prompt: "second input".into(),
+            user_message: None,
             history: Vec::new(),
             model: None,
             system_prompt: None,
@@ -1155,6 +1159,7 @@ fn production_resumed_headless_turn_replays_typed_history_and_appends_to_the_sam
         &resumed,
         HeadlessChatRequest {
             prompt: "second input".into(),
+            user_message: None,
             history: Vec::new(),
             model: None,
             system_prompt: None,
@@ -1246,6 +1251,120 @@ fn production_resumed_headless_turn_replays_typed_history_and_appends_to_the_sam
     std::fs::remove_dir_all(temporary).expect("temporary files should be removed");
 }
 
+#[test]
+fn cancellation_before_provider_delta_persists_the_exact_ordered_user_message_once() {
+    let temporary = std::env::temp_dir().join(format!(
+        "agens-pre-delta-cancellation-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let project_root = temporary.join("project");
+    let config_home = temporary.join("config");
+    let data_directory = temporary.join("data");
+    std::fs::create_dir_all(project_root.join(".git")).unwrap();
+    std::fs::create_dir_all(&config_home).unwrap();
+    let provider = ScriptedProvider::start(
+        ScriptedDialect::Responses,
+        Script::new([ScriptedTurn::text("must not be delivered")]),
+    );
+    let dependencies = CliDependencies::for_test(
+        project_root,
+        Some(temporary.join("home")),
+        BTreeMap::from([
+            (
+                "AGENS_CONFIG_HOME".to_owned(),
+                config_home.display().to_string(),
+            ),
+            ("OPENAI_API_KEY".to_owned(), "test-key".to_owned()),
+        ]),
+        BTreeMap::from([
+            (
+                config_home.join("config.toml"),
+                format!(
+                    "[provider]\nmodel = \"openai-api/gpt-4.1\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n",
+                    provider.base_url(),
+                    data_directory.display()
+                ),
+            ),
+            (
+                config_home.join("auth.json"),
+                r#"{"openai-api": {"api_key": "fixture"}}"#.to_owned(),
+            ),
+        ]),
+    );
+    let bootstrap = bootstrap(&dependencies).unwrap();
+    let media = ingest_media_bytes(&data_directory, b"cancelled-image", "image/png").unwrap();
+    let ordered = vec![
+        MessagePart::Media {
+            media_id: media.id,
+            mime: media.mime,
+        },
+        MessagePart::Text("after media".into()),
+    ];
+    let user_message = SessionMessage::try_from(Message {
+        role: Role::User,
+        parts: ordered.clone(),
+    })
+    .unwrap();
+    let request = HeadlessChatRequest {
+        prompt: "legacy text must not be persisted".into(),
+        user_message: Some(user_message),
+        history: Vec::new(),
+        model: None,
+        system_prompt: None,
+        max_iterations: None,
+        mode: PermissionMode::Edit,
+        dangerously_allow_all: false,
+        dangerous_mode: false,
+        request_config: agens_core::RequestConfig::default(),
+        session_reasoning_effort: None,
+        session: None,
+        active_agent: None,
+        effective_capabilities: None,
+        pending_system_reminder: None,
+        skills: None,
+        media_ids: Vec::new(),
+        media_mimes: Vec::new(),
+    };
+    let cancellation = HeadlessTurnCancellation::new();
+    cancellation.cancel();
+
+    let Err(failure) = run_production_headless_chat_with_progress(
+        request,
+        &bootstrap,
+        &cancellation,
+        None,
+        Box::new(|_| Box::new(TtyPermissionPrompter)),
+        None,
+        None,
+    ) else {
+        panic!("pre-cancelled turn must fail");
+    };
+
+    assert_eq!(failure.error.category, "cancelled");
+    assert!(provider.wait_for_requests(0).is_empty());
+    let store = SessionStore::open(&data_directory).unwrap();
+    let stored = store.load_session_for_resume(1).unwrap();
+    let users = stored
+        .messages
+        .iter()
+        .filter(|message| message.role == Role::User)
+        .collect::<Vec<_>>();
+    assert_eq!(users.len(), 1);
+    assert_eq!(users[0].parts, ordered);
+    assert!(
+        store
+            .load_retry_boundary(stored.latest_attempt.unwrap().key())
+            .unwrap()
+            .is_none(),
+        "a persisted cancellation must not re-stage the submitted message for retry"
+    );
+    std::fs::remove_dir_all(temporary).unwrap();
+}
+
 /// AGN-176: an overflowing request used to end the turn. The turn now compacts
 /// its own history once and sends the request again, so the run survives the
 /// overflow instead of reporting it.
@@ -1309,13 +1428,21 @@ fn a_context_overflow_compacts_the_history_once_and_retries_the_request() {
 
     // Wider than the default tail budget on its own, so the cut has to fall
     // inside the history rather than at its end.
+    let summary_media = ingest_media_bytes(&data_directory, b"summary-image", "image/png").unwrap();
     let bulk = "the earlier work this session did. ".repeat(1_500);
     let request = HeadlessChatRequest {
         prompt: "what did we decide".into(),
+        user_message: None,
         history: vec![
             Message {
                 role: Role::User,
-                parts: vec![MessagePart::Text("start the earlier work".into())],
+                parts: vec![
+                    MessagePart::Media {
+                        media_id: summary_media.id,
+                        mime: summary_media.mime,
+                    },
+                    MessagePart::Text("start the earlier work".into()),
+                ],
             },
             Message {
                 role: Role::Assistant,
@@ -1359,6 +1486,13 @@ fn a_context_overflow_compacts_the_history_once_and_retries_the_request() {
             .body()
             .contains("Summarize the transcript below"),
         "the compaction should ask the model for a summary: {}",
+        requests[1].body()
+    );
+    assert!(
+        requests[1]
+            .body()
+            .contains("data:image/png;base64,c3VtbWFyeS1pbWFnZQ=="),
+        "the summarizer must receive the actual ordered media and its matching blob: {}",
         requests[1].body()
     );
 
@@ -1468,6 +1602,7 @@ fn an_overflow_that_survives_the_compaction_ends_the_turn_with_its_own_error() {
 
     let request = HeadlessChatRequest {
         prompt: "what did we decide".into(),
+        user_message: None,
         history: vec![
             Message {
                 role: Role::User,
@@ -1587,6 +1722,7 @@ fn an_overflow_with_no_history_to_compact_never_issues_a_summarizing_call() {
 
     let request = HeadlessChatRequest {
         prompt: "a prompt that outruns the window on its own".into(),
+        user_message: None,
         history: Vec::new(),
         model: None,
         system_prompt: None,

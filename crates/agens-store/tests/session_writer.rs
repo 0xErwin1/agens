@@ -1363,6 +1363,7 @@ fn appends_completed_turn_when_a_concurrent_subagent_turn_advanced_the_count() {
 fn media_parts_round_trip_without_source_path() {
     let directory = directory();
     let media = ingest_media_bytes(&directory, b"session-media", "image/png").unwrap();
+    let second_media = ingest_media_bytes(&directory, b"session-media-two", "image/jpeg").unwrap();
     let metadata = SessionMetadata {
         id: 11,
         project: "project".into(),
@@ -1382,11 +1383,16 @@ fn media_parts_round_trip_without_source_path() {
         Message {
             role: Role::User,
             parts: vec![
-                MessagePart::Text("what is this".into()),
                 MessagePart::Media {
                     media_id: media.id,
                     mime: media.mime.clone(),
                 },
+                MessagePart::Text("what is this".into()),
+                MessagePart::Media {
+                    media_id: second_media.id,
+                    mime: second_media.mime.clone(),
+                },
+                MessagePart::Text("and this".into()),
             ],
         },
         Message {
@@ -1410,11 +1416,16 @@ fn media_parts_round_trip_without_source_path() {
     assert_eq!(
         stored.messages[0].parts,
         vec![
-            MessagePart::Text("what is this".into()),
             MessagePart::Media {
                 media_id: media.id,
                 mime: "image/png".into(),
             },
+            MessagePart::Text("what is this".into()),
+            MessagePart::Media {
+                media_id: second_media.id,
+                mime: "image/jpeg".into(),
+            },
+            MessagePart::Text("and this".into()),
         ]
     );
 
@@ -1423,7 +1434,7 @@ fn media_parts_round_trip_without_source_path() {
         connection
             .query_row(
                 "SELECT kind, media_id, mime, text FROM message_parts
-                 WHERE session_id = ?1 AND message_sequence = 1 AND sequence = 1",
+                 WHERE session_id = ?1 AND message_sequence = 1 AND sequence = 0",
                 [metadata.id],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
@@ -1486,6 +1497,159 @@ fn begin_session_attempt_allows_empty_prompt_when_media_ids_present() {
             .is_err(),
         "empty prompt without media must still fail"
     );
+}
+
+#[test]
+fn canonical_retry_boundary_round_trips_ordered_parts_and_mimes_with_legacy_fallback() {
+    let directory = directory();
+    let first = ingest_media_bytes(&directory, b"canonical-retry-a", "image/png").unwrap();
+    let second = ingest_media_bytes(&directory, b"canonical-retry-b", "image/jpeg").unwrap();
+    let metadata = SessionMetadata {
+        id: 31,
+        project: "project".into(),
+        title: "title".into(),
+        active_agent: "primary".into(),
+        provider_id: None,
+        model_id: None,
+        reasoning_effort: None,
+        created_at: 10,
+        updated_at: 20,
+        completed_turn_count: 0,
+        resumable: false,
+        parent_session_id: None,
+        fork_message_count: None,
+    };
+    let message = agens_core::SessionMessage::try_from(Message {
+        role: Role::User,
+        parts: vec![
+            MessagePart::Media {
+                media_id: first.id,
+                mime: first.mime.clone(),
+            },
+            MessagePart::Text("between".into()),
+            MessagePart::Media {
+                media_id: second.id,
+                mime: second.mime.clone(),
+            },
+            MessagePart::Text("after".into()),
+        ],
+    })
+    .unwrap();
+    let mut store = SessionStore::open(&directory).unwrap();
+
+    let canonical = store
+        .begin_session_attempt_with_user_message(&metadata, &message)
+        .unwrap();
+    let loaded = store.load_retry_boundary(canonical.key()).unwrap().unwrap();
+    assert_eq!(loaded.user_message(), message.as_message());
+    assert_eq!(loaded.prompt(), "betweenafter");
+    assert_eq!(loaded.media_ids(), &[first.id, second.id]);
+
+    let legacy = store
+        .begin_session_attempt_with_media(
+            &SessionMetadata {
+                id: 32,
+                project: "legacy".into(),
+                ..metadata
+            },
+            "legacy text".into(),
+            vec![second.id],
+        )
+        .unwrap();
+    let loaded = store.load_retry_boundary(legacy.key()).unwrap().unwrap();
+    assert_eq!(
+        loaded.user_message().parts,
+        vec![
+            MessagePart::Text("legacy text".into()),
+            MessagePart::Media {
+                media_id: second.id,
+                mime: "image/jpeg".into(),
+            },
+        ]
+    );
+}
+
+#[test]
+fn terminal_attempts_physically_delete_canonical_retry_user_parts() {
+    let directory = directory();
+    let metadata = SessionMetadata {
+        id: 41,
+        project: "project".into(),
+        title: "title".into(),
+        active_agent: "primary".into(),
+        provider_id: None,
+        model_id: None,
+        reasoning_effort: None,
+        created_at: 10,
+        updated_at: 20,
+        completed_turn_count: 0,
+        resumable: false,
+        parent_session_id: None,
+        fork_message_count: None,
+    };
+    let user_message = SessionMessage::try_from(Message {
+        role: Role::User,
+        parts: vec![
+            MessagePart::Text("first".into()),
+            MessagePart::Text("second".into()),
+        ],
+    })
+    .unwrap();
+    let completed = turn(vec![
+        user_message.as_message().clone(),
+        Message {
+            role: Role::Assistant,
+            parts: vec![MessagePart::Text("answer".into())],
+        },
+    ]);
+    let mut store = SessionStore::open(&directory).unwrap();
+
+    let successful = store
+        .begin_session_attempt_with_user_message(&metadata, &user_message)
+        .unwrap();
+    store
+        .persist_completed_session_attempt(successful.key(), &metadata, &completed, 21)
+        .unwrap();
+
+    let partial_metadata = SessionMetadata {
+        id: 42,
+        project: "partial".into(),
+        ..metadata
+    };
+    let partial = store
+        .begin_session_attempt_with_user_message(&partial_metadata, &user_message)
+        .unwrap();
+    store
+        .persist_partial_session_attempt(
+            partial.key(),
+            &partial_metadata,
+            &completed,
+            SessionAttemptStatus::Cancelled,
+            22,
+        )
+        .unwrap();
+
+    assert!(
+        store
+            .load_retry_boundary(successful.key())
+            .unwrap()
+            .is_none()
+    );
+    assert!(store.load_retry_boundary(partial.key()).unwrap().is_none());
+    let connection = Connection::open(store.database_path()).unwrap();
+    for attempt_id in [successful.key().attempt_id(), partial.key().attempt_id()] {
+        let count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM retry_user_parts WHERE attempt_id = ?1",
+                [attempt_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "terminal attempt {attempt_id} retained retry parts"
+        );
+    }
 }
 
 #[test]

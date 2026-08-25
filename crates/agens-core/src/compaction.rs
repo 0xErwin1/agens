@@ -157,6 +157,7 @@ pub struct CompactionPlan {
     pinned: usize,
     first_kept: usize,
     entries: Vec<TranscriptEntry>,
+    summarized_messages: Vec<Message>,
 }
 
 impl CompactionPlan {
@@ -181,7 +182,49 @@ impl CompactionPlan {
         render_flat_transcript(&self.entries)
     }
 
-    /// The prompt handed to the summarizing model.
+    /// Ordered multimodal prompt handed to the summarizing model.
+    pub fn summary_message(&self, previous_summary: Option<&str>) -> Message {
+        let mut parts = vec![MessagePart::Text(String::from(
+            "Summarize the transcript below so work can continue without it. Record decisions, \
+             files and commands touched, established facts, and open work. Write prose, not \
+             dialogue, and do not continue the conversation.\n",
+        ))];
+        if let Some(previous) = previous_summary {
+            parts.push(MessagePart::Text(format!(
+                "\nFold this previous summary into the answer:\n\n# Previous Summary\n\n{previous}\n"
+            )));
+        }
+        parts.push(MessagePart::Text("\n# Transcript\n\n".into()));
+        for message in &self.summarized_messages {
+            parts.push(MessagePart::Text(format!("{}: ", role_name(message.role))));
+            for part in &message.parts {
+                match part {
+                    MessagePart::Media { .. } => parts.push(part.clone()),
+                    MessagePart::Text(text) => parts.push(MessagePart::Text(text.clone())),
+                    MessagePart::Reasoning(text) => {
+                        parts.push(MessagePart::Text(format!("(reasoning) {text}")));
+                    }
+                    MessagePart::ToolCall { name, input, .. } => {
+                        parts.push(MessagePart::Text(format!("call {name}({input})")));
+                    }
+                    MessagePart::ToolResult {
+                        content, is_error, ..
+                    } => parts.push(MessagePart::Text(if *is_error {
+                        format!("(error) {content}")
+                    } else {
+                        content.clone()
+                    })),
+                }
+            }
+            parts.push(MessagePart::Text("\n".into()));
+        }
+        Message {
+            role: Role::User,
+            parts,
+        }
+    }
+
+    /// Legacy flat prompt projection for text-only callers.
     ///
     /// A previous summary is folded in rather than discarded, so a session
     /// compacted repeatedly keeps one continuous account of itself instead of
@@ -250,6 +293,7 @@ pub fn plan_compaction(
         pinned,
         first_kept: pinned + cut,
         entries: transcript_entries(&body[..cut]),
+        summarized_messages: body[..cut].to_vec(),
     })
 }
 
@@ -348,6 +392,16 @@ pub fn transcript_entries(messages: &[Message]) -> Vec<TranscriptEntry> {
     entries
 }
 
+fn role_name(role: Role) -> &'static str {
+    match role {
+        Role::Assistant => "assistant",
+        Role::Tool => "tool",
+        Role::User => "user",
+        Role::System => "system",
+        Role::Supervisor => "supervisor",
+    }
+}
+
 fn speaker_entry(role: Role, text: String) -> TranscriptEntry {
     match role {
         Role::Assistant => TranscriptEntry::Assistant(text),
@@ -418,6 +472,41 @@ mod tests {
         CompactionBudget {
             keep_recent_tokens: 1,
         }
+    }
+
+    #[test]
+    fn summarizer_message_retains_ordered_media_parts() {
+        let messages = vec![
+            Message {
+                role: Role::User,
+                parts: vec![
+                    MessagePart::Media {
+                        media_id: 7,
+                        mime: "image/png".into(),
+                    },
+                    MessagePart::Text("after image".into()),
+                ],
+            },
+            text(Role::Assistant, "answer"),
+            text(Role::User, "tail"),
+        ];
+        let plan = plan_compaction(&messages, tiny_budget()).expect("history can be compacted");
+
+        let prompt = plan.summary_message(None);
+
+        let media_index = prompt
+            .parts
+            .iter()
+            .position(|part| matches!(part, MessagePart::Media { media_id: 7, .. }))
+            .expect("actual media retained");
+        let text_index = prompt
+            .parts
+            .iter()
+            .position(
+                |part| matches!(part, MessagePart::Text(text) if text.contains("after image")),
+            )
+            .expect("following text retained");
+        assert!(media_index < text_index);
     }
 
     #[test]

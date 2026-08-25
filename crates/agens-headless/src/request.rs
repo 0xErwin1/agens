@@ -6,7 +6,7 @@ use std::{
     sync::Arc,
 };
 
-use agens_core::{Message, MessagePart, PermissionMode, Role, SessionMetadata};
+use agens_core::{Message, MessagePart, PermissionMode, Role, SessionMessage, SessionMetadata};
 use agens_tools::{EffectiveCapabilitySet, SkillCatalog};
 
 use agens_bootstrap::Bootstrap;
@@ -15,6 +15,9 @@ use agens_session::context::SessionContext;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HeadlessChatRequest {
     pub prompt: String,
+    /// Validated ordered content for the current user turn. When present, legacy
+    /// `prompt` and media vectors are ignored for provider and persistence behavior.
+    pub user_message: Option<SessionMessage>,
     pub history: Vec<Message>,
     pub model: Option<String>,
     pub system_prompt: Option<String>,
@@ -83,15 +86,23 @@ pub fn preflight_request_media(
     model_id: &str,
     request: &HeadlessChatRequest,
 ) -> Result<(), MediaPreflightError> {
-    if request.media_ids.len() != request.media_mimes.len() {
-        return Err(MediaPreflightError::LengthMismatch {
-            media_ids: request.media_ids.len(),
-            media_mimes: request.media_mimes.len(),
-        });
-    }
+    if let Some(message) = &request.user_message {
+        for part in &message.as_message().parts {
+            if let MessagePart::Media { mime, .. } = part {
+                gate_mime(model_id, mime)?;
+            }
+        }
+    } else {
+        if request.media_ids.len() != request.media_mimes.len() {
+            return Err(MediaPreflightError::LengthMismatch {
+                media_ids: request.media_ids.len(),
+                media_mimes: request.media_mimes.len(),
+            });
+        }
 
-    for mime in &request.media_mimes {
-        gate_mime(model_id, mime)?;
+        for mime in &request.media_mimes {
+            gate_mime(model_id, mime)?;
+        }
     }
 
     for message in &request.history {
@@ -142,15 +153,16 @@ pub fn provider_messages(
             parts: vec![MessagePart::Text(reminder.clone())],
         });
     }
-    messages.push(Message {
-        role: Role::User,
-        parts: user_turn_parts(request),
-    });
+    messages.push(user_turn_message(request));
     messages
 }
 
-/// Builds the multi-part user content for the current turn.
-fn user_turn_parts(request: &HeadlessChatRequest) -> Vec<MessagePart> {
+/// Returns the immutable user message used by provider, persistence, and retry paths.
+pub(crate) fn user_turn_message(request: &HeadlessChatRequest) -> Message {
+    if let Some(message) = &request.user_message {
+        return message.as_message().clone();
+    }
+
     let mut parts = Vec::new();
 
     if !request.prompt.is_empty() {
@@ -168,7 +180,10 @@ fn user_turn_parts(request: &HeadlessChatRequest) -> Vec<MessagePart> {
         parts.push(MessagePart::Text(request.prompt.clone()));
     }
 
-    parts
+    Message {
+        role: Role::User,
+        parts,
+    }
 }
 
 fn replay_safe_history(history: &[Message]) -> Vec<Message> {
@@ -338,12 +353,13 @@ pub fn explicit_task_delegation_prompt(base: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agens_core::PermissionMode;
+    use agens_core::{PermissionMode, SessionMessage};
     use agens_session::context::SessionContext;
 
     fn bare_request() -> HeadlessChatRequest {
         HeadlessChatRequest {
             prompt: String::new(),
+            user_message: None,
             history: Vec::new(),
             model: None,
             system_prompt: None,
@@ -507,6 +523,84 @@ mod tests {
         let twice = explicit_task_delegation_prompt(&once);
 
         assert_eq!(twice, once);
+    }
+
+    #[test]
+    fn provider_messages_preserves_explicit_ordered_user_parts() {
+        for parts in [
+            vec![
+                MessagePart::Media {
+                    media_id: 1,
+                    mime: "image/png".into(),
+                },
+                MessagePart::Text("after".into()),
+            ],
+            vec![
+                MessagePart::Text("before".into()),
+                MessagePart::Media {
+                    media_id: 2,
+                    mime: "image/jpeg".into(),
+                },
+                MessagePart::Text("after".into()),
+            ],
+            vec![
+                MessagePart::Media {
+                    media_id: 3,
+                    mime: "image/png".into(),
+                },
+                MessagePart::Media {
+                    media_id: 4,
+                    mime: "image/jpeg".into(),
+                },
+                MessagePart::Media {
+                    media_id: 5,
+                    mime: "image/webp".into(),
+                },
+            ],
+        ] {
+            let mut request = bare_request();
+            request.prompt = "legacy prompt".into();
+            request.media_ids = vec![99];
+            request.media_mimes = vec!["image/png".into()];
+            request.user_message = Some(
+                SessionMessage::try_from(Message {
+                    role: Role::User,
+                    parts: parts.clone(),
+                })
+                .unwrap(),
+            );
+
+            let messages = provider_messages(&request, false);
+
+            assert_eq!(messages.last().unwrap().parts, parts);
+            assert_eq!(messages.len(), 1, "legacy content must not be duplicated");
+        }
+    }
+
+    #[test]
+    fn preflight_scans_explicit_ordered_current_turn_media() {
+        let mut request = bare_request();
+        request.user_message = Some(
+            SessionMessage::try_from(Message {
+                role: Role::User,
+                parts: vec![
+                    MessagePart::Text("document".into()),
+                    MessagePart::Media {
+                        media_id: 7,
+                        mime: "application/pdf".into(),
+                    },
+                ],
+            })
+            .unwrap(),
+        );
+
+        assert_eq!(
+            preflight_request_media("gpt-4.1-nano", &request),
+            Err(MediaPreflightError::UnsupportedMime {
+                model: "gpt-4.1-nano".into(),
+                mime: "application/pdf".into(),
+            })
+        );
     }
 
     #[test]
