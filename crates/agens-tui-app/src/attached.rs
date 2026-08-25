@@ -32,18 +32,26 @@ use agens_bootstrap::Bootstrap;
 use agens_coordinator_client::{
     ChatClient, ClientError, Coordinator, HostedChatEvent, PermissionDecision, PermissionQuestion,
 };
-use agens_core::{HeadlessTurnCancellation, Message, TurnEvent};
-use agens_error::{CliError, ExitStatus};
-use agens_tui::{
-    Engine, Tui, TuiPermissionBridge, TuiPermissionReply, TuiRouteRequest, TuiSubmissionOutcome,
-    run_with_default_progress_submit_with_permissions,
+use agens_core::{
+    HeadlessTurnCancellation, Message, MessagePart, SessionMessage, SubmitOrigin, TurnEvent,
 };
+use agens_error::{CliError, ExitStatus};
+use agens_session::context::SessionContext;
+use agens_tui::{
+    Engine, Tui, TuiPermissionBridge, TuiPermissionReply,
+    run_with_default_progress_submit_with_permissions_and_task_controls,
+};
+#[cfg(test)]
+use agens_tui::{TuiRouteRequest, TuiSubmissionOutcome};
 use tokio::runtime::Runtime;
 use tokio_stream::{Stream, StreamExt};
 
-use crate::router::tui_provider_outcome;
+use crate::extensions::{start_tui_commands, start_tui_skills};
+use crate::files::tui_picker_file_candidates;
+use crate::router::{TuiRuntimeRouter, tui_provider_outcome};
 
 /// What this mode cannot serve yet, said the same way everywhere it comes up.
+#[cfg(test)]
 const UNSUPPORTED: &str =
     "not available while attached to a daemon yet; start without attaching for this";
 
@@ -63,12 +71,17 @@ struct Attachment {
     /// Where a permission question the daemon asked is put to the person, and
     /// where their answer comes back from.
     permissions: TuiPermissionBridge,
+    staging: Arc<Mutex<SessionContext>>,
 }
 
 impl Attachment {
     /// Sends one prompt and reports what the turn did, forwarding everything it
     /// produced to the surface as it happens.
-    fn take_turn(&self, prompt: &str, progress: &Sender<TurnEvent>) -> Result<String, CliError> {
+    fn take_turn(
+        &self,
+        message: &Message,
+        progress: &Sender<TurnEvent>,
+    ) -> Result<String, CliError> {
         let asking = HeadlessTurnCancellation::new();
         let mut chat = self
             .chat
@@ -79,9 +92,12 @@ impl Attachment {
             .lock()
             .map_err(|_| unavailable("the chat's event stream is unusable"))?;
 
+        let message = SessionMessage::try_from(message.clone())
+            .map_err(|_| CliError::usage("submitted message is invalid"))?;
         self.runtime
-            .block_on(chat.prompt(self.session_id, prompt))
-            .map_err(refused)?;
+            .block_on(chat.prompt_message(self.session_id, &message))
+            .map_err(rejected)?;
+        self.claim_accepted_media(&message);
 
         loop {
             let event = self
@@ -130,6 +146,28 @@ impl Attachment {
 }
 
 impl Attachment {
+    fn claim_accepted_media(&self, message: &SessionMessage) {
+        let Ok(mut staging) = self.staging.lock() else {
+            return;
+        };
+        for part in &message.as_message().parts {
+            let MessagePart::Media { media_id, mime } = part else {
+                continue;
+            };
+            if let Some(index) = staging
+                .pending_media_ids
+                .iter()
+                .zip(&staging.pending_media_mimes)
+                .position(|(candidate_id, candidate_mime)| {
+                    candidate_id == media_id && candidate_mime == mime
+                })
+            {
+                staging.pending_media_ids.remove(index);
+                staging.pending_media_mimes.remove(index);
+            }
+        }
+    }
+
     /// Puts one question to the person and waits for their answer.
     ///
     /// A cancelled prompt is answered as a refusal rather than left open. The
@@ -194,6 +232,7 @@ impl Engine for AttachedEngine {
 /// route — a slash command, a dialog, a clipboard image — belongs to the local
 /// router, and the local router drives a local session. Saying so is the point:
 /// a command that quietly did nothing would read as the terminal being broken.
+#[cfg(test)]
 fn route(request: &TuiRouteRequest) -> TuiSubmissionOutcome {
     match request {
         TuiRouteRequest::Input(input) => {
@@ -246,16 +285,32 @@ pub fn run_attached_tui_with_prompt(
         .clone()
         .unwrap_or_else(|| PathBuf::from("."));
 
+    let staging = Arc::new(Mutex::new(SessionContext::fresh()));
     let (permissions, permission_requests) = TuiPermissionBridge::channel();
-    let (attachment, engine, arrival) = attach(socket, &checkout, resume, permissions)?;
+    let (attachment, engine, arrival) =
+        attach(socket, &checkout, resume, permissions, Arc::clone(&staging))?;
 
     let mut tui = Tui::new(engine);
     tui.adopt_environment();
     tui.set_collapse_thinking(bootstrap.collapse_thinking);
     tui.add_info(arrival.describe());
     tui.add_info(
-        "attached mode does not support slash commands, the skill palette, file selection, or delegation yet",
+        "attached mode supports ordered prompts and prompt-producing commands; selected subagents, background controls, and session mutations remain unsupported",
     );
+    let skills = start_tui_skills(&mut tui, bootstrap, &checkout)?;
+    let commands = start_tui_commands(&mut tui, bootstrap, &checkout)?;
+    let router = TuiRuntimeRouter::new(
+        bootstrap.clone(),
+        Arc::clone(&staging),
+        Arc::new(Mutex::new(None)),
+        commands,
+        skills,
+    );
+    if let Ok(context) = staging.lock()
+        && let Ok(candidates) = tui_picker_file_candidates(&context, bootstrap)
+    {
+        tui.set_file_candidates(candidates);
+    }
     if let Some(prompt) = initial_prompt {
         tui.set_composer_draft(prompt);
     }
@@ -272,15 +327,22 @@ pub fn run_attached_tui_with_prompt(
 
     let permissions = attachment.permissions.clone();
 
-    run_with_default_progress_submit_with_permissions(
+    let route_router = router.clone();
+    run_with_default_progress_submit_with_permissions_and_task_controls(
         &mut tui,
-        move |request, _progress, _cancellation| route(&request),
-        move |prompt, _origin, progress, _metrics| {
-            tui_provider_outcome(attachment.take_turn(&prompt, &progress))
+        move |request, progress, cancellation| {
+            route_router.route_attached_request(request, progress, cancellation)
         },
-        // Nothing delegates in this mode, so no execution can be sent to the
-        // background and this is asked about nothing.
+        move |message, origin, progress, _metrics| {
+            if let Some(rejection) = unsupported_attached_origin(origin) {
+                rejection
+            } else {
+                attached_provider_outcome(attachment.take_turn(&message, &progress))
+            }
+        },
         |_| false,
+        |_| false,
+        |_, _| false,
         Some((permissions, permission_requests)),
     )
     .map_err(|error| CliError::new(ExitStatus::Failure, "ui", error.to_string()))?;
@@ -336,6 +398,7 @@ fn attach(
     checkout: &Path,
     resume: Option<i64>,
     permissions: TuiPermissionBridge,
+    staging: Arc<Mutex<SessionContext>>,
 ) -> Result<(Attachment, AttachedEngine, Arrival), CliError> {
     let runtime = Arc::new(
         Runtime::new()
@@ -390,6 +453,7 @@ fn attach(
             events: Mutex::new(Box::pin(events)),
             session_id,
             permissions,
+            staging,
         },
         engine,
         arrival,
@@ -437,6 +501,35 @@ fn rejoin_or_open(
             .block_on(chat.open(checkout, None))
             .map_err(refused)?,
     ))
+}
+
+fn unsupported_attached_origin(origin: SubmitOrigin) -> Option<agens_tui::TuiProviderOutcome> {
+    (origin != SubmitOrigin::User).then(|| agens_tui::TuiProviderOutcome::Failed {
+        message: "selected subagent and background submissions are not supported while attached"
+            .into(),
+        action: "Select the main conversation and submit an ordinary queued prompt.".into(),
+    })
+}
+
+fn attached_provider_outcome(result: Result<String, CliError>) -> agens_tui::TuiProviderOutcome {
+    match result {
+        Err(error) if error.category == "attached_rejected" => {
+            agens_tui::TuiProviderOutcome::Rejected {
+                message: error.to_string(),
+                action: "Correct the attachment or retry after updating the daemon.".into(),
+            }
+        }
+        result => tui_provider_outcome(result),
+    }
+}
+
+fn rejected(error: ClientError) -> CliError {
+    let category = if error.definitively_rejected_prompt() {
+        "attached_rejected"
+    } else {
+        "provider"
+    };
+    CliError::new(ExitStatus::Failure, category, error.to_string())
 }
 
 /// A daemon that is not there is reported as unavailable rather than as a
@@ -516,5 +609,40 @@ mod tests {
     #[test]
     fn a_fresh_chat_says_that_leaving_does_not_stop_it() {
         assert!(Arrival::opened(7).describe().contains("does not stop it"));
+    }
+
+    #[test]
+    fn ambiguous_prompt_failures_do_not_claim_proven_rejection() {
+        let outcome = attached_provider_outcome(Err(rejected(ClientError::Unreadable(
+            "response lost after send".into(),
+        ))));
+        assert!(matches!(
+            outcome,
+            agens_tui::TuiProviderOutcome::Failed { .. }
+        ));
+    }
+
+    #[test]
+    fn local_preflight_refusals_are_restorable() {
+        let outcome = attached_provider_outcome(Err(rejected(ClientError::InvalidRequest(
+            "capability absent".into(),
+        ))));
+        assert!(matches!(
+            outcome,
+            agens_tui::TuiProviderOutcome::Rejected { .. }
+        ));
+    }
+
+    #[test]
+    fn selected_and_background_origins_are_explicitly_rejected() {
+        assert!(unsupported_attached_origin(SubmitOrigin::User).is_none());
+        for origin in [SubmitOrigin::Background, SubmitOrigin::SubagentCompletion] {
+            let outcome = unsupported_attached_origin(origin).expect("unsupported origin rejects");
+            assert!(matches!(
+                outcome,
+                agens_tui::TuiProviderOutcome::Failed { ref message, .. }
+                    if message.contains("not supported while attached")
+            ));
+        }
     }
 }

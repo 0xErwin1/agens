@@ -43,13 +43,22 @@ struct ScriptedTurns {
 impl ChatTurns for ScriptedTurns {
     fn run(
         &mut self,
-        prompt: &str,
+        message: &agens_core::SessionMessage,
         _runtime: &SessionRuntime,
         cancellation: &HeadlessTurnCancellation,
         asks: &Arc<dyn ChatAsks>,
         progress: &agens_core::TurnProgressSink,
     ) -> ChatTurnOutcome {
-        let _ = self.started.send(prompt.to_owned());
+        let prompt = message
+            .as_message()
+            .parts
+            .iter()
+            .filter_map(|part| match part {
+                agens_core::MessagePart::Text(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        let _ = self.started.send(prompt);
         progress(TurnEvent::StateChanged(TurnState::Streaming));
 
         // A turn the test gave a question to asks it and reports the answer as
@@ -174,6 +183,14 @@ fn harness_with_questions(
     }
 }
 
+fn user_message(text: &str) -> agens_core::SessionMessage {
+    agens_core::SessionMessage::try_from(agens_core::Message {
+        role: agens_core::Role::User,
+        parts: vec![agens_core::MessagePart::Text(text.to_owned())],
+    })
+    .unwrap()
+}
+
 fn request(session: i64) -> ChatSessionRequest {
     ChatSessionRequest {
         checkout: PathBuf::from("/projects/agens"),
@@ -203,7 +220,7 @@ fn a_prompt_reaches_the_turn_and_its_progress_reaches_a_subscriber() {
 
     harness
         .chats
-        .prompt(session, "what does this repository do".to_owned())
+        .prompt(session, user_message("what does this repository do"))
         .expect("the prompt is accepted");
 
     assert_eq!(
@@ -242,7 +259,7 @@ fn a_prompt_sent_while_a_turn_is_running_and_one_already_waits_is_refused() {
 
     harness
         .chats
-        .prompt(session, "first".to_owned())
+        .prompt(session, user_message("first"))
         .expect("the prompt is accepted");
     assert_eq!(
         harness.started.recv_timeout(PATIENCE),
@@ -251,11 +268,11 @@ fn a_prompt_sent_while_a_turn_is_running_and_one_already_waits_is_refused() {
 
     harness
         .chats
-        .prompt(session, "second".to_owned())
+        .prompt(session, user_message("second"))
         .expect("one prompt may wait behind a running turn");
 
     assert_eq!(
-        harness.chats.prompt(session, "third".to_owned()),
+        harness.chats.prompt(session, user_message("third")),
         Err(ChatError::Busy),
     );
 }
@@ -268,7 +285,7 @@ fn a_turn_that_failed_is_published_as_a_failure_and_the_chat_stays_open() {
 
     harness
         .chats
-        .prompt(session, "first".to_owned())
+        .prompt(session, user_message("first"))
         .expect("the prompt is accepted");
     assert_eq!(
         harness.started.recv_timeout(PATIENCE),
@@ -292,7 +309,7 @@ fn a_turn_that_failed_is_published_as_a_failure_and_the_chat_stays_open() {
 
     harness
         .chats
-        .prompt(session, "second".to_owned())
+        .prompt(session, user_message("second"))
         .expect("a failed turn does not close the chat");
     assert_eq!(
         harness.started.recv_timeout(PATIENCE),
@@ -321,7 +338,9 @@ fn a_prompt_for_a_chat_nobody_opened_is_refused_rather_than_started() {
     let harness = harness();
 
     assert_eq!(
-        harness.chats.prompt(SessionId::new(7), "hello".to_owned()),
+        harness
+            .chats
+            .prompt(SessionId::new(7), user_message("hello")),
         Err(ChatError::Unknown),
     );
     assert_eq!(
@@ -395,7 +414,7 @@ fn cancelling_stops_the_running_turn_and_leaves_the_chat_open() {
 
     harness
         .chats
-        .prompt(session, "first".to_owned())
+        .prompt(session, user_message("first"))
         .expect("the prompt is accepted");
     assert_eq!(
         harness.started.recv_timeout(PATIENCE),
@@ -425,7 +444,7 @@ fn cancelling_stops_the_running_turn_and_leaves_the_chat_open() {
 
     harness
         .chats
-        .prompt(session, "second".to_owned())
+        .prompt(session, user_message("second"))
         .expect("a cancelled turn does not close the chat");
     assert_eq!(
         harness.started.recv_timeout(PATIENCE),
@@ -444,7 +463,7 @@ fn a_cancellation_does_not_carry_into_the_next_turn() {
 
     harness
         .chats
-        .prompt(session, "first".to_owned())
+        .prompt(session, user_message("first"))
         .expect("the prompt is accepted");
     assert_eq!(
         harness.started.recv_timeout(PATIENCE),
@@ -457,7 +476,7 @@ fn a_cancellation_does_not_carry_into_the_next_turn() {
 
     harness
         .chats
-        .prompt(session, "second".to_owned())
+        .prompt(session, user_message("second"))
         .expect("the prompt is accepted");
     assert_eq!(
         harness.started.recv_timeout(PATIENCE),
@@ -490,7 +509,7 @@ fn a_chats_conversation_is_readable_while_a_turn_is_running() {
 
     harness
         .chats
-        .prompt(session, "first".to_owned())
+        .prompt(session, user_message("first"))
         .expect("the prompt is accepted");
     assert_eq!(
         harness.started.recv_timeout(PATIENCE),
@@ -532,7 +551,7 @@ fn a_question_the_turn_asks_reaches_a_subscriber_and_the_answer_reaches_the_turn
 
     harness
         .chats
-        .prompt(session, "run the tests".to_owned())
+        .prompt(session, user_message("run the tests"))
         .expect("the prompt is accepted");
     assert_eq!(
         harness.started.recv_timeout(PATIENCE),
@@ -589,7 +608,7 @@ fn an_external_ask_user_answer_is_validated_then_continues_the_same_turn() {
 
     harness
         .chats
-        .prompt(session, "ask before continuing".to_owned())
+        .prompt(session, user_message("ask before continuing"))
         .expect("the prompt is accepted");
     assert_eq!(
         harness.started.recv_timeout(PATIENCE),
@@ -642,7 +661,7 @@ fn a_question_nobody_is_listening_to_is_refused_rather_than_held() {
 
     harness
         .chats
-        .prompt(session, "run the tests".to_owned())
+        .prompt(session, user_message("run the tests"))
         .expect("the prompt is accepted");
     assert_eq!(
         harness.started.recv_timeout(PATIENCE),
@@ -658,7 +677,7 @@ fn a_question_nobody_is_listening_to_is_refused_rather_than_held() {
 
     harness
         .chats
-        .prompt(session, "again".to_owned())
+        .prompt(session, user_message("again"))
         .expect("the prompt is accepted");
 
     assert_eq!(

@@ -41,6 +41,8 @@ pub enum ClientError {
     /// The daemon answered something this client cannot read, which is a
     /// disagreement about the wire rather than about the request.
     Unreadable(String),
+    /// The request cannot be represented safely for this daemon.
+    InvalidRequest(String),
 }
 
 impl std::fmt::Display for ClientError {
@@ -54,6 +56,24 @@ impl std::fmt::Display for ClientError {
                     "the daemon answered something unreadable: {detail}"
                 )
             }
+            Self::InvalidRequest(detail) => formatter.write_str(detail),
+        }
+    }
+}
+
+impl ClientError {
+    /// Whether a failed prompt is known not to have crossed the daemon's inbox boundary.
+    #[must_use]
+    pub fn definitively_rejected_prompt(&self) -> bool {
+        match self {
+            Self::InvalidRequest(_) => true,
+            Self::Refused(status) => matches!(
+                status.code(),
+                tonic::Code::InvalidArgument
+                    | tonic::Code::NotFound
+                    | tonic::Code::FailedPrecondition
+            ),
+            Self::NotRunning(_) | Self::Unreadable(_) => false,
         }
     }
 }

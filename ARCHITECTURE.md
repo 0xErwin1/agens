@@ -153,6 +153,22 @@ There is no ancestor-directory search; only these two exact paths are considered
 
 Every `task` subagent inherits its prompt from the catalog agent it was dispatched from, so the catalog append point already covers it; no separate subagent call site exists.
 
+## Attached chat wire
+
+A daemon-hosted chat accepts ordered user `Text` and `Media` parts. `PromptRequest.prompt`
+remains the text-only compatibility projection; when `parts` is non-empty it is authoritative and
+the projection is never appended to it. `ChatHandle.supports_prompt_parts` is the version edge:
+clients may send text to an older daemon, but reject media locally when that capability is absent.
+The daemon independently validates durable media IDs, MIME identity, blob availability, and the
+user-only part vocabulary before bounded inbox admission. Media references are store IDs and MIME
+types only; source paths and presentation chips never cross the wire.
+
+Attached terminals use the message-preserving submission and queue path, including local `@` file
+expansion and prompt-producing commands or skills. Selected-subagent execution, remote background
+or control lifecycle, non-prompt session mutations, and media upload RPCs are intentionally not
+part of attached chat. Unsupported controls fail explicitly rather than flattening content or
+claiming local-mode parity.
+
 ## Repository contracts
 
 - The devenv scripts declared in `devenv.nix` are the canonical Rust developer command surface.

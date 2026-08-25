@@ -29,8 +29,8 @@ use std::sync::Arc;
 use agens_bootstrap::Bootstrap;
 use agens_core::ask_user::{AskUserPort, AskUserReply, AskUserRequest};
 use agens_core::{
-    HeadlessTurnCancellation, HeadlessTurnPortError, Message, PermissionMode, RequestConfig,
-    SessionMetadata, TurnProgressSink,
+    HeadlessTurnCancellation, HeadlessTurnPortError, Message, MessagePart, PermissionMode,
+    RequestConfig, SessionMessage, SessionMetadata, TurnProgressSink,
 };
 use agens_headless::{
     HeadlessChatRequest, run_production_headless_chat_with_progress_and_ask_user,
@@ -232,13 +232,13 @@ struct HostedChat {
 impl ChatTurns for HostedChat {
     fn run(
         &mut self,
-        prompt: &str,
+        message: &SessionMessage,
         _runtime: &SessionRuntime,
         cancellation: &HeadlessTurnCancellation,
         asks: &Arc<dyn ChatAsks>,
         progress: &TurnProgressSink,
     ) -> ChatTurnOutcome {
-        let request = match self.request_for(prompt) {
+        let request = match self.request_for(message) {
             Ok(request) => request,
             Err(error) => return ChatTurnOutcome::Failed(error),
         };
@@ -286,7 +286,7 @@ impl ChatTurns for HostedChat {
 
 impl HostedChat {
     /// The turn one prompt becomes.
-    fn request_for(&self, prompt: &str) -> Result<HeadlessChatRequest, String> {
+    fn request_for(&self, message: &SessionMessage) -> Result<HeadlessChatRequest, String> {
         let project_root = self
             .bootstrap
             .project_root
@@ -297,9 +297,28 @@ impl HostedChat {
             .catalog()
             .clone();
 
+        let prompt = message
+            .as_message()
+            .parts
+            .iter()
+            .filter_map(|part| match part {
+                MessagePart::Text(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        let (media_ids, media_mimes): (Vec<_>, Vec<_>) = message
+            .as_message()
+            .parts
+            .iter()
+            .filter_map(|part| match part {
+                MessagePart::Media { media_id, mime } => Some((*media_id, mime.clone())),
+                _ => None,
+            })
+            .unzip();
+
         Ok(HeadlessChatRequest {
-            prompt: prompt.to_owned(),
-            user_message: None,
+            prompt,
+            user_message: Some(message.clone()),
             history: self.history.clone(),
             model: Some(self.model.clone()),
             // Left for the turn to resolve from the project root, which is how
@@ -320,8 +339,8 @@ impl HostedChat {
             effective_capabilities: None,
             pending_system_reminder: None,
             skills: Some(Arc::new(skills)),
-            media_ids: Vec::new(),
-            media_mimes: Vec::new(),
+            media_ids,
+            media_mimes,
         })
     }
 

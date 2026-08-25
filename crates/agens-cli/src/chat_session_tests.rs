@@ -76,6 +76,7 @@ async fn ask(
         .prompt(proto::PromptRequest {
             session_id,
             prompt: prompt.to_owned(),
+            parts: Vec::new(),
         })
         .await
         .expect("the prompt is accepted");
@@ -86,6 +87,12 @@ async fn ask(
 #[test]
 fn a_prompt_a_client_sent_is_answered_by_a_turn_the_daemon_ran() {
     let daemon = DaemonFixture::start(script(), daemon_settings());
+    let first_media =
+        agens_store::ingest_media_bytes(&daemon.data_directory, b"first-image", "image/png")
+            .expect("first hosted media is stored");
+    let second_media =
+        agens_store::ingest_media_bytes(&daemon.data_directory, b"second-image", "image/jpeg")
+            .expect("second hosted media is stored");
 
     let socket = daemon.socket.clone();
     let stopper = daemon.stopper();
@@ -119,13 +126,58 @@ fn a_prompt_a_client_sent_is_answered_by_a_turn_the_daemon_ran() {
                 .expect("the chat is open")
                 .into_inner();
 
-            let first = ask(
-                &mut chat,
-                opened.session_id,
-                "what is this repository",
-                &mut events,
-            )
-            .await;
+            chat.prompt(proto::PromptRequest {
+                session_id: opened.session_id,
+                prompt: "compatibility projection".into(),
+                parts: vec![
+                    proto::MessagePart {
+                        part: Some(proto::message_part::Part::Media(proto::Media {
+                            media_id: first_media.id,
+                            mime: first_media.mime.clone(),
+                        })),
+                    },
+                    proto::MessagePart {
+                        part: Some(proto::message_part::Part::Text(
+                            "what is this repository".into(),
+                        )),
+                    },
+                    proto::MessagePart {
+                        part: Some(proto::message_part::Part::Media(proto::Media {
+                            media_id: second_media.id,
+                            mime: second_media.mime.clone(),
+                        })),
+                    },
+                ],
+            })
+            .await
+            .expect("the ordered media prompt is accepted");
+            let first = turn_on(&mut events).await;
+
+            let completed_history = chat
+                .history(proto::ChatRef {
+                    session_id: opened.session_id,
+                })
+                .await
+                .expect("the completed hosted turn is persisted")
+                .into_inner();
+            assert_eq!(completed_history.messages[0].role, "user");
+            assert!(matches!(
+                completed_history.messages[0].parts.as_slice(),
+                [
+                    proto::MessagePart {
+                        part: Some(proto::message_part::Part::Media(first)),
+                    },
+                    proto::MessagePart {
+                        part: Some(proto::message_part::Part::Text(text)),
+                    },
+                    proto::MessagePart {
+                        part: Some(proto::message_part::Part::Media(second)),
+                    },
+                ] if first.media_id == first_media.id
+                    && text == "what is this repository"
+                    && second.media_id == second_media.id
+            ));
+
             let second = ask(
                 &mut chat,
                 opened.session_id,
@@ -174,6 +226,10 @@ fn a_prompt_a_client_sent_is_answered_by_a_turn_the_daemon_ran() {
         second_request.contains("what is this repository"),
         "the second turn carries the first one's history, so the chat is one \
          conversation rather than two strangers"
+    );
+    assert!(
+        second_request.contains("Zmlyc3QtaW1hZ2U=") && second_request.contains("c2Vjb25kLWltYWdl"),
+        "completed Media→Text→Media history is replayed with both blobs: {second_request}"
     );
 
     daemon.provider.assert_script_consumed();

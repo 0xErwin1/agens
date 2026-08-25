@@ -13,7 +13,7 @@ use agens_auth::{ChatGptAuthFlow, ChatGptAuthProgress};
 use agens_core::HeadlessTurnError;
 use agens_models::ModelSelection;
 use agens_session::provider::ProviderKind;
-use agens_tui::{TuiPresentation, TuiRouteProgress, TuiRouteRequest};
+use agens_tui::{TuiPresentation, TuiRouteCancellation, TuiRouteProgress, TuiRouteRequest};
 
 use super::*;
 use crate::engine::{ProductionTuiEngine, run_tui_prompt_with};
@@ -32,6 +32,128 @@ use agens_agents::ensure_active_agent_runtime;
 use agens_headless::HeadlessChatCompletion;
 use agens_models::ModelSource;
 use agens_session::attempt::active_session_attempts;
+
+fn attached_route(router: &TuiRuntimeRouter, request: TuiRouteRequest) -> TuiSubmissionOutcome {
+    let (progress, _) = std::sync::mpsc::channel();
+    router.route_attached_request(request, progress, TuiRouteCancellation::new())
+}
+
+#[test]
+fn attached_routes_preserve_order_expand_media_and_reject_session_mutations() {
+    let temporary = tui_session_directory("attached-ordered");
+    let bootstrap = tui_session_bootstrap(&temporary, &[]);
+    let project = temporary.join("project");
+    write_router_test_skill(
+        &project,
+        "inspect",
+        "Inspect @shot.png before the supplied content.",
+    );
+    std::fs::write(project.join("shot.png"), b"shot").unwrap();
+    let _store = SessionStore::open(bootstrap.data_directory()).unwrap();
+    let existing =
+        agens_store::ingest_media_bytes(bootstrap.data_directory(), b"existing", "application/pdf")
+            .unwrap();
+    let cancellation = Arc::new(Mutex::new(None));
+    let mut tui = Tui::new(ProductionTuiEngine {
+        cancellation: Arc::clone(&cancellation),
+    });
+    let commands = start_tui_commands(&mut tui, &bootstrap, &project).unwrap();
+    let skills = start_tui_skills(&mut tui, &bootstrap, &project).unwrap();
+    let router = TuiRuntimeRouter::new(
+        bootstrap,
+        Arc::new(Mutex::new(SessionContext::fresh())),
+        cancellation,
+        commands,
+        skills,
+    );
+
+    let source = Message {
+        role: Role::User,
+        parts: vec![
+            MessagePart::Text("before @shot.png after ".into()),
+            MessagePart::Media {
+                media_id: existing.id,
+                mime: existing.mime.clone(),
+            },
+        ],
+    };
+    let TuiSubmissionOutcome::ProviderMessage { message, .. } =
+        attached_route(&router, TuiRouteRequest::InputMessage(source))
+    else {
+        panic!("an attached ordered message must become a provider message");
+    };
+    assert!(matches!(message.parts[0], MessagePart::Text(ref text) if text == "before "));
+    assert!(matches!(message.parts[1], MessagePart::Media { ref mime, .. } if mime == "image/png"));
+    assert!(matches!(message.parts[2], MessagePart::Text(ref text) if text == " after "));
+    assert!(
+        matches!(message.parts[3], MessagePart::Media { media_id, .. } if media_id == existing.id)
+    );
+
+    let expanded_media = message
+        .parts
+        .iter()
+        .find_map(|part| match part {
+            MessagePart::Media { media_id, mime } if mime == "image/png" => {
+                Some((*media_id, mime.clone()))
+            }
+            _ => None,
+        })
+        .expect("@media expansion introduced the image");
+    tui.apply_submission_outcome(TuiSubmissionOutcome::ProviderMessage {
+        display: "expanded".into(),
+        message: message.clone(),
+    });
+    tui.finish_provider_turn(agens_tui::TuiProviderOutcome::Rejected {
+        message: "definitive pre-admission rejection".into(),
+        action: "correct and retry".into(),
+    });
+    assert_eq!(
+        tui.staged_media(),
+        &[
+            agens_core::PromptAttachment::new(expanded_media.0, expanded_media.1),
+            agens_core::PromptAttachment::new(existing.id, existing.mime.clone()),
+        ],
+        "message-derived media is restored exactly once even without prior staging"
+    );
+
+    assert!(matches!(
+        attached_route(
+            &router,
+            TuiRouteRequest::BusyMessage(Message {
+                role: Role::User,
+                parts: vec![MessagePart::Text("queued".into())],
+            }),
+        ),
+        TuiSubmissionOutcome::BusyProviderMessage { .. }
+    ));
+    let TuiSubmissionOutcome::ProviderMessage { message, .. } =
+        attached_route(&router, TuiRouteRequest::Input("/inspect argument".into()))
+    else {
+        panic!("a prompt-producing skill remains available while attached");
+    };
+    assert!(
+        message
+            .parts
+            .iter()
+            .any(|part| matches!(part, MessagePart::Media { mime, .. } if mime == "image/png")),
+        "skill/command expansion media must survive in canonical order: {:?}",
+        message.parts
+    );
+    let rendered = agens_tui::present_user_message_parts(&message.parts);
+    assert!(rendered.contains("Inspect "), "{rendered}");
+    assert!(rendered.contains("argument"), "{rendered}");
+    let TuiSubmissionOutcome::LocalActionableError { message, .. } =
+        attached_route(&router, TuiRouteRequest::Input("/model".into()))
+    else {
+        panic!("a non-prompt mutation must be rejected");
+    };
+    assert!(
+        message.contains("not supported while attached"),
+        "{message}"
+    );
+
+    std::fs::remove_dir_all(temporary).unwrap();
+}
 
 fn write_router_test_skill(root: &Path, name: &str, body: &str) {
     let directory = root.join(".agens/skills").join(name);

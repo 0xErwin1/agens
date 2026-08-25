@@ -5501,6 +5501,57 @@ fn scheduler_owned_background_handoff_releases_and_dispatches_the_oldest_fifo_pr
 }
 
 #[test]
+fn queued_message_owns_its_media_without_consuming_media_staged_later() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.begin_submission("running");
+    let queued = Message {
+        role: Role::User,
+        parts: vec![
+            MessagePart::Media {
+                media_id: 1,
+                mime: "image/png".into(),
+            },
+            MessagePart::Text("queued".into()),
+            MessagePart::Media {
+                media_id: 2,
+                mime: "application/pdf".into(),
+            },
+        ],
+    };
+    tui.set_staged_media(vec![PromptAttachment::new(1, "image/png")]);
+    tui.apply_busy_submission_outcome(TuiSubmissionOutcome::BusyProviderMessage {
+        display: "queued".into(),
+        message: queued.clone(),
+    });
+    assert!(
+        tui.staged_media().is_empty(),
+        "queued composer media is consumed at admission"
+    );
+
+    let later = PromptAttachment::new(3, "image/jpeg");
+    tui.set_staged_media(vec![later.clone()]);
+    assert_eq!(
+        tui.finish_provider_turn(TuiProviderOutcome::Backgrounded),
+        Some("queued".into())
+    );
+    tui.begin_message_submission(queued);
+    assert_eq!(tui.staged_media(), std::slice::from_ref(&later));
+
+    tui.finish_provider_turn(TuiProviderOutcome::Rejected {
+        message: "proven rejection".into(),
+        action: "correct and retry".into(),
+    });
+    assert_eq!(
+        tui.staged_media(),
+        &[
+            PromptAttachment::new(1, "image/png"),
+            PromptAttachment::new(2, "application/pdf"),
+            later,
+        ]
+    );
+}
+
+#[test]
 fn local_route_stays_cancellable_without_claiming_scheduler_foreground_running() {
     let mut tui = Tui::new(FakeEngine::default());
     tui.begin_route();

@@ -341,11 +341,10 @@ pub fn serve_until_shutdown(
     // The same supervisor the scheduler launches into, so a hosted chat is a
     // peer of the runs rather than a session the daemon does not know it has:
     // one capacity, one shutdown, one drain.
-    let chats = Arc::new(ChatSessions::new(
-        daemon.sessions().clone(),
-        chat,
-        chat_history,
-    ));
+    let chats = Arc::new(
+        ChatSessions::new(daemon.sessions().clone(), chat, chat_history)
+            .with_media_store(data_directory.to_path_buf()),
+    );
 
     let report = daemon.serve_until_shutdown(coordinator.core(), chats, shutdown);
 

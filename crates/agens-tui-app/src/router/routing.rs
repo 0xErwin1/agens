@@ -94,6 +94,37 @@ impl TuiRuntimeRouter {
         self.route_request_with_cancellation(request, progress, TuiRouteCancellation::new())
     }
 
+    pub(crate) fn route_attached_request(
+        &self,
+        request: TuiRouteRequest,
+        progress: std::sync::mpsc::Sender<TuiRouteProgress>,
+        cancellation: TuiRouteCancellation,
+    ) -> TuiSubmissionOutcome {
+        let result = match request {
+            TuiRouteRequest::Input(input) => {
+                self.resolve_attached(text_message(input), &cancellation)
+            }
+            TuiRouteRequest::InputMessage(input) => self.resolve_attached(input, &cancellation),
+            TuiRouteRequest::BusyInput(input) => self
+                .resolve_attached(text_message(input), &cancellation)
+                .map(queue_attached),
+            TuiRouteRequest::BusyMessage(input) => self
+                .resolve_attached(input, &cancellation)
+                .map(queue_attached),
+            TuiRouteRequest::AttachClipboardImage { .. }
+            | TuiRouteRequest::ReplaceStagedMedia { .. } => {
+                return self.route_request_with_cancellation(request, progress, cancellation);
+            }
+            _ => Err(CliError::usage(
+                "this action is not supported while attached to a daemon",
+            )),
+        };
+        result.unwrap_or_else(|error| TuiSubmissionOutcome::LocalActionableError {
+            message: error.to_string(),
+            action: TUI_ERROR_ACTION.into(),
+        })
+    }
+
     pub fn route_request_with_cancellation(
         &self,
         request: TuiRouteRequest,
@@ -310,5 +341,17 @@ impl TuiRuntimeRouter {
                     action: TUI_ERROR_ACTION.into(),
                 }),
         }
+    }
+}
+
+fn queue_attached(outcome: TuiSubmissionOutcome) -> TuiSubmissionOutcome {
+    match outcome {
+        TuiSubmissionOutcome::ProviderMessage { display, message } => {
+            TuiSubmissionOutcome::BusyProviderMessage { display, message }
+        }
+        TuiSubmissionOutcome::ProviderTurn { display, prompt } => {
+            TuiSubmissionOutcome::BusyProviderTurn { display, prompt }
+        }
+        outcome => outcome,
     }
 }

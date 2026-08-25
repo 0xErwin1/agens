@@ -950,8 +950,19 @@ impl TuiRouteCancellation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TuiProviderOutcome {
     Completed(String),
-    Failed { message: String, action: String },
-    Cancelled { message: String, action: String },
+    Failed {
+        message: String,
+        action: String,
+    },
+    /// Refused before a turn started; accepted attachments return to staging.
+    Rejected {
+        message: String,
+        action: String,
+    },
+    Cancelled {
+        message: String,
+        action: String,
+    },
     Backgrounded,
 }
 
@@ -6961,10 +6972,26 @@ where
                     mime: attachment.mime.clone(),
                 }),
         );
-        self.begin_message_submission(Message {
+        let message = Message {
             role: Role::User,
             parts,
-        });
+        };
+        self.claim_composer_media(&message);
+        self.begin_message_submission(message);
+    }
+
+    /// Removes only composer attachments carried by an accepted message.
+    fn claim_composer_media(&mut self, message: &Message) {
+        let mut remaining = std::mem::take(&mut self.staged_media);
+        for accepted in message_media(message) {
+            if let Some(index) = remaining
+                .iter()
+                .position(|candidate| candidate == &accepted)
+            {
+                remaining.remove(index);
+            }
+        }
+        self.set_staged_media(remaining);
     }
 
     /// Adds canonical ordered user content before the shared runtime starts.
@@ -6983,8 +7010,7 @@ where
         }
         self.runtime_events.clear();
         self.turn_duration = None;
-        self.submitted_media = std::mem::take(&mut self.staged_media);
-        self.media_chips.clear();
+        self.submitted_media = message_media(&message);
         self.transcript
             .push(TranscriptEntry::User(presented.clone()));
         self.conversation = Some(Conversation::new(presented));
@@ -7198,6 +7224,7 @@ where
                 display: _,
                 message,
             } => {
+                self.claim_composer_media(&message);
                 self.begin_message_submission(message.clone());
                 Some(message)
             }
@@ -7598,7 +7625,9 @@ where
                 generation,
                 output: output.clone(),
             }),
-            TuiProviderOutcome::Failed { .. } => Some(AppEvent::TurnFailedFor { generation }),
+            TuiProviderOutcome::Failed { .. } | TuiProviderOutcome::Rejected { .. } => {
+                Some(AppEvent::TurnFailedFor { generation })
+            }
             TuiProviderOutcome::Cancelled { .. } => Some(AppEvent::TurnCancelledFor { generation }),
             TuiProviderOutcome::Backgrounded => Some(AppEvent::TurnReleasedFor { generation }),
         };
@@ -7631,6 +7660,15 @@ where
                 }
                 self.clear_submitted_media();
                 self.set_foreground_presentation(false);
+            }
+            TuiProviderOutcome::Rejected { message, action } => {
+                let mut restored = std::mem::take(&mut self.submitted_media);
+                restored.append(&mut self.staged_media);
+                self.set_staged_media(restored);
+                self.assistant_streaming = false;
+                self.turn_state = Some(TurnState::Failed);
+                self.active_tool = None;
+                self.add_error(message, action);
             }
             TuiProviderOutcome::Failed { message, action } => {
                 let finishing = self.foreground_running();
@@ -9910,6 +9948,7 @@ where
             return;
         }
         self.record_prompt_history(&message);
+        self.claim_composer_media(&message);
         self.clear_composer();
         self.surface_focus = SurfaceFocus::Composer;
     }
@@ -12406,6 +12445,7 @@ where
                 renderer.render(tui.view())?;
             }
             Action::Submit(message) => {
+                tui.claim_composer_media(message.as_message());
                 tui.begin_message_submission(message.as_message().clone());
                 let submit = Arc::clone(&submit);
                 let sender = sender.clone();
@@ -12611,6 +12651,19 @@ struct ScheduledPrompt {
     display: String,
     prompt: String,
     message: Message,
+}
+
+fn message_media(message: &Message) -> Vec<PromptAttachment> {
+    message
+        .parts
+        .iter()
+        .filter_map(|part| match part {
+            MessagePart::Media { media_id, mime } => {
+                Some(PromptAttachment::new(*media_id, mime.clone()))
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 fn next_scheduled_prompt(effects: Vec<Effect>) -> Option<ScheduledPrompt> {
@@ -13124,18 +13177,41 @@ where
                 });
             }
             Action::TransitionToBackground(id) => {
-                let _ = transition(id);
+                if !transition(id) {
+                    tui.add_error(
+                        "This execution cannot be moved to the background.".into(),
+                        "Background transition is unavailable for this session.".into(),
+                    );
+                }
             }
             Action::CancelExecution(id) => {
                 if cancel_execution(id) {
                     tui.apply_confirmed_cancellations([id]);
+                } else {
+                    tui.add_error(
+                        "This execution could not be cancelled.".into(),
+                        "Cancellation control is unavailable for this session.".into(),
+                    );
                 }
             }
             Action::CancelAllExecutions => {
-                tui.apply_confirmed_cancellations(cancel_all_executions());
+                let cancelled = cancel_all_executions();
+                if cancelled.is_empty() {
+                    tui.add_error(
+                        "No executions were cancelled.".into(),
+                        "Bulk cancellation control is unavailable for this session.".into(),
+                    );
+                } else {
+                    tui.apply_confirmed_cancellations(cancelled);
+                }
             }
             Action::SendTaskMessage { id, message } => {
-                let _ = send_task_message(id, message);
+                if !send_task_message(id, message) {
+                    tui.add_error(
+                        "The task message was not sent.".into(),
+                        "Task messaging is unavailable for this session.".into(),
+                    );
+                }
             }
             Action::OpenDialog(route_id) => {
                 if route_id == "sessions"
@@ -14071,6 +14147,34 @@ mod runtime_tests {
             osc52_copy_sequence("café 🙂"),
             "\u{1b}]52;c;Y2Fmw6kg8J+Zgg==\u{7}"
         );
+    }
+
+    #[test]
+    fn a_rejected_submission_restores_accepted_media_once_without_losing_mid_turn_staging() {
+        let mut tui = Tui::new(NoopEngine);
+        let first = PromptAttachment::new(1, "image/png");
+        let mid_turn = PromptAttachment::new(2, "application/pdf");
+        tui.set_staged_media(vec![first.clone()]);
+        tui.begin_message_submission(Message {
+            role: Role::User,
+            parts: vec![MessagePart::Media {
+                media_id: 1,
+                mime: "image/png".into(),
+            }],
+        });
+        tui.set_staged_media(vec![mid_turn.clone()]);
+
+        tui.finish_provider_turn(TuiProviderOutcome::Rejected {
+            message: "the daemon refused".into(),
+            action: "retry".into(),
+        });
+        assert_eq!(tui.staged_media(), &[first.clone(), mid_turn.clone()]);
+
+        tui.finish_provider_turn(TuiProviderOutcome::Rejected {
+            message: "duplicate terminal".into(),
+            action: "retry".into(),
+        });
+        assert_eq!(tui.staged_media(), &[first, mid_turn]);
     }
 
     #[test]

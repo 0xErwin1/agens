@@ -52,19 +52,30 @@ struct Script {
 /// while a turn is still running.
 struct ScriptedTurns {
     started: Sender<String>,
+    structured: Sender<agens_core::SessionMessage>,
     release: Arc<Mutex<Receiver<Script>>>,
 }
 
 impl ChatTurns for ScriptedTurns {
     fn run(
         &mut self,
-        prompt: &str,
+        message: &agens_core::SessionMessage,
         _runtime: &SessionRuntime,
         _cancellation: &HeadlessTurnCancellation,
         _asks: &Arc<dyn agens_server::ChatAsks>,
         progress: &agens_core::TurnProgressSink,
     ) -> ChatTurnOutcome {
-        let _ = self.started.send(prompt.to_owned());
+        let _ = self.structured.send(message.clone());
+        let prompt = message
+            .as_message()
+            .parts
+            .iter()
+            .filter_map(|part| match part {
+                MessagePart::Text(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        let _ = self.started.send(prompt);
 
         let Ok(script) = self
             .release
@@ -89,7 +100,9 @@ struct Wire {
     _chats: Arc<ChatSessions>,
     supervisor: SessionSupervisor,
     started: Receiver<String>,
+    structured: Receiver<agens_core::SessionMessage>,
     release: Sender<Script>,
+    media_directory: PathBuf,
     shutdown: HeadlessTurnCancellation,
 }
 
@@ -139,35 +152,40 @@ async fn connect_unix(path: PathBuf) -> tonic::transport::Channel {
 
 async fn wire(name: &str) -> Wire {
     let supervisor = SessionSupervisor::new(tokio::runtime::Handle::current());
+    let directory = scratch_directory(name);
 
     let (started, started_rx) = channel();
+    let (structured, structured_rx) = channel();
     let (release, release_rx) = channel();
     let release_rx = Arc::new(Mutex::new(release_rx));
 
-    let chats = Arc::new(ChatSessions::new(
-        supervisor.clone(),
-        Arc::new(move |request: &ChatSessionRequest| {
-            Ok(ChatSession {
-                admission: SessionAdmission::new(
-                    SessionId::new(request.resume.unwrap_or(1)),
-                    Box::new(StubProvider),
-                    SessionBudget::unlimited(),
-                ),
-                turns: Box::new(ScriptedTurns {
-                    started: started.clone(),
-                    release: Arc::clone(&release_rx),
-                }),
-            })
-        }),
-        Arc::new(|_| {
-            Ok(vec![agens_core::Message {
-                role: agens_core::Role::Assistant,
-                parts: vec![agens_core::MessagePart::Text("what we said".to_owned())],
-            }])
-        }),
-    ));
+    let chats = Arc::new(
+        ChatSessions::new(
+            supervisor.clone(),
+            Arc::new(move |request: &ChatSessionRequest| {
+                Ok(ChatSession {
+                    admission: SessionAdmission::new(
+                        SessionId::new(request.resume.unwrap_or(1)),
+                        Box::new(StubProvider),
+                        SessionBudget::unlimited(),
+                    ),
+                    turns: Box::new(ScriptedTurns {
+                        started: started.clone(),
+                        structured: structured.clone(),
+                        release: Arc::clone(&release_rx),
+                    }),
+                })
+            }),
+            Arc::new(|_| {
+                Ok(vec![agens_core::Message {
+                    role: agens_core::Role::Assistant,
+                    parts: vec![agens_core::MessagePart::Text("what we said".to_owned())],
+                }])
+            }),
+        )
+        .with_media_store(directory.clone()),
+    );
 
-    let directory = scratch_directory(name);
     let socket = directory.join("facade.sock");
     let listener = tokio::net::UnixListener::bind(&socket).unwrap();
 
@@ -199,7 +217,9 @@ async fn wire(name: &str) -> Wire {
         _chats: chats,
         supervisor,
         started: started_rx,
+        structured: structured_rx,
         release,
+        media_directory: directory,
         shutdown,
     }
 }
@@ -281,6 +301,7 @@ async fn a_prompt_over_the_wire_runs_in_the_daemon_and_its_turn_comes_back_on_th
         .prompt(Request::new(proto::PromptRequest {
             session_id: handle.session_id,
             prompt: "what does this repository do".to_owned(),
+            parts: Vec::new(),
         }))
         .await
         .expect("the prompt is accepted");
@@ -328,6 +349,158 @@ async fn a_prompt_over_the_wire_runs_in_the_daemon_and_its_turn_comes_back_on_th
     );
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn structured_prompt_parts_are_authoritative_and_reach_the_turn_in_order() {
+    let mut wire = wire("structured-prompt").await;
+    let first = agens_store::ingest_media_bytes(&wire.media_directory, b"first", "image/png")
+        .expect("media is stored");
+    let second =
+        agens_store::ingest_media_bytes(&wire.media_directory, b"second", "application/pdf")
+            .expect("media is stored");
+    let handle = wire
+        .client
+        .open(Request::new(open_request("/projects/agens")))
+        .await
+        .expect("the chat opens")
+        .into_inner();
+    assert!(handle.supports_prompt_parts);
+
+    wire.client
+        .prompt(Request::new(proto::PromptRequest {
+            session_id: handle.session_id,
+            prompt: "compatibility text must not be duplicated".into(),
+            parts: vec![
+                proto::MessagePart {
+                    part: Some(proto::message_part::Part::Media(proto::Media {
+                        media_id: first.id,
+                        mime: first.mime,
+                    })),
+                },
+                proto::MessagePart {
+                    part: Some(proto::message_part::Part::Text("between".into())),
+                },
+                proto::MessagePart {
+                    part: Some(proto::message_part::Part::Media(proto::Media {
+                        media_id: second.id,
+                        mime: second.mime,
+                    })),
+                },
+            ],
+        }))
+        .await
+        .expect("the structured prompt is accepted");
+
+    let received = wire
+        .structured
+        .recv_timeout(PATIENCE)
+        .expect("the turn starts");
+    assert_eq!(
+        received.as_message().parts,
+        vec![
+            MessagePart::Media {
+                media_id: first.id,
+                mime: "image/png".into(),
+            },
+            MessagePart::Text("between".into()),
+            MessagePart::Media {
+                media_id: second.id,
+                mime: "application/pdf".into(),
+            },
+        ]
+    );
+    wire.release
+        .send(Script {
+            progress: Vec::new(),
+            outcome: ChatTurnOutcome::Completed("done".into()),
+        })
+        .expect("the turn is waiting");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unavailable_media_is_rejected_before_queue_admission_or_turn_start() {
+    let mut wire = wire("missing-media").await;
+    let handle = wire
+        .client
+        .open(Request::new(open_request("/projects/agens")))
+        .await
+        .expect("the chat opens")
+        .into_inner();
+
+    let refused = wire
+        .client
+        .prompt(Request::new(proto::PromptRequest {
+            session_id: handle.session_id,
+            prompt: String::new(),
+            parts: vec![proto::MessagePart {
+                part: Some(proto::message_part::Part::Media(proto::Media {
+                    media_id: 999_999,
+                    mime: "image/png".into(),
+                })),
+            }],
+        }))
+        .await
+        .expect_err("missing media fails closed");
+    assert_eq!(refused.code(), Code::InvalidArgument);
+    assert!(wire.started.try_recv().is_err(), "no turn was started");
+
+    let mismatched = agens_store::ingest_media_bytes(&wire.media_directory, b"image", "image/png")
+        .expect("media is stored");
+    let refused = wire
+        .client
+        .prompt(Request::new(proto::PromptRequest {
+            session_id: handle.session_id,
+            prompt: String::new(),
+            parts: vec![proto::MessagePart {
+                part: Some(proto::message_part::Part::Media(proto::Media {
+                    media_id: mismatched.id,
+                    mime: "application/pdf".into(),
+                })),
+            }],
+        }))
+        .await
+        .expect_err("stored MIME mismatch fails closed");
+    assert_eq!(refused.code(), Code::InvalidArgument);
+
+    let missing_blob =
+        agens_store::ingest_media_bytes(&wire.media_directory, b"gone", "image/jpeg")
+            .expect("media is stored");
+    let (_, blob) = agens_store::open_media(&wire.media_directory, missing_blob.id)
+        .expect("the blob exists before deletion");
+    fs::remove_file(blob).expect("the test removes only its scratch blob");
+    let refused = wire
+        .client
+        .prompt(Request::new(proto::PromptRequest {
+            session_id: handle.session_id,
+            prompt: String::new(),
+            parts: vec![proto::MessagePart {
+                part: Some(proto::message_part::Part::Media(proto::Media {
+                    media_id: missing_blob.id,
+                    mime: missing_blob.mime,
+                })),
+            }],
+        }))
+        .await
+        .expect_err("a media row whose blob is missing fails closed");
+    assert_eq!(refused.code(), Code::InvalidArgument);
+    assert!(
+        wire.started.try_recv().is_err(),
+        "invalid media never starts a turn"
+    );
+
+    wire.client
+        .prompt(Request::new(proto::PromptRequest {
+            session_id: handle.session_id,
+            prompt: "legacy still works".into(),
+            parts: Vec::new(),
+        }))
+        .await
+        .expect("the rejected message did not consume the inbox");
+    assert_eq!(
+        wire.started.recv_timeout(PATIENCE),
+        Ok("legacy still works".into())
+    );
+}
+
 /// The turn's own facts about a tool result are what the daemon feeds its ingest
 /// with; no surface renders them. They are skipped at the boundary rather than
 /// ending the stream or arriving as a shape that does not mean them.
@@ -355,6 +528,7 @@ async fn an_event_this_wire_does_not_carry_is_skipped_without_breaking_the_strea
         .prompt(Request::new(proto::PromptRequest {
             session_id: handle.session_id,
             prompt: "run the tests".to_owned(),
+            parts: Vec::new(),
         }))
         .await
         .expect("the prompt is accepted");
@@ -426,6 +600,7 @@ async fn a_prompt_for_a_chat_nobody_opened_is_not_found() {
         .prompt(Request::new(proto::PromptRequest {
             session_id: 404,
             prompt: "hello".to_owned(),
+            parts: Vec::new(),
         }))
         .await
         .expect_err("there is no such chat");
@@ -451,6 +626,7 @@ async fn a_prompt_past_the_one_that_may_wait_is_a_failed_precondition() {
             .prompt(Request::new(proto::PromptRequest {
                 session_id: handle.session_id,
                 prompt: prompt.to_owned(),
+                parts: Vec::new(),
             }))
             .await
             .expect("the running turn and the one waiting behind it are both accepted");
@@ -463,6 +639,7 @@ async fn a_prompt_past_the_one_that_may_wait_is_a_failed_precondition() {
         .prompt(Request::new(proto::PromptRequest {
             session_id: handle.session_id,
             prompt: "third".to_owned(),
+            parts: Vec::new(),
         }))
         .await
         .expect_err("a third prompt has nowhere to wait");
@@ -555,6 +732,7 @@ async fn a_chat_that_is_answering_says_so_in_the_listing() {
         .prompt(Request::new(proto::PromptRequest {
             session_id: handle.session_id,
             prompt: "take your time".to_owned(),
+            parts: Vec::new(),
         }))
         .await
         .expect("the prompt is accepted");

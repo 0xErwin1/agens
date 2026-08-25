@@ -19,6 +19,8 @@ use std::sync::mpsc::RecvTimeoutError;
 use tokio_stream::{Stream, wrappers::ReceiverStream};
 use tonic::{Request, Response, Status};
 
+use agens_core::{Message, MessagePart, Role, SessionMessage};
+
 use super::proto::chat_server::Chat;
 use super::subscriptions::{
     FORWARD_PATIENCE, LIVE_SUBSCRIPTIONS, SUBSCRIPTION_BUFFER, SubscriptionSlots, forward,
@@ -96,6 +98,7 @@ impl Chat for ChatFacade {
 
         Ok(Response::new(proto::ChatHandle {
             session_id: session.value(),
+            supports_prompt_parts: true,
         }))
     }
 
@@ -105,9 +108,9 @@ impl Chat for ChatFacade {
     ) -> Result<Response<proto::ChatAck>, Status> {
         let request = request.into_inner();
         let session = SessionId::new(request.session_id);
-        let prompt = request.prompt;
+        let message = prompt_message(request)?;
 
-        self.off_runtime(move |chats| chats.prompt(session, prompt))
+        self.off_runtime(move |chats| chats.prompt(session, message))
             .await?;
 
         Ok(Response::new(proto::ChatAck {}))
@@ -286,13 +289,121 @@ fn refusal(error: ChatError) -> Status {
         // A client that answered something already resolved has to know the
         // difference in order to stop showing it.
         ChatError::NotAsked => Status::failed_precondition(error.to_string()),
+        ChatError::InvalidMessage => Status::invalid_argument(error.to_string()),
         ChatError::Unavailable(detail) => Status::unavailable(detail),
     }
+}
+
+fn prompt_message(request: proto::PromptRequest) -> Result<SessionMessage, Status> {
+    let parts = if request.parts.is_empty() {
+        vec![MessagePart::Text(request.prompt)]
+    } else {
+        request
+            .parts
+            .into_iter()
+            .map(|part| match part.part {
+                Some(proto::message_part::Part::Text(text)) => Ok(MessagePart::Text(text)),
+                Some(proto::message_part::Part::Media(media))
+                    if agens_store::is_media_mime(&media.mime) =>
+                {
+                    Ok(MessagePart::Media {
+                        media_id: media.media_id,
+                        mime: media.mime,
+                    })
+                }
+                Some(proto::message_part::Part::Media(_)) => {
+                    Err(Status::invalid_argument("the attached message is invalid"))
+                }
+                _ => Err(Status::invalid_argument(
+                    "attached chat accepts only text and media parts",
+                )),
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    };
+
+    SessionMessage::try_from(Message {
+        role: Role::User,
+        parts,
+    })
+    .map_err(|_| Status::invalid_argument("the attached message is invalid"))
 }
 
 fn unavailable(error: BlockingError) -> Status {
     match error {
         BlockingError::Panicked => Status::internal("the chat plane failed to answer"),
         BlockingError::ShuttingDown => Status::unavailable("the daemon is shutting down"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prompt_parts_reject_unset_provider_and_tool_shapes() {
+        let invalid = [
+            proto::MessagePart { part: None },
+            proto::MessagePart {
+                part: Some(proto::message_part::Part::Reasoning("no".into())),
+            },
+            proto::MessagePart {
+                part: Some(proto::message_part::Part::ToolCall(proto::ToolCall {
+                    id: "call".into(),
+                    name: "bash".into(),
+                    input: "{}".into(),
+                })),
+            },
+            proto::MessagePart {
+                part: Some(proto::message_part::Part::ToolResult(proto::ToolResult {
+                    tool_call_id: "call".into(),
+                    content: "no".into(),
+                    is_error: false,
+                })),
+            },
+        ];
+
+        for part in invalid {
+            assert!(
+                prompt_message(proto::PromptRequest {
+                    session_id: 1,
+                    prompt: "compatibility text".into(),
+                    parts: vec![part],
+                })
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_prompt_and_media_only_parts_are_distinct_valid_messages() {
+        let legacy = prompt_message(proto::PromptRequest {
+            session_id: 1,
+            prompt: "legacy".into(),
+            parts: Vec::new(),
+        })
+        .unwrap();
+        assert_eq!(
+            legacy.as_message().parts,
+            vec![MessagePart::Text("legacy".into())]
+        );
+
+        let media = prompt_message(proto::PromptRequest {
+            session_id: 1,
+            prompt: "must not be copied".into(),
+            parts: vec![proto::MessagePart {
+                part: Some(proto::message_part::Part::Media(proto::Media {
+                    media_id: 7,
+                    mime: "image/png".into(),
+                })),
+            }],
+        })
+        .unwrap();
+        assert_eq!(
+            media.as_message().parts,
+            vec![MessagePart::Media {
+                media_id: 7,
+                mime: "image/png".into(),
+            }]
+        );
     }
 }

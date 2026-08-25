@@ -77,6 +77,46 @@ impl TuiRuntimeRouter {
         })
     }
 
+    pub(crate) fn resolve_attached(
+        &self,
+        input: Message,
+        cancellation: &TuiRouteCancellation,
+    ) -> Result<TuiSubmissionOutcome, CliError> {
+        let input_text = agens_tui::user_message_text(&input);
+        if input_text.starts_with('/') {
+            let command = input_text.trim();
+            let name = command_name(command).unwrap_or_default();
+            let prompt_producing = self.commands()?.command(name).is_some_and(|command| {
+                command.busy_policy() == agens_tools::CommandBusyPolicy::ProviderTurn
+            }) || self.skills()?.skill(name).is_some();
+            if command.starts_with("/attach") {
+                return self.resolve_with_cancellation(input, cancellation);
+            }
+            if !prompt_producing {
+                return Err(CliError::usage(
+                    "this command is not supported while attached to a daemon",
+                ));
+            }
+        }
+
+        match self.resolve_with_cancellation(input, cancellation)? {
+            TuiSubmissionOutcome::ProviderMessage { display, message } => {
+                let bootstrap = self.bootstrap()?;
+                let session = self
+                    .session
+                    .lock()
+                    .map_err(|_| CliError::storage("TUI session is unavailable"))?;
+                let expanded =
+                    crate::files::expand_tui_message_with_media(&session, &bootstrap, &message)?;
+                Ok(TuiSubmissionOutcome::ProviderMessage {
+                    display,
+                    message: expanded.message,
+                })
+            }
+            outcome => Ok(outcome),
+        }
+    }
+
     pub(super) fn resolve_with_cancellation(
         &self,
         input: Message,

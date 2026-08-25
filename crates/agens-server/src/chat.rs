@@ -25,7 +25,9 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use agens_core::ask_user::{AskUserAnswer, AskUserReply, AskUserRequest, AskUserUnavailable};
-use agens_core::{HeadlessTurnCancellation, Message, TurnEvent, TurnProgressSink};
+use agens_core::{
+    HeadlessTurnCancellation, Message, MessagePart, SessionMessage, TurnEvent, TurnProgressSink,
+};
 
 use crate::sessions::{
     SessionAdmission, SessionId, SessionOutcome, SessionRegistryError, SessionRuntime,
@@ -156,7 +158,7 @@ pub trait ChatTurns: Send {
     /// which is what shutting the daemon down uses.
     fn run(
         &mut self,
-        prompt: &str,
+        message: &SessionMessage,
         runtime: &SessionRuntime,
         cancellation: &HeadlessTurnCancellation,
         asks: &Arc<dyn ChatAsks>,
@@ -224,6 +226,8 @@ pub enum ChatError {
     /// An answer named a question this chat is not waiting on, or an answer
     /// this daemon does not know.
     NotAsked,
+    /// The submitted user content is malformed or references unavailable media.
+    InvalidMessage,
     Unavailable(String),
 }
 
@@ -234,6 +238,7 @@ impl std::fmt::Display for ChatError {
             Self::Busy => formatter.write_str("the chat session is already running a turn"),
             Self::NotAsked => formatter
                 .write_str("the chat is not waiting on that question, or that is not an answer"),
+            Self::InvalidMessage => formatter.write_str("the attached message is invalid"),
             Self::Unavailable(detail) => formatter.write_str(detail),
         }
     }
@@ -347,7 +352,7 @@ struct PendingQuestion {
 /// One open chat, as the daemon holds it.
 struct OpenChat {
     /// Dropping this ends the session's loop, which is what closing a chat is.
-    prompts: SyncSender<String>,
+    prompts: SyncSender<SessionMessage>,
     subscribers: Arc<Subscribers>,
     /// What the chat was opened against. Held so a client that comes back can
     /// find the chat belonging to the project it is in without having written
@@ -367,6 +372,7 @@ pub struct ChatSessions {
     open_chat: ChatSessionFactory,
     history: ChatHistorySource,
     open: Mutex<BTreeMap<SessionId, OpenChat>>,
+    media_store: Option<PathBuf>,
 }
 
 impl ChatSessions {
@@ -381,7 +387,15 @@ impl ChatSessions {
             open_chat,
             history,
             open: Mutex::new(BTreeMap::new()),
+            media_store: None,
         }
+    }
+
+    /// Enables validation of durable media references before inbox admission.
+    #[must_use]
+    pub fn with_media_store(mut self, data_directory: PathBuf) -> Self {
+        self.media_store = Some(data_directory);
+        self
     }
 
     /// What one chat has said so far.
@@ -460,15 +474,40 @@ impl ChatSessions {
     }
 
     /// Hands a prompt to an open chat, without waiting for the turn it starts.
-    pub fn prompt(&self, session: SessionId, prompt: String) -> Result<(), ChatError> {
+    pub fn prompt(&self, session: SessionId, message: SessionMessage) -> Result<(), ChatError> {
+        if !self.locked()?.contains_key(&session) {
+            return Err(ChatError::Unknown);
+        }
+        self.validate_media(&message)?;
         let open = self.locked()?;
         let chat = open.get(&session).ok_or(ChatError::Unknown)?;
 
-        chat.prompts.try_send(prompt).map_err(|error| match error {
+        chat.prompts.try_send(message).map_err(|error| match error {
             TrySendError::Full(_) => ChatError::Busy,
             // The loop is gone, so the session behind this record has ended.
             TrySendError::Disconnected(_) => ChatError::Unknown,
         })
+    }
+
+    fn validate_media(&self, message: &SessionMessage) -> Result<(), ChatError> {
+        let Some(data_directory) = self.media_store.as_deref() else {
+            return Ok(());
+        };
+
+        for part in &message.as_message().parts {
+            let MessagePart::Media { media_id, mime } = part else {
+                continue;
+            };
+            if !agens_store::is_media_mime(mime) {
+                return Err(ChatError::InvalidMessage);
+            }
+            let (stored_mime, _) = agens_store::open_media(data_directory, *media_id)
+                .map_err(|_| ChatError::InvalidMessage)?;
+            if stored_mime != *mime {
+                return Err(ChatError::InvalidMessage);
+            }
+        }
+        Ok(())
     }
 
     /// Answers a question a chat's turn is waiting on.
@@ -741,7 +780,7 @@ impl ChatQuestions {
 fn serve_prompts(
     turns: &mut dyn ChatTurns,
     runtime: &SessionRuntime,
-    inbox: &Receiver<String>,
+    inbox: &Receiver<SessionMessage>,
     subscribers: &Arc<Subscribers>,
     running: &Arc<Mutex<Option<HeadlessTurnCancellation>>>,
     asked: &Arc<Mutex<BTreeMap<u64, PendingQuestion>>>,
@@ -759,8 +798,8 @@ fn serve_prompts(
             return SessionOutcome::Cancelled;
         }
 
-        let prompt = match inbox.recv_timeout(PROMPT_POLL) {
-            Ok(prompt) => prompt,
+        let message = match inbox.recv_timeout(PROMPT_POLL) {
+            Ok(message) => message,
             Err(RecvTimeoutError::Timeout) => continue,
             // The client closed the chat. Its end of the inbox is gone, which
             // is the only signal a hosted session gets that nobody will prompt
@@ -785,7 +824,7 @@ fn serve_prompts(
             *turn = Some(cancellation.clone());
         }
 
-        let event = match turns.run(&prompt, runtime, &cancellation, &questions, &progress) {
+        let event = match turns.run(&message, runtime, &cancellation, &questions, &progress) {
             ChatTurnOutcome::Completed(text) => ChatEvent::TurnCompleted { text },
             ChatTurnOutcome::Failed(detail) => ChatEvent::TurnFailed { detail },
         };

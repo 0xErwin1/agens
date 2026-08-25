@@ -1,11 +1,13 @@
 //! The chat plane, as a surface uses it.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use tokio_stream::{Stream, StreamExt};
 use tonic::transport::Channel;
 
-use agens_core::Message;
+use agens_core::{Message, MessagePart, Role, SessionMessage};
 
 use crate::ClientError;
 use crate::decode::{HostedChatEvent, PermissionDecision, message, session_event};
@@ -25,12 +27,14 @@ pub struct OpenChat {
 #[derive(Clone, Debug)]
 pub struct ChatClient {
     inner: proto::chat_client::ChatClient<Channel>,
+    prompt_parts: Arc<Mutex<BTreeMap<i64, bool>>>,
 }
 
 impl ChatClient {
     pub(crate) fn new(channel: Channel) -> Self {
         Self {
             inner: proto::chat_client::ChatClient::new(channel),
+            prompt_parts: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -48,6 +52,11 @@ impl ChatClient {
             })
             .await?
             .into_inner();
+
+        self.prompt_parts
+            .lock()
+            .map_err(|_| ClientError::Unreadable("chat capabilities are unavailable".into()))?
+            .insert(opened.session_id, opened.supports_prompt_parts);
 
         Ok(opened.session_id)
     }
@@ -83,13 +92,30 @@ impl ChatClient {
     /// that waited for the turn on this call would be a client whose going away
     /// ends the turn, which is the whole thing a hosted chat exists to avoid.
     pub async fn prompt(&mut self, session_id: i64, prompt: &str) -> Result<(), ClientError> {
-        self.inner
-            .prompt(proto::PromptRequest {
-                session_id,
-                prompt: prompt.to_owned(),
-            })
-            .await?;
+        let message = SessionMessage::try_from(Message {
+            role: Role::User,
+            parts: vec![MessagePart::Text(prompt.to_owned())],
+        })
+        .map_err(|_| ClientError::InvalidRequest("the prompt is empty or invalid".into()))?;
+        self.prompt_message(session_id, &message).await
+    }
 
+    /// Sends canonical ordered user content. Media is refused locally unless the
+    /// opened daemon advertised structured prompt parts.
+    pub async fn prompt_message(
+        &mut self,
+        session_id: i64,
+        message: &SessionMessage,
+    ) -> Result<(), ClientError> {
+        let supports_parts = self
+            .prompt_parts
+            .lock()
+            .map_err(|_| ClientError::Unreadable("chat capabilities are unavailable".into()))?
+            .get(&session_id)
+            .copied()
+            .unwrap_or(false);
+        let request = prompt_request(session_id, message, supports_parts)?;
+        self.inner.prompt(request).await?;
         Ok(())
     }
 
@@ -174,5 +200,187 @@ impl ChatClient {
             Ok(event) => session_event(event),
             Err(status) => Err(ClientError::Refused(status)),
         }))
+    }
+}
+
+fn prompt_request(
+    session_id: i64,
+    message: &SessionMessage,
+    supports_parts: bool,
+) -> Result<proto::PromptRequest, ClientError> {
+    if message.as_message().role != Role::User {
+        return Err(ClientError::InvalidRequest(
+            "attached chat accepts only user messages".into(),
+        ));
+    }
+
+    let has_media = message
+        .as_message()
+        .parts
+        .iter()
+        .any(|part| matches!(part, MessagePart::Media { .. }));
+    if has_media && !supports_parts {
+        return Err(ClientError::InvalidRequest(
+            "the attached daemon does not support media prompts".into(),
+        ));
+    }
+
+    let prompt = message
+        .as_message()
+        .parts
+        .iter()
+        .filter_map(|part| match part {
+            MessagePart::Text(text) => Some(text.as_str()),
+            MessagePart::Media { .. } => None,
+            _ => None,
+        })
+        .collect::<String>();
+    let parts = if supports_parts {
+        message
+            .as_message()
+            .parts
+            .iter()
+            .map(|part| {
+                let part = match part {
+                    MessagePart::Text(text) => proto::message_part::Part::Text(text.clone()),
+                    MessagePart::Media { media_id, mime } => {
+                        proto::message_part::Part::Media(proto::Media {
+                            media_id: *media_id,
+                            mime: mime.clone(),
+                        })
+                    }
+                    _ => {
+                        return Err(ClientError::InvalidRequest(
+                            "attached chat accepts only text and media parts".into(),
+                        ));
+                    }
+                };
+                Ok(proto::MessagePart { part: Some(part) })
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        Vec::new()
+    };
+
+    Ok(proto::PromptRequest {
+        session_id,
+        prompt,
+        parts,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use agens_core::{Message, MessagePart, Role, SessionMessage};
+
+    use super::*;
+
+    fn session_message(role: Role, parts: Vec<MessagePart>) -> SessionMessage {
+        SessionMessage::try_from(Message { role, parts }).unwrap()
+    }
+
+    #[test]
+    fn structured_prompt_encoding_preserves_order_and_projects_text_only() {
+        let message = session_message(
+            Role::User,
+            vec![
+                MessagePart::Media {
+                    media_id: 7,
+                    mime: "image/png".into(),
+                },
+                MessagePart::Text("between".into()),
+                MessagePart::Media {
+                    media_id: 9,
+                    mime: "application/pdf".into(),
+                },
+            ],
+        );
+
+        let request = prompt_request(3, &message, true).unwrap();
+        assert_eq!(request.prompt, "between");
+        assert!(matches!(
+            request.parts[0].part,
+            Some(proto::message_part::Part::Media(ref media)) if media.media_id == 7
+        ));
+        assert!(matches!(
+            request.parts[1].part,
+            Some(proto::message_part::Part::Text(ref text)) if text == "between"
+        ));
+        assert!(matches!(
+            request.parts[2].part,
+            Some(proto::message_part::Part::Media(ref media)) if media.media_id == 9
+        ));
+    }
+
+    #[test]
+    fn media_fails_locally_without_prompt_parts_capability() {
+        let message = session_message(
+            Role::User,
+            vec![MessagePart::Media {
+                media_id: 7,
+                mime: "image/png".into(),
+            }],
+        );
+
+        assert!(matches!(
+            prompt_request(3, &message, false),
+            Err(ClientError::InvalidRequest(_))
+        ));
+    }
+
+    #[test]
+    fn text_for_a_capability_absent_daemon_uses_the_legacy_request_shape() {
+        let message = session_message(Role::User, vec![MessagePart::Text("legacy text".into())]);
+
+        let request = prompt_request(3, &message, false).unwrap();
+        assert_eq!(request.prompt, "legacy text");
+        assert!(request.parts.is_empty());
+    }
+
+    #[test]
+    fn non_user_messages_are_rejected_before_rpc() {
+        let reasoning = session_message(Role::Assistant, vec![MessagePart::Reasoning("no".into())]);
+        let tool_result = session_message(
+            Role::Tool,
+            vec![MessagePart::ToolResult {
+                tool_call_id: "call".into(),
+                content: "no".into(),
+                is_error: false,
+            }],
+        );
+
+        assert!(prompt_request(3, &reasoning, true).is_err());
+        assert!(prompt_request(3, &tool_result, true).is_err());
+    }
+
+    #[test]
+    fn prompt_error_classification_restores_only_proven_pre_admission_refusals() {
+        for code in [
+            tonic::Code::InvalidArgument,
+            tonic::Code::NotFound,
+            tonic::Code::FailedPrecondition,
+        ] {
+            assert!(
+                ClientError::Refused(tonic::Status::new(code, "rejected"))
+                    .definitively_rejected_prompt()
+            );
+        }
+        for code in [
+            tonic::Code::Unavailable,
+            tonic::Code::Unknown,
+            tonic::Code::DeadlineExceeded,
+            tonic::Code::Cancelled,
+            tonic::Code::Internal,
+        ] {
+            assert!(
+                !ClientError::Refused(tonic::Status::new(code, "uncertain"))
+                    .definitively_rejected_prompt(),
+                "{code:?} is ambiguous after RPC start"
+            );
+        }
+        assert!(
+            ClientError::InvalidRequest("local capability check".into())
+                .definitively_rejected_prompt()
+        );
     }
 }

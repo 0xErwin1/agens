@@ -503,11 +503,17 @@ message OpenChatRequest {
 
 message ChatHandle {
   int64 session_id = 1;
+  // A client must see this before sending media. False is the compatible default
+  // returned by daemons that predate structured prompt parts.
+  bool supports_prompt_parts = 2;
 }
 
 message PromptRequest {
   int64 session_id = 1;
+  // Text-only compatibility projection for daemons that predate `parts`.
   string prompt = 2;
+  // Authoritative when non-empty. Empty means the legacy prompt above.
+  repeated MessagePart parts = 3;
 }
 
 // One open chat, named.

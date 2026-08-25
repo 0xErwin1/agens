@@ -87,13 +87,22 @@ struct ScriptedTurns {
 impl ChatTurns for ScriptedTurns {
     fn run(
         &mut self,
-        prompt: &str,
+        message: &agens_core::SessionMessage,
         _runtime: &SessionRuntime,
         _cancellation: &HeadlessTurnCancellation,
         _asks: &Arc<dyn agens_server::ChatAsks>,
         progress: &TurnProgressSink,
     ) -> ChatTurnOutcome {
-        let _ = self.started.send(prompt.to_owned());
+        let prompt = message
+            .as_message()
+            .parts
+            .iter()
+            .filter_map(|part| match part {
+                MessagePart::Text(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        let _ = self.started.send(prompt);
 
         for event in self.events.clone() {
             progress(event);
