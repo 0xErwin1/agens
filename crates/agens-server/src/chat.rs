@@ -24,7 +24,7 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
-use agens_core::ask_user::{AskUserAnswer, AskUserReply, AskUserRequest, AskUserUnavailable};
+use agens_core::ask_user::{AskUserReply, AskUserRequest, AskUserUnavailable};
 use agens_core::{
     HeadlessTurnCancellation, Message, MessagePart, SessionMessage, TurnEvent, TurnProgressSink,
 };
@@ -149,6 +149,13 @@ pub trait ChatAsks: Send + Sync {
 }
 
 pub trait ChatTurns: Send {
+    /// Executes a command against this chat's daemon-owned session state.
+    fn command(&mut self, _command: &str) -> Result<String, ChatError> {
+        Err(ChatError::Unavailable(
+            "the command is not supported".to_owned(),
+        ))
+    }
+
     /// Runs one prompt to completion, reporting progress through `progress`.
     ///
     /// `cancellation` belongs to this turn and to no other. It is not the
@@ -205,6 +212,10 @@ pub enum ChatEvent {
     PermissionAsked {
         prompt_id: u64,
         request: ChatPermissionRequest,
+    },
+    AskUserAsked {
+        prompt_id: u64,
+        request: AskUserRequest,
     },
     TurnCompleted {
         text: String,
@@ -344,15 +355,29 @@ pub struct OpenChatSummary {
 }
 
 /// A question this chat is waiting on an answer to.
-struct PendingQuestion {
-    answer: SyncSender<String>,
-    admissible_answers: Vec<String>,
+enum PendingQuestion {
+    Permission {
+        answer: SyncSender<String>,
+        admissible_answers: Vec<String>,
+    },
+    AskUser {
+        answer: SyncSender<AskUserReply>,
+        request: AskUserRequest,
+    },
+}
+
+enum ChatInput {
+    Prompt(SessionMessage),
+    Command {
+        command: String,
+        result: SyncSender<Result<String, ChatError>>,
+    },
 }
 
 /// One open chat, as the daemon holds it.
 struct OpenChat {
     /// Dropping this ends the session's loop, which is what closing a chat is.
-    prompts: SyncSender<SessionMessage>,
+    inputs: SyncSender<ChatInput>,
     subscribers: Arc<Subscribers>,
     /// What the chat was opened against. Held so a client that comes back can
     /// find the chat belonging to the project it is in without having written
@@ -426,7 +451,7 @@ impl ChatSessions {
         } = (self.open_chat)(request)?;
 
         let session = admission.session();
-        let (prompts, inbox) = sync_channel(PROMPT_BACKLOG);
+        let (inputs, inbox) = sync_channel(PROMPT_BACKLOG);
         let subscribers = Arc::new(Subscribers::default());
         let published = Arc::clone(&subscribers);
         let running = Arc::new(Mutex::new(None));
@@ -445,7 +470,7 @@ impl ChatSessions {
         open.insert(
             session,
             OpenChat {
-                prompts,
+                inputs,
                 subscribers,
                 checkout,
                 running,
@@ -482,11 +507,33 @@ impl ChatSessions {
         let open = self.locked()?;
         let chat = open.get(&session).ok_or(ChatError::Unknown)?;
 
-        chat.prompts.try_send(message).map_err(|error| match error {
-            TrySendError::Full(_) => ChatError::Busy,
-            // The loop is gone, so the session behind this record has ended.
-            TrySendError::Disconnected(_) => ChatError::Unknown,
-        })
+        chat.inputs
+            .try_send(ChatInput::Prompt(message))
+            .map_err(|error| match error {
+                TrySendError::Full(_) => ChatError::Busy,
+                // The loop is gone, so the session behind this record has ended.
+                TrySendError::Disconnected(_) => ChatError::Unknown,
+            })
+    }
+
+    /// Executes a command on the same serialized state that owns hosted turns.
+    pub fn command(&self, session: SessionId, command: String) -> Result<String, ChatError> {
+        let inputs = self
+            .locked()?
+            .get(&session)
+            .ok_or(ChatError::Unknown)?
+            .inputs
+            .clone();
+        let (result, answered) = sync_channel(1);
+
+        inputs
+            .try_send(ChatInput::Command { command, result })
+            .map_err(|error| match error {
+                TrySendError::Full(_) => ChatError::Busy,
+                TrySendError::Disconnected(_) => ChatError::Unknown,
+            })?;
+
+        answered.recv().map_err(|_| ChatError::Unknown)?
     }
 
     fn validate_media(&self, message: &SessionMessage) -> Result<(), ChatError> {
@@ -538,21 +585,51 @@ impl ChatSessions {
             .asked
             .lock()
             .map_err(|_| unusable("the chat's open questions"))?;
-        let admissible = asked
-            .get(&prompt_id)
-            .ok_or(ChatError::NotAsked)?
-            .admissible_answers
+        let Some(PendingQuestion::Permission {
+            admissible_answers, ..
+        }) = asked.get(&prompt_id)
+        else {
+            return Err(ChatError::NotAsked);
+        };
+        if !admissible_answers
             .iter()
-            .any(|candidate| candidate == answer);
-        if !admissible {
+            .any(|candidate| candidate == answer)
+        {
             return Err(ChatError::NotAsked);
         }
-        let question = asked.remove(&prompt_id).ok_or(ChatError::NotAsked)?;
+        let Some(PendingQuestion::Permission { answer: sender, .. }) = asked.remove(&prompt_id)
+        else {
+            return Err(ChatError::NotAsked);
+        };
 
-        question
-            .answer
+        sender
             .try_send(answer.to_owned())
             .map_err(|_| ChatError::NotAsked)
+    }
+
+    pub fn answer_ask_user(
+        &self,
+        session: SessionId,
+        prompt_id: u64,
+        answer: AskUserReply,
+    ) -> Result<(), ChatError> {
+        let open = self.locked()?;
+        let chat = open.get(&session).ok_or(ChatError::Unknown)?;
+        let mut asked = chat
+            .asked
+            .lock()
+            .map_err(|_| unusable("the chat's open questions"))?;
+        let Some(PendingQuestion::AskUser { request, .. }) = asked.get(&prompt_id) else {
+            return Err(ChatError::NotAsked);
+        };
+        request
+            .validate_reply(&answer)
+            .map_err(|_| ChatError::NotAsked)?;
+        let Some(PendingQuestion::AskUser { answer: sender, .. }) = asked.remove(&prompt_id) else {
+            return Err(ChatError::NotAsked);
+        };
+
+        sender.try_send(answer).map_err(|_| ChatError::NotAsked)
     }
 
     /// Opens a stream of one chat's events, live from now.
@@ -678,7 +755,7 @@ impl ChatAsks for ChatQuestions {
         };
         asked.insert(
             prompt_id,
-            PendingQuestion {
+            PendingQuestion::Permission {
                 answer,
                 admissible_answers,
             },
@@ -703,17 +780,6 @@ impl ChatAsks for ChatQuestions {
     }
 
     fn ask_user(&self, request: &AskUserRequest) -> AskUserReply {
-        let [question] = request.questions() else {
-            return AskUserReply::Unavailable(AskUserUnavailable::NoInteractiveSurface);
-        };
-        let admissible_answers = question
-            .options()
-            .iter()
-            .map(|option| option.id().to_owned())
-            .collect::<Vec<_>>();
-        if admissible_answers.is_empty() {
-            return AskUserReply::Unavailable(AskUserUnavailable::NoInteractiveSurface);
-        }
         let prompt_id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (answer, answered) = sync_channel(1);
         let Ok(mut asked) = self.asked.lock() else {
@@ -721,33 +787,20 @@ impl ChatAsks for ChatQuestions {
         };
         asked.insert(
             prompt_id,
-            PendingQuestion {
+            PendingQuestion::AskUser {
                 answer,
-                admissible_answers,
+                request: request.clone(),
             },
         );
         drop(asked);
-        self.subscribers.publish(&ChatEvent::PermissionAsked {
+        self.subscribers.publish(&ChatEvent::AskUserAsked {
             prompt_id,
-            request: ChatPermissionRequest {
-                tool: "ask_user".into(),
-                target: String::new(),
-                access: "ask_user".into(),
-                reason: String::new(),
-            },
+            request: request.clone(),
         });
 
-        let outcome = self.wait_for(&answered).map_or(
-            AskUserReply::Unavailable(AskUserUnavailable::SurfaceClosed),
-            |value| {
-                AskUserReply::Answered(vec![AskUserAnswer {
-                    question_id: question.id().to_owned(),
-                    selected: vec![value],
-                    other: None,
-                    note: None,
-                }])
-            },
-        );
+        let outcome = self
+            .wait_for(&answered)
+            .unwrap_or(AskUserReply::Unavailable(AskUserUnavailable::SurfaceClosed));
         if let Ok(mut asked) = self.asked.lock() {
             asked.remove(&prompt_id);
         }
@@ -762,7 +815,7 @@ impl ChatQuestions {
     /// The subscriber count is read after the publish that would have dropped a
     /// client that went away, so it is the count of clients that could still
     /// answer rather than the count that existed when the question was asked.
-    fn wait_for(&self, answered: &Receiver<String>) -> Option<String> {
+    fn wait_for<T>(&self, answered: &Receiver<T>) -> Option<T> {
         loop {
             match answered.recv_timeout(ANSWER_POLL) {
                 Ok(answer) => return Some(answer),
@@ -780,7 +833,7 @@ impl ChatQuestions {
 fn serve_prompts(
     turns: &mut dyn ChatTurns,
     runtime: &SessionRuntime,
-    inbox: &Receiver<SessionMessage>,
+    inbox: &Receiver<ChatInput>,
     subscribers: &Arc<Subscribers>,
     running: &Arc<Mutex<Option<HeadlessTurnCancellation>>>,
     asked: &Arc<Mutex<BTreeMap<u64, PendingQuestion>>>,
@@ -799,7 +852,11 @@ fn serve_prompts(
         }
 
         let message = match inbox.recv_timeout(PROMPT_POLL) {
-            Ok(message) => message,
+            Ok(ChatInput::Command { command, result }) => {
+                drop(result.send(turns.command(&command)));
+                continue;
+            }
+            Ok(ChatInput::Prompt(message)) => message,
             Err(RecvTimeoutError::Timeout) => continue,
             // The client closed the chat. Its end of the inbox is gone, which
             // is the only signal a hosted session gets that nobody will prompt

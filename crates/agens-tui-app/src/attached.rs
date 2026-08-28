@@ -38,11 +38,10 @@ use agens_core::{
 use agens_error::{CliError, ExitStatus};
 use agens_session::context::SessionContext;
 use agens_tui::{
-    Engine, Tui, TuiPermissionBridge, TuiPermissionReply,
-    run_with_default_progress_submit_with_permissions_and_task_controls,
+    Engine, Tui, TuiAskUserBridge, TuiPermissionBridge, TuiPermissionReply, TuiRouteRequest,
+    TuiSubmissionOutcome,
+    run_with_default_progress_submit_with_permissions_task_controls_and_ask_user,
 };
-#[cfg(test)]
-use agens_tui::{TuiRouteRequest, TuiSubmissionOutcome};
 use tokio::runtime::Runtime;
 use tokio_stream::{Stream, StreamExt};
 
@@ -51,7 +50,6 @@ use crate::files::tui_picker_file_candidates;
 use crate::router::{TuiRuntimeRouter, tui_provider_outcome};
 
 /// What this mode cannot serve yet, said the same way everywhere it comes up.
-#[cfg(test)]
 const UNSUPPORTED: &str =
     "not available while attached to a daemon yet; start without attaching for this";
 
@@ -71,10 +69,22 @@ struct Attachment {
     /// Where a permission question the daemon asked is put to the person, and
     /// where their answer comes back from.
     permissions: TuiPermissionBridge,
+    ask_user: TuiAskUserBridge,
     staging: Arc<Mutex<SessionContext>>,
 }
 
 impl Attachment {
+    fn command(&self, command: &str) -> Result<String, CliError> {
+        let mut chat = self
+            .chat
+            .lock()
+            .map_err(|_| unavailable("the connection to the daemon is unusable"))?;
+
+        self.runtime
+            .block_on(chat.command(self.session_id, command))
+            .map_err(refused)
+    }
+
     /// Sends one prompt and reports what the turn did, forwarding everything it
     /// produced to the surface as it happens.
     fn take_turn(
@@ -129,6 +139,13 @@ impl Attachment {
                             question.prompt_id,
                             decision,
                         ))
+                        .map_err(refused)?;
+                }
+                HostedChatEvent::AskUserAsked { prompt_id, request } => {
+                    let reply = self.ask_user.wait_for_reply(request, None, &asking);
+
+                    self.runtime
+                        .block_on(chat.answer_ask_user(self.session_id, prompt_id, reply))
                         .map_err(refused)?;
                 }
                 HostedChatEvent::TurnCompleted { text } => return Ok(text),
@@ -232,14 +249,26 @@ impl Engine for AttachedEngine {
 /// route — a slash command, a dialog, a clipboard image — belongs to the local
 /// router, and the local router drives a local session. Saying so is the point:
 /// a command that quietly did nothing would read as the terminal being broken.
-#[cfg(test)]
-fn route(request: &TuiRouteRequest) -> TuiSubmissionOutcome {
+fn route(
+    request: &TuiRouteRequest,
+    execute_command: impl Fn(&str) -> Result<String, CliError>,
+) -> TuiSubmissionOutcome {
     match request {
         TuiRouteRequest::Input(input) => {
             let trimmed = input.trim();
 
             if trimmed.is_empty() {
                 return TuiSubmissionOutcome::LocalInfo(String::new());
+            }
+
+            if trimmed.starts_with("/effort ") || trimmed.starts_with("/model ") {
+                return match execute_command(trimmed) {
+                    Ok(message) => TuiSubmissionOutcome::LocalInfo(message),
+                    Err(error) => TuiSubmissionOutcome::LocalActionableError {
+                        message: error.to_string(),
+                        action: "Correct the command or runtime condition, then retry.".to_owned(),
+                    },
+                };
             }
 
             if trimmed.starts_with('/') {
@@ -287,15 +316,22 @@ pub fn run_attached_tui_with_prompt(
 
     let staging = Arc::new(Mutex::new(SessionContext::fresh()));
     let (permissions, permission_requests) = TuiPermissionBridge::channel();
-    let (attachment, engine, arrival) =
-        attach(socket, &checkout, resume, permissions, Arc::clone(&staging))?;
+    let (ask_user, ask_user_requests) = TuiAskUserBridge::channel();
+    let (attachment, engine, arrival) = attach(
+        socket,
+        &checkout,
+        resume,
+        permissions,
+        ask_user,
+        Arc::clone(&staging),
+    )?;
 
     let mut tui = Tui::new(engine);
     tui.adopt_environment();
     tui.set_collapse_thinking(bootstrap.collapse_thinking);
     tui.add_info(arrival.describe());
     tui.add_info(
-        "attached mode supports ordered prompts and prompt-producing commands; selected subagents, background controls, and session mutations remain unsupported",
+        "attached mode supports ordered prompts, prompt-producing commands, /effort <value>, and /model <provider/model>; selected subagents, background controls, and session mutations remain unsupported",
     );
     let skills = start_tui_skills(&mut tui, bootstrap, &checkout)?;
     let commands = start_tui_commands(&mut tui, bootstrap, &checkout)?;
@@ -325,13 +361,26 @@ pub fn run_attached_tui_with_prompt(
         ));
     }
 
+    let attachment = Arc::new(attachment);
     let permissions = attachment.permissions.clone();
+    let asks = attachment.ask_user.clone();
+    let commands = Arc::clone(&attachment);
 
     let route_router = router.clone();
-    run_with_default_progress_submit_with_permissions_and_task_controls(
+    run_with_default_progress_submit_with_permissions_task_controls_and_ask_user(
         &mut tui,
         move |request, progress, cancellation| {
-            route_router.route_attached_request(request, progress, cancellation)
+            let is_hosted_command = matches!(
+                &request,
+                TuiRouteRequest::Input(input)
+                    if input.trim().starts_with("/effort ")
+                        || input.trim().starts_with("/model ")
+            );
+            if is_hosted_command {
+                route(&request, |command| commands.command(command))
+            } else {
+                route_router.route_attached_request(request, progress, cancellation)
+            }
         },
         move |message, origin, progress, _metrics| {
             if let Some(rejection) = unsupported_attached_origin(origin) {
@@ -342,8 +391,10 @@ pub fn run_attached_tui_with_prompt(
         },
         |_| false,
         |_| false,
+        Vec::new,
         |_, _| false,
         Some((permissions, permission_requests)),
+        Some((asks, ask_user_requests)),
     )
     .map_err(|error| CliError::new(ExitStatus::Failure, "ui", error.to_string()))?;
 
@@ -398,6 +449,7 @@ fn attach(
     checkout: &Path,
     resume: Option<i64>,
     permissions: TuiPermissionBridge,
+    ask_user: TuiAskUserBridge,
     staging: Arc<Mutex<SessionContext>>,
 ) -> Result<(Attachment, AttachedEngine, Arrival), CliError> {
     let runtime = Arc::new(
@@ -453,6 +505,7 @@ fn attach(
             events: Mutex::new(Box::pin(events)),
             session_id,
             permissions,
+            ask_user,
             staging,
         },
         engine,
@@ -552,10 +605,16 @@ fn unavailable(detail: &str) -> CliError {
 mod tests {
     use super::*;
 
+    fn route_without_commands(request: &TuiRouteRequest) -> TuiSubmissionOutcome {
+        route(request, |_| {
+            panic!("this route does not execute a hosted command")
+        })
+    }
+
     #[test]
     fn an_ordinary_prompt_becomes_a_turn_for_the_daemon_to_run() {
         assert_eq!(
-            route(&TuiRouteRequest::Input("what changed here".to_owned())),
+            route_without_commands(&TuiRouteRequest::Input("what changed here".to_owned())),
             TuiSubmissionOutcome::ProviderTurn {
                 display: "what changed here".to_owned(),
                 prompt: "what changed here".to_owned(),
@@ -563,12 +622,36 @@ mod tests {
         );
     }
 
-    /// A command that quietly did nothing would read as the terminal being
-    /// broken, so this mode says what it cannot do instead.
+    #[test]
+    fn effort_executes_as_a_hosted_command() {
+        let outcome = route(
+            &TuiRouteRequest::Input("/effort high".to_owned()),
+            |command| Ok(format!("executed:{command}")),
+        );
+
+        assert_eq!(
+            outcome,
+            TuiSubmissionOutcome::LocalInfo("executed:/effort high".to_owned())
+        );
+    }
+
+    #[test]
+    fn qualified_model_executes_as_a_hosted_command() {
+        let outcome = route(
+            &TuiRouteRequest::Input("/model openai-api/gpt-4.1".to_owned()),
+            |command| Ok(format!("executed:{command}")),
+        );
+
+        assert_eq!(
+            outcome,
+            TuiSubmissionOutcome::LocalInfo("executed:/model openai-api/gpt-4.1".to_owned())
+        );
+    }
+
     #[test]
     fn a_command_this_mode_cannot_serve_says_so_rather_than_doing_nothing() {
         let TuiSubmissionOutcome::LocalInfo(message) =
-            route(&TuiRouteRequest::Input("/model".to_owned()))
+            route_without_commands(&TuiRouteRequest::Input("/model".to_owned()))
         else {
             panic!("a command is not a turn for the daemon to run");
         };
@@ -580,12 +663,10 @@ mod tests {
         );
     }
 
-    /// The daemon accepts one waiting prompt and no more, so queueing a second
-    /// one here would only move the refusal later.
     #[test]
     fn a_prompt_sent_while_the_daemon_is_answering_keeps_the_draft() {
         assert!(matches!(
-            route(&TuiRouteRequest::BusyInput("and the tests".to_owned())),
+            route_without_commands(&TuiRouteRequest::BusyInput("and the tests".to_owned())),
             TuiSubmissionOutcome::BusyRefusal(_)
         ));
     }

@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use agens_core::ask_user::{
-    AskUserMode, AskUserOption, AskUserQuestion, AskUserReply, AskUserRequest,
+    AskUserAnswer, AskUserMode, AskUserOption, AskUserQuestion, AskUserReply, AskUserRequest,
 };
 use agens_core::{HeadlessTurnCancellation, TurnEvent, TurnState};
 use agens_server::{
@@ -41,6 +41,13 @@ struct ScriptedTurns {
 }
 
 impl ChatTurns for ScriptedTurns {
+    fn command(&mut self, command: &str) -> Result<String, ChatError> {
+        match command {
+            "/effort high" => Ok("Reasoning effort: high.".to_owned()),
+            _ => Err(ChatError::Unavailable("unsupported command".to_owned())),
+        }
+    }
+
     fn run(
         &mut self,
         message: &agens_core::SessionMessage,
@@ -210,6 +217,17 @@ fn wait_for(events: &ChatSubscription, accepts: impl Fn(&ChatEvent) -> bool) -> 
             Err(error) => panic!("the chat never published the event: {error:?}"),
         }
     }
+}
+
+#[test]
+fn a_command_executes_on_the_daemon_owned_chat_state() {
+    let harness = harness();
+    let session = harness.chats.open(&request(1)).expect("the chat opens");
+
+    assert_eq!(
+        harness.chats.command(session, "/effort high".to_owned()),
+        Ok("Reasoning effort: high.".to_owned()),
+    );
 }
 
 #[test]
@@ -616,22 +634,29 @@ fn an_external_ask_user_answer_is_validated_then_continues_the_same_turn() {
     );
 
     let asked = wait_for(&events, |event| {
-        matches!(event, ChatEvent::PermissionAsked { .. })
+        matches!(event, ChatEvent::AskUserAsked { .. })
     });
-    let ChatEvent::PermissionAsked { prompt_id, .. } = asked else {
+    let ChatEvent::AskUserAsked { prompt_id, request } = asked else {
         panic!("the chat published something else");
     };
+    assert_eq!(request, an_ask_user_question());
 
+    let invalid = AskUserReply::Answered(Vec::new());
     assert_eq!(
-        harness
-            .chats
-            .answer_value(session, prompt_id, "outside-domain"),
+        harness.chats.answer_ask_user(session, prompt_id, invalid),
         Err(ChatError::NotAsked),
     );
+
+    let answer = AskUserReply::Answered(vec![AskUserAnswer {
+        question_id: "approval".to_owned(),
+        selected: vec!["approve".to_owned()],
+        other: None,
+        note: None,
+    }]);
     harness
         .chats
-        .answer_value(session, prompt_id, "approve")
-        .expect("an admissible external answer is accepted");
+        .answer_ask_user(session, prompt_id, answer)
+        .expect("a valid structured answer is accepted");
 
     assert_eq!(
         wait_for(&events, |event| matches!(

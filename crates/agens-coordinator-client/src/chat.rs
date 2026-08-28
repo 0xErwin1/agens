@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use tokio_stream::{Stream, StreamExt};
 use tonic::transport::Channel;
 
+use agens_core::ask_user::{AskUserReply, AskUserUnavailable};
 use agens_core::{Message, MessagePart, Role, SessionMessage};
 
 use crate::ClientError;
@@ -119,6 +120,20 @@ impl ChatClient {
         Ok(())
     }
 
+    /// Executes a slash command against the daemon-owned chat state.
+    pub async fn command(&mut self, session_id: i64, command: &str) -> Result<String, ClientError> {
+        let result = self
+            .inner
+            .command(proto::ChatCommandRequest {
+                session_id,
+                command: command.to_owned(),
+            })
+            .await?
+            .into_inner();
+
+        Ok(result.message)
+    }
+
     /// Answers a question the chat's turn is stopped on.
     ///
     /// A question that already resolved is refused rather than ignored: an
@@ -146,6 +161,23 @@ impl ChatClient {
                 session_id,
                 prompt_id,
                 answer: answer.to_owned(),
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    pub async fn answer_ask_user(
+        &mut self,
+        session_id: i64,
+        prompt_id: u64,
+        answer: AskUserReply,
+    ) -> Result<(), ClientError> {
+        self.inner
+            .answer_ask_user(proto::AnswerAskUserRequest {
+                session_id,
+                prompt_id,
+                reply: Some(ask_user_reply(answer)),
             })
             .await?;
 
@@ -201,6 +233,37 @@ impl ChatClient {
             Err(status) => Err(ClientError::Refused(status)),
         }))
     }
+}
+
+fn ask_user_reply(reply: AskUserReply) -> proto::AskUserReply {
+    use proto::ask_user_reply::Reply;
+
+    let reply = match reply {
+        AskUserReply::Answered(answers) => Reply::Answered(proto::AskUserAnswered {
+            answers: answers
+                .into_iter()
+                .map(|answer| proto::AskUserAnswer {
+                    question_id: answer.question_id,
+                    selected: answer.selected,
+                    other: answer.other,
+                    note: answer.note,
+                })
+                .collect(),
+        }),
+        AskUserReply::Discuss { question_id, note } => {
+            Reply::Discuss(proto::AskUserDiscuss { question_id, note })
+        }
+        AskUserReply::Cancelled => Reply::Cancelled(proto::AskUserCancelled {}),
+        AskUserReply::Unavailable(reason) => Reply::Unavailable(proto::AskUserUnavailable {
+            reason: match reason {
+                AskUserUnavailable::NoInteractiveSurface => "no_interactive_surface",
+                AskUserUnavailable::SurfaceClosed => "surface_closed",
+            }
+            .to_owned(),
+        }),
+    };
+
+    proto::AskUserReply { reply: Some(reply) }
 }
 
 fn prompt_request(

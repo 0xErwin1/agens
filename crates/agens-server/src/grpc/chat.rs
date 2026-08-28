@@ -16,6 +16,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::mpsc::RecvTimeoutError;
 
+use agens_core::ask_user::{AskUserAnswer, AskUserReply, AskUserUnavailable};
 use tokio_stream::{Stream, wrappers::ReceiverStream};
 use tonic::{Request, Response, Status};
 
@@ -116,6 +117,20 @@ impl Chat for ChatFacade {
         Ok(Response::new(proto::ChatAck {}))
     }
 
+    async fn command(
+        &self,
+        request: Request<proto::ChatCommandRequest>,
+    ) -> Result<Response<proto::ChatCommandResult>, Status> {
+        let request = request.into_inner();
+        let session = SessionId::new(request.session_id);
+        let command = request.command;
+        let message = self
+            .off_runtime(move |chats| chats.command(session, command))
+            .await?;
+
+        Ok(Response::new(proto::ChatCommandResult { message }))
+    }
+
     async fn cancel(
         &self,
         request: Request<proto::ChatRef>,
@@ -176,6 +191,25 @@ impl Chat for ChatFacade {
 
         let answer = request.answer;
         self.off_runtime(move |chats| chats.answer_value(session, prompt_id, &answer))
+            .await?;
+
+        Ok(Response::new(proto::ChatAck {}))
+    }
+
+    async fn answer_ask_user(
+        &self,
+        request: Request<proto::AnswerAskUserRequest>,
+    ) -> Result<Response<proto::ChatAck>, Status> {
+        let request = request.into_inner();
+        let session = SessionId::new(request.session_id);
+        let prompt_id = request.prompt_id;
+        let answer = ask_user_reply(
+            request
+                .reply
+                .ok_or_else(|| Status::invalid_argument("an ask-user answer carried nothing"))?,
+        )?;
+
+        self.off_runtime(move |chats| chats.answer_ask_user(session, prompt_id, answer))
             .await?;
 
         Ok(Response::new(proto::ChatAck {}))
@@ -257,6 +291,44 @@ impl Chat for ChatFacade {
         });
 
         Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))
+    }
+}
+
+fn ask_user_reply(reply: proto::AskUserReply) -> Result<AskUserReply, Status> {
+    use proto::ask_user_reply::Reply;
+
+    match reply
+        .reply
+        .ok_or_else(|| Status::invalid_argument("an ask-user reply carried nothing"))?
+    {
+        Reply::Answered(answered) => Ok(AskUserReply::Answered(
+            answered
+                .answers
+                .into_iter()
+                .map(|answer| AskUserAnswer {
+                    question_id: answer.question_id,
+                    selected: answer.selected,
+                    other: answer.other,
+                    note: answer.note,
+                })
+                .collect(),
+        )),
+        Reply::Discuss(discuss) => Ok(AskUserReply::Discuss {
+            question_id: discuss.question_id,
+            note: discuss.note,
+        }),
+        Reply::Cancelled(_) => Ok(AskUserReply::Cancelled),
+        Reply::Unavailable(unavailable) => Ok(AskUserReply::Unavailable(
+            match unavailable.reason.as_str() {
+                "no_interactive_surface" => AskUserUnavailable::NoInteractiveSurface,
+                "surface_closed" => AskUserUnavailable::SurfaceClosed,
+                _ => {
+                    return Err(Status::invalid_argument(
+                        "unknown ask-user unavailable reason",
+                    ));
+                }
+            },
+        )),
     }
 }
 

@@ -108,6 +108,14 @@ pub(crate) struct DaemonFixture {
 
 impl DaemonFixture {
     pub(crate) fn start(script: Script, settings: CoordinatorSettings) -> Self {
+        Self::start_with_model(script, settings, "gpt-4.1")
+    }
+
+    pub(crate) fn start_with_model(
+        script: Script,
+        settings: CoordinatorSettings,
+        model: &str,
+    ) -> Self {
         let mut settings = settings;
         let root = scratch();
         let checkout = checkout(&root);
@@ -133,7 +141,7 @@ impl DaemonFixture {
                 (
                     config_home.join("config.toml"),
                     format!(
-                        "[provider]\nmodel = \"openai-api/gpt-4.1\"\nbase_url = \"{base_url}\"\n\n\
+                        "[provider]\nmodel = \"openai-api/{model}\"\nbase_url = \"{base_url}\"\n\n\
                          [options]\ndata_dir = \"{}\"\n",
                         data_directory.display()
                     ),

@@ -61,6 +61,9 @@ async fn turn_on(
                     asked.tool
                 );
             }
+            Some(proto::session_event::Event::AskUserAsked(_)) => {
+                panic!("the turn asked the user something nobody scripted");
+            }
             Some(proto::session_event::Event::Closed(_)) | None => return (streamed, None),
         }
     }
@@ -86,7 +89,7 @@ async fn ask(
 
 #[test]
 fn a_prompt_a_client_sent_is_answered_by_a_turn_the_daemon_ran() {
-    let daemon = DaemonFixture::start(script(), daemon_settings());
+    let daemon = DaemonFixture::start_with_model(script(), daemon_settings(), "gpt-5.5");
     let first_media =
         agens_store::ingest_media_bytes(&daemon.data_directory, b"first-image", "image/png")
             .expect("first hosted media is stored");
@@ -111,7 +114,7 @@ fn a_prompt_a_client_sent_is_answered_by_a_turn_the_daemon_ran() {
 
             let opened = chat
                 .open(proto::OpenChatRequest {
-                    checkout,
+                    checkout: checkout.clone(),
                     resume: None,
                 })
                 .await
@@ -125,6 +128,42 @@ fn a_prompt_a_client_sent_is_answered_by_a_turn_the_daemon_ran() {
                 .await
                 .expect("the chat is open")
                 .into_inner();
+
+            let command = chat
+                .command(proto::ChatCommandRequest {
+                    session_id: opened.session_id,
+                    command: "/effort high".to_owned(),
+                })
+                .await
+                .expect("the hosted command executes")
+                .into_inner();
+            assert_eq!(command.message, "Reasoning effort: high.");
+
+            let rejected = chat
+                .command(proto::ChatCommandRequest {
+                    session_id: opened.session_id,
+                    command: "/model moonshotai/kimi-k3".to_owned(),
+                })
+                .await
+                .expect_err("an unauthenticated provider is refused");
+            assert!(
+                rejected.message().contains("unavailable"),
+                "{}",
+                rejected.message()
+            );
+
+            let model = chat
+                .command(proto::ChatCommandRequest {
+                    session_id: opened.session_id,
+                    command: "/model openai-api/gpt-4.1".to_owned(),
+                })
+                .await
+                .expect("the hosted model command executes")
+                .into_inner();
+            assert_eq!(
+                model.message,
+                "Model: gpt-4.1. Reasoning effort reset to Default because high is unsupported."
+            );
 
             chat.prompt(proto::PromptRequest {
                 session_id: opened.session_id,
@@ -178,16 +217,39 @@ fn a_prompt_a_client_sent_is_answered_by_a_turn_the_daemon_ran() {
                     && second.media_id == second_media.id
             ));
 
+            chat.close(proto::ChatRef {
+                session_id: opened.session_id,
+            })
+            .await
+            .expect("the chat closes before resume");
+
+            let reopened = chat
+                .open(proto::OpenChatRequest {
+                    checkout,
+                    resume: Some(opened.session_id),
+                })
+                .await
+                .expect("the hosted chat resumes")
+                .into_inner();
+            assert_eq!(reopened.session_id, opened.session_id);
+
+            let mut events = chat
+                .subscribe(proto::ChatRef {
+                    session_id: reopened.session_id,
+                })
+                .await
+                .expect("the resumed chat is open")
+                .into_inner();
             let second = ask(
                 &mut chat,
-                opened.session_id,
+                reopened.session_id,
                 "which crate is the daemon",
                 &mut events,
             )
             .await;
 
             chat.close(proto::ChatRef {
-                session_id: opened.session_id,
+                session_id: reopened.session_id,
             })
             .await
             .expect("the chat is open");
@@ -222,6 +284,30 @@ fn a_prompt_a_client_sent_is_answered_by_a_turn_the_daemon_ran() {
     let requests = daemon.provider.wait_for_requests(2);
     let second_request = requests[1].body();
 
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.body().contains(r#""model":"gpt-4.1""#)),
+        "the persisted hosted model survives resume: {:?}",
+        requests
+            .iter()
+            .map(|request| request.body())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !requests[0]
+            .body()
+            .contains(r#""reasoning":{"effort":"high"}"#),
+        "changing to an incompatible model resets daemon-owned effort: {}",
+        requests[0].body()
+    );
+
+    let stored = agens_store::SessionStore::open(&daemon.data_directory)
+        .and_then(|store| store.load_session_for_resume(session_id))
+        .expect("the hosted model selection is persisted");
+    assert_eq!(stored.metadata.provider_id.as_deref(), Some("openai-api"));
+    assert_eq!(stored.metadata.model_id.as_deref(), Some("gpt-4.1"));
+    assert_eq!(stored.metadata.reasoning_effort, None);
     assert!(
         second_request.contains("what is this repository"),
         "the second turn carries the first one's history, so the chat is one \
