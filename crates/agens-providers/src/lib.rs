@@ -2709,7 +2709,7 @@ fn queued_user_input(
     messages
         .into_iter()
         .map(|message| {
-            if message.role != Role::User || message.parts.is_empty() {
+            if !matches!(message.role, Role::User | Role::Supervisor) || message.parts.is_empty() {
                 return Err(HeadlessTurnPortError::Provider);
             }
             let content = message
@@ -4414,6 +4414,24 @@ mod tests {
                 &MediaBlobs::new(),
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn queued_supervisor_message_encodes_as_user_input() {
+        assert_eq!(
+            queued_user_input(
+                vec![Message {
+                    role: Role::Supervisor,
+                    parts: vec![MessagePart::Text("the user cancelled the previous turn".into())],
+                }],
+                &MediaBlobs::new(),
+            )
+            .unwrap(),
+            vec![serde_json::json!({
+                "role": "user",
+                "content": [{"type": "input_text", "text": "the user cancelled the previous turn"}],
+            })],
         );
     }
 
