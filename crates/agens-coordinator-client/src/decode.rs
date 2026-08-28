@@ -14,6 +14,7 @@
 
 use std::time::Duration;
 
+use agens_core::ask_user::{AskUserMode, AskUserOption, AskUserQuestion, AskUserRequest};
 use agens_core::{
     IntraTurnInputSource, Message, MessagePart, Role, TurnEvent, TurnRetryReason, TurnState, Usage,
 };
@@ -30,6 +31,10 @@ pub enum HostedChatEvent {
     /// A decision the turn cannot make for itself. The turn is stopped on this
     /// until it is answered, so a client that renders one has to answer it.
     PermissionAsked(PermissionQuestion),
+    AskUserAsked {
+        prompt_id: u64,
+        request: AskUserRequest,
+    },
     TurnCompleted {
         text: String,
     },
@@ -97,8 +102,51 @@ pub(crate) fn session_event(event: proto::SessionEvent) -> Result<HostedChatEven
                 reason: asked.reason,
             }))
         }
+        proto::session_event::Event::AskUserAsked(asked) => Ok(HostedChatEvent::AskUserAsked {
+            prompt_id: asked.prompt_id,
+            request: ask_user_request(asked)?,
+        }),
         proto::session_event::Event::Closed(_) => Ok(HostedChatEvent::Closed),
     }
+}
+
+fn ask_user_request(asked: proto::AskUserAsked) -> Result<AskUserRequest, ClientError> {
+    let questions = asked
+        .questions
+        .into_iter()
+        .map(|question| {
+            let mode = match question.mode.as_str() {
+                "single" => AskUserMode::Single,
+                "multiple" => AskUserMode::Multiple,
+                other => {
+                    return Err(ClientError::Unreadable(format!(
+                        "unknown ask-user mode `{other}`"
+                    )));
+                }
+            };
+            let options = question
+                .options
+                .into_iter()
+                .map(|option| {
+                    AskUserOption::new(option.id, option.label, option.explanation, option.context)
+                })
+                .collect();
+
+            Ok(AskUserQuestion::new(
+                question.id,
+                question.prompt,
+                question.explanation,
+                mode,
+                options,
+                question.allow_other,
+                question.allow_note,
+                question.allow_discuss,
+            ))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    AskUserRequest::new(asked.title, questions)
+        .map_err(|error| ClientError::Unreadable(format!("invalid ask-user request: {error:?}")))
 }
 
 /// One stored message, as the client reads it back.
@@ -242,6 +290,51 @@ fn required<T>(value: Option<T>, subject: &str) -> Result<T, ClientError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_structured_ask_user_event_keeps_the_full_answer_domain() {
+        let event = proto::SessionEvent {
+            session_id: 1,
+            event: Some(proto::session_event::Event::AskUserAsked(
+                proto::AskUserAsked {
+                    prompt_id: 7,
+                    title: Some("Release".to_owned()),
+                    questions: vec![proto::AskUserQuestion {
+                        id: "approval".to_owned(),
+                        prompt: "Choose an outcome".to_owned(),
+                        explanation: Some("This blocks the turn".to_owned()),
+                        mode: "multiple".to_owned(),
+                        options: vec![proto::AskUserOption {
+                            id: "approve".to_owned(),
+                            label: "Approve".to_owned(),
+                            explanation: Some("Continue".to_owned()),
+                            context: Some("Production".to_owned()),
+                        }],
+                        allow_other: true,
+                        allow_note: true,
+                        allow_discuss: true,
+                    }],
+                },
+            )),
+        };
+
+        let HostedChatEvent::AskUserAsked { prompt_id, request } =
+            session_event(event).expect("the structured request decodes")
+        else {
+            panic!("the chat event had the wrong kind");
+        };
+
+        assert_eq!(prompt_id, 7);
+        assert_eq!(request.title(), Some("Release"));
+        let [question] = request.questions() else {
+            panic!("the request lost its question");
+        };
+        assert_eq!(question.mode(), agens_core::ask_user::AskUserMode::Multiple);
+        assert!(question.allow_other());
+        assert!(question.allow_note());
+        assert!(question.allow_discuss());
+        assert_eq!(question.options()[0].context(), Some("Production"));
+    }
 
     #[test]
     fn a_streamed_part_comes_back_as_the_part_the_turn_produced() {

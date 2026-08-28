@@ -15,6 +15,7 @@
 //! run's health is readable through the Feed. It is dropped at the boundary
 //! rather than mapped onto a shape that does not mean it.
 
+use agens_core::ask_user::{AskUserMode, AskUserOption, AskUserQuestion, AskUserRequest};
 use agens_core::{
     IntraTurnInputSource, Message, MessagePart, Role, TurnEvent, TurnRetryReason, TurnState, Usage,
 };
@@ -50,6 +51,9 @@ pub(super) fn session_event(session_id: i64, event: &ChatEvent) -> Option<proto:
                 reason: request.reason.clone(),
             })
         }
+        ChatEvent::AskUserAsked { prompt_id, request } => {
+            proto::session_event::Event::AskUserAsked(ask_user_request(*prompt_id, request))
+        }
         ChatEvent::Closed => proto::session_event::Event::Closed(proto::ChatClosed {}),
     };
 
@@ -57,6 +61,40 @@ pub(super) fn session_event(session_id: i64, event: &ChatEvent) -> Option<proto:
         session_id,
         event: Some(event),
     })
+}
+
+fn ask_user_request(prompt_id: u64, request: &AskUserRequest) -> proto::AskUserAsked {
+    proto::AskUserAsked {
+        prompt_id,
+        title: request.title().map(str::to_owned),
+        questions: request.questions().iter().map(ask_user_question).collect(),
+    }
+}
+
+fn ask_user_question(question: &AskUserQuestion) -> proto::AskUserQuestion {
+    proto::AskUserQuestion {
+        id: question.id().to_owned(),
+        prompt: question.prompt().to_owned(),
+        explanation: question.explanation().map(str::to_owned),
+        mode: match question.mode() {
+            AskUserMode::Single => "single",
+            AskUserMode::Multiple => "multiple",
+        }
+        .to_owned(),
+        options: question.options().iter().map(ask_user_option).collect(),
+        allow_other: question.allow_other(),
+        allow_note: question.allow_note(),
+        allow_discuss: question.allow_discuss(),
+    }
+}
+
+fn ask_user_option(option: &AskUserOption) -> proto::AskUserOption {
+    proto::AskUserOption {
+        id: option.id().to_owned(),
+        label: option.label().to_owned(),
+        explanation: option.explanation().map(str::to_owned),
+        context: option.context().map(str::to_owned),
+    }
 }
 
 /// One stored message, as the wire carries it.

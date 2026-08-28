@@ -475,6 +475,61 @@ message AnswerPermissionRequest {
   string answer = 3;
 }
 
+message AskUserOption {
+  string id = 1;
+  string label = 2;
+  optional string explanation = 3;
+  optional string context = 4;
+}
+
+message AskUserQuestion {
+  string id = 1;
+  string prompt = 2;
+  optional string explanation = 3;
+  // "single" or "multiple".
+  string mode = 4;
+  repeated AskUserOption options = 5;
+  bool allow_other = 6;
+  bool allow_note = 7;
+  bool allow_discuss = 8;
+}
+
+message AskUserAsked {
+  uint64 prompt_id = 1;
+  optional string title = 2;
+  repeated AskUserQuestion questions = 3;
+}
+
+message AskUserAnswer {
+  string question_id = 1;
+  repeated string selected = 2;
+  optional string other = 3;
+  optional string note = 4;
+}
+
+message AskUserAnswered { repeated AskUserAnswer answers = 1; }
+message AskUserDiscuss {
+  string question_id = 1;
+  optional string note = 2;
+}
+message AskUserCancelled {}
+message AskUserUnavailable { string reason = 1; }
+
+message AskUserReply {
+  oneof reply {
+    AskUserAnswered answered = 1;
+    AskUserDiscuss discuss = 2;
+    AskUserCancelled cancelled = 3;
+    AskUserUnavailable unavailable = 4;
+  }
+}
+
+message AnswerAskUserRequest {
+  int64 session_id = 1;
+  uint64 prompt_id = 2;
+  AskUserReply reply = 3;
+}
+
 // The chat has ended and will publish nothing further.
 message ChatClosed {}
 
@@ -487,6 +542,7 @@ message SessionEvent {
     TurnFailed turn_failed = 4;
     ChatClosed closed = 5;
     PermissionAsked permission_asked = 6;
+    AskUserAsked ask_user_asked = 7;
   }
 }
 
@@ -515,6 +571,13 @@ message PromptRequest {
   // Authoritative when non-empty. Empty means the legacy prompt above.
   repeated MessagePart parts = 3;
 }
+
+message ChatCommandRequest {
+  int64 session_id = 1;
+  string command = 2;
+}
+
+message ChatCommandResult { string message = 1; }
 
 // One open chat, named.
 message ChatRef {
@@ -569,6 +632,7 @@ message ChatHistory {
 service Chat {
   rpc Open(OpenChatRequest) returns (ChatHandle);
   rpc Prompt(PromptRequest) returns (ChatAck);
+  rpc Command(ChatCommandRequest) returns (ChatCommandResult);
   // Ends the turn a chat is running and leaves the session open.
   rpc Cancel(ChatRef) returns (ChatAck);
   // Ends the session, letting the turn it may be running finish first.
@@ -582,4 +646,5 @@ service Chat {
   rpc History(ChatRef) returns (ChatHistory);
   // Answers a question the chat's turn is stopped on.
   rpc AnswerPermission(AnswerPermissionRequest) returns (ChatAck);
+  rpc AnswerAskUser(AnswerAskUserRequest) returns (ChatAck);
 }

@@ -57,6 +57,10 @@ struct ScriptedTurns {
 }
 
 impl ChatTurns for ScriptedTurns {
+    fn command(&mut self, command: &str) -> Result<String, agens_server::ChatError> {
+        Ok(format!("executed:{command}"))
+    }
+
     fn run(
         &mut self,
         message: &agens_core::SessionMessage,
@@ -275,6 +279,29 @@ async fn next_event(
         .expect("the stream is healthy")?;
 
     event.event
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_command_over_the_wire_executes_on_the_hosted_chat() {
+    let mut wire = wire("command").await;
+    let handle = wire
+        .client
+        .open(Request::new(open_request("/projects/agens")))
+        .await
+        .expect("the chat opens")
+        .into_inner();
+
+    let result = wire
+        .client
+        .command(Request::new(proto::ChatCommandRequest {
+            session_id: handle.session_id,
+            command: "/effort high".to_owned(),
+        }))
+        .await
+        .expect("the command executes")
+        .into_inner();
+
+    assert_eq!(result.message, "executed:/effort high");
 }
 
 #[tokio::test(flavor = "multi_thread")]

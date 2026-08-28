@@ -85,6 +85,10 @@ struct ScriptedTurns {
 }
 
 impl ChatTurns for ScriptedTurns {
+    fn command(&mut self, command: &str) -> Result<String, agens_server::ChatError> {
+        Ok(format!("executed:{command}"))
+    }
+
     fn run(
         &mut self,
         message: &agens_core::SessionMessage,
@@ -247,6 +251,23 @@ async fn every_event_a_turn_produces_survives_the_round_trip_unchanged() {
         seen,
         every_event(),
         "what the daemon sent and what the client read are the same values"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn qualified_model_command_survives_the_client_round_trip() {
+    let served = served(Vec::new()).await;
+    let mut chat = served.coordinator.chat();
+    let session = chat
+        .open(&PathBuf::from("/projects/agens"), None)
+        .await
+        .expect("the chat opens");
+
+    assert_eq!(
+        chat.command(session, "/model openai-api/gpt-4.1")
+            .await
+            .expect("the hosted command executes"),
+        "executed:/model openai-api/gpt-4.1"
     );
 }
 

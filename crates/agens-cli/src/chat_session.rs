@@ -35,12 +35,14 @@ use agens_core::{
 use agens_headless::{
     HeadlessChatRequest, run_production_headless_chat_with_progress_and_ask_user,
 };
+use agens_models::{ModelSelection, QualifiedModel};
 use agens_permissions::{PermissionPromptAnswer, PermissionPromptContext, PermissionPrompter};
 use agens_server::{
     ChatAsks, ChatError, ChatHistorySource, ChatPermissionAnswer, ChatPermissionRequest,
     ChatSession, ChatSessionFactory, ChatSessionRequest, ChatTurnOutcome, ChatTurns,
     SessionAdmission, SessionBudget, SessionId, SessionProvider, SessionRuntime,
 };
+use agens_session::provider::{bootstrap_authentication, resolve_provider_for_model};
 use agens_store::SessionStore;
 
 /// The factory `agens serve` gives the daemon: how a client's request becomes a
@@ -76,7 +78,10 @@ fn build_chat(
     let checkout = checkout_of(&request.checkout)?;
     let bootstrap = chat_bootstrap(bootstrap, &checkout);
     let session = open_session(&bootstrap, request, &checkout)?;
-    let model = model_of(&bootstrap)?;
+    let (model, request_config) = match restored_selection(&bootstrap, &session)? {
+        Some(selection) => selection,
+        None => (model_of(&bootstrap)?, RequestConfig::default()),
+    };
     let history = resumed_history(&bootstrap, request, session.id);
 
     Ok(ChatSession {
@@ -95,6 +100,7 @@ fn build_chat(
             session,
             model,
             history,
+            request_config,
         }),
     })
 }
@@ -183,6 +189,47 @@ fn open_session(
     Ok(SessionMetadata { id, ..metadata })
 }
 
+fn restored_selection(
+    bootstrap: &Bootstrap,
+    session: &SessionMetadata,
+) -> Result<Option<(String, RequestConfig)>, ChatError> {
+    let (provider, model) = match (&session.provider_id, &session.model_id) {
+        (None, None) => return Ok(None),
+        (Some(provider), Some(model)) => (provider, model),
+        _ => {
+            return Err(ChatError::Unavailable(
+                "the persisted session model selection is incomplete".to_owned(),
+            ));
+        }
+    };
+    let qualified = format!("{provider}/{model}");
+    let resolved =
+        resolve_provider_for_model(Some(&qualified), &bootstrap_authentication(bootstrap))
+            .map_err(|_| {
+                ChatError::Unavailable(
+                    "the persisted session model selection is unavailable".to_owned(),
+                )
+            })?;
+    let mut selection = ModelSelection::for_source(&resolved.model, resolved.provider.source());
+    selection.apply_model(&resolved.model).map_err(|error| {
+        ChatError::Unavailable(format!(
+            "the persisted session model selection is stale: {error}"
+        ))
+    })?;
+
+    if let Some(effort) = session.reasoning_effort {
+        selection
+            .apply_reasoning_effort(effort.as_str())
+            .map_err(|error| {
+                ChatError::Unavailable(format!(
+                    "the persisted session reasoning effort is stale: {error}"
+                ))
+            })?;
+    }
+
+    Ok(Some((qualified, selection.request_config().clone())))
+}
+
 /// The transcript a resumed chat comes back to.
 ///
 /// A history that cannot be read is treated as an empty one: the person is
@@ -227,9 +274,44 @@ struct HostedChat {
     session: SessionMetadata,
     model: String,
     history: Vec<Message>,
+    request_config: RequestConfig,
 }
 
 impl ChatTurns for HostedChat {
+    fn command(&mut self, command: &str) -> Result<String, ChatError> {
+        if let Some(model) = command.strip_prefix("/model ") {
+            return self.select_model(model.trim());
+        }
+
+        let effort = command
+            .strip_prefix("/effort ")
+            .ok_or_else(|| ChatError::Unavailable("unsupported hosted command".to_owned()))?
+            .trim();
+        let resolved = resolve_provider_for_model(
+            Some(&self.model),
+            &bootstrap_authentication(&self.bootstrap),
+        )
+        .map_err(|_| ChatError::Unavailable("the configured provider is unavailable".to_owned()))?;
+        let model = QualifiedModel::parse(&self.model)
+            .map_err(|error| ChatError::Unavailable(error.to_string()))?;
+        let mut selection = ModelSelection::for_source(model.model(), resolved.provider.source());
+        selection
+            .apply_reasoning_effort(effort)
+            .map_err(ChatError::Unavailable)?;
+
+        self.session.provider_id = Some(resolved.provider.identifier().to_owned());
+        self.session.model_id = Some(model.model().to_owned());
+        self.session.reasoning_effort = selection.reasoning_effort_value();
+        self.request_config = selection.request_config().clone();
+        SessionStore::open(self.bootstrap.data_directory())
+            .and_then(|mut store| store.update_session_selection(&self.session))
+            .map_err(|_| {
+                ChatError::Unavailable("session selection could not be saved".to_owned())
+            })?;
+
+        Ok(format!("Reasoning effort: {effort}."))
+    }
+
     fn run(
         &mut self,
         message: &SessionMessage,
@@ -285,6 +367,61 @@ impl ChatTurns for HostedChat {
 }
 
 impl HostedChat {
+    fn select_model(&mut self, requested: &str) -> Result<String, ChatError> {
+        let parsed = QualifiedModel::parse(requested)
+            .map_err(|error| ChatError::Unavailable(error.to_string()))?;
+        if parsed.source().is_none() {
+            return Err(ChatError::Unavailable(
+                "hosted model commands require provider/model".to_owned(),
+            ));
+        }
+
+        let authentication = bootstrap_authentication(&self.bootstrap);
+        let current = resolve_provider_for_model(Some(&self.model), &authentication)
+            .map_err(|_| ChatError::Unavailable("the configured provider is unavailable".into()))?;
+        let resolved = resolve_provider_for_model(Some(requested), &authentication)
+            .map_err(|_| ChatError::Unavailable("the requested provider is unavailable".into()))?;
+        let mut selection = ModelSelection::for_source(&resolved.model, resolved.provider.source());
+        selection
+            .apply_model(&resolved.model)
+            .map_err(ChatError::Unavailable)?;
+
+        let reset_effort = self
+            .session
+            .reasoning_effort
+            .filter(|effort| selection.apply_reasoning_effort(effort.as_str()).is_err());
+        let model = format!("{}/{}", resolved.provider.identifier(), resolved.model);
+        let mut session = self.session.clone();
+        session.provider_id = Some(resolved.provider.identifier().to_owned());
+        session.model_id = Some(resolved.model.clone());
+        session.reasoning_effort = selection.reasoning_effort_value();
+        SessionStore::open(self.bootstrap.data_directory())
+            .and_then(|mut store| store.update_session_selection(&session))
+            .map_err(|_| {
+                ChatError::Unavailable("session selection could not be saved".to_owned())
+            })?;
+
+        self.session = session;
+        self.model = model;
+        self.request_config = selection.request_config().clone();
+
+        let selected = reset_effort.map_or_else(
+            || format!("Model: {}.", resolved.model),
+            |effort| {
+                format!(
+                    "Model: {}. Reasoning effort reset to Default because {} is unsupported.",
+                    resolved.model,
+                    effort.as_str()
+                )
+            },
+        );
+        Ok(if current.provider == resolved.provider {
+            selected
+        } else {
+            format!("Provider: {}. {selected}", resolved.provider.label())
+        })
+    }
+
     /// The turn one prompt becomes.
     fn request_for(&self, message: &SessionMessage) -> Result<HeadlessChatRequest, String> {
         let project_root = self
@@ -332,8 +469,8 @@ impl HostedChat {
             // what the operator did not decide in advance is refused.
             dangerously_allow_all: false,
             dangerous_mode: false,
-            request_config: RequestConfig::default(),
-            session_reasoning_effort: None,
+            request_config: self.request_config.clone(),
+            session_reasoning_effort: self.session.reasoning_effort,
             session: Some(self.session.clone()),
             active_agent: None,
             effective_capabilities: None,
