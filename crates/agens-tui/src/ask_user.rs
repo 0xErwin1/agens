@@ -473,13 +473,25 @@ impl AskUserState {
         self.move_to_question((self.question + 1) % count)
     }
 
+    /// Steps back one question; from review it returns to the last question
+    /// rather than skipping past it.
     fn move_to_previous_question(&mut self) -> AskUserOutcome {
+        if self.reviewing {
+            return self.focus_question(self.question);
+        }
         self.move_to_question(self.question.saturating_sub(1))
     }
 
+    /// Advances one question. Past the last one the next stop is the review
+    /// screen, answered or not — skips are accepted at submit time anyway.
     fn move_to_next_question(&mut self) -> AskUserOutcome {
-        let count = self.request.questions().len();
-        self.move_to_question((self.question + 1).min(count - 1))
+        if self.reviewing {
+            return AskUserOutcome::Unchanged;
+        }
+        if self.is_last_question() {
+            return self.enter_review();
+        }
+        self.move_to_question(self.question + 1)
     }
 
     fn activate_row(&mut self) -> AskUserOutcome {
@@ -492,23 +504,11 @@ impl AskUserState {
         }
         match self.row {
             AskUserRow::Option(index) => {
-                let mode = self.request.questions()[self.question].mode();
-                if self.is_last_question()
-                    && mode == AskUserMode::Single
-                    && self.selections[self.question].contains(&index)
-                {
-                    // Single mode, last question, cursor on the chosen option:
-                    // Enter here cannot change the answer (it is a no-op as a
-                    // selection), so it reads as "move on" and opens review.
-                    // Moving to another option and pressing Enter still corrects
-                    // the selection; multiple mode still accumulates in place.
-                    return self.enter_review();
-                }
-                let selected = self.toggle_or_select(index);
-                if !self.is_last_question() {
-                    return self.move_to_next_question();
-                }
-                selected
+                // Enter answers and carries the interaction forward: the next
+                // question while any remain, review after the last. Multiple
+                // mode accumulates in place with Space before moving on.
+                self.toggle_or_select(index);
+                self.move_to_next_question()
             }
             AskUserRow::Proceed => self.proceed(),
             AskUserRow::Discuss => self.discuss(),
@@ -698,9 +698,6 @@ impl AskUserState {
     fn proceed(&mut self) -> AskUserOutcome {
         if self.reviewing {
             return self.submit();
-        }
-        if self.is_last_question() {
-            return self.enter_review();
         }
         self.move_to_next_question()
     }
