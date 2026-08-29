@@ -20,7 +20,7 @@ use direct::run_direct;
 use models::run_models;
 use serve::run_serve;
 use sessions::run_sessions;
-use team::{run_team_ls, run_team_show};
+use team::{run_team_action, run_team_ls, run_team_show};
 
 pub(crate) fn dispatch(
     parsed: cli::Cli,
@@ -53,6 +53,16 @@ pub(crate) fn dispatch(
             None,
             None,
         ),
+        Some(cli::Command::Team { prompt })
+            if prompt.first().is_some_and(|action| {
+                matches!(
+                    action.as_str(),
+                    "answer" | "permission" | "merge" | "cancel"
+                )
+            }) =>
+        {
+            run_team_action(&prompt, dependencies)
+        }
         Some(cli::Command::Team { prompt })
             if matches!(prompt.as_slice(), [action] if action == "ls")
                 || matches!(prompt.as_slice(), [action, json] if action == "ls" && json == "--json") =>

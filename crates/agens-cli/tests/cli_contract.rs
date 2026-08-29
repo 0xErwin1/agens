@@ -349,7 +349,7 @@ fn team_and_attach_are_first_class_attached_entry_points() {
     assert_eq!(
         team_help,
         success(
-            "enter team mode or inspect the machine fleet\n\nUsage: agens team [PROMPT]...\n\nArguments:\n  [PROMPT]...  An optional first prompt for the attached chat; use `ls [--json]` to inspect the fleet\n\nOptions:\n  -h, --help  Print help\n"
+            "enter team mode or inspect the machine fleet\n\nUsage: agens team [PROMPT]...\n\nArguments:\n  [PROMPT]...  An optional first prompt for the attached chat. Fleet operations are `ls [--json]`, `show <id> [--follow]`, `answer <question-id> <answer>`, `permission <chat-id> <prompt-id> <answer>`, `merge <approval-question-id>`, and `cancel <id>`\n\nOptions:\n  -h, --help  Print help\n"
         )
     );
     assert_eq!(*starts.lock().expect("start count lock"), 1);
@@ -377,6 +377,25 @@ fn team_ls_reports_an_absent_daemon_without_starting_the_tui() {
     );
     assert_eq!(
         execute(["team", "show", "17", "--follow"], &dependencies),
+        success("No daemon is running.\n")
+    );
+    assert_eq!(
+        execute(["team", "answer", "23", "yes"], &dependencies),
+        success("No daemon is running.\n")
+    );
+    assert_eq!(
+        execute(
+            ["team", "permission", "17", "9", "allow_once"],
+            &dependencies,
+        ),
+        success("No daemon is running.\n")
+    );
+    assert_eq!(
+        execute(["team", "merge", "17"], &dependencies),
+        success("No daemon is running.\n")
+    );
+    assert_eq!(
+        execute(["team", "cancel", "17"], &dependencies),
         success("No daemon is running.\n")
     );
 }

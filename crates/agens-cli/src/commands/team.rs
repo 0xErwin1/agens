@@ -6,7 +6,9 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agens_config::TeamSettings;
-use agens_coordinator_client::{ClientError, Coordinator, HostedChatEvent, proto};
+use agens_coordinator_client::{
+    ChatClient, ClientError, Coordinator, FeedClient, HostedChatEvent, proto,
+};
 use agens_core::{Message, MessagePart, Role};
 use agens_error::CliError;
 use agens_store::{QuestionClass, QuestionStore, SessionStore};
@@ -163,6 +165,184 @@ enum ShowTarget {
     Chat(i64),
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum TeamAction {
+    Answer {
+        question_id: i64,
+        answer: String,
+    },
+    Permission {
+        session_id: i64,
+        prompt_id: u64,
+        answer: String,
+    },
+    Merge {
+        question_id: i64,
+    },
+    Cancel {
+        id: i64,
+    },
+}
+
+pub(crate) fn run_team_action(
+    arguments: &[String],
+    dependencies: &CliDependencies,
+) -> Result<String, CliError> {
+    let action = parse_action(arguments)?;
+    let bootstrap = bootstrap(dependencies)?;
+    let socket = agens_server::socket_path(bootstrap.data_directory());
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| {
+            CliError::unavailable(format!("the fleet action is unavailable: {error}"))
+        })?;
+
+    runtime.block_on(async {
+        let coordinator = match Coordinator::attach(&socket).await {
+            Ok(coordinator) => coordinator,
+            Err(ClientError::NotRunning(_)) => return Ok(no_daemon(false)),
+            Err(error) => return Err(client_error(error)),
+        };
+
+        match action {
+            TeamAction::Answer {
+                question_id,
+                answer,
+            } => {
+                let mut team = coordinator.team();
+                let answered = team
+                    .answer_question(question_id, &answer)
+                    .await
+                    .map_err(client_error)?;
+                Ok(format!(
+                    "Answered question {question_id} for run {}.\n",
+                    answered.run_id
+                ))
+            }
+            TeamAction::Permission {
+                session_id,
+                prompt_id,
+                answer,
+            } => {
+                coordinator
+                    .chat()
+                    .answer_question(session_id, prompt_id, &answer)
+                    .await
+                    .map_err(client_error)?;
+                Ok(format!(
+                    "Answered prompt {prompt_id} for chat {session_id}.\n"
+                ))
+            }
+            TeamAction::Merge { question_id } => {
+                let authorized = coordinator
+                    .team()
+                    .authorize_merge(proto::AuthorizeMergeRequest {
+                        subject: Some(proto::authorize_merge_request::Subject::QuestionId(
+                            question_id,
+                        )),
+                        answer: "merge".to_owned(),
+                        expires_at: None,
+                    })
+                    .await
+                    .map_err(client_error)?;
+                Ok(format!(
+                    "Authorized merge for run {} with question {}.\n",
+                    authorized.run_id, authorized.question_id
+                ))
+            }
+            TeamAction::Cancel { id } => {
+                let roots = TeamSettings::from(bootstrap.settings())
+                    .project_roots
+                    .into_iter()
+                    .collect::<BTreeSet<_>>();
+                let worktrees = SessionWorktrees::new(bootstrap.data_directory());
+                let mut feed = coordinator.feed();
+                let mut chat = coordinator.chat();
+
+                match locate_target(id, &roots, &worktrees, &mut feed, &mut chat).await? {
+                    ShowTarget::Run(run_id) => {
+                        coordinator
+                            .team()
+                            .cancel_run(run_id)
+                            .await
+                            .map_err(client_error)?;
+                        Ok(format!("Cancelled run {run_id}.\n"))
+                    }
+                    ShowTarget::Chat(session_id) => {
+                        chat.cancel(session_id).await.map_err(client_error)?;
+                        Ok(format!("Cancelled chat {session_id}.\n"))
+                    }
+                }
+            }
+        }
+    })
+}
+
+fn parse_action(arguments: &[String]) -> Result<TeamAction, CliError> {
+    match arguments {
+        [action, question_id, answer] if action == "answer" => Ok(TeamAction::Answer {
+            question_id: positive_i64(question_id, "team answer requires a positive question id")?,
+            answer: nonempty_answer(answer)?,
+        }),
+        [action, session_id, prompt_id, answer] if action == "permission" => {
+            Ok(TeamAction::Permission {
+                session_id: positive_i64(
+                    session_id,
+                    "team permission requires a positive chat id",
+                )?,
+                prompt_id: positive_u64(
+                    prompt_id,
+                    "team permission requires a positive prompt id",
+                )?,
+                answer: nonempty_answer(answer)?,
+            })
+        }
+        [action, run_id] if action == "merge" => Ok(TeamAction::Merge {
+            question_id: positive_i64(
+                run_id,
+                "team merge requires a positive approval question id",
+            )?,
+        }),
+        [action, id] if action == "cancel" => Ok(TeamAction::Cancel {
+            id: positive_i64(id, "team cancel requires a positive run or chat id")?,
+        }),
+        [action, ..]
+            if matches!(
+                action.as_str(),
+                "answer" | "permission" | "merge" | "cancel"
+            ) =>
+        {
+            Err(CliError::usage(format!("invalid team {action} arguments")))
+        }
+        _ => Err(CliError::usage("unknown team action")),
+    }
+}
+
+fn nonempty_answer(answer: &str) -> Result<String, CliError> {
+    if answer.trim().is_empty() {
+        return Err(CliError::usage("team answers cannot be empty"));
+    }
+
+    Ok(answer.to_owned())
+}
+
+fn positive_i64(value: &str, message: &'static str) -> Result<i64, CliError> {
+    value
+        .parse::<i64>()
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| CliError::usage(message))
+}
+
+fn positive_u64(value: &str, message: &'static str) -> Result<u64, CliError> {
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| CliError::usage(message))
+}
+
 pub(crate) fn run_team_show(
     id: &str,
     follow: bool,
@@ -188,34 +368,12 @@ pub(crate) fn run_team_show(
             .into_iter()
             .collect::<BTreeSet<_>>();
         let worktrees = SessionWorktrees::new(bootstrap.data_directory());
-        let numeric_id = id
-            .parse::<i64>()
-            .ok()
-            .filter(|id| *id > 0)
-            .ok_or_else(|| CliError::usage("team show requires a positive numeric id"))?;
+        let numeric_id = positive_i64(id, "team show requires a positive numeric id")?;
         let mut feed = coordinator.feed();
         let mut chat = coordinator.chat();
-        let mut run_found = false;
-        let mut chat_found = false;
+        let target = locate_target(numeric_id, &roots, &worktrees, &mut feed, &mut chat).await?;
 
-        for root in roots {
-            let repo_id = repository_id(&worktrees, &root)?;
-            run_found |= feed
-                .tree(&repo_id)
-                .await
-                .map_err(client_error)?
-                .runs
-                .iter()
-                .any(|run| run.run_id == numeric_id);
-            chat_found |= chat
-                .open_against(&root)
-                .await
-                .map_err(client_error)?
-                .iter()
-                .any(|open| open.session_id == numeric_id);
-        }
-
-        match resolve_show_target(id, run_found, chat_found)? {
+        match target {
             ShowTarget::Run(run_id) => {
                 let detail = feed.run_detail(run_id).await.map_err(client_error)?;
                 let output = render_run_detail(&detail)?;
@@ -250,6 +408,36 @@ pub(crate) fn run_team_show(
 
         Ok(String::new())
     })
+}
+
+async fn locate_target(
+    id: i64,
+    roots: &BTreeSet<std::path::PathBuf>,
+    worktrees: &SessionWorktrees,
+    feed: &mut FeedClient,
+    chat: &mut ChatClient,
+) -> Result<ShowTarget, CliError> {
+    let mut run_found = false;
+    let mut chat_found = false;
+
+    for root in roots {
+        let repo_id = repository_id(worktrees, root)?;
+        run_found |= feed
+            .tree(&repo_id)
+            .await
+            .map_err(client_error)?
+            .runs
+            .iter()
+            .any(|run| run.run_id == id);
+        chat_found |= chat
+            .open_against(root)
+            .await
+            .map_err(client_error)?
+            .iter()
+            .any(|open| open.session_id == id);
+    }
+
+    resolve_show_target(&id.to_string(), run_found, chat_found)
 }
 
 fn resolve_show_target(
@@ -466,8 +654,31 @@ mod tests {
     use agens_core::{Message, MessagePart, Role};
 
     use super::{
-        FleetItem, FleetView, ShowTarget, render, render_chat_history, resolve_show_target,
+        FleetItem, FleetView, ShowTarget, TeamAction, parse_action, render, render_chat_history,
+        resolve_show_target,
     };
+
+    #[test]
+    fn action_parser_preserves_answer_domains_and_rejects_empty_answers() {
+        let arguments = ["permission", "17", "9", "allow_once"]
+            .map(str::to_owned)
+            .to_vec();
+
+        assert_eq!(
+            parse_action(&arguments).unwrap(),
+            TeamAction::Permission {
+                session_id: 17,
+                prompt_id: 9,
+                answer: "allow_once".to_owned(),
+            }
+        );
+        assert!(
+            parse_action(&["answer", "23", " "].map(str::to_owned))
+                .unwrap_err()
+                .to_string()
+                .contains("cannot be empty")
+        );
+    }
 
     #[test]
     fn fleet_rows_keep_machine_readable_waiting_and_activity_facts() {
