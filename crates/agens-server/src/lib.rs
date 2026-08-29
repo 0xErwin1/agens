@@ -75,10 +75,10 @@ pub use diagnostics::CoordinatorDiagnostics;
 pub use fsm::{
     AppliedQuestionTransition, AppliedRunTransition, AppliedTransition, AppliedWorktreeTransition,
     MergeSettlement, Principal, QUESTION_TRANSITIONS, QuestionEffect, QuestionFacts, QuestionGuard,
-    QuestionTransition, QuestionTrigger, RUN_TRANSITIONS, RunEffect, RunFacts, RunGuard,
-    RunTransition, RunTrigger, SettledMerge, StateMachines, TransitionOutcome, TransitionRejection,
-    WORKTREE_HOLDING_RUN_STATES, WORKTREE_TRANSITIONS, WorktreeEffect, WorktreeFacts,
-    WorktreeGuard, WorktreeTransition, WorktreeTrigger,
+    QuestionTransition, QuestionTrigger, RUN_RESULT_MAX_BYTES, RUN_TRANSITIONS, RunEffect,
+    RunFacts, RunGuard, RunTransition, RunTrigger, SettledMerge, StateMachines, TransitionOutcome,
+    TransitionRejection, WORKTREE_HOLDING_RUN_STATES, WORKTREE_TRANSITIONS, WorktreeEffect,
+    WorktreeFacts, WorktreeGuard, WorktreeTransition, WorktreeTrigger,
 };
 pub use gates::{
     DisposeVerdict, GateError, GateRefusal, Gates, MergePath, PreMergeRequest, PreMergeVerdict,

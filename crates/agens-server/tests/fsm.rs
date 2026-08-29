@@ -12,9 +12,9 @@ use std::{
 
 use agens_server::{
     Principal, QUESTION_TRANSITIONS, QuestionFacts, QuestionGuard, QuestionTransition,
-    QuestionTrigger, RUN_TRANSITIONS, RunEffect, RunFacts, RunGuard, RunTransition, RunTrigger,
-    StateMachines, TransitionOutcome, TransitionRejection, WORKTREE_TRANSITIONS, WorktreeFacts,
-    WorktreeGuard, WorktreeTransition, WorktreeTrigger,
+    QuestionTrigger, RUN_RESULT_MAX_BYTES, RUN_TRANSITIONS, RunEffect, RunFacts, RunGuard,
+    RunTransition, RunTrigger, StateMachines, TransitionOutcome, TransitionRejection,
+    WORKTREE_TRANSITIONS, WorktreeFacts, WorktreeGuard, WorktreeTransition, WorktreeTrigger,
 };
 use agens_store::{
     AttemptOutcome, AttemptRow, ControlPlaneStore, ProviderRow, QuestionAuthor, QuestionKind,
@@ -1625,6 +1625,173 @@ fn a_run_that_only_ever_parked_keeps_its_whole_retry_budget() {
         },
     );
     assert!(retried.is_ok(), "{:?}", retried.err());
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn finishing_records_the_turns_last_message_as_the_runs_result() {
+    let directory = data_directory();
+    let mut store = ControlPlaneStore::open(&directory).unwrap();
+    let run_id = store
+        .insert_run(&run_in(RunState::Running, Some(WorktreeStatus::Active)))
+        .unwrap();
+    store
+        .insert_attempt(&open_attempt(run_id, NOW - 90))
+        .unwrap();
+    let mut machines = StateMachines::new(store);
+
+    machines
+        .apply_run(
+            run_id,
+            RunTrigger::Finished,
+            &RunFacts {
+                now: NOW,
+                result: Some("the definition of done is met".to_owned()),
+                ..RunFacts::default()
+            },
+        )
+        .unwrap();
+
+    assert_eq!(
+        machines
+            .store()
+            .load_run(run_id)
+            .unwrap()
+            .unwrap()
+            .result
+            .as_deref(),
+        Some("the definition of done is met")
+    );
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn a_failing_turn_records_no_result_even_when_one_travels_with_the_facts() {
+    let directory = data_directory();
+    let mut store = ControlPlaneStore::open(&directory).unwrap();
+    let run_id = store
+        .insert_run(&run_in(RunState::Running, Some(WorktreeStatus::Active)))
+        .unwrap();
+    store
+        .insert_attempt(&open_attempt(run_id, NOW - 90))
+        .unwrap();
+    let mut machines = StateMachines::new(store);
+
+    machines
+        .apply_run(
+            run_id,
+            RunTrigger::AttemptFailed,
+            &RunFacts {
+                now: NOW,
+                result: Some("a claim the failed leg does not get to make".to_owned()),
+                ..RunFacts::default()
+            },
+        )
+        .unwrap();
+
+    assert_eq!(
+        machines.store().load_run(run_id).unwrap().unwrap().result,
+        None
+    );
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn an_oversized_result_is_cut_at_the_bound_on_a_character_boundary() {
+    let directory = data_directory();
+    let mut store = ControlPlaneStore::open(&directory).unwrap();
+    let run_id = store
+        .insert_run(&run_in(RunState::Running, Some(WorktreeStatus::Active)))
+        .unwrap();
+    store
+        .insert_attempt(&open_attempt(run_id, NOW - 90))
+        .unwrap();
+    let mut machines = StateMachines::new(store);
+
+    // Two-byte characters, so the byte bound falls inside one of them and the
+    // cut has to step back to the boundary rather than split it.
+    let oversized = "é".repeat(RUN_RESULT_MAX_BYTES / 2 + 8);
+    machines
+        .apply_run(
+            run_id,
+            RunTrigger::Finished,
+            &RunFacts {
+                now: NOW,
+                result: Some(oversized.clone()),
+                ..RunFacts::default()
+            },
+        )
+        .unwrap();
+
+    let result = machines
+        .store()
+        .load_run(run_id)
+        .unwrap()
+        .unwrap()
+        .result
+        .expect("the finish recorded a result");
+
+    assert!(result.len() <= RUN_RESULT_MAX_BYTES);
+    assert!(oversized.starts_with(&result));
+    assert!(result.len() > RUN_RESULT_MAX_BYTES - 2);
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn the_ask_domain_event_names_the_question_it_opened() {
+    let directory = data_directory();
+    let mut store = ControlPlaneStore::open(&directory).unwrap();
+    let run_id = store
+        .insert_run(&run_in(RunState::Running, Some(WorktreeStatus::Active)))
+        .unwrap();
+    store
+        .insert_attempt(&open_attempt(run_id, NOW - 90))
+        .unwrap();
+    let mut machines = StateMachines::new(store);
+
+    let outcome = machines
+        .apply_run(
+            run_id,
+            RunTrigger::Ask,
+            &RunFacts {
+                now: NOW,
+                opened_question: Some(question_in(
+                    run_id,
+                    QuestionKind::Question,
+                    QuestionState::Open,
+                    None,
+                )),
+                ..RunFacts::default()
+            },
+        )
+        .unwrap();
+    let opened = outcome
+        .applied()
+        .and_then(|applied| applied.opened_question_id)
+        .expect("the ask opened a question");
+
+    let event = machines
+        .store()
+        .events_for_run(run_id)
+        .unwrap()
+        .into_iter()
+        .find(|event| event.event_type == "run_awaiting_input")
+        .expect("the ask journaled its domain event");
+    let payload: serde_json::Value = serde_json::from_str(&event.payload).unwrap();
+
+    assert_eq!(
+        payload.get("opened_question_id").and_then(|id| id.as_i64()),
+        Some(opened)
+    );
+    assert_eq!(
+        payload.get("question_id"),
+        Some(&serde_json::Value::Null),
+        "the answered-question field stays what it was: nothing was answered here"
+    );
 
     fs::remove_dir_all(directory).unwrap();
 }

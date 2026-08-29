@@ -685,6 +685,43 @@ fn a_stored_checkpoint_row_reaches_ingest_through_the_claim_interface() {
     harness.finish();
 }
 
+#[test]
+fn a_turns_tokens_are_charged_to_the_runs_open_attempt() {
+    let mut harness = Harness::open();
+    let run_id = harness.seed_run();
+
+    harness.accept(run_id, 1, IngestFact::TurnStarted);
+    harness.accept(run_id, 1, IngestFact::TurnEnded { tokens: 900 });
+    harness.accept(run_id, 2, IngestFact::TurnStarted);
+    harness.accept(run_id, 2, IngestFact::TurnEnded { tokens: 350 });
+
+    let attempts = harness.ingest_store_mut().attempts_for_run(run_id).unwrap();
+    let attempt = attempts.first().expect("the seeded attempt exists");
+
+    assert_eq!(attempt.tokens, Some(1_250));
+
+    harness.finish();
+}
+
+#[test]
+fn a_turn_that_reported_no_tokens_charges_the_attempt_nothing() {
+    let mut harness = Harness::open();
+    let run_id = harness.seed_run();
+
+    harness.accept(run_id, 1, IngestFact::TurnStarted);
+    harness.accept(run_id, 1, IngestFact::TurnEnded { tokens: 0 });
+
+    let attempts = harness.ingest_store_mut().attempts_for_run(run_id).unwrap();
+    let attempt = attempts.first().expect("the seeded attempt exists");
+
+    assert_eq!(
+        attempt.tokens, None,
+        "an attempt nothing was charged to stays unreported rather than zero"
+    );
+
+    harness.finish();
+}
+
 struct Harness {
     directory: std::path::PathBuf,
     ingest: Ingest,
