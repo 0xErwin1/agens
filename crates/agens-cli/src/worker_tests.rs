@@ -33,7 +33,8 @@ use agens_store::{AttemptOutcome, ControlPlaneStore, QuotaState};
 use tonic::transport::Channel;
 
 use crate::daemon_fixture::{
-    DaemonFixture, PATIENCE, await_reported_state, connect, daemon_settings, journal_of,
+    DaemonFixture, PATIENCE, await_journal_event, await_reported_state, connect, daemon_settings,
+    journal_of,
 };
 
 const ANSWER: &str = "split";
@@ -485,7 +486,10 @@ fn a_provider_that_refuses_for_quota_parks_the_run_and_the_wheel_brings_it_back(
             .await
             .expect("the user may approve a proposed run");
 
-            let parked = await_reported_state(&mut feed, created.run_id, "awaiting_quota").await;
+            // Observed through the journal rather than the state: the park
+            // lasts one second, and a state poll under CI load can arrive
+            // after the wheel has already brought the run back.
+            let parked = await_journal_event(&mut feed, created.run_id, "quota_reached").await;
             let findings = findings_of(&mut feed, created.run_id).await;
             let inbox = feed
                 .inbox(proto::InboxRequest {
@@ -517,9 +521,17 @@ fn a_provider_that_refuses_for_quota_parks_the_run_and_the_wheel_brings_it_back(
         client.join().expect("the client thread finishes");
 
     assert!(report.is_clean(), "every session ended: {report:?}");
-    assert_eq!(
-        parked, "awaiting_quota",
-        "the provider's refusal parks the run instead of failing it, journal: {journal:?}"
+    assert!(
+        parked.contains(&"quota_reached".to_owned()),
+        "the provider's refusal parks the run instead of failing it, journal: {parked:?}"
+    );
+    assert!(
+        journal
+            .iter()
+            .position(|event| event == "quota_reached")
+            .zip(journal.iter().position(|event| event == "quota_reset"))
+            .is_some_and(|(reached, reset)| reached < reset),
+        "the reset lifts a park that was already recorded, journal: {journal:?}"
     );
     assert_eq!(
         findings,

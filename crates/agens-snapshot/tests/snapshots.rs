@@ -22,14 +22,22 @@ struct Project {
 }
 
 impl Project {
+    /// Builds a root no other test can reach. The counter is what separates
+    /// two tests inside this process: the wall clock alone has collided in CI,
+    /// where two threads read the same nanosecond and then raced each other
+    /// over one `.git/config`. The clock still separates this run from a stale
+    /// root a killed run with a recycled pid left behind.
     fn new() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
         let root = std::env::temp_dir().join(format!(
-            "agens-snapshot-{}-{}",
+            "agens-snapshot-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("the fixture clock is after the epoch")
-                .as_nanos()
+                .as_nanos(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         let worktree = root.join("project");
         let data = root.join("data");
