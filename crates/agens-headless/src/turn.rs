@@ -125,6 +125,35 @@ pub struct RunExecution {
 pub type PermissionPrompterFactory =
     Box<dyn FnOnce(DirectiveTarget) -> Box<dyn PermissionPrompter> + Send>;
 
+/// The inbox a turn actually reads: the durable directive queue, then the
+/// caller's in-process steering channel when it installed one.
+///
+/// The durable queue drains first because its rows were addressed before the
+/// process accepted the steer — an `agens direct` message already waiting must
+/// not be overtaken by one typed a moment ago.
+struct SteeredDirectiveInbox {
+    directives: DirectiveInbox,
+    steering: Option<agens_core::IntraTurnSteeringQueue>,
+}
+
+impl agens_core::HeadlessIntraTurnInbox for SteeredDirectiveInbox {
+    fn drain(
+        &mut self,
+    ) -> impl std::future::Future<
+        Output = Result<Vec<agens_core::PendingIntraTurnInput>, agens_core::HeadlessTurnPortError>,
+    > + Send {
+        async move {
+            let mut inputs = agens_core::HeadlessIntraTurnInbox::drain(&mut self.directives).await?;
+
+            if let Some(steering) = self.steering.as_mut() {
+                inputs.extend(agens_core::HeadlessIntraTurnInbox::drain(steering).await?);
+            }
+
+            Ok(inputs)
+        }
+    }
+}
+
 struct HeadlessProviderContext<'a> {
     bootstrap: &'a Bootstrap,
     /// The provider this turn resolved from its own model, rather than a
@@ -140,6 +169,9 @@ struct HeadlessProviderContext<'a> {
     failure_detail: ProviderFailureDetail,
     /// The run this turn is executing, when it is executing one.
     run: Option<&'a RunExecution>,
+    /// The in-process steering channel of the surface driving this turn,
+    /// drained at the same safe points as the durable directive queue.
+    steering: Option<agens_core::IntraTurnSteeringQueue>,
 }
 
 /// The provider this turn speaks to, chosen by the model it was given.
@@ -217,6 +249,35 @@ pub fn run_production_headless_chat_with_progress_and_ask_user(
     )
 }
 
+/// The same turn, with an in-process steering channel the driving surface can
+/// write into while the turn runs. The channel is drained at the turn's safe
+/// points alongside the durable directive queue, so a steered message reaches
+/// the provider before its next request and is recorded as intra-turn input.
+#[allow(clippy::too_many_arguments)]
+pub fn run_production_headless_chat_with_progress_and_steering(
+    request: HeadlessChatRequest,
+    bootstrap: &Bootstrap,
+    cancellation: &HeadlessTurnCancellation,
+    progress: Option<&TurnProgressSink>,
+    prompter_factory: PermissionPrompterFactory,
+    task_runtime: Option<&ProductionTuiTaskRuntime>,
+    operation_reference: Option<&str>,
+    steering: agens_core::IntraTurnSteeringQueue,
+) -> Result<HeadlessChatCompletion, HeadlessChatFailure> {
+    run_production_headless_chat_executing_run_with_steering(
+        request,
+        bootstrap,
+        cancellation,
+        progress,
+        prompter_factory,
+        task_runtime,
+        operation_reference,
+        None,
+        None,
+        Some(steering),
+    )
+}
+
 /// The same turn, for a session executing a coordinator run.
 ///
 /// Kept as a separate entry point rather than a field on the request: the
@@ -224,6 +285,32 @@ pub fn run_production_headless_chat_with_progress_and_ask_user(
 /// a comparable, cloneable value that a retry boundary copies.
 #[allow(clippy::too_many_arguments)]
 pub fn run_production_headless_chat_executing_run(
+    request: HeadlessChatRequest,
+    bootstrap: &Bootstrap,
+    cancellation: &HeadlessTurnCancellation,
+    progress: Option<&TurnProgressSink>,
+    prompter_factory: PermissionPrompterFactory,
+    task_runtime: Option<&ProductionTuiTaskRuntime>,
+    operation_reference: Option<&str>,
+    ask_user: Option<Box<dyn agens_core::ask_user::AskUserPort>>,
+    run: Option<&RunExecution>,
+) -> Result<HeadlessChatCompletion, HeadlessChatFailure> {
+    run_production_headless_chat_executing_run_with_steering(
+        request,
+        bootstrap,
+        cancellation,
+        progress,
+        prompter_factory,
+        task_runtime,
+        operation_reference,
+        ask_user,
+        run,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_production_headless_chat_executing_run_with_steering(
     mut request: HeadlessChatRequest,
     bootstrap: &Bootstrap,
     cancellation: &HeadlessTurnCancellation,
@@ -233,6 +320,7 @@ pub fn run_production_headless_chat_executing_run(
     operation_reference: Option<&str>,
     ask_user: Option<Box<dyn agens_core::ask_user::AskUserPort>>,
     run: Option<&RunExecution>,
+    steering: Option<agens_core::IntraTurnSteeringQueue>,
 ) -> Result<HeadlessChatCompletion, HeadlessChatFailure> {
     agens_callcount::note_provider_runtime_build();
 
@@ -323,6 +411,7 @@ pub fn run_production_headless_chat_executing_run(
                     include_system_prompt: true,
                     failure_detail: failure_detail.clone(),
                     run,
+                    steering: steering.clone(),
                 },
                 move |model, messages, tools, request_config, media_blobs| {
                     build_openai_provider_with_media(
@@ -368,6 +457,7 @@ pub fn run_production_headless_chat_executing_run(
                     include_system_prompt: true,
                     failure_detail: failure_detail.clone(),
                     run,
+                    steering: steering.clone(),
                 },
                 move |model, messages, tools, request_config, media_blobs| {
                     MoonshotProvider::from_api_key_with_messages_and_tools_and_timeout(
@@ -418,6 +508,7 @@ pub fn run_production_headless_chat_executing_run(
                     include_system_prompt: false,
                     failure_detail: failure_detail.clone(),
                     run,
+                    steering: steering.clone(),
                 },
                 move |model, messages, tools, request_config, media_blobs| {
                     build_chatgpt_provider_with_media(
@@ -1387,10 +1478,13 @@ where
             cancellation_result(context.cancellation)?;
             // The queue is scoped to this session, so the turn only ever
             // collects what was addressed to it.
-            let mut inbox = DirectiveInbox::for_target(
-                context.bootstrap.data_directory(),
-                mailbox_of(context.run, attempt_key.session_id()),
-            );
+            let mut inbox = SteeredDirectiveInbox {
+                directives: DirectiveInbox::for_target(
+                    context.bootstrap.data_directory(),
+                    mailbox_of(context.run, attempt_key.session_id()),
+                ),
+                steering: context.steering.clone(),
+            };
             let max_iterations =
                 effective_max_iterations(request.max_iterations, context.bootstrap.max_iterations);
             let summary_media_blobs = media_blobs.clone();
@@ -1530,8 +1624,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        PartialTurnRecorder, attach_recorded_failure_detail, build_chatgpt_provider_with_media,
-        build_openai_provider_with_media, mcp_failure_notice_lines,
+        PartialTurnRecorder, SteeredDirectiveInbox, attach_recorded_failure_detail,
+        build_chatgpt_provider_with_media, build_openai_provider_with_media,
+        mcp_failure_notice_lines,
     };
     use agens_core::{HeadlessTurnError, Message, MessagePart, Role, TurnEvent};
     use agens_providers::{MediaBlobs, ProviderFailureDetail};
@@ -2004,5 +2099,83 @@ mod tests {
         let status = McpStatusHandle::default();
 
         assert!(mcp_failure_notice_lines(&status).is_empty());
+    }
+
+    struct Temporary {
+        path: std::path::PathBuf,
+    }
+
+    impl Temporary {
+        fn new(label: &str) -> Self {
+            let path = std::env::temp_dir()
+                .join(format!("agens-steered-inbox-{label}-{}", std::process::id()));
+            std::fs::remove_dir_all(&path).ok();
+            std::fs::create_dir_all(&path).expect("test data directory");
+            Self { path }
+        }
+    }
+
+    impl Drop for Temporary {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.path).ok();
+        }
+    }
+
+    fn block_on_ready<T>(future: impl std::future::Future<Output = T>) -> T {
+        let mut future = std::pin::pin!(future);
+        let context = &mut std::task::Context::from_waker(std::task::Waker::noop());
+
+        match future.as_mut().poll(context) {
+            std::task::Poll::Ready(value) => value,
+            std::task::Poll::Pending => panic!("inbox drains must complete immediately"),
+        }
+    }
+
+    #[test]
+    fn a_steered_inbox_delivers_durable_directives_before_in_process_steers() {
+        use agens_core::{HeadlessIntraTurnInbox, IntraTurnInputSource, IntraTurnSteeringQueue};
+        use agens_store::{DirectiveGrain, DirectiveInbox, DirectiveStore, DirectiveTarget};
+
+        let temporary = Temporary::new("order");
+        let target = DirectiveTarget::Session(7);
+        DirectiveStore::open(&temporary.path)
+            .expect("the queue opens")
+            .enqueue(
+                &target,
+                IntraTurnInputSource::Supervisor,
+                DirectiveGrain::ToolCall,
+                "directive",
+            )
+            .expect("the directive queues");
+
+        let steering = IntraTurnSteeringQueue::default();
+        steering.push(1, IntraTurnInputSource::Human, "steer".into());
+        let mut inbox = SteeredDirectiveInbox {
+            directives: DirectiveInbox::for_target(&temporary.path, target),
+            steering: Some(steering),
+        };
+
+        let drained = block_on_ready(inbox.drain()).expect("both channels drain");
+        let texts = drained
+            .iter()
+            .map(|input| input.text.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(texts, ["directive", "steer"]);
+    }
+
+    #[test]
+    fn a_steered_inbox_without_a_channel_drains_only_the_durable_queue() {
+        use agens_core::HeadlessIntraTurnInbox;
+        use agens_store::{DirectiveInbox, DirectiveTarget};
+
+        let temporary = Temporary::new("no-channel");
+        let mut inbox = SteeredDirectiveInbox {
+            directives: DirectiveInbox::for_target(&temporary.path, DirectiveTarget::Session(7)),
+            steering: None,
+        };
+
+        let drained = block_on_ready(inbox.drain()).expect("the empty queue drains");
+        assert!(drained.is_empty());
     }
 }
