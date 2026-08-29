@@ -246,6 +246,27 @@ fn rejects_a_question_explanation_over_the_bound() {
     );
 }
 
+/// A question explanation carries the whole reason a turn stopped, and the
+/// consent envelopes that stop turns in practice run well past a paragraph.
+/// The bound is therefore the same one an option's context gets: wide enough
+/// that a real explanation reaches the reader intact.
+#[test]
+fn accepts_a_question_explanation_of_two_thousand_characters() {
+    let explanation = "e".repeat(2_000);
+    let question = AskUserQuestion::new(
+        "plan",
+        "Which do you prefer?",
+        Some(explanation),
+        AskUserMode::Single,
+        vec![option("a", "A"), option("b", "B")],
+        false,
+        false,
+        false,
+    );
+
+    assert!(AskUserRequest::new(None, vec![question]).is_ok());
+}
+
 #[test]
 fn rejects_an_option_label_over_the_bound() {
     let label = "l".repeat(MAX_ASK_USER_LABEL_CHARS + 1);

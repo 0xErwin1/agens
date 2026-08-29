@@ -4423,7 +4423,9 @@ mod tests {
             queued_user_input(
                 vec![Message {
                     role: Role::Supervisor,
-                    parts: vec![MessagePart::Text("the user cancelled the previous turn".into())],
+                    parts: vec![MessagePart::Text(
+                        "the user cancelled the previous turn".into()
+                    )],
                 }],
                 &MediaBlobs::new(),
             )
