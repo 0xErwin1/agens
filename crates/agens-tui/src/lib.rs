@@ -9192,9 +9192,8 @@ where
             }
             TurnEvent::StateChanged(state) => self.turn_state = Some(state),
             TurnEvent::IntraTurnInput { source, text } => {
-                let _ = self
-                    .scheduler
-                    .reduce(AppEvent::SteeringDelivered { text: text.clone() });
+                let delivered = AppEvent::SteeringDelivered { text: text.clone() };
+                let _ = self.scheduler.reduce(delivered);
                 match source {
                     IntraTurnInputSource::Human => {
                         self.transcript.push(TranscriptEntry::User(text.clone()));
