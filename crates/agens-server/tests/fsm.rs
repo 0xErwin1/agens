@@ -1740,3 +1740,58 @@ fn an_oversized_result_is_cut_at_the_bound_on_a_character_boundary() {
 
     fs::remove_dir_all(directory).unwrap();
 }
+
+#[test]
+fn the_ask_domain_event_names_the_question_it_opened() {
+    let directory = data_directory();
+    let mut store = ControlPlaneStore::open(&directory).unwrap();
+    let run_id = store
+        .insert_run(&run_in(RunState::Running, Some(WorktreeStatus::Active)))
+        .unwrap();
+    store
+        .insert_attempt(&open_attempt(run_id, NOW - 90))
+        .unwrap();
+    let mut machines = StateMachines::new(store);
+
+    let outcome = machines
+        .apply_run(
+            run_id,
+            RunTrigger::Ask,
+            &RunFacts {
+                now: NOW,
+                opened_question: Some(question_in(
+                    run_id,
+                    QuestionKind::Question,
+                    QuestionState::Open,
+                    None,
+                )),
+                ..RunFacts::default()
+            },
+        )
+        .unwrap();
+    let opened = outcome
+        .applied()
+        .and_then(|applied| applied.opened_question_id)
+        .expect("the ask opened a question");
+
+    let event = machines
+        .store()
+        .events_for_run(run_id)
+        .unwrap()
+        .into_iter()
+        .find(|event| event.event_type == "run_awaiting_input")
+        .expect("the ask journaled its domain event");
+    let payload: serde_json::Value = serde_json::from_str(&event.payload).unwrap();
+
+    assert_eq!(
+        payload.get("opened_question_id").and_then(|id| id.as_i64()),
+        Some(opened)
+    );
+    assert_eq!(
+        payload.get("question_id"),
+        Some(&serde_json::Value::Null),
+        "the answered-question field stays what it was: nothing was answered here"
+    );
+
+    fs::remove_dir_all(directory).unwrap();
+}

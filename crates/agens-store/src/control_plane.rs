@@ -425,6 +425,10 @@ pub struct AttemptClose {
     pub outcome: AttemptOutcome,
 }
 
+/// The payload key a transition's event declares, as null, to be given the id
+/// of the question the same transition opens.
+pub const OPENED_QUESTION_ID_KEY: &str = "opened_question_id";
+
 /// Everything one applied transition writes.
 ///
 /// It is one struct rather than a call per table because a state change and the
@@ -463,6 +467,12 @@ pub struct TransitionWrite<'a> {
     pub result: Option<&'a str>,
     /// The provider's quota state as this transition leaves it.
     pub provider: Option<&'a ProviderRow>,
+    /// The journal entries announcing the transition.
+    ///
+    /// An event whose JSON payload declares [`OPENED_QUESTION_ID_KEY`] as null
+    /// has the slot filled with the id of the question this transition opened.
+    /// The caller cannot write that id itself, because it does not exist until
+    /// the question row is inserted inside this same transaction.
     pub events: &'a [EventRow],
 }
 
@@ -1122,7 +1132,9 @@ impl ControlPlaneStore {
 
         let mut event_ids = Vec::with_capacity(write.events.len());
         for event in write.events {
-            event_ids.push(append_event_row(&transaction, event).map_err(failure)?);
+            let filled = fill_opened_question_slot(event, question_id);
+            let row = filled.as_ref().unwrap_or(event);
+            event_ids.push(append_event_row(&transaction, row).map_err(failure)?);
         }
 
         transaction.commit().map_err(failure)?;
@@ -1263,6 +1275,27 @@ fn close_open_attempts(
          WHERE run_id = ?3 AND ended_at IS NULL AND outcome IS NULL",
         params![close.ended_at, close.outcome.as_str(), run_id],
     )
+}
+
+/// The event with its declared [`OPENED_QUESTION_ID_KEY`] slot filled, or
+/// `None` when there is nothing to fill: no question was opened, the payload
+/// is not a JSON object, it declares no slot, or the slot already holds a
+/// value that filling would overwrite.
+fn fill_opened_question_slot(event: &EventRow, question_id: Option<i64>) -> Option<EventRow> {
+    let question_id = question_id?;
+
+    let mut payload: serde_json::Value = serde_json::from_str(&event.payload).ok()?;
+    let slot = payload.as_object_mut()?.get_mut(OPENED_QUESTION_ID_KEY)?;
+    if !slot.is_null() {
+        return None;
+    }
+
+    *slot = serde_json::Value::from(question_id);
+
+    Some(EventRow {
+        payload: payload.to_string(),
+        ..event.clone()
+    })
 }
 
 fn insert_question_row(connection: &Connection, question: &QuestionRow) -> rusqlite::Result<i64> {

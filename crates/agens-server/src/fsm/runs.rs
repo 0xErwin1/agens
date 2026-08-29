@@ -9,8 +9,9 @@
 //! replanning opens a new run that inherits the worktree and the lineage.
 
 use agens_store::{
-    AttemptClose, AttemptOutcome, AttemptRow, EventClass, ProviderRow, QuestionRow, QuestionState,
-    QuotaState, RetryTrigger, RunState, StateChange, TransitionWrite, WorktreeStatus,
+    AttemptClose, AttemptOutcome, AttemptRow, EventClass, OPENED_QUESTION_ID_KEY, ProviderRow,
+    QuestionRow, QuestionState, QuotaState, RetryTrigger, RunState, StateChange, TransitionWrite,
+    WorktreeStatus,
 };
 
 use super::{
@@ -473,6 +474,21 @@ impl StateMachines {
 
         let provider = self.provider_write(transition, &run.provider, facts);
 
+        // `question_id` is the answered question the transition consumed. The
+        // question `ask` opens has no id yet — the row is inserted inside the
+        // transaction below — so the event declares the null slot the store
+        // fills at insert time.
+        let mut domain_detail = serde_json::json!({
+            "principal": facts.principal.as_str(),
+            "retry_trigger": facts.retry_trigger.map(RetryTrigger::as_str),
+            "question_id": facts.answered_question_id,
+        });
+        if transition.effects.contains(&RunEffect::OpenQuestion)
+            && let Some(detail) = domain_detail.as_object_mut()
+        {
+            detail.insert(OPENED_QUESTION_ID_KEY.to_owned(), serde_json::Value::Null);
+        }
+
         let events = transition_events(
             &JournaledMove {
                 run_id,
@@ -484,11 +500,7 @@ impl StateMachines {
                 trigger: trigger.as_str(),
                 domain_event: transition.domain_event,
             },
-            &serde_json::json!({
-                "principal": facts.principal.as_str(),
-                "retry_trigger": facts.retry_trigger.map(RetryTrigger::as_str),
-                "question_id": facts.answered_question_id,
-            }),
+            &domain_detail,
         );
 
         let outcome = self.store.apply_transition(&TransitionWrite {

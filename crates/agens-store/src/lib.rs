@@ -24,9 +24,10 @@ pub use compaction::{CompactionStore, CompactionStoreError, StoredCompaction};
 pub use control_plane::{
     AttemptClose, AttemptOutcome, AttemptRow, CausalDisposition, CheckpointWrite,
     ControlPlaneError, ControlPlaneStore, EventClass, EventRow, EvidenceClass, FindingRow,
-    IngestOutcome, IngestWrite, ProviderRow, QuestionAnswer, QuestionAuthor, QuestionChange,
-    QuestionKind, QuestionRow, QuestionState, QuotaState, RetryTrigger, RunHealthRow, RunRow,
-    RunState, StateChange, TransitionOutcome, TransitionWrite, WorktreeStatus,
+    IngestOutcome, IngestWrite, OPENED_QUESTION_ID_KEY, ProviderRow, QuestionAnswer,
+    QuestionAuthor, QuestionChange, QuestionKind, QuestionRow, QuestionState, QuotaState,
+    RetryTrigger, RunHealthRow, RunRow, RunState, StateChange, TransitionOutcome, TransitionWrite,
+    WorktreeStatus,
 };
 pub use database::unified_database_path;
 pub use directives::{
