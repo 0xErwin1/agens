@@ -2490,3 +2490,163 @@ fn table_b_device_auth_then_double_dash_reaches_the_device_flow_without_blocking
 
     assert_eq!(actual, success("Logged in to ChatGPT.\n"));
 }
+
+/// A bare `auth login` on a terminal opens an interactive provider menu
+/// instead of the usage listing. The menu itself is a dependency
+/// (`with_login_menu`), so this test pins what the command hands it: the
+/// four provider entries in the usage listing's order, each marked with the
+/// same credential status `auth status` reports — here a ChatGPT entry
+/// whose token is past its expiry ("refresh required"), a stored Moonshot
+/// key ("ready"), and no OpenAI key ("not logged in"). Declining the menu
+/// (`Ok(None)`) cancels the login.
+#[test]
+fn auth_login_on_a_terminal_offers_a_menu_marked_with_credential_status() {
+    let temporary = TemporaryDirectory::new("auth-login-menu-marks");
+    let config_home = temporary.path().join("throwaway-config-home");
+    std::fs::create_dir_all(&config_home).expect("config home should be created");
+    std::fs::write(
+        config_home.join("auth.json"),
+        concat!(
+            "{\"openai-chatgpt\":{\"access_token\":\"token\",",
+            "\"refresh_token\":\"refresh\",\"account_id\":\"account\",",
+            "\"expires_at\":\"2000-01-01T00:00:00Z\"},",
+            "\"moonshotai\":{\"api_key\":\"k\"}}",
+        ),
+    )
+    .expect("credentials should be written");
+    let mut environment = BTreeMap::new();
+    environment.insert(
+        "AGENS_CONFIG_HOME".to_owned(),
+        config_home.display().to_string(),
+    );
+    let dependencies = CliDependencies::for_test(
+        temporary.project_root(),
+        Some(temporary.home()),
+        environment,
+        BTreeMap::new(),
+    )
+    .with_stdin_is_terminal(true)
+    .with_login_menu(|items| {
+        assert_eq!(
+            items,
+            [
+                "ChatGPT subscription, through OAuth in a browser (refresh required)",
+                "ChatGPT subscription, through a device code (refresh required)",
+                "OpenAI API key (not logged in)",
+                "Moonshot AI (Kimi) API key (ready)",
+            ],
+        );
+        Ok(None)
+    });
+
+    let actual = execute(
+        argv(&["auth", "login"]).iter().map(String::as_str),
+        &dependencies,
+    );
+
+    assert_eq!(
+        actual,
+        failure(ExitStatus::Authentication, "auth: login was cancelled")
+    );
+}
+
+/// Selecting the first menu entry runs the ChatGPT browser flow, exactly as
+/// `auth login chatgpt` would; the `auth_login` stub records the flow it was
+/// handed instead of opening a real browser.
+#[test]
+fn auth_login_menu_selection_routes_to_the_chatgpt_browser_flow() {
+    let temporary = TemporaryDirectory::new("auth-login-menu-browser");
+    let dependencies = base_dependencies(&temporary)
+        .with_stdin_is_terminal(true)
+        .with_login_menu(|_| Ok(Some(0)))
+        .with_auth_login(|_, device_auth, _| {
+            assert!(
+                !device_auth,
+                "the first menu entry must select the browser flow"
+            );
+            Ok(String::new())
+        });
+
+    let actual = execute(
+        argv(&["auth", "login"]).iter().map(String::as_str),
+        &dependencies,
+    );
+
+    assert_eq!(actual, success("Logged in to ChatGPT.\n"));
+}
+
+/// Selecting the second menu entry runs the ChatGPT device-code flow,
+/// exactly as `auth login chatgpt --device-auth` would.
+#[test]
+fn auth_login_menu_selection_routes_to_the_chatgpt_device_flow() {
+    let temporary = TemporaryDirectory::new("auth-login-menu-device");
+    let dependencies = base_dependencies(&temporary)
+        .with_stdin_is_terminal(true)
+        .with_login_menu(|_| Ok(Some(1)))
+        .with_auth_login(|_, device_auth, _| {
+            assert!(
+                device_auth,
+                "the second menu entry must select the device flow"
+            );
+            Ok(String::new())
+        });
+
+    let actual = execute(
+        argv(&["auth", "login"]).iter().map(String::as_str),
+        &dependencies,
+    );
+
+    assert_eq!(actual, success("Logged in to ChatGPT.\n"));
+}
+
+/// Selecting an API-key entry routes into the same hidden terminal prompt
+/// as `auth login api-key <provider>` under a terminal. Like the existing
+/// empty-stdin api-key case, this test must run with a non-terminal
+/// standard input (the verification gate closes stdin), where the raw-mode
+/// prompt fails cleanly instead of waiting for keystrokes.
+#[test]
+fn auth_login_menu_api_key_selection_reads_the_hidden_terminal_prompt() {
+    let temporary = TemporaryDirectory::new("auth-login-menu-api-key");
+    let dependencies = base_dependencies(&temporary)
+        .with_stdin_is_terminal(true)
+        .with_login_menu(|_| Ok(Some(2)));
+
+    let actual = execute(
+        argv(&["auth", "login"]).iter().map(String::as_str),
+        &dependencies,
+    );
+
+    assert_eq!(
+        actual,
+        failure(
+            ExitStatus::Authentication,
+            "auth: API-key input is unavailable"
+        )
+    );
+}
+
+/// Without a terminal the menu never opens: a bare `auth login` keeps the
+/// usage listing, and the menu dependency is never consulted. A pipe or CI
+/// run therefore sees exactly the pre-menu behavior pinned in
+/// `table_a_auth_holds`.
+#[test]
+fn auth_login_without_a_terminal_keeps_the_usage_listing_and_never_opens_the_menu() {
+    let temporary = TemporaryDirectory::new("auth-login-menu-no-terminal");
+    let dependencies = base_dependencies(&temporary)
+        .with_stdin_is_terminal(false)
+        .with_login_menu(|_| panic!("the menu must not open without a terminal"));
+
+    let actual = execute(
+        argv(&["auth", "login"]).iter().map(String::as_str),
+        &dependencies,
+    );
+
+    assert_eq!(actual.status, ExitStatus::Usage);
+    assert!(
+        actual
+            .stderr
+            .starts_with("error: usage: auth login requires a provider:\n"),
+        "a non-terminal bare `auth login` must keep the usage listing, got: {}",
+        actual.stderr
+    );
+}

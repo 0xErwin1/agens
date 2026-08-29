@@ -13,6 +13,7 @@
 crates/agens-bus/src/lib.rs	let _ = self.state.wake.wait_timeout(guard, timeout);	documented_no_op
 crates/agens-cli/src/commands/auth.rs	let _ = std::io::stderr().flush();	best_effort_observability
 crates/agens-cli/src/commands/auth.rs	let _ = std::io::stderr().flush();	best_effort_observability
+crates/agens-cli/src/commands/auth.rs	let _ = std::io::stderr().flush();	best_effort_observability
 crates/agens-cli/src/commands/auth.rs	let _ = writeln!(std::io::stdout(), "Open {url} to authenticate.");	best_effort_observability
 crates/agens-cli/src/commands/auth.rs	let _ = std::io::stdout().flush();	best_effort_observability
 crates/agens-cli/src/commands/auth.rs	let _ = writeln!(	best_effort_observability

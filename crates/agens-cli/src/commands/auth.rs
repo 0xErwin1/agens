@@ -46,7 +46,13 @@ pub(crate) fn run_auth(
         cli::AuthAction::Login {
             device_auth: false,
             method: None,
-        } => Err(CliError::usage(login_methods())),
+        } => {
+            if (dependencies.stdin_is_terminal)() {
+                run_interactive_login(dependencies, cancellation)
+            } else {
+                Err(CliError::usage(login_methods()))
+            }
+        }
         cli::AuthAction::Login {
             device_auth: true,
             method: None,
@@ -100,24 +106,104 @@ pub(crate) fn run_auth(
 /// user wants to spend, so the command lists them and stops instead.
 fn login_methods() -> String {
     let mut message = String::from("auth login requires a provider:\n");
-    for (command, description) in [
-        (
-            "agens auth login chatgpt",
-            "ChatGPT subscription, through OAuth in a browser",
-        ),
-        (
-            "agens auth login chatgpt --device-auth",
-            "ChatGPT subscription, through a device code",
-        ),
-        ("agens auth login api-key openai-api", "OpenAI API key"),
-        (
-            "agens auth login api-key moonshotai",
-            "Moonshot AI (Kimi) API key",
-        ),
-    ] {
-        message.push_str(&format!("\n  {command}\n      {description}\n"));
+    for choice in LOGIN_CHOICES {
+        message.push_str(&format!(
+            "\n  {}\n      {}\n",
+            choice.command(),
+            choice.description()
+        ));
     }
     message.trim_end().to_owned()
+}
+
+/// One flow a bare `auth login` can start, shared between the usage listing
+/// and the interactive menu so both always offer the same providers in the
+/// same order.
+#[derive(Clone, Copy)]
+enum LoginChoice {
+    Chatgpt { device_auth: bool },
+    ApiKey(CredentialProvider),
+}
+
+const LOGIN_CHOICES: [LoginChoice; 4] = [
+    LoginChoice::Chatgpt { device_auth: false },
+    LoginChoice::Chatgpt { device_auth: true },
+    LoginChoice::ApiKey(CredentialProvider::OpenAiApi),
+    LoginChoice::ApiKey(CredentialProvider::Moonshot),
+];
+
+impl LoginChoice {
+    const fn command(self) -> &'static str {
+        match self {
+            Self::Chatgpt { device_auth: false } => "agens auth login chatgpt",
+            Self::Chatgpt { device_auth: true } => "agens auth login chatgpt --device-auth",
+            Self::ApiKey(CredentialProvider::OpenAiApi) => "agens auth login api-key openai-api",
+            Self::ApiKey(_) => "agens auth login api-key moonshotai",
+        }
+    }
+
+    const fn description(self) -> &'static str {
+        match self {
+            Self::Chatgpt { device_auth: false } => {
+                "ChatGPT subscription, through OAuth in a browser"
+            }
+            Self::Chatgpt { device_auth: true } => "ChatGPT subscription, through a device code",
+            Self::ApiKey(CredentialProvider::OpenAiApi) => "OpenAI API key",
+            Self::ApiKey(_) => "Moonshot AI (Kimi) API key",
+        }
+    }
+}
+
+/// Runs the interactive provider menu a bare `auth login` opens on a
+/// terminal, then starts the chosen flow exactly as its explicit invocation
+/// would — including the hidden API-key prompt for the api-key entries.
+fn run_interactive_login(
+    dependencies: &CliDependencies,
+    cancellation: &HeadlessTurnCancellation,
+) -> Result<String, CliError> {
+    let bootstrap = bootstrap(dependencies)?;
+    let items = login_menu_items(&bootstrap.paths.credentials);
+
+    let Some(index) = (dependencies.login_menu)(&items)? else {
+        return Err(CliError::authentication("login was cancelled"));
+    };
+
+    match LOGIN_CHOICES.get(index) {
+        Some(LoginChoice::Chatgpt { device_auth }) => {
+            run_auth_login(dependencies, *device_auth, cancellation)
+        }
+        Some(LoginChoice::ApiKey(provider)) => {
+            run_api_key_login(provider.identifier(), None, dependencies)
+        }
+        None => Err(CliError::authentication("login selection is invalid")),
+    }
+}
+
+/// One menu line per [`LOGIN_CHOICES`] entry, marked with the same
+/// credential status `auth status` reports for that provider.
+fn login_menu_items(credentials: &Path) -> Vec<String> {
+    let chatgpt_mark = match load_chatgpt_auth_state(credentials, std::time::SystemTime::now()) {
+        Ok(ChatGptAuthState::Ready) => "ready",
+        Ok(ChatGptAuthState::RefreshRequired) => "refresh required",
+        Err(_) => "not logged in",
+    };
+
+    LOGIN_CHOICES
+        .iter()
+        .map(|choice| {
+            let mark = match choice {
+                LoginChoice::Chatgpt { .. } => chatgpt_mark,
+                LoginChoice::ApiKey(provider) => {
+                    if api_key_is_ready(credentials, *provider) {
+                        "ready"
+                    } else {
+                        "not logged in"
+                    }
+                }
+            };
+            format!("{} ({mark})", choice.description())
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy)]
@@ -220,41 +306,150 @@ fn read_api_key(
 /// the buffer without bound.
 const MAX_API_KEY_INPUT_BYTES: u64 = 8192;
 
+/// Puts the terminal in raw mode — no echo, no line buffering, no kernel
+/// signal generation — and restores the original attributes on drop.
+///
+/// Raw mode means the holder, not the kernel, owns interrupt handling. That
+/// is deliberate: the process installs an async `ctrl_c` handler that
+/// replaces SIGINT's default disposition, so a blocking line read would
+/// swallow the interrupt and leave the prompt waiting forever with the
+/// terminal still not echoing.
+#[cfg(unix)]
+struct RawModeGuard(libc::termios);
+
+#[cfg(unix)]
+impl RawModeGuard {
+    fn enable(unavailable: &'static str) -> Result<Self, CliError> {
+        let mut original = std::mem::MaybeUninit::<libc::termios>::uninit();
+        if unsafe { libc::tcgetattr(libc::STDIN_FILENO, original.as_mut_ptr()) } != 0 {
+            return Err(CliError::authentication(unavailable));
+        }
+        let original = unsafe { original.assume_init() };
+        let guard = Self(original);
+
+        let mut raw = original;
+        raw.c_lflag &= !(libc::ECHO | libc::ICANON | libc::ISIG);
+        if unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw) } != 0 {
+            return Err(CliError::authentication(unavailable));
+        }
+
+        Ok(guard)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        unsafe {
+            libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.0);
+        }
+    }
+}
+
+/// Presents the provider menu on the terminal: one line per entry, arrow
+/// keys (or a digit) move the cursor, Enter selects, and `q` or ctrl-c
+/// cancels. Only ever called when standard input is a terminal.
+#[cfg(unix)]
+pub(crate) fn run_production_login_menu(items: &[String]) -> Result<Option<usize>, CliError> {
+    let _guard = RawModeGuard::enable("login menu is unavailable")?;
+
+    eprintln!("Select a login method (arrows move, Enter selects, q cancels):");
+    let mut selected = 0;
+    draw_login_menu(items, selected, true);
+
+    let mut stdin = std::io::stdin().lock();
+    let mut byte = [0_u8; 1];
+
+    loop {
+        match stdin.read(&mut byte) {
+            Ok(0) => return Ok(None),
+            Ok(_) => {}
+            Err(_) => return Err(CliError::authentication("login menu is unavailable")),
+        }
+
+        match byte[0] {
+            b'\r' | b'\n' => return Ok(Some(selected)),
+            0x03 | 0x04 | b'q' => return Ok(None),
+            0x1b => {
+                match read_arrow_key(&mut stdin) {
+                    Some(ArrowKey::Up) if selected > 0 => selected -= 1,
+                    Some(ArrowKey::Down) if selected + 1 < items.len() => selected += 1,
+                    _ => continue,
+                }
+                draw_login_menu(items, selected, false);
+            }
+            digit @ b'1'..=b'9' => {
+                let index = usize::from(digit - b'1');
+                if index < items.len() {
+                    selected = index;
+                    draw_login_menu(items, selected, false);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn run_production_login_menu(_items: &[String]) -> Result<Option<usize>, CliError> {
+    Err(CliError::authentication("login menu is unavailable"))
+}
+
+/// Redraws the menu in place: after the first draw, the cursor moves back
+/// up over the previously drawn lines instead of appending a new copy.
+#[cfg(unix)]
+fn draw_login_menu(items: &[String], selected: usize, first_draw: bool) {
+    if !first_draw {
+        eprint!("\u{1b}[{}A", items.len());
+    }
+
+    for (index, item) in items.iter().enumerate() {
+        let cursor = if index == selected { '>' } else { ' ' };
+        eprint!("\r\u{1b}[K");
+        eprintln!("{cursor} {item}");
+    }
+
+    let _ = std::io::stderr().flush();
+}
+
+#[cfg(unix)]
+enum ArrowKey {
+    Up,
+    Down,
+}
+
+/// Consumes one terminal escape sequence and reports whether it was an up
+/// or down arrow; every other sequence is swallowed like
+/// [`discard_escape_sequence`] does.
+#[cfg(unix)]
+fn read_arrow_key(stdin: &mut std::io::StdinLock<'_>) -> Option<ArrowKey> {
+    let mut byte = [0_u8; 1];
+    if stdin.read(&mut byte).unwrap_or(0) == 0 || byte[0] != b'[' {
+        return None;
+    }
+
+    loop {
+        if stdin.read(&mut byte).unwrap_or(0) == 0 {
+            return None;
+        }
+
+        match byte[0] {
+            b'A' => return Some(ArrowKey::Up),
+            b'B' => return Some(ArrowKey::Down),
+            value if value.is_ascii_alphabetic() || value == b'~' => return None,
+            _ => {}
+        }
+    }
+}
+
 /// Reads a key from the terminal without ever echoing it, showing one mask
 /// character per accepted byte so the terminal does not look frozen.
-///
-/// The terminal is put in raw mode, which means this loop — not the kernel —
-/// owns interrupt handling. That is deliberate: the process installs an async
-/// `ctrl_c` handler that replaces SIGINT's default disposition, so a blocking
-/// line read here would swallow the interrupt and leave the prompt waiting
-/// forever with the terminal still not echoing.
 #[cfg(unix)]
 fn read_hidden_tty_api_key() -> Result<String, CliError> {
     const MASK: &str = "*";
     const ERASE: &str = "\u{8} \u{8}";
 
-    struct TerminalGuard(libc::termios);
-
-    impl Drop for TerminalGuard {
-        fn drop(&mut self) {
-            unsafe {
-                libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.0);
-            }
-        }
-    }
-
-    let mut original = std::mem::MaybeUninit::<libc::termios>::uninit();
-    if unsafe { libc::tcgetattr(libc::STDIN_FILENO, original.as_mut_ptr()) } != 0 {
-        return Err(CliError::authentication("API-key input is unavailable"));
-    }
-    let original = unsafe { original.assume_init() };
-    let _guard = TerminalGuard(original);
-
-    let mut raw = original;
-    raw.c_lflag &= !(libc::ECHO | libc::ICANON | libc::ISIG);
-    if unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw) } != 0 {
-        return Err(CliError::authentication("API-key input is unavailable"));
-    }
+    let _guard = RawModeGuard::enable("API-key input is unavailable")?;
 
     eprint!("API key (ctrl-c to cancel): ");
     let _ = std::io::stderr().flush();
@@ -358,25 +553,27 @@ fn normalize_api_key_input(input: &str) -> Result<String, CliError> {
     Ok(input.to_owned())
 }
 
+fn api_key_is_ready(path: &Path, provider: CredentialProvider) -> bool {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok())
+        .and_then(|root| root.get(provider.identifier()).cloned())
+        .and_then(|entry| entry.get("api_key").cloned())
+        .and_then(|key| key.as_str().map(|key| !key.trim().is_empty()))
+        .unwrap_or(false)
+}
+
 fn provider_status(path: &Path, provider: CredentialProvider) -> Result<String, CliError> {
     match provider {
         CredentialProvider::OpenAiApi | CredentialProvider::Moonshot => {
             let label = provider.label();
-            let unavailable = || {
-                CliError::authentication(format!("{label} credentials are unavailable or invalid"))
-            };
-            let contents = fs::read_to_string(path).map_err(|_| unavailable())?;
-            let ready = serde_json::from_str::<serde_json::Value>(&contents)
-                .ok()
-                .and_then(|root| root.get(provider.identifier()).cloned())
-                .and_then(|entry| entry.get("api_key").cloned())
-                .and_then(|key| key.as_str().map(|key| !key.trim().is_empty()))
-                .unwrap_or(false);
 
-            if ready {
+            if api_key_is_ready(path, provider) {
                 Ok(format!("{label} authentication: ready\n"))
             } else {
-                Err(unavailable())
+                Err(CliError::authentication(format!(
+                    "{label} credentials are unavailable or invalid"
+                )))
             }
         }
         CredentialProvider::OpenAiChatGpt => {
