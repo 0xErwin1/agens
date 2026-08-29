@@ -5,7 +5,10 @@ pub const MAX_ASK_USER_OPTIONS: usize = 12;
 pub const MAX_ASK_USER_ID_CHARS: usize = 64;
 pub const MAX_ASK_USER_LABEL_CHARS: usize = 120;
 pub const MAX_ASK_USER_PROMPT_CHARS: usize = 512;
-pub const MAX_ASK_USER_EXPLANATION_CHARS: usize = 512;
+/// Matches the per-option context bound: an explanation carries the whole
+/// reason a turn stopped, and the surface scrolls whatever the header cannot
+/// hold rather than cutting it.
+pub const MAX_ASK_USER_EXPLANATION_CHARS: usize = 2_048;
 pub const MAX_ASK_USER_CONTEXT_CHARS: usize = 2_048;
 pub const MAX_ASK_USER_FREE_TEXT_CHARS: usize = 1_024;
 pub const MAX_ASK_USER_NOTE_CHARS: usize = 512;

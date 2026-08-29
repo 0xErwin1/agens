@@ -6684,6 +6684,78 @@ fn long_context_request() -> AskUserRequest {
     .expect("a bounded question forms a valid request")
 }
 
+/// An explanation long enough that the header could only ever show its first
+/// rows, with a sentinel at each end so a test can tell "shown from the top"
+/// from "reachable all the way down".
+fn long_explanation_request() -> AskUserRequest {
+    let explanation = format!(
+        "EXPLAINHEAD {} EXPLAINTAIL",
+        (0..40)
+            .map(|index| format!("EXPLAINLINE{index:02}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    AskUserRequest::new(
+        None,
+        vec![AskUserQuestion::new(
+            "q1",
+            "PROMPT_SENTINEL",
+            Some(explanation),
+            AskUserMode::Single,
+            vec![
+                ask_user_option("a", "A_LABEL", "first", Some("CTX_A")),
+                ask_user_option("b", "B_LABEL", "second", Some("CTX_B")),
+            ],
+            false,
+            false,
+            false,
+        )],
+    )
+    .expect("a bounded question forms a valid request")
+}
+
+/// The header has room for a couple of rows, so an explanation past that used
+/// to be cut without a word. It moves whole into the pane that already knows
+/// how to scroll, and the reader keeps the prompt above it either way.
+#[test]
+fn a_long_question_explanation_moves_into_the_scrollable_context_pane() {
+    let (mut tui, mut renderer) =
+        open_ask_user(ASK_USER_WIDE_TERMINAL, 30, long_explanation_request());
+
+    let text = rendered_text(&renderer);
+    assert!(text.contains("PROMPT_SENTINEL"), "{text:?}");
+    assert!(text.contains("EXPLAINHEAD"), "{text:?}");
+
+    tui.handle(Event::Key(Key::End));
+    renderer.render(tui.view()).unwrap();
+    let bottom = rendered_text(&renderer);
+    assert!(
+        bottom.contains("EXPLAINTAIL"),
+        "the end of a long explanation is reachable: {bottom:?}"
+    );
+    assert!(
+        bottom.contains("CTX_A"),
+        "the selected option keeps its own context under the explanation: {bottom:?}"
+    );
+}
+
+/// An explanation the header can hold stays in the header, where it reads as
+/// part of the question rather than as context for one option.
+#[test]
+fn a_short_question_explanation_stays_in_the_header() {
+    let (_tui, renderer) =
+        open_ask_user(ASK_USER_WIDE_TERMINAL, 30, ask_user_request_with_context());
+
+    let explanation_row = rendered_row(&renderer, "Both options keep");
+    let prompt_row = rendered_row(&renderer, "How should the migration land?");
+    let option_row = rendered_row(&renderer, "BIGBANG_LABEL");
+
+    assert!(
+        prompt_row < explanation_row && explanation_row < option_row,
+        "the explanation sits between the prompt and the option list"
+    );
+}
+
 #[test]
 fn ask_user_context_pane_scrolls_by_keyboard_and_end_leaves_a_reachable_last_page() {
     let (mut tui, mut renderer) = open_ask_user(ASK_USER_WIDE_TERMINAL, 30, long_context_request());

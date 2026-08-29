@@ -2711,35 +2711,66 @@ struct AskUserFrame<'a> {
     max_context_scroll: u16,
 }
 
-/// Whether the current question offers any per-option context to show.
+/// Whether the current question has anything for the scrolling pane to show:
+/// per-option context, or an explanation the header cannot hold.
 ///
 /// When it does not, the pane is not merely empty — the two-column layout would
 /// spend half the overlay on nothing, so the list keeps the whole width.
 /// Review has no option rows, so the context column is never useful there.
-fn ask_user_has_context(render: &AskUserRender<'_>) -> bool {
+fn ask_user_has_context(render: &AskUserRender<'_>, width: u16) -> bool {
     if render.reviewing {
         return false;
     }
-    render
-        .current()
-        .options()
-        .iter()
-        .any(|option| option.context().is_some())
+    ask_user_paned_explanation(render, width).is_some()
+        || render
+            .current()
+            .options()
+            .iter()
+            .any(|option| option.context().is_some())
 }
 
-fn ask_user_context_text<'a>(render: &AskUserRender<'a>) -> &'a str {
-    render
+/// The current question's explanation when it is too tall for the header.
+///
+/// The header keeps a fixed handful of rows so the option list is not pushed
+/// off the overlay, which used to mean a longer explanation was cut without
+/// a word to say so. Past that height the whole explanation moves to the pane
+/// that already scrolls, rather than being shown in halves.
+fn ask_user_paned_explanation<'a>(render: &AskUserRender<'a>, width: u16) -> Option<&'a str> {
+    let explanation = render.current().explanation()?;
+
+    (wrapped_prose_lines(explanation, width).len() > MAX_ASK_USER_EXPLANATION_ROWS)
+        .then_some(explanation)
+}
+
+/// What the pane shows: the paned explanation, the selected option's own
+/// context, or both with a blank row between them.
+///
+/// `header_width` decides whether the explanation belongs here at all, and it
+/// is the header's width rather than the pane's: the question is what the
+/// header could not hold.
+fn ask_user_context_text(render: &AskUserRender<'_>, header_width: u16) -> String {
+    let explanation = ask_user_paned_explanation(render, header_width);
+    let context = render
         .current()
         .options()
         .get(render.context_option)
-        .and_then(agens_core::ask_user::AskUserOption::context)
-        .unwrap_or(ASK_USER_EMPTY_CONTEXT)
+        .and_then(agens_core::ask_user::AskUserOption::context);
+
+    match (explanation, context) {
+        (Some(explanation), Some(context)) => format!("{explanation}\n\n{context}"),
+        (Some(explanation), None) => explanation.to_owned(),
+        (None, Some(context)) => context.to_owned(),
+        (None, None) => ASK_USER_EMPTY_CONTEXT.to_owned(),
+    }
 }
 
-fn ask_user_shortcuts(render: &AskUserRender<'_>) -> Vec<widgets::OverlayShortcut<'static>> {
+fn ask_user_shortcuts(
+    render: &AskUserRender<'_>,
+    has_context: bool,
+) -> Vec<widgets::OverlayShortcut<'static>> {
     let question = render.current();
     if render.entry != AskUserEntry::Browsing {
-        return ask_user_entry_shortcuts(ask_user_has_context(render));
+        return ask_user_entry_shortcuts(has_context);
     }
 
     if render.reviewing {
@@ -2785,7 +2816,7 @@ fn ask_user_shortcuts(render: &AskUserRender<'_>) -> Vec<widgets::OverlayShortcu
             label: "note",
         });
     }
-    if ask_user_has_context(render) {
+    if has_context {
         shortcuts.push(widgets::OverlayShortcut {
             key: ASK_USER_CONTEXT_KEYS,
             label: "context",
@@ -3004,11 +3035,12 @@ fn ask_user_header_lines(render: &AskUserRender<'_>, width: u16) -> Vec<Line<'st
                 )
             }),
     );
-    if let Some(explanation) = question.explanation() {
+    if let Some(explanation) = question.explanation()
+        && ask_user_paned_explanation(render, width).is_none()
+    {
         lines.extend(
             wrapped_prose_lines(explanation, width)
                 .into_iter()
-                .take(MAX_ASK_USER_EXPLANATION_ROWS)
                 .map(|line| Line::styled(line, muted)),
         );
     }
@@ -3303,7 +3335,7 @@ fn ask_user_frame<'a>(
 ) -> Option<AskUserFrame<'a>> {
     let sizing = widgets::OverlaySizing::ask_user(composer);
     let inner = sizing.inner_width(area)?;
-    let has_context = ask_user_has_context(render);
+    let has_context = ask_user_has_context(render, inner);
     let two_column = has_context && inner >= ASK_USER_TWO_COLUMN_MIN_WIDTH;
     let (list_width, context_width) = if two_column {
         let right = (inner - ASK_USER_COLUMN_GAP) / 2;
@@ -3315,7 +3347,7 @@ fn ask_user_frame<'a>(
     let header_lines = ask_user_header_lines(render, inner);
     let (rows, selected_row) = ask_user_rows(render, list_width);
     let context_lines = if has_context {
-        ask_user_context_lines(ask_user_context_text(render), context_width)
+        ask_user_context_lines(&ask_user_context_text(render, inner), context_width)
     } else {
         Vec::new()
     };
@@ -3327,7 +3359,7 @@ fn ask_user_frame<'a>(
     } else {
         rows.len()
     };
-    let shortcuts = ask_user_shortcuts(render);
+    let shortcuts = ask_user_shortcuts(render, has_context);
     let title = prompt_title(
         render.request.title().unwrap_or(ASK_USER_DEFAULT_TITLE),
         render.origin,
