@@ -16,7 +16,7 @@ use std::sync::Arc;
 use agens_config::resolve_paths;
 use agens_core::HeadlessTurnCancellation;
 
-use crate::commands::auth::run_production_auth_login;
+use crate::commands::auth::{run_production_auth_login, run_production_login_menu};
 use crate::commands::config::{create_configuration_file, create_global_configuration_file};
 use crate::commands::serve::DaemonStartupRequest;
 use crate::headless::run_production_headless_chat;
@@ -45,6 +45,13 @@ type AuthLogin = Box<dyn Fn(&Path, bool, &HeadlessTurnCancellation) -> Result<St
 /// runner happens to provide: the same argv means a hidden prompt under a
 /// terminal and a piped read without one.
 type StdinIsTerminal = Box<dyn Fn() -> bool>;
+/// Presents the interactive `auth login` provider menu and returns the index
+/// of the chosen entry, or `None` when the user cancels.
+///
+/// This is a dependency for the same reason `stdin_is_terminal` is: the
+/// production menu owns the terminal (raw mode, arrow keys), which a test
+/// can neither drive nor observe, so a test injects the selection instead.
+type LoginMenu = Box<dyn Fn(&[String]) -> Result<Option<usize>, CliError>>;
 
 pub struct CliDependencies {
     pub(crate) host: HostEnvironment,
@@ -54,6 +61,7 @@ pub struct CliDependencies {
     pub(crate) daemon_ensurer: DaemonEnsurer,
     pub(crate) auth_login: AuthLogin,
     pub(crate) stdin_is_terminal: StdinIsTerminal,
+    pub(crate) login_menu: LoginMenu,
 }
 
 impl CliDependencies {
@@ -96,6 +104,7 @@ impl CliDependencies {
             daemon_ensurer: Box::new(crate::commands::serve::ensure_daemon_running),
             auth_login: Box::new(run_production_auth_login),
             stdin_is_terminal: Box::new(|| std::io::stdin().is_terminal()),
+            login_menu: Box::new(run_production_login_menu),
         }
     }
 
@@ -113,6 +122,7 @@ impl CliDependencies {
             daemon_ensurer: Box::new(|_, _| Ok(false)),
             auth_login: Box::new(|_, _, _| Err(CliError::unavailable(UNAVAILABLE_MESSAGE))),
             stdin_is_terminal: Box::new(|| false),
+            login_menu: Box::new(|_| Err(CliError::unavailable(UNAVAILABLE_MESSAGE))),
         }
     }
 
@@ -163,6 +173,14 @@ impl CliDependencies {
 
     pub fn with_stdin_is_terminal(mut self, is_terminal: bool) -> Self {
         self.stdin_is_terminal = Box::new(move || is_terminal);
+        self
+    }
+
+    pub fn with_login_menu(
+        mut self,
+        menu: impl Fn(&[String]) -> Result<Option<usize>, CliError> + 'static,
+    ) -> Self {
+        self.login_menu = Box::new(menu);
         self
     }
 }
