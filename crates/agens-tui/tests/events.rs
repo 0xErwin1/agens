@@ -258,6 +258,7 @@ fn transcript_admission_retention_session_resume_keeps_restored_history_summary_
         resume_error: None,
         file_candidates: Vec::new(),
         palette_entries: Vec::new(),
+        extension_notice: None,
     });
 
     let view = tui.view();
@@ -347,6 +348,7 @@ fn session_resume_success_replaces_prepared_state_in_one_outcome() {
         resume_error: None,
         file_candidates: Vec::new(),
         palette_entries: Vec::new(),
+        extension_notice: None,
     });
 
     let resumed = tui.view();
@@ -382,6 +384,7 @@ fn failed_session_resume_restores_exact_draft_with_history_at_composer_bottom() 
         resume_error: None,
         file_candidates: Vec::new(),
         palette_entries: Vec::new(),
+        extension_notice: None,
     });
 
     let resumed = tui.view();
@@ -428,6 +431,7 @@ fn recovered_failed_prompt_escape_discards_and_successful_resume_replaces_atomic
         resume_error: None,
         file_candidates: Vec::new(),
         palette_entries: Vec::new(),
+        extension_notice: None,
     });
 
     assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Render);
@@ -443,6 +447,7 @@ fn recovered_failed_prompt_escape_discards_and_successful_resume_replaces_atomic
         resume_error: None,
         file_candidates: Vec::new(),
         palette_entries: Vec::new(),
+        extension_notice: None,
     });
     tui.apply_submission_outcome(TuiSubmissionOutcome::SessionResumed {
         message: "Resumed session 3.".into(),
@@ -453,6 +458,7 @@ fn recovered_failed_prompt_escape_discards_and_successful_resume_replaces_atomic
         resume_error: None,
         file_candidates: Vec::new(),
         palette_entries: Vec::new(),
+        extension_notice: None,
     });
 
     assert!(tui.input().is_empty());

@@ -270,7 +270,9 @@ fn a_post_startup_resume_command_refreshes_commands_skills_and_picker_candidates
         .router
         .route(format!("/resume {}", fixture.metadata_id));
     let TuiSubmissionOutcome::SessionResumed {
-        file_candidates, ..
+        file_candidates,
+        extension_notice,
+        ..
     } = resume_outcome
     else {
         panic!("expected a successful resume, got {resume_outcome:?}");
@@ -282,6 +284,10 @@ fn a_post_startup_resume_command_refreshes_commands_skills_and_picker_candidates
         vec!["only-in-a.txt".to_owned()],
         "the picker candidates on the resume outcome must enumerate the resumed \
          session's own root, not the resuming process's discovered root"
+    );
+    assert_eq!(
+        extension_notice, None,
+        "a successful re-discovery carries no degradation notice"
     );
 }
 
@@ -400,6 +406,50 @@ fn a_post_startup_resume_refreshes_the_composers_own_palette_not_just_the_router
         rendered_palette_names.iter().any(|name| name == "askill"),
         "root A's own skill must be present in the composer's rendered palette after resume: \
          {rendered_palette_names:?}"
+    );
+}
+
+/// A resume whose re-discovery fails must not leave the PREVIOUS root's catalogs in
+/// place: the session root moves to root A while the catalogs stay discovered under
+/// root B, and that stale pair makes `SkillResourceTool` refuse every project-skill
+/// call at dispatch time — a per-call refusal for a session-level condition. A failed
+/// re-discovery drops both catalogs instead, so nothing stale stays advertised.
+#[test]
+fn a_post_startup_resume_with_failed_rediscovery_drops_the_previous_roots_catalogs() {
+    let fixture = catalog_confinement_fixture("catalog-confinement-failed-rediscovery");
+
+    // Root A's skills directory becomes a regular file, so skill discovery under the
+    // resumed session's own root fails with an error rather than an empty catalog.
+    let origin_skills = fixture.origin.join("project").join(".agens/skills");
+    std::fs::remove_dir_all(&origin_skills).unwrap();
+    std::fs::write(&origin_skills, "not a directory").unwrap();
+
+    let resume_outcome = fixture
+        .router
+        .route(format!("/resume {}", fixture.metadata_id));
+    let TuiSubmissionOutcome::SessionResumed {
+        extension_notice, ..
+    } = resume_outcome
+    else {
+        panic!("the resume itself still succeeds when only re-discovery fails: {resume_outcome:?}");
+    };
+    assert!(
+        extension_notice
+            .as_deref()
+            .is_some_and(|notice| notice.contains("discovery failed")),
+        "the degradation must surface once, on the resume outcome: {extension_notice:?}"
+    );
+
+    assert!(
+        matches!(
+            fixture.router.route("/bskill args".into()),
+            TuiSubmissionOutcome::LocalActionableError { .. }
+        ),
+        "root B's skill must not survive a failed re-discovery into root A"
+    );
+    assert!(
+        fixture.router.skills().unwrap().is_empty(),
+        "a failed re-discovery must leave an empty catalog, not the previous root's"
     );
 }
 

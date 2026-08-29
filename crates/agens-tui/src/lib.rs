@@ -607,6 +607,10 @@ pub enum TuiSubmissionOutcome {
         /// TUI startup (or by an earlier session), even after those names are no longer reachable
         /// once the session is confined to a different root.
         palette_entries: Vec<PaletteEntry>,
+        /// A one-time notice that command/skill re-discovery failed under the resumed session's
+        /// root and both catalogs were dropped. Session-level by design: without it the only
+        /// symptom would be per-call tool refusals, which the model reads as argument errors.
+        extension_notice: Option<String>,
     },
     Dialog(DialogView),
     SafeDialog(DialogView),
@@ -7340,6 +7344,7 @@ where
                 resume_error,
                 file_candidates,
                 palette_entries,
+                extension_notice,
             } => {
                 self.finish_session_load();
                 self.replace_projected_history(history);
@@ -7357,6 +7362,9 @@ where
                 self.restored_syntax_ready_at =
                     Some(self.now.saturating_add(ACTIVE_FRAME_HEARTBEAT));
                 self.status = Some(message);
+                if let Some(notice) = extension_notice {
+                    self.add_diagnostic(notice);
+                }
                 if let Some(error) = resume_error {
                     self.show_dialog(
                         "Action required",
@@ -14454,6 +14462,7 @@ mod runtime_tests {
             resume_error: None,
             file_candidates: Vec::new(),
             palette_entries: Vec::new(),
+            extension_notice: None,
         });
         let terminal = RatatuiTerminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
         let mut renderer = RatatuiRenderer::new(terminal);
