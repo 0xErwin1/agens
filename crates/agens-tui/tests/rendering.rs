@@ -7327,3 +7327,78 @@ fn the_tool_overlay_bounds_a_huge_argument_and_ctrl_o_still_reaches_all_of_it() 
         scrolls += 1;
     }
 }
+
+/// A single long row — a long `command` value or a long output line — used to
+/// run off the overlay's right border with no marker, leaving everything past
+/// the border unreachable. The overlay hard-wraps rows the way the transcript
+/// wraps terminal output, so the tail of a long line is on screen (or a scroll
+/// away), never silently clipped.
+#[test]
+fn the_tool_overlay_wraps_a_long_line_instead_of_clipping_it() {
+    let arg_tail = "ARGTAIL9".repeat(30);
+    let out_tail = "OUTTAIL9".repeat(30);
+    let command = format!("echo {}{arg_tail}", "x".repeat(300));
+    let raw_input = format!(r#"{{"command":"{command}"}}"#);
+    let output = format!("ok\n{}{out_tail}", "y".repeat(300));
+
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(100, 30)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.handle(Event::Resize {
+        width: 100,
+        height: 30,
+    });
+    tui.begin_submission("run the command");
+    tui.apply_progress(TurnEvent::ToolCallRequested {
+        id: "bash-1".into(),
+        name: "native::bash".into(),
+        input: raw_input.clone(),
+    });
+    tui.apply_runtime_event(TuiRuntimeEvent::ToolStarted {
+        call_id: "bash-1".into(),
+        name: "native::bash".into(),
+        input: raw_input,
+        parsed: ToolInput::Bash {
+            command: command.clone(),
+        },
+    });
+    tui.apply_progress(TurnEvent::ToolResult(MessagePart::ToolResult {
+        tool_call_id: "bash-1".into(),
+        content: output,
+        is_error: false,
+    }));
+    tui.finish_provider_turn(agens_tui::TuiProviderOutcome::Completed("done".into()));
+
+    tui.handle(Event::MouseDown { column: 4, row: 1 });
+    tui.handle(Event::Key(Key::Char('K')));
+    tui.handle(Event::Key(Key::Enter));
+    renderer.render(tui.view()).unwrap();
+
+    let overlay = tui.view().tool_overlay.expect("the overlay is open");
+    assert!(
+        overlay.args.contains(&arg_tail) && overlay.output.contains(&out_tail),
+        "state keeps the full text of both long lines"
+    );
+
+    let mut text = rendered_text(&renderer);
+    let mut scrolls = 0;
+    while !text.contains("ARGTAIL9ARGTAIL9") {
+        assert!(
+            scrolls < 40,
+            "the tail of a long argument line stayed unreachable: {text:?}"
+        );
+        tui.handle(Event::Key(Key::PageDown));
+        renderer.render(tui.view()).unwrap();
+        text = rendered_text(&renderer);
+        scrolls += 1;
+    }
+    while !text.contains("OUTTAIL9OUTTAIL9") {
+        assert!(
+            scrolls < 40,
+            "the tail of a long output line stayed unreachable: {text:?}"
+        );
+        tui.handle(Event::Key(Key::PageDown));
+        renderer.render(tui.view()).unwrap();
+        text = rendered_text(&renderer);
+        scrolls += 1;
+    }
+}

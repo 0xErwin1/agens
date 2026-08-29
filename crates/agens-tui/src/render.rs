@@ -1396,7 +1396,7 @@ fn ansi_byte(value: u16) -> u8 {
 /// Alignment carries meaning in tool output, so a row breaks at the column it
 /// runs out of room in rather than at a word boundary, and the remainder
 /// continues on the next row instead of being clipped away.
-fn wrap_terminal_row(spans: Vec<Span<'static>>, max_width: usize) -> Vec<Line<'static>> {
+pub(crate) fn wrap_terminal_row(spans: Vec<Span<'static>>, max_width: usize) -> Vec<Line<'static>> {
     let width = spans.iter().map(|span| span.content.width()).sum::<usize>();
     if width <= max_width {
         return vec![Line::from(spans)];
