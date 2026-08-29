@@ -18,10 +18,9 @@
 //! reads no differently from confirming one this process was running.
 //!
 //! This mode is still narrower than the local one and stays opt-in until it is
-//! not. A hosted chat has no task runtime behind it, so slash commands, the
-//! skill palette, the file picker and delegation are not wired here. A
-//! submission this mode cannot serve is reported as such rather than silently
-//! doing nothing.
+//! not. Hosted model and named-agent commands run in the daemon, while the skill
+//! palette, the file picker and delegation are not wired here. A submission this
+//! mode cannot serve is reported as such rather than silently doing nothing.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -245,10 +244,10 @@ impl Engine for AttachedEngine {
 
 /// What a submission means in this mode.
 ///
-/// Only an ordinary prompt becomes a turn. Everything else the surface can
-/// route — a slash command, a dialog, a clipboard image — belongs to the local
-/// router, and the local router drives a local session. Saying so is the point:
-/// a command that quietly did nothing would read as the terminal being broken.
+/// Only an ordinary prompt becomes a turn. Supported stateful commands execute
+/// against the daemon-owned chat. Everything else the surface can route belongs
+/// to the local router, and a command that quietly did nothing would read as the
+/// terminal being broken.
 fn route(
     request: &TuiRouteRequest,
     execute_command: impl Fn(&str) -> Result<String, CliError>,
@@ -261,7 +260,11 @@ fn route(
                 return TuiSubmissionOutcome::LocalInfo(String::new());
             }
 
-            if trimmed.starts_with("/effort ") || trimmed.starts_with("/model ") {
+            if trimmed == "/agents"
+                || trimmed.starts_with("/agent ")
+                || trimmed.starts_with("/effort ")
+                || trimmed.starts_with("/model ")
+            {
                 return match execute_command(trimmed) {
                     Ok(message) => TuiSubmissionOutcome::LocalInfo(message),
                     Err(error) => TuiSubmissionOutcome::LocalActionableError {
@@ -331,7 +334,7 @@ pub fn run_attached_tui_with_prompt(
     tui.set_collapse_thinking(bootstrap.collapse_thinking);
     tui.add_info(arrival.describe());
     tui.add_info(
-        "attached mode supports ordered prompts, prompt-producing commands, /effort <value>, and /model <provider/model>; selected subagents, background controls, and session mutations remain unsupported",
+        "attached mode supports ordered prompts, prompt-producing commands, /agents, /agent <name>, /effort <value>, and /model <provider/model>; selected subagents, background controls, and session mutations remain unsupported",
     );
     let skills = start_tui_skills(&mut tui, bootstrap, &checkout)?;
     let commands = start_tui_commands(&mut tui, bootstrap, &checkout)?;
@@ -373,7 +376,9 @@ pub fn run_attached_tui_with_prompt(
             let is_hosted_command = matches!(
                 &request,
                 TuiRouteRequest::Input(input)
-                    if input.trim().starts_with("/effort ")
+                    if input.trim() == "/agents"
+                        || input.trim().starts_with("/agent ")
+                        || input.trim().starts_with("/effort ")
                         || input.trim().starts_with("/model ")
             );
             if is_hosted_command {
@@ -632,6 +637,31 @@ mod tests {
         assert_eq!(
             outcome,
             TuiSubmissionOutcome::LocalInfo("executed:/effort high".to_owned())
+        );
+    }
+
+    #[test]
+    fn agent_catalog_executes_as_a_hosted_command() {
+        let outcome = route(&TuiRouteRequest::Input("/agents".to_owned()), |command| {
+            Ok(format!("executed:{command}"))
+        });
+
+        assert_eq!(
+            outcome,
+            TuiSubmissionOutcome::LocalInfo("executed:/agents".to_owned())
+        );
+    }
+
+    #[test]
+    fn named_agent_executes_as_a_hosted_command() {
+        let outcome = route(
+            &TuiRouteRequest::Input("/agent all".to_owned()),
+            |command| Ok(format!("executed:{command}")),
+        );
+
+        assert_eq!(
+            outcome,
+            TuiSubmissionOutcome::LocalInfo("executed:/agent all".to_owned())
         );
     }
 
