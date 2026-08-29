@@ -546,6 +546,14 @@ fn render_chat_event(event: &HostedChatEvent) -> String {
             "permission {}: tool={} target={} access={} reason={}\n",
             question.prompt_id, question.tool, question.target, question.access, question.reason
         ),
+        HostedChatEvent::AskUserAsked { prompt_id, request } => {
+            let prompts: Vec<&str> = request
+                .questions()
+                .iter()
+                .map(|question| question.prompt())
+                .collect();
+            format!("question {}: {}\n", prompt_id, prompts.join(" | "))
+        }
         HostedChatEvent::TurnCompleted { text } => format!("assistant: {text}\n"),
         HostedChatEvent::TurnFailed { detail } => format!("failed: {detail}\n"),
         HostedChatEvent::Closed => "closed\n".to_owned(),
