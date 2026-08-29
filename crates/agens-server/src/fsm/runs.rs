@@ -18,6 +18,13 @@ use super::{
     TransitionRejection, event_pair, transition_events,
 };
 
+/// How much of the worker's closing message the run's result keeps, in bytes.
+///
+/// The worker's contract is that its last message is the run's result, and a
+/// worker can close with an arbitrarily long transcript. The bound is applied
+/// where the result is recorded, so no caller can write an unbounded row.
+pub const RUN_RESULT_MAX_BYTES: usize = 16 * 1024;
+
 /// What drives a run out of the state it is in.
 ///
 /// A caller names one of these, never a destination state. Which state it leads
@@ -151,6 +158,10 @@ pub enum RunEffect {
     /// Writes the durable question the run parks on. `ask` is the only way a
     /// question comes into being: one buried in a transcript does not exist.
     OpenQuestion,
+    /// Persists the worker's closing message as the run's result. Only the
+    /// transition that finishes the run declares it: a leg that failed or
+    /// parked has no result to claim, whatever its last message said.
+    RecordResult,
     LaunchSession,
     /// The worker does not stay resident: an hours-long wait held in memory is
     /// state a restart cannot rebuild.
@@ -276,7 +287,10 @@ pub static RUN_TRANSITIONS: &[RunTransition] = &[
         trigger: RunTrigger::Finished,
         to: RunState::Done,
         guard: RunGuard::ReportedByHarness,
-        effects: &[RunEffect::CloseAttempt(AttemptOutcome::Succeeded)],
+        effects: &[
+            RunEffect::CloseAttempt(AttemptOutcome::Succeeded),
+            RunEffect::RecordResult,
+        ],
         domain_event: "run_finished",
         class: EventClass::Agent,
     },
@@ -378,6 +392,9 @@ pub struct RunFacts {
     pub answered_question_id: Option<i64>,
     /// The question `ask` opens, written in the same transaction as the park.
     pub opened_question: Option<QuestionRow>,
+    /// The worker's closing message, recorded as the run's result by the
+    /// transition that finishes the run and ignored by every other one.
+    pub result: Option<String>,
     /// When the capped provider says it will serve again. `None` means it named
     /// no reset, and what wakes the parked runs then is
     /// [`RunFacts::quota_window_seconds`].
@@ -448,6 +465,12 @@ impl StateMachines {
             outcome,
         });
 
+        let result = transition
+            .effects
+            .contains(&RunEffect::RecordResult)
+            .then(|| facts.result.as_deref().map(bounded_result))
+            .flatten();
+
         let provider = self.provider_write(transition, &run.provider, facts);
 
         let events = transition_events(
@@ -483,6 +506,7 @@ impl StateMachines {
                 .flatten(),
             attempt: attempt.as_ref(),
             close_attempt,
+            result,
             provider: provider.as_ref(),
             events: &events,
         })?;
@@ -815,6 +839,21 @@ fn check_ask_opens_question(
             "a run cannot park on awaiting_input without the question it parks on".to_owned(),
         )),
     }
+}
+
+/// The result as far as its byte bound allows, cut on a character boundary so
+/// a truncation can never leave broken UTF-8 in the row.
+fn bounded_result(result: &str) -> &str {
+    if result.len() <= RUN_RESULT_MAX_BYTES {
+        return result;
+    }
+
+    let mut end = RUN_RESULT_MAX_BYTES;
+    while !result.is_char_boundary(end) {
+        end -= 1;
+    }
+
+    &result[..end]
 }
 
 /// The outcome a transition ends the run's open attempt with, if it ends one.

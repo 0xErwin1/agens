@@ -12,9 +12,9 @@ use std::{
 
 use agens_server::{
     Principal, QUESTION_TRANSITIONS, QuestionFacts, QuestionGuard, QuestionTransition,
-    QuestionTrigger, RUN_TRANSITIONS, RunEffect, RunFacts, RunGuard, RunTransition, RunTrigger,
-    StateMachines, TransitionOutcome, TransitionRejection, WORKTREE_TRANSITIONS, WorktreeFacts,
-    WorktreeGuard, WorktreeTransition, WorktreeTrigger,
+    QuestionTrigger, RUN_RESULT_MAX_BYTES, RUN_TRANSITIONS, RunEffect, RunFacts, RunGuard,
+    RunTransition, RunTrigger, StateMachines, TransitionOutcome, TransitionRejection,
+    WORKTREE_TRANSITIONS, WorktreeFacts, WorktreeGuard, WorktreeTransition, WorktreeTrigger,
 };
 use agens_store::{
     AttemptOutcome, AttemptRow, ControlPlaneStore, ProviderRow, QuestionAuthor, QuestionKind,
@@ -1625,6 +1625,118 @@ fn a_run_that_only_ever_parked_keeps_its_whole_retry_budget() {
         },
     );
     assert!(retried.is_ok(), "{:?}", retried.err());
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn finishing_records_the_turns_last_message_as_the_runs_result() {
+    let directory = data_directory();
+    let mut store = ControlPlaneStore::open(&directory).unwrap();
+    let run_id = store
+        .insert_run(&run_in(RunState::Running, Some(WorktreeStatus::Active)))
+        .unwrap();
+    store
+        .insert_attempt(&open_attempt(run_id, NOW - 90))
+        .unwrap();
+    let mut machines = StateMachines::new(store);
+
+    machines
+        .apply_run(
+            run_id,
+            RunTrigger::Finished,
+            &RunFacts {
+                now: NOW,
+                result: Some("the definition of done is met".to_owned()),
+                ..RunFacts::default()
+            },
+        )
+        .unwrap();
+
+    assert_eq!(
+        machines
+            .store()
+            .load_run(run_id)
+            .unwrap()
+            .unwrap()
+            .result
+            .as_deref(),
+        Some("the definition of done is met")
+    );
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn a_failing_turn_records_no_result_even_when_one_travels_with_the_facts() {
+    let directory = data_directory();
+    let mut store = ControlPlaneStore::open(&directory).unwrap();
+    let run_id = store
+        .insert_run(&run_in(RunState::Running, Some(WorktreeStatus::Active)))
+        .unwrap();
+    store
+        .insert_attempt(&open_attempt(run_id, NOW - 90))
+        .unwrap();
+    let mut machines = StateMachines::new(store);
+
+    machines
+        .apply_run(
+            run_id,
+            RunTrigger::AttemptFailed,
+            &RunFacts {
+                now: NOW,
+                result: Some("a claim the failed leg does not get to make".to_owned()),
+                ..RunFacts::default()
+            },
+        )
+        .unwrap();
+
+    assert_eq!(
+        machines.store().load_run(run_id).unwrap().unwrap().result,
+        None
+    );
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn an_oversized_result_is_cut_at_the_bound_on_a_character_boundary() {
+    let directory = data_directory();
+    let mut store = ControlPlaneStore::open(&directory).unwrap();
+    let run_id = store
+        .insert_run(&run_in(RunState::Running, Some(WorktreeStatus::Active)))
+        .unwrap();
+    store
+        .insert_attempt(&open_attempt(run_id, NOW - 90))
+        .unwrap();
+    let mut machines = StateMachines::new(store);
+
+    // Two-byte characters, so the byte bound falls inside one of them and the
+    // cut has to step back to the boundary rather than split it.
+    let oversized = "é".repeat(RUN_RESULT_MAX_BYTES / 2 + 8);
+    machines
+        .apply_run(
+            run_id,
+            RunTrigger::Finished,
+            &RunFacts {
+                now: NOW,
+                result: Some(oversized.clone()),
+                ..RunFacts::default()
+            },
+        )
+        .unwrap();
+
+    let result = machines
+        .store()
+        .load_run(run_id)
+        .unwrap()
+        .unwrap()
+        .result
+        .expect("the finish recorded a result");
+
+    assert!(result.len() <= RUN_RESULT_MAX_BYTES);
+    assert!(oversized.starts_with(&result));
+    assert!(result.len() > RUN_RESULT_MAX_BYTES - 2);
 
     fs::remove_dir_all(directory).unwrap();
 }

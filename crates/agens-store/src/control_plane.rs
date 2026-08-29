@@ -454,6 +454,13 @@ pub struct TransitionWrite<'a> {
     /// close written in a second statement can be lost while the state change
     /// stands.
     pub close_attempt: Option<AttemptClose>,
+    /// The run's result, when this transition is the one that records it.
+    ///
+    /// Written unconditionally against the run rather than guarded on a prior
+    /// value: the transition that carries it is already conditional on the
+    /// state change, and a retried run finishing again legitimately replaces
+    /// the result its earlier leg left.
+    pub result: Option<&'a str>,
     /// The provider's quota state as this transition leaves it.
     pub provider: Option<&'a ProviderRow>,
     pub events: &'a [EventRow],
@@ -1061,6 +1068,15 @@ impl ControlPlaneStore {
                     change.expected.as_str()
                 )));
             }
+        }
+
+        if let Some(result) = write.result {
+            transaction
+                .execute(
+                    "UPDATE runs SET result = ?1 WHERE id = ?2",
+                    params![result, write.run_id],
+                )
+                .map_err(failure)?;
         }
 
         let question_id = match write.new_question {

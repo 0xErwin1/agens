@@ -103,6 +103,7 @@ impl Harness {
                 new_question: None,
                 attempt: None,
                 close_attempt: None,
+                result: None,
                 provider: None,
                 events: &[],
             })
@@ -419,6 +420,7 @@ impl RunLauncher for RecordingLauncher {
                     new_question: None,
                     attempt: None,
                     close_attempt: None,
+                    result: None,
                     provider: None,
                     events: &[],
                 })

@@ -46,7 +46,8 @@ pub use questions::{
 };
 pub(crate) use runs::charged_attempts;
 pub use runs::{
-    AppliedRunTransition, RUN_TRANSITIONS, RunEffect, RunFacts, RunGuard, RunTransition, RunTrigger,
+    AppliedRunTransition, RUN_RESULT_MAX_BYTES, RUN_TRANSITIONS, RunEffect, RunFacts, RunGuard,
+    RunTransition, RunTrigger,
 };
 pub use worktrees::{
     AppliedWorktreeTransition, WORKTREE_HOLDING_RUN_STATES, WORKTREE_TRANSITIONS, WorktreeEffect,
@@ -238,6 +239,7 @@ impl StateMachines {
             new_question: Some(question),
             attempt: None,
             close_attempt: None,
+            result: None,
             provider: None,
             events,
         })?;
@@ -298,6 +300,7 @@ impl StateMachines {
             new_question: None,
             attempt: None,
             close_attempt: None,
+            result: None,
             provider: None,
             events: &events,
         })?;
@@ -339,6 +342,7 @@ impl StateMachines {
             new_question: None,
             attempt: None,
             close_attempt: None,
+            result: None,
             provider: None,
             events,
         })?;

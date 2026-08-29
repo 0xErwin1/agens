@@ -303,6 +303,7 @@ fn execute(
             run.run_id,
             RunTrigger::AttemptFailed,
             SessionOutcome::Failed,
+            None,
         );
     }
 
@@ -515,7 +516,7 @@ fn stopped(
     }
 
     match state {
-        Some(RunState::Running) => report(core, run_id, RunTrigger::AttemptFailed, outcome),
+        Some(RunState::Running) => report(core, run_id, RunTrigger::AttemptFailed, outcome, None),
         _ => outcome,
     }
 }
@@ -586,13 +587,14 @@ fn journal_turn_failure(
 /// finished on top of that would be claiming a result for work that stopped to
 /// ask a question. Reading the row rather than the text is what keeps the two
 /// apart without the worker having to remember which tool it called.
-fn finish(core: &Arc<Mutex<ApiCore>>, run_id: i64, _text: &str) -> SessionOutcome {
+fn finish(core: &Arc<Mutex<ApiCore>>, run_id: i64, text: &str) -> SessionOutcome {
     match state_of(core, run_id) {
         Some(RunState::Running) => report(
             core,
             run_id,
             RunTrigger::Finished,
             SessionOutcome::Completed,
+            Some(text),
         ),
         // Parked, cancelled or already moved by something else. The session
         // ended cleanly and the run is where the transition that moved it left
@@ -612,6 +614,7 @@ fn report(
     run_id: i64,
     trigger: RunTrigger,
     outcome: SessionOutcome,
+    result: Option<&str>,
 ) -> SessionOutcome {
     let Ok(mut core) = core.lock() else {
         return SessionOutcome::Failed;
@@ -622,6 +625,7 @@ fn report(
         trigger,
         &RunFacts {
             now: now(),
+            result: result.map(str::to_owned),
             ..RunFacts::default()
         },
     );
