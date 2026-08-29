@@ -5642,6 +5642,7 @@ fn a_context_changed_outcome_shows_the_toggled_safety_state_without_a_further_ke
 }
 
 const ERROR_COLOR: Color = Color::Rgb(0xf0, 0x71, 0x78);
+const WARNING_COLOR: Color = Color::Rgb(0xe6, 0xb4, 0x50);
 const MUTED_COLOR: Color = Color::Rgb(0x5c, 0x67, 0x73);
 
 #[test]
@@ -5758,6 +5759,42 @@ fn a_successful_subagent_card_keeps_its_result_out_of_the_transcript() {
         !rendered_text(&renderer).contains("long successful summary body"),
         "{:?}",
         rendered_text(&renderer)
+    );
+}
+
+#[test]
+fn a_successful_subagent_card_surfaces_a_warning_prefixed_result() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(120, 24)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    start_execution(&mut tui, 12, "worker");
+    tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
+        agent: "worker".into(),
+        event: TuiExecutionEvent::Completed { id: 12 },
+    });
+    apply_subagent(
+        &mut tui,
+        TuiSubagentEvent::terminal(
+            12,
+            SubagentStatus::Success,
+            "warning: agent worker is configured to run gpt-5.6-terra; the explicit model \
+             argument gpt-5.4 overrides that configuration\ndelegated summary body",
+        ),
+    );
+
+    renderer.render(tui.view()).unwrap();
+    let rendered = rendered_text(&renderer);
+
+    assert!(
+        rendered.contains("warning: agent worker is configured to run gpt-5.6-terra"),
+        "{rendered:?}"
+    );
+    assert!(
+        !rendered.contains("delegated summary body"),
+        "the successful result body still stays off the transcript: {rendered:?}"
+    );
+    assert_eq!(
+        cell_for_text(&renderer, "warning: agent worker").fg,
+        WARNING_COLOR
     );
 }
 

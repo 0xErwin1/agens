@@ -1489,6 +1489,7 @@ fn subagent_card_block(
         Style::default().fg(RolePalette::muted()),
     ))));
     rows.extend(subagent_failure_row(card, content_width));
+    rows.extend(subagent_warning_rows(card, content_width));
 
     for activity in card.activities.iter().take(3) {
         rows.push(BlockLine::new(Line::from(Span::styled(
@@ -1538,6 +1539,39 @@ fn subagent_failure_row(card: &crate::SubagentCard, content_width: usize) -> Opt
             Style::default().fg(RolePalette::error()),
         )))
     })
+}
+
+/// Warning notices the runtime prefixed to a delegation's final result.
+///
+/// The task tool prepends `warning:` lines to the result it hands the parent
+/// -- a configured model overridden by an explicit argument, an unavailable
+/// model replaced by a fallback. On success the result body stays off the
+/// transcript, which used to hide those notices with it: a delegation could
+/// run on a different model than the operator configured and nothing on
+/// screen said so. A failed card is exempt because its failure row already
+/// carries the whole result, warning prefix included.
+fn subagent_warning_rows(card: &crate::SubagentCard, content_width: usize) -> Vec<BlockLine> {
+    if matches!(card.status, Some(agens_core::SubagentStatus::Failure)) {
+        return Vec::new();
+    }
+
+    let Some(result) = card.final_result.as_deref() else {
+        return Vec::new();
+    };
+
+    result
+        .lines()
+        .take_while(|line| line.starts_with("warning:"))
+        .filter_map(|line| {
+            let warning = bounded_single_line(line, content_width);
+            (!warning.is_empty()).then(|| {
+                BlockLine::new(Line::from(Span::styled(
+                    warning,
+                    Style::default().fg(RolePalette::warning()),
+                )))
+            })
+        })
+        .collect()
 }
 
 fn subagent_status_color(status: Option<agens_core::SubagentStatus>) -> Color {
