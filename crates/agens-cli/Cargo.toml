@@ -45,6 +45,7 @@ agens-tui = { path = "../agens-tui" }
 agens-tui-app = { path = "../agens-tui-app" }
 toml = "0.8"
 tokio = { version = "1", features = ["net", "rt", "signal", "time"] }
+tokio-stream = "0.1"
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"

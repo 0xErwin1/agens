@@ -81,7 +81,10 @@ pub(crate) enum Command {
     },
     #[command(about = "enter team mode or inspect the machine fleet")]
     Team {
-        /// An optional first prompt for the attached chat; use `ls [--json]` to inspect the fleet.
+        /// An optional first prompt for the attached chat. Fleet operations are `ls [--json]`,
+        /// `show <id> [--follow]`, `answer <question-id> <answer>`,
+        /// `permission <chat-id> <prompt-id> <answer>`, `merge <approval-question-id>`, and
+        /// `cancel <id>`.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         prompt: Vec<String>,
     },
