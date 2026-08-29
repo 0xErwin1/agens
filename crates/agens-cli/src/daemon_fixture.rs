@@ -265,6 +265,31 @@ pub(crate) async fn await_reported_state(
     }
 }
 
+/// Waits until the run's journal carries the named event, and returns the
+/// journal it found — or whatever the journal held when patience ran out.
+///
+/// A state read races whatever moves the run next: a park the wheel lifts
+/// after a second can be over before a poll lands on it. The journal only
+/// grows, so an event that happened stays observable however late the
+/// observer arrives.
+pub(crate) async fn await_journal_event(
+    client: &mut FeedClient<Channel>,
+    run_id: i64,
+    wanted: &str,
+) -> Vec<String> {
+    let deadline = Instant::now() + PATIENCE;
+
+    loop {
+        let journal = journal_of(client, run_id).await;
+
+        if journal.iter().any(|event| event == wanted) || Instant::now() >= deadline {
+            return journal;
+        }
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 /// One run's journal, for an assertion that has to say what happened instead of
 /// only that it did not.
 pub(crate) async fn journal_of(client: &mut FeedClient<Channel>, run_id: i64) -> Vec<String> {
