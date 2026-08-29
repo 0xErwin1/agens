@@ -26,6 +26,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use agens_agents::{agent_catalog_for_context, ensure_active_agent_runtime};
 use agens_bootstrap::Bootstrap;
 use agens_core::ask_user::{AskUserPort, AskUserReply, AskUserRequest};
 use agens_core::{
@@ -42,8 +43,11 @@ use agens_server::{
     ChatSession, ChatSessionFactory, ChatSessionRequest, ChatTurnOutcome, ChatTurns,
     SessionAdmission, SessionBudget, SessionId, SessionProvider, SessionRuntime,
 };
+use agens_session::context::{ActiveAgentRuntime, SessionContext};
 use agens_session::provider::{bootstrap_authentication, resolve_provider_for_model};
 use agens_store::SessionStore;
+use agens_tool_runtime::rotation::rotate_agent;
+use agens_tool_runtime::runtime::production_tool_runtime;
 
 /// The factory `agens serve` gives the daemon: how a client's request becomes a
 /// chat session.
@@ -83,6 +87,7 @@ fn build_chat(
         None => (model_of(&bootstrap)?, RequestConfig::default()),
     };
     let history = resumed_history(&bootstrap, request, session.id);
+    let active_agent = active_agent_for(&bootstrap, &session)?;
 
     Ok(ChatSession {
         admission: SessionAdmission::new(
@@ -101,6 +106,7 @@ fn build_chat(
             model,
             history,
             request_config,
+            active_agent,
         }),
     })
 }
@@ -230,6 +236,48 @@ fn restored_selection(
     Ok(Some((qualified, selection.request_config().clone())))
 }
 
+fn active_agent_for(
+    bootstrap: &Bootstrap,
+    session: &SessionMetadata,
+) -> Result<ActiveAgentRuntime, ChatError> {
+    let context = Arc::new(std::sync::Mutex::new(hosted_context(
+        bootstrap, session, None,
+    )));
+    let project_root = bootstrap
+        .project_root
+        .as_deref()
+        .ok_or_else(|| ChatError::Unavailable("the chat has no checkout to run in".to_owned()))?;
+    let skills = agens_bootstrap::discover_skill_catalog(bootstrap, project_root)
+        .map_err(|error| ChatError::Unavailable(error.to_string()))?
+        .catalog()
+        .clone();
+    let (_, dispatcher) = production_tool_runtime(bootstrap, project_root, Some(&skills))
+        .map_err(|error| ChatError::Unavailable(error.to_string()))?;
+    ensure_active_agent_runtime(bootstrap, &context, &dispatcher)
+        .map_err(|error| ChatError::Unavailable(error.to_string()))?;
+
+    context
+        .lock()
+        .map_err(|_| ChatError::Unavailable("hosted agent state is unavailable".to_owned()))?
+        .active_agent
+        .clone()
+        .ok_or_else(|| ChatError::Unavailable("the active agent is unavailable".to_owned()))
+}
+
+fn hosted_context(
+    bootstrap: &Bootstrap,
+    session: &SessionMetadata,
+    active_agent: Option<ActiveAgentRuntime>,
+) -> SessionContext {
+    SessionContext {
+        identifier: Some(session.id),
+        metadata: Some(session.clone()),
+        confinement_root: bootstrap.project_root.clone(),
+        active_agent,
+        ..SessionContext::fresh()
+    }
+}
+
 /// The transcript a resumed chat comes back to.
 ///
 /// A history that cannot be read is treated as an empty one: the person is
@@ -275,10 +323,17 @@ struct HostedChat {
     model: String,
     history: Vec<Message>,
     request_config: RequestConfig,
+    active_agent: ActiveAgentRuntime,
 }
 
 impl ChatTurns for HostedChat {
     fn command(&mut self, command: &str) -> Result<String, ChatError> {
+        if command == "/agents" {
+            return self.list_agents();
+        }
+        if let Some(agent) = command.strip_prefix("/agent ") {
+            return self.select_agent(agent.trim());
+        }
         if let Some(model) = command.strip_prefix("/model ") {
             return self.select_model(model.trim());
         }
@@ -367,6 +422,64 @@ impl ChatTurns for HostedChat {
 }
 
 impl HostedChat {
+    fn list_agents(&self) -> Result<String, ChatError> {
+        let context = hosted_context(
+            &self.bootstrap,
+            &self.session,
+            Some(self.active_agent.clone()),
+        );
+        let catalog = agent_catalog_for_context(&self.bootstrap, &context)
+            .map_err(|error| ChatError::Unavailable(error.to_string()))?;
+        let current = self.active_agent.name.as_str();
+        let entries = catalog.primary_or_all().map(|agent| {
+            if agent.name == current {
+                format!("{} (current)", agent.name)
+            } else {
+                agent.name.clone()
+            }
+        });
+
+        Ok(std::iter::once("Eligible primary agents:".to_owned())
+            .chain(entries)
+            .collect::<Vec<_>>()
+            .join("\n"))
+    }
+
+    fn select_agent(&mut self, requested: &str) -> Result<String, ChatError> {
+        if requested == "praetor" {
+            return Err(ChatError::Unavailable(
+                "praetor is team mode, not an agent profile; use /team".to_owned(),
+            ));
+        }
+
+        let project_root = self.bootstrap.project_root.as_deref().ok_or_else(|| {
+            ChatError::Unavailable("the chat has no checkout to run in".to_owned())
+        })?;
+        let skills = agens_bootstrap::discover_skill_catalog(&self.bootstrap, project_root)
+            .map_err(|error| ChatError::Unavailable(error.to_string()))?
+            .catalog()
+            .clone();
+        let context = Arc::new(std::sync::Mutex::new(hosted_context(
+            &self.bootstrap,
+            &self.session,
+            Some(self.active_agent.clone()),
+        )));
+        let message = rotate_agent(&self.bootstrap, requested, &context, &skills)
+            .map_err(|error| ChatError::Unavailable(error.to_string()))?;
+        let context = context
+            .lock()
+            .map_err(|_| ChatError::Unavailable("hosted agent state is unavailable".to_owned()))?;
+        self.session = context.metadata.clone().ok_or_else(|| {
+            ChatError::Unavailable("hosted session state is unavailable".to_owned())
+        })?;
+        self.active_agent = context
+            .active_agent
+            .clone()
+            .ok_or_else(|| ChatError::Unavailable("the active agent is unavailable".to_owned()))?;
+
+        Ok(message)
+    }
+
     fn select_model(&mut self, requested: &str) -> Result<String, ChatError> {
         let parsed = QualifiedModel::parse(requested)
             .map_err(|error| ChatError::Unavailable(error.to_string()))?;
@@ -395,6 +508,7 @@ impl HostedChat {
         session.provider_id = Some(resolved.provider.identifier().to_owned());
         session.model_id = Some(resolved.model.clone());
         session.reasoning_effort = selection.reasoning_effort_value();
+        let active_agent = active_agent_for(&self.bootstrap, &session)?;
         SessionStore::open(self.bootstrap.data_directory())
             .and_then(|mut store| store.update_session_selection(&session))
             .map_err(|_| {
@@ -404,6 +518,7 @@ impl HostedChat {
         self.session = session;
         self.model = model;
         self.request_config = selection.request_config().clone();
+        self.active_agent = active_agent;
 
         let selected = reset_effort.map_or_else(
             || format!("Model: {}.", resolved.model),
@@ -453,15 +568,34 @@ impl HostedChat {
             })
             .unzip();
 
+        let project_prompt = agens_bootstrap::session_config::SessionInstructions::resolve(
+            &agens_bootstrap::session_root::SessionRoot::confined_to(project_root),
+            &self.bootstrap,
+        );
+        let system_prompt = project_prompt
+            .text()
+            .filter(|instructions| !instructions.is_empty())
+            .and_then(|instructions| {
+                self.active_agent
+                    .system_prompt
+                    .strip_suffix(&format!("\n\n{instructions}"))
+            })
+            .unwrap_or(&self.active_agent.system_prompt)
+            .to_owned();
+        let active_model = self.active_agent.model.as_deref();
+        let selected_model = QualifiedModel::parse(&self.model)
+            .map(|model| model.model().to_owned())
+            .unwrap_or_else(|_| self.model.clone());
+        let overrides_selection = active_model.is_some_and(|model| model != selected_model);
+
         Ok(HeadlessChatRequest {
             prompt,
             user_message: Some(message.clone()),
             history: self.history.clone(),
-            model: Some(self.model.clone()),
-            // Left for the turn to resolve from the project root, which is how
-            // a chat gets this project's AGENTS.md and the active agent's own
-            // instructions rather than a prompt composed here.
-            system_prompt: None,
+            model: active_model
+                .map(ToOwned::to_owned)
+                .or_else(|| Some(self.model.clone())),
+            system_prompt: Some(system_prompt),
             max_iterations: None,
             mode: PermissionMode::Edit,
             // Deliberately not widened. See this module's header: a chat runs
@@ -469,11 +603,17 @@ impl HostedChat {
             // what the operator did not decide in advance is refused.
             dangerously_allow_all: false,
             dangerous_mode: false,
-            request_config: self.request_config.clone(),
-            session_reasoning_effort: self.session.reasoning_effort,
+            request_config: if overrides_selection {
+                RequestConfig::default()
+            } else {
+                self.request_config.clone()
+            },
+            session_reasoning_effort: (!overrides_selection)
+                .then_some(self.session.reasoning_effort)
+                .flatten(),
             session: Some(self.session.clone()),
-            active_agent: None,
-            effective_capabilities: None,
+            active_agent: Some(self.active_agent.name.clone()),
+            effective_capabilities: Some(self.active_agent.capabilities.clone()),
             pending_system_reminder: None,
             skills: Some(Arc::new(skills)),
             media_ids,

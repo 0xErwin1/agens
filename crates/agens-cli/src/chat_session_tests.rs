@@ -18,8 +18,13 @@ use tonic::transport::Channel;
 use crate::daemon_fixture::{DaemonFixture, PATIENCE, connect, daemon_settings};
 
 /// The model's side of the conversation: two turns, one per prompt.
-fn script() -> Script {
+fn script(marker: &std::path::Path) -> Script {
     Script::new([
+        ScriptedTurn::tool_call(
+            "agent-denied",
+            "bash",
+            serde_json::json!({"command": format!("touch {}", marker.display())}).to_string(),
+        ),
         ScriptedTurn::text("it is a Rust workspace"),
         ScriptedTurn::text("agens-server holds the daemon"),
     ])
@@ -89,7 +94,18 @@ async fn ask(
 
 #[test]
 fn a_prompt_a_client_sent_is_answered_by_a_turn_the_daemon_ran() {
-    let daemon = DaemonFixture::start_with_model(script(), daemon_settings(), "gpt-5.5");
+    let marker = std::env::temp_dir().join("agens-hosted-agent-command-ran");
+    let daemon = DaemonFixture::start_with_model(script(&marker), daemon_settings(), "gpt-5.5");
+    let agent_root = daemon.checkout.join(".agens/agents");
+    std::fs::create_dir_all(&agent_root).expect("create hosted agent directory");
+    std::fs::write(
+        agent_root.join("all.md"),
+        "---\nname: all\ndescription: hosted all\nmode: all\npermissions: [\"deny bash\"]\n---\nHosted all agent prompt.\n",
+    )
+    .expect("write hosted agent");
+    let project_instructions = "Hosted project instructions marker.";
+    std::fs::write(daemon.checkout.join("AGENTS.md"), project_instructions)
+        .expect("write hosted project instructions");
     let first_media =
         agens_store::ingest_media_bytes(&daemon.data_directory, b"first-image", "image/png")
             .expect("first hosted media is stored");
@@ -128,6 +144,29 @@ fn a_prompt_a_client_sent_is_answered_by_a_turn_the_daemon_ran() {
                 .await
                 .expect("the chat is open")
                 .into_inner();
+
+            let agents = chat
+                .command(proto::ChatCommandRequest {
+                    session_id: opened.session_id,
+                    command: "/agents".to_owned(),
+                })
+                .await
+                .expect("the hosted agent catalog crosses the wire")
+                .into_inner();
+            assert_eq!(
+                agents.message,
+                "Eligible primary agents:\nprimary (current)\nall"
+            );
+
+            let agent = chat
+                .command(proto::ChatCommandRequest {
+                    session_id: opened.session_id,
+                    command: "/agent all".to_owned(),
+                })
+                .await
+                .expect("the hosted agent selection crosses the wire")
+                .into_inner();
+            assert_eq!(agent.message, "Active agent: all.");
 
             let command = chat
                 .command(proto::ChatCommandRequest {
@@ -281,9 +320,24 @@ fn a_prompt_a_client_sent_is_answered_by_a_turn_the_daemon_ran() {
         first.0
     );
 
-    let requests = daemon.provider.wait_for_requests(2);
-    let second_request = requests[1].body();
+    let requests = daemon.provider.wait_for_requests(3);
+    let second_request = requests[2].body();
 
+    assert!(
+        [&requests[0], &requests[2]].into_iter().all(|request| {
+            request.body().matches("Hosted all agent prompt.").count() == 1
+                && request.body().matches(project_instructions).count() == 1
+        }),
+        "the selected agent prompt and project instructions reach each turn exactly once: {:?}",
+        requests
+            .iter()
+            .map(|request| request.body())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !marker.exists(),
+        "the selected agent's denied tool capability governs the hosted runtime"
+    );
     assert!(
         requests
             .iter()
@@ -305,6 +359,7 @@ fn a_prompt_a_client_sent_is_answered_by_a_turn_the_daemon_ran() {
     let stored = agens_store::SessionStore::open(&daemon.data_directory)
         .and_then(|store| store.load_session_for_resume(session_id))
         .expect("the hosted model selection is persisted");
+    assert_eq!(stored.metadata.active_agent, "all");
     assert_eq!(stored.metadata.provider_id.as_deref(), Some("openai-api"));
     assert_eq!(stored.metadata.model_id.as_deref(), Some("gpt-4.1"));
     assert_eq!(stored.metadata.reasoning_effort, None);
