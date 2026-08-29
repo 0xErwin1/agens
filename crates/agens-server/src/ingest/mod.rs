@@ -492,10 +492,16 @@ impl Ingest {
             .as_ref()
             .map(|paths| serde_json::json!(paths).to_string());
 
+        let charge_attempt_tokens = match observation {
+            Observation::TurnEnded { tokens } if tokens > 0 => Some(tokens),
+            _ => None,
+        };
+
         let outcome = self.store.apply_ingest(&IngestWrite {
             run_id: reported.run_id,
             health: &health,
             freeze_genesis_paths: genesis_json.as_deref(),
+            charge_attempt_tokens,
             events: &events,
         })?;
 

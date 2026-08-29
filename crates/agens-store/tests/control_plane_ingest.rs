@@ -36,6 +36,7 @@ fn an_ingest_write_lands_its_journal_and_its_health_snapshot_together() {
             run_id,
             health: &health_snapshot(run_id, 2),
             freeze_genesis_paths: None,
+            charge_attempt_tokens: None,
             events: &[event(run_id, "turn_ended"), event(run_id, "worker_lost")],
         })
         .unwrap();
@@ -68,6 +69,7 @@ fn an_ingest_write_whose_journal_is_refused_leaves_the_health_snapshot_untouched
             run_id,
             health: &health_snapshot(run_id, 9),
             freeze_genesis_paths: Some(r#"["src/one.rs"]"#),
+            charge_attempt_tokens: None,
             events: &[malformed],
         })
         .unwrap_err();
@@ -94,6 +96,7 @@ fn the_first_freeze_of_genesis_paths_wins_and_a_later_one_never_moves_it() {
             run_id,
             health: &health_snapshot(run_id, 0),
             freeze_genesis_paths: Some(r#"["src/one.rs"]"#),
+            charge_attempt_tokens: None,
             events: &[event(run_id, "genesis_paths_frozen")],
         })
         .unwrap();
@@ -102,6 +105,7 @@ fn the_first_freeze_of_genesis_paths_wins_and_a_later_one_never_moves_it() {
             run_id,
             health: &health_snapshot(run_id, 0),
             freeze_genesis_paths: Some(r#"["src/two.rs"]"#),
+            charge_attempt_tokens: None,
             events: &[event(run_id, "genesis_paths_frozen")],
         })
         .unwrap();

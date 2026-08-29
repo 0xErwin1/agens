@@ -504,6 +504,14 @@ pub struct IngestWrite<'a> {
     /// conditional on the column still being NULL, so the first checkpoint with
     /// a diff wins and no later one moves it.
     pub freeze_genesis_paths: Option<&'a str>,
+    /// Tokens this fact charges to the run's open attempt.
+    ///
+    /// Added to whatever the attempt already carries, so an attempt whose turn
+    /// reported more than once accumulates rather than keeping the last
+    /// report. It lands on the attempt that is still open because that is the
+    /// only one a live fact can be about: ingest refused it already if it came
+    /// from an attempt the run has left.
+    pub charge_attempt_tokens: Option<i64>,
     pub events: &'a [EventRow],
 }
 
@@ -967,6 +975,16 @@ impl ControlPlaneStore {
             }
             None => false,
         };
+
+        if let Some(tokens) = write.charge_attempt_tokens {
+            transaction
+                .execute(
+                    "UPDATE attempts SET tokens = COALESCE(tokens, 0) + ?1
+                     WHERE run_id = ?2 AND ended_at IS NULL",
+                    params![tokens, write.run_id],
+                )
+                .map_err(failure)?;
+        }
 
         record_run_health_row(&transaction, write.health).map_err(failure)?;
 
