@@ -403,6 +403,42 @@ fn a_post_startup_resume_refreshes_the_composers_own_palette_not_just_the_router
     );
 }
 
+/// A resume whose re-discovery fails must not leave the PREVIOUS root's catalogs in
+/// place: the session root moves to root A while the catalogs stay discovered under
+/// root B, and that stale pair makes `SkillResourceTool` refuse every project-skill
+/// call at dispatch time — a per-call refusal for a session-level condition. A failed
+/// re-discovery drops both catalogs instead, so nothing stale stays advertised.
+#[test]
+fn a_post_startup_resume_with_failed_rediscovery_drops_the_previous_roots_catalogs() {
+    let fixture = catalog_confinement_fixture("catalog-confinement-failed-rediscovery");
+
+    // Root A's skills directory becomes a regular file, so skill discovery under the
+    // resumed session's own root fails with an error rather than an empty catalog.
+    let origin_skills = fixture.origin.join("project").join(".agens/skills");
+    std::fs::remove_dir_all(&origin_skills).unwrap();
+    std::fs::write(&origin_skills, "not a directory").unwrap();
+
+    let resume_outcome = fixture
+        .router
+        .route(format!("/resume {}", fixture.metadata_id));
+    assert!(
+        matches!(resume_outcome, TuiSubmissionOutcome::SessionResumed { .. }),
+        "the resume itself still succeeds when only re-discovery fails: {resume_outcome:?}"
+    );
+
+    assert!(
+        matches!(
+            fixture.router.route("/bskill args".into()),
+            TuiSubmissionOutcome::LocalActionableError { .. }
+        ),
+        "root B's skill must not survive a failed re-discovery into root A"
+    );
+    assert!(
+        fixture.router.skills().unwrap().is_empty(),
+        "a failed re-discovery must leave an empty catalog, not the previous root's"
+    );
+}
+
 #[test]
 fn subagent_profile_overlay_renders_origins_and_marks_unavailable_catalog_entries() {
     let bootstrap = bootstrap_from_configuration(
