@@ -2,8 +2,112 @@
 //! steering channel instead of waiting for the turn boundary, and the boundary
 //! queue stays the fallback for anything the turn never collected.
 
-use agens_tui::{AppEvent, AppState, Effect};
-use agens_core::{Message, MessagePart, Role};
+use agens_core::{
+    HeadlessIntraTurnInbox, IntraTurnInputSource, IntraTurnSteeringQueue, Message, MessagePart,
+    Role, TurnEvent,
+};
+use agens_tui::{
+    AppEvent, AppState, Effect, Engine, Event, Key, TranscriptEntry, Tui, TuiProviderOutcome,
+};
+
+#[derive(Default)]
+struct SteerEngine;
+
+impl Engine for SteerEngine {
+    fn cancel(&mut self) {}
+}
+
+fn block_on_ready<T>(future: impl std::future::Future<Output = T>) -> T {
+    let mut future = std::pin::pin!(future);
+    let context = &mut std::task::Context::from_waker(std::task::Waker::noop());
+
+    match future.as_mut().poll(context) {
+        std::task::Poll::Ready(value) => value,
+        std::task::Poll::Pending => panic!("steering drains complete immediately"),
+    }
+}
+
+fn drained_texts(steering: &IntraTurnSteeringQueue) -> Vec<String> {
+    let mut inbox = steering.clone();
+    block_on_ready(inbox.drain())
+        .expect("the steering queue drains")
+        .into_iter()
+        .map(|input| input.text)
+        .collect()
+}
+
+fn steering_tui() -> (Tui<SteerEngine>, IntraTurnSteeringQueue) {
+    let mut tui = Tui::new(SteerEngine);
+    let steering = IntraTurnSteeringQueue::default();
+    tui.set_steering(steering.clone());
+    tui.begin_submission("first");
+    (tui, steering)
+}
+
+fn submit_text(tui: &mut Tui<SteerEngine>, text: &str) {
+    for character in text.chars() {
+        tui.handle(Event::Key(Key::Char(character)));
+    }
+    tui.handle(Event::Key(Key::Enter));
+}
+
+#[test]
+fn a_mid_turn_submission_reaches_the_steering_channel() {
+    let (mut tui, steering) = steering_tui();
+
+    submit_text(&mut tui, "steer me");
+
+    assert_eq!(drained_texts(&steering), ["steer me"]);
+    let entries = tui.queue_entries();
+    assert_eq!(entries.len(), 1);
+    assert!(entries[0].steered());
+}
+
+#[test]
+fn a_collected_steer_moves_from_the_queue_into_the_transcript() {
+    let (mut tui, steering) = steering_tui();
+    submit_text(&mut tui, "steer me");
+
+    tui.apply_progress(TurnEvent::IntraTurnInput {
+        source: IntraTurnInputSource::Human,
+        text: "steer me".into(),
+    });
+
+    assert!(tui.queue_entries().is_empty());
+    assert!(
+        tui.transcript()
+            .iter()
+            .any(|entry| matches!(entry, TranscriptEntry::User(text) if text == "steer me")),
+        "a delivered steer renders as user input"
+    );
+    let _ = steering;
+}
+
+#[test]
+fn a_finished_turn_clears_steers_it_never_collected() {
+    let (mut tui, steering) = steering_tui();
+    submit_text(&mut tui, "steer me");
+
+    let next = tui.finish_provider_turn(TuiProviderOutcome::Completed("done".into()));
+
+    assert_eq!(next.as_deref(), Some("steer me"));
+    assert!(
+        drained_texts(&steering).is_empty(),
+        "an uncollected steer must not leak into the next turn"
+    );
+}
+
+#[test]
+fn removing_a_steered_queue_entry_withdraws_it_from_the_channel() {
+    let (mut tui, steering) = steering_tui();
+    submit_text(&mut tui, "steer me");
+    let id = tui.queue_entries()[0].id();
+
+    assert!(tui.withdraw_queue_entry(id).is_some());
+
+    assert!(drained_texts(&steering).is_empty());
+    assert!(tui.queue_entries().is_empty());
+}
 
 fn running_app(capacity: usize) -> AppState {
     let mut app = AppState::new(capacity);

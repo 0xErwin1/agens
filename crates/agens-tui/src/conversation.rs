@@ -11,6 +11,10 @@ use agens_core::{TuiExecutionState, TuiSubagentEvent, TuiSubagentUpdate};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConversationEvent {
     Info(String),
+    /// Input a person added while this turn was already running, collected at
+    /// one of the turn's safe points. It joins the turn in progress rather
+    /// than opening a new exchange.
+    UserInput(String),
     /// Runtime context the reader must not be able to mistake for prose the
     /// turn produced, because it reports something the runtime could not do.
     FailureNotice(String),
@@ -427,6 +431,9 @@ impl Conversation {
             ConversationEvent::Info(message) => {
                 self.info.push(message.clone());
                 self.items.push(ConversationItem::Info(message));
+            }
+            ConversationEvent::UserInput(text) => {
+                self.items.push(ConversationItem::User(text));
             }
             ConversationEvent::FailureNotice(message) => {
                 self.info.push(message.clone());
