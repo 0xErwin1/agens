@@ -6463,12 +6463,10 @@ fn ask_user_review_lists_every_prompt_and_selected_label_before_submit() {
         three_question_ask_user_request(),
     );
 
-    // Answer each question with its first option, advancing via Enter.
+    // Answer each question with its first option, advancing via Enter; the
+    // last Enter answers the final question and opens review directly.
     tui.handle(Event::Key(Key::Enter));
     tui.handle(Event::Key(Key::Enter));
-    tui.handle(Event::Key(Key::Enter));
-    // On the last question Enter selected option without advancing; open review.
-    walk_to_proceed_for_render(&mut tui);
     tui.handle(Event::Key(Key::Enter));
     renderer.render(tui.view()).unwrap();
 
@@ -6490,17 +6488,6 @@ fn ask_user_review_lists_every_prompt_and_selected_label_before_submit() {
         !text.contains("other:"),
         "review has no free-text entry rows: {text:?}"
     );
-}
-
-/// Walks Down onto the proceed row without asserting via events helpers.
-fn walk_to_proceed_for_render(tui: &mut Tui<FakeEngine>) {
-    for _ in 0..8 {
-        if tui.ask_user_snapshot().map(|s| s.row) == Some(agens_tui::AskUserRowSnapshot::Proceed) {
-            return;
-        }
-        tui.handle(Event::Key(Key::Down));
-    }
-    panic!("proceed row must be reachable");
 }
 
 /// The complaint this pins: typing past the width of the row left the reader

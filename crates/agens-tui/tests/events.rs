@@ -4846,12 +4846,12 @@ fn ask_user_navigation_preserves_a_valid_answer_on_the_first_question() {
 #[test]
 fn ask_user_single_choice_replaces_previous_selection() {
     let mut tui = Tui::new(FakeEngine::default());
-    // Single-question set: Enter selects without advancing past the last item.
+    // Space selects in place, so the second press can replace the first.
     tui.open_ask_user(1, single_question_ask_user_request(false, false, false));
 
-    tui.handle(Event::Key(Key::Enter));
+    tui.handle(Event::Key(Key::Char(' ')));
     tui.handle(Event::Key(Key::Down));
-    tui.handle(Event::Key(Key::Enter));
+    tui.handle(Event::Key(Key::Char(' ')));
 
     let snapshot = tui.ask_user_snapshot().expect("ask-user still open");
     assert_eq!(snapshot.selected, vec![1]);
@@ -4907,8 +4907,8 @@ fn ask_user_enter_on_option_advances_to_the_next_question() {
     assert_eq!(snapshot.question_index, 1);
     assert_eq!(snapshot.row, AskUserRowSnapshot::Option(0));
 
-    // On the last question, the first Enter answers it and stays; a second
-    // Enter has no answer left to give, so it opens the review screen.
+    // On the last question Enter answers and moves straight to review —
+    // there is no question left to advance to.
     tui.handle(Event::Key(Key::Tab));
     assert_eq!(
         tui.ask_user_snapshot().unwrap().question_index,
@@ -4916,48 +4916,79 @@ fn ask_user_enter_on_option_advances_to_the_next_question() {
         "tab reaches the last question"
     );
     assert_eq!(tui.handle(Event::Key(Key::Enter)), Action::Render);
-    let last = tui
-        .ask_user_snapshot()
-        .expect("still open on last question");
-    assert_eq!(last.question_index, 2);
-    assert_eq!(last.selected, vec![0]);
-    assert_eq!(last.row, AskUserRowSnapshot::Option(0));
-
-    assert_eq!(tui.handle(Event::Key(Key::Enter)), Action::Render);
-    assert!(tui.ask_user_snapshot().expect("review open").reviewing);
+    let review = tui.ask_user_snapshot().expect("review open");
+    assert!(review.reviewing);
+    assert_eq!(review.selected, vec![0]);
+    assert_eq!(review.row, AskUserRowSnapshot::Proceed);
 }
 
 #[test]
-fn ask_user_enter_on_answered_last_question_reaches_submit_in_two_keystrokes() {
+fn ask_user_enter_on_last_question_reaches_submit_in_two_keystrokes() {
     let mut tui = Tui::new(FakeEngine::default());
     tui.open_ask_user(1, single_question_ask_user_request(false, false, false));
 
-    // First Enter answers the question and stays.
+    // First Enter answers the question and opens review.
     assert_eq!(tui.handle(Event::Key(Key::Enter)), Action::Render);
-    let snapshot = tui.ask_user_snapshot().expect("still open");
+    let snapshot = tui.ask_user_snapshot().expect("review open");
     assert_eq!(snapshot.selected, vec![0]);
-    assert_eq!(snapshot.row, AskUserRowSnapshot::Option(0));
+    assert!(snapshot.reviewing);
 
-    // Second Enter opens the review screen, where Enter submits.
-    assert_eq!(tui.handle(Event::Key(Key::Enter)), Action::Render);
-    assert!(tui.ask_user_snapshot().expect("review open").reviewing);
+    // Second Enter submits from review.
     tui.handle(Event::Key(Key::Enter));
     assert!(tui.ask_user_snapshot().is_none());
 }
 
 #[test]
-fn ask_user_enter_on_unanswered_last_question_never_leaves_the_options() {
+fn ask_user_enter_on_unanswered_last_question_answers_and_opens_review() {
     let mut tui = Tui::new(FakeEngine::default());
     tui.open_ask_user(1, three_question_ask_user_request());
 
-    // Land on the last question without answering it: Enter answers in place,
-    // so a reader can never jump past the question without answering first.
+    // Land on the last question without answering it: Enter answers it and
+    // moves on to review, because answering was the only thing left to do.
     tui.handle(Event::Key(Key::Tab));
     tui.handle(Event::Key(Key::Tab));
     assert_eq!(tui.handle(Event::Key(Key::Enter)), Action::Render);
     let snapshot = tui.ask_user_snapshot().expect("still open");
-    assert_eq!(snapshot.question_index, 2);
     assert_eq!(snapshot.selected, vec![0]);
+    assert!(snapshot.reviewing);
+}
+
+#[test]
+fn ask_user_right_on_last_question_opens_review_even_unanswered() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.open_ask_user(1, three_question_ask_user_request());
+
+    tui.handle(Event::Key(Key::Right));
+    tui.handle(Event::Key(Key::Right));
+    assert_eq!(tui.ask_user_snapshot().unwrap().question_index, 2);
+
+    // Right past the last question opens review with nothing answered —
+    // skips are accepted at submit time, so navigation must not gate on them.
+    assert_eq!(tui.handle(Event::Key(Key::Right)), Action::Render);
+    let review = tui.ask_user_snapshot().expect("review open");
+    assert!(review.reviewing);
+    assert_eq!(review.row, AskUserRowSnapshot::Proceed);
+
+    // A further Right has nowhere left to go.
+    assert_eq!(tui.handle(Event::Key(Key::Right)), Action::Unchanged);
+}
+
+#[test]
+fn ask_user_left_while_reviewing_returns_to_the_last_question() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.open_ask_user(1, three_question_ask_user_request());
+
+    tui.handle(Event::Key(Key::Right));
+    tui.handle(Event::Key(Key::Right));
+    tui.handle(Event::Key(Key::Right));
+    assert!(tui.ask_user_snapshot().unwrap().reviewing);
+
+    // Left undoes the Right that opened review: back onto the last question,
+    // not past it.
+    assert_eq!(tui.handle(Event::Key(Key::Left)), Action::Render);
+    let snapshot = tui.ask_user_snapshot().expect("still open");
+    assert!(!snapshot.reviewing);
+    assert_eq!(snapshot.question_index, 2);
     assert_eq!(snapshot.row, AskUserRowSnapshot::Option(0));
 }
 
@@ -5080,7 +5111,8 @@ fn ask_user_submit_when_complete_resolves_answered_in_request_order() {
     let mut tui = Tui::new(FakeEngine::default());
     tui.open_ask_user(9, request.clone());
 
-    tui.handle(Event::Key(Key::Enter));
+    // Space selects in place so the free-text buffers stay reachable.
+    tui.handle(Event::Key(Key::Char(' ')));
     type_into_buffer(&mut tui, 'o', "more");
     type_into_buffer(&mut tui, 'n', "nb");
     tui.handle(Event::Key(Key::Down));
@@ -5196,8 +5228,7 @@ fn ask_user_submit_from_review_accepts_skipped_questions() {
     tui.handle(Event::Key(Key::Tab));
     tui.handle(Event::Key(Key::Tab));
     assert_eq!(tui.ask_user_snapshot().unwrap().question_index, 2);
-    tui.handle(Event::Key(Key::Enter));
-    walk_to_proceed_row(&mut tui);
+    // Enter answers the last question and opens review directly.
     assert_eq!(tui.handle(Event::Key(Key::Enter)), Action::Render);
     assert!(tui.ask_user_snapshot().unwrap().reviewing);
     let action = tui.handle(Event::Key(Key::Enter));
@@ -5417,13 +5448,17 @@ fn ask_user_no_op_keys_report_unchanged() {
         Action::Unchanged
     );
 
-    let mut reselect = Tui::new(FakeEngine::default());
-    reselect.open_ask_user(1, single_question_ask_user_request(false, false, false));
-    reselect.handle(Event::Key(Key::Enter));
-    // Enter on the already-selected option of the answered last question is a
-    // selection no-op, so it advances to the review screen instead.
-    assert_eq!(reselect.handle(Event::Key(Key::Enter)), Action::Render);
-    assert!(reselect.ask_user_snapshot().expect("review open").reviewing);
+    let mut reviewing = Tui::new(FakeEngine::default());
+    reviewing.open_ask_user(1, single_question_ask_user_request(false, false, false));
+    reviewing.handle(Event::Key(Key::Enter));
+    assert!(
+        reviewing
+            .ask_user_snapshot()
+            .expect("review open")
+            .reviewing
+    );
+    // Review is the end of the line: Right has nowhere further to go.
+    assert_eq!(reviewing.handle(Event::Key(Key::Right)), Action::Unchanged);
 }
 
 #[test]
