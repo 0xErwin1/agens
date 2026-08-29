@@ -37,10 +37,12 @@ use agens_bootstrap::Bootstrap;
 use agens_diagnostics::next_diagnostic_reference;
 use agens_dispatch::origin_launches_selected_subagent;
 use agens_error::{CliError, ExitStatus};
+#[cfg(any(test, feature = "test-support"))]
+use agens_headless::run_production_headless_chat_with_progress;
 use agens_headless::seed_configured_reasoning_effort;
 use agens_headless::{
     HeadlessChatCompletion, HeadlessChatFailure, HeadlessChatRequest,
-    run_production_headless_chat_with_progress,
+    run_production_headless_chat_with_progress_and_steering,
 };
 use agens_session::context::{ResumeDraft, SessionContext};
 use agens_session::provider::CredentialResolver;
@@ -168,6 +170,10 @@ pub fn run_production_tui_with_options(
         cancellation: Arc::clone(&cancellation),
     };
     let mut tui = Tui::new(engine);
+    // One shared channel for the whole session: the TUI writes prompts into it
+    // while a turn runs, and each foreground turn drains it at its safe points.
+    let steering = agens_core::IntraTurnSteeringQueue::default();
+    tui.set_steering(steering.clone());
     tui.adopt_environment();
     if let Some(notice) = startup_notice {
         tui.add_info(notice);
@@ -496,7 +502,7 @@ pub fn run_production_tui_with_options(
                         &router.session,
                         &task_runtime.dispatcher,
                     )?;
-                    run_production_headless_chat_with_progress(
+                    run_production_headless_chat_with_progress_and_steering(
                         request,
                         &runtime_bootstrap,
                         &turn_cancellation,
@@ -510,6 +516,7 @@ pub fn run_production_tui_with_options(
                         }),
                         Some(&task_runtime),
                         Some(&task_diagnostic_reference),
+                        steering.clone(),
                     )
                 },
             );

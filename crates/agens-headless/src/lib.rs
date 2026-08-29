@@ -28,4 +28,5 @@ pub use turn::{
     headless_turn_system_prompt, run_production_headless_chat_executing_run,
     run_production_headless_chat_with_progress,
     run_production_headless_chat_with_progress_and_ask_user,
+    run_production_headless_chat_with_progress_and_steering,
 };

@@ -8,6 +8,17 @@ use agens_core::{Message, MessagePart, Role};
 const RUNNING_REFUSAL: &str = "This command is unavailable while a response is in progress.";
 const QUEUE_FULL_REFUSAL: &str = "Prompt queue is full; draft was kept unchanged.";
 
+fn queued_message_text(message: &Message) -> String {
+    message
+        .parts
+        .iter()
+        .filter_map(|part| match part {
+            MessagePart::Text(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
 fn text_message(text: String) -> Message {
     Message {
         role: Role::User,
@@ -81,6 +92,7 @@ pub struct QueueEntry {
     prompt: String,
     message: Message,
     resolved: bool,
+    steered: bool,
 }
 
 /// A prompt-scheduler transition safe to expose to local diagnostics.
@@ -91,6 +103,8 @@ pub enum PromptTransition {
     Queued,
     Dequeued,
     Removed,
+    SteerRequested,
+    SteeringDelivered,
     CancellationRequested,
     CancellationConfirmed,
     StaleEventDropped,
@@ -103,6 +117,8 @@ pub struct PromptObservability {
     queued: u64,
     dequeued: u64,
     removed: u64,
+    steer_requested: u64,
+    steering_delivered: u64,
     cancellation_requested: u64,
     cancellation_confirmed: u64,
     stale_event_dropped: u64,
@@ -119,6 +135,12 @@ impl PromptObservability {
     }
     pub const fn removed(&self) -> u64 {
         self.removed
+    }
+    pub const fn steer_requested(&self) -> u64 {
+        self.steer_requested
+    }
+    pub const fn steering_delivered(&self) -> u64 {
+        self.steering_delivered
     }
     pub const fn cancellation_requested(&self) -> u64 {
         self.cancellation_requested
@@ -141,6 +163,8 @@ impl PromptObservability {
             PromptTransition::Queued => self.queued += 1,
             PromptTransition::Dequeued => self.dequeued += 1,
             PromptTransition::Removed => self.removed += 1,
+            PromptTransition::SteerRequested => self.steer_requested += 1,
+            PromptTransition::SteeringDelivered => self.steering_delivered += 1,
             PromptTransition::CancellationRequested => self.cancellation_requested += 1,
             PromptTransition::CancellationConfirmed => self.cancellation_confirmed += 1,
             PromptTransition::StaleEventDropped => self.stale_event_dropped += 1,
@@ -158,6 +182,7 @@ impl QueueEntry {
             prompt,
             message,
             resolved: false,
+            steered: false,
         }
     }
 
@@ -167,6 +192,7 @@ impl QueueEntry {
             prompt: display,
             message,
             resolved: true,
+            steered: false,
         }
     }
 
@@ -183,6 +209,14 @@ impl QueueEntry {
     /// Returns the immutable canonical content owned by this queue entry.
     pub fn message(&self) -> &Message {
         &self.message
+    }
+
+    /// Whether this entry was also handed to the mid-turn steering channel.
+    ///
+    /// A steered entry stays queued until the running turn confirms it took
+    /// the message; until then the boundary queue remains its fallback.
+    pub const fn steered(&self) -> bool {
+        self.steered
     }
 }
 
@@ -221,6 +255,10 @@ pub enum AppEvent {
         display: String,
         message: Message,
     },
+    /// The running turn collected a steered message at one of its safe points.
+    SteeringDelivered {
+        text: String,
+    },
     /// The active turn completed successfully with its final output.
     TurnCompletedFor {
         generation: u64,
@@ -257,6 +295,11 @@ pub enum Effect {
         display: String,
         message: Message,
     },
+    /// Hand this queued entry's text to the running turn's steering channel.
+    SteerPrompt {
+        id: u64,
+        text: String,
+    },
     /// Persist a successfully completed prompt and output pair.
     PersistCompleted {
         prompt: String,
@@ -290,6 +333,7 @@ pub struct AppState {
     dialog: Option<Dialog>,
     exit_armed_until: Option<Instant>,
     pending_auto_turns: usize,
+    steering_enabled: bool,
     observability: PromptObservability,
 }
 
@@ -305,6 +349,7 @@ impl PartialEq for AppState {
             && self.dialog == other.dialog
             && self.exit_armed_until == other.exit_armed_until
             && self.pending_auto_turns == other.pending_auto_turns
+            && self.steering_enabled == other.steering_enabled
     }
 }
 
@@ -326,8 +371,16 @@ impl AppState {
             dialog: None,
             exit_armed_until: None,
             pending_auto_turns: 0,
+            steering_enabled: false,
             observability: PromptObservability::default(),
         }
+    }
+
+    /// Turns on mid-turn steering. Only the runtime that actually installed a
+    /// steering channel calls this; without it, a prompt submitted while a
+    /// turn runs waits in the boundary queue exactly as it always has.
+    pub fn enable_steering(&mut self) {
+        self.steering_enabled = true;
     }
 
     /// Applies one event and returns the runtime work required by its transition.
@@ -336,6 +389,7 @@ impl AppState {
             AppEvent::SubmitPrompt(prompt) => self.submit_prompt(prompt),
             AppEvent::QueuePrompt { display, prompt } => self.queue_prompt(display, prompt),
             AppEvent::QueueMessage { display, message } => self.queue_message(display, message),
+            AppEvent::SteeringDelivered { text } => self.steering_delivered(&text),
             AppEvent::TurnCompletedFor { generation, output } => {
                 self.complete_turn(generation, output)
             }
@@ -474,9 +528,7 @@ impl AppState {
 
         let entry = QueueEntry::new(self.next_queue_entry_id, prompt);
         self.next_queue_entry_id += 1;
-        self.queued_prompts.push_back(entry);
-        self.observability.record(PromptTransition::Queued);
-        Vec::new()
+        self.enqueue_running(entry)
     }
 
     fn queue_prompt(&mut self, display: String, prompt: String) -> Vec<Effect> {
@@ -495,8 +547,66 @@ impl AppState {
 
         let entry = QueueEntry::resolved_message(self.next_queue_entry_id, display, message);
         self.next_queue_entry_id += 1;
+        self.enqueue_running(entry)
+    }
+
+    /// Queues one entry behind the active turn, steering it when the channel
+    /// can carry it. The entry stays queued either way: the boundary queue is
+    /// the fallback for a steer the turn never collects, and only a confirmed
+    /// [`AppEvent::SteeringDelivered`] takes it out early.
+    fn enqueue_running(&mut self, mut entry: QueueEntry) -> Vec<Effect> {
+        let steer = self.steerable_text(&entry.message);
+        entry.steered = steer.is_some();
+        let id = entry.id;
         self.queued_prompts.push_back(entry);
         self.observability.record(PromptTransition::Queued);
+
+        let Some(text) = steer else {
+            return Vec::new();
+        };
+        self.observability.record(PromptTransition::SteerRequested);
+        vec![Effect::SteerPrompt { id, text }]
+    }
+
+    /// The text a message can be steered as, when it can be steered at all.
+    ///
+    /// Only a text-only message reaches a running turn mid-flight: the
+    /// steering channel carries text, so a message with media waits at the
+    /// boundary where its parts survive intact. A cancelling turn is not
+    /// steered either — it is already ending, and its collection points are
+    /// gone.
+    fn steerable_text(&self, message: &Message) -> Option<String> {
+        if !self.steering_enabled || !matches!(self.lifecycle, TurnLifecycle::Running(_)) {
+            return None;
+        }
+
+        let mut text = String::new();
+        for part in &message.parts {
+            match part {
+                MessagePart::Text(part) => text.push_str(part),
+                _ => return None,
+            }
+        }
+
+        (!text.is_empty()).then_some(text)
+    }
+
+    /// Retires the oldest steered entry the running turn confirmed it took.
+    ///
+    /// Matched by text because the confirmation travels back through the
+    /// turn's progress events, which carry what was said and not who queued
+    /// it. An unmatched confirmation is an externally steered message (for
+    /// example `agens direct`) and changes nothing here.
+    fn steering_delivered(&mut self, text: &str) -> Vec<Effect> {
+        let Some(position) = self.queued_prompts.iter().position(|entry| {
+            entry.steered && self.steering_enabled && queued_message_text(&entry.message) == text
+        }) else {
+            return Vec::new();
+        };
+
+        self.queued_prompts.remove(position);
+        self.observability
+            .record(PromptTransition::SteeringDelivered);
         Vec::new()
     }
 

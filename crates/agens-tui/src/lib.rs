@@ -57,7 +57,9 @@ use agens_core::ask_user::{AskUserMode, AskUserQuestion, AskUserReply, AskUserRe
 use agens_core::{
     HistoryBrowseResult, Message, PromptMemory, PromptRecall, Role, media_chip_label,
 };
-use agens_core::{MessagePart, TurnEvent, TurnState, Usage};
+use agens_core::{
+    IntraTurnInputSource, IntraTurnSteeringQueue, MessagePart, TurnEvent, TurnState, Usage,
+};
 use ask_user::{AskUserEntry, AskUserOutcome, AskUserRow, AskUserState};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use crossterm::{
@@ -6359,6 +6361,10 @@ impl AttachmentToken {
 pub struct Tui<E> {
     engine: E,
     scheduler: AppState,
+    /// The mid-turn steering channel of the runtime driving this TUI, when it
+    /// installed one. Prompts submitted while a turn runs ride it to the
+    /// turn's next safe point instead of waiting for the boundary queue.
+    steering: Option<IntraTurnSteeringQueue>,
     busy_policy_routing: bool,
     surface_focus: SurfaceFocus,
     queue_selected: Option<usize>,
@@ -6474,6 +6480,7 @@ where
         Self {
             engine,
             scheduler: AppState::new(queue_capacity),
+            steering: None,
             busy_policy_routing: false,
             surface_focus: SurfaceFocus::Composer,
             queue_selected: None,
@@ -7087,6 +7094,55 @@ where
         self.busy_policy_routing = true;
     }
 
+    /// Installs the runtime's mid-turn steering channel and turns steering on.
+    ///
+    /// Only a runtime that actually drains this channel inside its turns may
+    /// install it: an installed channel nobody reads would hold prompts the
+    /// terminal clear at turn end silently drops back to the boundary queue.
+    pub fn set_steering(&mut self, steering: IntraTurnSteeringQueue) {
+        self.scheduler.enable_steering();
+        self.steering = Some(steering);
+    }
+
+    /// Hands each requested steer to the installed channel.
+    ///
+    /// The queue entry stays behind as the fallback: it leaves the queue only
+    /// when the turn's own progress confirms the message was collected.
+    fn dispatch_steer_effects(&self, effects: &[Effect]) {
+        let Some(steering) = &self.steering else {
+            return;
+        };
+
+        for effect in effects {
+            if let Effect::SteerPrompt { id, text } = effect {
+                steering.push(*id, IntraTurnInputSource::Human, text.clone());
+            }
+        }
+    }
+
+    /// Removes an undispatched queue entry, withdrawing its steer copy so a
+    /// message the user deleted can no longer reach the running turn.
+    pub fn withdraw_queue_entry(&mut self, id: u64) -> Option<QueueEntry> {
+        let entry = self.scheduler.remove_queue_entry(id)?;
+
+        if entry.steered()
+            && let Some(steering) = &self.steering
+        {
+            steering.withdraw(id);
+        }
+
+        Some(entry)
+    }
+
+    /// Drops every steer the finished turn never collected. The entries are
+    /// still queued, so the boundary drain that follows delivers them as the
+    /// next turn instead of losing them.
+    fn clear_uncollected_steers(&self) {
+        if let Some(steering) = &self.steering {
+            steering.clear();
+        }
+    }
+
     /// Starts the turn a finished background subagent scheduled, but only at a safe point.
     ///
     /// The shared runtime rejects a concurrent turn, and firing over a composer the user is
@@ -7674,6 +7730,12 @@ where
                 .reduce(AppEvent::TurnFailedFor { generation });
             return None;
         }
+
+        // The turn is over, so nothing will drain the channel again. Anything
+        // still in it stays queued at the boundary; dropping the copies here is
+        // what keeps a leftover steer from leaking into the next turn's drain
+        // and arriving twice.
+        self.clear_uncollected_steers();
 
         let terminal_event = match &outcome {
             TuiProviderOutcome::Completed(output) => Some(AppEvent::TurnCompletedFor {
@@ -9129,6 +9191,23 @@ where
                 }
             }
             TurnEvent::StateChanged(state) => self.turn_state = Some(state),
+            TurnEvent::IntraTurnInput { source, text } => match source {
+                // Only a human collection can be one of this terminal's own
+                // steers: everything it pushes is pushed as human input, so a
+                // supervisor delivery must never retire a queued entry that
+                // happens to carry the same text.
+                IntraTurnInputSource::Human => {
+                    let delivered = AppEvent::SteeringDelivered { text: text.clone() };
+                    let _ = self.scheduler.reduce(delivered);
+                    self.transcript.push(TranscriptEntry::User(text.clone()));
+                    self.project_conversation(ConversationEvent::UserInput(text));
+                }
+                IntraTurnInputSource::Supervisor => {
+                    let notice = format!("supervisor: {text}");
+                    self.transcript.push(TranscriptEntry::Info(notice.clone()));
+                    self.project_conversation(ConversationEvent::Info(notice));
+                }
+            },
             TurnEvent::ProviderRetry {
                 attempt,
                 max_attempts,
@@ -9921,7 +10000,7 @@ where
             };
             entry.id()
         };
-        let _ = self.scheduler.remove_queue_entry(id);
+        let _ = self.withdraw_queue_entry(id);
         let remaining = self.scheduler.queued_entries().len();
         self.queue_selected = (remaining > 0).then_some(selected.min(remaining - 1));
     }
@@ -9937,7 +10016,7 @@ where
             };
             entry.id()
         };
-        let Some(entry) = self.scheduler.remove_queue_entry(id) else {
+        let Some(entry) = self.withdraw_queue_entry(id) else {
             return;
         };
         self.input = entry.prompt().to_owned();
@@ -9953,6 +10032,7 @@ where
             self.status = Some(message.clone());
             return Action::Render;
         }
+        self.dispatch_steer_effects(&effects);
         self.record_prompt_history(&Message {
             role: Role::User,
             parts: (!draft.is_empty())
@@ -10002,6 +10082,7 @@ where
             self.status = Some(reason.clone());
             return;
         }
+        self.dispatch_steer_effects(&effects);
         self.record_prompt_history(&message);
         self.claim_composer_media(&message);
         self.clear_composer();

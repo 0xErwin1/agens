@@ -6,9 +6,9 @@ use agens_core::{
     AttemptKey, CompletedTurnRepository, CompletedTurnSnapshot, CompletedTurnStoreError, FactPath,
     HeadlessIntraTurnInbox, HeadlessPermissionGate, HeadlessPermissionResolver, HeadlessToolCall,
     HeadlessToolDispatcher, HeadlessToolOutput, HeadlessTurnCancellation, HeadlessTurnError,
-    HeadlessTurnPortError, IntraTurnInputSource, Message, MessagePart, PendingIntraTurnInput,
-    PermissionDecision, Role, ToolOutcome, ToolResultFacts, TurnEvent, TurnProgressSink,
-    TurnProvider, TurnState, run_headless_turn, run_headless_turn_with_inbox,
+    HeadlessTurnPortError, IntraTurnInputSource, IntraTurnSteeringQueue, Message, MessagePart,
+    PendingIntraTurnInput, PermissionDecision, Role, ToolOutcome, ToolResultFacts, TurnEvent,
+    TurnProgressSink, TurnProvider, TurnState, run_headless_turn, run_headless_turn_with_inbox,
     run_headless_turn_with_max_iterations, run_headless_turn_with_progress,
 };
 
@@ -1462,4 +1462,90 @@ fn an_empty_inbox_leaves_a_turn_byte_for_byte_unchanged() {
     .expect("the turn completes");
 
     assert_eq!(with_inbox.events(), without_inbox.events());
+}
+
+/// The in-process steering queue is an inbox like any other: a message pushed
+/// while the turn runs lands after the tool batch, is recorded as intra-turn
+/// input, and is handed to the provider before the next request goes out.
+#[test]
+fn a_steering_queue_message_reaches_the_provider_after_a_tool_batch() {
+    let steering = IntraTurnSteeringQueue::default();
+    steering.push(7, IntraTurnInputSource::Human, "focus on the tests".into());
+
+    let mut provider = Provider::new(vec![
+        Ok(vec![MessagePart::ToolCall {
+            id: "call-1".into(),
+            name: "git_read".into(),
+            input: r#"{"operation":"diff"}"#.into(),
+        }]),
+        Ok(vec![MessagePart::Text("acknowledged".into())]),
+    ]);
+    let queued = Arc::clone(&provider.queued);
+
+    let mut inbox = steering.clone();
+    let snapshot = block_on_ready(run_headless_turn_with_inbox(
+        &mut provider,
+        &mut PermissionGate {
+            decisions: vec![PermissionDecision::Allow],
+            denial_facts: None,
+        },
+        &mut PermissionResolver::default(),
+        &mut ToolDispatcher {
+            outputs: vec![Ok(HeadlessToolOutput::success("diff"))],
+            calls: Vec::new(),
+        },
+        &mut Repository::default(),
+        &HeadlessTurnCancellation::new(),
+        None,
+        None,
+        None,
+        &mut inbox,
+    ))
+    .expect("the turn completes after collecting the steer");
+
+    let events = snapshot.events();
+    let input_at = events
+        .iter()
+        .position(|event| matches!(event, TurnEvent::IntraTurnInput { .. }))
+        .expect("the steer is recorded");
+    let result_at = events
+        .iter()
+        .position(|event| matches!(event, TurnEvent::ToolResult(_)))
+        .expect("the tool ran");
+    assert!(input_at > result_at, "{events:?}");
+    assert_eq!(
+        events[input_at],
+        TurnEvent::IntraTurnInput {
+            source: IntraTurnInputSource::Human,
+            text: "focus on the tests".into(),
+        }
+    );
+
+    assert_eq!(
+        *queued.lock().unwrap(),
+        vec![Message {
+            role: Role::User,
+            parts: vec![MessagePart::Text("focus on the tests".into())],
+        }]
+    );
+}
+
+/// A withdrawn steer never reaches the turn, and clearing the queue empties
+/// every remaining entry at once.
+#[test]
+fn withdrawn_and_cleared_steering_messages_are_never_delivered() {
+    let steering = IntraTurnSteeringQueue::default();
+    steering.push(1, IntraTurnInputSource::Human, "first".into());
+    steering.push(2, IntraTurnInputSource::Human, "second".into());
+
+    assert!(steering.withdraw(1));
+    assert!(!steering.withdraw(1));
+
+    steering.push(3, IntraTurnInputSource::Human, "third".into());
+    steering.clear();
+
+    let mut inbox = steering;
+    let drained = block_on_ready(HeadlessIntraTurnInbox::drain(&mut inbox))
+        .expect("an empty steering queue drains cleanly");
+    assert!(drained.is_empty());
 }
