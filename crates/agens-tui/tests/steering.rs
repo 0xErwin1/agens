@@ -140,7 +140,10 @@ fn steering_stays_off_unless_the_runtime_installed_a_channel() {
     let mut app = AppState::new(4);
     app.reduce(AppEvent::SubmitPrompt("first".into()));
 
-    assert!(app.reduce(AppEvent::SubmitPrompt("queued".into())).is_empty());
+    assert!(
+        app.reduce(AppEvent::SubmitPrompt("queued".into()))
+            .is_empty()
+    );
     assert!(!app.queued_entries()[0].steered());
 }
 

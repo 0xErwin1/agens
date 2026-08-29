@@ -143,7 +143,8 @@ impl agens_core::HeadlessIntraTurnInbox for SteeredDirectiveInbox {
         Output = Result<Vec<agens_core::PendingIntraTurnInput>, agens_core::HeadlessTurnPortError>,
     > + Send {
         async move {
-            let mut inputs = agens_core::HeadlessIntraTurnInbox::drain(&mut self.directives).await?;
+            let mut inputs =
+                agens_core::HeadlessIntraTurnInbox::drain(&mut self.directives).await?;
 
             if let Some(steering) = self.steering.as_mut() {
                 inputs.extend(agens_core::HeadlessIntraTurnInbox::drain(steering).await?);
@@ -2107,8 +2108,10 @@ mod tests {
 
     impl Temporary {
         fn new(label: &str) -> Self {
-            let path = std::env::temp_dir()
-                .join(format!("agens-steered-inbox-{label}-{}", std::process::id()));
+            let path = std::env::temp_dir().join(format!(
+                "agens-steered-inbox-{label}-{}",
+                std::process::id()
+            ));
             std::fs::remove_dir_all(&path).ok();
             std::fs::create_dir_all(&path).expect("test data directory");
             Self { path }

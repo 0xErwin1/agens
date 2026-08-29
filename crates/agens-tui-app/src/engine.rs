@@ -37,13 +37,13 @@ use agens_bootstrap::Bootstrap;
 use agens_diagnostics::next_diagnostic_reference;
 use agens_dispatch::origin_launches_selected_subagent;
 use agens_error::{CliError, ExitStatus};
+#[cfg(any(test, feature = "test-support"))]
+use agens_headless::run_production_headless_chat_with_progress;
 use agens_headless::seed_configured_reasoning_effort;
 use agens_headless::{
     HeadlessChatCompletion, HeadlessChatFailure, HeadlessChatRequest,
     run_production_headless_chat_with_progress_and_steering,
 };
-#[cfg(any(test, feature = "test-support"))]
-use agens_headless::run_production_headless_chat_with_progress;
 use agens_session::context::{ResumeDraft, SessionContext};
 use agens_session::provider::CredentialResolver;
 use agens_session::undo::{
