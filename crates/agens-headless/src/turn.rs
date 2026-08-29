@@ -137,21 +137,16 @@ struct SteeredDirectiveInbox {
 }
 
 impl agens_core::HeadlessIntraTurnInbox for SteeredDirectiveInbox {
-    fn drain(
+    async fn drain(
         &mut self,
-    ) -> impl std::future::Future<
-        Output = Result<Vec<agens_core::PendingIntraTurnInput>, agens_core::HeadlessTurnPortError>,
-    > + Send {
-        async move {
-            let mut inputs =
-                agens_core::HeadlessIntraTurnInbox::drain(&mut self.directives).await?;
+    ) -> Result<Vec<agens_core::PendingIntraTurnInput>, agens_core::HeadlessTurnPortError> {
+        let mut inputs = agens_core::HeadlessIntraTurnInbox::drain(&mut self.directives).await?;
 
-            if let Some(steering) = self.steering.as_mut() {
-                inputs.extend(agens_core::HeadlessIntraTurnInbox::drain(steering).await?);
-            }
-
-            Ok(inputs)
+        if let Some(steering) = self.steering.as_mut() {
+            inputs.extend(agens_core::HeadlessIntraTurnInbox::drain(steering).await?);
         }
+
+        Ok(inputs)
     }
 }
 

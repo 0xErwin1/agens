@@ -9191,21 +9191,23 @@ where
                 }
             }
             TurnEvent::StateChanged(state) => self.turn_state = Some(state),
-            TurnEvent::IntraTurnInput { source, text } => {
-                let delivered = AppEvent::SteeringDelivered { text: text.clone() };
-                let _ = self.scheduler.reduce(delivered);
-                match source {
-                    IntraTurnInputSource::Human => {
-                        self.transcript.push(TranscriptEntry::User(text.clone()));
-                        self.project_conversation(ConversationEvent::UserInput(text));
-                    }
-                    IntraTurnInputSource::Supervisor => {
-                        let notice = format!("supervisor: {text}");
-                        self.transcript.push(TranscriptEntry::Info(notice.clone()));
-                        self.project_conversation(ConversationEvent::Info(notice));
-                    }
+            TurnEvent::IntraTurnInput { source, text } => match source {
+                // Only a human collection can be one of this terminal's own
+                // steers: everything it pushes is pushed as human input, so a
+                // supervisor delivery must never retire a queued entry that
+                // happens to carry the same text.
+                IntraTurnInputSource::Human => {
+                    let delivered = AppEvent::SteeringDelivered { text: text.clone() };
+                    let _ = self.scheduler.reduce(delivered);
+                    self.transcript.push(TranscriptEntry::User(text.clone()));
+                    self.project_conversation(ConversationEvent::UserInput(text));
                 }
-            }
+                IntraTurnInputSource::Supervisor => {
+                    let notice = format!("supervisor: {text}");
+                    self.transcript.push(TranscriptEntry::Info(notice.clone()));
+                    self.project_conversation(ConversationEvent::Info(notice));
+                }
+            },
             TurnEvent::ProviderRetry {
                 attempt,
                 max_attempts,

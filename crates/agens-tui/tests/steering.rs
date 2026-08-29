@@ -290,3 +290,16 @@ fn a_full_queue_still_refuses_before_steering() {
 
     assert!(matches!(effects.first(), Some(Effect::RefusePrompt(_))));
 }
+
+#[test]
+fn a_supervisor_delivery_never_retires_a_queued_user_steer() {
+    let (mut tui, _steering) = steering_tui();
+    submit_text(&mut tui, "steer me");
+
+    tui.apply_progress(TurnEvent::IntraTurnInput {
+        source: IntraTurnInputSource::Supervisor,
+        text: "steer me".into(),
+    });
+
+    assert_eq!(tui.queue_entries().len(), 1);
+}
