@@ -1,10 +1,11 @@
 use std::{
     borrow::Cow,
+    collections::VecDeque,
     fmt,
     future::{Future, ready},
     path::{Component, Path},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -1770,6 +1771,7 @@ pub trait HeadlessPermissionResolver {
 }
 
 /// Input waiting to be handed to a running turn.
+#[derive(Debug)]
 pub struct PendingIntraTurnInput {
     pub source: IntraTurnInputSource,
     pub text: String,
@@ -1797,6 +1799,66 @@ impl HeadlessIntraTurnInbox for NoIntraTurnInput {
     ) -> impl Future<Output = Result<Vec<PendingIntraTurnInput>, HeadlessTurnPortError>> + Send
     {
         ready(Ok(Vec::new()))
+    }
+}
+
+/// An in-process steering channel for a locally driven turn.
+///
+/// The writer side is the surface that accepted the message (the TUI while its
+/// turn is running) and the reader side is the turn loop, which drains it at
+/// the same safe point as every other inbox. Entries carry the writer's own
+/// identifier so an entry the person withdrew before the turn collected it is
+/// never delivered.
+///
+/// A poisoned lock degrades to an empty channel rather than failing the turn:
+/// losing a steer is bad, and killing work in progress over it is worse.
+#[derive(Clone, Debug, Default)]
+pub struct IntraTurnSteeringQueue {
+    inner: Arc<Mutex<VecDeque<(u64, PendingIntraTurnInput)>>>,
+}
+
+impl IntraTurnSteeringQueue {
+    /// Queues one message for the next safe point of the running turn.
+    pub fn push(&self, id: u64, source: IntraTurnInputSource, text: String) {
+        if let Ok(mut entries) = self.inner.lock() {
+            entries.push_back((id, PendingIntraTurnInput { source, text }));
+        }
+    }
+
+    /// Removes an entry the turn has not collected yet. Returns whether it was
+    /// still waiting; a `false` means the turn already took it.
+    pub fn withdraw(&self, id: u64) -> bool {
+        let Ok(mut entries) = self.inner.lock() else {
+            return false;
+        };
+        let Some(position) = entries.iter().position(|(entry_id, _)| *entry_id == id) else {
+            return false;
+        };
+
+        entries.remove(position);
+        true
+    }
+
+    /// Drops every entry the turn never collected. The owner keeps its own
+    /// copies, so what is cleared here is the delivery attempt, not the text.
+    pub fn clear(&self) {
+        if let Ok(mut entries) = self.inner.lock() {
+            entries.clear();
+        }
+    }
+}
+
+impl HeadlessIntraTurnInbox for IntraTurnSteeringQueue {
+    fn drain(
+        &mut self,
+    ) -> impl Future<Output = Result<Vec<PendingIntraTurnInput>, HeadlessTurnPortError>> + Send
+    {
+        let drained = self.inner.lock().map_or_else(
+            |_| Vec::new(),
+            |mut entries| entries.drain(..).map(|(_, input)| input).collect(),
+        );
+
+        ready(Ok(drained))
     }
 }
 
