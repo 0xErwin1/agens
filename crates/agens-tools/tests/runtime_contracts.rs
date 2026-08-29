@@ -251,11 +251,13 @@ fn registry_replacement_invalidates_an_already_authorized_call() {
         panic!("read-only tool should be authorized");
     };
 
-    dispatcher.replace_native(
-        "native::read",
-        ToolAccess::ReadOnly,
-        CountingTool(Arc::clone(&replacement_calls)),
-    );
+    dispatcher
+        .replace_native(
+            "native::read",
+            ToolAccess::ReadOnly,
+            CountingTool(Arc::clone(&replacement_calls)),
+        )
+        .unwrap();
     assert!(
         dispatcher
             .execute(

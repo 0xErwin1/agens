@@ -170,7 +170,10 @@ pub fn mcp_servers_with_defaults(
                 .get("disabled")
                 .and_then(toml::Value::as_bool)
                 .unwrap_or(false);
-            if name.is_empty() || name.contains("::") {
+            // `native` is the namespace the dispatcher qualifies its own tools
+            // under, so a server by that name would make `native::<tool>` rules
+            // bind to the remote tool instead of the native one.
+            if name.is_empty() || name.contains("::") || name == "native" {
                 return Err(invalid_field("mcp", name));
             }
             if disabled && !server.contains_key("transport") {
