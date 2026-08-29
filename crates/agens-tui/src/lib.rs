@@ -2587,6 +2587,10 @@ fn render_frame_content(frame: &mut ratatui::Frame<'_>, state: &ViewState<'_>) {
 /// [`widgets::DisplayMode::Expanded`] draws every argument row: the other levels hide
 /// a body in the transcript, which the overlay must never do — it exists to show
 /// what the call carried — so they draw the bounded, marked preview instead.
+///
+/// A row wider than the overlay hard-wraps the way transcript terminal output
+/// wraps, so the tail of a long line is a scroll away instead of clipped off
+/// the right border with nothing saying it was there.
 fn render_tool_detail_overlay(
     frame: &mut ratatui::Frame<'_>,
     area: Rect,
@@ -2654,6 +2658,17 @@ fn render_tool_detail_overlay(
             ));
         }
     }
+
+    let content_width = usize::from(layout.content.width).max(1);
+    let lines = lines
+        .into_iter()
+        .flat_map(|line| {
+            let style = line.style;
+            render::wrap_terminal_row(line.spans, content_width)
+                .into_iter()
+                .map(move |wrapped| wrapped.style(style))
+        })
+        .collect::<Vec<_>>();
 
     let visible = usize::from(layout.content.height);
     let max_scroll = lines.len().saturating_sub(visible.max(1));
