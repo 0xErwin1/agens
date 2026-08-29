@@ -134,7 +134,9 @@ fn synchronize_server_dispatcher(
                     registry: Arc::clone(shared_registry),
                 },
             )
-            .map_err(|_| CliError::configuration("tool catalog is invalid"))?;
+            .map_err(|error| {
+                CliError::configuration(format!("MCP tool registration refused: {error}"))
+            })?;
     }
     Ok(())
 }

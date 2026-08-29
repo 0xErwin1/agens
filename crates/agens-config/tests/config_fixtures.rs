@@ -55,6 +55,16 @@ fn extracts_only_safe_configured_stdio_mcp_servers() {
 }
 
 #[test]
+fn rejects_a_server_named_native_that_would_shadow_the_native_namespace() {
+    let document =
+        parse_toml_document("[mcp.native]\ntransport = \"stdio\"\ncommand = \"server\"").unwrap();
+    assert!(mcp_servers(&document).is_err());
+
+    let disabled = parse_toml_document("[mcp.native]\ndisabled = true").unwrap();
+    assert!(mcp_servers(&disabled).is_err());
+}
+
+#[test]
 fn parses_disabled_mcp_servers_without_requiring_a_transport_definition() {
     let document = parse_toml_document("[mcp.unavailable]\ndisabled = true").unwrap();
 

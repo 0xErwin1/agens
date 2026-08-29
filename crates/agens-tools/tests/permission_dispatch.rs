@@ -182,7 +182,7 @@ fn unknown_tools_are_rejected_before_policy_evaluation() {
 }
 
 #[test]
-fn later_mcp_registration_wins_a_native_model_alias_collision() {
+fn an_mcp_registration_that_would_reassign_a_native_alias_is_refused() {
     let native_calls = Arc::new(AtomicUsize::new(0));
     let mcp_calls = Arc::new(AtomicUsize::new(0));
     let mut dispatcher = ToolDispatcher::new();
@@ -201,40 +201,106 @@ fn later_mcp_registration_wins_a_native_model_alias_collision() {
         input_schema: json!({}),
         access: RemoteToolAccess::ReadOnly,
     };
-    dispatcher
+
+    let error = dispatcher
         .register_mcp(
             &metadata,
             CountingTool(Arc::clone(&mcp_calls), Ok(ToolOutput::success("mcp"))),
         )
-        .unwrap();
+        .expect_err("a registration that would reassign the model alias must be refused");
+    assert!(error.to_string().contains("files_read"), "{error}");
 
-    let identity = dispatcher
-        .canonical_identity("files::read")
-        .expect("legacy alias must resolve")
+    assert_eq!(dispatcher.canonical_identity("files::read"), None);
+    let native_identity = dispatcher
+        .canonical_identity("native::files_read")
+        .expect("the native tool must survive the refused registration")
         .to_owned();
-    assert_eq!(dispatcher.canonical_identity("files_read"), Some(&identity));
-    assert_ne!(identity.as_str(), "files::read");
-
-    let policy = PermissionPolicy::new(
-        PermissionMode::Edit,
-        vec![PermissionRule::global(
-            PermissionDecision::Allow,
-            PermissionPattern::Exact("files::read".into()),
-            PermissionPattern::Any,
-        )],
+    assert_eq!(
+        dispatcher.canonical_identity("files_read"),
+        Some(&native_identity)
     );
+
+    let policy = PermissionPolicy::new(PermissionMode::Edit, vec![]);
     let ToolEvaluationOutcome::Authorized(handle) = dispatcher
         .evaluate(
             &policy,
-            &[ProjectPermissionGrant::allow(
-                "project",
-                PermissionPattern::Exact("files_read".into()),
-                PermissionPattern::Any,
-            )],
-            &PermissionSession::new(),
+            &[],
+            &PermissionSession::with_temporary_bypass(),
             request("project", "files_read", "target"),
         )
-        .expect("the later MCP registration should own the model alias")
+        .expect("the native owner should still answer to its model alias")
+    else {
+        panic!("read-only native tool should be authorized");
+    };
+
+    assert_eq!(
+        dispatcher
+            .execute(
+                handle,
+                &ToolExecutionContext::with_timeout(Duration::from_secs(1)),
+            )
+            .unwrap(),
+        ToolOutput::success("native")
+    );
+    assert_eq!(native_calls.load(Ordering::Acquire), 1);
+    assert_eq!(mcp_calls.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn ambiguous_flattened_model_aliases_refuse_the_second_registration() {
+    let first_calls = Arc::new(AtomicUsize::new(0));
+    let second_calls = Arc::new(AtomicUsize::new(0));
+    let mut dispatcher = ToolDispatcher::new();
+    dispatcher
+        .register_mcp(
+            &RemoteToolMetadata {
+                qualified_name: "a_b::c".into(),
+                server_name: "a_b".into(),
+                tool_name: "c".into(),
+                description: None,
+                input_schema: json!({}),
+                access: RemoteToolAccess::ReadOnly,
+            },
+            CountingTool(Arc::clone(&first_calls), Ok(ToolOutput::success("first"))),
+        )
+        .unwrap();
+    let first_identity = dispatcher
+        .canonical_identity("a_b::c")
+        .expect("the first registration must resolve")
+        .to_owned();
+
+    let error = dispatcher
+        .register_mcp(
+            &RemoteToolMetadata {
+                qualified_name: "a::b_c".into(),
+                server_name: "a".into(),
+                tool_name: "b_c".into(),
+                description: None,
+                input_schema: json!({}),
+                access: RemoteToolAccess::ReadOnly,
+            },
+            CountingTool(Arc::clone(&second_calls), Ok(ToolOutput::success("second"))),
+        )
+        .expect_err("two pairs flattening onto one model alias must not both register");
+    let message = error.to_string();
+    assert!(message.contains(first_identity.as_str()), "{message}");
+    assert!(message.contains("b_c"), "{message}");
+
+    assert_eq!(dispatcher.canonical_identity("a::b_c"), None);
+    assert_eq!(
+        dispatcher.canonical_identity("a_b_c"),
+        Some(&first_identity)
+    );
+
+    let policy = PermissionPolicy::new(PermissionMode::Edit, vec![]);
+    let ToolEvaluationOutcome::Authorized(handle) = dispatcher
+        .evaluate(
+            &policy,
+            &[],
+            &PermissionSession::with_temporary_bypass(),
+            request("project", "a_b_c", "target"),
+        )
+        .expect("the first owner should still answer to the flattened alias")
     else {
         panic!("read-only MCP tool should be authorized");
     };
@@ -246,14 +312,38 @@ fn later_mcp_registration_wins_a_native_model_alias_collision() {
                 &ToolExecutionContext::with_timeout(Duration::from_secs(1)),
             )
             .unwrap(),
-        ToolOutput::success("mcp")
+        ToolOutput::success("first")
     );
-    assert_eq!(native_calls.load(Ordering::Acquire), 0);
-    assert_eq!(mcp_calls.load(Ordering::Acquire), 1);
+    assert_eq!(first_calls.load(Ordering::Acquire), 1);
+    assert_eq!(second_calls.load(Ordering::Acquire), 0);
 }
 
 #[test]
-fn displaced_canonical_and_legacy_aliases_invalidate_old_handles() {
+fn a_server_that_claims_the_native_namespace_is_refused() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut dispatcher = ToolDispatcher::new();
+
+    let error = dispatcher
+        .register_mcp(
+            &RemoteToolMetadata {
+                qualified_name: "native::read".into(),
+                server_name: "native".into(),
+                tool_name: "read".into(),
+                description: None,
+                input_schema: json!({}),
+                access: RemoteToolAccess::ReadOnly,
+            },
+            CountingTool(Arc::clone(&calls), Ok(ToolOutput::success("mcp"))),
+        )
+        .expect_err("a server named native must not claim the native namespace");
+    assert!(error.to_string().contains("native"), "{error}");
+
+    assert_eq!(dispatcher.canonical_identity("native::read"), None);
+    assert_eq!(dispatcher.canonical_identity("native_read"), None);
+}
+
+#[test]
+fn a_refused_registration_leaves_the_native_owner_and_its_handles_intact() {
     for (native_name, authorized_alias) in [
         ("native::files_read", "files_read"),
         ("native::files::read", "files::read"),
@@ -269,7 +359,7 @@ fn displaced_canonical_and_legacy_aliases_invalidate_old_handles() {
             )
             .unwrap();
         let policy = PermissionPolicy::new(PermissionMode::Edit, vec![]);
-        let ToolEvaluationOutcome::Authorized(stale_handle) = dispatcher
+        let ToolEvaluationOutcome::Authorized(handle) = dispatcher
             .evaluate(
                 &policy,
                 &[],
@@ -278,7 +368,7 @@ fn displaced_canonical_and_legacy_aliases_invalidate_old_handles() {
             )
             .unwrap()
         else {
-            panic!("native tool should authorize before replacement");
+            panic!("native tool should authorize before the collision attempt");
         };
 
         dispatcher
@@ -293,38 +383,18 @@ fn displaced_canonical_and_legacy_aliases_invalidate_old_handles() {
                 },
                 CountingTool(Arc::clone(&mcp_calls), Ok(ToolOutput::success("mcp"))),
             )
-            .unwrap();
+            .expect_err("a registration colliding with a native alias must be refused");
 
-        assert!(
-            dispatcher
-                .execute(
-                    stale_handle,
-                    &ToolExecutionContext::with_timeout(Duration::from_secs(1)),
-                )
-                .is_err()
-        );
-        assert_eq!(native_calls.load(Ordering::Acquire), 0);
-
-        let ToolEvaluationOutcome::Authorized(new_handle) = dispatcher
-            .evaluate(
-                &policy,
-                &[],
-                &PermissionSession::with_temporary_bypass(),
-                request("project", "files_read", "target"),
-            )
-            .unwrap()
-        else {
-            panic!("new MCP owner should authorize");
-        };
         assert_eq!(
             dispatcher
                 .execute(
-                    new_handle,
+                    handle,
                     &ToolExecutionContext::with_timeout(Duration::from_secs(1)),
                 )
                 .unwrap(),
-            ToolOutput::success("mcp")
+            ToolOutput::success("native")
         );
-        assert_eq!(mcp_calls.load(Ordering::Acquire), 1);
+        assert_eq!(native_calls.load(Ordering::Acquire), 1);
+        assert_eq!(mcp_calls.load(Ordering::Acquire), 0);
     }
 }

@@ -4159,8 +4159,7 @@ impl ToolDispatcher {
             access,
             version,
             tool,
-        );
-        Ok(())
+        )
     }
 
     pub fn register_mcp(
@@ -4168,6 +4167,16 @@ impl ToolDispatcher {
         metadata: &RemoteToolMetadata,
         tool: impl DispatchTool + 'static,
     ) -> Result<(), Error> {
+        // Alias-collision refusal in `insert` only fires against a native that
+        // is actually registered; a server literally called `native` could
+        // still claim `native::<tool>` names for tools no native answers to.
+        // Configuration validation rejects the name, and this keeps embedders
+        // that bypass it honest.
+        if metadata.server_name == "native" {
+            return Err(Error::Tool(
+                "MCP server name \"native\" would shadow the native tool namespace".into(),
+            ));
+        }
         let version = self.allocate_version();
         self.insert(
             ToolIdentity::mcp(&metadata.server_name, &metadata.tool_name),
@@ -4178,8 +4187,7 @@ impl ToolDispatcher {
             remote_tool_access(metadata.access),
             version,
             tool,
-        );
-        Ok(())
+        )
     }
 
     /// Removes a server's MCP registrations and invalidates their outstanding handles.
@@ -4207,15 +4215,13 @@ impl ToolDispatcher {
         name: impl Into<String>,
         access: ToolAccess,
         tool: impl DispatchTool + 'static,
-    ) {
+    ) -> Result<(), Error> {
         let name = name.into();
-        let Some(native_name) = name
+        let native_name = name
             .strip_prefix("native::")
             .filter(|name| !name.is_empty())
-            .map(ToOwned::to_owned)
-        else {
-            return;
-        };
+            .ok_or_else(|| Error::Tool("native tool name is invalid".into()))?
+            .to_owned();
         let version = self.allocate_version();
         self.insert(
             ToolIdentity::native(&native_name),
@@ -4223,7 +4229,7 @@ impl ToolDispatcher {
             access,
             version,
             tool,
-        );
+        )
     }
 
     pub fn canonical_identity(&self, alias: &str) -> Option<&ToolIdentity> {
@@ -4522,6 +4528,15 @@ impl ToolDispatcher {
         }
     }
 
+    /// Installs a tool under its aliases, refusing any alias another identity
+    /// already answers to.
+    ///
+    /// Permission rules bind through this alias map, so a silent reassignment
+    /// would let a rule resolve to a tool other than the one the operator
+    /// named. This is also what keeps the flattened `<server>_<tool>` model
+    /// alias unambiguous: server `a_b` with tool `c` and server `a` with tool
+    /// `b_c` both flatten to `a_b_c`, and whichever registers second is
+    /// refused here.
     fn insert(
         &mut self,
         identity: ToolIdentity,
@@ -4529,23 +4544,24 @@ impl ToolDispatcher {
         access: ToolAccess,
         version: u64,
         tool: impl DispatchTool + 'static,
-    ) {
+    ) -> Result<(), Error> {
         let aliases = aliases
             .into_iter()
             .filter(|alias| !alias.is_empty())
             .collect::<Vec<_>>();
-        let displaced = aliases
-            .iter()
-            .filter_map(|alias| self.aliases.get(alias))
-            .filter(|current| *current != &identity)
-            .cloned()
-            .collect::<std::collections::BTreeSet<_>>();
 
-        for displaced_identity in displaced {
-            let replacement_version = self.allocate_version();
-            if let Some(displaced_tool) = self.tools.get_mut(&displaced_identity) {
-                displaced_tool.version = replacement_version;
-            }
+        let collision = aliases.iter().find_map(|alias| {
+            self.aliases
+                .get(alias)
+                .filter(|current| *current != &identity)
+                .map(|current| (alias, current))
+        });
+        if let Some((alias, current)) = collision {
+            return Err(Error::Tool(format!(
+                "tool alias \"{alias}\" already names {}; refusing to reassign it to {}",
+                current.as_str(),
+                identity.as_str(),
+            )));
         }
 
         self.aliases.retain(|_, current| current != &identity);
@@ -4559,6 +4575,7 @@ impl ToolDispatcher {
                 tool: Box::new(tool),
             },
         );
+        Ok(())
     }
 
     fn allocate_version(&mut self) -> u64 {
