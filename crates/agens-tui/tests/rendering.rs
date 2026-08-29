@@ -1742,6 +1742,7 @@ fn restored_tool_call_collapses_exactly_like_the_live_path() {
         resume_error: None,
         file_candidates: Vec::new(),
         palette_entries: Vec::new(),
+        extension_notice: None,
     });
 
     renderer.render(tui.view()).unwrap();
@@ -5050,6 +5051,7 @@ fn conversation_owns_the_first_row_under_every_notice_condition() {
                 resume_error: None,
                 file_candidates: Vec::new(),
                 palette_entries: Vec::new(),
+                extension_notice: None,
             });
         }),
         ("danger", |tui| tui.set_dangerous_mode(true)),

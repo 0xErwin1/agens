@@ -162,6 +162,7 @@ impl ScenarioContext {
             resume_error: None,
             file_candidates: Vec::new(),
             palette_entries: Vec::new(),
+            extension_notice: None,
         });
 
         Ok(())

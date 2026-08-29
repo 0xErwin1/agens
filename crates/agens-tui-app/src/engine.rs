@@ -205,6 +205,8 @@ pub fn run_production_tui_with_options(
             // is resolved and `start_tui_skills`/`start_tui_commands` have run against it.
             file_candidates: Vec::new(),
             palette_entries: Vec::new(),
+            // Startup discovery degradation reports through `tui.add_info` below instead.
+            extension_notice: None,
         });
         for event in resumed_subagent_cards(&resumed.messages) {
             tui.apply_runtime_event(event);

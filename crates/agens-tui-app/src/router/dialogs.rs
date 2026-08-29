@@ -1027,17 +1027,21 @@ impl TuiRuntimeRouter {
             &self.credentials,
         )?;
         persist_pending_agent_correction(bootstrap, &mut resumed);
-        self.refresh_session_extensions(bootstrap, &resumed);
+        let extension_notice = self.refresh_session_extensions(bootstrap, &resumed);
         let prompt = boundary.prompt().to_owned();
         *self
             .session
             .lock()
             .map_err(|_| CliError::storage("TUI session is unavailable"))? = resumed;
 
-        Ok(TuiSubmissionOutcome::ProviderTurn {
-            display: "Retrying recovered attempt.".into(),
-            prompt,
-        })
+        // This path has no `SessionResumed` outcome to carry the one-time degraded-discovery
+        // notice, so it rides on the turn's display line instead.
+        let display = match extension_notice {
+            Some(notice) => format!("{notice}\nRetrying recovered attempt."),
+            None => "Retrying recovered attempt.".into(),
+        };
+
+        Ok(TuiSubmissionOutcome::ProviderTurn { display, prompt })
     }
 }
 

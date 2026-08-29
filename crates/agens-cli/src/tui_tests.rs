@@ -405,6 +405,7 @@ fn production_tui_project_identity_uses_the_canonical_current_project_for_new_an
         resume_error: None,
         file_candidates: Vec::new(),
         palette_entries: Vec::new(),
+        extension_notice: None,
     });
     let resumed_session_header = render_tui_test_backend(&tui, 120, 24);
     assert!(

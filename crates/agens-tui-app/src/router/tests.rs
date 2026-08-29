@@ -270,7 +270,9 @@ fn a_post_startup_resume_command_refreshes_commands_skills_and_picker_candidates
         .router
         .route(format!("/resume {}", fixture.metadata_id));
     let TuiSubmissionOutcome::SessionResumed {
-        file_candidates, ..
+        file_candidates,
+        extension_notice,
+        ..
     } = resume_outcome
     else {
         panic!("expected a successful resume, got {resume_outcome:?}");
@@ -282,6 +284,10 @@ fn a_post_startup_resume_command_refreshes_commands_skills_and_picker_candidates
         vec!["only-in-a.txt".to_owned()],
         "the picker candidates on the resume outcome must enumerate the resumed \
          session's own root, not the resuming process's discovered root"
+    );
+    assert_eq!(
+        extension_notice, None,
+        "a successful re-discovery carries no degradation notice"
     );
 }
 
@@ -421,9 +427,17 @@ fn a_post_startup_resume_with_failed_rediscovery_drops_the_previous_roots_catalo
     let resume_outcome = fixture
         .router
         .route(format!("/resume {}", fixture.metadata_id));
+    let TuiSubmissionOutcome::SessionResumed {
+        extension_notice, ..
+    } = resume_outcome
+    else {
+        panic!("the resume itself still succeeds when only re-discovery fails: {resume_outcome:?}");
+    };
     assert!(
-        matches!(resume_outcome, TuiSubmissionOutcome::SessionResumed { .. }),
-        "the resume itself still succeeds when only re-discovery fails: {resume_outcome:?}"
+        extension_notice
+            .as_deref()
+            .is_some_and(|notice| notice.contains("discovery failed")),
+        "the degradation must surface once, on the resume outcome: {extension_notice:?}"
     );
 
     assert!(

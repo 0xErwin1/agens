@@ -223,7 +223,7 @@ pub fn commit_tui_session_resume(
     expected: &SessionContext,
     resumed: ResumedTuiSession,
     cancellation: &TuiRouteCancellation,
-    on_commit: impl FnOnce(&SessionContext) -> (Vec<String>, Vec<PaletteEntry>),
+    on_commit: impl FnOnce(&SessionContext) -> (Vec<String>, Vec<PaletteEntry>, Option<String>),
 ) -> Result<TuiSubmissionOutcome, CliError> {
     let ResumedTuiSession {
         context: mut resumed,
@@ -249,7 +249,7 @@ pub fn commit_tui_session_resume(
         return Ok(TuiSubmissionOutcome::RouteCancelled);
     }
     persist_pending_agent_correction(bootstrap, &mut resumed);
-    let (file_candidates, palette_entries) = on_commit(&resumed);
+    let (file_candidates, palette_entries, extension_notice) = on_commit(&resumed);
     *current = resumed;
 
     Ok(TuiSubmissionOutcome::SessionResumed {
@@ -261,6 +261,7 @@ pub fn commit_tui_session_resume(
         resume_error,
         file_candidates,
         palette_entries,
+        extension_notice,
     })
 }
 
@@ -778,7 +779,7 @@ mod tests {
             &expected,
             prepared,
             &TuiRouteCancellation::new(),
-            |_| (Vec::new(), Vec::new()),
+            |_| (Vec::new(), Vec::new(), None),
         )
         .unwrap();
         assert!(session.lock().unwrap().resume_draft.is_none());
@@ -1101,7 +1102,7 @@ mod tests {
                 &original,
                 prepared.clone(),
                 &cancelled,
-                |_| (Vec::new(), Vec::new()),
+                |_| (Vec::new(), Vec::new(), None),
             )
             .unwrap(),
             TuiSubmissionOutcome::RouteCancelled
@@ -1117,7 +1118,7 @@ mod tests {
                 &original,
                 prepared.clone(),
                 &TuiRouteCancellation::new(),
-                |_| (Vec::new(), Vec::new()),
+                |_| (Vec::new(), Vec::new(), None),
             )
             .unwrap(),
             TuiSubmissionOutcome::RouteCancelled
@@ -1128,7 +1129,7 @@ mod tests {
         let accepted = TuiRouteCancellation::new();
         assert!(matches!(
             commit_tui_session_resume(&bootstrap, &session, &original, prepared, &accepted, |_| {
-                (Vec::new(), Vec::new())
+                (Vec::new(), Vec::new(), None)
             },)
             .unwrap(),
             TuiSubmissionOutcome::SessionResumed { .. }
@@ -1336,7 +1337,7 @@ mod tests {
             &expected,
             resumed,
             &TuiRouteCancellation::new(),
-            |_| (Vec::new(), Vec::new()),
+            |_| (Vec::new(), Vec::new(), None),
         )
         .unwrap();
         assert!(matches!(
@@ -1739,7 +1740,7 @@ mod tests {
                     &original,
                     prepared,
                     &cancellation,
-                    |_| (Vec::new(), Vec::new()),
+                    |_| (Vec::new(), Vec::new(), None),
                 )
                 .unwrap();
                 (outcome, call_counts())
