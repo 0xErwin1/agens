@@ -719,6 +719,46 @@ async fn a_client_that_comes_back_is_told_which_chat_is_already_open_here() {
     assert!(!open.chats[0].answering, "no turn is running yet");
 }
 
+/// A bare relaunch settles the listing by opening the id it was offered. The
+/// daemon's chats outlive the client, so that id is usually still live — and
+/// opening it again from the same checkout is coming back, not a conflict.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_relaunch_that_opens_the_live_chat_it_was_offered_rejoins_it() {
+    let mut wire = wire("rejoined").await;
+
+    let handle = wire
+        .client
+        .open(Request::new(open_request("/projects/agens")))
+        .await
+        .expect("the chat opens")
+        .into_inner();
+
+    let rejoined = wire
+        .client
+        .open(Request::new(proto::OpenChatRequest {
+            checkout: "/projects/agens".to_owned(),
+            resume: Some(handle.session_id),
+        }))
+        .await
+        .expect("the live chat is rejoined rather than refused")
+        .into_inner();
+
+    assert_eq!(rejoined.session_id, handle.session_id);
+
+    wire.client
+        .prompt(Request::new(proto::PromptRequest {
+            session_id: handle.session_id,
+            prompt: "still here".to_owned(),
+            parts: Vec::new(),
+        }))
+        .await
+        .expect("the live loop still serves prompts");
+    assert_eq!(
+        wire.started.recv_timeout(PATIENCE),
+        Ok("still here".to_owned()),
+    );
+}
+
 /// One daemon serves N projects, so a listing scoped to one checkout never
 /// offers another project's conversation.
 #[tokio::test(flavor = "multi_thread")]

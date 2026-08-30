@@ -475,6 +475,23 @@ impl ChatSessions {
         // workers, and doing it on the same beat is what keeps the two from
         // disagreeing about which sessions exist.
         open.retain(|session, _| self.is_running(*session));
+        // The daemon's chats outlive every client, so a client that comes back
+        // opens an id that is usually still live. Opening it again from the
+        // same checkout is the same conversation: the existing record and its
+        // loop are kept as they are, because a fresh record here would hand
+        // channels to nobody while the live loop keeps reading the old inbox.
+        // The same id from another checkout is a genuine conflict, refused
+        // without touching the live record. Both are decided under the lock
+        // the pruning above ran under, so a loop that ended between a client's
+        // listing and this open has already fallen out and restarts below.
+        if let Some(existing) = open.get(&session) {
+            if existing.checkout == request.checkout {
+                return Ok(session);
+            }
+            return Err(ChatError::Unavailable(
+                describe(SessionRegistryError::AlreadyLive).to_owned(),
+            ));
+        }
         open.insert(
             session,
             OpenChat {
