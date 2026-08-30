@@ -46,10 +46,10 @@ impl AgentProfileStore for TuiProfileStore {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum TuiMode {
     /// In this process, which is what closing the terminal ends.
-    #[default]
     Local,
     /// In the daemon, which keeps the session whether anybody is watching or
     /// not.
+    #[default]
     Attached,
 }
 
@@ -131,11 +131,10 @@ pub(crate) fn run_tui(
     let bootstrap = bootstrap(dependencies)?;
     let startup_notice = daemon_startup
         .map(|request| (dependencies.daemon_ensurer)(&bootstrap, request))
-        .transpose()?
+        .transpose()
+        .map_err(|error| attached_failure(mode, error))?
         .unwrap_or(false)
-        .then(|| {
-            "started the machine daemon; this chat remains local until you use /team".to_owned()
-        });
+        .then(|| "started the machine daemon".to_owned());
     let output = (dependencies.tui_launcher)(
         &bootstrap,
         TuiLaunch {
@@ -144,6 +143,22 @@ pub(crate) fn run_tui(
             initial_prompt,
             startup_notice,
         },
-    )?;
+    )
+    .map_err(|error| attached_failure(mode, error))?;
     Ok(format!("{output}\n"))
+}
+
+fn attached_failure(mode: TuiMode, error: CliError) -> CliError {
+    if mode == TuiMode::Local || error.message.contains("agens --local") {
+        return error;
+    }
+
+    CliError::new(
+        error.status(),
+        error.category,
+        format!(
+            "{}; run `agens --local` to use in-process mode",
+            error.message
+        ),
+    )
 }

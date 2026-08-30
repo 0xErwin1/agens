@@ -23,8 +23,10 @@
 //!   the way it stops in a terminal. What it will not do is decide one on
 //!   nobody's behalf: a question nobody can hear is denied for that call.
 
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use agens_agents::{agent_catalog_for_context, ensure_active_agent_runtime};
 use agens_bootstrap::Bootstrap;
@@ -46,16 +48,292 @@ use agens_server::{
 use agens_session::context::{ActiveAgentRuntime, SessionContext};
 use agens_session::provider::{bootstrap_authentication, resolve_provider_for_model};
 use agens_store::SessionStore;
+use agens_tool_runtime::mcp::ProductionHostedMcp;
 use agens_tool_runtime::rotation::rotate_agent;
+use agens_tool_runtime::runner::{TuiTaskControls, TuiTaskLifecycleBridge};
 use agens_tool_runtime::runtime::production_tool_runtime;
+use agens_tool_runtime::task::{ProductionTuiTaskRuntime, production_tui_task_runtime};
+use agens_tools::{TaskExecutionId, TaskExecutionRegistry, TaskMessageSource, TaskMessageTarget};
 
 /// The factory `agens serve` gives the daemon: how a client's request becomes a
 /// chat session.
 #[must_use]
-pub(crate) fn hosted_chat(bootstrap: &Bootstrap) -> ChatSessionFactory {
+pub(crate) fn hosted_chat_with_tasks(
+    bootstrap: &Bootstrap,
+    tasks: HostedTaskCoordinator,
+) -> ChatSessionFactory {
     let bootstrap = bootstrap.clone();
+    Arc::new(move |request: &ChatSessionRequest| build_chat(&bootstrap, request, tasks.clone()))
+}
 
-    Arc::new(move |request: &ChatSessionRequest| build_chat(&bootstrap, request))
+#[cfg(test)]
+#[must_use]
+pub(crate) fn hosted_chat(bootstrap: &Bootstrap) -> ChatSessionFactory {
+    let tasks = hosted_tasks(bootstrap).expect("hosted task journal is available");
+    hosted_chat_with_tasks(bootstrap, tasks)
+}
+
+pub(crate) fn hosted_catalogs(
+    bootstrap: &Bootstrap,
+) -> Result<Arc<dyn agens_core::hosted::HostedCatalogs>, ChatError> {
+    let root = bootstrap
+        .project_root
+        .as_deref()
+        .unwrap_or_else(|| bootstrap.data_directory());
+    let skills = agens_bootstrap::discover_skill_catalog(bootstrap, root)
+        .map_err(|error| ChatError::Unavailable(error.to_string()))?;
+    let entries = skills
+        .catalog()
+        .skills()
+        .map(|skill| {
+            agens_core::hosted::CatalogEntry::new(skill.name(), skill.description(), false)
+        })
+        .collect::<Vec<_>>();
+    let mut hash = Sha256::new();
+    for entry in &entries {
+        hash.update(entry.name().as_bytes());
+        hash.update([0]);
+        hash.update(entry.description().as_bytes());
+        hash.update([0]);
+    }
+    let skill =
+        agens_core::hosted::CatalogSnapshot::new(format!("sha256:{:x}", hash.finalize()), entries);
+    let commands = agens_tui_app::extensions::tui_hosted_builtin_entries();
+    let mut command_hash = Sha256::new();
+    for entry in &commands {
+        command_hash.update(entry.name().as_bytes());
+        command_hash.update([0]);
+        command_hash.update(entry.description().as_bytes());
+        command_hash.update([entry.built_in() as u8]);
+    }
+    let command = agens_core::hosted::CatalogSnapshot::new(
+        format!("sha256:{:x}", command_hash.finalize()),
+        commands,
+    );
+    Ok(Arc::new(agens_server::HostedCatalogSet::new(
+        Some(command),
+        Some(skill),
+    )))
+}
+
+pub(crate) fn hosted_files(
+    bootstrap: &Bootstrap,
+) -> Arc<dyn agens_core::hosted::HostedWorkspaceFiles> {
+    Arc::new(agens_server::ConfinedWorkspaceFiles::with_media_store(
+        bootstrap.data_directory().to_path_buf(),
+    ))
+}
+
+pub(crate) fn hosted_mcp(
+    bootstrap: &Bootstrap,
+) -> Result<Box<dyn agens_core::hosted::HostedMcpControl>, ChatError> {
+    let root = bootstrap
+        .project_root
+        .as_deref()
+        .unwrap_or_else(|| bootstrap.data_directory());
+    ProductionHostedMcp::new(bootstrap, root)
+        .map(|runtime| Box::new(runtime) as Box<dyn agens_core::hosted::HostedMcpControl>)
+        .map_err(|error| ChatError::Unavailable(error.to_string()))
+}
+
+pub(crate) fn hosted_tasks(bootstrap: &Bootstrap) -> Result<HostedTaskCoordinator, ChatError> {
+    agens_store::HostedTaskStore::open(bootstrap.data_directory())
+        .map(HostedTaskCoordinator::new)
+        .map_err(|error| ChatError::Unavailable(error.to_string()))
+}
+
+#[derive(Clone)]
+pub(crate) struct HostedTaskCoordinator {
+    store: Arc<Mutex<agens_store::HostedTaskStore>>,
+    runtimes: Arc<Mutex<BTreeMap<i64, TaskExecutionRegistry>>>,
+}
+
+impl HostedTaskCoordinator {
+    fn new(store: agens_store::HostedTaskStore) -> Self {
+        Self {
+            store: Arc::new(Mutex::new(store)),
+            runtimes: Arc::new(Mutex::new(BTreeMap::new())),
+        }
+    }
+    fn register(&self, session: i64, registry: TaskExecutionRegistry) {
+        if let Ok(mut runtimes) = self.runtimes.lock() {
+            runtimes.insert(session, registry);
+        }
+    }
+    fn persist_runtime_event(&self, session: i64, event: &agens_core::TuiRuntimeEvent) -> bool {
+        if let agens_core::TuiRuntimeEvent::SubagentExecution(event) = event
+            && let agens_core::TuiSubagentUpdate::Terminal {
+                status,
+                final_result,
+            } = &event.update
+        {
+            let payload = serde_json::json!({"status":format!("{status:?}"),"result":final_result})
+                .to_string();
+            return self
+                .store
+                .lock()
+                .ok()
+                .and_then(|mut store| {
+                    store
+                        .persist_completed_child_turn(session, &event.id.to_string(), 1, &payload)
+                        .ok()
+                })
+                .is_some();
+        }
+        let agens_core::TuiRuntimeEvent::TaskExecution { agent, event } = event else {
+            return true;
+        };
+        let (id, state, detail) = match event {
+            agens_core::TuiExecutionEvent::ForegroundStarted { id } => (
+                *id,
+                agens_core::hosted::HostedTaskState::Running,
+                "foreground",
+            ),
+            agens_core::TuiExecutionEvent::BackgroundStarted { id }
+            | agens_core::TuiExecutionEvent::Backgrounded { id } => (
+                *id,
+                agens_core::hosted::HostedTaskState::Background,
+                "background",
+            ),
+            agens_core::TuiExecutionEvent::CancellationRequested { .. } => return true,
+            agens_core::TuiExecutionEvent::Completed { id } => (
+                *id,
+                agens_core::hosted::HostedTaskState::Completed,
+                "completed",
+            ),
+            agens_core::TuiExecutionEvent::Failed { id } => {
+                (*id, agens_core::hosted::HostedTaskState::Failed, "failed")
+            }
+            agens_core::TuiExecutionEvent::Cancelled { id } => (
+                *id,
+                agens_core::hosted::HostedTaskState::Cancelled,
+                "cancelled",
+            ),
+        };
+        self.store
+            .lock()
+            .ok()
+            .and_then(|mut store| {
+                store
+                    .append_event(
+                        session,
+                        &id.to_string(),
+                        state,
+                        &format!("{detail}:{agent}"),
+                    )
+                    .ok()
+            })
+            .is_some()
+    }
+}
+
+impl agens_core::hosted::HostedTaskJournal for HostedTaskCoordinator {
+    fn append_event(
+        &mut self,
+        session_id: i64,
+        task_id: &str,
+        state: agens_core::hosted::HostedTaskState,
+        payload: &str,
+    ) -> Result<agens_core::hosted::HostedTaskEvent, agens_core::hosted::TaskControlError> {
+        self.store
+            .lock()
+            .map_err(|_| agens_core::hosted::TaskControlError::Storage)?
+            .append_event(session_id, task_id, state, payload)
+            .map_err(|_| agens_core::hosted::TaskControlError::Storage)
+    }
+    fn persist_completed_child_turn(
+        &mut self,
+        session_id: i64,
+        task_id: &str,
+        sequence: u64,
+        payload: &str,
+    ) -> Result<(), agens_core::hosted::TaskControlError> {
+        self.store
+            .lock()
+            .map_err(|_| agens_core::hosted::TaskControlError::Storage)?
+            .persist_completed_child_turn(session_id, task_id, sequence, payload)
+            .map_err(|_| agens_core::hosted::TaskControlError::Storage)
+    }
+    fn completed_child_turns(
+        &self,
+        session_id: i64,
+    ) -> Result<Vec<agens_core::hosted::HostedChildTurn>, agens_core::hosted::TaskControlError>
+    {
+        self.store
+            .lock()
+            .map_err(|_| agens_core::hosted::TaskControlError::Storage)?
+            .completed_child_turns(session_id)
+            .map_err(|_| agens_core::hosted::TaskControlError::Storage)
+    }
+    fn snapshot_tail(
+        &self,
+        session_id: i64,
+    ) -> Result<agens_core::hosted::HostedTaskReplay, agens_core::hosted::TaskControlError> {
+        self.store
+            .lock()
+            .map_err(|_| agens_core::hosted::TaskControlError::Storage)?
+            .snapshot_tail(session_id)
+            .map_err(|_| agens_core::hosted::TaskControlError::Storage)
+    }
+    fn replay_after(
+        &self,
+        session_id: i64,
+        after_cursor: u64,
+    ) -> Result<agens_core::hosted::HostedTaskReplay, agens_core::hosted::TaskControlError> {
+        self.store
+            .lock()
+            .map_err(|_| agens_core::hosted::TaskControlError::Storage)?
+            .replay_after(session_id, after_cursor)
+            .map_err(|_| agens_core::hosted::TaskControlError::Storage)
+    }
+    fn apply_control(
+        &mut self,
+        command: &agens_core::hosted::HostedControlCommand,
+    ) -> Result<agens_core::hosted::HostedControlResult, agens_core::hosted::TaskControlError> {
+        self.store
+            .lock()
+            .map_err(|_| agens_core::hosted::TaskControlError::Storage)?
+            .apply_control_with(command, || {
+                let registry = self
+                    .runtimes
+                    .lock()
+                    .ok()
+                    .and_then(|r| r.get(&command.session_id()).cloned())
+                    .ok_or(agens_core::hosted::TaskControlError::WrongSession)?;
+                let id = command
+                    .task_id()
+                    .and_then(|id| id.parse::<u64>().ok())
+                    .map(TaskExecutionId::from_value);
+                let applied = match command.kind() {
+                    agens_core::hosted::HostedControlKind::Background => {
+                        id.is_some_and(|id| registry.transition_to_background(id))
+                    }
+                    agens_core::hosted::HostedControlKind::Cancel => {
+                        id.is_some_and(|id| registry.cancel(id))
+                    }
+                    agens_core::hosted::HostedControlKind::CancelAll => {
+                        registry.cancel_all();
+                        true
+                    }
+                    agens_core::hosted::HostedControlKind::Message(message) => {
+                        id.is_some_and(|id| {
+                            registry
+                                .send_message(
+                                    TaskMessageSource::User,
+                                    TaskMessageTarget::Execution(id),
+                                    message.clone(),
+                                )
+                                .is_ok()
+                        })
+                    }
+                };
+                if !applied {
+                    return Err(agens_core::hosted::TaskControlError::InvalidTransition);
+                }
+                Ok(())
+            })
+            .map_err(|error| error.kind())
+    }
 }
 
 /// Where the daemon reads a chat's conversation back from.
@@ -78,6 +356,7 @@ pub(crate) fn hosted_chat_history(bootstrap: &Bootstrap) -> ChatHistorySource {
 fn build_chat(
     bootstrap: &Bootstrap,
     request: &ChatSessionRequest,
+    tasks: HostedTaskCoordinator,
 ) -> Result<ChatSession, ChatError> {
     let checkout = checkout_of(&request.checkout)?;
     let bootstrap = chat_bootstrap(bootstrap, &checkout);
@@ -107,6 +386,8 @@ fn build_chat(
             history,
             request_config,
             active_agent,
+            tasks,
+            task_runtime: None,
         }),
     })
 }
@@ -324,6 +605,8 @@ struct HostedChat {
     history: Vec<Message>,
     request_config: RequestConfig,
     active_agent: ActiveAgentRuntime,
+    tasks: HostedTaskCoordinator,
+    task_runtime: Option<ProductionTuiTaskRuntime>,
 }
 
 impl ChatTurns for HostedChat {
@@ -375,10 +658,67 @@ impl ChatTurns for HostedChat {
         asks: &Arc<dyn ChatAsks>,
         progress: &TurnProgressSink,
     ) -> ChatTurnOutcome {
-        let request = match self.request_for(message) {
+        let mut request = match self.request_for(message) {
             Ok(request) => request,
             Err(error) => return ChatTurnOutcome::Failed(error),
         };
+
+        if self.task_runtime.is_none() {
+            let project_root = match self.bootstrap.project_root.as_deref() {
+                Some(root) => root,
+                None => {
+                    return ChatTurnOutcome::Failed("the chat has no checkout to run in".into());
+                }
+            };
+            let skills =
+                match agens_bootstrap::discover_skill_catalog(&self.bootstrap, project_root) {
+                    Ok(skills) => skills.catalog().clone(),
+                    Err(error) => return ChatTurnOutcome::Failed(error.to_string()),
+                };
+            let registry = TaskExecutionRegistry::default();
+            let (events, receiver) = agens_tui::BridgeTx::bounded(256);
+            std::thread::spawn(move || while receiver.recv().is_ok() {});
+            let session_id = self.session.id;
+            let event_tasks = self.tasks.clone();
+            let lifecycle = TuiTaskLifecycleBridge::new(events, TuiTaskControls(registry.clone()))
+                .with_event_writer(Arc::new(move |event| {
+                    event_tasks.persist_runtime_event(session_id, event)
+                }));
+            let runtime = production_tui_task_runtime(
+                &self.bootstrap,
+                project_root,
+                &skills,
+                Box::new(AttachedPrompter {
+                    asks: Arc::clone(asks),
+                }),
+                lifecycle,
+                self.request_config.clone(),
+                format!("hosted-task-{session_id}"),
+                false,
+                Box::new(AttachedAskUserPort {
+                    asks: Arc::clone(asks),
+                }),
+            );
+            match runtime {
+                Ok(runtime) => {
+                    self.tasks
+                        .register(session_id, runtime.task_registry.clone());
+                    self.task_runtime = Some(runtime);
+                }
+                Err(error) => return ChatTurnOutcome::Failed(error.to_string()),
+            }
+        }
+
+        if let Some(project_root) = self.bootstrap.project_root.as_deref() {
+            request.system_prompt = match agens_headless::headless_turn_own_system_prompt(
+                &self.bootstrap,
+                project_root,
+                request.system_prompt.take(),
+            ) {
+                Ok(prompt) => Some(prompt),
+                Err(error) => return ChatTurnOutcome::Failed(error.to_string()),
+            };
+        }
 
         let completion = run_production_headless_chat_with_progress_and_ask_user(
             request,
@@ -393,7 +733,7 @@ impl ChatTurns for HostedChat {
                     }) as Box<dyn PermissionPrompter>
                 }
             }),
-            None,
+            self.task_runtime.as_ref(),
             None,
             Some(Box::new(AttachedAskUserPort {
                 asks: Arc::clone(asks),

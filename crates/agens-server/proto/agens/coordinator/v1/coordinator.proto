@@ -623,6 +623,153 @@ message ChatHistory {
   repeated Message messages = 1;
 }
 
+enum HostedCatalogKind {
+  HOSTED_CATALOG_KIND_UNSPECIFIED = 0;
+  HOSTED_CATALOG_KIND_COMMAND = 1;
+  HOSTED_CATALOG_KIND_SKILL = 2;
+}
+
+message HostedCatalogRequest {
+  HostedCatalogKind kind = 1;
+  optional string known_revision = 2;
+}
+
+message HostedCatalogEntry {
+  string name = 1;
+  string description = 2;
+  bool built_in = 3;
+}
+
+message HostedCatalogSnapshot {
+  string revision = 1;
+  repeated HostedCatalogEntry entries = 2;
+}
+
+message HostedCatalogStale { string current_revision = 1; }
+message HostedUnsupported {}
+message HostedCatalogResult {
+  oneof result {
+    HostedCatalogSnapshot current = 1;
+    HostedCatalogStale stale = 2;
+    HostedUnsupported unsupported = 3;
+  }
+}
+
+message WorkspaceFilesRequest {
+  string checkout = 1;
+  string selector = 2;
+}
+
+message WorkspaceFileRequest {
+  string checkout = 1;
+  string selector = 2;
+}
+
+enum HostedFileKind {
+  HOSTED_FILE_KIND_UNSPECIFIED = 0;
+  HOSTED_FILE_KIND_TEXT = 1;
+  HOSTED_FILE_KIND_MEDIA = 2;
+}
+
+enum HostedFileError {
+  HOSTED_FILE_ERROR_UNSPECIFIED = 0;
+  HOSTED_FILE_ERROR_INVALID_SELECTOR = 1;
+  HOSTED_FILE_ERROR_OUTSIDE_ROOT = 2;
+  HOSTED_FILE_ERROR_IGNORED = 3;
+  HOSTED_FILE_ERROR_MISSING = 4;
+  HOSTED_FILE_ERROR_UNSUPPORTED = 5;
+  HOSTED_FILE_ERROR_OVERSIZED = 6;
+  HOSTED_FILE_ERROR_ENTRY_LIMIT = 7;
+  HOSTED_FILE_ERROR_UNREADABLE = 8;
+}
+
+message HostedWorkspaceFile {
+  string path = 1;
+  uint64 byte_len = 2;
+  HostedFileKind kind = 3;
+}
+
+message HostedWorkspaceFileList { repeated HostedWorkspaceFile files = 1; }
+message HostedWorkspaceFileText { string path = 1; string text = 2; }
+message HostedWorkspaceFileMedia { string path = 1; string mime = 2; bytes bytes = 3; optional int64 media_id = 4; }
+message HostedWorkspaceFilesResult {
+  oneof result {
+    HostedWorkspaceFileList files = 1;
+    HostedFileError error = 2;
+  }
+}
+message HostedWorkspaceFileResult {
+  oneof result {
+    HostedWorkspaceFileText text = 1;
+    HostedWorkspaceFileMedia media = 2;
+    HostedFileError error = 3;
+  }
+}
+
+
+enum HostedTaskState {
+  HOSTED_TASK_STATE_UNSPECIFIED = 0;
+  HOSTED_TASK_STATE_RUNNING = 1;
+  HOSTED_TASK_STATE_BACKGROUND = 2;
+  HOSTED_TASK_STATE_COMPLETED = 3;
+  HOSTED_TASK_STATE_CANCELLED = 4;
+  HOSTED_TASK_STATE_FAILED = 5;
+}
+message HostedTaskRecord { string task_id = 1; HostedTaskState state = 2; }
+message HostedTaskEvent { uint64 cursor = 1; string task_id = 2; HostedTaskState state = 3; string payload = 4; }
+message HostedChildTurn { string task_id = 1; uint64 sequence = 2; string payload = 3; }
+message HostedTaskSnapshot { uint64 cursor = 1; repeated HostedTaskRecord tasks = 2; repeated HostedChildTurn child_turns = 3; }
+message HostedTaskEvents { repeated HostedTaskEvent events = 1; }
+message HostedTaskSnapshotTail { HostedTaskSnapshot snapshot = 1; repeated HostedTaskEvent events = 2; }
+message HostedTaskGap { uint64 oldest_cursor = 1; }
+enum HostedTaskError {
+  HOSTED_TASK_ERROR_UNSPECIFIED = 0;
+  HOSTED_TASK_ERROR_WRONG_SESSION = 1;
+  HOSTED_TASK_ERROR_UNKNOWN_TASK = 2;
+  HOSTED_TASK_ERROR_INVALID_TRANSITION = 3;
+  HOSTED_TASK_ERROR_COMMAND_CONFLICT = 4;
+  HOSTED_TASK_ERROR_CONTROL_CAPACITY = 5;
+  HOSTED_TASK_ERROR_INVALID_REQUEST = 6;
+  HOSTED_TASK_ERROR_STORAGE = 7;
+}
+message HostedTaskReplayResult {
+  oneof result { HostedTaskEvents events = 1; HostedTaskSnapshotTail snapshot_tail = 2; HostedTaskGap gap = 3; HostedTaskError error = 4; }
+}
+message HostedTaskSnapshotRequest { int64 session_id = 1; }
+message HostedTaskReplayRequest { int64 session_id = 1; uint64 after_cursor = 2; }
+enum HostedTaskControlKind {
+  HOSTED_TASK_CONTROL_KIND_UNSPECIFIED = 0;
+  HOSTED_TASK_CONTROL_KIND_BACKGROUND = 1;
+  HOSTED_TASK_CONTROL_KIND_CANCEL = 2;
+  HOSTED_TASK_CONTROL_KIND_CANCEL_ALL = 3;
+  HOSTED_TASK_CONTROL_KIND_MESSAGE = 4;
+}
+message HostedTaskControlRequest { int64 session_id = 1; string task_id = 2; string command_id = 3; HostedTaskControlKind kind = 4; string message = 5; }
+message HostedTaskControlApplied { HostedTaskState state = 1; bool replayed = 2; }
+message HostedTaskControlResult { oneof result { HostedTaskControlApplied applied = 1; HostedTaskError error = 2; } }
+
+
+enum HostedMcpState {
+  HOSTED_MCP_STATE_UNSPECIFIED = 0;
+  HOSTED_MCP_STATE_DISABLED = 1;
+  HOSTED_MCP_STATE_IDLE = 2;
+  HOSTED_MCP_STATE_CONNECTING = 3;
+  HOSTED_MCP_STATE_READY = 4;
+  HOSTED_MCP_STATE_DEGRADED = 5;
+  HOSTED_MCP_STATE_FAILED = 6;
+  HOSTED_MCP_STATE_CLOSED = 7;
+}
+enum HostedMcpAction {
+  HOSTED_MCP_ACTION_UNSPECIFIED = 0;
+  HOSTED_MCP_ACTION_CONNECT = 1;
+  HOSTED_MCP_ACTION_DISCONNECT = 2;
+  HOSTED_MCP_ACTION_RECONNECT = 3;
+}
+message HostedMcpServer { string name = 1; HostedMcpState state = 2; uint64 generation = 3; optional string error = 4; }
+message HostedMcpStatusRequest {}
+message HostedMcpControlRequest { string server = 1; HostedMcpAction action = 2; }
+message HostedMcpResult { repeated HostedMcpServer servers = 1; optional string error = 2; }
+
 // The chat plane: the user's own conversation, hosted by the daemon.
 //
 // `Prompt` returns as soon as the turn has somewhere to start, not when it
@@ -630,6 +777,14 @@ message ChatHistory {
 // client detach from a turn without ending it — and lets another one attach to
 // a turn already under way.
 service Chat {
+  rpc Catalog(HostedCatalogRequest) returns (HostedCatalogResult);
+  rpc ListWorkspaceFiles(WorkspaceFilesRequest) returns (HostedWorkspaceFilesResult);
+  rpc ReadWorkspaceFile(WorkspaceFileRequest) returns (HostedWorkspaceFileResult);
+  rpc McpStatus(HostedMcpStatusRequest) returns (HostedMcpResult);
+  rpc McpControl(HostedMcpControlRequest) returns (HostedMcpResult);
+  rpc TaskSnapshot(HostedTaskSnapshotRequest) returns (HostedTaskReplayResult);
+  rpc TaskReplay(HostedTaskReplayRequest) returns (HostedTaskReplayResult);
+  rpc TaskControl(HostedTaskControlRequest) returns (HostedTaskControlResult);
   rpc Open(OpenChatRequest) returns (ChatHandle);
   rpc Prompt(PromptRequest) returns (ChatAck);
   rpc Command(ChatCommandRequest) returns (ChatCommandResult);

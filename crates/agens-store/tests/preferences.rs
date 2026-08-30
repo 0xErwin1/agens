@@ -65,7 +65,8 @@ fn a_remembered_model_and_effort_survive_a_reopen_as_one_selection() {
             "0017_session_compactions",
             "0018_repository_policy",
             "0019_open_questions",
-            "0020_retry_user_parts"
+            "0020_retry_user_parts",
+            "0021_hosted_tasks"
         ]
     );
     drop(connection);

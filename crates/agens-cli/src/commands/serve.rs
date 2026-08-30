@@ -22,7 +22,10 @@ mod lifecycle;
 pub(crate) use lifecycle::DaemonStartupRequest;
 
 use crate::CliDependencies;
-use crate::chat_session::{hosted_chat, hosted_chat_history};
+use crate::chat_session::{
+    hosted_catalogs, hosted_chat_history, hosted_chat_with_tasks, hosted_files, hosted_mcp,
+    hosted_tasks,
+};
 use crate::cli::ServeAction;
 use crate::deps::bootstrap;
 use crate::worker::run_worker;
@@ -123,13 +126,22 @@ fn run_daemon(
         ..CoordinatorSettings::default()
     };
 
-    let shutdown = agens_server::serve_until_shutdown(
+    let tasks =
+        hosted_tasks(bootstrap).map_err(|error| CliError::unavailable(error.to_string()))?;
+    let catalogs =
+        hosted_catalogs(bootstrap).map_err(|error| CliError::unavailable(error.to_string()))?;
+    let mcp = hosted_mcp(bootstrap).map_err(|error| CliError::unavailable(error.to_string()))?;
+    let shutdown = agens_server::serve_until_shutdown_with_hosted(
         bootstrap.data_directory(),
         &settings,
         run_worker(bootstrap),
-        hosted_chat(bootstrap),
+        hosted_chat_with_tasks(bootstrap, tasks.clone()),
         hosted_chat_history(bootstrap),
         cancellation,
+        catalogs,
+        hosted_files(bootstrap),
+        mcp,
+        Box::new(tasks),
     )
     .map_err(|error| match error {
         ServerError::AlreadyRunning => CliError::unavailable(

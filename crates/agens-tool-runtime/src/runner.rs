@@ -72,6 +72,8 @@ impl TuiTaskControls {
             .transition_to_background(agens_tools::TaskExecutionId::from_value(id))
     }
 }
+type RuntimeEventWriter = Arc<dyn Fn(&TuiRuntimeEvent) -> bool + Send + Sync>;
+
 #[derive(Clone)]
 pub struct TuiTaskLifecycleBridge {
     events: BridgeTx<TuiRuntimeEvent>,
@@ -81,6 +83,7 @@ pub struct TuiTaskLifecycleBridge {
     completed_turns: Arc<Mutex<BTreeMap<u64, CompletedSubagentTurn>>>,
     trusted_messages: Arc<Mutex<BTreeMap<u64, SessionMessage>>>,
     observed_executions: Arc<Mutex<BTreeSet<u64>>>,
+    persist_event: Option<RuntimeEventWriter>,
     pub persist_completed: Option<Arc<dyn Fn(CompletedSubagentTurn) -> bool + Send + Sync>>,
     persist_selected_completed:
         Option<Arc<dyn Fn(CompletedSubagentTurn, SessionMessage) -> bool + Send + Sync>>,
@@ -96,9 +99,23 @@ impl TuiTaskLifecycleBridge {
             completed_turns: Arc::new(Mutex::new(BTreeMap::new())),
             trusted_messages: Arc::new(Mutex::new(BTreeMap::new())),
             observed_executions: Arc::new(Mutex::new(BTreeSet::new())),
+            persist_event: None,
             persist_completed: None,
             persist_selected_completed: None,
         }
+    }
+
+    pub fn with_event_writer(mut self, persist: RuntimeEventWriter) -> Self {
+        self.persist_event = Some(persist);
+        self
+    }
+
+    pub fn with_completed_writer(
+        mut self,
+        persist: Arc<dyn Fn(CompletedSubagentTurn) -> bool + Send + Sync>,
+    ) -> Self {
+        self.persist_completed = Some(persist);
+        self
     }
 
     pub fn with_session_writer(
@@ -196,14 +213,13 @@ impl TuiTaskLifecycleBridge {
                 },
             );
         }
-        self.publish(TuiRuntimeEvent::TaskExecution {
+        let published = self.publish(TuiRuntimeEvent::TaskExecution {
             agent: agent.clone(),
             event: match lifecycle.mode() {
                 TaskLaunchMode::Foreground => TuiExecutionEvent::ForegroundStarted { id },
                 TaskLaunchMode::Background => TuiExecutionEvent::BackgroundStarted { id },
             },
-        });
-        self.publish(TuiRuntimeEvent::SubagentExecution(
+        }) && self.publish(TuiRuntimeEvent::SubagentExecution(
             TuiSubagentEvent::started_on(
                 id,
                 &agent,
@@ -216,12 +232,19 @@ impl TuiTaskLifecycleBridge {
                     .map(|effort| effort.as_str()),
             ),
         ));
+        if !published {
+            self.controls.0.cancel(lifecycle.id());
+            return;
+        }
         self.watch_lifecycle(agent, lifecycle);
     }
 
     fn watch_lifecycle(&self, agent: String, lifecycle: TaskExecutionLifecycle) {
         let id = lifecycle.id().value();
-        let events = self.events.clone();
+        let events = PersistingEvents {
+            events: self.events.clone(),
+            persist: self.persist_event.clone(),
+        };
         let registry = self.controls.0.clone();
         let terminal_results = Arc::clone(&self.terminal_results);
         let completed_turns = Arc::clone(&self.completed_turns);
@@ -264,7 +287,7 @@ impl TuiTaskLifecycleBridge {
                         TaskExecutionEvent::Failed(_) => TuiExecutionEvent::Failed { id },
                         TaskExecutionEvent::Cancelled(_) => TuiExecutionEvent::Cancelled { id },
                     };
-                    let _ = events.publish(
+                    let outcome = events.publish(
                         TuiRuntimeEvent::TaskExecution {
                             agent: agent.clone(),
                             event,
@@ -272,6 +295,10 @@ impl TuiTaskLifecycleBridge {
                         &BridgeCancel::new(),
                         None,
                     );
+                    if outcome == agens_bus::PublishOutcome::Disconnected {
+                        registry.cancel(lifecycle.id());
+                        return;
+                    }
                     if matches!(
                         event,
                         TuiExecutionEvent::Completed { .. }
@@ -396,8 +423,41 @@ impl TuiTaskLifecycleBridge {
         }
     }
 
-    fn publish(&self, event: TuiRuntimeEvent) {
-        let _ = self.events.publish(event, &BridgeCancel::new(), None);
+    fn publish(&self, event: TuiRuntimeEvent) -> bool {
+        if self
+            .persist_event
+            .as_ref()
+            .is_some_and(|persist| !persist(&event))
+        {
+            return false;
+        }
+        matches!(
+            self.events.publish(event, &BridgeCancel::new(), None),
+            agens_bus::PublishOutcome::Published { .. }
+        )
+    }
+}
+
+struct PersistingEvents {
+    events: BridgeTx<TuiRuntimeEvent>,
+    persist: Option<RuntimeEventWriter>,
+}
+
+impl PersistingEvents {
+    fn publish(
+        &self,
+        event: TuiRuntimeEvent,
+        cancellation: &BridgeCancel,
+        deadline: Option<std::time::Instant>,
+    ) -> agens_bus::PublishOutcome {
+        if self
+            .persist
+            .as_ref()
+            .is_some_and(|persist| !persist(&event))
+        {
+            return agens_bus::PublishOutcome::Disconnected;
+        }
+        self.events.publish(event, cancellation, deadline)
     }
 }
 
@@ -421,7 +481,7 @@ fn terminal_cancellation_state(registry: &TaskExecutionRegistry, id: u64) -> &'s
 /// one.
 fn notify_main_of_terminal_subagent(
     registry: &TaskExecutionRegistry,
-    events: &BridgeTx<TuiRuntimeEvent>,
+    events: &PersistingEvents,
     id: u64,
     agent: &str,
     state: &str,
@@ -822,6 +882,38 @@ mod lifecycle_bridge_tests {
     use std::time::Duration;
 
     use super::*;
+
+    #[test]
+    fn hosted_writer_persists_before_publication_and_blocks_unstored_events() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let persisted = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&persisted);
+        let (events, receiver) = BridgeTx::bounded(2);
+        let bridge = TuiTaskLifecycleBridge::new(events, TuiTaskControls::default())
+            .with_event_writer(Arc::new(move |_| {
+                observed.store(true, Ordering::Release);
+                true
+            }));
+        bridge.publish(TuiRuntimeEvent::TurnStarted);
+        assert!(persisted.load(Ordering::Acquire));
+        assert!(receiver.try_recv().is_ok());
+
+        let (events, receiver) = BridgeTx::bounded(2);
+        let bridge = TuiTaskLifecycleBridge::new(events, TuiTaskControls::default())
+            .with_event_writer(Arc::new(|_| false));
+        let registry = TaskExecutionRegistry::new();
+        let id = registry.admit(TaskLaunchMode::Background).unwrap();
+        if !bridge.publish(TuiRuntimeEvent::TurnStarted) {
+            registry.cancel(id);
+        }
+        let lifecycle = registry.lifecycle(id).unwrap();
+        bridge.watch_lifecycle("general".into(), lifecycle);
+        registry.transition_to_background(id);
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(registry.active_snapshots()[0].cancellation_requested);
+        assert!(receiver.try_recv().is_err());
+    }
 
     #[test]
     fn registry_cancellation_projects_pending_before_terminal_confirmation() {

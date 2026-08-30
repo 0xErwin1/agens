@@ -17,11 +17,18 @@ use agens_coordinator_client::{ClientError, Coordinator, HostedChatEvent};
 use agens_core::{
     HeadlessTurnCancellation, IntraTurnInputSource, MessagePart, TurnEvent, TurnProgressSink,
     TurnRetryReason, TurnState, Usage,
+    hosted::{
+        CatalogEntry, CatalogKind, CatalogResult, CatalogSnapshot, FileError, HostedChildTurn,
+        HostedControlCommand, HostedControlKind, HostedControlResult, HostedMcpAction,
+        HostedMcpControl, HostedMcpResult, HostedMcpServer, HostedMcpState, HostedTaskEvent,
+        HostedTaskJournal, HostedTaskRecord, HostedTaskReplay, HostedTaskSnapshot, HostedTaskState,
+        TaskControlError, WorkspaceFileContent,
+    },
 };
 use agens_server::{
     BlockingBoundary, ChatFacade, ChatSession, ChatSessionRequest, ChatSessions, ChatTurnOutcome,
-    ChatTurns, SessionAdmission, SessionBudget, SessionId, SessionProvider, SessionRuntime,
-    SessionSupervisor, grpc::proto,
+    ChatTurns, ConfinedWorkspaceFiles, HostedCatalogSet, SessionAdmission, SessionBudget,
+    SessionId, SessionProvider, SessionRuntime, SessionSupervisor, grpc::proto,
 };
 use tokio_stream::StreamExt;
 use tonic::transport::Server;
@@ -116,17 +123,94 @@ impl ChatTurns for ScriptedTurns {
     }
 }
 
+struct StubMcp;
+impl HostedMcpControl for StubMcp {
+    fn status(&self) -> Vec<HostedMcpServer> {
+        vec![HostedMcpServer::new("files", HostedMcpState::Idle, 0, None)]
+    }
+    fn control(&mut self, server: &str, action: HostedMcpAction) -> HostedMcpResult {
+        let state = match action {
+            HostedMcpAction::Connect | HostedMcpAction::Reconnect => HostedMcpState::Ready,
+            HostedMcpAction::Disconnect => HostedMcpState::Closed,
+        };
+        HostedMcpResult::new(vec![HostedMcpServer::new(server, state, 1, None)], None)
+    }
+}
+
+struct StubTasks;
+impl HostedTaskJournal for StubTasks {
+    fn append_event(
+        &mut self,
+        _: i64,
+        _: &str,
+        _: HostedTaskState,
+        _: &str,
+    ) -> Result<HostedTaskEvent, TaskControlError> {
+        Err(TaskControlError::Storage)
+    }
+    fn persist_completed_child_turn(
+        &mut self,
+        _: i64,
+        _: &str,
+        _: u64,
+        _: &str,
+    ) -> Result<(), TaskControlError> {
+        Ok(())
+    }
+    fn completed_child_turns(&self, _: i64) -> Result<Vec<HostedChildTurn>, TaskControlError> {
+        Ok(vec![])
+    }
+    fn snapshot_tail(&self, session: i64) -> Result<HostedTaskReplay, TaskControlError> {
+        if session != 41 {
+            return Err(TaskControlError::WrongSession);
+        }
+        Ok(HostedTaskReplay::SnapshotTail {
+            snapshot: HostedTaskSnapshot::new(
+                7,
+                vec![HostedTaskRecord::new("1", HostedTaskState::Running)],
+            )
+            .with_child_turns(vec![HostedChildTurn::new("1", 1, "completed child")]),
+            events: vec![HostedTaskEvent::new(
+                8,
+                "1",
+                HostedTaskState::Background,
+                "detached",
+            )],
+        })
+    }
+    fn replay_after(&self, session: i64, _: u64) -> Result<HostedTaskReplay, TaskControlError> {
+        self.snapshot_tail(session)
+    }
+    fn apply_control(
+        &mut self,
+        command: &HostedControlCommand,
+    ) -> Result<HostedControlResult, TaskControlError> {
+        if command.session_id() != 41 {
+            return Err(TaskControlError::WrongSession);
+        }
+        let state = match command.kind() {
+            HostedControlKind::Background | HostedControlKind::Message(_) => {
+                HostedTaskState::Background
+            }
+            HostedControlKind::Cancel | HostedControlKind::CancelAll => HostedTaskState::Cancelled,
+        };
+        Ok(HostedControlResult::new(state, false))
+    }
+}
+
 struct Served {
     coordinator: Coordinator,
     supervisor: SessionSupervisor,
     started: Receiver<String>,
     shutdown: HeadlessTurnCancellation,
+    directory: PathBuf,
 }
 
 impl Drop for Served {
     fn drop(&mut self) {
         self.shutdown.cancel();
         self.supervisor.registry().cancel_all();
+        let _ = fs::remove_dir_all(&self.directory);
     }
 }
 
@@ -171,9 +255,21 @@ async fn served(events: Vec<TurnEvent>) -> Served {
 
     tokio::spawn(async move {
         Server::builder()
-            .add_service(proto::chat_server::ChatServer::new(ChatFacade::new(
-                chats, blocking,
-            )))
+            .add_service(proto::chat_server::ChatServer::new(
+                ChatFacade::new(chats, blocking)
+                    .with_hosted(
+                        Arc::new(HostedCatalogSet::new(
+                            Some(CatalogSnapshot::new(
+                                "commands-v2",
+                                vec![CatalogEntry::new("/help", "Show help", true)],
+                            )),
+                            None,
+                        )),
+                        Arc::new(ConfinedWorkspaceFiles::default()),
+                    )
+                    .with_hosted_mcp(Box::new(StubMcp))
+                    .with_hosted_tasks(Box::new(StubTasks)),
+            ))
             .serve_with_incoming_shutdown(
                 tokio_stream::wrappers::UnixListenerStream::new(listener),
                 async move {
@@ -192,6 +288,7 @@ async fn served(events: Vec<TurnEvent>) -> Served {
         supervisor,
         started: started_rx,
         shutdown,
+        directory,
     }
 }
 
@@ -282,4 +379,121 @@ async fn attaching_where_no_daemon_listens_says_so_rather_than_hanging() {
         Coordinator::attach(&nowhere).await,
         Err(ClientError::NotRunning(_))
     ));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn catalogs_files_round_trip_preserves_typed_outcomes() {
+    let served = served(Vec::new()).await;
+    fs::write(served.directory.join("README.sh"), "#!/bin/sh\nfalse\n").unwrap();
+    fs::write(served.directory.join(".gitignore"), "ignored.txt\n").unwrap();
+    fs::write(served.directory.join("ignored.txt"), "secret").unwrap();
+    let mut chat = served.coordinator.chat();
+
+    assert!(matches!(
+        chat.catalog(CatalogKind::Command, None).await.unwrap(),
+        CatalogResult::Current(snapshot) if snapshot.revision() == "commands-v2"
+    ));
+    assert_eq!(
+        chat.catalog(CatalogKind::Command, Some("commands-v1"))
+            .await
+            .unwrap(),
+        CatalogResult::Stale {
+            current_revision: "commands-v2".into()
+        }
+    );
+    assert_eq!(
+        chat.catalog(CatalogKind::Skill, None).await.unwrap(),
+        CatalogResult::Unsupported
+    );
+
+    let listed = chat
+        .list_workspace_files(&served.directory, PathBuf::from(".").as_path())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        listed
+            .iter()
+            .any(|file| file.path() == std::path::Path::new("README.sh"))
+    );
+    assert!(
+        !listed
+            .iter()
+            .any(|file| file.path() == std::path::Path::new("ignored.txt"))
+    );
+    assert!(matches!(
+        chat.read_workspace_file(&served.directory, std::path::Path::new("README.sh")).await.unwrap(),
+        Ok(WorkspaceFileContent::Text { text, .. }) if text.contains("false")
+    ));
+    assert_eq!(
+        chat.read_workspace_file(&served.directory, std::path::Path::new("../outside"))
+            .await
+            .unwrap(),
+        Err(FileError::OutsideRoot)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn hosted_task_and_mcp_round_trip_preserves_resulting_state_and_replay() {
+    let served = served(Vec::new()).await;
+    let mut chat = served.coordinator.chat();
+
+    let status = chat.mcp_status().await.unwrap();
+    assert_eq!(status.servers()[0].state(), HostedMcpState::Idle);
+    let connected = chat
+        .mcp_control("files", HostedMcpAction::Connect)
+        .await
+        .unwrap();
+    assert_eq!(connected.servers()[0].state(), HostedMcpState::Ready);
+    let disconnected = chat
+        .mcp_control("files", HostedMcpAction::Disconnect)
+        .await
+        .unwrap();
+    assert_eq!(disconnected.servers()[0].state(), HostedMcpState::Closed);
+    let reconnected = chat
+        .mcp_control("files", HostedMcpAction::Reconnect)
+        .await
+        .unwrap();
+    assert_eq!(reconnected.servers()[0].state(), HostedMcpState::Ready);
+
+    let replay = chat.task_snapshot(41).await.unwrap().unwrap();
+    let HostedTaskReplay::SnapshotTail { snapshot, events } = replay else {
+        panic!("snapshot tail")
+    };
+    assert_eq!(snapshot.tasks()[0].state(), HostedTaskState::Running);
+    assert_eq!(snapshot.child_turns()[0].payload(), "completed child");
+    assert_eq!(events[0].state(), HostedTaskState::Background);
+
+    for (id, kind, expected) in [
+        (
+            "background",
+            HostedControlKind::Background,
+            HostedTaskState::Background,
+        ),
+        (
+            "message",
+            HostedControlKind::Message("continue".into()),
+            HostedTaskState::Background,
+        ),
+        (
+            "cancel",
+            HostedControlKind::Cancel,
+            HostedTaskState::Cancelled,
+        ),
+        (
+            "cancel-all",
+            HostedControlKind::CancelAll,
+            HostedTaskState::Cancelled,
+        ),
+    ] {
+        let command = HostedControlCommand::new(41, Some("1".into()), id, kind);
+        assert_eq!(
+            chat.task_control(&command).await.unwrap().unwrap().state(),
+            expected
+        );
+    }
+    assert_eq!(
+        chat.task_snapshot(99).await.unwrap(),
+        Err(TaskControlError::WrongSession)
+    );
 }

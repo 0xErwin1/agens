@@ -17,6 +17,7 @@ pub mod compaction;
 pub mod denylist;
 #[cfg(test)]
 mod denylist_tests;
+pub mod hosted;
 pub mod mcp_failure;
 mod permission_precedence;
 mod permission_target;

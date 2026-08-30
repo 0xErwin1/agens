@@ -294,6 +294,125 @@ pub fn remote_function_tool(
     .map_err(|_| CliError::configuration("MCP tool metadata is invalid"))
 }
 
+pub struct ProductionHostedMcp {
+    runtime: ProductionMcpRuntime,
+    generation: u64,
+}
+
+impl ProductionHostedMcp {
+    pub fn new(bootstrap: &Bootstrap, project_root: &Path) -> Result<Self, CliError> {
+        let registry = bootstrap
+            .mcp_registry
+            .get_or_init(|| load_configured_mcp_registry(bootstrap, project_root))
+            .ok_or_else(|| CliError::configuration("MCP tools are unavailable"))?;
+        Ok(Self {
+            runtime: ProductionMcpRuntime {
+                registry,
+                dispatcher: Arc::new(Mutex::new(ToolDispatcher::new())),
+            },
+            generation: 0,
+        })
+    }
+
+    fn resulting_status(&self, error: Option<String>) -> agens_core::hosted::HostedMcpResult {
+        agens_core::hosted::HostedMcpResult::new(
+            agens_core::hosted::HostedMcpControl::status(self),
+            error,
+        )
+    }
+}
+
+impl agens_core::hosted::HostedMcpControl for ProductionHostedMcp {
+    fn status(&self) -> Vec<agens_core::hosted::HostedMcpServer> {
+        self.runtime
+            .registry
+            .lock()
+            .map(|registry| {
+                registry
+                    .status_handle()
+                    .snapshot()
+                    .servers()
+                    .iter()
+                    .map(|server| {
+                        let state = match server.state() {
+                            agens_tools::McpLifecycleState::Disabled => {
+                                agens_core::hosted::HostedMcpState::Disabled
+                            }
+                            agens_tools::McpLifecycleState::Idle => {
+                                agens_core::hosted::HostedMcpState::Idle
+                            }
+                            agens_tools::McpLifecycleState::Connecting => {
+                                agens_core::hosted::HostedMcpState::Connecting
+                            }
+                            agens_tools::McpLifecycleState::Ready => {
+                                agens_core::hosted::HostedMcpState::Ready
+                            }
+                            agens_tools::McpLifecycleState::Degraded => {
+                                agens_core::hosted::HostedMcpState::Degraded
+                            }
+                            agens_tools::McpLifecycleState::Failed => {
+                                agens_core::hosted::HostedMcpState::Failed
+                            }
+                            agens_tools::McpLifecycleState::Closed => {
+                                agens_core::hosted::HostedMcpState::Closed
+                            }
+                        };
+                        agens_core::hosted::HostedMcpServer::new(
+                            server.descriptor().name(),
+                            state,
+                            self.generation,
+                            server.last_error().map(|error| error.message().to_owned()),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn control(
+        &mut self,
+        server: &str,
+        action: agens_core::hosted::HostedMcpAction,
+    ) -> agens_core::hosted::HostedMcpResult {
+        self.generation = self.generation.saturating_add(1);
+        let outcome = match action {
+            agens_core::hosted::HostedMcpAction::Connect => {
+                self.runtime.discover_server(server).map(|_| ())
+            }
+            agens_core::hosted::HostedMcpAction::Reconnect => {
+                self.runtime.reload_server(server).map(|_| ())
+            }
+            agens_core::hosted::HostedMcpAction::Disconnect => {
+                let mut dispatcher = self
+                    .runtime
+                    .dispatcher
+                    .lock()
+                    .map_err(|_| CliError::configuration("tool catalog is invalid"));
+                let mut registry = self
+                    .runtime
+                    .registry
+                    .lock()
+                    .map_err(|_| CliError::configuration("MCP tools are unavailable"));
+                match (&mut dispatcher, &mut registry) {
+                    (Ok(dispatcher), Ok(registry)) => {
+                        if registry.disconnect_server(server) {
+                            dispatcher.remove_mcp_server(server);
+                            Ok(())
+                        } else {
+                            Err(CliError::configuration("MCP server is not configured"))
+                        }
+                    }
+                    (Err(error), _) | (_, Err(error)) => Err(std::mem::replace(
+                        error,
+                        CliError::configuration("MCP control failed"),
+                    )),
+                }
+            }
+        };
+        self.resulting_status(outcome.err().map(|error| error.to_string()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use agens_core::{

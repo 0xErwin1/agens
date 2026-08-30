@@ -27,11 +27,8 @@ pub(crate) struct Cli {
     /// Resume the most recent session, or the given session id.
     #[arg(long, value_name = "SESSION_ID")]
     pub(crate) resume: Option<Option<i64>>,
-    // Both are spelled out rather than one implying the other's absence,
-    // because the default is going to move: `--local` says what it means today
-    // and keeps meaning it after attaching becomes what happens when neither is
-    // given. The help stays one line per flag so `--help` keeps its short form;
-    // a second paragraph turns clap's whole root help into the long rendering.
+    // Both modes stay explicit even though attached is the default. This keeps
+    // scripts readable and gives daemon startup failures one stable local exit.
     /// Run the turn in this process
     #[arg(long, conflicts_with = "attach")]
     pub(crate) local: bool,
@@ -45,15 +42,12 @@ pub(crate) struct Cli {
 impl Cli {
     /// Where this invocation's turns run.
     ///
-    /// Local unless attaching was asked for. The two flags are both spelled out
-    /// rather than one implying the other's absence, because the default is
-    /// going to move: `--local` says what it means today and will keep meaning
-    /// it after attaching becomes what happens when neither is given.
+    /// Attached unless local execution was explicitly requested.
     pub(crate) const fn tui_mode(&self) -> crate::tui::TuiMode {
-        if self.attach {
-            crate::tui::TuiMode::Attached
-        } else {
+        if self.local {
             crate::tui::TuiMode::Local
+        } else {
+            crate::tui::TuiMode::Attached
         }
     }
 }

@@ -25,11 +25,17 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 
 use agens_bootstrap::Bootstrap;
 use agens_coordinator_client::{
     ChatClient, ClientError, Coordinator, HostedChatEvent, PermissionDecision, PermissionQuestion,
+};
+use agens_core::hosted::{
+    CatalogKind, CatalogResult, FileError, HostedControlCommand, HostedControlKind,
+    HostedControlResult, HostedMcpAction, HostedMcpResult, HostedTaskReplay, TaskControlError,
+    WorkspaceFile, WorkspaceFileContent,
 };
 use agens_core::{
     HeadlessTurnCancellation, Message, MessagePart, SessionMessage, SubmitOrigin, TurnEvent,
@@ -37,22 +43,29 @@ use agens_core::{
 use agens_error::{CliError, ExitStatus};
 use agens_session::context::SessionContext;
 use agens_tui::{
-    Engine, Tui, TuiAskUserBridge, TuiPermissionBridge, TuiPermissionReply, TuiRouteRequest,
-    TuiSubmissionOutcome,
+    Engine, Tui, TuiAskUserBridge, TuiPermissionBridge, TuiPermissionReply,
     run_with_default_progress_submit_with_permissions_task_controls_and_ask_user,
 };
 use tokio::runtime::Runtime;
 use tokio_stream::{Stream, StreamExt};
 
-use crate::extensions::{start_tui_commands, start_tui_skills};
-use crate::files::tui_picker_file_candidates;
-use crate::router::{TuiRuntimeRouter, tui_provider_outcome};
+#[cfg(test)]
+use agens_tui::{TuiRouteRequest, TuiSubmissionOutcome};
+
+use crate::router::{AttachedRouteBackend, TuiRuntimeRouter, tui_provider_outcome};
 
 /// What this mode cannot serve yet, said the same way everywhere it comes up.
+#[cfg(test)]
 const UNSUPPORTED: &str =
     "not available while attached to a daemon yet; start without attaching for this";
 
 type Events = std::pin::Pin<Box<dyn Stream<Item = Result<HostedChatEvent, ClientError>> + Send>>;
+
+static NEXT_ATTACHMENT_NONCE: AtomicU64 = AtomicU64::new(1);
+
+fn control_command_id(session: i64, nonce: u64, sequence: u64) -> String {
+    format!("attached-tui-{session}-{nonce}-{sequence}")
+}
 
 /// The connection the terminal holds while it is attached.
 ///
@@ -65,6 +78,9 @@ struct Attachment {
     chat: Mutex<ChatClient>,
     events: Mutex<Events>,
     session_id: i64,
+    checkout: PathBuf,
+    attachment_nonce: u64,
+    next_control_id: AtomicU64,
     /// Where a permission question the daemon asked is put to the person, and
     /// where their answer comes back from.
     permissions: TuiPermissionBridge,
@@ -221,6 +237,105 @@ impl Attachment {
 /// blocked on: the surface asks to cancel from the thread drawing it while the
 /// turn is parked on the stream, and reaching through the same lock would mean
 /// the cancellation waits for the thing it is cancelling.
+impl AttachedRouteBackend for Attachment {
+    fn catalog(&self, kind: CatalogKind) -> Result<CatalogResult, CliError> {
+        let mut chat = self
+            .chat
+            .lock()
+            .map_err(|_| unavailable("the connection to the daemon is unusable"))?;
+        self.runtime
+            .block_on(chat.catalog(kind, None))
+            .map_err(refused)
+    }
+
+    fn command(&self, command: &str) -> Result<String, CliError> {
+        self.command(command)
+    }
+
+    fn list_files(
+        &self,
+        selector: &Path,
+    ) -> Result<Result<Vec<WorkspaceFile>, FileError>, CliError> {
+        let mut chat = self
+            .chat
+            .lock()
+            .map_err(|_| unavailable("the connection to the daemon is unusable"))?;
+        self.runtime
+            .block_on(chat.list_workspace_files(&self.checkout, selector))
+            .map_err(refused)
+    }
+
+    fn read_file(
+        &self,
+        selector: &Path,
+    ) -> Result<Result<WorkspaceFileContent, FileError>, CliError> {
+        let mut chat = self
+            .chat
+            .lock()
+            .map_err(|_| unavailable("the connection to the daemon is unusable"))?;
+        self.runtime
+            .block_on(chat.read_workspace_file(&self.checkout, selector))
+            .map_err(refused)
+    }
+
+    fn mcp_status(&self) -> Result<HostedMcpResult, CliError> {
+        let mut chat = self
+            .chat
+            .lock()
+            .map_err(|_| unavailable("the connection to the daemon is unusable"))?;
+        self.runtime.block_on(chat.mcp_status()).map_err(refused)
+    }
+
+    fn mcp_control(
+        &self,
+        server: &str,
+        action: HostedMcpAction,
+    ) -> Result<HostedMcpResult, CliError> {
+        let mut chat = self
+            .chat
+            .lock()
+            .map_err(|_| unavailable("the connection to the daemon is unusable"))?;
+        self.runtime
+            .block_on(chat.mcp_control(server, action))
+            .map_err(refused)
+    }
+
+    fn task_snapshot(&self) -> Result<Result<HostedTaskReplay, TaskControlError>, CliError> {
+        let mut chat = self
+            .chat
+            .lock()
+            .map_err(|_| unavailable("the connection to the daemon is unusable"))?;
+        self.runtime
+            .block_on(chat.task_snapshot(self.session_id))
+            .map_err(refused)
+    }
+
+    fn task_control(
+        &self,
+        kind: HostedControlKind,
+        task_id: Option<u64>,
+    ) -> Result<Result<HostedControlResult, TaskControlError>, CliError> {
+        let command_id = control_command_id(
+            self.session_id,
+            self.attachment_nonce,
+            self.next_control_id.fetch_add(1, Ordering::Relaxed),
+        );
+        let command = HostedControlCommand::new(
+            self.session_id,
+            task_id.map(|id| id.to_string()),
+            command_id,
+            kind,
+        );
+        let mut chat = self
+            .chat
+            .lock()
+            .map_err(|_| unavailable("the connection to the daemon is unusable"))?;
+        self.runtime
+            .block_on(chat.task_control(&command))
+            .map_err(refused)
+    }
+}
+
 struct AttachedEngine {
     runtime: Arc<Runtime>,
     chat: Mutex<ChatClient>,
@@ -248,6 +363,7 @@ impl Engine for AttachedEngine {
 /// against the daemon-owned chat. Everything else the surface can route belongs
 /// to the local router, and a command that quietly did nothing would read as the
 /// terminal being broken.
+#[cfg(test)]
 fn route(
     request: &TuiRouteRequest,
     execute_command: impl Fn(&str) -> Result<String, CliError>,
@@ -333,23 +449,18 @@ pub fn run_attached_tui_with_prompt(
     tui.adopt_environment();
     tui.set_collapse_thinking(bootstrap.collapse_thinking);
     tui.add_info(arrival.describe());
-    tui.add_info(
-        "attached mode supports ordered prompts, prompt-producing commands, /agents, /agent <name>, /effort <value>, and /model <provider/model>; selected subagents, background controls, and session mutations remain unsupported",
-    );
-    let skills = start_tui_skills(&mut tui, bootstrap, &checkout)?;
-    let commands = start_tui_commands(&mut tui, bootstrap, &checkout)?;
+    tui.add_info("attached mode uses daemon-owned commands, skills, files, MCP state, and tasks");
+    let attachment = Arc::new(attachment);
     let router = TuiRuntimeRouter::new(
         bootstrap.clone(),
         Arc::clone(&staging),
         Arc::new(Mutex::new(None)),
-        commands,
-        skills,
-    );
-    if let Ok(context) = staging.lock()
-        && let Ok(candidates) = tui_picker_file_candidates(&context, bootstrap)
-    {
-        tui.set_file_candidates(candidates);
-    }
+        Arc::new(agens_tools::CommandCatalog::default()),
+        Arc::new(agens_tools::SkillCatalog::default()),
+    )
+    .with_attached_backend(attachment.clone());
+    tui.set_palette_entries(router.attached_palette_entries()?);
+    tui.set_file_candidates(router.attached_file_candidates()?);
     if let Some(prompt) = initial_prompt {
         tui.set_composer_draft(prompt);
     }
@@ -364,28 +475,21 @@ pub fn run_attached_tui_with_prompt(
         ));
     }
 
-    let attachment = Arc::new(attachment);
+    for event in router.attached_task_events()? {
+        tui.apply_runtime_event(event);
+    }
+
     let permissions = attachment.permissions.clone();
     let asks = attachment.ask_user.clone();
-    let commands = Arc::clone(&attachment);
-
     let route_router = router.clone();
+    let background_router = router.clone();
+    let cancel_router = router.clone();
+    let cancel_all_router = router.clone();
+    let message_router = router.clone();
     run_with_default_progress_submit_with_permissions_task_controls_and_ask_user(
         &mut tui,
         move |request, progress, cancellation| {
-            let is_hosted_command = matches!(
-                &request,
-                TuiRouteRequest::Input(input)
-                    if input.trim() == "/agents"
-                        || input.trim().starts_with("/agent ")
-                        || input.trim().starts_with("/effort ")
-                        || input.trim().starts_with("/model ")
-            );
-            if is_hosted_command {
-                route(&request, |command| commands.command(command))
-            } else {
-                route_router.route_attached_request(request, progress, cancellation)
-            }
+            route_router.route_attached_request(request, progress, cancellation)
         },
         move |message, origin, progress, _metrics| {
             if let Some(rejection) = unsupported_attached_origin(origin) {
@@ -394,10 +498,10 @@ pub fn run_attached_tui_with_prompt(
                 attached_provider_outcome(attachment.take_turn(&message, &progress))
             }
         },
-        |_| false,
-        |_| false,
-        Vec::new,
-        |_, _| false,
+        move |id| background_router.attached_background_task(id),
+        move |id| cancel_router.attached_cancel_task(id),
+        move || cancel_all_router.attached_cancel_all_tasks(),
+        move |id, message| message_router.attached_send_task_message(id, message),
         Some((permissions, permission_requests)),
         Some((asks, ask_user_requests)),
     )
@@ -509,6 +613,9 @@ fn attach(
             chat: Mutex::new(chat),
             events: Mutex::new(Box::pin(events)),
             session_id,
+            checkout: checkout.to_path_buf(),
+            attachment_nonce: NEXT_ATTACHMENT_NONCE.fetch_add(1, Ordering::Relaxed),
+            next_control_id: AtomicU64::new(1),
             permissions,
             ask_user,
             staging,
@@ -596,7 +703,7 @@ fn rejected(error: ClientError) -> CliError {
 fn refused(error: ClientError) -> CliError {
     match error {
         ClientError::NotRunning(_) => CliError::unavailable(
-            "no daemon is running; start one with `agens serve`, or run with `--local`",
+            "no daemon is running; start one with `agens serve`, or run `agens --local`",
         ),
         other => CliError::new(ExitStatus::Failure, "provider", other.to_string()),
     }
@@ -663,6 +770,11 @@ mod tests {
             outcome,
             TuiSubmissionOutcome::LocalInfo("executed:/agent all".to_owned())
         );
+    }
+
+    #[test]
+    fn control_ids_do_not_collide_between_attachments() {
+        assert_ne!(control_command_id(7, 1, 1), control_command_id(7, 2, 1));
     }
 
     #[test]

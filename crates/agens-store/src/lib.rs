@@ -15,6 +15,7 @@ mod control_plane;
 mod database;
 mod directives;
 mod fact_store;
+mod hosted_tasks;
 mod media;
 mod prompt_memory;
 mod questions;
@@ -35,6 +36,7 @@ pub use directives::{
     DirectiveTarget,
 };
 pub use fact_store::{ToolFactStore, ToolFactStoreError};
+pub use hosted_tasks::{HostedTaskStore, HostedTaskStoreError};
 pub use media::{
     MAX_MEDIA_BYTES, MediaRecord, MediaStoreError, guess_mime_from_bytes, guess_mime_from_path,
     ingest_media_bytes, ingest_media_path, is_media_mime, media_chip_label, media_mime, open_media,

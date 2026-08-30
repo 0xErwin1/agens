@@ -3,8 +3,14 @@
 //! Every route runs under a cancellation the caller owns, so a keystroke can
 //! stop a turn that is already in flight.
 
+use agens_core::hosted::{
+    CatalogKind, CatalogResult, HostedControlKind, HostedMcpAction, HostedMcpResult,
+    HostedTaskReplay, HostedTaskState, WorkspaceFileContent,
+};
+use agens_core::{TuiExecutionEvent, TuiRuntimeEvent};
 use agens_tui::{
-    SecretInput, TuiRouteCancellation, TuiRouteProgress, TuiRouteRequest, TuiSubmissionOutcome,
+    DialogEntry, DialogView, SecretInput, TuiRouteCancellation, TuiRouteProgress, TuiRouteRequest,
+    TuiSubmissionOutcome,
 };
 
 use agens_auth::ChatGptAuthFlow;
@@ -100,6 +106,27 @@ impl TuiRuntimeRouter {
         progress: std::sync::mpsc::Sender<TuiRouteProgress>,
         cancellation: TuiRouteCancellation,
     ) -> TuiSubmissionOutcome {
+        if self.attached_backend.is_some() {
+            let result = match request {
+                TuiRouteRequest::Input(input) => self.resolve_daemon_attached(text_message(input)),
+                TuiRouteRequest::InputMessage(input) => self.resolve_daemon_attached(input),
+                TuiRouteRequest::BusyInput(input) => self
+                    .resolve_daemon_attached(text_message(input))
+                    .map(queue_attached),
+                TuiRouteRequest::BusyMessage(input) => {
+                    self.resolve_daemon_attached(input).map(queue_attached)
+                }
+                TuiRouteRequest::DialogAction(action) => self.resolve_daemon_dialog_action(&action),
+                _ => Err(CliError::usage(
+                    "this action is not supported while attached to a daemon",
+                )),
+            };
+            return result.unwrap_or_else(|error| TuiSubmissionOutcome::LocalActionableError {
+                message: error.to_string(),
+                action: TUI_ERROR_ACTION.into(),
+            });
+        }
+
         let result = match request {
             TuiRouteRequest::Input(input) => {
                 self.resolve_attached(text_message(input), &cancellation)
@@ -277,6 +304,255 @@ impl TuiRuntimeRouter {
         )
     }
 
+    fn resolve_daemon_attached(
+        &self,
+        input: agens_core::Message,
+    ) -> Result<TuiSubmissionOutcome, CliError> {
+        let display = agens_tui::user_message_text(&input);
+        let command = display.trim();
+        if command.starts_with('/') {
+            return self.resolve_daemon_command(command);
+        }
+
+        let backend = self.attached_backend()?;
+        let mut parts = Vec::new();
+        for part in input.parts {
+            let agens_core::MessagePart::Text(text) = part else {
+                parts.push(part);
+                continue;
+            };
+            let mut expanded = String::new();
+            for segment in text.split_inclusive(char::is_whitespace) {
+                let token = segment.trim_end_matches(char::is_whitespace);
+                let whitespace = &segment[token.len()..];
+                let Some(selector) = token.strip_prefix('@').filter(|value| !value.is_empty())
+                else {
+                    expanded.push_str(token);
+                    expanded.push_str(whitespace);
+                    continue;
+                };
+                match backend
+                    .read_file(std::path::Path::new(selector))?
+                    .map_err(file_error)?
+                {
+                    WorkspaceFileContent::Text { path, text } => {
+                        expanded.push_str(&format!(
+                            "<file path=\"{}\">\n{}\n</file>",
+                            path.display(),
+                            text
+                        ));
+                    }
+                    WorkspaceFileContent::Media {
+                        mime,
+                        media_id: Some(media_id),
+                        ..
+                    } => {
+                        if !expanded.is_empty() {
+                            parts
+                                .push(agens_core::MessagePart::Text(std::mem::take(&mut expanded)));
+                        }
+                        parts.push(agens_core::MessagePart::Media { media_id, mime });
+                    }
+                    WorkspaceFileContent::Media { media_id: None, .. } => {
+                        return Err(CliError::usage(
+                            "daemon media reference did not include a durable media identifier",
+                        ));
+                    }
+                }
+                expanded.push_str(whitespace);
+            }
+            if !expanded.is_empty() {
+                parts.push(agens_core::MessagePart::Text(expanded));
+            }
+        }
+
+        Ok(TuiSubmissionOutcome::ProviderMessage {
+            display,
+            message: agens_core::Message {
+                role: agens_core::Role::User,
+                parts,
+            },
+        })
+    }
+
+    fn resolve_daemon_command(&self, command: &str) -> Result<TuiSubmissionOutcome, CliError> {
+        let backend = self.attached_backend()?;
+        let mut words = command.split_whitespace();
+        let name = words.next().unwrap_or_default().trim_start_matches('/');
+        match name {
+            "attach" => {
+                let selector = words
+                    .next()
+                    .ok_or_else(|| CliError::usage("/attach requires a daemon workspace path"))?;
+                let content = backend
+                    .read_file(std::path::Path::new(selector))?
+                    .map_err(file_error)?;
+                let WorkspaceFileContent::Media {
+                    mime,
+                    media_id: Some(media_id),
+                    ..
+                } = content
+                else {
+                    return Err(CliError::usage(
+                        "/attach requires a daemon-owned media file",
+                    ));
+                };
+                let attachment = agens_core::PromptAttachment::new(media_id, mime);
+                let staged_media = {
+                    let mut session = self
+                        .session
+                        .lock()
+                        .map_err(|_| CliError::storage("TUI session is unavailable"))?;
+                    session.pending_media_ids.push(media_id);
+                    session.pending_media_mimes.push(attachment.mime.clone());
+                    session
+                        .pending_media_ids
+                        .iter()
+                        .copied()
+                        .zip(session.pending_media_mimes.iter().cloned())
+                        .map(|(id, mime)| agens_core::PromptAttachment::new(id, mime))
+                        .collect()
+                };
+                return Ok(TuiSubmissionOutcome::MediaAttached {
+                    message: format!("Attached media #{media_id} from the daemon."),
+                    staged_media,
+                });
+            }
+            "skills" => {
+                return Ok(TuiSubmissionOutcome::Dialog(catalog_dialog(
+                    "Skills",
+                    backend.catalog(CatalogKind::Skill)?,
+                )?));
+            }
+            "mcp" => {
+                let action = words.next();
+                let result = match action {
+                    None => backend.mcp_status()?,
+                    Some(action) => {
+                        let server = words.next().ok_or_else(|| {
+                            CliError::usage("/mcp control requires a server name")
+                        })?;
+                        let action = match action {
+                            "connect" => HostedMcpAction::Connect,
+                            "disconnect" => HostedMcpAction::Disconnect,
+                            "reconnect" => HostedMcpAction::Reconnect,
+                            _ => {
+                                return Err(CliError::usage(
+                                    "/mcp supports connect, disconnect, or reconnect",
+                                ));
+                            }
+                        };
+                        backend.mcp_control(server, action)?
+                    }
+                };
+                return Ok(TuiSubmissionOutcome::Dialog(mcp_dialog(result)));
+            }
+            "select" => {
+                let files = backend
+                    .list_files(std::path::Path::new("."))?
+                    .map_err(file_error)?
+                    .into_iter()
+                    .map(|file| {
+                        DialogEntry::action_with_detail(
+                            file.path().display().to_string(),
+                            Some(format!("{} bytes · {:?}", file.byte_len(), file.kind())),
+                            format!("attach:{}", file.path().display()),
+                        )
+                    })
+                    .collect();
+                return Ok(TuiSubmissionOutcome::Dialog(DialogView::selection(
+                    "Select file",
+                    Some("Daemon workspace files"),
+                    files,
+                )));
+            }
+            "quit" => return Ok(TuiSubmissionOutcome::Quit),
+            _ => {}
+        }
+
+        let known = catalog_contains(backend.catalog(CatalogKind::Command)?, name)?
+            || catalog_contains(backend.catalog(CatalogKind::Skill)?, name)?;
+        if !known {
+            return Err(CliError::usage(format!("unknown daemon command: /{name}")));
+        }
+        backend
+            .command(command)
+            .map(TuiSubmissionOutcome::LocalInfo)
+    }
+
+    fn resolve_daemon_dialog_action(&self, action: &str) -> Result<TuiSubmissionOutcome, CliError> {
+        if let Some(path) = action.strip_prefix("attach:") {
+            return self.resolve_daemon_command(&format!("/attach {path}"));
+        }
+        if let Some(server) = action.strip_prefix("mcp:reconnect:") {
+            return self.resolve_daemon_command(&format!("/mcp reconnect {server}"));
+        }
+        Err(CliError::usage("unknown attached dialog action"))
+    }
+
+    pub(crate) fn attached_task_events(&self) -> Result<Vec<TuiRuntimeEvent>, CliError> {
+        let replay = self
+            .attached_backend()?
+            .task_snapshot()?
+            .map_err(task_error)?;
+        let mut events = Vec::new();
+        match replay {
+            HostedTaskReplay::Events(tail) => {
+                events.extend(tail.into_iter().filter_map(hosted_event));
+            }
+            HostedTaskReplay::SnapshotTail {
+                snapshot,
+                events: tail,
+            } => {
+                events.extend(snapshot.tasks().iter().filter_map(|task| {
+                    hosted_task_event(task.task_id(), task.state(), "attached")
+                }));
+                events.extend(tail.into_iter().filter_map(hosted_event));
+                for turn in snapshot.child_turns() {
+                    if let Ok(id) = turn.task_id().parse::<u64>() {
+                        events.push(TuiRuntimeEvent::RestoredCompletedSubagent {
+                            id,
+                            agent: "attached".into(),
+                            task_summary: format!("Restored task {}", turn.task_id()),
+                            final_result: turn.payload().to_owned(),
+                            tool_uses: 0,
+                        });
+                    }
+                }
+            }
+            HostedTaskReplay::Gap { oldest_cursor } => {
+                return Err(CliError::storage(format!(
+                    "daemon task history starts at cursor {oldest_cursor}"
+                )));
+            }
+        }
+        Ok(events)
+    }
+
+    pub(crate) fn attached_background_task(&self, id: u64) -> bool {
+        self.attached_control(HostedControlKind::Background, Some(id))
+    }
+
+    pub(crate) fn attached_cancel_task(&self, id: u64) -> bool {
+        self.attached_control(HostedControlKind::Cancel, Some(id))
+    }
+
+    pub(crate) fn attached_cancel_all_tasks(&self) -> Vec<u64> {
+        self.attached_control(HostedControlKind::CancelAll, None)
+            .then(Vec::new)
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn attached_send_task_message(&self, id: u64, message: String) -> bool {
+        self.attached_control(HostedControlKind::Message(message), Some(id))
+    }
+
+    fn attached_control(&self, kind: HostedControlKind, id: Option<u64>) -> bool {
+        self.attached_backend()
+            .and_then(|backend| backend.task_control(kind, id))
+            .is_ok_and(|result| result.is_ok())
+    }
+
     fn submit_secret(&self, action_id: String, secret: SecretInput) -> TuiSubmissionOutcome {
         let provider = match action_id.as_str() {
             "login:api-key:openai-api" => ProviderKind::OpenAiApi,
@@ -342,6 +618,110 @@ impl TuiRuntimeRouter {
                 }),
         }
     }
+}
+
+fn file_error(error: agens_core::hosted::FileError) -> CliError {
+    CliError::new(
+        agens_error::ExitStatus::Failure,
+        "file",
+        format!("daemon workspace file failed: {error:?}"),
+    )
+}
+
+fn task_error(error: agens_core::hosted::TaskControlError) -> CliError {
+    CliError::new(
+        agens_error::ExitStatus::Failure,
+        "task",
+        format!("daemon task operation failed: {error:?}"),
+    )
+}
+
+fn catalog_contains(result: CatalogResult, name: &str) -> Result<bool, CliError> {
+    match result {
+        CatalogResult::Current(snapshot) => {
+            Ok(snapshot.entries().iter().any(|entry| entry.name() == name))
+        }
+        CatalogResult::Stale { current_revision } => Err(CliError::unavailable(format!(
+            "daemon catalog changed to revision {current_revision}; retry"
+        ))),
+        CatalogResult::Unsupported => Err(CliError::unavailable("daemon catalog is unsupported")),
+    }
+}
+
+fn catalog_dialog(title: &str, result: CatalogResult) -> Result<DialogView, CliError> {
+    let CatalogResult::Current(snapshot) = result else {
+        return match result {
+            CatalogResult::Stale { current_revision } => Err(CliError::unavailable(format!(
+                "daemon catalog changed to revision {current_revision}; retry"
+            ))),
+            CatalogResult::Unsupported => {
+                Err(CliError::unavailable("daemon catalog is unsupported"))
+            }
+            CatalogResult::Current(_) => unreachable!(),
+        };
+    };
+    let entries = snapshot
+        .entries()
+        .iter()
+        .map(|entry| {
+            DialogEntry::action_with_detail(
+                format!("/{}", entry.name()),
+                Some(entry.description()),
+                format!("fill:/{} ", entry.name()),
+            )
+        })
+        .collect();
+    Ok(DialogView::selection(
+        title,
+        Some(format!("Daemon catalog · revision {}", snapshot.revision())),
+        entries,
+    ))
+}
+
+fn mcp_dialog(result: HostedMcpResult) -> DialogView {
+    let entries = result
+        .servers()
+        .iter()
+        .map(|server| {
+            DialogEntry::action_with_detail(
+                server.name(),
+                Some(format!(
+                    "{:?} · generation {}{}",
+                    server.state(),
+                    server.generation(),
+                    server
+                        .error()
+                        .map_or(String::new(), |error| format!(" · {error}"))
+                )),
+                format!("mcp:reconnect:{}", server.name()),
+            )
+        })
+        .collect();
+    DialogView::selection("MCP servers", result.error(), entries)
+}
+
+fn hosted_event(event: agens_core::hosted::HostedTaskEvent) -> Option<TuiRuntimeEvent> {
+    hosted_task_event(event.task_id(), event.state(), event.payload())
+}
+
+fn hosted_task_event(
+    task_id: &str,
+    state: HostedTaskState,
+    payload: &str,
+) -> Option<TuiRuntimeEvent> {
+    let id = task_id.parse::<u64>().ok()?;
+    let agent = payload.split_once(':').map_or(payload, |(_, agent)| agent);
+    let event = match state {
+        HostedTaskState::Running => TuiExecutionEvent::ForegroundStarted { id },
+        HostedTaskState::Background => TuiExecutionEvent::BackgroundStarted { id },
+        HostedTaskState::Completed => TuiExecutionEvent::Completed { id },
+        HostedTaskState::Cancelled => TuiExecutionEvent::Cancelled { id },
+        HostedTaskState::Failed => TuiExecutionEvent::Failed { id },
+    };
+    Some(TuiRuntimeEvent::TaskExecution {
+        agent: agent.to_owned(),
+        event,
+    })
 }
 
 fn queue_attached(outcome: TuiSubmissionOutcome) -> TuiSubmissionOutcome {

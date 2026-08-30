@@ -57,7 +57,9 @@ use crate::fsm::{Principal, TransitionRejection};
 
 pub use chat::ChatFacade;
 pub use feed::FeedFacade;
-pub use serve::{FacadeBinding, FacadeError, serve_until_shutdown};
+pub use serve::{
+    FacadeBinding, FacadeError, serve_until_shutdown, serve_until_shutdown_with_hosted,
+};
 pub use team::TeamFacade;
 
 /// A facade's handle on the one service core the daemon owns.

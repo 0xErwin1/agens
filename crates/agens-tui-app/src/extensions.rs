@@ -231,6 +231,15 @@ const TUI_BUILT_INS: &[TuiBuiltinCommand] = &[
         5,
     ),
     TuiBuiltinCommand::new(
+        "skills",
+        "Show available skills",
+        "",
+        Some("skills"),
+        CommandBusyPolicy::Local,
+        false,
+        22,
+    ),
+    TuiBuiltinCommand::new(
         "stash",
         "Pick or remove a stashed prompt",
         "",
@@ -280,6 +289,15 @@ const TUI_BUILT_INS: &[TuiBuiltinCommand] = &[
 
 pub(crate) fn tui_builtin_commands() -> &'static [TuiBuiltinCommand] {
     TUI_BUILT_INS
+}
+
+pub fn tui_hosted_builtin_entries() -> Vec<agens_core::hosted::CatalogEntry> {
+    TUI_BUILT_INS
+        .iter()
+        .map(|command| {
+            agens_core::hosted::CatalogEntry::new(command.name, command.description, true)
+        })
+        .collect()
 }
 
 /// Discovers the command catalog for the given root without surfacing diagnostics to a `Tui`.
@@ -885,6 +903,7 @@ mod tests {
                 "subagent",
                 "subagents",
                 "history",
+                "skills",
                 "stash",
                 "attach",
                 "undo",
