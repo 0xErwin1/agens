@@ -227,6 +227,65 @@ fn concurrent_explicit_team_starts_wait_for_one_ready_daemon() {
     assert!(alive(operator.published_pid()));
 }
 
+/// The point of starting the daemon detached: the client that started it is
+/// an ordinary process whose exit must leave the daemon serving. By the time
+/// `run` returns the client is fully gone, so everything asserted here is
+/// asserted about a daemon with no client left.
+#[test]
+fn the_daemon_a_default_chat_started_outlives_its_client() {
+    let operator = Operator::prepare();
+
+    let client = operator.run(&[]);
+
+    assert!(
+        !client.status.success(),
+        "the non-terminal attached TUI still refuses"
+    );
+
+    let pid = operator.published_pid();
+    assert!(
+        alive(pid),
+        "the daemon is still running after its client exited"
+    );
+    assert!(
+        accepts(&operator.socket()),
+        "the daemon still accepts after its client exited"
+    );
+
+    let report = stdout_of(&operator.run(&["serve", "status"]));
+    assert!(report.contains("Status:  running"), "{report}");
+    assert!(report.contains(&format!("Pid:     {pid}")), "{report}");
+}
+
+#[test]
+fn concurrent_default_chats_share_one_ready_daemon() {
+    let operator = Operator::prepare();
+
+    let outputs = std::thread::scope(|scope| {
+        let first = scope.spawn(|| operator.run(&[]));
+        let second = scope.spawn(|| operator.run(&[]));
+        [first.join().unwrap(), second.join().unwrap()]
+    });
+
+    for output in &outputs {
+        assert!(
+            !output.status.success(),
+            "the non-terminal attached TUI still refuses"
+        );
+
+        // Whichever launch lost the start race must wait for the winner
+        // rather than report a daemon that is on its way up as a failure.
+        let complaint = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !complaint.contains("stopped before it started serving"),
+            "a launch that lost the start race waits for the winner: {complaint}"
+        );
+    }
+
+    assert!(accepts(&operator.socket()));
+    assert!(alive(operator.published_pid()));
+}
+
 #[test]
 fn default_chat_reuses_the_running_daemon() {
     let operator = Operator::prepare();

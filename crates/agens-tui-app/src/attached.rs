@@ -429,14 +429,18 @@ pub fn run_attached_tui(
     socket: &Path,
     resume: Option<i64>,
 ) -> Result<String, CliError> {
-    run_attached_tui_with_prompt(bootstrap, socket, resume, None)
+    run_attached_tui_with_prompt(bootstrap, socket, resume, None, None)
 }
 
+/// `startup_notice` is what the launch has to say before the arrival does:
+/// the one thing it carries today is that this launch just started the daemon
+/// the arrival is about to describe.
 pub fn run_attached_tui_with_prompt(
     bootstrap: &Bootstrap,
     socket: &Path,
     resume: Option<i64>,
     initial_prompt: Option<&str>,
+    startup_notice: Option<&str>,
 ) -> Result<String, CliError> {
     let checkout = bootstrap
         .project_root
@@ -458,8 +462,9 @@ pub fn run_attached_tui_with_prompt(
     let mut tui = Tui::new(engine);
     tui.adopt_environment();
     tui.set_collapse_thinking(bootstrap.collapse_thinking);
-    tui.add_info(arrival.describe());
-    tui.add_info("attached mode uses daemon-owned commands, skills, files, MCP state, and tasks");
+    for notice in opening_notices(startup_notice, &arrival) {
+        tui.add_info(notice);
+    }
     let attachment = Arc::new(attachment);
     let router = TuiRuntimeRouter::new(
         bootstrap.clone(),
@@ -518,6 +523,25 @@ pub fn run_attached_tui_with_prompt(
     .map_err(|error| CliError::new(ExitStatus::Failure, "ui", error.to_string()))?;
 
     Ok(String::new())
+}
+
+/// The lines the terminal shows before the first prompt, in order.
+///
+/// The daemon-startup notice comes first when there is one, so a person reads
+/// that the daemon exists before they read where they landed on it.
+fn opening_notices(startup_notice: Option<&str>, arrival: &Arrival) -> Vec<String> {
+    let mut notices = Vec::new();
+
+    if let Some(notice) = startup_notice {
+        notices.push(notice.to_owned());
+    }
+
+    notices.push(arrival.describe());
+    notices.push(
+        "attached mode uses daemon-owned commands, skills, files, MCP state, and tasks".to_owned(),
+    );
+
+    notices
 }
 
 /// How this terminal came to the chat it is now on, and what was already
@@ -835,6 +859,34 @@ mod tests {
     fn coming_back_says_where_you_landed_and_whether_it_is_mid_answer() {
         assert!(came_back_to(false).describe().contains("where you left it"));
         assert!(came_back_to(true).describe().contains("still answering"));
+    }
+
+    /// The launch that started the daemon says so exactly once, and before it
+    /// says where it landed: the daemon the arrival describes is one this
+    /// launch just brought up.
+    #[test]
+    fn a_startup_notice_opens_the_terminal_once_and_first() {
+        let notices = opening_notices(Some("started the machine daemon"), &Arrival::opened(7));
+
+        assert_eq!(notices[0], "started the machine daemon");
+        assert!(notices[1].contains("session 7"), "{notices:?}");
+        assert_eq!(
+            notices
+                .iter()
+                .filter(|notice| notice.contains("started the machine daemon"))
+                .count(),
+            1
+        );
+    }
+
+    /// A launch that found the daemon already running has nothing to announce,
+    /// so the terminal opens straight on where it landed.
+    #[test]
+    fn without_a_startup_notice_the_terminal_opens_on_the_arrival() {
+        let notices = opening_notices(None, &Arrival::opened(7));
+
+        assert!(notices[0].contains("session 7"), "{notices:?}");
+        assert!(!notices.iter().any(|notice| notice.contains("started")));
     }
 
     /// A fresh chat says that leaving does not stop it, because that is the one
