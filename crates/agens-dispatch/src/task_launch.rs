@@ -99,7 +99,7 @@ impl<P: PermissionPrompter> AuthorizedNativeTaskRuntime<P> {
 pub fn origin_launches_selected_subagent(origin: SubmitOrigin) -> bool {
     match origin {
         SubmitOrigin::User | SubmitOrigin::Background => true,
-        SubmitOrigin::SubagentCompletion => false,
+        SubmitOrigin::SubagentCompletion | SubmitOrigin::Adopted => false,
     }
 }
 
