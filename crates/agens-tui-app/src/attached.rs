@@ -506,14 +506,11 @@ pub fn run_attached_tui_with_prompt(
         tui.add_info(notice);
     }
     let attachment = Arc::new(attachment);
-    let router = TuiRuntimeRouter::new(
+    let router = TuiRuntimeRouter::attached(
         bootstrap.clone(),
         Arc::clone(&staging),
-        Arc::new(Mutex::new(None)),
-        Arc::new(agens_tools::CommandCatalog::default()),
-        Arc::new(agens_tools::SkillCatalog::default()),
-    )
-    .with_attached_backend(attachment.clone());
+        attachment.clone(),
+    );
     tui.set_palette_entries(router.attached_palette_entries()?);
     tui.set_file_candidates(router.attached_file_candidates()?);
     if let Some(prompt) = initial_prompt {

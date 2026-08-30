@@ -164,6 +164,67 @@ impl AttachedRouteBackend for FakeAttachedBackend {
     }
 }
 
+/// An attached router carries no local configuration semantics: the daemon
+/// owns MCP servers, agents, commands, and skills, so a divergent local
+/// configuration must leave no trace on what this client asks or shows.
+#[test]
+fn an_attached_router_reads_no_local_mcp_agent_or_extension_configuration() {
+    let temporary = tui_session_directory("attached-no-local-config");
+    let mut bootstrap = tui_session_bootstrap(&temporary, &[]);
+    bootstrap.mcp_servers = vec![agens_config::McpServerConfig {
+        name: "local-only".into(),
+        disabled: false,
+        transport: agens_config::McpTransport::Stdio,
+        command: Some("/bin/echo".into()),
+        args: Vec::new(),
+        environment: BTreeMap::new(),
+        cwd: None,
+        url: None,
+        headers: BTreeMap::new(),
+        max_retries: 0,
+        timeout_ms: 250,
+    }];
+    let backend = Arc::new(FakeAttachedBackend::default());
+
+    let local = TuiRuntimeRouter::new(
+        bootstrap.clone(),
+        Arc::new(Mutex::new(SessionContext::fresh())),
+        Arc::new(Mutex::new(None)),
+        Arc::new(agens_tools::CommandCatalog::default()),
+        Arc::new(agens_tools::SkillCatalog::default()),
+    );
+    assert!(
+        !local.mcp_status.snapshot().servers().is_empty(),
+        "the local constructor registers configured MCP servers"
+    );
+
+    let attached = TuiRuntimeRouter::attached(
+        bootstrap,
+        Arc::new(Mutex::new(SessionContext::fresh())),
+        backend.clone(),
+    );
+    assert!(
+        attached.mcp_status.snapshot().servers().is_empty(),
+        "an attached router must not register locally configured MCP servers"
+    );
+    assert_eq!(
+        attached.palette_entries().unwrap(),
+        Vec::new(),
+        "an attached router holds no locally discovered palette"
+    );
+
+    // Daemon-owned routes still work exactly as before.
+    assert!(matches!(
+        attached_route(&attached, TuiRouteRequest::Input("/skills".into())),
+        TuiSubmissionOutcome::Dialog(_)
+    ));
+    assert_eq!(
+        attached.attached_palette_entries().unwrap().len(),
+        crate::extensions::tui_hosted_builtin_entries().len() + 1,
+        "the palette this surface shows comes from the daemon's catalogs"
+    );
+}
+
 #[test]
 fn attached_surface_uses_daemon_catalogs_files_mcp_and_task_controls() {
     let temporary = tui_session_directory("attached-daemon-surface");
