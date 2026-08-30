@@ -1093,6 +1093,28 @@ impl SessionStore {
             .optional()
             .map_err(|error| SessionStoreError::operation("load session", &self.database_path, error))?;
         let Some(metadata) = metadata else {
+            // The row can be there and merely gated out above; saying "unknown"
+            // then would send a caller hunting for a session that exists. The
+            // reason names which of the three refusals this is: present but not
+            // resumable, present only in the legacy table, or truly absent.
+            let exists = self
+                .connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)",
+                    [id],
+                    |row| row.get::<_, bool>(0),
+                )
+                .map_err(|error| {
+                    SessionStoreError::operation("check session", &self.database_path, error)
+                })?;
+            if exists {
+                return Err(SessionStoreError::operation(
+                    "load session",
+                    &self.database_path,
+                    format!("session {id} exists but is not resumable"),
+                ));
+            }
+
             let legacy = self
                 .connection
                 .query_row(
@@ -1114,6 +1136,51 @@ impl SessionStore {
                 reason,
             ));
         };
+
+        self.stored_session(metadata)
+    }
+
+    /// Loads one session and its whole thread, without the resumability gate.
+    ///
+    /// The load a hosted chat resumes through. A chat's row is created before
+    /// its first turn completes, so `resumable` — which means "has a completed
+    /// turn", and is what [`SessionStore::list_sessions`] and the local resume
+    /// gate go by — is still false for a chat that was opened and left before
+    /// anything was said. Coming back to that id is coming back to an empty
+    /// conversation, not to an error, and this is the read that says so.
+    ///
+    /// `unknown session` here means the id is truly absent.
+    pub fn load_session_thread(&self, id: i64) -> Result<StoredSession, SessionStoreError> {
+        let metadata = self
+            .connection
+            .query_row(
+                "SELECT id, project, title, active_agent, created_at, updated_at, completed_turn_count, resumable,
+                        provider_id, model_id, reasoning_effort, parent_session_id, fork_message_count
+                 FROM sessions WHERE id = ?1",
+                [id],
+                session_metadata,
+            )
+            .optional()
+            .map_err(|error| SessionStoreError::operation("load session", &self.database_path, error))?;
+        let Some(metadata) = metadata else {
+            return Err(SessionStoreError::operation(
+                "load session",
+                &self.database_path,
+                format!("unknown session {id}"),
+            ));
+        };
+
+        self.stored_session(metadata)
+    }
+
+    /// Reads the thread and latest attempt behind an already-loaded session
+    /// row, which is the half of a session load the resumability gate has no
+    /// say in.
+    fn stored_session(
+        &self,
+        metadata: SessionMetadata,
+    ) -> Result<StoredSession, SessionStoreError> {
+        let id = metadata.id;
         let mut statement = self.connection.prepare(
             "SELECT messages.sequence, role, kind, text, call_id, name, input_json, content, is_error, media_id, mime
              FROM messages JOIN message_parts ON messages.session_id = message_parts.session_id

@@ -2807,3 +2807,77 @@ fn a_session_registered_by_its_first_attempt_is_reachable_but_never_listed() {
     assert!(!cancelled.metadata.resumable);
     assert_eq!(store.list_sessions().unwrap(), Vec::new());
 }
+
+#[test]
+fn a_session_that_never_completed_a_turn_loads_as_an_empty_thread() {
+    let directory = directory();
+    let mut store = SessionStore::open(&directory).unwrap();
+    let metadata = SessionMetadata {
+        id: 0,
+        project: "project".into(),
+        title: String::new(),
+        active_agent: "primary".into(),
+        provider_id: None,
+        model_id: None,
+        reasoning_effort: None,
+        created_at: 50,
+        updated_at: 50,
+        completed_turn_count: 0,
+        resumable: false,
+        parent_session_id: None,
+        fork_message_count: None,
+    };
+    let session_id = store.open_session(&metadata).unwrap();
+
+    let stored = store.load_session_thread(session_id).unwrap();
+    assert_eq!(stored.metadata.id, session_id);
+    assert_eq!(stored.metadata.completed_turn_count, 0);
+    assert!(!stored.metadata.resumable);
+    assert!(stored.messages.is_empty());
+
+    let absent = store.load_session_thread(session_id + 1).unwrap_err();
+    assert!(
+        absent
+            .to_string()
+            .contains(&format!("unknown session {}", session_id + 1)),
+        "{absent}"
+    );
+}
+
+#[test]
+fn a_resume_refusal_names_an_existing_session_rather_than_denying_it() {
+    let directory = directory();
+    let mut store = SessionStore::open(&directory).unwrap();
+    let metadata = SessionMetadata {
+        id: 0,
+        project: "project".into(),
+        title: String::new(),
+        active_agent: "primary".into(),
+        provider_id: None,
+        model_id: None,
+        reasoning_effort: None,
+        created_at: 50,
+        updated_at: 50,
+        completed_turn_count: 0,
+        resumable: false,
+        parent_session_id: None,
+        fork_message_count: None,
+    };
+    let session_id = store.open_session(&metadata).unwrap();
+
+    let refused = store.load_session_for_resume(session_id).unwrap_err();
+    assert!(
+        refused
+            .to_string()
+            .contains(&format!("session {session_id} exists but is not resumable")),
+        "{refused}"
+    );
+
+    let absent = store.load_session_for_resume(session_id + 1).unwrap_err();
+    assert!(
+        absent
+            .to_string()
+            .contains(&format!("unknown session {}", session_id + 1)),
+        "{absent}"
+    );
+}
