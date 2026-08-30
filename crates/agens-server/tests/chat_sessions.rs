@@ -83,6 +83,7 @@ impl ChatTurns for ScriptedTurns {
                     .and_then(|answer| answer.selected.first())
                     .cloned()
                     .unwrap_or_else(|| "unavailable".to_owned()),
+                AskUserReply::Cancelled => "cancelled".to_owned(),
                 _ => "unavailable".to_owned(),
             };
 
@@ -657,6 +658,138 @@ fn an_external_ask_user_answer_is_validated_then_continues_the_same_turn() {
         .chats
         .answer_ask_user(session, prompt_id, answer)
         .expect("a valid structured answer is accepted");
+
+    assert_eq!(
+        wait_for(&events, |event| matches!(
+            event,
+            ChatEvent::TurnCompleted { .. }
+        )),
+        ChatEvent::TurnCompleted {
+            text: "continued:approve".to_owned(),
+        },
+    );
+}
+
+/// Detaching is not declining. The daemon keeps the question open so the
+/// person can come back to it, and a subscriber that joins while it is open is
+/// greeted with it rather than attaching to a silence.
+#[test]
+fn an_ask_user_question_survives_every_listener_detaching_and_greets_a_new_one() {
+    let harness = harness_asking_user(an_ask_user_question());
+    let session = harness.chats.open(&request(1)).expect("the chat opens");
+    let events = harness.chats.subscribe(session).expect("the chat is open");
+
+    harness
+        .chats
+        .prompt(session, user_message("ask before continuing"))
+        .expect("the prompt is accepted");
+    let asked = wait_for(&events, |event| {
+        matches!(event, ChatEvent::AskUserAsked { .. })
+    });
+    let ChatEvent::AskUserAsked { prompt_id, .. } = asked else {
+        panic!("the chat published something else");
+    };
+
+    // The one client watching detaches, and the daemon notices before anybody
+    // comes back.
+    drop(events);
+    std::thread::sleep(Duration::from_millis(200));
+
+    let events = harness.chats.subscribe(session).expect("the chat is open");
+    let replayed = wait_for(&events, |event| {
+        matches!(event, ChatEvent::AskUserAsked { .. })
+    });
+    assert_eq!(
+        replayed,
+        ChatEvent::AskUserAsked {
+            prompt_id,
+            request: an_ask_user_question(),
+        },
+        "the pending question greets the subscriber that came back"
+    );
+
+    let answer = AskUserReply::Answered(vec![AskUserAnswer {
+        question_id: "approval".to_owned(),
+        selected: vec!["approve".to_owned()],
+        other: None,
+        note: None,
+    }]);
+    harness
+        .chats
+        .answer_ask_user(session, prompt_id, answer)
+        .expect("the held question still takes its answer");
+
+    assert_eq!(
+        wait_for(&events, |event| matches!(
+            event,
+            ChatEvent::TurnCompleted { .. }
+        )),
+        ChatEvent::TurnCompleted {
+            text: "continued:approve".to_owned(),
+        },
+    );
+}
+
+/// A held question must not outlive the turn that asked it: cancelling the
+/// turn resolves the question as cancelled rather than leaving the chat stuck
+/// on something nobody will answer.
+#[test]
+fn cancelling_the_turn_releases_an_unanswered_ask_user_question() {
+    let harness = harness_asking_user(an_ask_user_question());
+    let session = harness.chats.open(&request(1)).expect("the chat opens");
+    let events = harness.chats.subscribe(session).expect("the chat is open");
+
+    harness
+        .chats
+        .prompt(session, user_message("ask before continuing"))
+        .expect("the prompt is accepted");
+    wait_for(&events, |event| {
+        matches!(event, ChatEvent::AskUserAsked { .. })
+    });
+
+    harness.chats.cancel(session).expect("the chat is open");
+
+    assert_eq!(
+        wait_for(&events, |event| matches!(
+            event,
+            ChatEvent::TurnCompleted { .. }
+        )),
+        ChatEvent::TurnCompleted {
+            text: "continued:cancelled".to_owned(),
+        },
+    );
+}
+
+/// The bounded-answer wire the fleet console already speaks can resolve a
+/// single-question ask by naming an option, so `team answer` needs no
+/// structured payload for the common case.
+#[test]
+fn a_bare_option_id_answers_a_single_question_ask_over_the_value_wire() {
+    let harness = harness_asking_user(an_ask_user_question());
+    let session = harness.chats.open(&request(1)).expect("the chat opens");
+    let events = harness.chats.subscribe(session).expect("the chat is open");
+
+    harness
+        .chats
+        .prompt(session, user_message("ask before continuing"))
+        .expect("the prompt is accepted");
+    let asked = wait_for(&events, |event| {
+        matches!(event, ChatEvent::AskUserAsked { .. })
+    });
+    let ChatEvent::AskUserAsked { prompt_id, .. } = asked else {
+        panic!("the chat published something else");
+    };
+
+    assert_eq!(
+        harness
+            .chats
+            .answer_value(session, prompt_id, "outside-domain"),
+        Err(ChatError::NotAsked),
+    );
+    harness
+        .chats
+        .answer_value(session, prompt_id, "approve")
+        .expect("an option id is a whole answer to a single question");
 
     assert_eq!(
         wait_for(&events, |event| matches!(
