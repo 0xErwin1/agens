@@ -724,3 +724,77 @@ fn a_bypassed_hosted_turn_runs_an_ask_gated_tool_without_prompting() {
     let _ = std::fs::remove_file(&marker);
     let _ = std::fs::remove_dir_all(PathBuf::from(&daemon.root));
 }
+
+#[test]
+fn a_configured_bypass_default_seeds_a_fresh_hosted_chat() {
+    let daemon = DaemonFixture::start_with_model_and_config(
+        Script::new([]),
+        daemon_settings(),
+        "gpt-4.1",
+        "\n[agent]\nbypass_permission_prompts = true\n",
+    );
+
+    let socket = daemon.socket.clone();
+    let stopper = daemon.stopper();
+    let checkout = daemon.checkout.display().to_string();
+
+    let client = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let stopper = stopper;
+
+        runtime.block_on(async move {
+            let mut chat = ChatClient::new(connect(socket).await);
+
+            let opened = chat
+                .open(proto::OpenChatRequest {
+                    checkout: checkout.clone(),
+                    resume: None,
+                })
+                .await
+                .expect("a fresh chat opens")
+                .into_inner();
+            assert_eq!(
+                opened.bypass_permissions,
+                Some(true),
+                "the configured default seeds a session that never recorded one"
+            );
+
+            // An explicit toggle records the session's own value, which then
+            // wins over the configured default on reopen.
+            let off = chat
+                .command(proto::ChatCommandRequest {
+                    session_id: opened.session_id,
+                    command: "/bypass".to_owned(),
+                })
+                .await
+                .expect("the bypass toggle executes")
+                .into_inner();
+            assert_eq!(off.message, agens_core::hosted::BYPASS_OFF_REPLY);
+
+            let reopened = chat
+                .open(proto::OpenChatRequest {
+                    checkout,
+                    resume: Some(opened.session_id),
+                })
+                .await
+                .expect("the live chat reopens idempotently")
+                .into_inner();
+            assert_eq!(
+                reopened.bypass_permissions,
+                Some(false),
+                "the session's own recorded value wins over configuration"
+            );
+
+            drop(stopper);
+        })
+    });
+
+    daemon.serve();
+
+    client.join().expect("the client thread finished");
+    let _ = std::fs::remove_dir_all(PathBuf::from(&daemon.root));
+}

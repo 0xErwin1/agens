@@ -116,6 +116,17 @@ impl DaemonFixture {
         settings: CoordinatorSettings,
         model: &str,
     ) -> Self {
+        Self::start_with_model_and_config(script, settings, model, "")
+    }
+
+    /// Starts the daemon with extra TOML appended to the fixture's global
+    /// configuration, so a test can exercise configured defaults.
+    pub(crate) fn start_with_model_and_config(
+        script: Script,
+        settings: CoordinatorSettings,
+        model: &str,
+        extra_config: &str,
+    ) -> Self {
         let mut settings = settings;
         let root = scratch();
         let checkout = checkout(&root);
@@ -142,7 +153,7 @@ impl DaemonFixture {
                     config_home.join("config.toml"),
                     format!(
                         "[provider]\nmodel = \"openai-api/{model}\"\nbase_url = \"{base_url}\"\n\n\
-                         [options]\ndata_dir = \"{}\"\n",
+                         [options]\ndata_dir = \"{}\"\n{extra_config}",
                         data_directory.display()
                     ),
                 ),

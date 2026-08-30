@@ -380,10 +380,19 @@ fn build_chat(
 
     let active_agent = active_agent_for(&bootstrap, &session)?;
 
-    let bypass_permissions = SessionStore::open(bootstrap.data_directory())
+    // The session's own recorded value wins over configuration; the configured
+    // default only seeds a session that never recorded one — the same rule a
+    // local resume applies, so hosted and local agree about the same session.
+    let persisted_bypass = SessionStore::open(bootstrap.data_directory())
         .and_then(|store| store.bypass_permission_prompts(session.id))
-        .unwrap_or_default()
-        .unwrap_or(false);
+        .unwrap_or_default();
+    let configured_bypass = agens_bootstrap::session_config::SessionConfig::resolve(
+        &agens_bootstrap::session_root::SessionRoot::confined_to(checkout.clone()),
+        &bootstrap,
+    )
+    .ok()
+    .map(|config| config.bypass_permission_prompts());
+    let bypass_permissions = persisted_bypass.or(configured_bypass).unwrap_or(false);
 
     Ok(ChatSession {
         admission: SessionAdmission::new(
