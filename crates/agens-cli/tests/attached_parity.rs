@@ -24,6 +24,7 @@ enum Journey {
     ChildQuestionOrigin,
     AskUserOverlay,
     AskUserDetachPending,
+    ReattachLiveTurn,
     ReattachReplay,
     ReplayGap,
     RestoredPanels,
@@ -50,6 +51,7 @@ impl Journey {
             Self::ChildQuestionOrigin => "child:question-origin".into(),
             Self::AskUserOverlay => "ask:overlay".into(),
             Self::AskUserDetachPending => "ask:detach-pending".into(),
+            Self::ReattachLiveTurn => "reattach:live-turn".into(),
             Self::ReattachReplay => "reattach:replay".into(),
             Self::ReplayGap => "reattach:gap".into(),
             Self::RestoredPanels => "reattach:panels".into(),
@@ -118,6 +120,11 @@ impl ParityDriver for LocalDriver {
                 "answer:external".into(),
                 "turn:resumed".into(),
             ],
+            Journey::ReattachLiveTurn => vec![
+                "adopt:live-turn".into(),
+                "progress:live".into(),
+                "ask:overlay-immediate".into(),
+            ],
             Journey::ReattachReplay => vec![
                 "detach:survived".into(),
                 "replay:ordered".into(),
@@ -184,6 +191,11 @@ impl ParityDriver for AttachedDriver {
                 "answer:external".into(),
                 "turn:resumed".into(),
             ],
+            Journey::ReattachLiveTurn => vec![
+                "adopt:live-turn".into(),
+                "progress:live".into(),
+                "ask:overlay-immediate".into(),
+            ],
             Journey::ReattachReplay => vec![
                 "detach:survived".into(),
                 "replay:ordered".into(),
@@ -226,6 +238,7 @@ fn parity_journeys() -> Vec<Journey> {
         Journey::ChildQuestionOrigin,
         Journey::AskUserOverlay,
         Journey::AskUserDetachPending,
+        Journey::ReattachLiveTurn,
         Journey::ReattachReplay,
         Journey::ReplayGap,
         Journey::RestoredPanels,
