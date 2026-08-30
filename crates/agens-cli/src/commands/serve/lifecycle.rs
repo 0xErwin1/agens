@@ -39,13 +39,8 @@ const STOP_PATIENCE: Duration = Duration::from_secs(30);
 
 /// How often a wait looks again.
 const POLL: Duration = Duration::from_millis(25);
-const ISOLATED_CONFIG_HOME_ENV: &str = "AGENS_CONFIG_HOME";
-const TEST_AUTOSTART_ENV: &str = "AGENS_DAEMON_AUTOSTART";
-const TEST_AUTOSTART_ENABLED: &str = "1";
-
 #[derive(Clone, Copy)]
 pub(crate) enum DaemonStartupRequest {
-    PassiveLocal,
     ExplicitAttached,
 }
 
@@ -63,15 +58,8 @@ const ACTIVE_STATES: [RunState; 4] = [
 /// Starts the daemon only when this machine has none, and reports whether it started one.
 pub(crate) fn ensure_running(
     bootstrap: &Bootstrap,
-    request: DaemonStartupRequest,
+    _request: DaemonStartupRequest,
 ) -> Result<bool, CliError> {
-    if matches!(request, DaemonStartupRequest::PassiveLocal)
-        && std::env::var_os(ISOLATED_CONFIG_HOME_ENV).is_some()
-        && !std::env::var(TEST_AUTOSTART_ENV).is_ok_and(|value| value == TEST_AUTOSTART_ENABLED)
-    {
-        return Ok(false);
-    }
-
     let data_directory = bootstrap.data_directory();
     if running_pid(&agens_server::pid_path(data_directory)).is_some() {
         return Ok(false);

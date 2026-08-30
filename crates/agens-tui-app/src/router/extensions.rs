@@ -5,8 +5,9 @@
 
 use std::sync::Arc;
 
+use agens_core::hosted::{CatalogKind, CatalogResult};
 use agens_tools::{CommandCatalog, SkillCatalog};
-use agens_tui::PaletteEntry;
+use agens_tui::{PaletteEntry, PaletteEntryKind};
 
 use crate::extensions::{discover_tui_command_catalog, resolved_tui_palette};
 use crate::files::tui_picker_file_candidates;
@@ -19,6 +20,59 @@ use agens_session::context::SessionContext;
 use super::TuiRuntimeRouter;
 
 impl TuiRuntimeRouter {
+    pub(crate) fn attached_palette_entries(&self) -> Result<Vec<PaletteEntry>, CliError> {
+        let backend = self.attached_backend()?;
+        let mut palette = Vec::new();
+        for (kind, palette_kind) in [
+            (CatalogKind::Command, PaletteEntryKind::Command),
+            (CatalogKind::Skill, PaletteEntryKind::Skill),
+        ] {
+            let result = backend.catalog(kind)?;
+            let CatalogResult::Current(snapshot) = result else {
+                return Err(match result {
+                    CatalogResult::Stale { current_revision } => CliError::unavailable(format!(
+                        "daemon catalog changed to revision {current_revision}; retry"
+                    )),
+                    CatalogResult::Unsupported => {
+                        CliError::unavailable("daemon catalog is unsupported")
+                    }
+                    CatalogResult::Current(_) => unreachable!(),
+                });
+            };
+            palette.extend(snapshot.entries().iter().map(|entry| {
+                PaletteEntry::new(
+                    entry.name(),
+                    entry.description(),
+                    "",
+                    if entry.built_in() {
+                        PaletteEntryKind::BuiltIn
+                    } else {
+                        palette_kind
+                    },
+                )
+            }));
+        }
+        Ok(palette)
+    }
+
+    pub(crate) fn attached_file_candidates(&self) -> Result<Vec<String>, CliError> {
+        self.attached_backend()?
+            .list_files(std::path::Path::new("."))?
+            .map(|files| {
+                files
+                    .into_iter()
+                    .map(|file| file.path().display().to_string())
+                    .collect()
+            })
+            .map_err(|error| {
+                CliError::new(
+                    agens_error::ExitStatus::Failure,
+                    "file",
+                    format!("daemon workspace file listing failed: {error:?}"),
+                )
+            })
+    }
+
     pub fn skills(&self) -> Result<Arc<SkillCatalog>, CliError> {
         self.extensions
             .lock()

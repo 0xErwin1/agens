@@ -17,6 +17,10 @@ use std::sync::{Arc, Mutex};
 
 use crate::profiles::{AgentProfileStore, ProfileEditor};
 use agens_core::HeadlessTurnCancellation;
+use agens_core::hosted::{
+    CatalogKind, CatalogResult, FileError, HostedControlKind, HostedControlResult, HostedMcpAction,
+    HostedMcpResult, HostedTaskReplay, TaskControlError, WorkspaceFile, WorkspaceFileContent,
+};
 use agens_tools::{
     CommandBusyPolicy, CommandCatalog, McpStatusHandle, SkillCatalog, ToolDispatcher,
 };
@@ -35,6 +39,31 @@ use agens_session::provider::{
 use agens_tool_runtime::mcp::{ProductionMcpRuntime, load_configured_mcp_registry};
 
 pub const TUI_ERROR_ACTION: &str = "Correct the command or runtime condition, then retry.";
+
+pub(crate) trait AttachedRouteBackend: Send + Sync {
+    fn catalog(&self, kind: CatalogKind) -> Result<CatalogResult, CliError>;
+    fn command(&self, command: &str) -> Result<String, CliError>;
+    fn list_files(
+        &self,
+        selector: &Path,
+    ) -> Result<Result<Vec<WorkspaceFile>, FileError>, CliError>;
+    fn read_file(
+        &self,
+        selector: &Path,
+    ) -> Result<Result<WorkspaceFileContent, FileError>, CliError>;
+    fn mcp_status(&self) -> Result<HostedMcpResult, CliError>;
+    fn mcp_control(
+        &self,
+        server: &str,
+        action: HostedMcpAction,
+    ) -> Result<HostedMcpResult, CliError>;
+    fn task_snapshot(&self) -> Result<Result<HostedTaskReplay, TaskControlError>, CliError>;
+    fn task_control(
+        &self,
+        kind: HostedControlKind,
+        task_id: Option<u64>,
+    ) -> Result<Result<HostedControlResult, TaskControlError>, CliError>;
+}
 
 /// The only busy-session policy for a resolved input route.
 ///
@@ -85,6 +114,7 @@ pub struct TuiRuntimeRouter {
     profile_focus: Arc<Mutex<Option<String>>>,
     profile_store: Option<Arc<dyn AgentProfileStore>>,
     team_transition: Arc<std::sync::atomic::AtomicBool>,
+    attached_backend: Option<Arc<dyn AttachedRouteBackend>>,
 }
 
 struct RouterExtensions {
@@ -171,7 +201,20 @@ impl TuiRuntimeRouter {
             profile_focus: Arc::new(Mutex::new(None)),
             profile_store: None,
             team_transition: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            attached_backend: None,
         }
+    }
+
+    pub(crate) fn with_attached_backend(mut self, backend: Arc<dyn AttachedRouteBackend>) -> Self {
+        self.attached_backend = Some(backend);
+        self
+    }
+
+    fn attached_backend(&self) -> Result<Arc<dyn AttachedRouteBackend>, CliError> {
+        self.attached_backend
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| CliError::unavailable("attached daemon services are unavailable"))
     }
 
     pub fn with_profile_store(mut self, store: Arc<dyn AgentProfileStore>) -> Self {

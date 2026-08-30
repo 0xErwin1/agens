@@ -8,6 +8,13 @@ use tokio_stream::{Stream, StreamExt};
 use tonic::transport::Channel;
 
 use agens_core::ask_user::{AskUserReply, AskUserUnavailable};
+use agens_core::hosted::{
+    CatalogEntry, CatalogKind, CatalogResult, CatalogSnapshot, FileError, HostedChildTurn,
+    HostedControlCommand, HostedControlKind, HostedControlResult, HostedMcpAction, HostedMcpResult,
+    HostedMcpServer, HostedMcpState, HostedTaskEvent, HostedTaskRecord, HostedTaskReplay,
+    HostedTaskSnapshot, HostedTaskState, TaskControlError, WorkspaceFile, WorkspaceFileContent,
+    WorkspaceFileKind,
+};
 use agens_core::{Message, MessagePart, Role, SessionMessage};
 
 use crate::ClientError;
@@ -37,6 +44,146 @@ impl ChatClient {
             inner: proto::chat_client::ChatClient::new(channel),
             prompt_parts: Arc::new(Mutex::new(BTreeMap::new())),
         }
+    }
+
+    pub async fn catalog(
+        &mut self,
+        kind: CatalogKind,
+        known_revision: Option<&str>,
+    ) -> Result<CatalogResult, ClientError> {
+        let kind = match kind {
+            CatalogKind::Command => proto::HostedCatalogKind::Command,
+            CatalogKind::Skill => proto::HostedCatalogKind::Skill,
+        };
+        let result = self
+            .inner
+            .catalog(proto::HostedCatalogRequest {
+                kind: kind as i32,
+                known_revision: known_revision.map(str::to_owned),
+            })
+            .await?
+            .into_inner();
+        decode_catalog(result)
+    }
+
+    pub async fn list_workspace_files(
+        &mut self,
+        checkout: &Path,
+        selector: &Path,
+    ) -> Result<Result<Vec<WorkspaceFile>, FileError>, ClientError> {
+        let result = self
+            .inner
+            .list_workspace_files(proto::WorkspaceFilesRequest {
+                checkout: checkout.display().to_string(),
+                selector: selector.display().to_string(),
+            })
+            .await?
+            .into_inner();
+        decode_file_list(result)
+    }
+
+    pub async fn read_workspace_file(
+        &mut self,
+        checkout: &Path,
+        selector: &Path,
+    ) -> Result<Result<WorkspaceFileContent, FileError>, ClientError> {
+        let result = self
+            .inner
+            .read_workspace_file(proto::WorkspaceFileRequest {
+                checkout: checkout.display().to_string(),
+                selector: selector.display().to_string(),
+            })
+            .await?
+            .into_inner();
+        decode_file(result)
+    }
+
+    pub async fn mcp_status(&mut self) -> Result<HostedMcpResult, ClientError> {
+        let result = self
+            .inner
+            .mcp_status(proto::HostedMcpStatusRequest {})
+            .await?
+            .into_inner();
+        decode_mcp_result(result)
+    }
+
+    pub async fn mcp_control(
+        &mut self,
+        server: &str,
+        action: HostedMcpAction,
+    ) -> Result<HostedMcpResult, ClientError> {
+        let action = match action {
+            HostedMcpAction::Connect => proto::HostedMcpAction::Connect,
+            HostedMcpAction::Disconnect => proto::HostedMcpAction::Disconnect,
+            HostedMcpAction::Reconnect => proto::HostedMcpAction::Reconnect,
+        };
+        let result = self
+            .inner
+            .mcp_control(proto::HostedMcpControlRequest {
+                server: server.to_owned(),
+                action: action as i32,
+            })
+            .await?
+            .into_inner();
+        decode_mcp_result(result)
+    }
+
+    pub async fn task_snapshot(
+        &mut self,
+        session_id: i64,
+    ) -> Result<Result<HostedTaskReplay, TaskControlError>, ClientError> {
+        let result = self
+            .inner
+            .task_snapshot(proto::HostedTaskSnapshotRequest { session_id })
+            .await?
+            .into_inner();
+        decode_task_replay(result)
+    }
+
+    pub async fn task_replay(
+        &mut self,
+        session_id: i64,
+        after_cursor: u64,
+    ) -> Result<Result<HostedTaskReplay, TaskControlError>, ClientError> {
+        let result = self
+            .inner
+            .task_replay(proto::HostedTaskReplayRequest {
+                session_id,
+                after_cursor,
+            })
+            .await?
+            .into_inner();
+        decode_task_replay(result)
+    }
+
+    pub async fn task_control(
+        &mut self,
+        command: &HostedControlCommand,
+    ) -> Result<Result<HostedControlResult, TaskControlError>, ClientError> {
+        let (kind, message) = match command.kind() {
+            HostedControlKind::Background => {
+                (proto::HostedTaskControlKind::Background, String::new())
+            }
+            HostedControlKind::Cancel => (proto::HostedTaskControlKind::Cancel, String::new()),
+            HostedControlKind::CancelAll => {
+                (proto::HostedTaskControlKind::CancelAll, String::new())
+            }
+            HostedControlKind::Message(message) => {
+                (proto::HostedTaskControlKind::Message, message.clone())
+            }
+        };
+        let result = self
+            .inner
+            .task_control(proto::HostedTaskControlRequest {
+                session_id: command.session_id(),
+                task_id: command.task_id().unwrap_or_default().to_owned(),
+                command_id: command.command_id().to_owned(),
+                kind: kind as i32,
+                message,
+            })
+            .await?
+            .into_inner();
+        decode_task_control(result)
     }
 
     /// Opens a chat rooted at `checkout`, or continues the stored session
@@ -266,6 +413,233 @@ fn ask_user_reply(reply: AskUserReply) -> proto::AskUserReply {
     proto::AskUserReply { reply: Some(reply) }
 }
 
+fn decode_catalog(result: proto::HostedCatalogResult) -> Result<CatalogResult, ClientError> {
+    use proto::hosted_catalog_result::Result;
+    match result.result {
+        Some(Result::Current(snapshot)) => Ok(CatalogResult::Current(CatalogSnapshot::new(
+            snapshot.revision,
+            snapshot
+                .entries
+                .into_iter()
+                .map(|entry| CatalogEntry::new(entry.name, entry.description, entry.built_in))
+                .collect(),
+        ))),
+        Some(Result::Stale(stale)) => Ok(CatalogResult::Stale {
+            current_revision: stale.current_revision,
+        }),
+        Some(Result::Unsupported(_)) => Ok(CatalogResult::Unsupported),
+        None => Err(ClientError::Unreadable(
+            "daemon returned no catalog outcome".into(),
+        )),
+    }
+}
+
+fn decode_file_list(
+    result: proto::HostedWorkspaceFilesResult,
+) -> Result<Result<Vec<WorkspaceFile>, FileError>, ClientError> {
+    use proto::hosted_workspace_files_result::Result;
+    match result.result {
+        Some(Result::Files(list)) => list
+            .files
+            .into_iter()
+            .map(|file| {
+                let kind = decode_file_kind(file.kind)?;
+                Ok(WorkspaceFile::new(
+                    PathBuf::from(file.path),
+                    file.byte_len,
+                    kind,
+                ))
+            })
+            .collect::<std::result::Result<Vec<_>, ClientError>>()
+            .map(Ok),
+        Some(Result::Error(error)) => decode_file_error(error).map(Err),
+        None => Err(ClientError::Unreadable(
+            "daemon returned no file-list outcome".into(),
+        )),
+    }
+}
+
+fn decode_file(
+    result: proto::HostedWorkspaceFileResult,
+) -> Result<Result<WorkspaceFileContent, FileError>, ClientError> {
+    use proto::hosted_workspace_file_result::Result;
+    match result.result {
+        Some(Result::Text(text)) => Ok(Ok(WorkspaceFileContent::Text {
+            path: PathBuf::from(text.path),
+            text: text.text,
+        })),
+        Some(Result::Media(media)) => Ok(Ok(WorkspaceFileContent::Media {
+            path: PathBuf::from(media.path),
+            mime: media.mime,
+            bytes: media.bytes,
+            media_id: media.media_id,
+            kind: WorkspaceFileKind::Media,
+        })),
+        Some(Result::Error(error)) => decode_file_error(error).map(Err),
+        None => Err(ClientError::Unreadable(
+            "daemon returned no file outcome".into(),
+        )),
+    }
+}
+
+fn decode_file_kind(kind: i32) -> Result<WorkspaceFileKind, ClientError> {
+    match proto::HostedFileKind::try_from(kind) {
+        Ok(proto::HostedFileKind::Text) => Ok(WorkspaceFileKind::Text),
+        Ok(proto::HostedFileKind::Media) => Ok(WorkspaceFileKind::Media),
+        _ => Err(ClientError::Unreadable(
+            "daemon returned an unknown file kind".into(),
+        )),
+    }
+}
+
+fn decode_file_error(error: i32) -> Result<FileError, ClientError> {
+    match proto::HostedFileError::try_from(error) {
+        Ok(proto::HostedFileError::InvalidSelector) => Ok(FileError::InvalidSelector),
+        Ok(proto::HostedFileError::OutsideRoot) => Ok(FileError::OutsideRoot),
+        Ok(proto::HostedFileError::Ignored) => Ok(FileError::Ignored),
+        Ok(proto::HostedFileError::Missing) => Ok(FileError::Missing),
+        Ok(proto::HostedFileError::Unsupported) => Ok(FileError::Unsupported),
+        Ok(proto::HostedFileError::Oversized) => Ok(FileError::Oversized),
+        Ok(proto::HostedFileError::EntryLimit) => Ok(FileError::EntryLimit),
+        Ok(proto::HostedFileError::Unreadable) => Ok(FileError::Unreadable),
+        _ => Err(ClientError::Unreadable(
+            "daemon returned an unknown file error".into(),
+        )),
+    }
+}
+
+fn decode_mcp_result(result: proto::HostedMcpResult) -> Result<HostedMcpResult, ClientError> {
+    let servers = result
+        .servers
+        .into_iter()
+        .map(decode_mcp_server)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(HostedMcpResult::new(servers, result.error))
+}
+
+fn decode_mcp_server(server: proto::HostedMcpServer) -> Result<HostedMcpServer, ClientError> {
+    let state = match proto::HostedMcpState::try_from(server.state) {
+        Ok(proto::HostedMcpState::Disabled) => HostedMcpState::Disabled,
+        Ok(proto::HostedMcpState::Idle) => HostedMcpState::Idle,
+        Ok(proto::HostedMcpState::Connecting) => HostedMcpState::Connecting,
+        Ok(proto::HostedMcpState::Ready) => HostedMcpState::Ready,
+        Ok(proto::HostedMcpState::Degraded) => HostedMcpState::Degraded,
+        Ok(proto::HostedMcpState::Failed) => HostedMcpState::Failed,
+        Ok(proto::HostedMcpState::Closed) => HostedMcpState::Closed,
+        _ => {
+            return Err(ClientError::Unreadable(
+                "daemon returned an unknown MCP state".into(),
+            ));
+        }
+    };
+    if server.name.is_empty() {
+        return Err(ClientError::Unreadable(
+            "daemon returned an unnamed MCP server".into(),
+        ));
+    }
+    Ok(HostedMcpServer::new(
+        server.name,
+        state,
+        server.generation,
+        server.error,
+    ))
+}
+
+fn decode_task_replay(
+    result: proto::HostedTaskReplayResult,
+) -> Result<Result<HostedTaskReplay, TaskControlError>, ClientError> {
+    use proto::hosted_task_replay_result::Result as Wire;
+    match result.result {
+        Some(Wire::Events(events)) => {
+            decode_task_events(events.events).map(|events| Ok(HostedTaskReplay::Events(events)))
+        }
+        Some(Wire::SnapshotTail(tail)) => {
+            let snapshot = tail.snapshot.ok_or_else(|| {
+                ClientError::Unreadable("daemon returned no task snapshot".into())
+            })?;
+            let tasks = snapshot
+                .tasks
+                .into_iter()
+                .map(|task| {
+                    decode_task_state(task.state)
+                        .map(|state| HostedTaskRecord::new(task.task_id, state))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let child_turns = snapshot
+                .child_turns
+                .into_iter()
+                .map(|turn| HostedChildTurn::new(turn.task_id, turn.sequence, turn.payload))
+                .collect();
+            let snapshot =
+                HostedTaskSnapshot::new(snapshot.cursor, tasks).with_child_turns(child_turns);
+            let events = decode_task_events(tail.events)?;
+            Ok(Ok(HostedTaskReplay::SnapshotTail { snapshot, events }))
+        }
+        Some(Wire::Gap(gap)) => Ok(Ok(HostedTaskReplay::Gap {
+            oldest_cursor: gap.oldest_cursor,
+        })),
+        Some(Wire::Error(error)) => decode_task_error(error).map(Err),
+        None => Err(ClientError::Unreadable(
+            "daemon returned no task replay outcome".into(),
+        )),
+    }
+}
+
+fn decode_task_events(
+    events: Vec<proto::HostedTaskEvent>,
+) -> Result<Vec<HostedTaskEvent>, ClientError> {
+    events
+        .into_iter()
+        .map(|event| {
+            decode_task_state(event.state).map(|state| {
+                HostedTaskEvent::new(event.cursor, event.task_id, state, event.payload)
+            })
+        })
+        .collect()
+}
+
+fn decode_task_control(
+    result: proto::HostedTaskControlResult,
+) -> Result<Result<HostedControlResult, TaskControlError>, ClientError> {
+    use proto::hosted_task_control_result::Result as Wire;
+    match result.result {
+        Some(Wire::Applied(applied)) => decode_task_state(applied.state)
+            .map(|state| Ok(HostedControlResult::new(state, applied.replayed))),
+        Some(Wire::Error(error)) => decode_task_error(error).map(Err),
+        None => Err(ClientError::Unreadable(
+            "daemon returned no task control outcome".into(),
+        )),
+    }
+}
+
+fn decode_task_state(state: i32) -> Result<HostedTaskState, ClientError> {
+    match proto::HostedTaskState::try_from(state) {
+        Ok(proto::HostedTaskState::Running) => Ok(HostedTaskState::Running),
+        Ok(proto::HostedTaskState::Background) => Ok(HostedTaskState::Background),
+        Ok(proto::HostedTaskState::Completed) => Ok(HostedTaskState::Completed),
+        Ok(proto::HostedTaskState::Cancelled) => Ok(HostedTaskState::Cancelled),
+        Ok(proto::HostedTaskState::Failed) => Ok(HostedTaskState::Failed),
+        _ => Err(ClientError::Unreadable(
+            "daemon returned an unknown task state".into(),
+        )),
+    }
+}
+
+fn decode_task_error(error: i32) -> Result<TaskControlError, ClientError> {
+    match proto::HostedTaskError::try_from(error) {
+        Ok(proto::HostedTaskError::WrongSession) => Ok(TaskControlError::WrongSession),
+        Ok(proto::HostedTaskError::UnknownTask) => Ok(TaskControlError::UnknownTask),
+        Ok(proto::HostedTaskError::InvalidTransition) => Ok(TaskControlError::InvalidTransition),
+        Ok(proto::HostedTaskError::CommandConflict) => Ok(TaskControlError::CommandConflict),
+        Ok(proto::HostedTaskError::ControlCapacity) => Ok(TaskControlError::ControlCapacity),
+        Ok(proto::HostedTaskError::InvalidRequest) => Ok(TaskControlError::InvalidRequest),
+        Ok(proto::HostedTaskError::Storage) => Ok(TaskControlError::Storage),
+        _ => Err(ClientError::Unreadable(
+            "daemon returned an unknown task error".into(),
+        )),
+    }
+}
+
 fn prompt_request(
     session_id: i64,
     message: &SessionMessage,
@@ -414,6 +788,28 @@ mod tests {
 
         assert!(prompt_request(3, &reasoning, true).is_err());
         assert!(prompt_request(3, &tool_result, true).is_err());
+    }
+
+    #[test]
+    fn hosted_decoders_reject_missing_and_unknown_typed_results() {
+        assert!(decode_task_replay(proto::HostedTaskReplayResult { result: None }).is_err());
+        assert!(decode_task_control(proto::HostedTaskControlResult { result: None }).is_err());
+        assert!(
+            decode_mcp_result(proto::HostedMcpResult {
+                servers: Vec::new(),
+                error: None
+            })
+            .is_ok()
+        );
+        assert!(
+            decode_mcp_server(proto::HostedMcpServer {
+                name: "files".into(),
+                state: 999,
+                generation: 1,
+                error: None,
+            })
+            .is_err()
+        );
     }
 
     #[test]

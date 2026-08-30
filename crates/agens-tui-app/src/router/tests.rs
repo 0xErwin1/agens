@@ -38,6 +38,251 @@ fn attached_route(router: &TuiRuntimeRouter, request: TuiRouteRequest) -> TuiSub
     router.route_attached_request(request, progress, TuiRouteCancellation::new())
 }
 
+#[derive(Default)]
+struct FakeAttachedBackend {
+    commands: Mutex<Vec<String>>,
+    controls: Mutex<Vec<(String, agens_core::hosted::HostedMcpAction)>>,
+    task_controls: Mutex<Vec<agens_core::hosted::HostedControlKind>>,
+}
+
+impl AttachedRouteBackend for FakeAttachedBackend {
+    fn catalog(
+        &self,
+        kind: agens_core::hosted::CatalogKind,
+    ) -> Result<agens_core::hosted::CatalogResult, CliError> {
+        let entries = match kind {
+            agens_core::hosted::CatalogKind::Command => {
+                crate::extensions::tui_hosted_builtin_entries()
+            }
+            agens_core::hosted::CatalogKind::Skill => vec![agens_core::hosted::CatalogEntry::new(
+                "inspect",
+                "Inspect code",
+                false,
+            )],
+        };
+        Ok(agens_core::hosted::CatalogResult::Current(
+            agens_core::hosted::CatalogSnapshot::new("daemon-revision", entries),
+        ))
+    }
+
+    fn command(&self, command: &str) -> Result<String, CliError> {
+        self.commands.lock().unwrap().push(command.to_owned());
+        Ok(format!("daemon:{command}"))
+    }
+
+    fn list_files(
+        &self,
+        _selector: &std::path::Path,
+    ) -> Result<
+        Result<Vec<agens_core::hosted::WorkspaceFile>, agens_core::hosted::FileError>,
+        CliError,
+    > {
+        Ok(Ok(vec![agens_core::hosted::WorkspaceFile::new(
+            "src/lib.rs".into(),
+            12,
+            agens_core::hosted::WorkspaceFileKind::Text,
+        )]))
+    }
+
+    fn read_file(
+        &self,
+        selector: &std::path::Path,
+    ) -> Result<
+        Result<agens_core::hosted::WorkspaceFileContent, agens_core::hosted::FileError>,
+        CliError,
+    > {
+        if selector == std::path::Path::new("shot.png") {
+            return Ok(Ok(agens_core::hosted::WorkspaceFileContent::Media {
+                path: selector.to_path_buf(),
+                mime: "image/png".into(),
+                bytes: b"image".to_vec(),
+                media_id: Some(71),
+                kind: agens_core::hosted::WorkspaceFileKind::Media,
+            }));
+        }
+        Ok(Ok(agens_core::hosted::WorkspaceFileContent::Text {
+            path: selector.to_path_buf(),
+            text: "daemon file body".into(),
+        }))
+    }
+
+    fn mcp_status(&self) -> Result<agens_core::hosted::HostedMcpResult, CliError> {
+        Ok(agens_core::hosted::HostedMcpResult::new(
+            vec![agens_core::hosted::HostedMcpServer::new(
+                "atlas",
+                agens_core::hosted::HostedMcpState::Ready,
+                3,
+                None,
+            )],
+            None,
+        ))
+    }
+
+    fn mcp_control(
+        &self,
+        server: &str,
+        action: agens_core::hosted::HostedMcpAction,
+    ) -> Result<agens_core::hosted::HostedMcpResult, CliError> {
+        self.controls
+            .lock()
+            .unwrap()
+            .push((server.to_owned(), action));
+        self.mcp_status()
+    }
+
+    fn task_snapshot(
+        &self,
+    ) -> Result<
+        Result<agens_core::hosted::HostedTaskReplay, agens_core::hosted::TaskControlError>,
+        CliError,
+    > {
+        Ok(Ok(agens_core::hosted::HostedTaskReplay::SnapshotTail {
+            snapshot: agens_core::hosted::HostedTaskSnapshot::new(
+                4,
+                vec![agens_core::hosted::HostedTaskRecord::new(
+                    "17",
+                    agens_core::hosted::HostedTaskState::Background,
+                )],
+            ),
+            events: vec![],
+        }))
+    }
+
+    fn task_control(
+        &self,
+        kind: agens_core::hosted::HostedControlKind,
+        _task_id: Option<u64>,
+    ) -> Result<
+        Result<agens_core::hosted::HostedControlResult, agens_core::hosted::TaskControlError>,
+        CliError,
+    > {
+        self.task_controls.lock().unwrap().push(kind);
+        Ok(Ok(agens_core::hosted::HostedControlResult::new(
+            agens_core::hosted::HostedTaskState::Background,
+            false,
+        )))
+    }
+}
+
+#[test]
+fn attached_surface_uses_daemon_catalogs_files_mcp_and_task_controls() {
+    let temporary = tui_session_directory("attached-daemon-surface");
+    let bootstrap = tui_session_bootstrap(&temporary, &[]);
+    let backend = Arc::new(FakeAttachedBackend::default());
+    let router = TuiRuntimeRouter::new(
+        bootstrap,
+        Arc::new(Mutex::new(SessionContext::fresh())),
+        Arc::new(Mutex::new(None)),
+        Arc::new(agens_tools::CommandCatalog::default()),
+        Arc::new(agens_tools::SkillCatalog::default()),
+    )
+    .with_attached_backend(backend.clone());
+
+    assert!(matches!(
+        attached_route(&router, TuiRouteRequest::Input("/skills".into())),
+        TuiSubmissionOutcome::Dialog(_)
+    ));
+    assert!(matches!(
+        attached_route(&router, TuiRouteRequest::Input("/mcp".into())),
+        TuiSubmissionOutcome::Dialog(_)
+    ));
+    assert!(matches!(
+        attached_route(
+            &router,
+            TuiRouteRequest::Input("/mcp reconnect atlas".into())
+        ),
+        TuiSubmissionOutcome::Dialog(_)
+    ));
+    assert_eq!(
+        attached_route(&router, TuiRouteRequest::Input("@src/lib.rs".into())),
+        TuiSubmissionOutcome::ProviderMessage {
+            display: "@src/lib.rs".into(),
+            message: Message {
+                role: Role::User,
+                parts: vec![MessagePart::Text(
+                    "<file path=\"src/lib.rs\">\ndaemon file body\n</file>".into()
+                )],
+            },
+        }
+    );
+    assert_eq!(
+        attached_route(
+            &router,
+            TuiRouteRequest::Input("before @shot.png after".into())
+        ),
+        TuiSubmissionOutcome::ProviderMessage {
+            display: "before @shot.png after".into(),
+            message: Message {
+                role: Role::User,
+                parts: vec![
+                    MessagePart::Text("before ".into()),
+                    MessagePart::Media {
+                        media_id: 71,
+                        mime: "image/png".into(),
+                    },
+                    MessagePart::Text(" after".into()),
+                ],
+            },
+        }
+    );
+    assert!(matches!(
+        attached_route(&router, TuiRouteRequest::Input("/select".into())),
+        TuiSubmissionOutcome::Dialog(_)
+    ));
+    assert!(matches!(
+        attached_route(
+            &router,
+            TuiRouteRequest::DialogAction("attach:shot.png".into())
+        ),
+        TuiSubmissionOutcome::MediaAttached { .. }
+    ));
+    assert!(matches!(
+        attached_route(
+            &router,
+            TuiRouteRequest::DialogAction("mcp:reconnect:atlas".into())
+        ),
+        TuiSubmissionOutcome::Dialog(_)
+    ));
+    assert_eq!(router.attached_task_events().unwrap().len(), 1);
+    assert!(router.attached_background_task(17));
+    assert!(router.attached_cancel_task(17));
+    assert!(router.attached_send_task_message(17, "status".into()));
+    assert_eq!(router.attached_cancel_all_tasks(), Vec::<u64>::new());
+    assert_eq!(backend.controls.lock().unwrap().len(), 2);
+    assert_eq!(backend.task_controls.lock().unwrap().len(), 4);
+}
+
+#[test]
+fn attached_surface_forwards_every_daemon_catalogued_builtin_without_local_discovery() {
+    let temporary = tui_session_directory("attached-all-builtins");
+    let bootstrap = tui_session_bootstrap(&temporary, &[]);
+    let backend = Arc::new(FakeAttachedBackend::default());
+    let router = TuiRuntimeRouter::new(
+        bootstrap,
+        Arc::new(Mutex::new(SessionContext::fresh())),
+        Arc::new(Mutex::new(None)),
+        Arc::new(agens_tools::CommandCatalog::default()),
+        Arc::new(agens_tools::SkillCatalog::default()),
+    )
+    .with_attached_backend(backend.clone());
+
+    for command in crate::extensions::tui_hosted_builtin_entries() {
+        if matches!(
+            command.name(),
+            "attach" | "skills" | "mcp" | "select" | "quit"
+        ) {
+            continue;
+        }
+        let input = format!("/{}", command.name());
+        assert!(matches!(
+            attached_route(&router, TuiRouteRequest::Input(input)),
+            TuiSubmissionOutcome::LocalInfo(_)
+        ));
+    }
+
+    assert!(!backend.commands.lock().unwrap().is_empty());
+}
+
 #[test]
 fn attached_routes_preserve_order_expand_media_and_reject_session_mutations() {
     let temporary = tui_session_directory("attached-ordered");

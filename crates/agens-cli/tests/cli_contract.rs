@@ -235,10 +235,10 @@ fn table_a_root_shapes_hold() {
             let dependencies = base_dependencies(&temporary)
                 .with_tui_launcher(|_, launch| Ok(format!("mode={:?}", launch.mode())));
             Case {
-                name: "neither flag runs the turn in this process today",
+                name: "neither flag runs the turn in the daemon",
                 argv: argv(&[]),
                 dependencies,
-                expected: success("mode=Local\n"),
+                expected: success("mode=Attached\n"),
                 _temporary: temporary,
             }
         },
@@ -403,10 +403,7 @@ fn team_ls_reports_an_absent_daemon_without_starting_the_tui() {
 #[test]
 fn default_tui_reports_start_and_reuses_an_existing_daemon() {
     for (started, expected_notice) in [
-        (
-            true,
-            "Some(\"started the machine daemon; this chat remains local until you use /team\")",
-        ),
+        (true, "Some(\"started the machine daemon\")"),
         (false, "None"),
     ] {
         let temporary = TemporaryDirectory::new("default-tui-daemon-state");
@@ -422,7 +419,7 @@ fn default_tui_reports_start_and_reuses_an_existing_daemon() {
 
         assert_eq!(
             execute(std::iter::empty::<&str>(), &dependencies),
-            success(format!("mode=Local;notice={expected_notice}\n"))
+            success(format!("mode=Attached;notice={expected_notice}\n"))
         );
     }
 }
@@ -440,7 +437,7 @@ fn test_dependencies_do_not_autostart_for_the_default_tui() {
 
     assert_eq!(
         execute(std::iter::empty::<&str>(), &dependencies),
-        success("mode=Local;notice=None\n")
+        success("mode=Attached;notice=None\n")
     );
 }
 

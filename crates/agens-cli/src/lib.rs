@@ -182,7 +182,7 @@ fn execute_command(
             Some(identifier),
             tui::TuiMode::default(),
             None,
-            None,
+            Some(commands::serve::DaemonStartupRequest::ExplicitAttached),
         );
     }
 

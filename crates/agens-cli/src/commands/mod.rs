@@ -30,8 +30,8 @@ pub(crate) fn dispatch(
     let tui_mode = parsed.tui_mode();
     match parsed.command {
         None => {
-            let daemon_startup = (parsed.resume.is_none() && !parsed.local && !parsed.attach)
-                .then_some(serve::DaemonStartupRequest::PassiveLocal);
+            let daemon_startup = (!parsed.local && !parsed.attach)
+                .then_some(serve::DaemonStartupRequest::ExplicitAttached);
             run_tui(
                 dependencies,
                 parsed.resume.flatten(),

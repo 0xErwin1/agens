@@ -14,6 +14,7 @@ mod diagnostics;
 mod fsm;
 mod gates;
 pub mod grpc;
+mod hosted;
 mod ingest;
 mod instance;
 mod introspection;
@@ -28,6 +29,9 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use agens_core::HeadlessTurnCancellation;
+use agens_core::hosted::{
+    HostedCatalogs, HostedMcpControl, HostedTaskJournal, HostedWorkspaceFiles,
+};
 
 /// What this crate is, as one list.
 ///
@@ -85,6 +89,7 @@ pub use gates::{
     Receipt, ReclaimRequest, ReclaimVerdict, SubAgentKind, SubAgentRequest, freeze_receipt,
 };
 pub use grpc::{ChatFacade, CoreHandle, FacadeBinding, FacadeError, FeedFacade, TeamFacade};
+pub use hosted::{ConfinedWorkspaceFiles, HostedCatalogSet};
 pub use ingest::{
     AcceptedFact, Attribution, BACKLOGGED_EVENT, BacklogNotice, CheckpointClaim,
     CheckpointStanding, DrainedFact, FactReceiver, FactSender, HealthSignal, HealthThresholds,
@@ -266,6 +271,42 @@ impl Daemon {
         Ok(report)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn serve_until_shutdown_with_hosted(
+        self,
+        core: Arc<Mutex<ApiCore>>,
+        chats: Arc<ChatSessions>,
+        shutdown: &HeadlessTurnCancellation,
+        catalogs: Arc<dyn HostedCatalogs>,
+        files: Arc<dyn HostedWorkspaceFiles>,
+        mcp: Box<dyn HostedMcpControl>,
+        tasks: Box<dyn HostedTaskJournal>,
+    ) -> Result<SessionShutdown, ServerError> {
+        let Self {
+            runtime,
+            sessions,
+            listener,
+            instance,
+        } = self;
+        publish_pid(&instance)?;
+        let binding = FacadeBinding::none().on_unix_socket(listener);
+        let blocking = BlockingBoundary::new(runtime.handle().clone());
+        let report = runtime.block_on(async {
+            let served = grpc::serve_until_shutdown_with_hosted(
+                core, chats, blocking, binding, shutdown, catalogs, files, mcp, tasks,
+            )
+            .await;
+            let report = sessions.cancel_all_and_join().await;
+            (served, report)
+        });
+        runtime.shutdown_timeout(std::time::Duration::ZERO);
+        drop(sessions);
+        drop(instance);
+        let (served, report) = report;
+        served.map_err(|error| ServerError::Unavailable(format!("the facade stopped: {error}")))?;
+        Ok(report)
+    }
+
     /// Parks until asked to stop, then stops every session before releasing the
     /// slot and the socket, reporting any session that outlived the wait.
     ///
@@ -362,6 +403,50 @@ pub fn serve_until_shutdown(
         ));
     }
 
+    report
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn serve_until_shutdown_with_hosted(
+    data_directory: &Path,
+    settings: &CoordinatorSettings,
+    worker: RunWorkerFactory,
+    chat: ChatSessionFactory,
+    chat_history: ChatHistorySource,
+    shutdown: &HeadlessTurnCancellation,
+    catalogs: Arc<dyn HostedCatalogs>,
+    files: Arc<dyn HostedWorkspaceFiles>,
+    mcp: Box<dyn HostedMcpControl>,
+    tasks: Box<dyn HostedTaskJournal>,
+) -> Result<SessionShutdown, ServerError> {
+    let daemon = Daemon::start(data_directory)?;
+    let coordinator = Coordinator::start(
+        data_directory,
+        settings,
+        daemon.sessions().clone(),
+        worker,
+        shutdown,
+    )
+    .map_err(|error| ServerError::Unavailable(error.to_string()))?;
+    let chats = Arc::new(
+        ChatSessions::new(daemon.sessions().clone(), chat, chat_history)
+            .with_media_store(data_directory.to_path_buf()),
+    );
+    let report = daemon.serve_until_shutdown_with_hosted(
+        coordinator.core(),
+        chats,
+        shutdown,
+        catalogs,
+        files,
+        mcp,
+        tasks,
+    );
+    let poisoned = coordinator.stop();
+    if poisoned {
+        return Err(ServerError::Unavailable(
+            "the service core was left poisoned and the daemon stopped".to_owned(),
+        ));
+    }
     report
 }
 

@@ -2788,6 +2788,25 @@ impl McpRegistry {
         self.discover_or_reload(server_name)
     }
 
+    pub fn disconnect_server(&mut self, server_name: &str) -> bool {
+        if self.closed || !self.configured.contains_key(server_name) {
+            return false;
+        }
+        self.tools.retain(|_, tool| tool.server_name != server_name);
+        self.diagnostics.remove(server_name);
+        self.attempted.remove(server_name);
+        if let Some(mut client) = self.clients.remove(server_name) {
+            client.close();
+        }
+        self.status.update(server_name, |status| {
+            status.state = McpLifecycleState::Closed;
+            status.tool_count = 0;
+            status.tool_names.clear();
+            status.last_error = None;
+        });
+        true
+    }
+
     pub fn close(&mut self) {
         if self.closed {
             return;

@@ -57,7 +57,7 @@ struct Migration {
     preserved_tables: &'static [&'static str],
 }
 
-const MIGRATIONS: [Migration; 20] = [
+const MIGRATIONS: [Migration; 21] = [
     Migration {
         id: "0001_permission_grants",
         ddl: permission_grants_ddl,
@@ -162,6 +162,11 @@ const MIGRATIONS: [Migration; 20] = [
     Migration {
         id: "0020_retry_user_parts",
         ddl: retry_user_parts_ddl,
+        preserved_tables: &[],
+    },
+    Migration {
+        id: "0021_hosted_tasks",
+        ddl: hosted_tasks_ddl,
         preserved_tables: &[],
     },
 ];
@@ -433,6 +438,41 @@ fn guard_layout(connection: &Connection, path: &Path) -> Result<(), DatabaseErro
     }
 
     Ok(())
+}
+
+fn hosted_tasks_ddl() -> String {
+    "
+    CREATE TABLE hosted_tasks (
+        session_id INTEGER NOT NULL, task_id TEXT NOT NULL CHECK(task_id <> ''),
+        state TEXT NOT NULL CHECK(state IN('running','background','completed','cancelled','failed')),
+        PRIMARY KEY(session_id, task_id), FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+    );
+    CREATE TABLE hosted_task_events (
+        session_id INTEGER NOT NULL, cursor INTEGER NOT NULL CHECK(cursor > 0), task_id TEXT NOT NULL,
+        state TEXT NOT NULL CHECK(state IN('running','background','completed','cancelled','failed')), payload TEXT NOT NULL,
+        PRIMARY KEY(session_id, cursor), FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+    );
+    CREATE TABLE hosted_task_snapshots (
+        session_id INTEGER PRIMARY KEY, cursor INTEGER NOT NULL CHECK(cursor >= 0),
+        FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+    );
+    CREATE TABLE hosted_task_snapshot_tasks (
+        session_id INTEGER NOT NULL, snapshot_cursor INTEGER NOT NULL, task_id TEXT NOT NULL,
+        state TEXT NOT NULL CHECK(state IN('running','background','completed','cancelled','failed')),
+        PRIMARY KEY(session_id, task_id), FOREIGN KEY(session_id) REFERENCES hosted_task_snapshots(session_id) ON DELETE CASCADE
+    );
+    CREATE TABLE hosted_child_turns (
+        session_id INTEGER NOT NULL, task_id TEXT NOT NULL, sequence INTEGER NOT NULL CHECK(sequence > 0), payload TEXT NOT NULL,
+        PRIMARY KEY(session_id, task_id, sequence), FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+    );
+    CREATE TABLE hosted_task_controls (
+        session_id INTEGER NOT NULL, command_id TEXT NOT NULL CHECK(command_id <> ''), request_hash TEXT NOT NULL,
+        result_state TEXT NOT NULL, PRIMARY KEY(session_id, command_id),
+        FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+    );
+    CREATE INDEX hosted_task_events_tail ON hosted_task_events(session_id, cursor);
+    CREATE INDEX hosted_child_turns_order ON hosted_child_turns(session_id, task_id, sequence);
+    ".to_owned()
 }
 
 fn permission_grants_ddl() -> String {

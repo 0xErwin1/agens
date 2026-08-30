@@ -181,30 +181,18 @@ fn a_bare_serve_returns_the_terminal_with_the_daemon_still_listening() {
 }
 
 #[test]
-fn default_chat_autostart_is_opt_in_under_an_isolated_config_home() {
+fn default_chat_starts_the_daemon_under_an_isolated_config_home() {
     let operator = Operator::prepare();
 
-    let _ = operator.run(&[]);
-
-    assert!(
-        !accepts(&operator.socket()),
-        "an isolated command does not leak a daemon unless the harness requests it"
-    );
-
-    let output = operator
-        .command()
-        .env("AGENS_DAEMON_AUTOSTART", "1")
-        .stdin(Stdio::null())
-        .output()
-        .expect("default chat runs");
+    let output = operator.run(&[]);
 
     assert!(
         !output.status.success(),
-        "the non-terminal TUI still refuses"
+        "the non-terminal attached TUI still refuses"
     );
     assert!(
         accepts(&operator.socket()),
-        "autostart waits for the socket"
+        "default attached startup waits for the daemon socket"
     );
 }
 

@@ -14,6 +14,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use agens_core::HeadlessTurnCancellation;
+use agens_core::hosted::{
+    HostedCatalogs, HostedMcpControl, HostedTaskJournal, HostedWorkspaceFiles,
+};
 use tokio_stream::wrappers::UnixListenerStream;
 use tonic::transport::Server;
 
@@ -113,16 +116,56 @@ pub async fn serve_until_shutdown(
         blocking,
         UnixListenerStream::new(listener),
         shutdown.clone(),
+        None,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
+pub async fn serve_until_shutdown_with_hosted(
+    core: Arc<Mutex<ApiCore>>,
+    chats: Arc<ChatSessions>,
+    blocking: BlockingBoundary,
+    binding: FacadeBinding,
+    shutdown: &HeadlessTurnCancellation,
+    catalogs: Arc<dyn HostedCatalogs>,
+    files: Arc<dyn HostedWorkspaceFiles>,
+    mcp: Box<dyn HostedMcpControl>,
+    tasks: Box<dyn HostedTaskJournal>,
+) -> Result<(), FacadeError> {
+    let Some(listener) = binding.unix else {
+        return Err(FacadeError::NoListener);
+    };
+    listener
+        .set_nonblocking(true)
+        .map_err(|error| FacadeError::unavailable("prepare the unix socket", error))?;
+    let listener = tokio::net::UnixListener::from_std(listener)
+        .map_err(|error| FacadeError::unavailable("adopt the unix socket", error))?;
+    let handle = CoreHandle::new(core, blocking.clone(), Principal::User);
+    serve_on(
+        handle,
+        chats,
+        blocking,
+        UnixListenerStream::new(listener),
+        shutdown.clone(),
+        Some((catalogs, files, mcp, tasks)),
+    )
+    .await
+}
+
+#[allow(clippy::type_complexity)]
 async fn serve_on<S, C>(
     handle: CoreHandle,
     chats: Arc<ChatSessions>,
     blocking: BlockingBoundary,
     incoming: S,
     shutdown: HeadlessTurnCancellation,
+    hosted: Option<(
+        Arc<dyn HostedCatalogs>,
+        Arc<dyn HostedWorkspaceFiles>,
+        Box<dyn HostedMcpControl>,
+        Box<dyn HostedTaskJournal>,
+    )>,
 ) -> Result<(), FacadeError>
 where
     S: tokio_stream::Stream<Item = io::Result<C>>,
@@ -130,10 +173,18 @@ where
     C: Send + Unpin + 'static,
     C::ConnectInfo: Clone + Send + Sync + 'static,
 {
+    let mut chat = ChatFacade::new(chats, blocking);
+    if let Some((catalogs, files, mcp, tasks)) = hosted {
+        chat = chat
+            .with_hosted(catalogs, files)
+            .with_hosted_mcp(mcp)
+            .with_hosted_tasks(tasks);
+    }
+
     Server::builder()
         .add_service(TeamServer::new(TeamFacade::new(handle.clone())))
         .add_service(FeedServer::new(FeedFacade::new(handle)))
-        .add_service(ChatServer::new(ChatFacade::new(chats, blocking)))
+        .add_service(ChatServer::new(chat))
         .serve_with_incoming_shutdown(incoming, park_until_shutdown(shutdown))
         .await
         .map_err(|error| FacadeError::unavailable("serve the facade", error))

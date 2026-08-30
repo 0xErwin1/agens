@@ -13,10 +13,16 @@
 
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::mpsc::RecvTimeoutError;
+use std::sync::{Arc, Mutex};
 
 use agens_core::ask_user::{AskUserAnswer, AskUserReply, AskUserUnavailable};
+use agens_core::hosted::{
+    CatalogKind, CatalogResult, FileError, HostedCatalogs, HostedControlCommand, HostedControlKind,
+    HostedMcpAction, HostedMcpControl, HostedMcpResult, HostedMcpState, HostedTaskJournal,
+    HostedTaskReplay, HostedTaskState, HostedWorkspaceFiles, TaskControlError,
+    WorkspaceFileContent, WorkspaceFileKind,
+};
 use tokio_stream::{Stream, wrappers::ReceiverStream};
 use tonic::{Request, Response, Status};
 
@@ -30,11 +36,16 @@ use super::{proto, turn};
 use crate::blocking::{BlockingBoundary, BlockingError};
 use crate::chat::{ChatError, ChatSessionRequest, ChatSessions};
 use crate::sessions::SessionId;
+use crate::{ConfinedWorkspaceFiles, HostedCatalogSet};
 
 pub struct ChatFacade {
     chats: Arc<ChatSessions>,
     blocking: BlockingBoundary,
     slots: Arc<SubscriptionSlots>,
+    catalogs: Arc<dyn HostedCatalogs>,
+    files: Arc<dyn HostedWorkspaceFiles>,
+    mcp: Option<Arc<Mutex<Box<dyn HostedMcpControl>>>>,
+    tasks: Option<Arc<Mutex<Box<dyn HostedTaskJournal>>>>,
 }
 
 impl ChatFacade {
@@ -58,7 +69,33 @@ impl ChatFacade {
             chats,
             blocking,
             slots: Arc::new(SubscriptionSlots::new(ceiling)),
+            catalogs: Arc::new(HostedCatalogSet::default()),
+            files: Arc::new(ConfinedWorkspaceFiles::default()),
+            mcp: None,
+            tasks: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_hosted(
+        mut self,
+        catalogs: Arc<dyn HostedCatalogs>,
+        files: Arc<dyn HostedWorkspaceFiles>,
+    ) -> Self {
+        self.catalogs = catalogs;
+        self.files = files;
+        self
+    }
+
+    #[must_use]
+    pub fn with_hosted_mcp(mut self, mcp: Box<dyn HostedMcpControl>) -> Self {
+        self.mcp = Some(Arc::new(Mutex::new(mcp)));
+        self
+    }
+
+    pub fn with_hosted_tasks(mut self, tasks: Box<dyn HostedTaskJournal>) -> Self {
+        self.tasks = Some(Arc::new(Mutex::new(tasks)));
+        self
     }
 
     /// Runs one synchronous chat operation off the runtime's workers.
@@ -82,6 +119,182 @@ type SessionEventStream = Pin<Box<dyn Stream<Item = Result<proto::SessionEvent, 
 #[tonic::async_trait]
 impl Chat for ChatFacade {
     type SubscribeStream = SessionEventStream;
+
+    async fn catalog(
+        &self,
+        request: Request<proto::HostedCatalogRequest>,
+    ) -> Result<Response<proto::HostedCatalogResult>, Status> {
+        let request = request.into_inner();
+        let kind = match proto::HostedCatalogKind::try_from(request.kind) {
+            Ok(proto::HostedCatalogKind::Command) => CatalogKind::Command,
+            Ok(proto::HostedCatalogKind::Skill) => CatalogKind::Skill,
+            _ => return Err(Status::invalid_argument("catalog kind is required")),
+        };
+        let catalogs = Arc::clone(&self.catalogs);
+        let result = self
+            .blocking
+            .run(move || catalogs.catalog(kind, request.known_revision.as_deref()))
+            .await
+            .map_err(unavailable)?;
+        Ok(Response::new(encode_catalog(result)))
+    }
+
+    async fn list_workspace_files(
+        &self,
+        request: Request<proto::WorkspaceFilesRequest>,
+    ) -> Result<Response<proto::HostedWorkspaceFilesResult>, Status> {
+        let request = request.into_inner();
+        let root = checkout(request.checkout)?;
+        let selector = PathBuf::from(request.selector);
+        let files = Arc::clone(&self.files);
+        let result = self
+            .blocking
+            .run(move || files.list(&root, &selector))
+            .await
+            .map_err(unavailable)?;
+        Ok(Response::new(encode_file_list(result)))
+    }
+
+    async fn read_workspace_file(
+        &self,
+        request: Request<proto::WorkspaceFileRequest>,
+    ) -> Result<Response<proto::HostedWorkspaceFileResult>, Status> {
+        let request = request.into_inner();
+        let root = checkout(request.checkout)?;
+        let selector = PathBuf::from(request.selector);
+        let files = Arc::clone(&self.files);
+        let result = self
+            .blocking
+            .run(move || files.read(&root, &selector))
+            .await
+            .map_err(unavailable)?;
+        Ok(Response::new(encode_file(result)))
+    }
+
+    async fn mcp_status(
+        &self,
+        _request: Request<proto::HostedMcpStatusRequest>,
+    ) -> Result<Response<proto::HostedMcpResult>, Status> {
+        let mcp = self
+            .mcp
+            .clone()
+            .ok_or_else(|| Status::unimplemented("hosted MCP is unavailable"))?;
+        let result = self
+            .blocking
+            .run(move || {
+                mcp.lock()
+                    .map_err(|_| ())
+                    .map(|mcp| HostedMcpResult::new(mcp.status(), None))
+            })
+            .await
+            .map_err(unavailable)?
+            .map_err(|()| Status::internal("hosted MCP is unavailable"))?;
+        Ok(Response::new(encode_mcp_result(result)))
+    }
+
+    async fn mcp_control(
+        &self,
+        request: Request<proto::HostedMcpControlRequest>,
+    ) -> Result<Response<proto::HostedMcpResult>, Status> {
+        let request = request.into_inner();
+        if request.server.is_empty() {
+            return Err(Status::invalid_argument("MCP server is required"));
+        }
+        let action = match proto::HostedMcpAction::try_from(request.action) {
+            Ok(proto::HostedMcpAction::Connect) => HostedMcpAction::Connect,
+            Ok(proto::HostedMcpAction::Disconnect) => HostedMcpAction::Disconnect,
+            Ok(proto::HostedMcpAction::Reconnect) => HostedMcpAction::Reconnect,
+            _ => return Err(Status::invalid_argument("MCP action is required")),
+        };
+        let mcp = self
+            .mcp
+            .clone()
+            .ok_or_else(|| Status::unimplemented("hosted MCP is unavailable"))?;
+        let result = self
+            .blocking
+            .run(move || {
+                mcp.lock()
+                    .map_err(|_| ())
+                    .map(|mut mcp| mcp.control(&request.server, action))
+            })
+            .await
+            .map_err(unavailable)?
+            .map_err(|()| Status::internal("hosted MCP is unavailable"))?;
+        Ok(Response::new(encode_mcp_result(result)))
+    }
+
+    async fn task_snapshot(
+        &self,
+        request: Request<proto::HostedTaskSnapshotRequest>,
+    ) -> Result<Response<proto::HostedTaskReplayResult>, Status> {
+        let session = request.into_inner().session_id;
+        let tasks = self
+            .tasks
+            .clone()
+            .ok_or_else(|| Status::unimplemented("hosted task journal is unavailable"))?;
+        let result = self
+            .blocking
+            .run(move || {
+                tasks
+                    .lock()
+                    .map_err(|_| TaskControlError::Storage)?
+                    .snapshot_tail(session)
+            })
+            .await
+            .map_err(unavailable)?;
+        Ok(Response::new(encode_task_replay(result)))
+    }
+
+    async fn task_replay(
+        &self,
+        request: Request<proto::HostedTaskReplayRequest>,
+    ) -> Result<Response<proto::HostedTaskReplayResult>, Status> {
+        let request = request.into_inner();
+        let tasks = self
+            .tasks
+            .clone()
+            .ok_or_else(|| Status::unimplemented("hosted task journal is unavailable"))?;
+        let result = self
+            .blocking
+            .run(move || {
+                tasks
+                    .lock()
+                    .map_err(|_| TaskControlError::Storage)?
+                    .replay_after(request.session_id, request.after_cursor)
+            })
+            .await
+            .map_err(unavailable)?;
+        Ok(Response::new(encode_task_replay(result)))
+    }
+
+    async fn task_control(
+        &self,
+        request: Request<proto::HostedTaskControlRequest>,
+    ) -> Result<Response<proto::HostedTaskControlResult>, Status> {
+        let request = request.into_inner();
+        let kind = decode_control_kind(&request)?;
+        let command = HostedControlCommand::new(
+            request.session_id,
+            (!request.task_id.is_empty()).then_some(request.task_id),
+            request.command_id,
+            kind,
+        );
+        let tasks = self
+            .tasks
+            .clone()
+            .ok_or_else(|| Status::unimplemented("hosted task journal is unavailable"))?;
+        let result = self
+            .blocking
+            .run(move || {
+                tasks
+                    .lock()
+                    .map_err(|_| TaskControlError::Storage)?
+                    .apply_control(&command)
+            })
+            .await
+            .map_err(unavailable)?;
+        Ok(Response::new(encode_control_result(result)))
+    }
 
     async fn open(
         &self,
@@ -332,6 +545,103 @@ fn ask_user_reply(reply: proto::AskUserReply) -> Result<AskUserReply, Status> {
     }
 }
 
+fn encode_catalog(result: CatalogResult) -> proto::HostedCatalogResult {
+    use proto::hosted_catalog_result::Result;
+    let result = match result {
+        CatalogResult::Current(snapshot) => Result::Current(proto::HostedCatalogSnapshot {
+            revision: snapshot.revision().to_owned(),
+            entries: snapshot
+                .entries()
+                .iter()
+                .map(|entry| proto::HostedCatalogEntry {
+                    name: entry.name().to_owned(),
+                    description: entry.description().to_owned(),
+                    built_in: entry.built_in(),
+                })
+                .collect(),
+        }),
+        CatalogResult::Stale { current_revision } => {
+            Result::Stale(proto::HostedCatalogStale { current_revision })
+        }
+        CatalogResult::Unsupported => Result::Unsupported(proto::HostedUnsupported {}),
+    };
+    proto::HostedCatalogResult {
+        result: Some(result),
+    }
+}
+
+fn encode_file_list(
+    result: Result<Vec<agens_core::hosted::WorkspaceFile>, FileError>,
+) -> proto::HostedWorkspaceFilesResult {
+    use proto::hosted_workspace_files_result::Result;
+    let result = match result {
+        Ok(files) => Result::Files(proto::HostedWorkspaceFileList {
+            files: files
+                .into_iter()
+                .map(|file| proto::HostedWorkspaceFile {
+                    path: file.path().display().to_string(),
+                    byte_len: file.byte_len(),
+                    kind: encode_file_kind(file.kind()) as i32,
+                })
+                .collect(),
+        }),
+        Err(error) => Result::Error(encode_file_error(error) as i32),
+    };
+    proto::HostedWorkspaceFilesResult {
+        result: Some(result),
+    }
+}
+
+fn encode_file(
+    result: Result<WorkspaceFileContent, FileError>,
+) -> proto::HostedWorkspaceFileResult {
+    use proto::hosted_workspace_file_result::Result;
+    let result = match result {
+        Ok(WorkspaceFileContent::Text { path, text }) => {
+            Result::Text(proto::HostedWorkspaceFileText {
+                path: path.display().to_string(),
+                text,
+            })
+        }
+        Ok(WorkspaceFileContent::Media {
+            path,
+            mime,
+            bytes,
+            media_id,
+            ..
+        }) => Result::Media(proto::HostedWorkspaceFileMedia {
+            path: path.display().to_string(),
+            mime,
+            bytes,
+            media_id,
+        }),
+        Err(error) => Result::Error(encode_file_error(error) as i32),
+    };
+    proto::HostedWorkspaceFileResult {
+        result: Some(result),
+    }
+}
+
+const fn encode_file_kind(kind: WorkspaceFileKind) -> proto::HostedFileKind {
+    match kind {
+        WorkspaceFileKind::Text => proto::HostedFileKind::Text,
+        WorkspaceFileKind::Media => proto::HostedFileKind::Media,
+    }
+}
+
+const fn encode_file_error(error: FileError) -> proto::HostedFileError {
+    match error {
+        FileError::InvalidSelector => proto::HostedFileError::InvalidSelector,
+        FileError::OutsideRoot => proto::HostedFileError::OutsideRoot,
+        FileError::Ignored => proto::HostedFileError::Ignored,
+        FileError::Missing => proto::HostedFileError::Missing,
+        FileError::Unsupported => proto::HostedFileError::Unsupported,
+        FileError::Oversized => proto::HostedFileError::Oversized,
+        FileError::EntryLimit => proto::HostedFileError::EntryLimit,
+        FileError::Unreadable => proto::HostedFileError::Unreadable,
+    }
+}
+
 /// The checkout a chat's tools run in.
 ///
 /// Empty is refused rather than read as "wherever the daemon happens to be":
@@ -404,6 +714,138 @@ fn unavailable(error: BlockingError) -> Status {
     match error {
         BlockingError::Panicked => Status::internal("the chat plane failed to answer"),
         BlockingError::ShuttingDown => Status::unavailable("the daemon is shutting down"),
+    }
+}
+
+fn decode_control_kind(
+    request: &proto::HostedTaskControlRequest,
+) -> Result<HostedControlKind, Status> {
+    match proto::HostedTaskControlKind::try_from(request.kind) {
+        Ok(proto::HostedTaskControlKind::Background) => Ok(HostedControlKind::Background),
+        Ok(proto::HostedTaskControlKind::Cancel) => Ok(HostedControlKind::Cancel),
+        Ok(proto::HostedTaskControlKind::CancelAll) => Ok(HostedControlKind::CancelAll),
+        Ok(proto::HostedTaskControlKind::Message) if !request.message.is_empty() => {
+            Ok(HostedControlKind::Message(request.message.clone()))
+        }
+        _ => Err(Status::invalid_argument(
+            "hosted task control kind is required",
+        )),
+    }
+}
+
+fn encode_mcp_result(result: HostedMcpResult) -> proto::HostedMcpResult {
+    proto::HostedMcpResult {
+        servers: result
+            .servers()
+            .iter()
+            .map(|server| proto::HostedMcpServer {
+                name: server.name().to_owned(),
+                state: encode_mcp_state(server.state()) as i32,
+                generation: server.generation(),
+                error: server.error().map(str::to_owned),
+            })
+            .collect(),
+        error: result.error().map(str::to_owned),
+    }
+}
+
+const fn encode_mcp_state(state: HostedMcpState) -> proto::HostedMcpState {
+    match state {
+        HostedMcpState::Disabled => proto::HostedMcpState::Disabled,
+        HostedMcpState::Idle => proto::HostedMcpState::Idle,
+        HostedMcpState::Connecting => proto::HostedMcpState::Connecting,
+        HostedMcpState::Ready => proto::HostedMcpState::Ready,
+        HostedMcpState::Degraded => proto::HostedMcpState::Degraded,
+        HostedMcpState::Failed => proto::HostedMcpState::Failed,
+        HostedMcpState::Closed => proto::HostedMcpState::Closed,
+    }
+}
+
+fn encode_task_replay(
+    result: Result<HostedTaskReplay, TaskControlError>,
+) -> proto::HostedTaskReplayResult {
+    use proto::hosted_task_replay_result::Result;
+    let result = match result {
+        Ok(HostedTaskReplay::Events(events)) => Result::Events(proto::HostedTaskEvents {
+            events: events.into_iter().map(encode_task_event).collect(),
+        }),
+        Ok(HostedTaskReplay::SnapshotTail { snapshot, events }) => {
+            Result::SnapshotTail(proto::HostedTaskSnapshotTail {
+                snapshot: Some(proto::HostedTaskSnapshot {
+                    cursor: snapshot.cursor(),
+                    tasks: snapshot
+                        .tasks()
+                        .iter()
+                        .map(|task| proto::HostedTaskRecord {
+                            task_id: task.task_id().to_owned(),
+                            state: encode_task_state(task.state()) as i32,
+                        })
+                        .collect(),
+                    child_turns: snapshot
+                        .child_turns()
+                        .iter()
+                        .map(|turn| proto::HostedChildTurn {
+                            task_id: turn.task_id().to_owned(),
+                            sequence: turn.sequence(),
+                            payload: turn.payload().to_owned(),
+                        })
+                        .collect(),
+                }),
+                events: events.into_iter().map(encode_task_event).collect(),
+            })
+        }
+        Ok(HostedTaskReplay::Gap { oldest_cursor }) => {
+            Result::Gap(proto::HostedTaskGap { oldest_cursor })
+        }
+        Err(error) => Result::Error(encode_task_error(error) as i32),
+    };
+    proto::HostedTaskReplayResult {
+        result: Some(result),
+    }
+}
+
+fn encode_control_result(
+    result: Result<agens_core::hosted::HostedControlResult, TaskControlError>,
+) -> proto::HostedTaskControlResult {
+    use proto::hosted_task_control_result::Result;
+    let result = match result {
+        Ok(applied) => Result::Applied(proto::HostedTaskControlApplied {
+            state: encode_task_state(applied.state()) as i32,
+            replayed: applied.replayed(),
+        }),
+        Err(error) => Result::Error(encode_task_error(error) as i32),
+    };
+    proto::HostedTaskControlResult {
+        result: Some(result),
+    }
+}
+
+fn encode_task_event(event: agens_core::hosted::HostedTaskEvent) -> proto::HostedTaskEvent {
+    proto::HostedTaskEvent {
+        cursor: event.cursor(),
+        task_id: event.task_id().to_owned(),
+        state: encode_task_state(event.state()) as i32,
+        payload: event.payload().to_owned(),
+    }
+}
+const fn encode_task_state(state: HostedTaskState) -> proto::HostedTaskState {
+    match state {
+        HostedTaskState::Running => proto::HostedTaskState::Running,
+        HostedTaskState::Background => proto::HostedTaskState::Background,
+        HostedTaskState::Completed => proto::HostedTaskState::Completed,
+        HostedTaskState::Cancelled => proto::HostedTaskState::Cancelled,
+        HostedTaskState::Failed => proto::HostedTaskState::Failed,
+    }
+}
+const fn encode_task_error(error: TaskControlError) -> proto::HostedTaskError {
+    match error {
+        TaskControlError::WrongSession => proto::HostedTaskError::WrongSession,
+        TaskControlError::UnknownTask => proto::HostedTaskError::UnknownTask,
+        TaskControlError::InvalidTransition => proto::HostedTaskError::InvalidTransition,
+        TaskControlError::CommandConflict => proto::HostedTaskError::CommandConflict,
+        TaskControlError::ControlCapacity => proto::HostedTaskError::ControlCapacity,
+        TaskControlError::InvalidRequest => proto::HostedTaskError::InvalidRequest,
+        TaskControlError::Storage => proto::HostedTaskError::Storage,
     }
 }
 

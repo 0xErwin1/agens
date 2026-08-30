@@ -246,6 +246,7 @@ dependencies = [
  "agens-store",
  "agens-tools",
  "hyper-util",
+ "ignore",
  "libc",
  "prost",
  "protox",
