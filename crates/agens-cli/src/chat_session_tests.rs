@@ -376,3 +376,103 @@ fn a_prompt_a_client_sent_is_answered_by_a_turn_the_daemon_ran() {
     daemon.provider.assert_script_consumed();
     let _ = std::fs::remove_dir_all(PathBuf::from(&daemon.root));
 }
+
+/// A session row opened by a chat that exited before completing a turn is
+/// `resumable = 0` with nothing said. The daemon that finds one — after a
+/// restart, from a `--resume`, or from a stale preference — is being handed a
+/// conversation that never started, and what the person is owed is that empty
+/// conversation, not an error that says the session does not exist.
+#[test]
+fn a_chat_that_never_completed_a_turn_reopens_as_a_fresh_conversation() {
+    let daemon = DaemonFixture::start(
+        Script::new([ScriptedTurn::text("it is a Rust workspace")]),
+        daemon_settings(),
+    );
+
+    // The orphan row, exactly as `open_session` leaves it for a chat that is
+    // opened and abandoned: no completed turns, not resumable, no messages.
+    // Written before the daemon serves, which is the restart shape — the
+    // daemon holds no live record of this session.
+    let orphan = agens_store::SessionStore::open(&daemon.data_directory)
+        .and_then(|mut store| {
+            store.open_session(&agens_core::SessionMetadata {
+                id: 0,
+                project: daemon.checkout.display().to_string(),
+                title: String::new(),
+                active_agent: "primary".to_owned(),
+                provider_id: None,
+                model_id: None,
+                reasoning_effort: None,
+                created_at: 1,
+                updated_at: 1,
+                completed_turn_count: 0,
+                resumable: false,
+                parent_session_id: None,
+                fork_message_count: None,
+            })
+        })
+        .expect("the orphan session row is stored");
+
+    let socket = daemon.socket.clone();
+    let stopper = daemon.stopper();
+    let checkout = daemon.checkout.display().to_string();
+
+    let client = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let stopper = stopper;
+
+        runtime.block_on(async move {
+            let mut chat = ChatClient::new(connect(socket).await);
+
+            let opened = chat
+                .open(proto::OpenChatRequest {
+                    checkout,
+                    resume: Some(orphan),
+                })
+                .await
+                .expect("the orphan session reopens")
+                .into_inner();
+            assert_eq!(opened.session_id, orphan);
+
+            let history = chat
+                .history(proto::ChatRef { session_id: orphan })
+                .await
+                .expect("an orphan session's history is an empty thread, not an error")
+                .into_inner();
+            assert_eq!(history.messages, Vec::new());
+
+            let mut events = chat
+                .subscribe(proto::ChatRef { session_id: orphan })
+                .await
+                .expect("the reopened chat is open")
+                .into_inner();
+            let answer = ask(&mut chat, orphan, "what is this repository", &mut events).await;
+
+            chat.close(proto::ChatRef { session_id: orphan })
+                .await
+                .expect("the chat closes");
+
+            drop(stopper);
+
+            answer
+        })
+    });
+
+    daemon.serve();
+
+    let answer = client.join().expect("the client thread finished");
+    assert_eq!(answer.1.as_deref(), Some("it is a Rust workspace"));
+
+    let stored = agens_store::SessionStore::open(&daemon.data_directory)
+        .and_then(|store| store.load_session_for_resume(orphan))
+        .expect("the first completed turn makes the session resumable");
+    assert!(stored.metadata.resumable);
+    assert_eq!(stored.metadata.completed_turn_count, 1);
+
+    daemon.provider.assert_script_consumed();
+    let _ = std::fs::remove_dir_all(PathBuf::from(&daemon.root));
+}

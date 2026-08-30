@@ -341,13 +341,17 @@ impl agens_core::hosted::HostedTaskJournal for HostedTaskCoordinator {
 /// The store rather than the running chat's own memory: the turn owns that
 /// memory while it runs, and a reader that waited for it would wait as long as
 /// the answer takes.
+///
+/// Read without the resumability gate: a chat's row exists before its first
+/// turn completes, and a client rejoining it before then is owed the empty
+/// thread, not a refusal for a session the daemon just opened for it.
 #[must_use]
 pub(crate) fn hosted_chat_history(bootstrap: &Bootstrap) -> ChatHistorySource {
     let data_directory = bootstrap.data_directory().to_path_buf();
 
     Arc::new(move |session: SessionId| {
         SessionStore::open(&data_directory)
-            .and_then(|store| store.load_session_for_resume(session.value()))
+            .and_then(|store| store.load_session_thread(session.value()))
             .map(|stored| stored.messages)
             .map_err(|error| ChatError::Unavailable(error.to_string()))
     })
@@ -575,7 +579,7 @@ fn resumed_history(
 
     SessionStore::open(bootstrap.data_directory())
         .ok()
-        .and_then(|store| store.load_session_for_resume(session_id).ok())
+        .and_then(|store| store.load_session_thread(session_id).ok())
         .map(|stored| stored.messages)
         .unwrap_or_default()
 }
