@@ -880,3 +880,57 @@ async fn the_conversation_of_a_chat_nobody_opened_is_not_found() {
 
     assert_eq!(refused.code(), Code::NotFound);
 }
+
+/// The attach handshake: a client deciding whether to trust, replace or refuse
+/// a daemon needs the daemon's own account of what it is and whether it is in
+/// the middle of answering somebody.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_daemon_reports_its_build_over_the_wire() {
+    let mut wire = wire("build-info").await;
+
+    let build = wire
+        .client
+        .build_info(Request::new(proto::BuildInfoRequest {}))
+        .await
+        .expect("the handshake is served")
+        .into_inner();
+
+    assert_eq!(build.wire_revision, agens_server::identity::WIRE_REVISION);
+    assert_eq!(build.build, agens_server::identity::BUILD_STAMP);
+    assert_eq!(build.answering_chats, 0, "an idle daemon reports itself idle");
+}
+
+/// A daemon mid-answer must never look idle to the handshake: idle is what
+/// authorizes a launcher to replace it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_daemon_mid_answer_reports_the_chat_it_is_answering() {
+    let mut wire = wire("build-info-answering").await;
+    let handle = wire
+        .client
+        .open(Request::new(open_request("/projects/agens")))
+        .await
+        .expect("the chat opens")
+        .into_inner();
+
+    wire.client
+        .prompt(Request::new(proto::PromptRequest {
+            session_id: handle.session_id,
+            prompt: "take your time".to_owned(),
+            parts: Vec::new(),
+        }))
+        .await
+        .expect("the prompt is accepted");
+    assert_eq!(
+        wire.started.recv_timeout(PATIENCE),
+        Ok("take your time".to_owned()),
+    );
+
+    let build = wire
+        .client
+        .build_info(Request::new(proto::BuildInfoRequest {}))
+        .await
+        .expect("the handshake is served")
+        .into_inner();
+
+    assert_eq!(build.answering_chats, 1);
+}
