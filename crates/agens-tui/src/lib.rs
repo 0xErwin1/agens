@@ -6366,6 +6366,10 @@ pub struct Tui<E> {
     /// turn's next safe point instead of waiting for the boundary queue.
     steering: Option<IntraTurnSteeringQueue>,
     busy_policy_routing: bool,
+    /// Whether the runtime should adopt a turn that is already running
+    /// somewhere else — a hosted chat this surface attached to mid-turn —
+    /// instead of waiting for a submission of its own.
+    adopted_turn_requested: bool,
     surface_focus: SurfaceFocus,
     queue_selected: Option<usize>,
     input: String,
@@ -6482,6 +6486,7 @@ where
             scheduler: AppState::new(queue_capacity),
             steering: None,
             busy_policy_routing: false,
+            adopted_turn_requested: false,
             surface_focus: SurfaceFocus::Composer,
             queue_selected: None,
             hyperlinks: true,
@@ -7072,6 +7077,51 @@ where
         self.transcript
             .push(TranscriptEntry::User(presented.clone()));
         self.conversation = Some(Conversation::new(presented));
+        {
+            let record = self.active_record_mut();
+            record.collapse_thinking = false;
+            record.thinking_user_pinned = false;
+        }
+        self.set_foreground_presentation(true);
+        self.assistant_streaming = true;
+        self.bump_selectable_epoch();
+    }
+
+    /// Asks the runtime to adopt a turn that is already running elsewhere.
+    ///
+    /// Set before the runtime starts, taken once by it. The surface stays
+    /// idle until the runtime begins the adopted turn on its own thread.
+    pub fn adopt_running_turn(&mut self) {
+        self.adopted_turn_requested = true;
+    }
+
+    /// Takes a pending adoption request, at most once.
+    pub fn take_adopted_turn_request(&mut self) -> bool {
+        std::mem::take(&mut self.adopted_turn_requested)
+    }
+
+    /// Enters the running-turn state for a turn this process did not start.
+    ///
+    /// A surface attaching to a hosted chat mid-turn owns no new user message:
+    /// the prompt that started the turn is already in the drawn history. The
+    /// lifecycle still has to go active so progress renders, Esc cancels, and
+    /// a concurrent submission is refused exactly as during a turn this
+    /// surface submitted.
+    pub fn begin_adopted_turn(&mut self) {
+        self.palette_open = false;
+        self.status = None;
+
+        if self.scheduler.lifecycle() == &TurnLifecycle::Idle {
+            let _ = self.scheduler.reduce(AppEvent::SubmitPrompt(String::new()));
+        }
+
+        if let Some(conversation) = self.conversation.take() {
+            self.completed_conversations.push(conversation);
+        }
+        self.runtime_events.clear();
+        self.turn_duration = None;
+        self.conversation = Some(Conversation::new(String::new()));
+
         {
             let record = self.active_record_mut();
             record.collapse_thinking = false;
@@ -13066,6 +13116,26 @@ where
     let mut next_route_id = 0_u64;
     let mut active_route: Option<(u64, TuiRouteCancellation, bool)> = None;
 
+    // A turn that is already running somewhere else is adopted before the
+    // first frame, so its progress renders — and a question it is stopped on
+    // opens — without waiting for a submission from this surface.
+    if tui.take_adopted_turn_request() {
+        tui.begin_adopted_turn();
+        let generation = tui.active_generation();
+        let submit = Arc::clone(&submit);
+        let sender = sender.clone();
+        let metrics = metrics_sender.clone();
+        let completion_sender = completion_sender.clone();
+        thread::spawn(move || {
+            let adopted = Message {
+                role: Role::User,
+                parts: Vec::new(),
+            };
+            let outcome = submit(adopted, SubmitOrigin::Adopted, sender, metrics);
+            let _ = completion_sender.send((generation, outcome));
+        });
+    }
+
     loop {
         let now = started.elapsed();
         let provider =
@@ -14283,6 +14353,35 @@ mod runtime_tests {
             osc52_copy_sequence("café 🙂"),
             "\u{1b}]52;c;Y2Fmw6kg8J+Zgg==\u{7}"
         );
+    }
+
+    /// A surface attaching mid-turn owns no new user message: the prompt that
+    /// started the turn is already in the drawn history. The adopted turn is
+    /// still a live one — progress renders and completion settles it — without
+    /// a duplicate user entry heading it.
+    #[test]
+    fn an_adopted_turn_goes_live_without_adding_a_user_entry() {
+        let mut tui = Tui::new(NoopEngine);
+        tui.adopt_running_turn();
+
+        assert!(tui.take_adopted_turn_request());
+        assert!(
+            !tui.take_adopted_turn_request(),
+            "an adoption request is taken exactly once"
+        );
+
+        tui.begin_adopted_turn();
+        assert!(tui.has_live_work());
+        assert!(tui.transcript().is_empty());
+
+        tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text("live".into())));
+        assert!(matches!(
+            tui.transcript().last(),
+            Some(TranscriptEntry::Assistant(text)) if text == "live"
+        ));
+
+        tui.finish_provider_turn(TuiProviderOutcome::Completed("live".into()));
+        assert!(!tui.has_live_work());
     }
 
     #[test]
