@@ -506,14 +506,8 @@ pub fn run_attached_tui_with_prompt(
         tui.add_info(notice);
     }
     let attachment = Arc::new(attachment);
-    let router = TuiRuntimeRouter::new(
-        bootstrap.clone(),
-        Arc::clone(&staging),
-        Arc::new(Mutex::new(None)),
-        Arc::new(agens_tools::CommandCatalog::default()),
-        Arc::new(agens_tools::SkillCatalog::default()),
-    )
-    .with_attached_backend(attachment.clone());
+    let router =
+        TuiRuntimeRouter::attached(bootstrap.clone(), Arc::clone(&staging), attachment.clone());
     tui.set_palette_entries(router.attached_palette_entries()?);
     tui.set_file_candidates(router.attached_file_candidates()?);
     if let Some(prompt) = initial_prompt {
@@ -622,10 +616,11 @@ struct HostedPresentation {
 /// The footer presentation this arrival earns, or `None` when the daemon did
 /// not describe the chat and the placeholders are the honest rendering.
 ///
-/// The shape mirrors what a local launch computes for itself: the provider
-/// falls back to the same placeholder, the session label is the same
-/// `session #id`, and a window the daemon did not hold is looked up in the
-/// same client-side model registry.
+/// Everything shown comes from the daemon's description and nothing else: the
+/// daemon owns the session's configuration, so a window it did not hold stays
+/// empty rather than being looked up in this client's own model registry. The
+/// provider falls back to the same placeholder a local launch uses, and the
+/// session label is the same `session #id`.
 fn arrival_presentation(arrival: &Arrival) -> Option<agens_tui::TuiPresentation> {
     let described = &arrival.presentation;
     let model = described
@@ -638,9 +633,7 @@ fn arrival_presentation(arrival: &Arrival) -> Option<agens_tui::TuiPresentation>
         .filter(|provider| !provider.is_empty())
         .unwrap_or("provider");
 
-    let window = described
-        .context_window
-        .or_else(|| agens_models::context_window_for(model));
+    let window = described.context_window;
     let mut presentation = agens_tui::TuiPresentation::new(
         provider,
         model,
@@ -1052,10 +1045,12 @@ mod tests {
         assert!(arrival_presentation(&Arrival::opened(7)).is_none());
     }
 
-    /// A daemon that names the model but holds no window for it still gets a
-    /// context gauge, from the same client-side registry local mode reads.
+    /// A window the daemon does not hold stays empty rather than being looked
+    /// up in this client's own model registry: the daemon owns the session's
+    /// configuration, and a gauge invented here could disagree with what the
+    /// daemon's turns actually measure against.
     #[test]
-    fn a_described_model_without_a_window_falls_back_to_the_client_registry() {
+    fn a_described_model_without_a_window_leaves_the_gauge_empty() {
         let arrival = Arrival {
             session_id: 3,
             landing: Landing::Opened,
@@ -1072,7 +1067,37 @@ mod tests {
         assert_eq!(
             presentation,
             agens_tui::TuiPresentation::new("openai-api", "gpt-4.1", "session #3")
-                .with_context_window(agens_models::context_window_for("gpt-4.1"))
+                .with_context_window(None)
+        );
+    }
+
+    /// When the daemon's window disagrees with what this client's own model
+    /// registry would say, the daemon's wins: the session's configuration
+    /// lives with the daemon, and two clients attached to it must render the
+    /// same gauge whatever they know locally.
+    #[test]
+    fn the_daemon_described_window_wins_over_the_client_registry() {
+        let locally_known = agens_models::context_window_for("gpt-4.1")
+            .expect("the client registry knows this model");
+        assert_ne!(locally_known, 10);
+
+        let arrival = Arrival {
+            session_id: 3,
+            landing: Landing::Opened,
+            history: Vec::new(),
+            presentation: HostedPresentation {
+                provider: Some("openai-api".to_owned()),
+                model: Some("gpt-4.1".to_owned()),
+                reasoning_effort: None,
+                context_window: Some(10),
+            },
+        };
+
+        let presentation = arrival_presentation(&arrival).expect("the daemon described the chat");
+        assert_eq!(
+            presentation,
+            agens_tui::TuiPresentation::new("openai-api", "gpt-4.1", "session #3")
+                .with_context_window(Some(10))
         );
     }
 

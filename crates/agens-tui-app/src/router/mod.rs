@@ -205,9 +205,48 @@ impl TuiRuntimeRouter {
         }
     }
 
-    pub(crate) fn with_attached_backend(mut self, backend: Arc<dyn AttachedRouteBackend>) -> Self {
-        self.attached_backend = Some(backend);
-        self
+    /// A router for a terminal attached to a daemon, which carries no local
+    /// configuration semantics: commands, skills, agents, MCP state, files,
+    /// and tasks are all answered by `backend`, so nothing here discovers a
+    /// subagent catalog, resolves a local palette, or loads the locally
+    /// configured MCP registry. Two clients attached to the same daemon
+    /// behave identically whatever their local configuration says.
+    ///
+    /// `bootstrap` is still held for the concerns that are legitimately this
+    /// process's own — where the daemon and its media store live, and how this
+    /// terminal renders — never for configuration the daemon owns.
+    pub(crate) fn attached(
+        bootstrap: Bootstrap,
+        session: Arc<Mutex<SessionContext>>,
+        backend: Arc<dyn AttachedRouteBackend>,
+    ) -> Self {
+        let mcp_status = McpStatusHandle::default();
+        let mcp_runtime = Arc::new(Mutex::new(ProductionMcpRuntime {
+            registry: Arc::new(Mutex::new(agens_tools::McpRegistry::new())),
+            dispatcher: Arc::new(Mutex::new(ToolDispatcher::new())),
+        }));
+
+        Self {
+            bootstrap: Arc::new(Mutex::new(bootstrap)),
+            session,
+            cancellation: Arc::new(Mutex::new(None)),
+            auth: ChatGptAuthCoordinator::production(),
+            credentials: CredentialResolver::production(),
+            extensions: Arc::new(Mutex::new(RouterExtensions {
+                commands: Arc::new(CommandCatalog::default()),
+                skills: Arc::new(SkillCatalog::default()),
+                palette: Vec::new(),
+            })),
+            mcp_status,
+            mcp_runtime,
+            clock: current_session_timestamp,
+            credential_restorer: Arc::new(restore_chatgpt_credentials),
+            profile_editor: Arc::new(Mutex::new(None)),
+            profile_focus: Arc::new(Mutex::new(None)),
+            profile_store: None,
+            team_transition: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            attached_backend: Some(backend),
+        }
     }
 
     fn attached_backend(&self) -> Result<Arc<dyn AttachedRouteBackend>, CliError> {
