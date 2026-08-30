@@ -15,6 +15,7 @@ mod fsm;
 mod gates;
 pub mod grpc;
 mod hosted;
+pub mod identity;
 mod ingest;
 mod instance;
 mod introspection;
