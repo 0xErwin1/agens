@@ -622,10 +622,11 @@ struct HostedPresentation {
 /// The footer presentation this arrival earns, or `None` when the daemon did
 /// not describe the chat and the placeholders are the honest rendering.
 ///
-/// The shape mirrors what a local launch computes for itself: the provider
-/// falls back to the same placeholder, the session label is the same
-/// `session #id`, and a window the daemon did not hold is looked up in the
-/// same client-side model registry.
+/// Everything shown comes from the daemon's description and nothing else: the
+/// daemon owns the session's configuration, so a window it did not hold stays
+/// empty rather than being looked up in this client's own model registry. The
+/// provider falls back to the same placeholder a local launch uses, and the
+/// session label is the same `session #id`.
 fn arrival_presentation(arrival: &Arrival) -> Option<agens_tui::TuiPresentation> {
     let described = &arrival.presentation;
     let model = described
@@ -638,9 +639,7 @@ fn arrival_presentation(arrival: &Arrival) -> Option<agens_tui::TuiPresentation>
         .filter(|provider| !provider.is_empty())
         .unwrap_or("provider");
 
-    let window = described
-        .context_window
-        .or_else(|| agens_models::context_window_for(model));
+    let window = described.context_window;
     let mut presentation = agens_tui::TuiPresentation::new(
         provider,
         model,
@@ -1052,10 +1051,12 @@ mod tests {
         assert!(arrival_presentation(&Arrival::opened(7)).is_none());
     }
 
-    /// A daemon that names the model but holds no window for it still gets a
-    /// context gauge, from the same client-side registry local mode reads.
+    /// A window the daemon does not hold stays empty rather than being looked
+    /// up in this client's own model registry: the daemon owns the session's
+    /// configuration, and a gauge invented here could disagree with what the
+    /// daemon's turns actually measure against.
     #[test]
-    fn a_described_model_without_a_window_falls_back_to_the_client_registry() {
+    fn a_described_model_without_a_window_leaves_the_gauge_empty() {
         let arrival = Arrival {
             session_id: 3,
             landing: Landing::Opened,
@@ -1072,7 +1073,7 @@ mod tests {
         assert_eq!(
             presentation,
             agens_tui::TuiPresentation::new("openai-api", "gpt-4.1", "session #3")
-                .with_context_window(agens_models::context_window_for("gpt-4.1"))
+                .with_context_window(None)
         );
     }
 
