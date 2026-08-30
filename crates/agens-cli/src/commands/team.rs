@@ -171,6 +171,11 @@ enum TeamAction {
         question_id: i64,
         answer: String,
     },
+    AskAnswer {
+        session_id: i64,
+        prompt_id: u64,
+        answer: String,
+    },
     Permission {
         session_id: i64,
         prompt_id: u64,
@@ -218,6 +223,20 @@ pub(crate) fn run_team_action(
                 Ok(format!(
                     "Answered question {question_id} for run {}.\n",
                     answered.run_id
+                ))
+            }
+            TeamAction::AskAnswer {
+                session_id,
+                prompt_id,
+                answer,
+            } => {
+                coordinator
+                    .chat()
+                    .answer_question(session_id, prompt_id, &answer)
+                    .await
+                    .map_err(client_error)?;
+                Ok(format!(
+                    "Answered question {prompt_id} for chat {session_id}.\n"
                 ))
             }
             TeamAction::Permission {
@@ -285,6 +304,13 @@ fn parse_action(arguments: &[String]) -> Result<TeamAction, CliError> {
             question_id: positive_i64(question_id, "team answer requires a positive question id")?,
             answer: nonempty_answer(answer)?,
         }),
+        [action, session_id, prompt_id, answer] if action == "answer" => {
+            Ok(TeamAction::AskAnswer {
+                session_id: positive_i64(session_id, "team answer requires a positive chat id")?,
+                prompt_id: positive_u64(prompt_id, "team answer requires a positive prompt id")?,
+                answer: nonempty_answer(answer)?,
+            })
+        }
         [action, session_id, prompt_id, answer] if action == "permission" => {
             Ok(TeamAction::Permission {
                 session_id: positive_i64(
@@ -547,10 +573,18 @@ fn render_chat_event(event: &HostedChatEvent) -> String {
             question.prompt_id, question.tool, question.target, question.access, question.reason
         ),
         HostedChatEvent::AskUserAsked { prompt_id, request } => {
-            let prompts: Vec<&str> = request
+            let prompts: Vec<String> = request
                 .questions()
                 .iter()
-                .map(|question| question.prompt())
+                .map(|question| {
+                    let options: Vec<&str> = question
+                        .options()
+                        .iter()
+                        .map(|option| option.id())
+                        .collect();
+
+                    format!("{} [{}]", question.prompt(), options.join("|"))
+                })
                 .collect();
             format!("question {}: {}\n", prompt_id, prompts.join(" | "))
         }
@@ -661,9 +695,12 @@ fn client_error(error: ClientError) -> CliError {
 mod tests {
     use agens_core::{Message, MessagePart, Role};
 
+    use agens_core::ask_user::{AskUserMode, AskUserOption, AskUserQuestion, AskUserRequest};
+    use agens_coordinator_client::HostedChatEvent;
+
     use super::{
-        FleetItem, FleetView, ShowTarget, TeamAction, parse_action, render, render_chat_history,
-        resolve_show_target,
+        FleetItem, FleetView, ShowTarget, TeamAction, parse_action, render, render_chat_event,
+        render_chat_history, resolve_show_target,
     };
 
     #[test]
@@ -685,6 +722,58 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("cannot be empty")
+        );
+    }
+
+    #[test]
+    fn a_three_argument_answer_names_a_chat_question_rather_than_a_run() {
+        assert_eq!(
+            parse_action(&["answer", "23", "approve"].map(str::to_owned)).unwrap(),
+            TeamAction::Answer {
+                question_id: 23,
+                answer: "approve".to_owned(),
+            }
+        );
+        assert_eq!(
+            parse_action(&["answer", "17", "9", "approve"].map(str::to_owned)).unwrap(),
+            TeamAction::AskAnswer {
+                session_id: 17,
+                prompt_id: 9,
+                answer: "approve".to_owned(),
+            }
+        );
+        assert!(
+            parse_action(&["answer", "17", "9", " "].map(str::to_owned))
+                .unwrap_err()
+                .to_string()
+                .contains("cannot be empty")
+        );
+    }
+
+    #[test]
+    fn a_followed_question_shows_the_option_ids_an_answer_must_come_from() {
+        let question = AskUserQuestion::new(
+            "approval",
+            "Choose an outcome",
+            None,
+            AskUserMode::Single,
+            vec![
+                AskUserOption::new("approve", "Approve", None, None),
+                AskUserOption::new("decline", "Decline", None, None),
+            ],
+            false,
+            false,
+            false,
+        );
+        let request =
+            AskUserRequest::new(None, vec![question]).expect("the question is valid");
+
+        assert_eq!(
+            render_chat_event(&HostedChatEvent::AskUserAsked {
+                prompt_id: 3,
+                request,
+            }),
+            "question 3: Choose an outcome [approve|decline]\n"
         );
     }
 
