@@ -31,6 +31,17 @@ pub struct OpenChat {
     pub answering: bool,
 }
 
+/// The daemon's account of what it is, as the attach handshake carries it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DaemonBuild {
+    /// The client/daemon contract revision. Equality is compatibility.
+    pub wire_revision: u64,
+    /// The build the daemon was compiled from, compared for equality only.
+    pub build: String,
+    /// Chats whose turn is running right now, machine-wide.
+    pub answering_chats: i64,
+}
+
 /// A handle on one daemon's chat plane.
 #[derive(Clone, Debug)]
 pub struct ChatClient {
@@ -44,6 +55,14 @@ impl ChatClient {
             inner: proto::chat_client::ChatClient::new(channel),
             prompt_parts: Arc::new(Mutex::new(BTreeMap::new())),
         }
+    }
+
+    /// Asks the daemon what it is, before this client commits to it.
+    ///
+    /// `None` is a daemon too old to say: it predates the handshake, so the
+    /// method comes back `Unimplemented` rather than answered.
+    pub async fn build_info(&mut self) -> Result<Option<DaemonBuild>, ClientError> {
+        daemon_build(self.inner.build_info(proto::BuildInfoRequest {}).await)
     }
 
     pub async fn catalog(
@@ -706,6 +725,25 @@ fn prompt_request(
     })
 }
 
+/// Reads a handshake answer, telling an older daemon apart from a failure.
+fn daemon_build(
+    result: Result<tonic::Response<proto::DaemonBuild>, tonic::Status>,
+) -> Result<Option<DaemonBuild>, ClientError> {
+    match result {
+        Ok(response) => {
+            let answered = response.into_inner();
+
+            Ok(Some(DaemonBuild {
+                wire_revision: answered.wire_revision,
+                build: answered.build,
+                answering_chats: answered.answering_chats,
+            }))
+        }
+        Err(status) if status.code() == tonic::Code::Unimplemented => Ok(None),
+        Err(status) => Err(status.into()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use agens_core::{Message, MessagePart, Role, SessionMessage};
@@ -714,6 +752,38 @@ mod tests {
 
     fn session_message(role: Role, parts: Vec<MessagePart>) -> SessionMessage {
         SessionMessage::try_from(Message { role, parts }).unwrap()
+    }
+
+    #[test]
+    fn a_served_handshake_reads_as_the_daemon_describing_itself() {
+        let answered = daemon_build(Ok(tonic::Response::new(proto::DaemonBuild {
+            wire_revision: 4,
+            build: "0.1.0+abc123".to_owned(),
+            answering_chats: 2,
+        })))
+        .expect("the handshake is readable")
+        .expect("the daemon described itself");
+
+        assert_eq!(answered.wire_revision, 4);
+        assert_eq!(answered.build, "0.1.0+abc123");
+        assert_eq!(answered.answering_chats, 2);
+    }
+
+    /// A daemon that predates the handshake refuses the method, not the
+    /// client: `Unimplemented` means an older daemon, never an error.
+    #[test]
+    fn a_daemon_without_the_handshake_reads_as_older_not_as_failed() {
+        let absent = daemon_build(Err(tonic::Status::unimplemented("unknown method")))
+            .expect("an older daemon is an answer, not a failure");
+
+        assert_eq!(absent, None);
+    }
+
+    #[test]
+    fn any_other_refusal_of_the_handshake_stays_an_error() {
+        let refused = daemon_build(Err(tonic::Status::internal("broken")));
+
+        assert!(refused.is_err());
     }
 
     #[test]

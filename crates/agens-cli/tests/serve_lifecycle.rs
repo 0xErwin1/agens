@@ -114,13 +114,47 @@ impl Operator {
 }
 
 impl Drop for Operator {
+    /// Whatever the test proved or failed to prove, no daemon outlives it.
+    ///
+    /// `serve stop` is asked first so the daemon gets its bounded shutdown, and
+    /// asked again while one is still coming up: a stop that raced the start is
+    /// refused, and giving up there is how suites have leaked daemons whose
+    /// HOME and binary were then deleted out from under them. A daemon that
+    /// still holds its pid when the patience runs out is killed outright — at
+    /// this point it is a leak, not a process whose report anybody will read.
     fn drop(&mut self) {
-        // Whatever the test proved or failed to prove, no daemon outlives it.
-        let _ = self
-            .command()
-            .args(["serve", "stop"])
-            .stdin(Stdio::null())
-            .output();
+        let deadline = Instant::now() + PATIENCE;
+
+        loop {
+            let _ = self
+                .command()
+                .args(["serve", "stop"])
+                .stdin(Stdio::null())
+                .output();
+
+            let published = std::fs::read_to_string(self.pid_path())
+                .ok()
+                .and_then(|contents| contents.trim().parse::<i32>().ok())
+                .filter(|pid| *pid > 0);
+
+            match published {
+                Some(pid) if alive(pid) => {
+                    if Instant::now() >= deadline {
+                        unsafe { libc::kill(pid, libc::SIGKILL) };
+                        break;
+                    }
+                }
+                Some(_) | None if !accepts(&self.socket()) => break,
+                Some(_) | None => {
+                    if Instant::now() >= deadline {
+                        break;
+                    }
+                }
+            }
+
+            std::thread::sleep(POLL);
+        }
+
         let _ = std::fs::remove_dir_all(&self.root);
     }
 }
@@ -552,5 +586,27 @@ fn the_runtime_files_live_under_the_data_directory() {
             Err(ErrorKind::NotFound)
         ),
         "and writes nothing beside it"
+    );
+}
+
+/// The hygiene the whole file depends on: a daemon spawned for a test dies
+/// with the test's operator, even though it was started detached exactly so it
+/// would outlive its client. The guard kills at teardown, not at client exit —
+/// the outliving assertions above still hold.
+#[test]
+fn no_daemon_survives_its_operators_teardown() {
+    let survivor = {
+        let operator = Operator::prepare();
+        assert_succeeded(&operator.run(&["serve"]), "serve");
+
+        let pid = operator.published_pid();
+        assert!(alive(pid), "the daemon serves while the operator exists");
+
+        pid
+    };
+
+    assert!(
+        !alive(survivor),
+        "the teardown stopped the daemon the test spawned"
     );
 }

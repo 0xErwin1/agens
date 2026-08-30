@@ -120,6 +120,22 @@ type SessionEventStream = Pin<Box<dyn Stream<Item = Result<proto::SessionEvent, 
 impl Chat for ChatFacade {
     type SubscribeStream = SessionEventStream;
 
+    /// The attach handshake. Answered from compiled-in constants and one lock,
+    /// never from the store: a client asking what this process is must get an
+    /// answer even when the daemon's own journal is what the skew broke.
+    async fn build_info(
+        &self,
+        _request: Request<proto::BuildInfoRequest>,
+    ) -> Result<Response<proto::DaemonBuild>, Status> {
+        let answering = i64::try_from(self.chats.answering_chats()).unwrap_or(i64::MAX);
+
+        Ok(Response::new(proto::DaemonBuild {
+            wire_revision: crate::identity::WIRE_REVISION,
+            build: crate::identity::BUILD_STAMP.to_owned(),
+            answering_chats: answering,
+        }))
+    }
+
     async fn catalog(
         &self,
         request: Request<proto::HostedCatalogRequest>,

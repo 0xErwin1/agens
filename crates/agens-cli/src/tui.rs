@@ -119,7 +119,17 @@ pub(crate) fn run_production_tui(
         bootstrap,
         crate::commands::serve::DaemonStartupRequest::ExplicitAttached,
     )?;
-    agens_tui_app::attached::run_attached_tui_with_prompt(bootstrap, &socket, None, None, None)
+    let notice = crate::commands::serve::check_daemon_build(
+        bootstrap,
+        crate::commands::serve::SkewPolicy::RestartWhenIdle,
+    )?;
+    agens_tui_app::attached::run_attached_tui_with_prompt(
+        bootstrap,
+        &socket,
+        None,
+        None,
+        notice.as_deref(),
+    )
 }
 
 pub(crate) fn run_tui(
@@ -130,12 +140,37 @@ pub(crate) fn run_tui(
     daemon_startup: Option<crate::commands::serve::DaemonStartupRequest>,
 ) -> Result<String, CliError> {
     let bootstrap = bootstrap(dependencies)?;
-    let startup_notice = daemon_startup
+    let started = daemon_startup
         .map(|request| (dependencies.daemon_ensurer)(&bootstrap, request))
         .transpose()
         .map_err(|error| attached_failure(mode, error))?
-        .unwrap_or(false)
-        .then(|| "started the machine daemon".to_owned());
+        .unwrap_or(false);
+
+    // The handshake runs on every attached launch, after a missing daemon was
+    // started and before the surface opens anything against the one serving.
+    // Only the launch forms that start daemons may also replace an idle one;
+    // an explicit attach reports and touches nothing.
+    let handshake_notice = if mode == TuiMode::Attached {
+        let policy = if daemon_startup.is_some() {
+            crate::commands::serve::SkewPolicy::RestartWhenIdle
+        } else {
+            crate::commands::serve::SkewPolicy::ReportOnly
+        };
+
+        (dependencies.daemon_build_check)(&bootstrap, policy)
+            .map_err(|error| attached_failure(mode, error))?
+    } else {
+        None
+    };
+
+    let startup_notice = match (
+        started.then(|| "started the machine daemon".to_owned()),
+        handshake_notice,
+    ) {
+        (Some(started), Some(handshake)) => Some(format!("{started}; {handshake}")),
+        (Some(one), None) | (None, Some(one)) => Some(one),
+        (None, None) => None,
+    };
     let output = (dependencies.tui_launcher)(
         &bootstrap,
         TuiLaunch {

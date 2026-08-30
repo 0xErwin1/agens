@@ -770,6 +770,24 @@ message HostedMcpStatusRequest {}
 message HostedMcpControlRequest { string server = 1; HostedMcpAction action = 2; }
 message HostedMcpResult { repeated HostedMcpServer servers = 1; optional string error = 2; }
 
+// The attach handshake, asked before a client opens or joins anything.
+message BuildInfoRequest {}
+
+// The daemon's account of what it is, for a client deciding whether the
+// process on the socket still serves its contract.
+message DaemonBuild {
+  // The client/daemon contract revision. Two processes with the same revision
+  // are compatible whatever their builds; two with different revisions are the
+  // skew that produces wrong answers rather than refusals.
+  uint64 wire_revision = 1;
+  // The build the daemon was compiled from: crate version plus git commit.
+  // Compared for equality only; a commit hash does not order.
+  string build = 2;
+  // Chats whose turn is running right now. A launcher may only replace a
+  // daemon that is answering nobody.
+  int64 answering_chats = 3;
+}
+
 // The chat plane: the user's own conversation, hosted by the daemon.
 //
 // `Prompt` returns as soon as the turn has somewhere to start, not when it
@@ -777,6 +795,10 @@ message HostedMcpResult { repeated HostedMcpServer servers = 1; optional string 
 // client detach from a turn without ending it — and lets another one attach to
 // a turn already under way.
 service Chat {
+  // Who the daemon is, answered before a client commits to it. A daemon that
+  // predates this RPC answers `Unimplemented`, which a client reads as a
+  // build too old to describe itself.
+  rpc BuildInfo(BuildInfoRequest) returns (DaemonBuild);
   rpc Catalog(HostedCatalogRequest) returns (HostedCatalogResult);
   rpc ListWorkspaceFiles(WorkspaceFilesRequest) returns (HostedWorkspaceFilesResult);
   rpc ReadWorkspaceFile(WorkspaceFileRequest) returns (HostedWorkspaceFileResult);

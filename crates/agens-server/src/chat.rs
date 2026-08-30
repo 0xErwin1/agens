@@ -775,6 +775,21 @@ impl ChatSessions {
         self.open.lock().map_or(0, |open| open.len())
     }
 
+    /// How many chats have a turn running right now, across every checkout.
+    ///
+    /// Machine-wide on purpose, unlike every listing: what reads it is the
+    /// attach handshake deciding whether this daemon may be replaced, and a
+    /// turn running for another project is exactly as much a reason not to as
+    /// one running here.
+    #[must_use]
+    pub fn answering_chats(&self) -> usize {
+        self.open.lock().map_or(0, |open| {
+            open.values()
+                .filter(|chat| chat.running.lock().is_ok_and(|running| running.is_some()))
+                .count()
+        })
+    }
+
     fn is_running(&self, session: SessionId) -> bool {
         self.supervisor
             .status(session)
