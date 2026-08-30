@@ -199,6 +199,8 @@ pub struct ChatPresentation {
     pub model: Option<String>,
     pub reasoning_effort: Option<String>,
     pub context_window: Option<u64>,
+    /// Whether the session currently bypasses Ask permission prompts.
+    pub bypass_permissions: bool,
 }
 
 /// A chat session the daemon opened, and how it described it.

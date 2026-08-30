@@ -44,6 +44,9 @@ pub struct OpenedChat {
     pub model: Option<String>,
     pub reasoning_effort: Option<String>,
     pub context_window: Option<u64>,
+    /// Whether the session bypasses Ask permission prompts. `false` for a
+    /// daemon that predates the field.
+    pub bypass_permissions: bool,
 }
 
 /// The daemon's account of what it is, as the attach handshake carries it.
@@ -252,6 +255,7 @@ impl ChatClient {
             model: opened.model.filter(|model| !model.is_empty()),
             reasoning_effort: opened.reasoning_effort.filter(|effort| !effort.is_empty()),
             context_window: opened.context_window.filter(|window| *window > 0),
+            bypass_permissions: opened.bypass_permissions.unwrap_or(false),
         })
     }
 

@@ -562,3 +562,165 @@ fn opening_a_chat_describes_the_sessions_own_configuration() {
     client.join().expect("the client thread finished");
     let _ = std::fs::remove_dir_all(PathBuf::from(&daemon.root));
 }
+
+#[test]
+fn the_hosted_bypass_command_toggles_persists_and_projects() {
+    let daemon = DaemonFixture::start(Script::new([]), daemon_settings());
+
+    let socket = daemon.socket.clone();
+    let stopper = daemon.stopper();
+    let checkout = daemon.checkout.display().to_string();
+    let data_directory = daemon.data_directory.clone();
+
+    let client = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let stopper = stopper;
+
+        runtime.block_on(async move {
+            let mut chat = ChatClient::new(connect(socket).await);
+
+            let opened = chat
+                .open(proto::OpenChatRequest {
+                    checkout: checkout.clone(),
+                    resume: None,
+                })
+                .await
+                .expect("a fresh chat opens")
+                .into_inner();
+            assert_eq!(opened.bypass_permissions, Some(false));
+
+            let on = chat
+                .command(proto::ChatCommandRequest {
+                    session_id: opened.session_id,
+                    command: "/bypass".to_owned(),
+                })
+                .await
+                .expect("the bypass toggle executes")
+                .into_inner();
+            assert_eq!(on.message, agens_core::hosted::BYPASS_ON_REPLY);
+
+            let persisted = agens_store::SessionStore::open(&data_directory)
+                .and_then(|store| store.bypass_permission_prompts(opened.session_id))
+                .expect("the persisted flag reads");
+            assert_eq!(persisted, Some(true));
+
+            let reopened = chat
+                .open(proto::OpenChatRequest {
+                    checkout: checkout.clone(),
+                    resume: Some(opened.session_id),
+                })
+                .await
+                .expect("the live chat reopens idempotently")
+                .into_inner();
+            assert_eq!(reopened.session_id, opened.session_id);
+            assert_eq!(reopened.bypass_permissions, Some(true));
+
+            let off = chat
+                .command(proto::ChatCommandRequest {
+                    session_id: opened.session_id,
+                    command: "/bypass".to_owned(),
+                })
+                .await
+                .expect("the second toggle executes")
+                .into_inner();
+            assert_eq!(off.message, agens_core::hosted::BYPASS_OFF_REPLY);
+
+            drop(stopper);
+        })
+    });
+
+    daemon.serve();
+
+    client.join().expect("the client thread finished");
+    let _ = std::fs::remove_dir_all(PathBuf::from(&daemon.root));
+}
+
+#[test]
+fn a_bypassed_hosted_turn_runs_an_ask_gated_tool_without_prompting() {
+    let marker =
+        std::env::temp_dir().join(format!("agens-hosted-bypass-ran-{}", std::process::id()));
+    let _ = std::fs::remove_file(&marker);
+    let daemon = DaemonFixture::start(
+        Script::new([
+            ScriptedTurn::tool_call(
+                "primary",
+                "bash",
+                serde_json::json!({"command": format!("touch {}", marker.display())}).to_string(),
+            ),
+            ScriptedTurn::text("done"),
+        ]),
+        daemon_settings(),
+    );
+
+    let socket = daemon.socket.clone();
+    let stopper = daemon.stopper();
+    let checkout = daemon.checkout.display().to_string();
+    let marker_path = marker.clone();
+
+    let client = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let stopper = stopper;
+
+        runtime.block_on(async move {
+            let mut chat = ChatClient::new(connect(socket).await);
+
+            let opened = chat
+                .open(proto::OpenChatRequest {
+                    checkout: checkout.clone(),
+                    resume: None,
+                })
+                .await
+                .expect("the chat opens")
+                .into_inner();
+
+            let mut events = chat
+                .subscribe(proto::ChatRef {
+                    session_id: opened.session_id,
+                })
+                .await
+                .expect("the chat is open")
+                .into_inner();
+
+            let on = chat
+                .command(proto::ChatCommandRequest {
+                    session_id: opened.session_id,
+                    command: "/bypass".to_owned(),
+                })
+                .await
+                .expect("the bypass toggle executes")
+                .into_inner();
+            assert_eq!(on.message, agens_core::hosted::BYPASS_ON_REPLY);
+
+            // `ask` panics on any PermissionAsked event, so a prompt that
+            // completes proves the ask-gated tool ran without a question.
+            let (_streamed, _) = ask(
+                &mut chat,
+                opened.session_id,
+                "touch the marker",
+                &mut events,
+            )
+            .await;
+
+            assert!(
+                marker_path.exists(),
+                "the bypassed turn should have run the tool"
+            );
+
+            drop(stopper);
+        })
+    });
+
+    daemon.serve();
+
+    client.join().expect("the client thread finished");
+    let _ = std::fs::remove_file(&marker);
+    let _ = std::fs::remove_dir_all(PathBuf::from(&daemon.root));
+}

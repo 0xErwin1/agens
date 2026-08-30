@@ -611,6 +611,7 @@ struct HostedPresentation {
     model: Option<String>,
     reasoning_effort: Option<String>,
     context_window: Option<u64>,
+    bypass_permissions: bool,
 }
 
 /// The footer presentation this arrival earns, or `None` when the daemon did
@@ -639,7 +640,8 @@ fn arrival_presentation(arrival: &Arrival) -> Option<agens_tui::TuiPresentation>
         model,
         format!("session #{}", arrival.session_id),
     )
-    .with_context_window(window);
+    .with_context_window(window)
+    .with_bypass(described.bypass_permissions);
 
     if let Some(effort) = &described.reasoning_effort {
         presentation = presentation.with_effort(effort.clone());
@@ -837,6 +839,7 @@ fn described_presentation(opened: &agens_coordinator_client::OpenedChat) -> Host
         model: opened.model.clone(),
         reasoning_effort: opened.reasoning_effort.clone(),
         context_window: opened.context_window,
+        bypass_permissions: opened.bypass_permissions,
     }
 }
 
@@ -1019,6 +1022,7 @@ mod tests {
                 model: Some("gpt-4.1".to_owned()),
                 reasoning_effort: Some("medium".to_owned()),
                 context_window: Some(1_047_576),
+                bypass_permissions: false,
             },
         };
 
@@ -1036,6 +1040,36 @@ mod tests {
         assert_eq!(view.provider_model, "openai-api / gpt-4.1");
         assert_eq!(view.reasoning_effort, Some("medium"));
         assert_eq!(view.context_window, Some(1_047_576));
+    }
+
+    /// A bypassed hosted session arrives with its footer already saying so,
+    /// and the daemon's later toggle reply flips it without a re-attach.
+    #[test]
+    fn the_arrival_and_the_toggle_reply_both_drive_the_bypass_footer() {
+        let arrival = Arrival {
+            session_id: 9,
+            landing: Landing::CameBack { answering: false },
+            history: Vec::new(),
+            presentation: HostedPresentation {
+                provider: Some("openai-api".to_owned()),
+                model: Some("gpt-4.1".to_owned()),
+                reasoning_effort: None,
+                context_window: None,
+                bypass_permissions: true,
+            },
+        };
+
+        let mut tui = Tui::new(StubEngine);
+        tui.apply_presentation(
+            arrival_presentation(&arrival).expect("the daemon described the chat"),
+        );
+        assert!(tui.view().bypass, "the arrival carries the bypassed state");
+
+        tui.apply_submission_outcome(agens_tui::TuiSubmissionOutcome::BypassChanged {
+            message: agens_core::hosted::BYPASS_OFF_REPLY.to_owned(),
+            enabled: false,
+        });
+        assert!(!tui.view().bypass, "the daemon's reply flips the footer");
     }
 
     /// A daemon that predates the description leaves the placeholders rather
@@ -1060,6 +1094,7 @@ mod tests {
                 model: Some("gpt-4.1".to_owned()),
                 reasoning_effort: None,
                 context_window: None,
+                bypass_permissions: false,
             },
         };
 
@@ -1090,6 +1125,7 @@ mod tests {
                 model: Some("gpt-4.1".to_owned()),
                 reasoning_effort: None,
                 context_window: Some(10),
+                bypass_permissions: false,
             },
         };
 
@@ -1114,6 +1150,7 @@ mod tests {
                 model: Some("gpt-4.1".to_owned()),
                 reasoning_effort: None,
                 context_window: Some(10),
+                bypass_permissions: false,
             },
         };
 
