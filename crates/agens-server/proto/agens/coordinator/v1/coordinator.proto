@@ -562,6 +562,14 @@ message ChatHandle {
   // A client must see this before sending media. False is the compatible default
   // returned by daemons that predate structured prompt parts.
   bool supports_prompt_parts = 2;
+  // How the session is configured, so an attaching surface can render the
+  // model, effort, and context gauge before the first prompt, the way a local
+  // launch does. Absent on daemons that predate the description; a client
+  // reads absence as "unknown", never as "unconfigured".
+  optional string provider = 3;
+  optional string model = 4;
+  optional string reasoning_effort = 5;
+  optional uint64 context_window = 6;
 }
 
 message PromptRequest {

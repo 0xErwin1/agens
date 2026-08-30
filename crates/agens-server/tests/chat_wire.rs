@@ -173,6 +173,12 @@ async fn wire(name: &str) -> Wire {
                         Box::new(StubProvider),
                         SessionBudget::unlimited(),
                     ),
+                    presentation: agens_server::ChatPresentation {
+                        provider: Some("stub".to_owned()),
+                        model: Some("model".to_owned()),
+                        reasoning_effort: Some("medium".to_owned()),
+                        context_window: Some(128_000),
+                    },
                     turns: Box::new(ScriptedTurns {
                         started: started.clone(),
                         structured: structured.clone(),
@@ -279,6 +285,25 @@ async fn next_event(
         .expect("the stream is healthy")?;
 
     event.event
+}
+
+/// The open answer describes the session's configuration, so an attaching
+/// surface can render the model, effort, and context gauge before the first
+/// prompt instead of opening on placeholders.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_open_answer_describes_the_sessions_configuration() {
+    let mut wire = wire("described").await;
+    let handle = wire
+        .client
+        .open(Request::new(open_request("/projects/agens")))
+        .await
+        .expect("the chat opens")
+        .into_inner();
+
+    assert_eq!(handle.provider.as_deref(), Some("stub"));
+    assert_eq!(handle.model.as_deref(), Some("model"));
+    assert_eq!(handle.reasoning_effort.as_deref(), Some("medium"));
+    assert_eq!(handle.context_window, Some(128_000));
 }
 
 #[tokio::test(flavor = "multi_thread")]

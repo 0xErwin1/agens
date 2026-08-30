@@ -42,10 +42,11 @@ use agens_models::{ModelSelection, QualifiedModel};
 use agens_permissions::{PermissionPromptAnswer, PermissionPromptContext, PermissionPrompter};
 use agens_server::{
     ChatAsks, ChatError, ChatHistorySource, ChatPermissionAnswer, ChatPermissionRequest,
-    ChatSession, ChatSessionFactory, ChatSessionRequest, ChatTurnOutcome, ChatTurns,
-    SessionAdmission, SessionBudget, SessionId, SessionProvider, SessionRuntime,
+    ChatPresentation, ChatSession, ChatSessionFactory, ChatSessionRequest, ChatTurnOutcome,
+    ChatTurns, SessionAdmission, SessionBudget, SessionId, SessionProvider, SessionRuntime,
 };
 use agens_session::context::{ActiveAgentRuntime, SessionContext};
+use agens_session::model::{current_provider, effective_model, model_source};
 use agens_session::provider::{bootstrap_authentication, resolve_provider_for_model};
 use agens_store::SessionStore;
 use agens_tool_runtime::mcp::ProductionHostedMcp;
@@ -369,7 +370,14 @@ fn build_chat(
         Some(selection) => selection,
         None => (model_of(&bootstrap)?, RequestConfig::default()),
     };
-    let history = resumed_history(&bootstrap, request, session.id);
+
+    // A fresh chat's history is known empty. A resumed one is read on the
+    // first turn that needs it rather than here: `open` is what an attaching
+    // client waits on, and the client reads the same thread through the
+    // history RPC anyway, so an eager read here would charge every attach a
+    // second full-thread load that grows with the conversation.
+    let history = request.resume.is_none().then(Vec::new);
+
     let active_agent = active_agent_for(&bootstrap, &session)?;
 
     Ok(ChatSession {
@@ -383,6 +391,7 @@ fn build_chat(
             // person never asked for; what bounds it is them closing it.
             SessionBudget::unlimited(),
         ),
+        presentation: presentation_of(&bootstrap, &session),
         turns: Box::new(HostedChat {
             bootstrap,
             session,
@@ -394,6 +403,37 @@ fn build_chat(
             task_runtime: None,
         }),
     })
+}
+
+/// How this session presents itself to an attaching surface.
+///
+/// Computed the way `tui_session_presentation` computes it for a local launch,
+/// from the same persisted metadata a resumed local session reads, so an
+/// attached footer and a local one describe the same session identically.
+fn presentation_of(bootstrap: &Bootstrap, session: &SessionMetadata) -> ChatPresentation {
+    let context = hosted_context(bootstrap, session, None);
+    let model = effective_model(bootstrap, &context);
+
+    let provider = session
+        .provider_id
+        .clone()
+        .or_else(|| current_provider(bootstrap, &context).map(|kind| kind.identifier().to_owned()));
+
+    let reasoning_effort = session
+        .reasoning_effort
+        .map(|effort| effort.as_str().to_owned())
+        .or_else(|| {
+            ModelSelection::for_source(&model, model_source(bootstrap, &context))
+                .reasoning_effort_default()
+                .map(str::to_owned)
+        });
+
+    ChatPresentation {
+        context_window: agens_models::context_window_for(&model),
+        provider,
+        model: Some(model),
+        reasoning_effort,
+    }
 }
 
 /// The checkout a chat's tools run in.
@@ -568,15 +608,7 @@ fn hosted_context(
 /// A history that cannot be read is treated as an empty one: the person is
 /// coming back to this conversation either way, and refusing to open it over an
 /// unreadable transcript would strand a session that is still perfectly usable.
-fn resumed_history(
-    bootstrap: &Bootstrap,
-    request: &ChatSessionRequest,
-    session_id: i64,
-) -> Vec<Message> {
-    if request.resume.is_none() {
-        return Vec::new();
-    }
-
+fn stored_thread(bootstrap: &Bootstrap, session_id: i64) -> Vec<Message> {
     SessionStore::open(bootstrap.data_directory())
         .ok()
         .and_then(|store| store.load_session_thread(session_id).ok())
@@ -606,7 +638,10 @@ struct HostedChat {
     /// the next one continues the same session rather than opening another.
     session: SessionMetadata,
     model: String,
-    history: Vec<Message>,
+    /// The conversation so far. `None` for a resumed chat until the first turn
+    /// reads the stored thread, so opening a chat never pays for a transcript
+    /// no turn has asked for yet.
+    history: Option<Vec<Message>>,
     request_config: RequestConfig,
     active_agent: ActiveAgentRuntime,
     tasks: HostedTaskCoordinator,
@@ -881,8 +916,18 @@ impl HostedChat {
         })
     }
 
+    /// The conversation this chat continues from, read lazily for a resumed
+    /// chat so `open` never blocks a client on a thread load.
+    fn stored_history(&mut self) -> &[Message] {
+        if self.history.is_none() {
+            self.history = Some(stored_thread(&self.bootstrap, self.session.id));
+        }
+
+        self.history.as_deref().unwrap_or_default()
+    }
+
     /// The turn one prompt becomes.
-    fn request_for(&self, message: &SessionMessage) -> Result<HeadlessChatRequest, String> {
+    fn request_for(&mut self, message: &SessionMessage) -> Result<HeadlessChatRequest, String> {
         let project_root = self
             .bootstrap
             .project_root
@@ -912,6 +957,7 @@ impl HostedChat {
             })
             .unzip();
 
+        let history = self.stored_history().to_vec();
         let project_prompt = agens_bootstrap::session_config::SessionInstructions::resolve(
             &agens_bootstrap::session_root::SessionRoot::confined_to(project_root),
             &self.bootstrap,
@@ -935,7 +981,7 @@ impl HostedChat {
         Ok(HeadlessChatRequest {
             prompt,
             user_message: Some(message.clone()),
-            history: self.history.clone(),
+            history,
             model: active_model
                 .map(ToOwned::to_owned)
                 .or_else(|| Some(self.model.clone())),
@@ -974,7 +1020,7 @@ impl HostedChat {
     /// reconciliation the terminal already performs is what it will need.
     fn adopt(&mut self, metadata: SessionMetadata, messages: Vec<Message>) {
         self.session = metadata;
-        self.history = messages;
+        self.history = Some(messages);
     }
 }
 

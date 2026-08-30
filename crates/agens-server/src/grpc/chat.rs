@@ -327,8 +327,12 @@ impl Chat for ChatFacade {
         let session = self.off_runtime(move |chats| chats.open(&opened)).await?;
 
         Ok(Response::new(proto::ChatHandle {
-            session_id: session.value(),
+            session_id: session.session.value(),
             supports_prompt_parts: true,
+            provider: session.presentation.provider,
+            model: session.presentation.model,
+            reasoning_effort: session.presentation.reasoning_effort,
+            context_window: session.presentation.context_window,
         }))
     }
 

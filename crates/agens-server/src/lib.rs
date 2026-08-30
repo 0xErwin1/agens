@@ -68,8 +68,8 @@ pub use api::{
 pub use blocking::{BlockingBoundary, BlockingError};
 pub use chat::{
     ChatAsks, ChatError, ChatEvent, ChatHistorySource, ChatPermissionAnswer, ChatPermissionRequest,
-    ChatSession, ChatSessionFactory, ChatSessionRequest, ChatSessions, ChatSubscription,
-    ChatTurnOutcome, ChatTurns, OpenChatSummary,
+    ChatPresentation, ChatSession, ChatSessionFactory, ChatSessionRequest, ChatSessions,
+    ChatSubscription, ChatTurnOutcome, ChatTurns, OpenChatSummary, OpenedChat,
 };
 pub use coordinator::{
     ADMISSION_FAILED_EVENT, BootReconciliation, CORE_POISONED_EVENT, Coordinator, CoordinatorError,
