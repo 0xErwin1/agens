@@ -319,6 +319,7 @@ fn await_serving(data_directory: &Path, mut child: Option<&mut Child>) -> Result
             return Ok(());
         }
 
+        let mut lost_race = false;
         if let Some(child) = child.as_deref_mut() {
             match child.try_wait() {
                 Ok(Some(status)) => {
@@ -326,13 +327,26 @@ fn await_serving(data_directory: &Path, mut child: Option<&mut Child>) -> Result
                         return Ok(());
                     }
 
-                    return Err(format!(
-                        "the daemon stopped before it started serving ({status})"
-                    ));
+                    // A held slot with the child gone means the child lost the
+                    // machine's slot to a daemon that is on its way up, which
+                    // happens when two launches spawn at the same time. The
+                    // wait continues on the winner's pid rather than reporting
+                    // a failure for a daemon that then comes up.
+                    if !agens_server::slot_is_held(data_directory) {
+                        return Err(format!(
+                            "the daemon stopped before it started serving ({status})"
+                        ));
+                    }
+
+                    lost_race = true;
                 }
                 Ok(None) => {}
                 Err(error) => return Err(format!("the daemon could not be waited on: {error}")),
             }
+        }
+
+        if lost_race {
+            child = None;
         }
 
         if Instant::now() >= deadline {
@@ -479,6 +493,78 @@ mod tests {
         assert_eq!(
             running_pid(&pid_path),
             Some(libc::pid_t::try_from(std::process::id()).expect("this process has a pid"))
+        );
+
+        std::fs::remove_dir_all(directory).expect("remove the scratch directory");
+    }
+
+    /// The launcher whose child lost the slot race is looking at a daemon on
+    /// its way up, not at a failed start: the wait continues on the winner's
+    /// pid instead of reporting a failure for a daemon that then comes up.
+    #[test]
+    fn a_child_that_lost_the_slot_race_defers_to_the_winners_pid() {
+        use std::os::fd::AsRawFd;
+
+        let directory = scratch();
+
+        // Hold the machine's slot the way the winning daemon does.
+        let lock = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(directory.join("serve.lock"))
+            .expect("open the slot lock");
+        assert_eq!(
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0,
+            "the test holds the slot"
+        );
+
+        // The loser: a child that already exited without publishing a pid.
+        let mut child = Command::new("true").spawn().expect("spawn a done child");
+        child.wait().expect("the child ends");
+
+        // The winner publishes its pid while the loser's launcher is waiting.
+        let pid_path = directory.join("serve.pid");
+        let publisher = std::thread::spawn({
+            let pid_path = pid_path.clone();
+            move || {
+                std::thread::sleep(Duration::from_millis(200));
+                std::fs::write(&pid_path, format!("{}\n", std::process::id()))
+                    .expect("publish the winner's pid");
+            }
+        });
+
+        let waited = await_serving(&directory, Some(&mut child));
+
+        publisher.join().expect("the publisher thread ends");
+        assert_eq!(waited, Ok(()), "the wait ends on the winner's pid");
+
+        drop(lock);
+        std::fs::remove_dir_all(directory).expect("remove the scratch directory");
+    }
+
+    /// Without a slot holder there is no daemon on its way up, so a child that
+    /// died without publishing a pid is a failed start and is reported as one
+    /// now, not after the whole patience.
+    #[test]
+    fn a_child_that_died_with_no_slot_holder_is_a_failed_start() {
+        let directory = scratch();
+
+        let mut child = Command::new("false").spawn().expect("spawn a done child");
+        child.wait().expect("the child ends");
+
+        let started = Instant::now();
+        let waited = await_serving(&directory, Some(&mut child));
+
+        assert!(
+            waited
+                .expect_err("the start failed")
+                .contains("stopped before it started serving"),
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the failure is reported without waiting out the patience"
         );
 
         std::fs::remove_dir_all(directory).expect("remove the scratch directory");
