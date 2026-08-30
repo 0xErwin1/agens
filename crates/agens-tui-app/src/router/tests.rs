@@ -230,14 +230,11 @@ fn attached_surface_uses_daemon_catalogs_files_mcp_and_task_controls() {
     let temporary = tui_session_directory("attached-daemon-surface");
     let bootstrap = tui_session_bootstrap(&temporary, &[]);
     let backend = Arc::new(FakeAttachedBackend::default());
-    let router = TuiRuntimeRouter::new(
+    let router = TuiRuntimeRouter::attached(
         bootstrap,
         Arc::new(Mutex::new(SessionContext::fresh())),
-        Arc::new(Mutex::new(None)),
-        Arc::new(agens_tools::CommandCatalog::default()),
-        Arc::new(agens_tools::SkillCatalog::default()),
-    )
-    .with_attached_backend(backend.clone());
+        backend.clone(),
+    );
 
     assert!(matches!(
         attached_route(&router, TuiRouteRequest::Input("/skills".into())),
@@ -318,14 +315,11 @@ fn attached_surface_forwards_every_daemon_catalogued_builtin_without_local_disco
     let temporary = tui_session_directory("attached-all-builtins");
     let bootstrap = tui_session_bootstrap(&temporary, &[]);
     let backend = Arc::new(FakeAttachedBackend::default());
-    let router = TuiRuntimeRouter::new(
+    let router = TuiRuntimeRouter::attached(
         bootstrap,
         Arc::new(Mutex::new(SessionContext::fresh())),
-        Arc::new(Mutex::new(None)),
-        Arc::new(agens_tools::CommandCatalog::default()),
-        Arc::new(agens_tools::SkillCatalog::default()),
-    )
-    .with_attached_backend(backend.clone());
+        backend.clone(),
+    );
 
     for command in crate::extensions::tui_hosted_builtin_entries() {
         if matches!(

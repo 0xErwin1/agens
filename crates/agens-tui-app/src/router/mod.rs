@@ -249,11 +249,6 @@ impl TuiRuntimeRouter {
         }
     }
 
-    pub(crate) fn with_attached_backend(mut self, backend: Arc<dyn AttachedRouteBackend>) -> Self {
-        self.attached_backend = Some(backend);
-        self
-    }
-
     fn attached_backend(&self) -> Result<Arc<dyn AttachedRouteBackend>, CliError> {
         self.attached_backend
             .as_ref()
