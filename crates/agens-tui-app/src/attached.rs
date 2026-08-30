@@ -124,6 +124,40 @@ impl Attachment {
             .map_err(rejected)?;
         self.claim_accepted_media(&message);
 
+        self.follow_turn(&mut chat, &mut events, &asking, progress)
+    }
+
+    /// Adopts the turn the daemon is already running, without prompting.
+    ///
+    /// A terminal attaching mid-turn finds the turn's events — including a
+    /// question it is stopped on, which the subscription greeting replays —
+    /// waiting on the stream it subscribed to. Following them from here is
+    /// what makes the arrival read as if this terminal had been attached all
+    /// along.
+    fn adopt_turn(&self, progress: &Sender<TurnEvent>) -> Result<String, CliError> {
+        let asking = HeadlessTurnCancellation::new();
+        let mut chat = self
+            .chat
+            .lock()
+            .map_err(|_| unavailable("the connection to the daemon is unusable"))?;
+        let mut events = self
+            .events
+            .lock()
+            .map_err(|_| unavailable("the chat's event stream is unusable"))?;
+
+        self.follow_turn(&mut chat, &mut events, &asking, progress)
+    }
+
+    /// Follows one turn's events to its end, forwarding progress and putting
+    /// its questions to the person. The same loop whether this client started
+    /// the turn or adopted one already running.
+    fn follow_turn(
+        &self,
+        chat: &mut ChatClient,
+        events: &mut Events,
+        asking: &HeadlessTurnCancellation,
+        progress: &Sender<TurnEvent>,
+    ) -> Result<String, CliError> {
         loop {
             let event = self
                 .runtime
@@ -146,7 +180,7 @@ impl Attachment {
                     // there is nothing else on this chat to miss while a person
                     // decides — and the surface is drawing the overlay from its
                     // own thread meanwhile.
-                    let decision = self.decide(&question, &asking);
+                    let decision = self.decide(&question, asking);
 
                     self.runtime
                         .block_on(chat.answer_permission(
@@ -157,7 +191,7 @@ impl Attachment {
                         .map_err(refused)?;
                 }
                 HostedChatEvent::AskUserAsked { prompt_id, request } => {
-                    let reply = self.ask_user.wait_for_reply(request, None, &asking);
+                    let reply = self.ask_user.wait_for_reply(request, None, asking);
 
                     // A question someone else already resolved — through the
                     // fleet console, or replayed from before a reattach — is
@@ -494,6 +528,14 @@ pub fn run_attached_tui_with_prompt(
         tui.apply_runtime_event(event);
     }
 
+    // A chat still answering has a turn to adopt: its remaining events are on
+    // the subscription already opened, and the runtime drains them from its
+    // first frame — so progress renders and a question the turn is stopped on
+    // opens the overlay without a submission from this terminal.
+    if arrival.adopts_live_turn() {
+        tui.adopt_running_turn();
+    }
+
     let permissions = attachment.permissions.clone();
     let asks = attachment.ask_user.clone();
     let route_router = router.clone();
@@ -507,7 +549,9 @@ pub fn run_attached_tui_with_prompt(
             route_router.route_attached_request(request, progress, cancellation)
         },
         move |message, origin, progress, _metrics| {
-            if let Some(rejection) = unsupported_attached_origin(origin) {
+            if origin == SubmitOrigin::Adopted {
+                attached_provider_outcome(attachment.adopt_turn(&progress))
+            } else if let Some(rejection) = unsupported_attached_origin(origin) {
                 rejection
             } else {
                 attached_provider_outcome(attachment.take_turn(&message, &progress))
@@ -568,6 +612,12 @@ impl Arrival {
             landing: Landing::Opened,
             history: Vec::new(),
         }
+    }
+
+    /// Whether this terminal landed on a turn that is still running — the one
+    /// it adopts instead of waiting for a submission of its own.
+    const fn adopts_live_turn(&self) -> bool {
+        matches!(self.landing, Landing::CameBack { answering: true })
     }
 
     fn describe(&self) -> String {
@@ -634,6 +684,20 @@ fn attach(
     let events = runtime
         .block_on(chat.subscribe(session_id))
         .map_err(refused)?;
+
+    // Whether the chat is still answering is re-read after the subscription
+    // opened, which closes the adoption race: a turn seen running here
+    // publishes everything it still does — including its end — onto the
+    // stream just opened, while a turn that ended before the subscription can
+    // no longer be seen answering and is not adopted.
+    if matches!(arrival.landing, Landing::CameBack { .. }) {
+        let answering = runtime
+            .block_on(chat.open_against(checkout))
+            .map_err(refused)?
+            .iter()
+            .any(|open| open.session_id == session_id && open.answering);
+        arrival.landing = Landing::CameBack { answering };
+    }
 
     let engine = AttachedEngine {
         runtime: Arc::clone(&runtime),
@@ -859,6 +923,15 @@ mod tests {
     fn coming_back_says_where_you_landed_and_whether_it_is_mid_answer() {
         assert!(came_back_to(false).describe().contains("where you left it"));
         assert!(came_back_to(true).describe().contains("still answering"));
+    }
+
+    /// Only a chat still answering has a turn to adopt. A chat that is idle —
+    /// or one this terminal just opened — waits for a prompt as before.
+    #[test]
+    fn only_a_chat_still_answering_is_adopted() {
+        assert!(came_back_to(true).adopts_live_turn());
+        assert!(!came_back_to(false).adopts_live_turn());
+        assert!(!Arrival::opened(7).adopts_live_turn());
     }
 
     /// The launch that started the daemon says so exactly once, and before it

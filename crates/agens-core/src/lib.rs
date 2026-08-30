@@ -624,6 +624,10 @@ pub enum SubmitOrigin {
     Background,
     /// A turn the runtime scheduled after a background subagent finished.
     SubagentCompletion,
+    /// A turn a hosted chat was already running when this surface attached.
+    /// Nobody submitted a new prompt: the surface adopts the running turn's
+    /// event stream instead of starting one.
+    Adopted,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
