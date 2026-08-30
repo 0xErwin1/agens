@@ -6370,6 +6370,10 @@ pub struct Tui<E> {
     /// somewhere else — a hosted chat this surface attached to mid-turn —
     /// instead of waiting for a submission of its own.
     adopted_turn_requested: bool,
+    /// Whether the active turn was adopted mid-run. An adopted turn's live
+    /// body is only the tail of the answer — deltas published before the
+    /// subscription opened were never seen — so its completed text wins.
+    adopted_live_turn: bool,
     surface_focus: SurfaceFocus,
     queue_selected: Option<usize>,
     input: String,
@@ -6487,6 +6491,7 @@ where
             steering: None,
             busy_policy_routing: false,
             adopted_turn_requested: false,
+            adopted_live_turn: false,
             surface_focus: SurfaceFocus::Composer,
             queue_selected: None,
             hyperlinks: true,
@@ -7129,6 +7134,7 @@ where
         }
         self.set_foreground_presentation(true);
         self.assistant_streaming = true;
+        self.adopted_live_turn = true;
         self.bump_selectable_epoch();
     }
 
@@ -7787,6 +7793,8 @@ where
         // and arriving twice.
         self.clear_uncollected_steers();
 
+        let adopted = std::mem::take(&mut self.adopted_live_turn);
+
         let terminal_event = match &outcome {
             TuiProviderOutcome::Completed(output) => Some(AppEvent::TurnCompletedFor {
                 generation,
@@ -7803,7 +7811,11 @@ where
             TuiProviderOutcome::Completed(output) => {
                 // Prefer the live stream body when present; heal exact dual-progress
                 // duplication (live == output+output) using the completed string once.
+                // An adopted turn is the exception: its live body starts at the
+                // subscription, not at the turn, so the completed text is the
+                // only complete answer it holds.
                 let body = match self.conversation.as_ref() {
+                    _ if adopted && !output.is_empty() => output.clone(),
                     Some(conversation) if !conversation.live_markdown.is_empty() => {
                         let live = &conversation.live_markdown;
                         if !output.is_empty()
@@ -14382,6 +14394,26 @@ mod runtime_tests {
 
         tui.finish_provider_turn(TuiProviderOutcome::Completed("live".into()));
         assert!(!tui.has_live_work());
+    }
+
+    /// A surface that attached mid-turn missed the deltas published before its
+    /// subscription opened, so its live body is only the tail of the answer.
+    /// The completed text is the whole answer and wins for an adopted turn,
+    /// where a locally-started turn keeps preferring its live stream.
+    #[test]
+    fn an_adopted_turn_completes_with_the_full_text_rather_than_the_tail_it_saw() {
+        let mut tui = Tui::new(NoopEngine);
+        tui.adopt_running_turn();
+        assert!(tui.take_adopted_turn_request());
+        tui.begin_adopted_turn();
+
+        tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text(" tail".into())));
+        tui.finish_provider_turn(TuiProviderOutcome::Completed("head tail".into()));
+
+        assert!(matches!(
+            tui.transcript().last(),
+            Some(TranscriptEntry::Assistant(text)) if text == "head tail"
+        ));
     }
 
     #[test]
