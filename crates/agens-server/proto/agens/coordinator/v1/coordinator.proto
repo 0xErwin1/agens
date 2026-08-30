@@ -570,6 +570,9 @@ message ChatHandle {
   optional string model = 4;
   optional string reasoning_effort = 5;
   optional uint64 context_window = 6;
+  // Whether the session currently bypasses Ask permission prompts. Absent on
+  // daemons that predate the field; a client reads absence as "off".
+  optional bool bypass_permissions = 7;
 }
 
 message PromptRequest {

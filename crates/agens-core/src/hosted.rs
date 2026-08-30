@@ -504,3 +504,9 @@ pub trait HostedMcpControl: Send + Sync {
     fn status(&self) -> Vec<HostedMcpServer>;
     fn control(&mut self, server: &str, action: HostedMcpAction) -> HostedMcpResult;
 }
+
+/// The authoritative hosted replies to a `/bypass` toggle. A client that
+/// mirrors the footer state matches these exactly rather than inferring from
+/// free text, so daemon and surface can never disagree about what was said.
+pub const BYPASS_ON_REPLY: &str = "Permission bypass: on.";
+pub const BYPASS_OFF_REPLY: &str = "Permission bypass: off.";

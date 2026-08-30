@@ -333,6 +333,7 @@ impl Chat for ChatFacade {
             model: session.presentation.model,
             reasoning_effort: session.presentation.reasoning_effort,
             context_window: session.presentation.context_window,
+            bypass_permissions: Some(session.presentation.bypass_permissions),
         }))
     }
 

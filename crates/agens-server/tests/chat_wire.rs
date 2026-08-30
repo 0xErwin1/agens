@@ -178,6 +178,7 @@ async fn wire(name: &str) -> Wire {
                         model: Some("model".to_owned()),
                         reasoning_effort: Some("medium".to_owned()),
                         context_window: Some(128_000),
+                        bypass_permissions: false,
                     },
                     turns: Box::new(ScriptedTurns {
                         started: started.clone(),

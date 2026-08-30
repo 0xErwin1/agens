@@ -380,6 +380,11 @@ fn build_chat(
 
     let active_agent = active_agent_for(&bootstrap, &session)?;
 
+    let bypass_permissions = SessionStore::open(bootstrap.data_directory())
+        .and_then(|store| store.bypass_permission_prompts(session.id))
+        .unwrap_or_default()
+        .unwrap_or(false);
+
     Ok(ChatSession {
         admission: SessionAdmission::new(
             SessionId::new(session.id),
@@ -391,7 +396,7 @@ fn build_chat(
             // person never asked for; what bounds it is them closing it.
             SessionBudget::unlimited(),
         ),
-        presentation: presentation_of(&bootstrap, &session),
+        presentation: presentation_of(&bootstrap, &session, bypass_permissions),
         turns: Box::new(HostedChat {
             bootstrap,
             session,
@@ -401,6 +406,7 @@ fn build_chat(
             active_agent,
             tasks,
             task_runtime: None,
+            bypass_permissions,
         }),
     })
 }
@@ -410,7 +416,11 @@ fn build_chat(
 /// Computed the way `tui_session_presentation` computes it for a local launch,
 /// from the same persisted metadata a resumed local session reads, so an
 /// attached footer and a local one describe the same session identically.
-fn presentation_of(bootstrap: &Bootstrap, session: &SessionMetadata) -> ChatPresentation {
+fn presentation_of(
+    bootstrap: &Bootstrap,
+    session: &SessionMetadata,
+    bypass_permissions: bool,
+) -> ChatPresentation {
     let context = hosted_context(bootstrap, session, None);
     let model = effective_model(bootstrap, &context);
 
@@ -433,6 +443,7 @@ fn presentation_of(bootstrap: &Bootstrap, session: &SessionMetadata) -> ChatPres
         provider,
         model: Some(model),
         reasoning_effort,
+        bypass_permissions,
     }
 }
 
@@ -646,6 +657,9 @@ struct HostedChat {
     active_agent: ActiveAgentRuntime,
     tasks: HostedTaskCoordinator,
     task_runtime: Option<ProductionTuiTaskRuntime>,
+    /// Whether this session bypasses Ask permission prompts. Mirrors the
+    /// persisted per-session flag; toggled by the hosted `/bypass` command.
+    bypass_permissions: bool,
 }
 
 impl ChatTurns for HostedChat {
@@ -658,6 +672,9 @@ impl ChatTurns for HostedChat {
         }
         if let Some(model) = command.strip_prefix("/model ") {
             return self.select_model(model.trim());
+        }
+        if command == "/bypass" {
+            return self.toggle_bypass();
         }
 
         let effort = command
@@ -801,6 +818,24 @@ impl ChatTurns for HostedChat {
 }
 
 impl HostedChat {
+    /// Flips this session's permission-bypass state and persists it, so the
+    /// next turn and the next attach both see the same decision.
+    fn toggle_bypass(&mut self) -> Result<String, ChatError> {
+        let enabled = !self.bypass_permissions;
+        SessionStore::open(self.bootstrap.data_directory())
+            .and_then(|mut store| store.set_bypass_permission_prompts(self.session.id, enabled))
+            .map_err(|_| {
+                ChatError::Unavailable("permission bypass state could not be saved".to_owned())
+            })?;
+        self.bypass_permissions = enabled;
+
+        Ok(if enabled {
+            agens_core::hosted::BYPASS_ON_REPLY.to_owned()
+        } else {
+            agens_core::hosted::BYPASS_OFF_REPLY.to_owned()
+        })
+    }
+
     fn list_agents(&self) -> Result<String, ChatError> {
         let context = hosted_context(
             &self.bootstrap,
@@ -988,10 +1023,10 @@ impl HostedChat {
             system_prompt: Some(system_prompt),
             max_iterations: None,
             mode: PermissionMode::Edit,
-            // Deliberately not widened. See this module's header: a chat runs
-            // in the user's own checkout with no approved scope behind it, so
-            // what the operator did not decide in advance is refused.
-            dangerously_allow_all: false,
+            // Widened only by the operator's own persisted `/bypass` toggle:
+            // a chat runs in the user's checkout with no approved scope behind
+            // it, so what the operator did not decide is still refused.
+            dangerously_allow_all: self.bypass_permissions,
             dangerous_mode: false,
             request_config: if overrides_selection {
                 RequestConfig::default()
