@@ -466,6 +466,20 @@ impl TuiRuntimeRouter {
                     files,
                 )));
             }
+            "bypass" => {
+                let reply = backend.command("/bypass")?;
+                let enabled = match reply.as_str() {
+                    agens_core::hosted::BYPASS_ON_REPLY => true,
+                    agens_core::hosted::BYPASS_OFF_REPLY => false,
+                    // A daemon that answered something else still answered;
+                    // show it without guessing at footer state.
+                    _ => return Ok(TuiSubmissionOutcome::LocalInfo(reply)),
+                };
+                return Ok(TuiSubmissionOutcome::BypassChanged {
+                    message: reply,
+                    enabled,
+                });
+            }
             "quit" => return Ok(TuiSubmissionOutcome::Quit),
             _ => {}
         }
@@ -486,6 +500,9 @@ impl TuiRuntimeRouter {
         }
         if let Some(server) = action.strip_prefix("mcp:reconnect:") {
             return self.resolve_daemon_command(&format!("/mcp reconnect {server}"));
+        }
+        if action == "bypass" {
+            return self.resolve_daemon_command("/bypass");
         }
         Err(CliError::usage("unknown attached dialog action"))
     }

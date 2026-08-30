@@ -578,6 +578,13 @@ pub enum TuiSubmissionOutcome {
         message: String,
         presentation: TuiPresentation,
     },
+    /// The session's permission-bypass state changed, as the daemon reported
+    /// it. Carries only the flag so an attached surface can flip its footer
+    /// without holding a full presentation.
+    BypassChanged {
+        message: String,
+        enabled: bool,
+    },
     /// A turn was taken back or put back: the transcript is replaced with the
     /// history that is live again and the prompt that started the turn goes
     /// back to the composer, so undoing costs no retyping.
@@ -7444,6 +7451,11 @@ where
                 presentation,
             } => {
                 self.apply_presentation(presentation);
+                self.add_info(message);
+                None
+            }
+            TuiSubmissionOutcome::BypassChanged { message, enabled } => {
+                self.set_bypass(enabled);
                 self.add_info(message);
                 None
             }

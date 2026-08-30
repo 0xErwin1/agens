@@ -67,6 +67,9 @@ impl AttachedRouteBackend for FakeAttachedBackend {
 
     fn command(&self, command: &str) -> Result<String, CliError> {
         self.commands.lock().unwrap().push(command.to_owned());
+        if command == "/bypass" {
+            return Ok(agens_core::hosted::BYPASS_ON_REPLY.to_owned());
+        }
         Ok(format!("daemon:{command}"))
     }
 
@@ -4811,4 +4814,41 @@ fn the_session_tree_lists_the_whole_lineage_from_whichever_fork_it_is_opened_in(
     );
 
     std::fs::remove_dir_all(temporary).unwrap();
+}
+
+#[test]
+fn an_attached_bypass_toggle_reaches_the_daemon_and_flips_the_footer_state() {
+    let temporary = tui_session_directory("attached-bypass-toggle");
+    let bootstrap = tui_session_bootstrap(&temporary, &[]);
+    let backend = Arc::new(FakeAttachedBackend::default());
+
+    let attached = TuiRuntimeRouter::attached(
+        bootstrap,
+        Arc::new(Mutex::new(SessionContext::fresh())),
+        backend.clone(),
+    );
+
+    let outcome = attached_route(&attached, TuiRouteRequest::Input("/bypass".into()));
+    assert_eq!(
+        outcome,
+        TuiSubmissionOutcome::BypassChanged {
+            message: agens_core::hosted::BYPASS_ON_REPLY.to_owned(),
+            enabled: true,
+        }
+    );
+
+    let dialog = attached_route(&attached, TuiRouteRequest::DialogAction("bypass".into()));
+    assert_eq!(
+        dialog,
+        TuiSubmissionOutcome::BypassChanged {
+            message: agens_core::hosted::BYPASS_ON_REPLY.to_owned(),
+            enabled: true,
+        }
+    );
+
+    assert_eq!(
+        backend.commands.lock().unwrap().as_slice(),
+        ["/bypass".to_owned(), "/bypass".to_owned()],
+        "both surfaces route the toggle to the daemon"
+    );
 }
