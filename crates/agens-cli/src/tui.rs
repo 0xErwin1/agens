@@ -90,6 +90,7 @@ pub(crate) fn run_production_tui(
             &socket,
             launch.resume,
             launch.initial_prompt.as_deref(),
+            launch.startup_notice.as_deref(),
         );
     }
 
@@ -118,7 +119,7 @@ pub(crate) fn run_production_tui(
         bootstrap,
         crate::commands::serve::DaemonStartupRequest::ExplicitAttached,
     )?;
-    agens_tui_app::attached::run_attached_tui_with_prompt(bootstrap, &socket, None, None)
+    agens_tui_app::attached::run_attached_tui_with_prompt(bootstrap, &socket, None, None, None)
 }
 
 pub(crate) fn run_tui(

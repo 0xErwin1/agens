@@ -510,6 +510,7 @@ mod tests {
         // Hold the machine's slot the way the winning daemon does.
         let lock = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(directory.join("serve.lock"))
