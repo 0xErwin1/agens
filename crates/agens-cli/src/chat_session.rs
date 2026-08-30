@@ -370,7 +370,14 @@ fn build_chat(
         Some(selection) => selection,
         None => (model_of(&bootstrap)?, RequestConfig::default()),
     };
-    let history = resumed_history(&bootstrap, request, session.id);
+
+    // A fresh chat's history is known empty. A resumed one is read on the
+    // first turn that needs it rather than here: `open` is what an attaching
+    // client waits on, and the client reads the same thread through the
+    // history RPC anyway, so an eager read here would charge every attach a
+    // second full-thread load that grows with the conversation.
+    let history = request.resume.is_none().then(Vec::new);
+
     let active_agent = active_agent_for(&bootstrap, &session)?;
 
     Ok(ChatSession {
@@ -601,15 +608,7 @@ fn hosted_context(
 /// A history that cannot be read is treated as an empty one: the person is
 /// coming back to this conversation either way, and refusing to open it over an
 /// unreadable transcript would strand a session that is still perfectly usable.
-fn resumed_history(
-    bootstrap: &Bootstrap,
-    request: &ChatSessionRequest,
-    session_id: i64,
-) -> Vec<Message> {
-    if request.resume.is_none() {
-        return Vec::new();
-    }
-
+fn stored_thread(bootstrap: &Bootstrap, session_id: i64) -> Vec<Message> {
     SessionStore::open(bootstrap.data_directory())
         .ok()
         .and_then(|store| store.load_session_thread(session_id).ok())
@@ -639,7 +638,10 @@ struct HostedChat {
     /// the next one continues the same session rather than opening another.
     session: SessionMetadata,
     model: String,
-    history: Vec<Message>,
+    /// The conversation so far. `None` for a resumed chat until the first turn
+    /// reads the stored thread, so opening a chat never pays for a transcript
+    /// no turn has asked for yet.
+    history: Option<Vec<Message>>,
     request_config: RequestConfig,
     active_agent: ActiveAgentRuntime,
     tasks: HostedTaskCoordinator,
@@ -914,8 +916,18 @@ impl HostedChat {
         })
     }
 
+    /// The conversation this chat continues from, read lazily for a resumed
+    /// chat so `open` never blocks a client on a thread load.
+    fn stored_history(&mut self) -> &[Message] {
+        if self.history.is_none() {
+            self.history = Some(stored_thread(&self.bootstrap, self.session.id));
+        }
+
+        self.history.as_deref().unwrap_or_default()
+    }
+
     /// The turn one prompt becomes.
-    fn request_for(&self, message: &SessionMessage) -> Result<HeadlessChatRequest, String> {
+    fn request_for(&mut self, message: &SessionMessage) -> Result<HeadlessChatRequest, String> {
         let project_root = self
             .bootstrap
             .project_root
@@ -945,6 +957,7 @@ impl HostedChat {
             })
             .unzip();
 
+        let history = self.stored_history().to_vec();
         let project_prompt = agens_bootstrap::session_config::SessionInstructions::resolve(
             &agens_bootstrap::session_root::SessionRoot::confined_to(project_root),
             &self.bootstrap,
@@ -968,7 +981,7 @@ impl HostedChat {
         Ok(HeadlessChatRequest {
             prompt,
             user_message: Some(message.clone()),
-            history: self.history.clone(),
+            history,
             model: active_model
                 .map(ToOwned::to_owned)
                 .or_else(|| Some(self.model.clone())),
@@ -1007,7 +1020,7 @@ impl HostedChat {
     /// reconciliation the terminal already performs is what it will need.
     fn adopt(&mut self, metadata: SessionMetadata, messages: Vec<Message>) {
         self.session = metadata;
-        self.history = messages;
+        self.history = Some(messages);
     }
 }
 
