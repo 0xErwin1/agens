@@ -163,10 +163,11 @@ impl Attachment {
                     // fleet console, or replayed from before a reattach — is
                     // not this turn failing. The daemon says which it was, and
                     // the turn's remaining events are still coming.
-                    match self
-                        .runtime
-                        .block_on(chat.answer_ask_user(self.session_id, prompt_id, reply))
-                    {
+                    match self.runtime.block_on(chat.answer_ask_user(
+                        self.session_id,
+                        prompt_id,
+                        reply,
+                    )) {
                         Ok(()) => {}
                         Err(error) if error.refused_precondition() => {}
                         Err(error) => return Err(refused(error)),

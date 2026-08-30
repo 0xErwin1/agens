@@ -695,8 +695,8 @@ fn client_error(error: ClientError) -> CliError {
 mod tests {
     use agens_core::{Message, MessagePart, Role};
 
-    use agens_core::ask_user::{AskUserMode, AskUserOption, AskUserQuestion, AskUserRequest};
     use agens_coordinator_client::HostedChatEvent;
+    use agens_core::ask_user::{AskUserMode, AskUserOption, AskUserQuestion, AskUserRequest};
 
     use super::{
         FleetItem, FleetView, ShowTarget, TeamAction, parse_action, render, render_chat_event,
@@ -765,8 +765,7 @@ mod tests {
             false,
             false,
         );
-        let request =
-            AskUserRequest::new(None, vec![question]).expect("the question is valid");
+        let request = AskUserRequest::new(None, vec![question]).expect("the question is valid");
 
         assert_eq!(
             render_chat_event(&HostedChatEvent::AskUserAsked {
