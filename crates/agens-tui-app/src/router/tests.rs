@@ -327,7 +327,7 @@ fn attached_surface_forwards_every_daemon_catalogued_builtin_without_local_disco
     for command in crate::extensions::tui_hosted_builtin_entries() {
         if matches!(
             command.name(),
-            "attach" | "skills" | "mcp" | "select" | "quit"
+            "attach" | "bypass" | "skills" | "mcp" | "select" | "quit"
         ) {
             continue;
         }
