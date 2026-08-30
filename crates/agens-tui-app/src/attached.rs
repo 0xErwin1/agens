@@ -496,6 +496,12 @@ pub fn run_attached_tui_with_prompt(
     let mut tui = Tui::new(engine);
     tui.adopt_environment();
     tui.set_collapse_thinking(bootstrap.collapse_thinking);
+    // Dressed before the first frame, so the footer opens naming the model the
+    // daemon is actually speaking to, the way a local launch opens naming its
+    // own. A daemon that did not describe the chat leaves the placeholders.
+    if let Some(presentation) = arrival_presentation(&arrival) {
+        tui.apply_presentation(presentation);
+    }
     for notice in opening_notices(startup_notice, &arrival) {
         tui.add_info(notice);
     }
@@ -596,6 +602,57 @@ struct Arrival {
     landing: Landing,
     /// What the chat has said so far. Empty for one this terminal just opened.
     history: Vec<Message>,
+    /// What the daemon said the chat is configured as when it was opened.
+    presentation: HostedPresentation,
+}
+
+/// The hosted session's active configuration, as the open answer carried it.
+///
+/// Every field is optional because a daemon that predates the description
+/// answers with none of them, and an arrival that invented values for such a
+/// daemon would dress the footer with a configuration nobody holds.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct HostedPresentation {
+    provider: Option<String>,
+    model: Option<String>,
+    reasoning_effort: Option<String>,
+    context_window: Option<u64>,
+}
+
+/// The footer presentation this arrival earns, or `None` when the daemon did
+/// not describe the chat and the placeholders are the honest rendering.
+///
+/// The shape mirrors what a local launch computes for itself: the provider
+/// falls back to the same placeholder, the session label is the same
+/// `session #id`, and a window the daemon did not hold is looked up in the
+/// same client-side model registry.
+fn arrival_presentation(arrival: &Arrival) -> Option<agens_tui::TuiPresentation> {
+    let described = &arrival.presentation;
+    let model = described
+        .model
+        .as_deref()
+        .filter(|model| !model.is_empty())?;
+    let provider = described
+        .provider
+        .as_deref()
+        .filter(|provider| !provider.is_empty())
+        .unwrap_or("provider");
+
+    let window = described
+        .context_window
+        .or_else(|| agens_models::context_window_for(model));
+    let mut presentation = agens_tui::TuiPresentation::new(
+        provider,
+        model,
+        format!("session #{}", arrival.session_id),
+    )
+    .with_context_window(window);
+
+    if let Some(effort) = &described.reasoning_effort {
+        presentation = presentation.with_effort(effort.clone());
+    }
+
+    Some(presentation)
 }
 
 /// Whether this terminal started the conversation or came back to it.
@@ -606,11 +663,12 @@ enum Landing {
 }
 
 impl Arrival {
-    const fn opened(session_id: i64) -> Self {
+    fn opened(session_id: i64) -> Self {
         Self {
             session_id,
             landing: Landing::Opened,
             history: Vec::new(),
+            presentation: HostedPresentation::default(),
         }
     }
 
@@ -662,13 +720,18 @@ fn attach(
     let mut arrival = match resume {
         // A named session is the person saying which conversation they want, so
         // it is not second-guessed and not looked up in the listing first.
-        Some(session_id) => Arrival {
-            session_id: runtime
+        Some(session_id) => {
+            let opened = runtime
                 .block_on(chat.open(checkout, Some(session_id)))
-                .map_err(refused)?,
-            landing: Landing::CameBack { answering: false },
-            history: Vec::new(),
-        },
+                .map_err(refused)?;
+
+            Arrival {
+                session_id: opened.session_id,
+                landing: Landing::CameBack { answering: false },
+                history: Vec::new(),
+                presentation: described_presentation(&opened),
+            }
+        }
         None => rejoin_or_open(&runtime, &mut chat, checkout)?,
     };
 
@@ -742,28 +805,46 @@ fn rejoin_or_open(
         // calls the chat can end, and `open` is what settles that — either it
         // returns the same session, or it opens a fresh one and this terminal
         // is where a new conversation starts.
-        let session_id = runtime
+        let opened = runtime
             .block_on(chat.open(checkout, Some(existing.session_id)))
             .map_err(refused)?;
 
-        if session_id == existing.session_id {
+        if opened.session_id == existing.session_id {
             return Ok(Arrival {
-                session_id,
+                session_id: opened.session_id,
                 landing: Landing::CameBack {
                     answering: existing.answering,
                 },
                 history: Vec::new(),
+                presentation: described_presentation(&opened),
             });
         }
 
-        return Ok(Arrival::opened(session_id));
+        return Ok(Arrival {
+            presentation: described_presentation(&opened),
+            ..Arrival::opened(opened.session_id)
+        });
     }
 
-    Ok(Arrival::opened(
-        runtime
-            .block_on(chat.open(checkout, None))
-            .map_err(refused)?,
-    ))
+    let opened = runtime
+        .block_on(chat.open(checkout, None))
+        .map_err(refused)?;
+
+    Ok(Arrival {
+        presentation: described_presentation(&opened),
+        ..Arrival::opened(opened.session_id)
+    })
+}
+
+/// What the open answer said about the chat's configuration, in the arrival's
+/// own shape.
+fn described_presentation(opened: &agens_coordinator_client::OpenedChat) -> HostedPresentation {
+    HostedPresentation {
+        provider: opened.provider.clone(),
+        model: opened.model.clone(),
+        reasoning_effort: opened.reasoning_effort.clone(),
+        context_window: opened.context_window,
+    }
 }
 
 fn unsupported_attached_origin(origin: SubmitOrigin) -> Option<agens_tui::TuiProviderOutcome> {
@@ -920,7 +1001,103 @@ mod tests {
             session_id: 7,
             landing: Landing::CameBack { answering },
             history: Vec::new(),
+            presentation: HostedPresentation::default(),
         }
+    }
+
+    struct StubEngine;
+
+    impl Engine for StubEngine {
+        fn cancel(&mut self) {}
+    }
+
+    /// The arrival dresses the surface with the hosted session's own
+    /// configuration, exactly as a local launch would: the footer names the
+    /// model and its effort, and the context gauge has a window to measure
+    /// against, before the first prompt is ever sent.
+    #[test]
+    fn the_arrival_renders_the_hosted_sessions_model_effort_and_context_window() {
+        let arrival = Arrival {
+            session_id: 7,
+            landing: Landing::CameBack { answering: false },
+            history: Vec::new(),
+            presentation: HostedPresentation {
+                provider: Some("openai-api".to_owned()),
+                model: Some("gpt-4.1".to_owned()),
+                reasoning_effort: Some("medium".to_owned()),
+                context_window: Some(1_047_576),
+            },
+        };
+
+        let presentation = arrival_presentation(&arrival).expect("the daemon described the chat");
+        assert_eq!(
+            presentation,
+            agens_tui::TuiPresentation::new("openai-api", "gpt-4.1", "session #7")
+                .with_effort("medium")
+                .with_context_window(Some(1_047_576))
+        );
+
+        let mut tui = Tui::new(StubEngine);
+        tui.apply_presentation(presentation);
+        let view = tui.view();
+        assert_eq!(view.provider_model, "openai-api / gpt-4.1");
+        assert_eq!(view.reasoning_effort, Some("medium"));
+        assert_eq!(view.context_window, Some(1_047_576));
+    }
+
+    /// A daemon that predates the description leaves the placeholders rather
+    /// than dressing the surface with invented values.
+    #[test]
+    fn an_arrival_the_daemon_did_not_describe_changes_nothing() {
+        assert!(arrival_presentation(&Arrival::opened(7)).is_none());
+    }
+
+    /// A daemon that names the model but holds no window for it still gets a
+    /// context gauge, from the same client-side registry local mode reads.
+    #[test]
+    fn a_described_model_without_a_window_falls_back_to_the_client_registry() {
+        let arrival = Arrival {
+            session_id: 3,
+            landing: Landing::Opened,
+            history: Vec::new(),
+            presentation: HostedPresentation {
+                provider: Some("openai-api".to_owned()),
+                model: Some("gpt-4.1".to_owned()),
+                reasoning_effort: None,
+                context_window: None,
+            },
+        };
+
+        let presentation = arrival_presentation(&arrival).expect("the daemon described the chat");
+        assert_eq!(
+            presentation,
+            agens_tui::TuiPresentation::new("openai-api", "gpt-4.1", "session #3")
+                .with_context_window(agens_models::context_window_for("gpt-4.1"))
+        );
+    }
+
+    /// A description without a provider still names the model, under the same
+    /// placeholder provider local mode uses when none resolves.
+    #[test]
+    fn a_described_model_without_a_provider_uses_the_local_placeholder() {
+        let arrival = Arrival {
+            session_id: 3,
+            landing: Landing::Opened,
+            history: Vec::new(),
+            presentation: HostedPresentation {
+                provider: None,
+                model: Some("gpt-4.1".to_owned()),
+                reasoning_effort: None,
+                context_window: Some(10),
+            },
+        };
+
+        let presentation = arrival_presentation(&arrival).expect("the daemon described the chat");
+        assert_eq!(
+            presentation,
+            agens_tui::TuiPresentation::new("provider", "gpt-4.1", "session #3")
+                .with_context_window(Some(10))
+        );
     }
 
     #[test]
