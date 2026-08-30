@@ -77,6 +77,7 @@ pub(crate) enum Command {
     Team {
         /// An optional first prompt for the attached chat. Fleet operations are `ls [--json]`,
         /// `show <id> [--follow]`, `answer <question-id> <answer>`,
+        /// `answer <chat-id> <prompt-id> <option-id>`,
         /// `permission <chat-id> <prompt-id> <answer>`, `merge <approval-question-id>`, and
         /// `cancel <id>`.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]

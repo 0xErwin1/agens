@@ -159,9 +159,19 @@ impl Attachment {
                 HostedChatEvent::AskUserAsked { prompt_id, request } => {
                     let reply = self.ask_user.wait_for_reply(request, None, &asking);
 
-                    self.runtime
-                        .block_on(chat.answer_ask_user(self.session_id, prompt_id, reply))
-                        .map_err(refused)?;
+                    // A question someone else already resolved — through the
+                    // fleet console, or replayed from before a reattach — is
+                    // not this turn failing. The daemon says which it was, and
+                    // the turn's remaining events are still coming.
+                    match self.runtime.block_on(chat.answer_ask_user(
+                        self.session_id,
+                        prompt_id,
+                        reply,
+                    )) {
+                        Ok(()) => {}
+                        Err(error) if error.refused_precondition() => {}
+                        Err(error) => return Err(refused(error)),
+                    }
                 }
                 HostedChatEvent::TurnCompleted { text } => return Ok(text),
                 HostedChatEvent::TurnFailed { detail } => {

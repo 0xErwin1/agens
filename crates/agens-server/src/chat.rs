@@ -24,7 +24,7 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
-use agens_core::ask_user::{AskUserReply, AskUserRequest, AskUserUnavailable};
+use agens_core::ask_user::{AskUserAnswer, AskUserReply, AskUserRequest, AskUserUnavailable};
 use agens_core::{
     HeadlessTurnCancellation, Message, MessagePart, SessionMessage, TurnEvent, TurnProgressSink,
 };
@@ -323,9 +323,17 @@ impl Subscribers {
         })
     }
 
-    fn add(&self) -> Result<ChatSubscription, ChatError> {
+    /// Adds a subscriber whose stream starts with `pending`, ahead of
+    /// anything published after it joins.
+    fn add_behind(&self, pending: Vec<ChatEvent>) -> Result<ChatSubscription, ChatError> {
         let (outbound, inbound) = sync_channel(SUBSCRIBER_BACKLOG);
         let listening = Arc::new(());
+
+        for event in pending {
+            outbound
+                .try_send(event)
+                .map_err(|_| unusable("the chat fan-out"))?;
+        }
 
         self.0
             .lock()
@@ -585,26 +593,40 @@ impl ChatSessions {
             .asked
             .lock()
             .map_err(|_| unusable("the chat's open questions"))?;
-        let Some(PendingQuestion::Permission {
-            admissible_answers, ..
-        }) = asked.get(&prompt_id)
-        else {
-            return Err(ChatError::NotAsked);
-        };
-        if !admissible_answers
-            .iter()
-            .any(|candidate| candidate == answer)
-        {
-            return Err(ChatError::NotAsked);
-        }
-        let Some(PendingQuestion::Permission { answer: sender, .. }) = asked.remove(&prompt_id)
-        else {
-            return Err(ChatError::NotAsked);
-        };
+        match asked.get(&prompt_id) {
+            Some(PendingQuestion::Permission {
+                admissible_answers, ..
+            }) => {
+                if !admissible_answers
+                    .iter()
+                    .any(|candidate| candidate == answer)
+                {
+                    return Err(ChatError::NotAsked);
+                }
 
-        sender
-            .try_send(answer.to_owned())
-            .map_err(|_| ChatError::NotAsked)
+                let Some(PendingQuestion::Permission { answer: sender, .. }) =
+                    asked.remove(&prompt_id)
+                else {
+                    return Err(ChatError::NotAsked);
+                };
+
+                sender
+                    .try_send(answer.to_owned())
+                    .map_err(|_| ChatError::NotAsked)
+            }
+            Some(PendingQuestion::AskUser { request, .. }) => {
+                let reply = bare_ask_user_reply(request, answer).ok_or(ChatError::NotAsked)?;
+
+                let Some(PendingQuestion::AskUser { answer: sender, .. }) =
+                    asked.remove(&prompt_id)
+                else {
+                    return Err(ChatError::NotAsked);
+                };
+
+                sender.try_send(reply).map_err(|_| ChatError::NotAsked)
+            }
+            None => Err(ChatError::NotAsked),
+        }
     }
 
     pub fn answer_ask_user(
@@ -636,13 +658,33 @@ impl ChatSessions {
     ///
     /// It is not a replay: a client that wants what it missed while it was
     /// detached asks for the session's stored history, which is the projection
-    /// built for exactly that.
+    /// built for exactly that. The one exception is a question the turn is
+    /// still stopped on, which greets the subscriber so it stays answerable
+    /// after everyone who heard it asked has detached.
     pub fn subscribe(&self, session: SessionId) -> Result<ChatSubscription, ChatError> {
-        self.locked()?
-            .get(&session)
-            .ok_or(ChatError::Unknown)?
-            .subscribers
-            .add()
+        let open = self.locked()?;
+        let chat = open.get(&session).ok_or(ChatError::Unknown)?;
+
+        // Snapshotted and added under the questions lock, which asking also
+        // publishes under: an open question is either in this snapshot or
+        // published to the subscription after it joins, never both and never
+        // neither.
+        let asked = chat
+            .asked
+            .lock()
+            .map_err(|_| unusable("the chat's open questions"))?;
+        let pending = asked
+            .iter()
+            .filter_map(|(prompt_id, question)| match question {
+                PendingQuestion::AskUser { request, .. } => Some(ChatEvent::AskUserAsked {
+                    prompt_id: *prompt_id,
+                    request: request.clone(),
+                }),
+                PendingQuestion::Permission { .. } => None,
+            })
+            .collect();
+
+        chat.subscribers.add_behind(pending)
     }
 
     /// Stops the turn a chat is running, leaving the session open.
@@ -737,6 +779,10 @@ struct ChatQuestions {
     subscribers: Arc<Subscribers>,
     asked: Arc<Mutex<BTreeMap<u64, PendingQuestion>>>,
     next_id: AtomicU64,
+    /// The session's own cancellation, which ends every question with it.
+    session: HeadlessTurnCancellation,
+    /// The cancellation of the turn currently running, when one is.
+    running: Arc<Mutex<Option<HeadlessTurnCancellation>>>,
 }
 
 impl ChatAsks for ChatQuestions {
@@ -792,15 +838,31 @@ impl ChatAsks for ChatQuestions {
                 request: request.clone(),
             },
         );
-        drop(asked);
+
+        // Published while the questions lock is held, which `subscribe` also
+        // snapshots under, so a joining subscriber cannot miss this question
+        // or hear it twice.
         self.subscribers.publish(&ChatEvent::AskUserAsked {
             prompt_id,
             request: request.clone(),
         });
+        drop(asked);
 
-        let outcome = self
-            .wait_for(&answered)
-            .unwrap_or(AskUserReply::Unavailable(AskUserUnavailable::SurfaceClosed));
+        // Held rather than given up when the last listener detaches: detaching
+        // is not declining, and the question stays answerable through a later
+        // subscriber or the fleet console. Only the turn ending calls it off.
+        let outcome = loop {
+            match answered.recv_timeout(ANSWER_POLL) {
+                Ok(answer) => break answer,
+                Err(RecvTimeoutError::Disconnected) => {
+                    break AskUserReply::Unavailable(AskUserUnavailable::SurfaceClosed);
+                }
+                Err(RecvTimeoutError::Timeout) if self.asking_turn_ended() => {
+                    break AskUserReply::Cancelled;
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+            }
+        };
         if let Ok(mut asked) = self.asked.lock() {
             asked.remove(&prompt_id);
         }
@@ -809,6 +871,20 @@ impl ChatAsks for ChatQuestions {
 }
 
 impl ChatQuestions {
+    /// Whether the turn these questions belong to was called off, alone or
+    /// with its whole session.
+    fn asking_turn_ended(&self) -> bool {
+        if self.session.is_cancelled() {
+            return true;
+        }
+
+        self.running.lock().map_or(true, |running| {
+            running
+                .as_ref()
+                .is_none_or(HeadlessTurnCancellation::is_cancelled)
+        })
+    }
+
     /// Waits for the answer, checking between waits that anybody is still there
     /// to give one.
     ///
@@ -843,6 +919,8 @@ fn serve_prompts(
         subscribers: Arc::clone(subscribers),
         asked: Arc::clone(asked),
         next_id: AtomicU64::new(0),
+        session: runtime.cancellation().clone(),
+        running: Arc::clone(running),
     });
 
     loop {
@@ -900,6 +978,25 @@ fn progress_sink(subscribers: &Arc<Subscribers>) -> TurnProgressSink {
     let subscribers = Arc::clone(subscribers);
 
     Arc::new(move |event| subscribers.publish(&ChatEvent::Progress(event)))
+}
+
+/// Reads a bare value as the whole answer to a single-question ask.
+///
+/// A request with several questions has no single value that answers it, so
+/// only the structured wire can resolve one of those.
+fn bare_ask_user_reply(request: &AskUserRequest, value: &str) -> Option<AskUserReply> {
+    let [question] = request.questions() else {
+        return None;
+    };
+
+    let reply = AskUserReply::Answered(vec![AskUserAnswer {
+        question_id: question.id().to_owned(),
+        selected: vec![value.to_owned()],
+        other: None,
+        note: None,
+    }]);
+
+    request.validate_reply(&reply).ok().map(|()| reply)
 }
 
 fn unusable(component: &str) -> ChatError {

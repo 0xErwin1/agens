@@ -64,6 +64,16 @@ impl std::fmt::Display for ClientError {
 impl ClientError {
     /// Whether a failed prompt is known not to have crossed the daemon's inbox boundary.
     #[must_use]
+    /// Whether the daemon refused because the state the request named is no
+    /// longer there — an answer to a question that already resolved, most of
+    /// all. The condition failed, not the connection or the wire.
+    pub fn refused_precondition(&self) -> bool {
+        matches!(
+            self,
+            Self::Refused(status) if status.code() == tonic::Code::FailedPrecondition
+        )
+    }
+
     pub fn definitively_rejected_prompt(&self) -> bool {
         match self {
             Self::InvalidRequest(_) => true,
@@ -146,4 +156,24 @@ async fn connect_unix(
     let stream = tokio::net::UnixStream::connect(socket).await?;
 
     Ok(hyper_util::rt::TokioIo::new(stream))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ClientError;
+
+    #[test]
+    fn only_a_failed_precondition_reads_as_a_question_already_resolved() {
+        assert!(
+            ClientError::Refused(tonic::Status::failed_precondition(
+                "this chat is not waiting on that question"
+            ))
+            .refused_precondition()
+        );
+        assert!(
+            !ClientError::Refused(tonic::Status::unavailable("the daemon went away"))
+                .refused_precondition()
+        );
+        assert!(!ClientError::Unreadable("wire disagreement".to_owned()).refused_precondition());
+    }
 }
