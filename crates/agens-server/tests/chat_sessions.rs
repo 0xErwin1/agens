@@ -423,6 +423,108 @@ fn opening_a_chat_drops_the_records_of_the_ones_that_already_ended() {
     assert_eq!(harness.chats.open_chats(), 1);
 }
 
+/// The daemon's chats outlive every client, so a client that relaunches opens
+/// the id it was told is live. That open is the same conversation, not a
+/// second one: the record and its loop stay as they were, and everything that
+/// was attached to them keeps working.
+#[test]
+fn opening_a_live_chat_again_from_the_same_checkout_rejoins_it() {
+    let harness = harness();
+    let session = harness.chats.open(&request(7)).expect("the chat opens");
+    let events = harness.chats.subscribe(session).expect("the chat is open");
+
+    let rejoined = harness
+        .chats
+        .open(&request(7))
+        .expect("a live chat is rejoined rather than refused");
+
+    assert_eq!(rejoined, session);
+    assert_eq!(harness.chats.open_chats(), 1);
+
+    harness
+        .chats
+        .prompt(session, user_message("still here"))
+        .expect("the live loop still serves prompts");
+    assert_eq!(
+        harness.started.recv_timeout(PATIENCE),
+        Ok("still here".to_owned()),
+    );
+
+    harness
+        .release
+        .send(ChatTurnOutcome::Completed("still yours".to_owned()))
+        .expect("the turn is waiting");
+    assert_eq!(
+        wait_for(&events, |event| matches!(
+            event,
+            ChatEvent::TurnCompleted { .. }
+        )),
+        ChatEvent::TurnCompleted {
+            text: "still yours".to_owned(),
+        },
+    );
+}
+
+/// The same id opened against another checkout is a genuine conflict, and it
+/// keeps being refused: rejoining is for the client coming back to its own
+/// conversation, not a way around the registry.
+#[test]
+fn opening_a_live_chat_from_another_checkout_is_still_refused() {
+    let harness = harness();
+    harness.chats.open(&request(7)).expect("the chat opens");
+
+    let conflicting = ChatSessionRequest {
+        checkout: PathBuf::from("/projects/something-else"),
+        resume: Some(7),
+    };
+
+    assert_eq!(
+        harness.chats.open(&conflicting),
+        Err(ChatError::Unavailable(
+            "a session with this id is already live".to_owned()
+        )),
+    );
+    assert_eq!(harness.chats.open_chats(), 1);
+}
+
+/// A chat whose loop already ended is not rejoined: its record is stale, and
+/// what the client needs is the ordinary restart, which is exactly what
+/// settling the listing by opening exists for.
+#[test]
+fn opening_a_chat_whose_session_ended_restarts_it_rather_than_rejoining() {
+    let harness = harness();
+    let session = harness.chats.open(&request(7)).expect("the chat opens");
+
+    harness
+        .supervisor
+        .cancel(session)
+        .expect("the session is live");
+    let deadline = Instant::now() + PATIENCE;
+    while !harness
+        .supervisor
+        .status(session)
+        .is_some_and(|status| status.state.terminal().is_some())
+    {
+        assert!(Instant::now() < deadline, "the cancelled chat never ended");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let reopened = harness
+        .chats
+        .open(&request(7))
+        .expect("an ended chat restarts");
+
+    assert_eq!(reopened, session);
+    harness
+        .chats
+        .prompt(reopened, user_message("fresh start"))
+        .expect("the restarted loop serves prompts");
+    assert_eq!(
+        harness.started.recv_timeout(PATIENCE),
+        Ok("fresh start".to_owned()),
+    );
+}
+
 /// Stopping the answer you are reading is stopping that answer. A cancellation
 /// that ended the chat would leave the next prompt with nowhere to arrive.
 #[test]

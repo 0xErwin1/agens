@@ -803,7 +803,11 @@ fn refused(error: ClientError) -> CliError {
         ClientError::NotRunning(_) => CliError::unavailable(
             "no daemon is running; start one with `agens serve`, or run `agens --local`",
         ),
-        other => CliError::new(ExitStatus::Failure, "provider", other.to_string()),
+        // The rest is the daemon speaking — a refusal, an unreadable answer, a
+        // request this client would not send — and none of it is a provider
+        // turn failing. Those arrive on the event stream and keep their own
+        // category.
+        other => CliError::new(ExitStatus::Failure, "daemon", other.to_string()),
     }
 }
 
@@ -989,6 +993,25 @@ mod tests {
             outcome,
             agens_tui::TuiProviderOutcome::Rejected { .. }
         ));
+    }
+
+    /// A control-plane refusal is the daemon speaking, not a provider turn
+    /// failing, and the error a person reads says which one it was. Only a
+    /// daemon that is not there at all reads as unavailable.
+    #[test]
+    fn control_plane_refusals_are_reported_as_the_daemon_speaking() {
+        let error = refused(ClientError::Unreadable("an answer off the wire".into()));
+        assert_eq!(error.category, "daemon");
+        assert!(error.message.contains("an answer off the wire"));
+
+        assert_eq!(
+            refused(ClientError::InvalidRequest("too wide for this wire".into())).category,
+            "daemon",
+        );
+        assert_eq!(
+            refused(ClientError::NotRunning("nobody on the socket".into())).category,
+            "unavailable",
+        );
     }
 
     #[test]
