@@ -228,6 +228,12 @@ async fn served(events: Vec<TurnEvent>) -> Served {
                     Box::new(StubProvider),
                     SessionBudget::unlimited(),
                 ),
+                presentation: agens_server::ChatPresentation {
+                    provider: Some("stub".to_owned()),
+                    model: Some("model".to_owned()),
+                    reasoning_effort: Some("medium".to_owned()),
+                    context_window: Some(128_000),
+                },
                 turns: Box::new(ScriptedTurns {
                     started: started.clone(),
                     events: events.lock().expect("the script is readable").clone(),
@@ -314,7 +320,8 @@ async fn every_event_a_turn_produces_survives_the_round_trip_unchanged() {
     let session = chat
         .open(&PathBuf::from("/projects/agens"), None)
         .await
-        .expect("the chat opens");
+        .expect("the chat opens")
+        .session_id;
     let mut events = chat.subscribe(session).await.expect("the chat is open");
 
     chat.prompt(session, "tell me everything")
@@ -351,6 +358,24 @@ async fn every_event_a_turn_produces_survives_the_round_trip_unchanged() {
     );
 }
 
+/// The client hands the daemon's description of the chat to its caller, so an
+/// attaching surface renders the session's own configuration.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_open_description_survives_the_client_round_trip() {
+    let served = served(Vec::new()).await;
+    let mut chat = served.coordinator.chat();
+
+    let opened = chat
+        .open(&PathBuf::from("/projects/agens"), None)
+        .await
+        .expect("the chat opens");
+
+    assert_eq!(opened.provider.as_deref(), Some("stub"));
+    assert_eq!(opened.model.as_deref(), Some("model"));
+    assert_eq!(opened.reasoning_effort.as_deref(), Some("medium"));
+    assert_eq!(opened.context_window, Some(128_000));
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn qualified_model_command_survives_the_client_round_trip() {
     let served = served(Vec::new()).await;
@@ -358,7 +383,8 @@ async fn qualified_model_command_survives_the_client_round_trip() {
     let session = chat
         .open(&PathBuf::from("/projects/agens"), None)
         .await
-        .expect("the chat opens");
+        .expect("the chat opens")
+        .session_id;
 
     assert_eq!(
         chat.command(session, "/model openai-api/gpt-4.1")

@@ -31,6 +31,21 @@ pub struct OpenChat {
     pub answering: bool,
 }
 
+/// A chat the daemon just opened for this client, and how it described it.
+///
+/// The description is what dresses the surface before the first prompt: the
+/// model the session actually speaks to, its reasoning effort, and the window
+/// its context gauge measures against. Absent fields mean the daemon predates
+/// the description, never that the session has no configuration.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenedChat {
+    pub session_id: i64,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub context_window: Option<u64>,
+}
+
 /// The daemon's account of what it is, as the attach handshake carries it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DaemonBuild {
@@ -208,9 +223,15 @@ impl ChatClient {
     /// Opens a chat rooted at `checkout`, or continues the stored session
     /// `resume` names.
     ///
-    /// Returns the session's durable id, which is what a client keeps in order
-    /// to come back to this conversation after detaching.
-    pub async fn open(&mut self, checkout: &Path, resume: Option<i64>) -> Result<i64, ClientError> {
+    /// Returns the session's durable id — what a client keeps in order to come
+    /// back to this conversation after detaching — together with the
+    /// configuration the daemon described the chat as holding. A daemon that
+    /// predates the description leaves every described field absent.
+    pub async fn open(
+        &mut self,
+        checkout: &Path,
+        resume: Option<i64>,
+    ) -> Result<OpenedChat, ClientError> {
         let opened = self
             .inner
             .open(proto::OpenChatRequest {
@@ -225,7 +246,13 @@ impl ChatClient {
             .map_err(|_| ClientError::Unreadable("chat capabilities are unavailable".into()))?
             .insert(opened.session_id, opened.supports_prompt_parts);
 
-        Ok(opened.session_id)
+        Ok(OpenedChat {
+            session_id: opened.session_id,
+            provider: opened.provider.filter(|provider| !provider.is_empty()),
+            model: opened.model.filter(|model| !model.is_empty()),
+            reasoning_effort: opened.reasoning_effort.filter(|effort| !effort.is_empty()),
+            context_window: opened.context_window.filter(|window| *window > 0),
+        })
     }
 
     /// What is already open for `checkout`, newest first.

@@ -166,6 +166,7 @@ fn harness_with_questions(
                     Box::new(StubProvider),
                     SessionBudget::unlimited(),
                 ),
+                presentation: agens_server::ChatPresentation::default(),
                 turns: Box::new(ScriptedTurns {
                     started: started.clone(),
                     release: Arc::clone(&release_rx),
@@ -223,7 +224,11 @@ fn wait_for(events: &ChatSubscription, accepts: impl Fn(&ChatEvent) -> bool) -> 
 #[test]
 fn a_command_executes_on_the_daemon_owned_chat_state() {
     let harness = harness();
-    let session = harness.chats.open(&request(1)).expect("the chat opens");
+    let session = harness
+        .chats
+        .open(&request(1))
+        .expect("the chat opens")
+        .session;
 
     assert_eq!(
         harness.chats.command(session, "/effort high".to_owned()),
@@ -234,7 +239,11 @@ fn a_command_executes_on_the_daemon_owned_chat_state() {
 #[test]
 fn a_prompt_reaches_the_turn_and_its_progress_reaches_a_subscriber() {
     let harness = harness();
-    let session = harness.chats.open(&request(1)).expect("the chat opens");
+    let session = harness
+        .chats
+        .open(&request(1))
+        .expect("the chat opens")
+        .session;
     let events = harness.chats.subscribe(session).expect("the chat is open");
 
     harness
@@ -274,7 +283,11 @@ fn a_prompt_reaches_the_turn_and_its_progress_reaches_a_subscriber() {
 #[test]
 fn a_prompt_sent_while_a_turn_is_running_and_one_already_waits_is_refused() {
     let harness = harness();
-    let session = harness.chats.open(&request(1)).expect("the chat opens");
+    let session = harness
+        .chats
+        .open(&request(1))
+        .expect("the chat opens")
+        .session;
 
     harness
         .chats
@@ -299,7 +312,11 @@ fn a_prompt_sent_while_a_turn_is_running_and_one_already_waits_is_refused() {
 #[test]
 fn a_turn_that_failed_is_published_as_a_failure_and_the_chat_stays_open() {
     let harness = harness();
-    let session = harness.chats.open(&request(1)).expect("the chat opens");
+    let session = harness
+        .chats
+        .open(&request(1))
+        .expect("the chat opens")
+        .session;
     let events = harness.chats.subscribe(session).expect("the chat is open");
 
     harness
@@ -339,7 +356,11 @@ fn a_turn_that_failed_is_published_as_a_failure_and_the_chat_stays_open() {
 #[test]
 fn closing_a_chat_ends_its_session_and_says_so_on_the_stream() {
     let harness = harness();
-    let session = harness.chats.open(&request(1)).expect("the chat opens");
+    let session = harness
+        .chats
+        .open(&request(1))
+        .expect("the chat opens")
+        .session;
     let events = harness.chats.subscribe(session).expect("the chat is open");
 
     harness.chats.close(session).expect("the chat is open");
@@ -374,7 +395,11 @@ fn a_prompt_for_a_chat_nobody_opened_is_refused_rather_than_started() {
 #[test]
 fn a_subscription_ends_with_the_chat_it_was_following() {
     let harness = harness();
-    let session = harness.chats.open(&request(1)).expect("the chat opens");
+    let session = harness
+        .chats
+        .open(&request(1))
+        .expect("the chat opens")
+        .session;
     let events = harness.chats.subscribe(session).expect("the chat is open");
 
     harness.chats.close(session).expect("the chat is open");
@@ -397,7 +422,11 @@ fn a_subscription_ends_with_the_chat_it_was_following() {
 fn opening_a_chat_drops_the_records_of_the_ones_that_already_ended() {
     let harness = harness();
 
-    let first = harness.chats.open(&request(1)).expect("the chat opens");
+    let first = harness
+        .chats
+        .open(&request(1))
+        .expect("the chat opens")
+        .session;
     // The session's own cancellation rather than the chat's: what ends a
     // session out from under its record is the daemon stopping it, and that is
     // the state pruning exists to clear.
@@ -430,13 +459,18 @@ fn opening_a_chat_drops_the_records_of_the_ones_that_already_ended() {
 #[test]
 fn opening_a_live_chat_again_from_the_same_checkout_rejoins_it() {
     let harness = harness();
-    let session = harness.chats.open(&request(7)).expect("the chat opens");
+    let session = harness
+        .chats
+        .open(&request(7))
+        .expect("the chat opens")
+        .session;
     let events = harness.chats.subscribe(session).expect("the chat is open");
 
     let rejoined = harness
         .chats
         .open(&request(7))
-        .expect("a live chat is rejoined rather than refused");
+        .expect("a live chat is rejoined rather than refused")
+        .session;
 
     assert_eq!(rejoined, session);
     assert_eq!(harness.chats.open_chats(), 1);
@@ -493,7 +527,11 @@ fn opening_a_live_chat_from_another_checkout_is_still_refused() {
 #[test]
 fn opening_a_chat_whose_session_ended_restarts_it_rather_than_rejoining() {
     let harness = harness();
-    let session = harness.chats.open(&request(7)).expect("the chat opens");
+    let session = harness
+        .chats
+        .open(&request(7))
+        .expect("the chat opens")
+        .session;
 
     harness
         .supervisor
@@ -512,7 +550,8 @@ fn opening_a_chat_whose_session_ended_restarts_it_rather_than_rejoining() {
     let reopened = harness
         .chats
         .open(&request(7))
-        .expect("an ended chat restarts");
+        .expect("an ended chat restarts")
+        .session;
 
     assert_eq!(reopened, session);
     harness
@@ -530,7 +569,11 @@ fn opening_a_chat_whose_session_ended_restarts_it_rather_than_rejoining() {
 #[test]
 fn cancelling_stops_the_running_turn_and_leaves_the_chat_open() {
     let harness = harness();
-    let session = harness.chats.open(&request(1)).expect("the chat opens");
+    let session = harness
+        .chats
+        .open(&request(1))
+        .expect("the chat opens")
+        .session;
     let events = harness.chats.subscribe(session).expect("the chat is open");
 
     harness
@@ -579,7 +622,11 @@ fn cancelling_stops_the_running_turn_and_leaves_the_chat_open() {
 #[test]
 fn a_cancellation_does_not_carry_into_the_next_turn() {
     let harness = harness();
-    let session = harness.chats.open(&request(1)).expect("the chat opens");
+    let session = harness
+        .chats
+        .open(&request(1))
+        .expect("the chat opens")
+        .session;
     let events = harness.chats.subscribe(session).expect("the chat is open");
 
     harness
@@ -626,7 +673,11 @@ fn a_cancellation_does_not_carry_into_the_next_turn() {
 #[test]
 fn a_chats_conversation_is_readable_while_a_turn_is_running() {
     let harness = harness();
-    let session = harness.chats.open(&request(1)).expect("the chat opens");
+    let session = harness
+        .chats
+        .open(&request(1))
+        .expect("the chat opens")
+        .session;
 
     harness
         .chats
@@ -667,7 +718,11 @@ fn a_question() -> ChatPermissionRequest {
 #[test]
 fn a_question_the_turn_asks_reaches_a_subscriber_and_the_answer_reaches_the_turn() {
     let harness = harness_asking(Some(a_question()));
-    let session = harness.chats.open(&request(1)).expect("the chat opens");
+    let session = harness
+        .chats
+        .open(&request(1))
+        .expect("the chat opens")
+        .session;
     let events = harness.chats.subscribe(session).expect("the chat is open");
 
     harness
@@ -724,7 +779,11 @@ fn an_ask_user_question() -> AskUserRequest {
 #[test]
 fn an_external_ask_user_answer_is_validated_then_continues_the_same_turn() {
     let harness = harness_asking_user(an_ask_user_question());
-    let session = harness.chats.open(&request(1)).expect("the chat opens");
+    let session = harness
+        .chats
+        .open(&request(1))
+        .expect("the chat opens")
+        .session;
     let events = harness.chats.subscribe(session).expect("the chat is open");
 
     harness
@@ -778,7 +837,11 @@ fn an_external_ask_user_answer_is_validated_then_continues_the_same_turn() {
 #[test]
 fn an_ask_user_question_survives_every_listener_detaching_and_greets_a_new_one() {
     let harness = harness_asking_user(an_ask_user_question());
-    let session = harness.chats.open(&request(1)).expect("the chat opens");
+    let session = harness
+        .chats
+        .open(&request(1))
+        .expect("the chat opens")
+        .session;
     let events = harness.chats.subscribe(session).expect("the chat is open");
 
     harness
@@ -838,7 +901,11 @@ fn an_ask_user_question_survives_every_listener_detaching_and_greets_a_new_one()
 #[test]
 fn cancelling_the_turn_releases_an_unanswered_ask_user_question() {
     let harness = harness_asking_user(an_ask_user_question());
-    let session = harness.chats.open(&request(1)).expect("the chat opens");
+    let session = harness
+        .chats
+        .open(&request(1))
+        .expect("the chat opens")
+        .session;
     let events = harness.chats.subscribe(session).expect("the chat is open");
 
     harness
@@ -868,7 +935,11 @@ fn cancelling_the_turn_releases_an_unanswered_ask_user_question() {
 #[test]
 fn a_bare_option_id_answers_a_single_question_ask_over_the_value_wire() {
     let harness = harness_asking_user(an_ask_user_question());
-    let session = harness.chats.open(&request(1)).expect("the chat opens");
+    let session = harness
+        .chats
+        .open(&request(1))
+        .expect("the chat opens")
+        .session;
     let events = harness.chats.subscribe(session).expect("the chat is open");
 
     harness
@@ -916,7 +987,11 @@ fn a_bare_option_id_answers_a_single_question_ask_over_the_value_wire() {
 #[test]
 fn a_question_nobody_is_listening_to_is_refused_rather_than_held() {
     let harness = harness_asking(Some(a_question()));
-    let session = harness.chats.open(&request(1)).expect("the chat opens");
+    let session = harness
+        .chats
+        .open(&request(1))
+        .expect("the chat opens")
+        .session;
     let events = harness.chats.subscribe(session).expect("the chat is open");
 
     harness
@@ -952,7 +1027,11 @@ fn a_question_nobody_is_listening_to_is_refused_rather_than_held() {
 #[test]
 fn an_answer_to_a_question_this_chat_is_not_waiting_on_is_refused() {
     let harness = harness();
-    let session = harness.chats.open(&request(1)).expect("the chat opens");
+    let session = harness
+        .chats
+        .open(&request(1))
+        .expect("the chat opens")
+        .session;
 
     assert_eq!(
         harness

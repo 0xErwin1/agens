@@ -42,10 +42,11 @@ use agens_models::{ModelSelection, QualifiedModel};
 use agens_permissions::{PermissionPromptAnswer, PermissionPromptContext, PermissionPrompter};
 use agens_server::{
     ChatAsks, ChatError, ChatHistorySource, ChatPermissionAnswer, ChatPermissionRequest,
-    ChatSession, ChatSessionFactory, ChatSessionRequest, ChatTurnOutcome, ChatTurns,
-    SessionAdmission, SessionBudget, SessionId, SessionProvider, SessionRuntime,
+    ChatPresentation, ChatSession, ChatSessionFactory, ChatSessionRequest, ChatTurnOutcome,
+    ChatTurns, SessionAdmission, SessionBudget, SessionId, SessionProvider, SessionRuntime,
 };
 use agens_session::context::{ActiveAgentRuntime, SessionContext};
+use agens_session::model::{current_provider, effective_model, model_source};
 use agens_session::provider::{bootstrap_authentication, resolve_provider_for_model};
 use agens_store::SessionStore;
 use agens_tool_runtime::mcp::ProductionHostedMcp;
@@ -383,6 +384,7 @@ fn build_chat(
             // person never asked for; what bounds it is them closing it.
             SessionBudget::unlimited(),
         ),
+        presentation: presentation_of(&bootstrap, &session),
         turns: Box::new(HostedChat {
             bootstrap,
             session,
@@ -394,6 +396,37 @@ fn build_chat(
             task_runtime: None,
         }),
     })
+}
+
+/// How this session presents itself to an attaching surface.
+///
+/// Computed the way `tui_session_presentation` computes it for a local launch,
+/// from the same persisted metadata a resumed local session reads, so an
+/// attached footer and a local one describe the same session identically.
+fn presentation_of(bootstrap: &Bootstrap, session: &SessionMetadata) -> ChatPresentation {
+    let context = hosted_context(bootstrap, session, None);
+    let model = effective_model(bootstrap, &context);
+
+    let provider = session
+        .provider_id
+        .clone()
+        .or_else(|| current_provider(bootstrap, &context).map(|kind| kind.identifier().to_owned()));
+
+    let reasoning_effort = session
+        .reasoning_effort
+        .map(|effort| effort.as_str().to_owned())
+        .or_else(|| {
+            ModelSelection::for_source(&model, model_source(bootstrap, &context))
+                .reasoning_effort_default()
+                .map(str::to_owned)
+        });
+
+    ChatPresentation {
+        context_window: agens_models::context_window_for(&model),
+        provider,
+        model: Some(model),
+        reasoning_effort,
+    }
 }
 
 /// The checkout a chat's tools run in.

@@ -476,3 +476,89 @@ fn a_chat_that_never_completed_a_turn_reopens_as_a_fresh_conversation() {
     daemon.provider.assert_script_consumed();
     let _ = std::fs::remove_dir_all(PathBuf::from(&daemon.root));
 }
+
+/// The open answer describes the configuration the composed factory actually
+/// gives a session: the daemon's configured model for a fresh chat, and the
+/// persisted selection for a resumed one. This is what lets an attaching
+/// terminal open on the daemon's configuration instead of placeholders.
+#[test]
+fn opening_a_chat_describes_the_sessions_own_configuration() {
+    let daemon = DaemonFixture::start(Script::new([]), daemon_settings());
+
+    let selected = agens_store::SessionStore::open(&daemon.data_directory)
+        .and_then(|mut store| {
+            store.open_session(&agens_core::SessionMetadata {
+                id: 0,
+                project: daemon.checkout.display().to_string(),
+                title: String::new(),
+                active_agent: "primary".to_owned(),
+                provider_id: Some("openai-api".to_owned()),
+                model_id: Some("gpt-5.5".to_owned()),
+                reasoning_effort: Some(agens_core::ReasoningEffort::High),
+                created_at: 1,
+                updated_at: 1,
+                completed_turn_count: 0,
+                resumable: false,
+                parent_session_id: None,
+                fork_message_count: None,
+            })
+        })
+        .expect("the selected session row is stored");
+
+    let socket = daemon.socket.clone();
+    let stopper = daemon.stopper();
+    let checkout = daemon.checkout.display().to_string();
+
+    let client = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let stopper = stopper;
+
+        runtime.block_on(async move {
+            let mut chat = ChatClient::new(connect(socket).await);
+
+            let fresh = chat
+                .open(proto::OpenChatRequest {
+                    checkout: checkout.clone(),
+                    resume: None,
+                })
+                .await
+                .expect("a fresh chat opens")
+                .into_inner();
+            assert_eq!(fresh.provider.as_deref(), Some("openai-api"));
+            assert_eq!(fresh.model.as_deref(), Some("gpt-4.1"));
+            assert_eq!(fresh.reasoning_effort, None);
+            assert_eq!(
+                fresh.context_window,
+                agens_models::context_window_for("gpt-4.1"),
+            );
+
+            let resumed = chat
+                .open(proto::OpenChatRequest {
+                    checkout,
+                    resume: Some(selected),
+                })
+                .await
+                .expect("the selected session reopens")
+                .into_inner();
+            assert_eq!(resumed.session_id, selected);
+            assert_eq!(resumed.provider.as_deref(), Some("openai-api"));
+            assert_eq!(resumed.model.as_deref(), Some("gpt-5.5"));
+            assert_eq!(resumed.reasoning_effort.as_deref(), Some("high"));
+            assert_eq!(
+                resumed.context_window,
+                agens_models::context_window_for("gpt-5.5"),
+            );
+
+            drop(stopper);
+        })
+    });
+
+    daemon.serve();
+
+    client.join().expect("the client thread finished");
+    let _ = std::fs::remove_dir_all(PathBuf::from(&daemon.root));
+}

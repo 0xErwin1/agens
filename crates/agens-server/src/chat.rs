@@ -184,6 +184,28 @@ pub enum ChatTurnOutcome {
 pub struct ChatSession {
     pub admission: SessionAdmission,
     pub turns: Box<dyn ChatTurns>,
+    /// How the session is configured, for the open answer to describe.
+    pub presentation: ChatPresentation,
+}
+
+/// The configuration a chat session holds, as the open answer describes it.
+///
+/// Computed by whoever builds the session — the factory reads the persisted
+/// selection the same way a turn will — so an attaching surface renders the
+/// configuration the session actually speaks with, not one the client guessed.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ChatPresentation {
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub context_window: Option<u64>,
+}
+
+/// A chat session the daemon opened, and how it described it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OpenedChat {
+    pub session: SessionId,
+    pub presentation: ChatPresentation,
 }
 
 /// How the daemon turns a client's request into a chat session.
@@ -452,10 +474,11 @@ impl ChatSessions {
     /// those two the client already holds nothing: a prompt that arrived in
     /// that window would be refused for a session that exists. A start that
     /// fails takes the record back out.
-    pub fn open(&self, request: &ChatSessionRequest) -> Result<SessionId, ChatError> {
+    pub fn open(&self, request: &ChatSessionRequest) -> Result<OpenedChat, ChatError> {
         let ChatSession {
             admission,
             mut turns,
+            presentation,
         } = (self.open_chat)(request)?;
 
         let session = admission.session();
@@ -486,7 +509,13 @@ impl ChatSessions {
         // listing and this open has already fallen out and restarts below.
         if let Some(existing) = open.get(&session) {
             if existing.checkout == request.checkout {
-                return Ok(session);
+                // The description still comes from the fresh build above: the
+                // factory reads the persisted selection, which a live session
+                // keeps current every time its selection changes.
+                return Ok(OpenedChat {
+                    session,
+                    presentation,
+                });
             }
             return Err(ChatError::Unavailable(
                 describe(SessionRegistryError::AlreadyLive).to_owned(),
@@ -520,7 +549,10 @@ impl ChatSessions {
             return Err(ChatError::Unavailable(describe(error).to_owned()));
         }
 
-        Ok(session)
+        Ok(OpenedChat {
+            session,
+            presentation,
+        })
     }
 
     /// Hands a prompt to an open chat, without waiting for the turn it starts.
