@@ -18,7 +18,7 @@ use agens_core::HeadlessTurnCancellation;
 
 use crate::commands::auth::{run_production_auth_login, run_production_login_menu};
 use crate::commands::config::{create_configuration_file, create_global_configuration_file};
-use crate::commands::serve::DaemonStartupRequest;
+use crate::commands::serve::{DaemonStartupRequest, SkewPolicy};
 use crate::headless::run_production_headless_chat;
 use crate::tui::{TuiLaunch, run_production_tui};
 use agens_bootstrap::{Bootstrap, HostEnvironment};
@@ -37,6 +37,10 @@ type HeadlessChat = Box<
 >;
 type TuiLauncher = Box<dyn Fn(&Bootstrap, TuiLaunch) -> Result<String, CliError>>;
 type DaemonEnsurer = Box<dyn Fn(&Bootstrap, DaemonStartupRequest) -> Result<bool, CliError>>;
+/// Runs the attach handshake before an attached launch commits to the daemon
+/// on the socket. Answers the notice the launch should surface, or the refusal
+/// that blocks it.
+type DaemonBuildCheck = Box<dyn Fn(&Bootstrap, SkewPolicy) -> Result<Option<String>, CliError>>;
 type AuthLogin = Box<dyn Fn(&Path, bool, &HeadlessTurnCancellation) -> Result<String, CliError>>;
 /// Whether the process's standard input is attached to a terminal.
 ///
@@ -59,6 +63,7 @@ pub struct CliDependencies {
     pub(crate) headless_chat: HeadlessChat,
     pub(crate) tui_launcher: TuiLauncher,
     pub(crate) daemon_ensurer: DaemonEnsurer,
+    pub(crate) daemon_build_check: DaemonBuildCheck,
     pub(crate) auth_login: AuthLogin,
     pub(crate) stdin_is_terminal: StdinIsTerminal,
     pub(crate) login_menu: LoginMenu,
@@ -102,6 +107,7 @@ impl CliDependencies {
             headless_chat: Box::new(run_production_headless_chat),
             tui_launcher: Box::new(run_production_tui),
             daemon_ensurer: Box::new(crate::commands::serve::ensure_daemon_running),
+            daemon_build_check: Box::new(crate::commands::serve::check_daemon_build),
             auth_login: Box::new(run_production_auth_login),
             stdin_is_terminal: Box::new(|| std::io::stdin().is_terminal()),
             login_menu: Box::new(run_production_login_menu),
@@ -120,6 +126,7 @@ impl CliDependencies {
             headless_chat: Box::new(|_, _, _| Err(CliError::unavailable(UNAVAILABLE_MESSAGE))),
             tui_launcher: Box::new(|_, _| Err(CliError::unavailable(UNAVAILABLE_MESSAGE))),
             daemon_ensurer: Box::new(|_, _| Ok(false)),
+            daemon_build_check: Box::new(|_, _| Ok(None)),
             auth_login: Box::new(|_, _, _| Err(CliError::unavailable(UNAVAILABLE_MESSAGE))),
             stdin_is_terminal: Box::new(|| false),
             login_menu: Box::new(|_| Err(CliError::unavailable(UNAVAILABLE_MESSAGE))),
@@ -160,6 +167,18 @@ impl CliDependencies {
         ensurer: impl Fn(&Bootstrap) -> Result<bool, CliError> + 'static,
     ) -> Self {
         self.daemon_ensurer = Box::new(move |bootstrap, _| ensurer(bootstrap));
+        self
+    }
+
+    /// Replaces the attach handshake. The `bool` handed to the check is
+    /// whether the launch form may replace an idle daemon.
+    pub fn with_daemon_build_check(
+        mut self,
+        check: impl Fn(&Bootstrap, bool) -> Result<Option<String>, CliError> + 'static,
+    ) -> Self {
+        self.daemon_build_check = Box::new(move |bootstrap, policy| {
+            check(bootstrap, policy == SkewPolicy::RestartWhenIdle)
+        });
         self
     }
 

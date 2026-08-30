@@ -897,7 +897,10 @@ async fn the_daemon_reports_its_build_over_the_wire() {
 
     assert_eq!(build.wire_revision, agens_server::identity::WIRE_REVISION);
     assert_eq!(build.build, agens_server::identity::BUILD_STAMP);
-    assert_eq!(build.answering_chats, 0, "an idle daemon reports itself idle");
+    assert_eq!(
+        build.answering_chats, 0,
+        "an idle daemon reports itself idle"
+    );
 }
 
 /// A daemon mid-answer must never look idle to the handshake: idle is what

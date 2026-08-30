@@ -17,8 +17,10 @@ use agens_config::TeamSettings;
 use agens_core::HeadlessTurnCancellation;
 use agens_server::{CoordinatorSettings, PolicySettings, ServerError, TimerSettings};
 
+mod handshake;
 mod lifecycle;
 
+pub(crate) use handshake::SkewPolicy;
 pub(crate) use lifecycle::DaemonStartupRequest;
 
 use crate::CliDependencies;
@@ -36,6 +38,15 @@ pub(crate) fn ensure_daemon_running(
     request: DaemonStartupRequest,
 ) -> Result<bool, CliError> {
     lifecycle::ensure_running(bootstrap, request)
+}
+
+/// Runs the attach handshake against the machine's daemon, replacing or
+/// refusing it as the policy allows. Returns the notice a launch should show.
+pub(crate) fn check_daemon_build(
+    bootstrap: &Bootstrap,
+    policy: SkewPolicy,
+) -> Result<Option<String>, CliError> {
+    handshake::check(bootstrap, policy)
 }
 
 pub(crate) fn run_serve(

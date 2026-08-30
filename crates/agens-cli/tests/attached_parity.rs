@@ -354,3 +354,70 @@ fn explicit_local_does_not_start_or_connect_to_the_daemon() {
     assert_eq!(result.stdout, "mode=Local\n");
     assert_eq!(launches.lock().expect("launch lock").len(), 1);
 }
+
+/// The version handshake runs on every attached launch, and only the launch
+/// forms that start daemons may also replace one: the bare default and `team`
+/// pass restart authority, an explicit `--attach` never does, and `--local`
+/// talks to no daemon at all.
+#[test]
+fn the_build_handshake_runs_per_launch_form_with_the_right_authority() {
+    let checks = Arc::new(Mutex::new(Vec::<bool>::new()));
+    let observed = Arc::clone(&checks);
+    let dependencies = dependencies("handshake-forms")
+        .with_daemon_ensurer(|_| Ok(false))
+        .with_daemon_build_check(move |_, may_replace| {
+            observed.lock().expect("check lock").push(may_replace);
+            Ok(None)
+        })
+        .with_tui_launcher(|_, launch| Ok(format!("mode={:?}", launch.mode())));
+
+    let bare = execute(std::iter::empty::<&str>(), &dependencies);
+    let attach = execute(["--attach"], &dependencies);
+    let local = execute(["--local"], &dependencies);
+
+    assert_eq!(bare.stdout, "mode=Attached\n");
+    assert_eq!(attach.stdout, "mode=Attached\n");
+    assert_eq!(local.stdout, "mode=Local\n");
+    assert_eq!(
+        *checks.lock().expect("check lock"),
+        vec![true, false],
+        "the default launch may replace an idle daemon, --attach may not, --local never asks"
+    );
+}
+
+/// An incompatible daemon blocks the attach with the handshake's own report
+/// rather than letting the client reach a wire that answers it wrongly.
+#[test]
+fn a_refused_handshake_blocks_the_attach_with_its_report() {
+    let dependencies = dependencies("handshake-refused")
+        .with_daemon_ensurer(|_| Ok(false))
+        .with_daemon_build_check(|_, _| {
+            Err(CliError::unavailable(
+                "the daemon was built as 0.1.0+old and no longer speaks this client's wire",
+            ))
+        })
+        .with_tui_launcher(|_, _| panic!("a refused handshake must prevent the launch"));
+
+    let refused = execute(std::iter::empty::<&str>(), &dependencies);
+
+    assert_eq!(refused.status, ExitStatus::Unavailable);
+    assert!(refused.stderr.contains("0.1.0+old"), "{}", refused.stderr);
+}
+
+/// What the handshake did — replaced an idle daemon, or kept serving with a
+/// compatible older one — surfaces as the launch's startup notice.
+#[test]
+fn a_handshake_notice_reaches_the_launched_surface() {
+    let dependencies = dependencies("handshake-notice")
+        .with_daemon_ensurer(|_| Ok(false))
+        .with_daemon_build_check(|_, _| Ok(Some("replaced the idle daemon".to_owned())))
+        .with_tui_launcher(|_, launch| Ok(format!("notice={:?}", launch.startup_notice())));
+
+    let launched = execute(std::iter::empty::<&str>(), &dependencies);
+
+    assert!(
+        launched.stdout.contains("replaced the idle daemon"),
+        "{}",
+        launched.stdout
+    );
+}

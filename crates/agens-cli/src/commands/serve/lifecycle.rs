@@ -48,7 +48,7 @@ pub(crate) enum DaemonStartupRequest {
 ///
 /// A draft is not one of them: it is a run that was created and is waiting for
 /// a person to approve its plan, not for this process.
-const ACTIVE_STATES: [RunState; 4] = [
+pub(super) const ACTIVE_STATES: [RunState; 4] = [
     RunState::Queued,
     RunState::Running,
     RunState::AwaitingInput,
