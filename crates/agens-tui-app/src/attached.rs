@@ -1074,6 +1074,36 @@ mod tests {
         );
     }
 
+    /// When the daemon's window disagrees with what this client's own model
+    /// registry would say, the daemon's wins: the session's configuration
+    /// lives with the daemon, and two clients attached to it must render the
+    /// same gauge whatever they know locally.
+    #[test]
+    fn the_daemon_described_window_wins_over_the_client_registry() {
+        let locally_known = agens_models::context_window_for("gpt-4.1")
+            .expect("the client registry knows this model");
+        assert_ne!(locally_known, 10);
+
+        let arrival = Arrival {
+            session_id: 3,
+            landing: Landing::Opened,
+            history: Vec::new(),
+            presentation: HostedPresentation {
+                provider: Some("openai-api".to_owned()),
+                model: Some("gpt-4.1".to_owned()),
+                reasoning_effort: None,
+                context_window: Some(10),
+            },
+        };
+
+        let presentation = arrival_presentation(&arrival).expect("the daemon described the chat");
+        assert_eq!(
+            presentation,
+            agens_tui::TuiPresentation::new("openai-api", "gpt-4.1", "session #3")
+                .with_context_window(Some(10))
+        );
+    }
+
     /// A description without a provider still names the model, under the same
     /// placeholder provider local mode uses when none resolves.
     #[test]
