@@ -180,6 +180,12 @@ impl CoordinatorDiagnostics {
         });
     }
 
+    /// The data directory this daemon serves is gone, so the daemon is
+    /// stopping itself.
+    pub fn runtime_lost(&self, reason: &str, checks: usize) {
+        self.record(CoordinatorEvent::RuntimeLost { reason, checks });
+    }
+
     /// The service core was left poisoned, so the daemon is stopping.
     pub fn core_poisoned(&self, component: &str) {
         self.record(CoordinatorEvent::CorePoisoned { component });
