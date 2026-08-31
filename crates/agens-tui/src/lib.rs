@@ -44,7 +44,7 @@ use std::{
     io::{self, Stdout, Write},
     sync::{
         Arc,
-        atomic::{AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
         mpsc,
     },
     thread,
@@ -6369,6 +6369,28 @@ impl AttachmentToken {
     }
 }
 
+/// A request for the runtime to adopt a turn running somewhere else.
+///
+/// Shared rather than owned by the surface, because the thread that knows a
+/// turn started is not the one drawing: a terminal attached to a hosted chat
+/// learns from that chat's event stream that another client began a turn, and
+/// says so here. The runtime takes the request on its next pass and begins
+/// the adopted turn on the surface's own thread.
+#[derive(Clone, Debug, Default)]
+pub struct TuiAdoptionSignal(Arc<AtomicBool>);
+
+impl TuiAdoptionSignal {
+    /// Asks for the running turn to be adopted. Repeating it before the
+    /// runtime looks asks for one adoption, not several.
+    pub fn request(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    fn take(&self) -> bool {
+        self.0.swap(false, Ordering::SeqCst)
+    }
+}
+
 /// Small event engine shared by the terminal lifecycle and future TUI components.
 pub struct Tui<E> {
     engine: E,
@@ -6379,9 +6401,10 @@ pub struct Tui<E> {
     steering: Option<IntraTurnSteeringQueue>,
     busy_policy_routing: bool,
     /// Whether the runtime should adopt a turn that is already running
-    /// somewhere else — a hosted chat this surface attached to mid-turn —
+    /// somewhere else — a hosted chat this surface attached to mid-turn, or
+    /// one another client started a turn on while this surface sat idle —
     /// instead of waiting for a submission of its own.
-    adopted_turn_requested: bool,
+    adopted_turn_requested: TuiAdoptionSignal,
     /// Whether the active turn was adopted mid-run. An adopted turn's live
     /// body is only the tail of the answer — deltas published before the
     /// subscription opened were never seen — so its completed text wins.
@@ -6502,7 +6525,7 @@ where
             scheduler: AppState::new(queue_capacity),
             steering: None,
             busy_policy_routing: false,
-            adopted_turn_requested: false,
+            adopted_turn_requested: TuiAdoptionSignal::default(),
             adopted_live_turn: false,
             surface_focus: SurfaceFocus::Composer,
             queue_selected: None,
@@ -7109,12 +7132,23 @@ where
     /// Set before the runtime starts, taken once by it. The surface stays
     /// idle until the runtime begins the adopted turn on its own thread.
     pub fn adopt_running_turn(&mut self) {
-        self.adopted_turn_requested = true;
+        self.adopted_turn_requested.request();
+    }
+
+    /// Hands out the adoption request, for a thread that watches a chat this
+    /// surface is attached to.
+    ///
+    /// A turn another client starts on that chat is announced through this,
+    /// from off the surface's thread, and the runtime takes it on its next
+    /// pass — which is what lets an idle terminal adopt a turn it never
+    /// submitted.
+    pub fn adoption_signal(&self) -> TuiAdoptionSignal {
+        self.adopted_turn_requested.clone()
     }
 
     /// Takes a pending adoption request, at most once.
     pub fn take_adopted_turn_request(&mut self) -> bool {
-        std::mem::take(&mut self.adopted_turn_requested)
+        self.adopted_turn_requested.take()
     }
 
     /// Enters the running-turn state for a turn this process did not start.
@@ -13077,6 +13111,18 @@ where
     )
 }
 
+/// Whether the runtime should begin an adopted turn on this pass.
+///
+/// The request is always taken, so one asked for while this surface is
+/// already running a turn is dropped rather than starting a second follower
+/// beside it: the turn in flight owns the chat's event stream, and whatever
+/// asked will ask again once it is free.
+fn adoption_to_start<E: Engine>(tui: &mut Tui<E>) -> bool {
+    let requested = tui.take_adopted_turn_request();
+
+    requested && !tui.foreground_running()
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn run_with_default_progress_submit_with_permissions_task_controls_and_ask_user<
     E,
@@ -13150,27 +13196,31 @@ where
     let mut next_route_id = 0_u64;
     let mut active_route: Option<(u64, TuiRouteCancellation, bool)> = None;
 
-    // A turn that is already running somewhere else is adopted before the
-    // first frame, so its progress renders — and a question it is stopped on
-    // opens — without waiting for a submission from this surface.
-    if tui.take_adopted_turn_request() {
-        tui.begin_adopted_turn();
-        let generation = tui.active_generation();
-        let submit = Arc::clone(&submit);
-        let sender = sender.clone();
-        let metrics = metrics_sender.clone();
-        let completion_sender = completion_sender.clone();
-        thread::spawn(move || {
-            let adopted = Message {
-                role: Role::User,
-                parts: Vec::new(),
-            };
-            let outcome = submit(adopted, SubmitOrigin::Adopted, sender, metrics);
-            let _ = completion_sender.send((generation, outcome));
-        });
-    }
-
     loop {
+        // A turn running somewhere else is adopted whenever the request
+        // arrives: before the first frame for a surface that attached
+        // mid-turn, and mid-run for one sitting idle on a chat another
+        // client just started a turn on. Either way its progress renders —
+        // and a question it is stopped on opens — without a submission from
+        // this surface.
+        if adoption_to_start(tui) {
+            tui.begin_adopted_turn();
+            let generation = tui.active_generation();
+            let submit = Arc::clone(&submit);
+            let sender = sender.clone();
+            let metrics = metrics_sender.clone();
+            let completion_sender = completion_sender.clone();
+            thread::spawn(move || {
+                let adopted = Message {
+                    role: Role::User,
+                    parts: Vec::new(),
+                };
+                let outcome = submit(adopted, SubmitOrigin::Adopted, sender, metrics);
+                let _ = completion_sender.send((generation, outcome));
+            });
+            render_requested = true;
+        }
+
         let now = started.elapsed();
         let provider =
             drain_provider_channels(tui, &metrics_receiver, &receiver, &completion_receiver);
@@ -14416,6 +14466,50 @@ mod runtime_tests {
 
         tui.finish_provider_turn(TuiProviderOutcome::Completed("live".into()));
         assert!(!tui.has_live_work());
+    }
+
+    /// A surface sitting idle on a hosted chat adopts a turn another client
+    /// starts on it: the request arrives from the thread watching the chat's
+    /// event stream, through a signal cloned out of the surface, and the
+    /// runtime takes it on its next pass.
+    #[test]
+    fn an_adoption_requested_from_another_thread_reaches_the_surface() {
+        let mut tui = Tui::new(NoopEngine);
+        let signal = tui.adoption_signal();
+
+        assert!(!tui.take_adopted_turn_request());
+        signal.request();
+
+        assert!(adoption_to_start(&mut tui));
+        assert!(
+            !adoption_to_start(&mut tui),
+            "an adoption request is taken exactly once"
+        );
+    }
+
+    /// An adoption asked for while this surface is already running a turn is
+    /// dropped rather than started beside it. The turn in flight owns the
+    /// chat's event stream, and the watcher asks again once it is over.
+    #[test]
+    fn an_adoption_asked_for_during_a_local_turn_is_dropped() {
+        let mut tui = Tui::new(NoopEngine);
+        let signal = tui.adoption_signal();
+        tui.begin_message_submission(Message {
+            role: Role::User,
+            parts: vec![MessagePart::Text("what changed".into())],
+        });
+
+        signal.request();
+        assert!(!adoption_to_start(&mut tui));
+
+        tui.finish_provider_turn(TuiProviderOutcome::Completed("done".into()));
+        assert!(
+            !adoption_to_start(&mut tui),
+            "the dropped request is not held over the turn that dropped it"
+        );
+
+        signal.request();
+        assert!(adoption_to_start(&mut tui));
     }
 
     /// A surface that attached mid-turn missed the deltas published before its
