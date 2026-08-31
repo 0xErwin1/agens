@@ -8,12 +8,13 @@ use std::sync::{Arc, Mutex};
 
 use agens_config::{SubagentSettings, ToolLimitSettings};
 use agens_core::ask_user::{AskUserPort, UnavailableAskUserPort};
+use agens_core::coordination::CoordinationPort;
 use agens_core::run_introspection::RunIntrospectionPort;
 use agens_providers::OpenAiFunctionTool;
 use agens_tools::{
     AskTool, AskUserTool, CheckpointTool, NativeToolCatalog, NativeTools, SessionWorktrees,
     SkillCatalog, SkillResourceTool, TaskControlTool, TaskExecutionRegistry, TaskMessageSource,
-    TaskMessageTool, TaskRunner, ToolDispatcher, WorkingDirectory,
+    TaskMessageTool, TaskRunner, TeamTool, TeamVerb, ToolDispatcher, WorkingDirectory,
 };
 
 use crate::mcp::{
@@ -222,6 +223,7 @@ pub fn production_tool_runtime_for_parent_executing_run_with_ask_user(
             .map(|reference| diagnosed_working_directory(bootstrap, project_root, reference)),
         discovery_cancellation,
         run_introspection,
+        None,
     )
 }
 
@@ -330,6 +332,7 @@ pub fn production_tool_runtime_with_discovery_cancellation<R: TaskRunner>(
         working_directory,
         discovery_cancellation,
         None,
+        None,
     )
 }
 
@@ -359,6 +362,7 @@ pub fn production_tool_runtime_with_parent_task_runner_and_ask_user<R: TaskRunne
         ask_user,
         None,
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        None,
         None,
     )
 }
@@ -394,6 +398,53 @@ pub fn production_tool_runtime_with_run_introspection<R: TaskRunner>(
     discovery_cancellation: std::sync::Arc<std::sync::atomic::AtomicBool>,
     run_introspection: Option<RunIntrospectionFactory>,
 ) -> Result<(Vec<OpenAiFunctionTool>, SharedToolDispatcher), CliError> {
+    production_tool_runtime_with_team_surfaces(
+        bootstrap,
+        project_root,
+        skills,
+        parent_model,
+        parent_request_config,
+        model_resolution_reference,
+        task_runner,
+        ask_user,
+        working_directory,
+        discovery_cancellation,
+        run_introspection,
+        None,
+    )
+}
+
+/// Builds one coordination port per tool of the `team_*` group.
+///
+/// A factory for the same reason introspection needs one: the group is ten
+/// tools and a boxed trait object cannot be handed to all of them.
+pub type CoordinationFactory = Arc<dyn Fn() -> Box<dyn CoordinationPort> + Send + Sync>;
+
+/// Same as [`production_tool_runtime_with_run_introspection`], plus the
+/// coordination group a session that manages a team reports and instructs
+/// through.
+///
+/// Both factories are optional and independent. A worker executing a run gets
+/// the first and not the second; a manager gets the second and not the first,
+/// because a manager executes no run of its own. Everything else supplies
+/// neither, which is also what keeps the group away from a sub-agent: children
+/// build their own runtime through [`ProductionTaskRunner`], which has no
+/// factory to hand on.
+#[allow(clippy::too_many_arguments)]
+pub fn production_tool_runtime_with_team_surfaces<R: TaskRunner>(
+    bootstrap: &Bootstrap,
+    project_root: &Path,
+    skills: Option<&SkillCatalog>,
+    parent_model: String,
+    parent_request_config: agens_core::RequestConfig,
+    model_resolution_reference: Option<String>,
+    task_runner: R,
+    ask_user: Box<dyn AskUserPort>,
+    working_directory: Option<WorkingDirectory>,
+    discovery_cancellation: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    run_introspection: Option<RunIntrospectionFactory>,
+    coordination: Option<CoordinationFactory>,
+) -> Result<(Vec<OpenAiFunctionTool>, SharedToolDispatcher), CliError> {
     production_tool_runtime_inner(
         bootstrap,
         project_root,
@@ -406,6 +457,7 @@ pub fn production_tool_runtime_with_run_introspection<R: TaskRunner>(
         working_directory,
         discovery_cancellation,
         run_introspection,
+        coordination,
     )
 }
 
@@ -422,6 +474,7 @@ fn production_tool_runtime_inner<R: TaskRunner>(
     working_directory: Option<WorkingDirectory>,
     discovery_cancellation: std::sync::Arc<std::sync::atomic::AtomicBool>,
     run_introspection: Option<RunIntrospectionFactory>,
+    coordination: Option<CoordinationFactory>,
 ) -> Result<(Vec<OpenAiFunctionTool>, SharedToolDispatcher), CliError> {
     agens_callcount::note_tool_runtime_build();
 
@@ -558,6 +611,25 @@ fn production_tool_runtime_inner<R: TaskRunner>(
                 AskTool::new(build()),
             )
             .map_err(|_| CliError::configuration("tool catalog is invalid"))?;
+    }
+
+    if let Some(build) = coordination {
+        for verb in TeamVerb::ALL {
+            let name = verb.tool_name();
+
+            provider_tools.insert(
+                name.to_owned(),
+                OpenAiFunctionTool::new(name, verb.description(), verb.input_schema())
+                    .map_err(|_| CliError::configuration("coordination tools are unavailable"))?,
+            );
+            dispatcher
+                .register_native(
+                    format!("native::{name}"),
+                    verb.access(),
+                    TeamTool::new(verb, build()),
+                )
+                .map_err(|_| CliError::configuration("tool catalog is invalid"))?;
+        }
     }
 
     register_production_task_tool(
