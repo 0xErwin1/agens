@@ -304,6 +304,47 @@ pub(crate) fn root_shape_conflict(arguments: &[String]) -> Option<clap::Error> {
     None
 }
 
+/// `--resume`, `--local` and `--attach` configure the chat that bare
+/// `agens` opens. clap parses them next to a subcommand without complaint
+/// and the dispatcher would silently ignore them, so the combination is
+/// refused with the conflict error clap itself would render under
+/// `args_conflicts_with_subcommands` (that setting is not used because it
+/// also rewrites the usage line of every root error).
+pub(crate) fn subcommand_flag_conflict(parsed: &Cli) -> Option<clap::Error> {
+    let command = parsed.command.as_ref()?;
+
+    let flag = if parsed.resume.is_some() {
+        "--resume [<SESSION_ID>]"
+    } else if parsed.local {
+        "--local"
+    } else if parsed.attach {
+        "--attach"
+    } else {
+        return None;
+    };
+
+    let name = subcommand_name(command);
+    Some(Cli::command().error(
+        ErrorKind::ArgumentConflict,
+        format!("the subcommand '{name}' cannot be used with '{flag}'"),
+    ))
+}
+
+const fn subcommand_name(command: &Command) -> &'static str {
+    match command {
+        Command::Config { .. } => "config",
+        Command::Auth { .. } => "auth",
+        Command::Chat(_) => "chat",
+        Command::Models => "models",
+        Command::Attach { .. } => "attach",
+        Command::Team { .. } => "team",
+        Command::Serve { .. } => "serve",
+        Command::Sessions { .. } => "sessions",
+        Command::Direct { .. } => "direct",
+        Command::Version => "version",
+    }
+}
+
 fn unrecognized_argument_error(token: &str) -> clap::Error {
     Cli::command().error(
         ErrorKind::UnknownArgument,

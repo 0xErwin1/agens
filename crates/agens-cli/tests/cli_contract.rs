@@ -387,6 +387,44 @@ fn a_mistyped_fleet_operation_is_a_usage_error_not_a_chat() {
     }
 }
 
+/// `--resume`, `--local` and `--attach` configure the chat that bare `agens`
+/// opens. Next to a subcommand they used to parse and then be silently
+/// ignored; an invocation that says two things at once is refused instead.
+#[test]
+fn root_chat_flags_take_no_subcommand() {
+    let temporary = TemporaryDirectory::new("root-flags-no-subcommand");
+    let dependencies = base_dependencies(&temporary)
+        .with_tui_launcher(|_, _| panic!("a refused shape never launches the TUI"));
+
+    let cases: &[(&[&str], &str, &str)] = &[
+        (&["--local", "models"], "--local", "models"),
+        (&["--local", "chat", "hi"], "--local", "chat"),
+        (&["--attach", "sessions", "list"], "--attach", "sessions"),
+        (&["--attach", "team", "ls"], "--attach", "team"),
+        (
+            &["--resume", "42", "models"],
+            "--resume [<SESSION_ID>]",
+            "models",
+        ),
+        (&["--local", "version"], "--local", "version"),
+    ];
+
+    for (argv, flag, subcommand) in cases {
+        let result = execute(argv.iter().copied(), &dependencies);
+
+        assert_eq!(
+            result,
+            preformatted_failure(
+                ExitStatus::Usage,
+                format!(
+                    "error: the subcommand '{subcommand}' cannot be used with '{flag}'\n\nUsage: agens [OPTIONS] [COMMAND]\n\nFor more information, try '--help'.\n"
+                ),
+            ),
+            "argv {argv:?} must be refused as a usage error"
+        );
+    }
+}
+
 #[test]
 fn team_ls_reports_an_absent_daemon_without_starting_the_tui() {
     let temporary = TemporaryDirectory::new("team-ls-no-daemon");
