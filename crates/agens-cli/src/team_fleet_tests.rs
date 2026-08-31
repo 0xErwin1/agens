@@ -46,8 +46,13 @@ fn showing_a_chat_without_completed_turns_reports_its_state_instead_of_a_bare_he
 
         drop(runtime);
 
-        let output = run_team_show(&session_id.to_string(), false, &seed.dependencies())
-            .expect("the chat detail renders");
+        let output = run_team_show(
+            &session_id.to_string(),
+            false,
+            &seed.dependencies(),
+            &agens_core::HeadlessTurnCancellation::new(),
+        )
+        .expect("the chat detail renders");
 
         (session_id, output)
     });

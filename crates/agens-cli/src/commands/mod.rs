@@ -86,6 +86,7 @@ pub(crate) fn dispatch(
                 &operation[1],
                 matches!(operation.as_slice(), [_, _, follow] if follow == "--follow"),
                 dependencies,
+                cancellation,
             )
         }
         // Anything else is a mistyped fleet operation and is refused with

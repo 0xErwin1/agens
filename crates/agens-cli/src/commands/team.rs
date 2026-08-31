@@ -8,7 +8,9 @@ use agens_coordinator_client::{
     ChatClient, ClientError, Coordinator, FeedClient, HostedChatEvent, proto,
 };
 use agens_core::ask_user::AskUserRequest;
-use agens_core::{IntraTurnInputSource, Message, MessagePart, Role, TurnEvent};
+use agens_core::{
+    HeadlessTurnCancellation, IntraTurnInputSource, Message, MessagePart, Role, TurnEvent,
+};
 use agens_error::CliError;
 use agens_store::{OpenQuestionStatus, QuestionClass, QuestionStore, SessionStore};
 use serde::Serialize;
@@ -16,6 +18,28 @@ use tokio_stream::{Stream, StreamExt};
 
 use crate::CliDependencies;
 use crate::deps::bootstrap;
+
+/// Awaits the next event unless the reader interrupts first.
+///
+/// Following is read-only, so an interrupt ends it immediately: the reader
+/// asked to stop watching, and there is nothing in flight here to unwind.
+async fn cancellable<F, T>(cancellation: &HeadlessTurnCancellation, next: F) -> Option<T>
+where
+    F: std::future::Future<Output = Option<T>>,
+{
+    const POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+    tokio::pin!(next);
+    loop {
+        if cancellation.is_cancelled() {
+            return None;
+        }
+        match tokio::time::timeout(POLL, &mut next).await {
+            Ok(event) => return event,
+            Err(_) => continue,
+        }
+    }
+}
 
 const LIVE_RUN_STATES: &[&str] = &["queued", "running", "awaiting_input", "awaiting_quota"];
 
@@ -382,6 +406,7 @@ pub(crate) fn run_team_show(
     id: &str,
     follow: bool,
     dependencies: &CliDependencies,
+    cancellation: &HeadlessTurnCancellation,
 ) -> Result<String, CliError> {
     let bootstrap = bootstrap(dependencies)?;
     let socket = agens_server::socket_path(bootstrap.data_directory());
@@ -413,7 +438,9 @@ pub(crate) fn run_team_show(
 
                 write_follow(&output)?;
                 let mut events = feed.subscribe_to_run(run_id).await.map_err(client_error)?;
-                while let Some(event) = events.next().await {
+                // Following is a read: the first interrupt ends it here rather
+                // than leaving the reader watching a stream they asked to stop.
+                while let Some(event) = cancellable(cancellation, events.next()).await {
                     write_follow(&render_run_event(&event.map_err(client_error)?))?;
                 }
             }
@@ -447,7 +474,7 @@ pub(crate) fn run_team_show(
 
                 write_follow(&output)?;
                 let mut renderer = ChatFollowRenderer::new(session_id);
-                while let Some(event) = events.next().await {
+                while let Some(event) = cancellable(cancellation, events.next()).await {
                     let event = event.map_err(client_error)?;
                     write_follow(&renderer.render(&event))?;
                     if event == HostedChatEvent::Closed {
