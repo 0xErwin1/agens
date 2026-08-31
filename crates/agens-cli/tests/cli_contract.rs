@@ -356,6 +356,38 @@ fn team_and_attach_are_first_class_attached_entry_points() {
 }
 
 #[test]
+fn a_mistyped_fleet_operation_is_a_usage_error_not_a_chat() {
+    let temporary = TemporaryDirectory::new("team-fleet-usage");
+    let dependencies = base_dependencies(&temporary).with_tui_launcher(|_, _| {
+        panic!("a mistyped fleet operation is refused, never opened as a chat")
+    });
+
+    let mistyped: &[&[&str]] = &[
+        // A flag the parser swallowed into the prompt, like `agens team --local ls`.
+        &["team", "--local", "ls"],
+        &["team", "--json"],
+        // A fleet verb with the wrong arity.
+        &["team", "ls", "extra"],
+        &["team", "show"],
+        &["team", "show", "17", "--follow", "extra"],
+    ];
+
+    for argv in mistyped {
+        assert_eq!(
+            execute(argv.iter().copied(), &dependencies),
+            failure(
+                ExitStatus::Usage,
+                "usage: team fleet operations are `ls [--json]`, `show <id> [--follow]`, \
+                 `answer <question-id> <answer>`, `answer <chat-id> <prompt-id> <option-id>`, \
+                 `permission <chat-id> <prompt-id> <answer>`, `merge <approval-question-id>`, \
+                 and `cancel <id>`"
+            ),
+            "argv {argv:?} must be refused as a usage error"
+        );
+    }
+}
+
+#[test]
 fn team_ls_reports_an_absent_daemon_without_starting_the_tui() {
     let temporary = TemporaryDirectory::new("team-ls-no-daemon");
     let dependencies = base_dependencies(&temporary).with_tui_launcher(|_, _| {
