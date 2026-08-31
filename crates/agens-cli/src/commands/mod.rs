@@ -82,6 +82,22 @@ pub(crate) fn dispatch(
                 dependencies,
             )
         }
+        // A first token that looks like a flag, or a fleet verb whose
+        // arguments did not match any accepted form, is a mistyped fleet
+        // operation. Opening a chat with it as the prompt would silently
+        // swallow the mistake, so it is refused instead. A prompt whose first
+        // token is a plain word stays a chat prompt on purpose.
+        Some(cli::Command::Team { prompt })
+            if prompt.first().is_some_and(|first| {
+                first.starts_with('-')
+                    || matches!(
+                        first.as_str(),
+                        "ls" | "show" | "answer" | "permission" | "merge" | "cancel"
+                    )
+            }) =>
+        {
+            Err(CliError::usage(team::FLEET_USAGE))
+        }
         Some(cli::Command::Team { prompt }) => run_tui(
             dependencies,
             None,

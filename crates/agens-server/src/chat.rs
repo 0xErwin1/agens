@@ -783,15 +783,33 @@ impl ChatSessions {
     /// there, and the daemon's ids are assigned in the order the chats were
     /// opened, so the largest is the last one.
     ///
-    /// Scoped to a checkout, never listed whole: one daemon serves N projects,
-    /// and a terminal offered another project's conversation would be a
-    /// terminal that can attach to the wrong one.
+    /// Scoped to a checkout: one daemon serves N projects, and a terminal
+    /// offered another project's conversation would be a terminal that can
+    /// attach to the wrong one. The machine-wide view for the operator's
+    /// read-only board is [`Self::open_chats_snapshot`], and nothing attaches
+    /// through it.
     pub fn open_against(&self, checkout: &Path) -> Result<Vec<OpenChatSummary>, ChatError> {
+        self.summaries(|chat| chat.checkout == checkout)
+    }
+
+    /// Every open chat on the machine, newest first.
+    ///
+    /// This exists for the operator's fleet board and for nothing that
+    /// attaches: a terminal picking a conversation to join keeps going through
+    /// [`Self::open_against`], which is scoped to the checkout it sits in.
+    pub fn open_chats_snapshot(&self) -> Result<Vec<OpenChatSummary>, ChatError> {
+        self.summaries(|_| true)
+    }
+
+    fn summaries(
+        &self,
+        wanted: impl Fn(&OpenChat) -> bool,
+    ) -> Result<Vec<OpenChatSummary>, ChatError> {
         let open = self.locked()?;
 
         let mut chats = open
             .iter()
-            .filter(|(_, chat)| chat.checkout == checkout)
+            .filter(|(_, chat)| wanted(chat))
             .filter(|(session, _)| self.is_running(**session))
             .map(|(session, chat)| OpenChatSummary {
                 session_id: *session,

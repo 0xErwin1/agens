@@ -582,6 +582,26 @@ async fn every_team_rpc_reaches_the_core_over_a_unix_socket() {
     );
 }
 
+/// The fleet board asks the daemon which repositories it holds runs for,
+/// rather than any client-side list of project roots.
+#[tokio::test]
+async fn the_daemon_names_every_repository_it_holds_runs_for() {
+    let mut wire = wire_for(Principal::User).await;
+
+    let repos = wire
+        .feed
+        .repos(proto::ReposRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert_eq!(
+        repos.repo_ids,
+        vec![OTHER_REPO.to_owned(), REPO.to_owned()],
+        "every repository with a run is named, whichever project it belongs to"
+    );
+}
+
 #[tokio::test]
 async fn every_feed_rpc_reaches_the_core_over_a_unix_socket() {
     let mut wire = wire_for(Principal::User).await;

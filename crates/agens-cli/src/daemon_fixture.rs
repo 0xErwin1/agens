@@ -89,6 +89,29 @@ pub(crate) fn daemon_settings() -> CoordinatorSettings {
     }
 }
 
+/// Everything needed to rebuild the fixture's `CliDependencies` on another
+/// thread. The dependencies themselves hold non-`Send` closures, so a test
+/// that runs a CLI command against the daemon from a client thread rebuilds
+/// them there from this seed instead of moving them across.
+#[derive(Clone)]
+pub(crate) struct CliDependencySeed {
+    current_directory: PathBuf,
+    home_directory: PathBuf,
+    environment: BTreeMap<String, String>,
+    files: BTreeMap<PathBuf, String>,
+}
+
+impl CliDependencySeed {
+    pub(crate) fn dependencies(&self) -> CliDependencies {
+        CliDependencies::for_test(
+            self.current_directory.clone(),
+            Some(self.home_directory.clone()),
+            self.environment.clone(),
+            self.files.clone(),
+        )
+    }
+}
+
 /// A daemon composed the way `agens serve` composes one, with a scripted model
 /// where the provider would be.
 pub(crate) struct DaemonFixture {
@@ -102,6 +125,8 @@ pub(crate) struct DaemonFixture {
     pub(crate) provider: ScriptedProvider,
     pub(crate) socket: PathBuf,
     pub(crate) shutdown: HeadlessTurnCancellation,
+    /// Rebuilds the `CliDependencies` this daemon was bootstrapped from.
+    pub(crate) dependency_seed: CliDependencySeed,
     bootstrap: Bootstrap,
     settings: CoordinatorSettings,
 }
@@ -138,17 +163,17 @@ impl DaemonFixture {
         let provider = ScriptedProvider::start(ScriptedDialect::Responses, script);
         let base_url = provider.base_url();
 
-        let dependencies = CliDependencies::for_test(
-            checkout.clone(),
-            Some(root.join("home")),
-            BTreeMap::from([
+        let dependency_seed = CliDependencySeed {
+            current_directory: checkout.clone(),
+            home_directory: root.join("home"),
+            environment: BTreeMap::from([
                 (
                     "AGENS_CONFIG_HOME".to_owned(),
                     config_home.display().to_string(),
                 ),
                 ("OPENAI_API_KEY".to_owned(), "test-key".to_owned()),
             ]),
-            BTreeMap::from([
+            files: BTreeMap::from([
                 (
                     config_home.join("config.toml"),
                     format!(
@@ -162,7 +187,8 @@ impl DaemonFixture {
                     r#"{"openai-api": {"api_key": "fixture"}}"#.to_owned(),
                 ),
             ]),
-        );
+        };
+        let dependencies = dependency_seed.dependencies();
         let bootstrap = bootstrap(&dependencies).expect("the production bootstrap is valid");
 
         // The daemon serves the checkouts its operator wrote down, and nothing
@@ -181,6 +207,7 @@ impl DaemonFixture {
             provider,
             socket,
             shutdown: HeadlessTurnCancellation::new(),
+            dependency_seed,
             bootstrap,
             settings,
         }

@@ -70,6 +70,20 @@ impl FeedClient {
         Ok(events.map(|event| event.map_err(ClientError::Refused)))
     }
 
+    /// Every repository the daemon holds runs for, in repository-id order.
+    ///
+    /// How a fleet surface learns which projects exist: a repository is here
+    /// because somebody created a run against it, never because a client
+    /// configured it in advance. Each one is then read through [`Self::tree`].
+    pub async fn repos(&mut self) -> Result<Vec<String>, ClientError> {
+        Ok(self
+            .inner
+            .repos(proto::ReposRequest {})
+            .await?
+            .into_inner()
+            .repo_ids)
+    }
+
     /// The tree of runs one repository has.
     pub async fn tree(&mut self, repo_id: &str) -> Result<proto::TreeSnapshot, ClientError> {
         Ok(self

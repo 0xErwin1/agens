@@ -848,21 +848,56 @@ async fn a_chat_that_is_answering_says_so_in_the_listing() {
     assert!(open.chats[0].answering);
 }
 
-/// A listing that names no checkout would be a listing across every project on
-/// the machine.
+/// A listing that names no checkout is the operator's read-only board: every
+/// open chat on the machine, newest first, each row carrying its own checkout.
+///
+/// The required checkout everywhere else is attach safety — a terminal offered
+/// another project's conversation can attach to the wrong one. Nothing
+/// attaches through this listing, so it may span projects.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_listing_that_names_no_checkout_is_refused() {
-    let mut wire = wire("unscoped-list").await;
+async fn a_listing_that_names_no_checkout_is_every_open_chat_on_the_machine() {
+    let mut wire = wire("machine-wide-list").await;
 
-    let refused = wire
+    let first = wire
+        .client
+        .open(Request::new(open_request("/projects/agens")))
+        .await
+        .expect("the first chat opens")
+        .into_inner();
+    // The scripted factory mints session 1 for a bare open, so the second
+    // chat names its own id to exist beside the first.
+    let second = wire
+        .client
+        .open(Request::new(proto::OpenChatRequest {
+            checkout: "/projects/something-else".to_owned(),
+            resume: Some(2),
+        }))
+        .await
+        .expect("the second chat opens")
+        .into_inner();
+
+    let everywhere = wire
         .client
         .list(Request::new(proto::ListChatsRequest {
             checkout: String::new(),
         }))
         .await
-        .expect_err("a listing names its checkout");
+        .expect("the machine-wide listing is served")
+        .into_inner();
 
-    assert_eq!(refused.code(), Code::InvalidArgument);
+    let rows: Vec<(i64, String)> = everywhere
+        .chats
+        .into_iter()
+        .map(|chat| (chat.session_id, chat.checkout))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            (second.session_id, "/projects/something-else".to_owned()),
+            (first.session_id, "/projects/agens".to_owned()),
+        ],
+        "every open chat is listed newest first, each with its own checkout"
+    );
 }
 
 /// A terminal that comes back draws the conversation it left rather than an

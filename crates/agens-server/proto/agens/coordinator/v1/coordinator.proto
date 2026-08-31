@@ -355,10 +355,23 @@ message InboxView {
   repeated InboxItem items = 2;
 }
 
+message ReposRequest {}
+
+// Every repository this daemon holds runs for.
+//
+// The one unscoped listing on this plane, and deliberately so: it names
+// repositories rather than runs, and exists so the operator's fleet board can
+// enumerate what the daemon actually hosts instead of a pre-declared list.
+// Runs themselves stay behind the repository-scoped `Tree`.
+message RepoList {
+  repeated string repo_ids = 1;
+}
+
 // The read plane. Nothing here writes, so a reader cannot see a state that
 // never happened and cannot cause one either.
 service Feed {
   rpc Subscribe(EventFilter) returns (stream Event);
+  rpc Repos(ReposRequest) returns (RepoList);
   rpc Tree(TreeRequest) returns (TreeSnapshot);
   rpc RunDetail(RunDetailRequest) returns (RunView);
   rpc Inbox(InboxRequest) returns (InboxView);
@@ -601,8 +614,11 @@ message ChatRef {
 message ChatAck {}
 
 message ListChatsRequest {
-  // Required. One daemon serves N projects, and a terminal offered another
-  // project's conversation is a terminal that can attach to the wrong one.
+  // Scopes the listing to one checkout. One daemon serves N projects, and a
+  // terminal offered another project's conversation is a terminal that can
+  // attach to the wrong one, so anything that attaches names its checkout.
+  // Empty means every open chat on the machine: the operator's read-only
+  // board, through which nothing attaches.
   string checkout = 1;
 }
 

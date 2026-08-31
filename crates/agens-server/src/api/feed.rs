@@ -94,6 +94,18 @@ pub struct InboxView {
 }
 
 impl ApiCore {
+    /// Every repository this daemon holds runs for, in repository-id order.
+    ///
+    /// The one unscoped listing on this plane: it names repositories rather
+    /// than runs, so the operator's fleet board can enumerate what the daemon
+    /// actually hosts and then read each repository through [`Self::tree`].
+    /// It shares the tree's authorization because it is the tree's preflight.
+    pub fn repos(&mut self, principal: Principal, now: i64) -> Result<Vec<String>, ApiError> {
+        self.authorize(Operation::Tree, principal, None, now)?;
+
+        Ok(self.machines.store().run_repo_ids()?)
+    }
+
     /// Every run of one repository.
     pub fn tree(
         &mut self,

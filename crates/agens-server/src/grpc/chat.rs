@@ -388,20 +388,27 @@ impl Chat for ChatFacade {
         Ok(Response::new(proto::ChatAck {}))
     }
 
-    /// What is already open for a checkout, newest first.
+    /// What is already open for a checkout, newest first — or every open chat
+    /// on the machine when no checkout is named.
     ///
-    /// The checkout is required for the reason every listing on this facade
-    /// requires one: a daemon serves N projects, and a terminal offered another
-    /// project's conversation is a terminal that can attach to the wrong one.
+    /// The scoped form exists for attach safety: a daemon serves N projects,
+    /// and a terminal offered another project's conversation is a terminal
+    /// that can attach to the wrong one. The unscoped form is the operator's
+    /// read-only board, and nothing attaches through it.
     async fn list(
         &self,
         request: Request<proto::ListChatsRequest>,
     ) -> Result<Response<proto::OpenChats>, Status> {
-        let checkout = checkout(request.into_inner().checkout)?;
+        let checkout = request.into_inner().checkout;
 
-        let chats = self
-            .off_runtime(move |chats| chats.open_against(&checkout))
-            .await?;
+        let chats = if checkout.is_empty() {
+            self.off_runtime(|chats| chats.open_chats_snapshot())
+                .await?
+        } else {
+            let checkout = PathBuf::from(checkout);
+            self.off_runtime(move |chats| chats.open_against(&checkout))
+                .await?
+        };
 
         Ok(Response::new(proto::OpenChats {
             chats: chats

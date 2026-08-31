@@ -288,6 +288,32 @@ impl ChatClient {
             .collect())
     }
 
+    /// Every open chat on the machine, newest first, each with its checkout.
+    ///
+    /// This is the operator's read-only fleet board and nothing else: a
+    /// terminal picking a conversation to join keeps going through
+    /// [`Self::open_against`], which is scoped to the checkout it sits in so
+    /// it cannot attach to another project's conversation.
+    pub async fn open_everywhere(&mut self) -> Result<Vec<OpenChat>, ClientError> {
+        let chats = self
+            .inner
+            .list(proto::ListChatsRequest {
+                checkout: String::new(),
+            })
+            .await?
+            .into_inner();
+
+        Ok(chats
+            .chats
+            .into_iter()
+            .map(|chat| OpenChat {
+                session_id: chat.session_id,
+                checkout: PathBuf::from(chat.checkout),
+                answering: chat.answering,
+            })
+            .collect())
+    }
+
     /// Sends a prompt and returns as soon as the daemon has somewhere to run it.
     ///
     /// What the turn does arrives on [`Self::subscribe`], never here. A client
