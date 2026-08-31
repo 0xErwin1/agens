@@ -203,6 +203,23 @@ impl Conversation {
         }
     }
 
+    /// Whether this is a prompt nothing has answered.
+    ///
+    /// The last exchange of a chat reads this way while the turn answering it
+    /// is still running — somewhere else, for a surface reading a chat back at
+    /// adoption — so the prompt belongs to the live turn rather than to the
+    /// finished conversation above it.
+    #[must_use]
+    pub fn is_unanswered(&self) -> bool {
+        self.final_markdown.is_none()
+            && self.live_markdown.is_empty()
+            && self.reasoning.is_empty()
+            && self.tool_batches.is_empty()
+            && self.diffs.is_empty()
+            && self.errors.is_empty()
+            && self.subagent_cards.is_empty()
+    }
+
     /// Reconstructs completed conversations from persisted messages.
     ///
     /// Restored tool calls degrade `parsed` to [`ToolInput::Other`] since no

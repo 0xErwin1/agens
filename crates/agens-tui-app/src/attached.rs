@@ -25,8 +25,10 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
+use std::thread;
+use std::time::Duration;
 
 use agens_bootstrap::Bootstrap;
 use agens_coordinator_client::{
@@ -43,7 +45,8 @@ use agens_core::{
 use agens_error::{CliError, ExitStatus};
 use agens_session::context::SessionContext;
 use agens_tui::{
-    Engine, Tui, TuiAskUserBridge, TuiPermissionBridge, TuiPermissionReply,
+    AdoptedTurnPrelude, Engine, Tui, TuiAdoptionSignal, TuiAskUserBridge, TuiPermissionBridge,
+    TuiPermissionReply,
     run_with_default_progress_submit_with_permissions_task_controls_and_ask_user,
 };
 use tokio::runtime::Runtime;
@@ -67,12 +70,114 @@ fn control_command_id(session: i64, nonce: u64, sequence: u64) -> String {
     format!("attached-tui-{session}-{nonce}-{sequence}")
 }
 
+/// How long the idle watcher parks on the event stream before letting go of
+/// it. Long enough that watching costs nothing, short enough that a turn this
+/// terminal starts is not kept waiting for the stream it needs.
+const WATCH_PARK: Duration = Duration::from_millis(100);
+
+/// Who may take events off the chat's one event stream.
+///
+/// The stream has exactly one consumer at a time. While no turn is being
+/// followed the idle watcher parks on it, and the event that ends that park is
+/// handed to the turn that adopts it rather than acted on by the watcher — so
+/// the follower sees the turn's first event and the watcher never drains a
+/// turn beside it.
+#[derive(Debug, Default)]
+struct StreamHandoff {
+    /// Whether a turn is being followed. The watcher stays off the stream for
+    /// as long as this holds.
+    claimed: AtomicBool,
+    /// The oldest unhandled event, left by the watcher for the follower.
+    pending: Mutex<Option<HostedChatEvent>>,
+}
+
+impl StreamHandoff {
+    /// Takes the stream for a turn about to be followed.
+    fn claim(&self) {
+        self.claimed.store(true, Ordering::SeqCst);
+    }
+
+    /// Takes the stream for a turn, and gives it back however that turn ends
+    /// — including on a refusal that never reached the stream, which would
+    /// otherwise leave the chat unwatched for the rest of the attachment.
+    fn claim_for_turn(&self) -> StreamRelease<'_> {
+        self.claim();
+
+        StreamRelease(self)
+    }
+
+    /// Gives the stream back to the watcher, whichever way the turn ended.
+    fn release(&self) {
+        self.claimed.store(false, Ordering::SeqCst);
+    }
+
+    fn is_claimed(&self) -> bool {
+        self.claimed.load(Ordering::SeqCst)
+    }
+
+    /// Leaves the event that ended a park for the follower, and takes the
+    /// stream out of the watcher's hands in the same step.
+    fn hand_over(&self, event: HostedChatEvent) {
+        if let Ok(mut pending) = self.pending.lock() {
+            *pending = Some(event);
+        }
+        self.claim();
+    }
+
+    fn take_pending(&self) -> Option<HostedChatEvent> {
+        self.pending
+            .lock()
+            .ok()
+            .and_then(|mut pending| pending.take())
+    }
+}
+
+/// Gives the event stream back to the idle watcher when a turn stops
+/// following it, on every exit path a turn has.
+struct StreamRelease<'a>(&'a StreamHandoff);
+
+impl Drop for StreamRelease<'_> {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
+/// What the surface says about a turn it adopted but cannot explain: the
+/// chat could not be read back, or the prompt is not stored yet.
+const FOREIGN_TURN_NOTICE: &str = "another client started a turn on this chat";
+
+/// What the surface needs to open a turn started elsewhere, from the chat as
+/// the daemon holds it.
+///
+/// The whole conversation rather than a computed tail: which part of it this
+/// terminal has already drawn is the surface's own question, and it is the one
+/// that knows. A read that failed still carries the notice, so the answer
+/// never arrives with nothing above it.
+fn adoption_prelude(history: Result<Vec<Message>, CliError>) -> AdoptedTurnPrelude {
+    AdoptedTurnPrelude::catching_up(history.unwrap_or_default(), FOREIGN_TURN_NOTICE)
+}
+
+/// Whether an event arriving while this terminal is idle means a turn is
+/// running for the surface to adopt.
+///
+/// A chat that ended has no turn to adopt, and reporting it as a turn that
+/// failed mid-answer would describe something that never ran here.
+const fn announces_running_turn(event: &HostedChatEvent) -> bool {
+    !matches!(event, HostedChatEvent::Closed)
+}
+
 /// The connection the terminal holds while it is attached.
 ///
 /// The event stream is opened once and drained per turn rather than
 /// resubscribed per prompt. A subscription is live from the moment it opens, so
 /// opening one after sending the prompt is a race the client loses by missing
 /// the turn's first events.
+///
+/// Between this terminal's own turns the stream is watched rather than left
+/// unread, because a turn another client starts on this chat is published on
+/// it too. Watching and following take turns on the one subscription: opening
+/// a second one would split a chat's events across two readers, and neither
+/// would see the whole turn.
 struct Attachment {
     runtime: Arc<Runtime>,
     chat: Mutex<ChatClient>,
@@ -86,6 +191,12 @@ struct Attachment {
     permissions: TuiPermissionBridge,
     ask_user: TuiAskUserBridge,
     staging: Arc<Mutex<SessionContext>>,
+    /// Who owns the event stream right now, and what the last park left for
+    /// the follower.
+    handoff: StreamHandoff,
+    /// Whether this attachment is over. The watcher stops on it rather than
+    /// outliving the surface it was watching for.
+    detached: AtomicBool,
 }
 
 impl Attachment {
@@ -108,6 +219,9 @@ impl Attachment {
         progress: &Sender<TurnEvent>,
     ) -> Result<String, CliError> {
         let asking = HeadlessTurnCancellation::new();
+        // Claimed before the stream is locked, so the idle watcher stops
+        // parking on it and this turn is not kept waiting behind a park.
+        let _stream = self.handoff.claim_for_turn();
         let mut chat = self
             .chat
             .lock()
@@ -134,8 +248,14 @@ impl Attachment {
     /// waiting on the stream it subscribed to. Following them from here is
     /// what makes the arrival read as if this terminal had been attached all
     /// along.
+    ///
+    /// A terminal that was already attached and idle when another client
+    /// started a turn adopts it the same way: the watcher's park ended on
+    /// that turn's first event, which is waiting in the handoff for this to
+    /// follow.
     fn adopt_turn(&self, progress: &Sender<TurnEvent>) -> Result<String, CliError> {
         let asking = HeadlessTurnCancellation::new();
+        let _stream = self.handoff.claim_for_turn();
         let mut chat = self
             .chat
             .lock()
@@ -158,6 +278,14 @@ impl Attachment {
         asking: &HeadlessTurnCancellation,
         progress: &Sender<TurnEvent>,
     ) -> Result<String, CliError> {
+        // The event the idle watcher's park ended on is the oldest unhandled
+        // one on this stream, so it is followed before anything read here.
+        if let Some(event) = self.handoff.take_pending()
+            && let Some(text) = self.handle_event(event, chat, asking, progress)?
+        {
+            return Ok(text);
+        }
+
         loop {
             let event = self
                 .runtime
@@ -165,59 +293,147 @@ impl Attachment {
                 .ok_or_else(|| unavailable("the daemon stopped publishing this chat"))?
                 .map_err(refused)?;
 
-            match event {
-                HostedChatEvent::Progress(event) => {
-                    // A surface that has gone away is not a turn that has to
-                    // stop. The daemon is running it either way, and all this
-                    // client does about it is stop forwarding.
-                    if progress.send(event).is_err() {
-                        return Err(unavailable("the terminal stopped listening"));
-                    }
-                }
-                HostedChatEvent::PermissionAsked(question) => {
-                    // Answered on this thread, which is the one draining the
-                    // stream. The daemon's turn is stopped on the question, so
-                    // there is nothing else on this chat to miss while a person
-                    // decides — and the surface is drawing the overlay from its
-                    // own thread meanwhile.
-                    let decision = self.decide(&question, asking);
-
-                    self.runtime
-                        .block_on(chat.answer_permission(
-                            self.session_id,
-                            question.prompt_id,
-                            decision,
-                        ))
-                        .map_err(refused)?;
-                }
-                HostedChatEvent::AskUserAsked { prompt_id, request } => {
-                    let reply = self.ask_user.wait_for_reply(request, None, asking);
-
-                    // A question someone else already resolved — through the
-                    // fleet console, or replayed from before a reattach — is
-                    // not this turn failing. The daemon says which it was, and
-                    // the turn's remaining events are still coming.
-                    match self.runtime.block_on(chat.answer_ask_user(
-                        self.session_id,
-                        prompt_id,
-                        reply,
-                    )) {
-                        Ok(()) => {}
-                        Err(error) if error.refused_precondition() => {}
-                        Err(error) => return Err(refused(error)),
-                    }
-                }
-                HostedChatEvent::TurnCompleted { text } => return Ok(text),
-                HostedChatEvent::TurnFailed { detail } => {
-                    return Err(CliError::new(ExitStatus::Failure, "provider", detail));
-                }
-                HostedChatEvent::Closed => {
-                    return Err(unavailable(
-                        "the chat was closed while the turn was running",
-                    ));
-                }
+            if let Some(text) = self.handle_event(event, chat, asking, progress)? {
+                return Ok(text);
             }
         }
+    }
+
+    /// Handles one event of the turn being followed, reporting the turn's
+    /// answer when that event was its end.
+    fn handle_event(
+        &self,
+        event: HostedChatEvent,
+        chat: &mut ChatClient,
+        asking: &HeadlessTurnCancellation,
+        progress: &Sender<TurnEvent>,
+    ) -> Result<Option<String>, CliError> {
+        match event {
+            HostedChatEvent::Progress(event) => {
+                // A surface that has gone away is not a turn that has to
+                // stop. The daemon is running it either way, and all this
+                // client does about it is stop forwarding.
+                if progress.send(event).is_err() {
+                    return Err(unavailable("the terminal stopped listening"));
+                }
+            }
+            HostedChatEvent::PermissionAsked(question) => {
+                // Answered on this thread, which is the one draining the
+                // stream. The daemon's turn is stopped on the question, so
+                // there is nothing else on this chat to miss while a person
+                // decides — and the surface is drawing the overlay from its
+                // own thread meanwhile.
+                let decision = self.decide(&question, asking);
+
+                self.runtime
+                    .block_on(chat.answer_permission(self.session_id, question.prompt_id, decision))
+                    .map_err(refused)?;
+            }
+            HostedChatEvent::AskUserAsked { prompt_id, request } => {
+                let reply = self.ask_user.wait_for_reply(request, None, asking);
+
+                // A question someone else already resolved — through the
+                // fleet console, or replayed from before a reattach — is
+                // not this turn failing. The daemon says which it was, and
+                // the turn's remaining events are still coming.
+                match self
+                    .runtime
+                    .block_on(chat.answer_ask_user(self.session_id, prompt_id, reply))
+                {
+                    Ok(()) => {}
+                    Err(error) if error.refused_precondition() => {}
+                    Err(error) => return Err(refused(error)),
+                }
+            }
+            HostedChatEvent::TurnCompleted { text } => return Ok(Some(text)),
+            HostedChatEvent::TurnFailed { detail } => {
+                return Err(CliError::new(ExitStatus::Failure, "provider", detail));
+            }
+            HostedChatEvent::Closed => {
+                return Err(unavailable(
+                    "the chat was closed while the turn was running",
+                ));
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Watches the chat while this terminal has no turn of its own in flight.
+    ///
+    /// A turn another client starts — the fleet console, a second terminal, a
+    /// supervisor — publishes onto the subscription this terminal already
+    /// holds, and nothing drains it while the surface is idle. Parking on it
+    /// here is what lets the surface hear about that turn: the first event of
+    /// it asks the surface to adopt, and the turn then renders, asks and
+    /// cancels exactly as one this terminal started.
+    ///
+    /// The stream keeps one consumer throughout. The watcher takes it only
+    /// while no turn is being followed, and hands both the stream and the
+    /// event that ended its park to the follower rather than reading on.
+    fn watch_while_idle(&self, adoption: &TuiAdoptionSignal) {
+        while !self.detached.load(Ordering::SeqCst) {
+            if self.handoff.is_claimed() {
+                thread::sleep(WATCH_PARK);
+                continue;
+            }
+
+            // A stream a turn still holds is not waited on: this thread has to
+            // stay free to notice the attachment ending.
+            let Ok(mut events) = self.events.try_lock() else {
+                thread::sleep(WATCH_PARK);
+                continue;
+            };
+
+            let parked = self
+                .runtime
+                .block_on(async { tokio::time::timeout(WATCH_PARK, events.next()).await });
+            drop(events);
+
+            match parked {
+                // Nothing yet. Letting go of the stream between parks is what
+                // keeps a turn this terminal starts from waiting on it.
+                Err(_elapsed) => continue,
+                Ok(Some(Ok(event))) => {
+                    if !announces_running_turn(&event) {
+                        return;
+                    }
+
+                    self.handoff.hand_over(event);
+                    adoption.request(adoption_prelude(self.conversation_so_far()));
+                }
+                // The chat ended, or the stream did. A turn started from here
+                // reports that when it next asks the stream for anything;
+                // there is nothing for an idle surface to adopt.
+                Ok(None | Some(Err(_))) => return,
+            }
+        }
+    }
+
+    /// Reads the chat back, the way attaching to it does.
+    ///
+    /// A turn started elsewhere is answering a prompt that arrived after this
+    /// terminal last read the chat, so the surface has to be handed the
+    /// conversation again to draw what it is missing.
+    ///
+    /// The client is taken rather than waited for: a turn already holds it for
+    /// as long as it runs, and an adoption that queued behind one would be
+    /// announcing a turn nobody is going to adopt.
+    fn conversation_so_far(&self) -> Result<Vec<Message>, CliError> {
+        let mut chat = self
+            .chat
+            .try_lock()
+            .map_err(|_| unavailable("the connection to the daemon is busy"))?;
+
+        self.runtime
+            .block_on(chat.history(self.session_id))
+            .map_err(refused)
+    }
+
+    /// Ends this attachment's watching, so the watcher does not outlive the
+    /// surface it was watching for.
+    fn detach(&self) {
+        self.detached.store(true, Ordering::SeqCst);
     }
 }
 
@@ -585,6 +801,15 @@ fn attach_and_run(
         tui.adopt_running_turn();
     }
 
+    // What an idle terminal would otherwise never hear: a turn another client
+    // starts on this chat publishes onto the subscription already open, and
+    // nobody drains it between this terminal's own turns. The watcher parks on
+    // it and hands the first event of such a turn to the surface to adopt.
+    let watcher = Arc::clone(&attachment);
+    let attached = Arc::clone(&attachment);
+    let adoption = tui.adoption_signal();
+    let watching = thread::spawn(move || watcher.watch_while_idle(&adoption));
+
     let permissions = attachment.permissions.clone();
     let asks = attachment.ask_user.clone();
     let route_router = router.clone();
@@ -592,7 +817,7 @@ fn attach_and_run(
     let cancel_router = router.clone();
     let cancel_all_router = router.clone();
     let message_router = router.clone();
-    run_with_default_progress_submit_with_permissions_task_controls_and_ask_user(
+    let outcome = run_with_default_progress_submit_with_permissions_task_controls_and_ask_user(
         &mut tui,
         move |request, progress, cancellation| {
             route_router.route_attached_request(request, progress, cancellation)
@@ -612,8 +837,14 @@ fn attach_and_run(
         move |id, message| message_router.attached_send_task_message(id, message),
         Some((permissions, permission_requests)),
         Some((asks, ask_user_requests)),
-    )
-    .map_err(|error| CliError::new(ExitStatus::Failure, "ui", error.to_string()))?;
+    );
+
+    // Ended before the result is reported, so a `/cd` to another checkout does
+    // not leave a thread parked on the chat this one is leaving.
+    attached.detach();
+    let _ = watching.join();
+
+    outcome.map_err(|error| CliError::new(ExitStatus::Failure, "ui", error.to_string()))?;
 
     Ok(String::new())
 }
@@ -826,6 +1057,8 @@ fn attach(
             permissions,
             ask_user,
             staging,
+            handoff: StreamHandoff::default(),
+            detached: AtomicBool::new(false),
         },
         engine,
         arrival,
@@ -1308,6 +1541,109 @@ mod tests {
             refused(ClientError::NotRunning("nobody on the socket".into())).category,
             "unavailable",
         );
+    }
+
+    /// The chat's one event stream keeps one consumer. The event that ended
+    /// the idle watcher's park is handed to the turn that adopts it rather
+    /// than acted on by the watcher, and the watcher stays off the stream
+    /// until that turn releases it.
+    #[test]
+    fn the_watcher_hands_the_stream_and_its_first_event_to_the_adopted_turn() {
+        let handoff = StreamHandoff::default();
+        assert!(!handoff.is_claimed());
+
+        handoff.hand_over(HostedChatEvent::TurnCompleted {
+            text: "elsewhere".to_owned(),
+        });
+        assert!(
+            handoff.is_claimed(),
+            "handing an event over claims the stream, so the watcher stops reading it"
+        );
+
+        assert_eq!(
+            handoff.take_pending(),
+            Some(HostedChatEvent::TurnCompleted {
+                text: "elsewhere".to_owned()
+            })
+        );
+        assert_eq!(
+            handoff.take_pending(),
+            None,
+            "the handed-over event is followed exactly once"
+        );
+
+        handoff.release();
+        assert!(!handoff.is_claimed());
+    }
+
+    /// A turn this terminal starts claims the stream for itself, so a watcher
+    /// parked on it steps back rather than draining that turn beside it. The
+    /// claim is given back however the turn ends — including when it never
+    /// reached the stream at all, which would otherwise leave the chat
+    /// unwatched for the rest of the attachment.
+    #[test]
+    fn a_local_turn_claims_the_stream_and_gives_it_back_however_it_ends() {
+        let handoff = StreamHandoff::default();
+        {
+            let _claim = handoff.claim_for_turn();
+            assert!(handoff.is_claimed());
+        }
+        assert!(!handoff.is_claimed());
+
+        let refused_before_it_reached_the_stream = || {
+            let _claim = handoff.claim_for_turn();
+            Err::<(), &str>("the daemon refused the prompt")
+        };
+        assert!(refused_before_it_reached_the_stream().is_err());
+        assert!(!handoff.is_claimed());
+    }
+
+    /// A turn another client started is adopted under the prompt it answers,
+    /// so the surface is handed the chat as the daemon holds it and draws
+    /// whatever it is missing.
+    #[test]
+    fn an_adoption_carries_the_chat_for_the_surface_to_catch_up_on() {
+        let history = vec![Message {
+            role: agens_core::Role::User,
+            parts: vec![MessagePart::Text("what changed".into())],
+        }];
+
+        let prelude = adoption_prelude(Ok(history.clone()));
+
+        assert_eq!(prelude.history(), history.as_slice());
+        assert_eq!(prelude.notice(), Some(FOREIGN_TURN_NOTICE));
+    }
+
+    /// A chat that could not be read back still opens the adopted turn on
+    /// something: an answer with no question above it would read as if this
+    /// terminal had asked for it.
+    #[test]
+    fn an_adoption_that_cannot_read_the_chat_back_still_names_what_happened() {
+        let prelude = adoption_prelude(Err(unavailable("the daemon stopped answering")));
+
+        assert!(prelude.history().is_empty());
+        assert_eq!(prelude.notice(), Some(FOREIGN_TURN_NOTICE));
+        assert!(
+            FOREIGN_TURN_NOTICE.contains("another client"),
+            "{FOREIGN_TURN_NOTICE}"
+        );
+    }
+
+    /// Only an event that means a turn is running asks the surface to adopt
+    /// one. A chat that ended publishes no turn to adopt, and reporting it as
+    /// a turn that failed mid-answer would describe something that never ran.
+    #[test]
+    fn only_a_running_turns_events_ask_the_surface_to_adopt() {
+        assert!(announces_running_turn(&HostedChatEvent::Progress(
+            TurnEvent::ProviderPart(MessagePart::Text("live".into()))
+        )));
+        assert!(announces_running_turn(&HostedChatEvent::TurnCompleted {
+            text: "done".to_owned()
+        }));
+        assert!(announces_running_turn(&HostedChatEvent::TurnFailed {
+            detail: "provider refused".to_owned()
+        }));
+        assert!(!announces_running_turn(&HostedChatEvent::Closed));
     }
 
     #[test]

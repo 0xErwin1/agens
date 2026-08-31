@@ -43,8 +43,8 @@ use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     io::{self, Stdout, Write},
     sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU8, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicU8, Ordering},
         mpsc,
     },
     thread,
@@ -6369,6 +6369,54 @@ impl AttachmentToken {
     }
 }
 
+/// What the surface has to draw before an adopted turn's own progress.
+///
+/// A turn this surface never submitted is answering a question this surface
+/// never drew, and an answer with no question above it reads as if this
+/// terminal had asked something it did not. The prelude carries the chat as
+/// whoever asked for the adoption read it back, for the surface to draw
+/// whatever it is missing.
+#[derive(Clone, Debug, Default)]
+pub struct AdoptedTurnPrelude {
+    /// The conversation as it stands, whole. The surface draws the part of it
+    /// it has not drawn and ignores the rest, so a caller never has to work
+    /// out what this terminal has already seen.
+    history: Vec<Message>,
+    /// What to say when that leaves the answer unexplained anyway — the read
+    /// failed, or the prompt is not stored yet. Never a bare answer.
+    notice: Option<String>,
+}
+
+impl AdoptedTurnPrelude {
+    /// For a surface that has nothing to catch up on: it drew this chat's
+    /// history a moment ago and the turn it is adopting is answering the last
+    /// prompt in it.
+    #[must_use]
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// For a surface adopting a turn started while it sat idle, with the chat
+    /// read back and what to say if that does not explain the answer.
+    #[must_use]
+    pub fn catching_up(history: Vec<Message>, notice: impl Into<String>) -> Self {
+        Self {
+            history,
+            notice: Some(notice.into()),
+        }
+    }
+
+    #[must_use]
+    pub fn history(&self) -> &[Message] {
+        &self.history
+    }
+
+    #[must_use]
+    pub fn notice(&self) -> Option<&str> {
+        self.notice.as_deref()
+    }
+}
+
 /// A request for the runtime to adopt a turn running somewhere else.
 ///
 /// Shared rather than owned by the surface, because the thread that knows a
@@ -6377,17 +6425,23 @@ impl AttachmentToken {
 /// says so here. The runtime takes the request on its next pass and begins
 /// the adopted turn on the surface's own thread.
 #[derive(Clone, Debug, Default)]
-pub struct TuiAdoptionSignal(Arc<AtomicBool>);
+pub struct TuiAdoptionSignal(Arc<Mutex<Option<AdoptedTurnPrelude>>>);
 
 impl TuiAdoptionSignal {
-    /// Asks for the running turn to be adopted. Repeating it before the
-    /// runtime looks asks for one adoption, not several.
-    pub fn request(&self) {
-        self.0.store(true, Ordering::SeqCst);
+    /// Asks for the running turn to be adopted, with what the surface needs
+    /// to open it. Repeating it before the runtime looks asks for one
+    /// adoption, not several, and the last prelude is the one it opens on.
+    pub fn request(&self, prelude: AdoptedTurnPrelude) {
+        if let Ok(mut requested) = self.0.lock() {
+            *requested = Some(prelude);
+        }
     }
 
-    fn take(&self) -> bool {
-        self.0.swap(false, Ordering::SeqCst)
+    fn take(&self) -> Option<AdoptedTurnPrelude> {
+        self.0
+            .lock()
+            .ok()
+            .and_then(|mut requested| requested.take())
     }
 }
 
@@ -7132,7 +7186,8 @@ where
     /// Set before the runtime starts, taken once by it. The surface stays
     /// idle until the runtime begins the adopted turn on its own thread.
     pub fn adopt_running_turn(&mut self) {
-        self.adopted_turn_requested.request();
+        self.adopted_turn_requested
+            .request(AdoptedTurnPrelude::none());
     }
 
     /// Hands out the adoption request, for a thread that watches a chat this
@@ -7147,7 +7202,7 @@ where
     }
 
     /// Takes a pending adoption request, at most once.
-    pub fn take_adopted_turn_request(&mut self) -> bool {
+    pub fn take_adopted_turn_request(&mut self) -> Option<AdoptedTurnPrelude> {
         self.adopted_turn_requested.take()
     }
 
@@ -7159,6 +7214,78 @@ where
     /// a concurrent submission is refused exactly as during a turn this
     /// surface submitted.
     pub fn begin_adopted_turn(&mut self) {
+        self.begin_adopted_turn_opening(String::new());
+    }
+
+    /// Enters the running-turn state for a turn started elsewhere, drawing
+    /// first whatever this surface has not drawn of the chat.
+    ///
+    /// The catch-up is what makes an adopted answer legible: a turn another
+    /// client started is answering a prompt that arrived after this surface
+    /// last read the chat, and the answer belongs under it. When the prelude
+    /// cannot supply that prompt, the turn opens on its notice instead — the
+    /// one thing it must never open on is nothing at all.
+    pub fn begin_adopted_turn_with(&mut self, prelude: AdoptedTurnPrelude) {
+        // Settled before the catch-up rather than by the turn that opens
+        // below: the last turn this surface drew is still held as the current
+        // conversation, and anything caught up here comes after it — both in
+        // what is drawn and in what counts as already drawn.
+        if let Some(conversation) = self.conversation.take() {
+            self.completed_conversations.push(conversation);
+        }
+
+        let answering = self.catch_up_history(prelude.history());
+
+        self.begin_adopted_turn_opening(answering.clone().unwrap_or_default());
+
+        if answering.is_none()
+            && let Some(notice) = prelude.notice()
+        {
+            let notice = notice.to_owned();
+            self.transcript.push(TranscriptEntry::Info(notice.clone()));
+            self.project_conversation(ConversationEvent::Info(notice));
+        }
+    }
+
+    /// Draws the conversation this surface is missing, and reports the prompt
+    /// the turn being adopted is answering when the chat ends on one.
+    ///
+    /// What counts as missing is measured in settled turns rather than in
+    /// messages, because that is the unit the surface draws in: every turn it
+    /// has drawn — from this chat's history, or from its own submissions — is
+    /// one settled conversation, and the daemon's conversation projects to the
+    /// same ones in the same order.
+    fn catch_up_history(&mut self, history: &[Message]) -> Option<String> {
+        let drawn = self.completed_conversations.len();
+        let mut projected = Conversation::from_messages(history).ok()?;
+
+        if projected.len() <= drawn {
+            return None;
+        }
+
+        let mut missing = projected.split_off(drawn);
+        // A prompt nothing has answered is the turn being adopted: its answer
+        // is on its way, so it opens the live turn rather than settling as a
+        // finished exchange with nothing in it.
+        let answering = missing
+            .last()
+            .is_some_and(Conversation::is_unanswered)
+            .then(|| {
+                missing
+                    .pop()
+                    .expect("a last conversation was just read")
+                    .user
+            });
+
+        if !missing.is_empty() {
+            self.completed_conversations.append(&mut missing);
+            self.invalidate_settled_conversations();
+        }
+
+        answering
+    }
+
+    fn begin_adopted_turn_opening(&mut self, answering: String) {
         self.palette_open = false;
         self.status = None;
 
@@ -7171,7 +7298,11 @@ where
         }
         self.runtime_events.clear();
         self.turn_duration = None;
-        self.conversation = Some(Conversation::new(String::new()));
+        if !answering.is_empty() {
+            self.transcript
+                .push(TranscriptEntry::User(answering.clone()));
+        }
+        self.conversation = Some(Conversation::new(answering));
 
         {
             let record = self.active_record_mut();
@@ -13117,10 +13248,10 @@ where
 /// already running a turn is dropped rather than starting a second follower
 /// beside it: the turn in flight owns the chat's event stream, and whatever
 /// asked will ask again once it is free.
-fn adoption_to_start<E: Engine>(tui: &mut Tui<E>) -> bool {
+fn adoption_to_start<E: Engine>(tui: &mut Tui<E>) -> Option<AdoptedTurnPrelude> {
     let requested = tui.take_adopted_turn_request();
 
-    requested && !tui.foreground_running()
+    requested.filter(|_| !tui.foreground_running())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -13203,8 +13334,8 @@ where
         // client just started a turn on. Either way its progress renders —
         // and a question it is stopped on opens — without a submission from
         // this surface.
-        if adoption_to_start(tui) {
-            tui.begin_adopted_turn();
+        if let Some(prelude) = adoption_to_start(tui) {
+            tui.begin_adopted_turn_with(prelude);
             let generation = tui.active_generation();
             let submit = Arc::clone(&submit);
             let sender = sender.clone();
@@ -14448,9 +14579,9 @@ mod runtime_tests {
         let mut tui = Tui::new(NoopEngine);
         tui.adopt_running_turn();
 
-        assert!(tui.take_adopted_turn_request());
+        assert!(tui.take_adopted_turn_request().is_some());
         assert!(
-            !tui.take_adopted_turn_request(),
+            tui.take_adopted_turn_request().is_none(),
             "an adoption request is taken exactly once"
         );
 
@@ -14477,12 +14608,12 @@ mod runtime_tests {
         let mut tui = Tui::new(NoopEngine);
         let signal = tui.adoption_signal();
 
-        assert!(!tui.take_adopted_turn_request());
-        signal.request();
+        assert!(tui.take_adopted_turn_request().is_none());
+        signal.request(AdoptedTurnPrelude::none());
 
-        assert!(adoption_to_start(&mut tui));
+        assert!(adoption_to_start(&mut tui).is_some());
         assert!(
-            !adoption_to_start(&mut tui),
+            adoption_to_start(&mut tui).is_none(),
             "an adoption request is taken exactly once"
         );
     }
@@ -14499,17 +14630,154 @@ mod runtime_tests {
             parts: vec![MessagePart::Text("what changed".into())],
         });
 
-        signal.request();
-        assert!(!adoption_to_start(&mut tui));
+        signal.request(AdoptedTurnPrelude::none());
+        assert!(adoption_to_start(&mut tui).is_none());
 
         tui.finish_provider_turn(TuiProviderOutcome::Completed("done".into()));
         assert!(
-            !adoption_to_start(&mut tui),
+            adoption_to_start(&mut tui).is_none(),
             "the dropped request is not held over the turn that dropped it"
         );
 
-        signal.request();
-        assert!(adoption_to_start(&mut tui));
+        signal.request(AdoptedTurnPrelude::none());
+        assert!(adoption_to_start(&mut tui).is_some());
+    }
+
+    fn said(role: Role, text: &str) -> Message {
+        Message {
+            role,
+            parts: vec![MessagePart::Text(text.to_owned())],
+        }
+    }
+
+    /// A turn another client started is adopted under the prompt it answers.
+    /// The surface reads the chat back at adoption and draws the exchange it
+    /// never saw, so the answer lands beneath its own question instead of
+    /// arriving out of nowhere.
+    #[test]
+    fn an_idle_adoption_draws_the_prompt_the_adopted_turn_is_answering() {
+        let mut tui = Tui::new(NoopEngine);
+        tui.replace_history(&[
+            said(Role::User, "what changed"),
+            said(Role::Assistant, "the parser"),
+        ])
+        .expect("the drawn history projects");
+        assert_eq!(tui.completed_conversations.len(), 1);
+
+        tui.begin_adopted_turn_with(AdoptedTurnPrelude::catching_up(
+            vec![
+                said(Role::User, "what changed"),
+                said(Role::Assistant, "the parser"),
+                said(Role::User, "and the tests"),
+            ],
+            "another client started a turn on this chat",
+        ));
+
+        assert_eq!(
+            tui.completed_conversations.len(),
+            1,
+            "a turn this surface already drew is not drawn a second time"
+        );
+        assert!(
+            matches!(
+                tui.transcript().first(),
+                Some(TranscriptEntry::User(prompt)) if prompt == "and the tests"
+            ),
+            "{:?}",
+            tui.transcript()
+        );
+
+        tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text("passing".into())));
+        tui.finish_provider_turn(TuiProviderOutcome::Completed("passing".into()));
+
+        assert!(!tui.has_live_work());
+        let adopted = tui.conversation.as_ref().expect("the adopted turn settled");
+        assert_eq!(
+            adopted.user, "and the tests",
+            "the settled turn keeps the question it answered"
+        );
+        assert!(matches!(
+            tui.transcript().last(),
+            Some(TranscriptEntry::Assistant(text)) if text == "passing"
+        ));
+    }
+
+    /// Everything said on the chat while this surface sat idle is drawn, not
+    /// only the turn being adopted: a terminal that missed two turns is not
+    /// left with an answer to a question two exchanges back.
+    #[test]
+    fn an_idle_adoption_draws_the_turns_that_finished_while_the_surface_waited() {
+        let mut tui = Tui::new(NoopEngine);
+        tui.replace_history(&[
+            said(Role::User, "what changed"),
+            said(Role::Assistant, "the parser"),
+        ])
+        .expect("the drawn history projects");
+
+        tui.begin_adopted_turn_with(AdoptedTurnPrelude::catching_up(
+            vec![
+                said(Role::User, "what changed"),
+                said(Role::Assistant, "the parser"),
+                said(Role::User, "and the tests"),
+                said(Role::Assistant, "passing"),
+                said(Role::User, "ship it"),
+            ],
+            "another client started a turn on this chat",
+        ));
+
+        let drawn = tui
+            .completed_conversations
+            .iter()
+            .map(|conversation| conversation.user.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(drawn, vec!["what changed", "and the tests"]);
+        assert!(matches!(
+            tui.transcript().first(),
+            Some(TranscriptEntry::User(prompt)) if prompt == "ship it"
+        ));
+    }
+
+    /// When the chat cannot be read back — the daemon refused, or the prompt
+    /// is not stored yet — the adopted turn opens on what is known instead of
+    /// on nothing. An answer with no question above it reads as if this
+    /// terminal had asked something it never asked.
+    #[test]
+    fn an_adoption_that_cannot_explain_the_answer_says_another_client_started_it() {
+        let mut tui = Tui::new(NoopEngine);
+
+        tui.begin_adopted_turn_with(AdoptedTurnPrelude::catching_up(
+            Vec::new(),
+            "another client started a turn on this chat",
+        ));
+
+        assert!(
+            matches!(
+                tui.transcript().first(),
+                Some(TranscriptEntry::Info(notice)) if notice.contains("another client")
+            ),
+            "{:?}",
+            tui.transcript()
+        );
+
+        tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text("live".into())));
+        assert!(matches!(
+            tui.transcript().last(),
+            Some(TranscriptEntry::Assistant(text)) if text == "live"
+        ));
+    }
+
+    /// A surface that attached mid-turn already drew the prompt as history, so
+    /// its adoption opens on neither a prompt nor a notice.
+    #[test]
+    fn a_mid_attach_adoption_opens_on_nothing_it_already_drew() {
+        let mut tui = Tui::new(NoopEngine);
+        tui.replace_history(&[said(Role::User, "what changed")])
+            .expect("the drawn history projects");
+
+        tui.begin_adopted_turn_with(AdoptedTurnPrelude::none());
+
+        assert!(tui.transcript().is_empty(), "{:?}", tui.transcript());
+        assert_eq!(tui.completed_conversations.len(), 1);
     }
 
     /// A surface that attached mid-turn missed the deltas published before its
@@ -14520,7 +14788,7 @@ mod runtime_tests {
     fn an_adopted_turn_completes_with_the_full_text_rather_than_the_tail_it_saw() {
         let mut tui = Tui::new(NoopEngine);
         tui.adopt_running_turn();
-        assert!(tui.take_adopted_turn_request());
+        assert!(tui.take_adopted_turn_request().is_some());
         tui.begin_adopted_turn();
 
         tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text(" tail".into())));
