@@ -232,7 +232,10 @@ fn a_command_executes_on_the_daemon_owned_chat_state() {
 
     assert_eq!(
         harness.chats.command(session, "/effort high".to_owned()),
-        Ok("Reasoning effort: high.".to_owned()),
+        Ok(agens_server::ChatCommandOutcome {
+            message: "Reasoning effort: high.".to_owned(),
+            presentation: None,
+        }),
     );
 }
 

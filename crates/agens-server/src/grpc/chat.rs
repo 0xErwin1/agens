@@ -359,11 +359,25 @@ impl Chat for ChatFacade {
         let request = request.into_inner();
         let session = SessionId::new(request.session_id);
         let command = request.command;
-        let message = self
+        let outcome = self
             .off_runtime(move |chats| chats.command(session, command))
             .await?;
+        // A chat that described nothing answers with every described field
+        // absent, rather than with a default-valued description a client would
+        // have to tell apart from a real one.
+        let described = outcome.presentation;
 
-        Ok(Response::new(proto::ChatCommandResult { message }))
+        Ok(Response::new(proto::ChatCommandResult {
+            message: outcome.message,
+            provider: described.as_ref().and_then(|shown| shown.provider.clone()),
+            model: described.as_ref().and_then(|shown| shown.model.clone()),
+            reasoning_effort: described
+                .as_ref()
+                .and_then(|shown| shown.reasoning_effort.clone()),
+            context_window: described.as_ref().and_then(|shown| shown.context_window),
+            bypass_permissions: described.as_ref().map(|shown| shown.bypass_permissions),
+            dangerous_mode: described.as_ref().map(|shown| shown.dangerous_mode),
+        }))
     }
 
     async fn cancel(

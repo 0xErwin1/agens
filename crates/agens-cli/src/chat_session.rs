@@ -679,6 +679,18 @@ struct HostedChat {
 }
 
 impl ChatTurns for HostedChat {
+    /// How this chat is configured right now, computed from the same session
+    /// metadata the open answer describes, so a footer redressed after a
+    /// command reads identically to one dressed by attaching afresh. Dangerous
+    /// mode is this object's own ephemeral flag rather than anything persisted.
+    fn presentation(&self) -> Option<ChatPresentation> {
+        let mut presentation =
+            presentation_of(&self.bootstrap, &self.session, self.bypass_permissions);
+        presentation.dangerous_mode = self.dangerous_mode;
+
+        Some(presentation)
+    }
+
     fn command(&mut self, command: &str) -> Result<String, ChatError> {
         if command == "/agents" {
             return self.list_agents();

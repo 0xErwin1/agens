@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use tonic::transport::{Channel, Endpoint, Uri};
 
 pub use agens_server::grpc::proto;
-pub use chat::{ChatClient, DaemonBuild, OpenChat, OpenedChat};
+pub use chat::{ChatClient, CommandReply, DaemonBuild, HostedPresentation, OpenChat, OpenedChat};
 pub use decode::{HostedChatEvent, PermissionDecision, PermissionQuestion};
 pub use feed::{FeedClient, JournalEntry};
 pub use team::TeamClient;

@@ -479,7 +479,7 @@ impl TuiRuntimeRouter {
                 )));
             }
             "bypass" => {
-                let reply = backend.command("/bypass")?;
+                let reply = backend.command("/bypass")?.message;
                 let enabled = match reply.as_str() {
                     agens_core::hosted::BYPASS_ON_REPLY => true,
                     agens_core::hosted::BYPASS_OFF_REPLY => false,
@@ -493,7 +493,7 @@ impl TuiRuntimeRouter {
                 });
             }
             "dangerous" => {
-                let reply = backend.command("/dangerous")?;
+                let reply = backend.command("/dangerous")?.message;
                 let enabled = match reply.as_str() {
                     agens_core::hosted::DANGEROUS_ON_REPLY => true,
                     agens_core::hosted::DANGEROUS_OFF_REPLY => false,
@@ -513,9 +513,20 @@ impl TuiRuntimeRouter {
         if !known {
             return Err(CliError::usage(format!("unknown daemon command: /{name}")));
         }
-        backend
-            .command(command)
-            .map(TuiSubmissionOutcome::LocalInfo)
+        // Whatever the command was, the daemon owns what the session is
+        // configured as after it. A command that changed the model, the effort
+        // or the agent's model comes back described, and the footer follows
+        // that description rather than the reply text; one that changed nothing
+        // comes back undescribed and leaves the footer as it was.
+        let reply = backend.command(command)?;
+
+        Ok(match reply.presentation {
+            Some(presentation) => TuiSubmissionOutcome::ContextChanged {
+                message: reply.message,
+                presentation,
+            },
+            None => TuiSubmissionOutcome::LocalInfo(reply.message),
+        })
     }
 
     /// Validates a `/cd` target the way the daemon validates a chat's
