@@ -9,6 +9,7 @@ mod api;
 mod blocking;
 mod cache;
 mod chat;
+mod coordination;
 mod coordinator;
 mod diagnostics;
 mod fsm;
@@ -62,9 +63,9 @@ pub use api::{
     Escalation, EventFeed, EventFilter, HookPolicy, InboxItem, InboxView, MergeAuthorization,
     MergeAuthorized, OPERATION_AUTHORIZATION, OpenedApproval, Operation, OperationAuthorization,
     PortError, Ports, PreparedRun, ProvisionedWorktree, RepositoryIdentity, RequestMerge,
-    RetryRequest, RunRef, RunSummary, RunView, SessionControl, StopRequest, StopScope, Subscription,
-    TURN_FAILED_EVENT, TakeoverHandle, TreeSnapshot, TurnFailure, WorktreeDerivation, WorktreeGate,
-    WorktreeRequest, praetor_may_answer,
+    RetryRequest, RunRef, RunSummary, RunView, SessionControl, StopRequest, StopScope,
+    Subscription, TURN_FAILED_EVENT, TakeoverHandle, TreeSnapshot, TurnFailure, WorktreeDerivation,
+    WorktreeGate, WorktreeRequest, praetor_may_answer,
 };
 pub use blocking::{BlockingBoundary, BlockingError};
 pub use chat::{
@@ -72,6 +73,7 @@ pub use chat::{
     ChatPermissionRequest, ChatPresentation, ChatSession, ChatSessionFactory, ChatSessionRequest,
     ChatSessions, ChatSubscription, ChatTurnOutcome, ChatTurns, OpenChatSummary, OpenedChat,
 };
+pub use coordination::{TeamBinding, TeamCoordination};
 pub use coordinator::{
     ADMISSION_FAILED_EVENT, BootReconciliation, CORE_POISONED_EVENT, Coordinator, CoordinatorError,
     CoordinatorSettings, MissingWorktree, OrphanWorktree, RUN_DEFERRED_EVENT, RunLaunch,
