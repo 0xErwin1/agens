@@ -367,6 +367,7 @@ pub enum ProviderDiagnosticKind {
     HealthSignalRaised,
     IngestBacklogged,
     CorePoisoned,
+    RuntimeLost,
 }
 
 impl ProviderDiagnosticKind {
@@ -400,6 +401,7 @@ impl ProviderDiagnosticKind {
             Self::HealthSignalRaised => "health_signal_raised",
             Self::IngestBacklogged => "ingest_backlogged",
             Self::CorePoisoned => "core_poisoned",
+            Self::RuntimeLost => "runtime_lost",
         }
     }
 }

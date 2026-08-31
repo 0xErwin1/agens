@@ -237,6 +237,19 @@ pub enum CoordinatorEvent<'a> {
     /// the reason this component writes to a file at all: a core nothing can
     /// take is a core nothing can journal through either.
     CorePoisoned { component: &'a str },
+    /// The data directory this daemon serves is gone: the socket it bound is
+    /// missing, or the path now names a different file. Nothing can reach the
+    /// process and nothing can ask it to stop, so it stops itself.
+    ///
+    /// About the daemon rather than about a run, like the poisoned core above,
+    /// and written here for the same reason: the record has to survive a data
+    /// directory that no longer holds a control plane to journal into.
+    RuntimeLost {
+        /// Which way the socket stopped being this daemon's.
+        reason: &'a str,
+        /// How many consecutive checks agreed before the daemon acted.
+        checks: usize,
+    },
 }
 
 impl CoordinatorEvent<'_> {
@@ -251,6 +264,7 @@ impl CoordinatorEvent<'_> {
             Self::HealthSignalRaised { .. } => ProviderDiagnosticKind::HealthSignalRaised,
             Self::IngestBacklogged { .. } => ProviderDiagnosticKind::IngestBacklogged,
             Self::CorePoisoned { .. } => ProviderDiagnosticKind::CorePoisoned,
+            Self::RuntimeLost { .. } => ProviderDiagnosticKind::RuntimeLost,
         }
     }
 
@@ -306,6 +320,9 @@ impl CoordinatorEvent<'_> {
                 fact,
             } => serde_json::json!({ "run": run_id, "reporter": reporter, "fact": fact }),
             Self::CorePoisoned { component } => serde_json::json!({ "component": component }),
+            Self::RuntimeLost { reason, checks } => {
+                serde_json::json!({ "reason": reason, "checks": checks })
+            }
         }
     }
 }

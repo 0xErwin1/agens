@@ -24,6 +24,7 @@ mod ports;
 mod scheduler;
 mod sessions;
 mod timers;
+mod watch;
 
 use std::os::unix::net::UnixListener;
 use std::path::Path;
@@ -174,6 +175,10 @@ pub struct Daemon {
     /// holds it bound without accepting.
     listener: UnixListener,
     instance: ServeInstance,
+    /// Watches the socket the daemon bound, so a data directory removed under
+    /// a running daemon stops it instead of leaving it alive against paths
+    /// nothing can reach.
+    watch: watch::RuntimeWatch,
 }
 
 impl Daemon {
@@ -202,12 +207,26 @@ impl Daemon {
             })?;
         let sessions = SessionSupervisor::new(runtime.handle().clone());
 
+        let watch = watch::RuntimeWatch::of_bound_socket(instance.socket_path());
+
         Ok(Self {
             runtime,
             sessions,
             listener,
             instance,
+            watch,
         })
+    }
+
+    /// Gives the daemon the diagnostics handle its watch reports through.
+    ///
+    /// Taken from the coordinator rather than built here, so the line saying
+    /// why this daemon stopped is written under the same reference as every
+    /// other line it wrote.
+    #[must_use]
+    pub fn reporting_to(mut self, diagnostics: CoordinatorDiagnostics) -> Self {
+        self.watch = self.watch.reporting_to(diagnostics);
+        self
     }
 
     /// Where a client attaches to this daemon.
@@ -244,7 +263,10 @@ impl Daemon {
             sessions,
             listener,
             instance,
+            watch,
         } = self;
+
+        runtime.spawn(watch.run(shutdown.clone()));
 
         // Everything this daemon serves with is built by now — the core arrived
         // composed — so this is the first moment the pid is true. A start
@@ -288,7 +310,9 @@ impl Daemon {
             sessions,
             listener,
             instance,
+            watch,
         } = self;
+        runtime.spawn(watch.run(shutdown.clone()));
         publish_pid(&instance)?;
         let binding = FacadeBinding::none().on_unix_socket(listener);
         let blocking = BlockingBoundary::new(runtime.handle().clone());
@@ -325,7 +349,10 @@ impl Daemon {
             sessions,
             listener,
             instance,
+            watch,
         } = self;
+
+        runtime.spawn(watch.run(shutdown.clone()));
 
         let report = runtime.block_on(async {
             park_until_shutdown(shutdown).await;
@@ -388,7 +415,9 @@ pub fn serve_until_shutdown(
             .with_media_store(data_directory.to_path_buf()),
     );
 
-    let report = daemon.serve_until_shutdown(coordinator.core(), chats, shutdown);
+    let report = daemon
+        .reporting_to(coordinator.diagnostics())
+        .serve_until_shutdown(coordinator.core(), chats, shutdown);
 
     // After the facade has stopped: nothing is admitting, ticking or publishing
     // against a core the sessions behind it have already been stopped.
@@ -450,15 +479,17 @@ pub fn serve_until_shutdown_with_hosted(
         ChatSessions::new(daemon.sessions().clone(), chat, chat_history)
             .with_media_store(data_directory.to_path_buf()),
     );
-    let report = daemon.serve_until_shutdown_with_hosted(
-        coordinator.core(),
-        chats,
-        shutdown,
-        catalogs,
-        files,
-        mcp,
-        tasks,
-    );
+    let report = daemon
+        .reporting_to(coordinator.diagnostics())
+        .serve_until_shutdown_with_hosted(
+            coordinator.core(),
+            chats,
+            shutdown,
+            catalogs,
+            files,
+            mcp,
+            tasks,
+        );
     let poisoned = coordinator.stop();
     if poisoned {
         return Err(ServerError::Unavailable(

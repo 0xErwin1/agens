@@ -208,6 +208,9 @@ pub struct Coordinator {
     /// Read on the way out: what the loops were stopped by is not something
     /// the stop flag itself records.
     fatal: Arc<FatalCore>,
+    /// Kept so the daemon's own watch reports under the same reference the
+    /// coordinator's loops write with.
+    diagnostics: CoordinatorDiagnostics,
     loops: Vec<JoinHandle<()>>,
 }
 
@@ -266,7 +269,7 @@ impl Coordinator {
             worker,
             facts: &facts,
             reports,
-            diagnostics,
+            diagnostics: diagnostics.clone(),
             fatal: &fatal,
         })?;
 
@@ -277,6 +280,7 @@ impl Coordinator {
             facts,
             stopping,
             fatal,
+            diagnostics,
             loops,
         };
 
@@ -320,6 +324,13 @@ impl Coordinator {
     #[must_use]
     pub const fn reconciliation(&self) -> &BootReconciliation {
         &self.reconciliation
+    }
+
+    /// The daemon's diagnostics handle, for the watch that reports why the
+    /// process stopped when there is no data directory left to journal into.
+    #[must_use]
+    pub fn diagnostics(&self) -> CoordinatorDiagnostics {
+        self.diagnostics.clone()
     }
 
     /// The one service core, for the facade the daemon serves.

@@ -1,3 +1,6 @@
+#[path = "support/daemon_reaper.rs"]
+mod daemon_reaper;
+
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::io::{Read, Write};
@@ -5304,7 +5307,13 @@ impl TemporaryDirectory {
 }
 
 impl Drop for TemporaryDirectory {
+    /// The isolated roots below are where a command's daemon would live, and a
+    /// launch that attaches makes the binary start one without this suite ever
+    /// asking. Removing the tree without stopping it first is what turns it
+    /// into a daemon serving a directory that no longer exists.
     fn drop(&mut self) {
+        daemon_reaper::reap_under(&self.path);
+
         let _ = std::fs::remove_dir_all(&self.path);
     }
 }
