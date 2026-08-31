@@ -731,12 +731,27 @@ async fn a_praetor_facade_is_refused_what_the_table_keeps_for_the_user() {
         .expect_err("the user approves bytes");
     assert_eq!(code(&refused), Code::PermissionDenied);
 
-    let refused = wire
+    // Releasing and discarding are different authorities. Praetor releases a
+    // worktree git already showed merged, and is refused the disposal that
+    // throws away work nobody has shown to be anywhere else.
+    let reclaimed = wire
         .team
         .cleaning(proto::CleaningRequest {
             run_id: fixture.merged,
             disposition: "reclaim".to_owned(),
             confirmed: false,
+        })
+        .await
+        .expect("releasing a merged worktree destroys nothing")
+        .into_inner();
+    assert_eq!(reclaimed.transition.unwrap().to, "cleaned");
+
+    let refused = wire
+        .team
+        .cleaning(proto::CleaningRequest {
+            run_id: fixture.merged,
+            disposition: "dispose".to_owned(),
+            confirmed: true,
         })
         .await
         .expect_err("discarding a worktree needs a person");

@@ -34,6 +34,7 @@ use serde_json::Value;
 mod agents;
 mod ask_user;
 mod capabilities;
+mod coordination;
 mod git_read;
 mod http_mcp;
 pub mod http_worker;
@@ -53,6 +54,7 @@ pub use agents::{
 };
 pub use ask_user::AskUserTool;
 pub use capabilities::{EffectiveCapabilityDescriptor, EffectiveCapabilitySet};
+pub use coordination::{TeamTool, TeamVerb};
 pub use git_read::{GitReadInput, GitReadOperation};
 pub use http_mcp::{McpHttpTransport, McpSseTransport};
 pub use mcp_status::{

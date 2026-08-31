@@ -15,6 +15,7 @@ use globset::{GlobBuilder, GlobMatcher};
 
 pub mod ask_user;
 pub mod compaction;
+pub mod coordination;
 pub mod denylist;
 #[cfg(test)]
 mod denylist_tests;

@@ -18,7 +18,7 @@ use super::{ApiCore, ApiError, Operation, praetor_may_answer};
 use crate::api::ports::{Delivery, DeliveryPayload, StopScope, TakeoverHandle};
 use crate::fsm::{
     Principal, QuestionEffect, QuestionFacts, QuestionTrigger, RunEffect, RunFacts, RunTrigger,
-    TransitionOutcome, WorktreeEffect, WorktreeFacts, WorktreeTrigger,
+    TransitionOutcome, TransitionRejection, WorktreeEffect, WorktreeFacts, WorktreeTrigger,
 };
 
 /// What an approval offers. Two options, because the decision is a merge or no
@@ -158,6 +158,55 @@ pub struct StopRequest {
     pub now: i64,
 }
 
+/// A decision handed to the person, on a run that is waiting for one.
+///
+/// The options arrive as the JSON array the question column stores. Whoever
+/// composes them is the party that validated them, which for the `team_*`
+/// facade is [`agens_core::run_introspection::Ask`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Escalation {
+    pub run_id: i64,
+    pub blocked_decision: String,
+    pub options: String,
+    pub recommendation: Option<String>,
+    pub now: i64,
+}
+
+/// Guidance queued for a run's next safe point.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Direction {
+    pub run_id: i64,
+    pub directive: String,
+    pub now: i64,
+}
+
+/// Asking the user to authorize landing a run's branch.
+///
+/// It opens the approval and grants nothing. The receipt is frozen here rather
+/// than taken from the request, for the same reason [`AuthorizeMerge`] freezes
+/// its own: a caller that named a tree would be describing bytes of its
+/// choosing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RequestMerge {
+    pub run_id: i64,
+    /// Why the requester believes the work is ready. Journaled with the
+    /// request, because the person deciding is entitled to the argument that
+    /// was made to them.
+    pub reason: Option<String>,
+    /// Epoch seconds, or `None` to never expire on its own.
+    pub expires_at: Option<i64>,
+    pub now: i64,
+}
+
+/// An approval opened, and the bytes it was frozen over.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenedApproval {
+    pub question_id: i64,
+    pub run_id: i64,
+    pub tree_hash: String,
+    pub paths_digest: String,
+}
+
 impl ApiCore {
     /// Freezes a proposed execution's scope and queues it.
     ///
@@ -294,7 +343,15 @@ impl ApiCore {
                     Some(run_id),
                     request.now,
                 )?;
-                self.open_approval(principal, run_id, expires_at, request.now)?
+                self.open_approval(
+                    Operation::AuthorizeMerge,
+                    principal,
+                    run_id,
+                    None,
+                    expires_at,
+                    request.now,
+                )?
+                .question_id
             }
         };
 
@@ -373,17 +430,19 @@ impl ApiCore {
     /// user is looking at, and the gate would compare against it happily.
     fn open_approval(
         &mut self,
+        operation: Operation,
         principal: Principal,
         run_id: i64,
+        reason: Option<&str>,
         expires_at: Option<i64>,
         now: i64,
-    ) -> Result<i64, ApiError> {
+    ) -> Result<OpenedApproval, ApiError> {
         let run = self.load_run(run_id)?;
         let derivation = self.ports.worktrees.derive(&run)?;
 
         if !derivation.worktree_clean {
             return Err(self.refuse(
-                Operation::AuthorizeMerge,
+                operation,
                 principal,
                 Some(run_id),
                 now,
@@ -418,12 +477,151 @@ impl ApiCore {
                 "tree_hash": derivation.tree_hash,
                 "paths_digest": derivation.paths_digest,
                 "expires_at": expires_at,
+                "requested_by": principal.as_str(),
+                "reason": reason,
             })
             .to_string(),
             ts: now,
         };
 
+        let question_id = self.machines.open_question(&question, &[announcement])?;
+
+        Ok(OpenedApproval {
+            question_id,
+            run_id,
+            tree_hash: derivation.tree_hash,
+            paths_digest: derivation.paths_digest,
+        })
+    }
+
+    /// Opens the merge authorization the user answers, and grants nothing.
+    ///
+    /// This is the whole of what a manager may do about landing code. The
+    /// authorization itself stays [`Operation::AuthorizeMerge`], which the
+    /// table gives to the user alone, so the two halves of a merge cannot be
+    /// held by the same party.
+    pub fn request_merge(
+        &mut self,
+        principal: Principal,
+        request: &RequestMerge,
+    ) -> Result<OpenedApproval, ApiError> {
+        self.authorize(
+            Operation::RequestMerge,
+            principal,
+            Some(request.run_id),
+            request.now,
+        )?;
+
+        self.open_approval(
+            Operation::RequestMerge,
+            principal,
+            request.run_id,
+            request.reason.as_deref(),
+            request.expires_at,
+            request.now,
+        )
+    }
+
+    /// Opens a question that hands a decision to the person.
+    ///
+    /// It moves no run. A run parks on a question only when the worker
+    /// executing it asked one, and a manager raising a decision about a run is
+    /// not the run declaring itself blocked.
+    pub fn escalate(
+        &mut self,
+        principal: Principal,
+        request: &Escalation,
+    ) -> Result<i64, ApiError> {
+        self.authorize(
+            Operation::Escalate,
+            principal,
+            Some(request.run_id),
+            request.now,
+        )?;
+
+        // The row exists check comes first so a request naming no run is a
+        // clean refusal rather than a foreign-key failure from the store.
+        self.load_run(request.run_id)?;
+
+        let question = QuestionRow {
+            id: None,
+            run_id: request.run_id,
+            // Never an approval: an approval authorizes bytes, and this opens
+            // a decision rather than freezing one.
+            kind: QuestionKind::Question,
+            blocked_decision: request.blocked_decision.clone(),
+            options: request.options.clone(),
+            recommendation: request.recommendation.clone(),
+            answer: None,
+            author: None,
+            expires_at: None,
+            tree_hash: None,
+            paths_digest: None,
+            state: agens_store::QuestionState::Open,
+            created_at: request.now,
+        };
+
+        let announcement = EventRow {
+            id: None,
+            run_id: Some(request.run_id),
+            event_type: "escalated".to_owned(),
+            class: EventClass::Infra,
+            payload: serde_json::json!({
+                "escalated_by": principal.as_str(),
+                "blocked_decision": request.blocked_decision,
+            })
+            .to_string(),
+            ts: request.now,
+        };
+
         Ok(self.machines.open_question(&question, &[announcement])?)
+    }
+
+    /// Queues guidance for a run's next safe point.
+    ///
+    /// Refused for a run that has already settled: a directive nothing will
+    /// ever read is not queued and reported as queued, because a manager that
+    /// believes it steered a finished run stops looking at what the run did.
+    pub fn direct(&mut self, principal: Principal, request: &Direction) -> Result<(), ApiError> {
+        self.authorize(
+            Operation::Direct,
+            principal,
+            Some(request.run_id),
+            request.now,
+        )?;
+
+        let run = self.load_run(request.run_id)?;
+
+        if !reads_directives(run.state) {
+            return Err(ApiError::Rejected(TransitionRejection::GuardFailed {
+                machine: "direct",
+                guard: "run_can_still_read",
+                detail: format!(
+                    "the run is {} and will never reach another safe point",
+                    run.state.as_str()
+                ),
+            }));
+        }
+
+        self.ports.delivery.enqueue(&Delivery::new(
+            request.run_id,
+            DeliveryPayload::Directive(request.directive.clone()),
+        ))?;
+
+        self.machines.journal(&[EventRow {
+            id: None,
+            run_id: Some(request.run_id),
+            event_type: "directive_queued".to_owned(),
+            class: EventClass::Infra,
+            payload: serde_json::json!({
+                "directed_by": principal.as_str(),
+                "directive": request.directive,
+            })
+            .to_string(),
+            ts: request.now,
+        }])?;
+
+        Ok(())
     }
 
     /// Cancels a run. Idempotent: a run already cancelled reports settled and
@@ -506,12 +704,16 @@ impl ApiCore {
         principal: Principal,
         request: &CleaningAction,
     ) -> Result<TransitionOutcome<WorktreeStatus, WorktreeEffect>, ApiError> {
-        self.authorize(
-            Operation::Cleaning,
-            principal,
-            Some(request.run_id),
-            request.now,
-        )?;
+        // Releasing and discarding are different authorities. Reclaim only
+        // ever releases a worktree the live derivation already shows merged,
+        // and the machine refuses it otherwise; disposal throws away work
+        // nobody has shown to be anywhere else, which stays the user's.
+        let operation = match request.disposition {
+            CleaningDisposition::Reclaim => Operation::Reclaim,
+            CleaningDisposition::Dispose => Operation::Cleaning,
+        };
+
+        self.authorize(operation, principal, Some(request.run_id), request.now)?;
 
         let run = self.load_run(request.run_id)?;
         let derivation = self.ports.worktrees.derive(&run)?;
@@ -748,4 +950,20 @@ impl ApiCore {
                 id: question_id,
             })
     }
+}
+
+/// Whether a run can still reach a safe point at which guidance is read.
+///
+/// A settled run cannot, and neither can a draft: nothing is executing it yet,
+/// so a directive would sit in the queue until the scope it was written against
+/// had already been approved and started.
+const fn reads_directives(state: RunState) -> bool {
+    matches!(
+        state,
+        RunState::Queued
+            | RunState::Running
+            | RunState::AwaitingInput
+            | RunState::AwaitingQuota
+            | RunState::Interrupted
+    )
 }
