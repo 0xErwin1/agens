@@ -231,11 +231,31 @@ pub fn praetor_may_answer(
         return Err(DetailQuestionRefusal::OpenEnded);
     }
 
-    let offered = options.iter().any(|option| option.as_str() == Some(answer));
+    let offered = options.iter().any(|option| offers(option, answer));
 
     if offered {
         Ok(())
     } else {
         Err(DetailQuestionRefusal::OutsideOptions)
+    }
+}
+
+/// Whether one stored option is the one that was answered.
+///
+/// An option is stored either as the bare string a client wrote or as the
+/// `{id, label, consequence}` object a worker's `ask` writes, and the answer is
+/// compared against the identifier in both. Reading only the bare form left
+/// every question a worker actually asks with no answerable option at all,
+/// which refused Praetor by accident rather than by policy.
+///
+/// Anything else is not an option this can recognize, and an option nobody can
+/// recognize offers nothing.
+fn offers(option: &serde_json::Value, answer: &str) -> bool {
+    match option {
+        serde_json::Value::String(id) => id == answer,
+        serde_json::Value::Object(fields) => {
+            fields.get("id").and_then(serde_json::Value::as_str) == Some(answer)
+        }
+        _ => false,
     }
 }

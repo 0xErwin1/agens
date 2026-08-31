@@ -2317,3 +2317,32 @@ fn a_creation_that_fails_after_the_row_exists_leaves_no_run_and_no_worktree() {
         "the question was opened, and one whose answer nothing recorded is not left standing"
     );
 }
+
+/// A worker's question stores its options as `{id, label, consequence}`
+/// objects, and reading only the bare-string shape refused Praetor every real
+/// question by accident rather than by policy.
+#[test]
+fn the_detail_question_policy_reads_the_shape_a_worker_actually_writes() {
+    let worker_question = question_in(
+        1,
+        QuestionKind::Question,
+        r#"[{"id":"postgres","label":"write to postgres"},{"id":"sqlite","label":"write to sqlite"}]"#,
+    );
+
+    assert_eq!(praetor_may_answer(&worker_question, "postgres"), Ok(()));
+    assert_eq!(
+        praetor_may_answer(&worker_question, "write to postgres"),
+        Err(DetailQuestionRefusal::OutsideOptions)
+    );
+    assert_eq!(
+        praetor_may_answer(&worker_question, "mysql"),
+        Err(DetailQuestionRefusal::OutsideOptions)
+    );
+
+    let unrecognizable = question_in(1, QuestionKind::Question, "[7]");
+
+    assert_eq!(
+        praetor_may_answer(&unrecognizable, "7"),
+        Err(DetailQuestionRefusal::OutsideOptions)
+    );
+}
