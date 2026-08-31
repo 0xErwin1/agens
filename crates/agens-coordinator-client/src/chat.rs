@@ -47,6 +47,9 @@ pub struct OpenedChat {
     /// Whether the session bypasses Ask permission prompts. `false` for a
     /// daemon that predates the field.
     pub bypass_permissions: bool,
+    /// Whether the session runs in dangerous mode. `false` for a daemon that
+    /// predates the field.
+    pub dangerous_mode: bool,
 }
 
 /// The daemon's account of what it is, as the attach handshake carries it.
@@ -256,6 +259,7 @@ impl ChatClient {
             reasoning_effort: opened.reasoning_effort.filter(|effort| !effort.is_empty()),
             context_window: opened.context_window.filter(|window| *window > 0),
             bypass_permissions: opened.bypass_permissions.unwrap_or(false),
+            dangerous_mode: opened.dangerous_mode.unwrap_or(false),
         })
     }
 

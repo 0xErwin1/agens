@@ -798,3 +798,62 @@ fn a_configured_bypass_default_seeds_a_fresh_hosted_chat() {
     client.join().expect("the client thread finished");
     let _ = std::fs::remove_dir_all(PathBuf::from(&daemon.root));
 }
+
+#[test]
+fn the_hosted_dangerous_toggle_flips_and_replies_with_the_shared_constants() {
+    let daemon = DaemonFixture::start(Script::new([]), daemon_settings());
+
+    let socket = daemon.socket.clone();
+    let stopper = daemon.stopper();
+    let checkout = daemon.checkout.display().to_string();
+
+    let client = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let stopper = stopper;
+
+        runtime.block_on(async move {
+            let mut chat = ChatClient::new(connect(socket).await);
+
+            let opened = chat
+                .open(proto::OpenChatRequest {
+                    checkout,
+                    resume: None,
+                })
+                .await
+                .expect("a fresh chat opens")
+                .into_inner();
+            assert_eq!(opened.dangerous_mode, Some(false));
+
+            let on = chat
+                .command(proto::ChatCommandRequest {
+                    session_id: opened.session_id,
+                    command: "/dangerous".to_owned(),
+                })
+                .await
+                .expect("the dangerous toggle executes")
+                .into_inner();
+            assert_eq!(on.message, agens_core::hosted::DANGEROUS_ON_REPLY);
+
+            let off = chat
+                .command(proto::ChatCommandRequest {
+                    session_id: opened.session_id,
+                    command: "/dangerous".to_owned(),
+                })
+                .await
+                .expect("the second toggle executes")
+                .into_inner();
+            assert_eq!(off.message, agens_core::hosted::DANGEROUS_OFF_REPLY);
+
+            drop(stopper);
+        })
+    });
+
+    daemon.serve();
+
+    client.join().expect("the client thread finished");
+    let _ = std::fs::remove_dir_all(PathBuf::from(&daemon.root));
+}

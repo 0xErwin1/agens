@@ -573,6 +573,9 @@ message ChatHandle {
   // Whether the session currently bypasses Ask permission prompts. Absent on
   // daemons that predate the field; a client reads absence as "off".
   optional bool bypass_permissions = 7;
+  // Whether the session runs in dangerous mode. Ephemeral session state, like
+  // the local toggle; absent reads as "off".
+  optional bool dangerous_mode = 8;
 }
 
 message PromptRequest {

@@ -334,6 +334,7 @@ impl Chat for ChatFacade {
             reasoning_effort: session.presentation.reasoning_effort,
             context_window: session.presentation.context_window,
             bypass_permissions: Some(session.presentation.bypass_permissions),
+            dangerous_mode: Some(session.presentation.dangerous_mode),
         }))
     }
 

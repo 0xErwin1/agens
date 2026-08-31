@@ -201,6 +201,8 @@ pub struct ChatPresentation {
     pub context_window: Option<u64>,
     /// Whether the session currently bypasses Ask permission prompts.
     pub bypass_permissions: bool,
+    /// Whether the session currently runs in dangerous mode.
+    pub dangerous_mode: bool,
 }
 
 /// A chat session the daemon opened, and how it described it.

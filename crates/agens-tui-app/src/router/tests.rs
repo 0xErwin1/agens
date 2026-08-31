@@ -70,6 +70,9 @@ impl AttachedRouteBackend for FakeAttachedBackend {
         if command == "/bypass" {
             return Ok(agens_core::hosted::BYPASS_ON_REPLY.to_owned());
         }
+        if command == "/dangerous" {
+            return Ok(agens_core::hosted::DANGEROUS_ON_REPLY.to_owned());
+        }
         Ok(format!("daemon:{command}"))
     }
 
@@ -327,7 +330,7 @@ fn attached_surface_forwards_every_daemon_catalogued_builtin_without_local_disco
     for command in crate::extensions::tui_hosted_builtin_entries() {
         if matches!(
             command.name(),
-            "attach" | "bypass" | "skills" | "mcp" | "select" | "quit"
+            "attach" | "bypass" | "dangerous" | "skills" | "mcp" | "select" | "quit"
         ) {
             continue;
         }
@@ -4850,5 +4853,36 @@ fn an_attached_bypass_toggle_reaches_the_daemon_and_flips_the_footer_state() {
         backend.commands.lock().unwrap().as_slice(),
         ["/bypass".to_owned(), "/bypass".to_owned()],
         "both surfaces route the toggle to the daemon"
+    );
+}
+
+#[test]
+fn an_attached_dangerous_toggle_reaches_the_daemon_and_flips_the_footer_state() {
+    let temporary = tui_session_directory("attached-dangerous-toggle");
+    let bootstrap = tui_session_bootstrap(&temporary, &[]);
+    let backend = Arc::new(FakeAttachedBackend::default());
+
+    let attached = TuiRuntimeRouter::attached(
+        bootstrap,
+        Arc::new(Mutex::new(SessionContext::fresh())),
+        backend.clone(),
+    );
+
+    let outcome = attached_route(&attached, TuiRouteRequest::Input("/dangerous".into()));
+    assert_eq!(
+        outcome,
+        TuiSubmissionOutcome::DangerousChanged {
+            message: agens_core::hosted::DANGEROUS_ON_REPLY.to_owned(),
+            enabled: true,
+        }
+    );
+
+    let dialog = attached_route(&attached, TuiRouteRequest::DialogAction("dangerous".into()));
+    assert_eq!(
+        dialog,
+        TuiSubmissionOutcome::DangerousChanged {
+            message: agens_core::hosted::DANGEROUS_ON_REPLY.to_owned(),
+            enabled: true,
+        }
     );
 }

@@ -612,6 +612,7 @@ pub fn run_tui_prompt(
                 | TuiSubmissionOutcome::ResetSucceeded { message, .. }
                 | TuiSubmissionOutcome::ContextChanged { message, .. }
                 | TuiSubmissionOutcome::BypassChanged { message, .. }
+                | TuiSubmissionOutcome::DangerousChanged { message, .. }
                 | TuiSubmissionOutcome::SessionResumed { message, .. }
                 | TuiSubmissionOutcome::HistoryRewritten { message, .. }
                 | TuiSubmissionOutcome::LocalActionableError { message, .. } => Ok(message),

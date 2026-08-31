@@ -416,6 +416,7 @@ fn build_chat(
             tasks,
             task_runtime: None,
             bypass_permissions,
+            dangerous_mode: false,
         }),
     })
 }
@@ -453,6 +454,9 @@ fn presentation_of(
         model: Some(model),
         reasoning_effort,
         bypass_permissions,
+        // A freshly built session object always starts with dangerous mode
+        // off; the toggle reply, not the arrival, is what turns the footer on.
+        dangerous_mode: false,
     }
 }
 
@@ -669,6 +673,9 @@ struct HostedChat {
     /// Whether this session bypasses Ask permission prompts. Mirrors the
     /// persisted per-session flag; toggled by the hosted `/bypass` command.
     bypass_permissions: bool,
+    /// Whether this session runs in dangerous mode. Ephemeral, like the local
+    /// toggle: it lives only as long as this hosted session object.
+    dangerous_mode: bool,
 }
 
 impl ChatTurns for HostedChat {
@@ -684,6 +691,14 @@ impl ChatTurns for HostedChat {
         }
         if command == "/bypass" {
             return self.toggle_bypass();
+        }
+        if command == "/dangerous" {
+            self.dangerous_mode = !self.dangerous_mode;
+            return Ok(if self.dangerous_mode {
+                agens_core::hosted::DANGEROUS_ON_REPLY.to_owned()
+            } else {
+                agens_core::hosted::DANGEROUS_OFF_REPLY.to_owned()
+            });
         }
 
         let effort = command
@@ -1036,7 +1051,7 @@ impl HostedChat {
             // a chat runs in the user's checkout with no approved scope behind
             // it, so what the operator did not decide is still refused.
             dangerously_allow_all: self.bypass_permissions,
-            dangerous_mode: false,
+            dangerous_mode: self.dangerous_mode,
             request_config: if overrides_selection {
                 RequestConfig::default()
             } else {

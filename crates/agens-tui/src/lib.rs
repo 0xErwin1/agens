@@ -585,6 +585,11 @@ pub enum TuiSubmissionOutcome {
         message: String,
         enabled: bool,
     },
+    /// The session's dangerous-mode state changed, as the daemon reported it.
+    DangerousChanged {
+        message: String,
+        enabled: bool,
+    },
     /// A turn was taken back or put back: the transcript is replaced with the
     /// history that is live again and the prompt that started the turn goes
     /// back to the composer, so undoing costs no retyping.
@@ -7456,6 +7461,11 @@ where
             }
             TuiSubmissionOutcome::BypassChanged { message, enabled } => {
                 self.set_bypass(enabled);
+                self.add_info(message);
+                None
+            }
+            TuiSubmissionOutcome::DangerousChanged { message, enabled } => {
+                self.set_dangerous_mode(enabled);
                 self.add_info(message);
                 None
             }

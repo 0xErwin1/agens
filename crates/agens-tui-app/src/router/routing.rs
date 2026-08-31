@@ -480,6 +480,18 @@ impl TuiRuntimeRouter {
                     enabled,
                 });
             }
+            "dangerous" => {
+                let reply = backend.command("/dangerous")?;
+                let enabled = match reply.as_str() {
+                    agens_core::hosted::DANGEROUS_ON_REPLY => true,
+                    agens_core::hosted::DANGEROUS_OFF_REPLY => false,
+                    _ => return Ok(TuiSubmissionOutcome::LocalInfo(reply)),
+                };
+                return Ok(TuiSubmissionOutcome::DangerousChanged {
+                    message: reply,
+                    enabled,
+                });
+            }
             "quit" => return Ok(TuiSubmissionOutcome::Quit),
             _ => {}
         }
@@ -503,6 +515,9 @@ impl TuiRuntimeRouter {
         }
         if action == "bypass" {
             return self.resolve_daemon_command("/bypass");
+        }
+        if action == "dangerous" {
+            return self.resolve_daemon_command("/dangerous");
         }
         Err(CliError::usage("unknown attached dialog action"))
     }

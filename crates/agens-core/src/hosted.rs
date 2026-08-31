@@ -510,3 +510,8 @@ pub trait HostedMcpControl: Send + Sync {
 /// free text, so daemon and surface can never disagree about what was said.
 pub const BYPASS_ON_REPLY: &str = "Permission bypass: on.";
 pub const BYPASS_OFF_REPLY: &str = "Permission bypass: off.";
+
+/// The authoritative hosted replies to a `/dangerous` toggle, matched exactly
+/// by a client for the same reason as the bypass replies.
+pub const DANGEROUS_ON_REPLY: &str = "Dangerous mode: on.";
+pub const DANGEROUS_OFF_REPLY: &str = "Dangerous mode: off.";

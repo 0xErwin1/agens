@@ -612,6 +612,7 @@ struct HostedPresentation {
     reasoning_effort: Option<String>,
     context_window: Option<u64>,
     bypass_permissions: bool,
+    dangerous_mode: bool,
 }
 
 /// The footer presentation this arrival earns, or `None` when the daemon did
@@ -641,7 +642,8 @@ fn arrival_presentation(arrival: &Arrival) -> Option<agens_tui::TuiPresentation>
         format!("session #{}", arrival.session_id),
     )
     .with_context_window(window)
-    .with_bypass(described.bypass_permissions);
+    .with_bypass(described.bypass_permissions)
+    .with_dangerous_mode(described.dangerous_mode);
 
     if let Some(effort) = &described.reasoning_effort {
         presentation = presentation.with_effort(effort.clone());
@@ -840,6 +842,7 @@ fn described_presentation(opened: &agens_coordinator_client::OpenedChat) -> Host
         reasoning_effort: opened.reasoning_effort.clone(),
         context_window: opened.context_window,
         bypass_permissions: opened.bypass_permissions,
+        dangerous_mode: opened.dangerous_mode,
     }
 }
 
@@ -1023,6 +1026,7 @@ mod tests {
                 reasoning_effort: Some("medium".to_owned()),
                 context_window: Some(1_047_576),
                 bypass_permissions: false,
+                dangerous_mode: false,
             },
         };
 
@@ -1056,6 +1060,7 @@ mod tests {
                 reasoning_effort: None,
                 context_window: None,
                 bypass_permissions: true,
+                dangerous_mode: false,
             },
         };
 
@@ -1095,6 +1100,7 @@ mod tests {
                 reasoning_effort: None,
                 context_window: None,
                 bypass_permissions: false,
+                dangerous_mode: false,
             },
         };
 
@@ -1126,6 +1132,7 @@ mod tests {
                 reasoning_effort: None,
                 context_window: Some(10),
                 bypass_permissions: false,
+                dangerous_mode: false,
             },
         };
 
@@ -1151,6 +1158,7 @@ mod tests {
                 reasoning_effort: None,
                 context_window: Some(10),
                 bypass_permissions: false,
+                dangerous_mode: false,
             },
         };
 
