@@ -416,9 +416,8 @@ fn an_attach_survives_configuration_broken_after_the_daemon_started() {
 #[test]
 fn the_auto_start_surfaces_the_daemons_own_configuration_failure() {
     let operator = Operator::prepare();
-    operator.write_config(
-        &operator.config_with("[provider]\nmodel = \"unknown-provider/gpt-4.1\"\n"),
-    );
+    operator
+        .write_config(&operator.config_with("[provider]\nmodel = \"unknown-provider/gpt-4.1\"\n"));
 
     let output = operator.run(&[]);
 

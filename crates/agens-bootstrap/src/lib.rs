@@ -679,10 +679,8 @@ mod tests {
     /// config home. `credentials_unavailable` makes the credentials file
     /// refuse to be read, the way a permission error would on a real machine.
     fn fixture_host(config: String, credentials_unavailable: bool) -> HostEnvironment {
-        let environment: BTreeMap<String, String> = BTreeMap::from([(
-            "AGENS_CONFIG_HOME".to_owned(),
-            "/fixture/config".to_owned(),
-        )]);
+        let environment: BTreeMap<String, String> =
+            BTreeMap::from([("AGENS_CONFIG_HOME".to_owned(), "/fixture/config".to_owned())]);
 
         HostEnvironment {
             current_directory: Box::new(|| Ok(PathBuf::from("/"))),
@@ -694,9 +692,7 @@ mod tests {
                 }
                 if path == Path::new("/fixture/config/auth.json") {
                     if credentials_unavailable {
-                        return Err(CliError::configuration(
-                            "configuration file is unavailable",
-                        ));
+                        return Err(CliError::configuration("configuration file is unavailable"));
                     }
                     return Ok(Some("{}".to_owned()));
                 }
@@ -726,11 +722,7 @@ mod tests {
                 format!("{RENDER_SECTIONS}\n[permissions]\nallow = [true]\n"),
                 false,
             ),
-            (
-                "unreadable credentials",
-                RENDER_SECTIONS.to_owned(),
-                true,
-            ),
+            ("unreadable credentials", RENDER_SECTIONS.to_owned(), true),
         ];
 
         for (name, config, credentials_unavailable) in broken {
@@ -744,7 +736,10 @@ mod tests {
                 .unwrap_or_else(|error| panic!("{name} must not stop an attach: {error:?}"));
 
             assert_eq!(bootstrap.data_directory(), Path::new("/fixture/data"));
-            assert!(bootstrap.collapse_thinking, "{name}: render preference lost");
+            assert!(
+                bootstrap.collapse_thinking,
+                "{name}: render preference lost"
+            );
         }
     }
 

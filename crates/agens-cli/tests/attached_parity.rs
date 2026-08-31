@@ -412,7 +412,10 @@ fn a_refused_handshake_blocks_the_attach_with_its_report() {
 #[test]
 fn a_broken_local_config_stops_local_but_not_attached_launches() {
     let broken_configs = [
-        ("model", "[provider]\nmodel = \"unknown-provider/gpt-4.1\"\n"),
+        (
+            "model",
+            "[provider]\nmodel = \"unknown-provider/gpt-4.1\"\n",
+        ),
         ("mcp", "[mcp.broken]\ntransport = \"stdio\"\n"),
         ("permissions", "[permissions]\nallow = [true]\n"),
     ];
