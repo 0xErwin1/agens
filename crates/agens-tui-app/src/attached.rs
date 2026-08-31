@@ -30,7 +30,8 @@ use std::sync::mpsc::Sender;
 
 use agens_bootstrap::Bootstrap;
 use agens_coordinator_client::{
-    ChatClient, ClientError, Coordinator, HostedChatEvent, PermissionDecision, PermissionQuestion,
+    ChatClient, ClientError, Coordinator, HostedChatEvent, HostedPresentation, PermissionDecision,
+    PermissionQuestion,
 };
 use agens_core::hosted::{
     CatalogKind, CatalogResult, FileError, HostedControlCommand, HostedControlKind,
@@ -52,7 +53,9 @@ use tokio_stream::{Stream, StreamExt};
 #[cfg(test)]
 use agens_tui::{TuiRouteRequest, TuiSubmissionOutcome};
 
-use crate::router::{AttachedRouteBackend, TuiRuntimeRouter, tui_provider_outcome};
+use crate::router::{
+    AttachedRouteBackend, HostedCommandReply, TuiRuntimeRouter, tui_provider_outcome,
+};
 
 /// What this mode cannot serve yet, said the same way everywhere it comes up.
 #[cfg(test)]
@@ -89,15 +92,28 @@ struct Attachment {
 }
 
 impl Attachment {
-    fn command(&self, command: &str) -> Result<String, CliError> {
+    /// Runs one daemon-owned command and reports what it answered, together
+    /// with the footer the daemon's description of the session earns once the
+    /// command has run. A daemon that described nothing leaves the footer as
+    /// it is.
+    fn command(&self, command: &str) -> Result<HostedCommandReply, CliError> {
         let mut chat = self
             .chat
             .lock()
             .map_err(|_| unavailable("the connection to the daemon is unusable"))?;
 
-        self.runtime
+        let reply = self
+            .runtime
             .block_on(chat.command(self.session_id, command))
-            .map_err(refused)
+            .map_err(refused)?;
+
+        Ok(HostedCommandReply {
+            message: reply.message,
+            presentation: reply
+                .presentation
+                .as_ref()
+                .and_then(|described| footer_presentation(described, self.session_id)),
+        })
     }
 
     /// Sends one prompt and reports what the turn did, forwarding everything it
@@ -292,7 +308,7 @@ impl AttachedRouteBackend for Attachment {
             .map_err(refused)
     }
 
-    fn command(&self, command: &str) -> Result<String, CliError> {
+    fn command(&self, command: &str) -> Result<HostedCommandReply, CliError> {
         self.command(command)
     }
 
@@ -649,21 +665,6 @@ struct Arrival {
     presentation: HostedPresentation,
 }
 
-/// The hosted session's active configuration, as the open answer carried it.
-///
-/// Every field is optional because a daemon that predates the description
-/// answers with none of them, and an arrival that invented values for such a
-/// daemon would dress the footer with a configuration nobody holds.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-struct HostedPresentation {
-    provider: Option<String>,
-    model: Option<String>,
-    reasoning_effort: Option<String>,
-    context_window: Option<u64>,
-    bypass_permissions: bool,
-    dangerous_mode: bool,
-}
-
 /// The footer presentation this arrival earns, or `None` when the daemon did
 /// not describe the chat and the placeholders are the honest rendering.
 ///
@@ -673,7 +674,19 @@ struct HostedPresentation {
 /// provider falls back to the same placeholder a local launch uses, and the
 /// session label is the same `session #id`.
 fn arrival_presentation(arrival: &Arrival) -> Option<agens_tui::TuiPresentation> {
-    let described = &arrival.presentation;
+    footer_presentation(&arrival.presentation, arrival.session_id)
+}
+
+/// The footer a hosted description dresses, or `None` when it described no
+/// model and the placeholders are the honest rendering.
+///
+/// Shared by the arrival and by every hosted command that answers with a fresh
+/// description, so a `/model` mid-session redresses the footer exactly the way
+/// attaching to that same selection would have.
+fn footer_presentation(
+    described: &HostedPresentation,
+    session_id: i64,
+) -> Option<agens_tui::TuiPresentation> {
     let model = described
         .model
         .as_deref()
@@ -685,14 +698,11 @@ fn arrival_presentation(arrival: &Arrival) -> Option<agens_tui::TuiPresentation>
         .unwrap_or("provider");
 
     let window = described.context_window;
-    let mut presentation = agens_tui::TuiPresentation::new(
-        provider,
-        model,
-        format!("session #{}", arrival.session_id),
-    )
-    .with_context_window(window)
-    .with_bypass(described.bypass_permissions)
-    .with_dangerous_mode(described.dangerous_mode);
+    let mut presentation =
+        agens_tui::TuiPresentation::new(provider, model, format!("session #{session_id}"))
+            .with_context_window(window)
+            .with_bypass(described.bypass_permissions)
+            .with_dangerous_mode(described.dangerous_mode);
 
     if let Some(effort) = &described.reasoning_effort {
         presentation = presentation.with_effort(effort.clone());

@@ -65,15 +65,29 @@ impl AttachedRouteBackend for FakeAttachedBackend {
         ))
     }
 
-    fn command(&self, command: &str) -> Result<String, CliError> {
+    fn command(&self, command: &str) -> Result<HostedCommandReply, CliError> {
         self.commands.lock().unwrap().push(command.to_owned());
         if command == "/bypass" {
-            return Ok(agens_core::hosted::BYPASS_ON_REPLY.to_owned());
+            return Ok(HostedCommandReply {
+                message: agens_core::hosted::BYPASS_ON_REPLY.to_owned(),
+                presentation: None,
+            });
         }
         if command == "/dangerous" {
-            return Ok(agens_core::hosted::DANGEROUS_ON_REPLY.to_owned());
+            return Ok(HostedCommandReply {
+                message: agens_core::hosted::DANGEROUS_ON_REPLY.to_owned(),
+                presentation: None,
+            });
         }
-        Ok(format!("daemon:{command}"))
+        let described = command.starts_with("/model ") || command.starts_with("/effort ");
+        Ok(HostedCommandReply {
+            message: format!("daemon:{command}"),
+            presentation: described.then(|| {
+                TuiPresentation::new("openai-api", "gpt-5.6", "session #7")
+                    .with_effort("high")
+                    .with_context_window(Some(400_000))
+            }),
+        })
     }
 
     fn list_files(
@@ -5030,4 +5044,49 @@ fn an_attached_dangerous_toggle_reaches_the_daemon_and_flips_the_footer_state() 
             enabled: true,
         }
     );
+}
+
+#[test]
+fn an_attached_model_command_redresses_the_footer_from_the_daemons_description() {
+    let temporary = tui_session_directory("attached-model-presentation");
+    let bootstrap = tui_session_bootstrap(&temporary, &[]);
+    let backend = Arc::new(FakeAttachedBackend::default());
+
+    let attached = TuiRuntimeRouter::attached(
+        bootstrap,
+        Arc::new(Mutex::new(SessionContext::fresh())),
+        backend.clone(),
+    );
+
+    let outcome = attached_route(
+        &attached,
+        TuiRouteRequest::Input("/model openai-api/gpt-5.6".into()),
+    );
+
+    assert_eq!(
+        outcome,
+        TuiSubmissionOutcome::ContextChanged {
+            message: "daemon:/model openai-api/gpt-5.6".to_owned(),
+            presentation: TuiPresentation::new("openai-api", "gpt-5.6", "session #7")
+                .with_effort("high")
+                .with_context_window(Some(400_000)),
+        },
+        "the footer follows the selection the daemon reports after the command"
+    );
+
+    let effort = attached_route(&attached, TuiRouteRequest::Input("/effort low".into()));
+
+    assert!(
+        matches!(effort, TuiSubmissionOutcome::ContextChanged { .. }),
+        "a hosted effort change redresses the footer too: {effort:?}"
+    );
+
+    let undescribed = attached_route(&attached, TuiRouteRequest::Input("/sessions".into()));
+
+    assert!(
+        matches!(undescribed, TuiSubmissionOutcome::LocalInfo(_)),
+        "a command the daemon did not describe leaves the footer alone: {undescribed:?}"
+    );
+
+    std::fs::remove_dir_all(temporary).unwrap();
 }

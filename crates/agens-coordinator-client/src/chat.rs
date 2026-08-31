@@ -52,6 +52,30 @@ pub struct OpenedChat {
     pub dangerous_mode: bool,
 }
 
+/// What a hosted command answered, and how the daemon described the session
+/// once the command had run.
+///
+/// The description is how an attached surface learns that `/model`, `/effort`
+/// or an agent rotation changed the selection: the daemon reads it off the
+/// session that now holds it, so the client never has to parse the reply text.
+/// `None` means the daemon described nothing, which reads as unchanged.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommandReply {
+    pub message: String,
+    pub presentation: Option<HostedPresentation>,
+}
+
+/// How a hosted session is configured, as the daemon describes it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HostedPresentation {
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub context_window: Option<u64>,
+    pub bypass_permissions: bool,
+    pub dangerous_mode: bool,
+}
+
 /// The daemon's account of what it is, as the attach handshake carries it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DaemonBuild {
@@ -348,7 +372,11 @@ impl ChatClient {
     }
 
     /// Executes a slash command against the daemon-owned chat state.
-    pub async fn command(&mut self, session_id: i64, command: &str) -> Result<String, ClientError> {
+    pub async fn command(
+        &mut self,
+        session_id: i64,
+        command: &str,
+    ) -> Result<CommandReply, ClientError> {
         let result = self
             .inner
             .command(proto::ChatCommandRequest {
@@ -358,7 +386,23 @@ impl ChatClient {
             .await?
             .into_inner();
 
-        Ok(result.message)
+        // The model is what makes a description one: a reply that names no
+        // model described nothing, and dressing a footer from the rest of it
+        // would show a configuration nobody holds.
+        let model = result.model.filter(|model| !model.is_empty());
+        let presentation = model.map(|model| HostedPresentation {
+            provider: result.provider.filter(|provider| !provider.is_empty()),
+            model: Some(model),
+            reasoning_effort: result.reasoning_effort.filter(|effort| !effort.is_empty()),
+            context_window: result.context_window.filter(|window| *window > 0),
+            bypass_permissions: result.bypass_permissions.unwrap_or(false),
+            dangerous_mode: result.dangerous_mode.unwrap_or(false),
+        });
+
+        Ok(CommandReply {
+            message: result.message,
+            presentation,
+        })
     }
 
     /// Answers a question the chat's turn is stopped on.

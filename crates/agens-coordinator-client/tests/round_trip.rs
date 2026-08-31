@@ -89,11 +89,29 @@ impl SessionProvider for StubProvider {
 struct ScriptedTurns {
     started: Sender<String>,
     events: Vec<TurnEvent>,
+    /// What the last `/model` selected. A chat that has selected nothing
+    /// describes nothing, the way a daemon that predates the description does.
+    selected: Option<String>,
 }
 
 impl ChatTurns for ScriptedTurns {
     fn command(&mut self, command: &str) -> Result<String, agens_server::ChatError> {
+        if let Some(model) = command.strip_prefix("/model ") {
+            self.selected = Some(model.to_owned());
+        }
+
         Ok(format!("executed:{command}"))
+    }
+
+    fn presentation(&self) -> Option<agens_server::ChatPresentation> {
+        Some(agens_server::ChatPresentation {
+            provider: Some("openai-api".to_owned()),
+            model: Some(self.selected.clone()?),
+            reasoning_effort: Some("high".to_owned()),
+            context_window: Some(400_000),
+            bypass_permissions: true,
+            dangerous_mode: true,
+        })
     }
 
     fn run(
@@ -239,6 +257,7 @@ async fn served(events: Vec<TurnEvent>) -> Served {
                 turns: Box::new(ScriptedTurns {
                     started: started.clone(),
                     events: events.lock().expect("the script is readable").clone(),
+                    selected: None,
                 }),
             })
         }),
@@ -388,11 +407,34 @@ async fn qualified_model_command_survives_the_client_round_trip() {
         .expect("the chat opens")
         .session_id;
 
+    let undescribed = chat
+        .command(session, "/sessions")
+        .await
+        .expect("the hosted command executes");
+
+    assert_eq!(undescribed.message, "executed:/sessions");
     assert_eq!(
-        chat.command(session, "/model openai-api/gpt-4.1")
-            .await
-            .expect("the hosted command executes"),
-        "executed:/model openai-api/gpt-4.1"
+        undescribed.presentation, None,
+        "a chat that described nothing leaves the client's footer alone"
+    );
+
+    let selected = chat
+        .command(session, "/model openai-api/gpt-4.1")
+        .await
+        .expect("the hosted command executes");
+
+    assert_eq!(selected.message, "executed:/model openai-api/gpt-4.1");
+    assert_eq!(
+        selected.presentation,
+        Some(agens_coordinator_client::HostedPresentation {
+            provider: Some("openai-api".to_owned()),
+            model: Some("openai-api/gpt-4.1".to_owned()),
+            reasoning_effort: Some("high".to_owned()),
+            context_window: Some(400_000),
+            bypass_permissions: true,
+            dangerous_mode: true,
+        }),
+        "the selection the command made crosses the wire with its reply"
     );
 }
 

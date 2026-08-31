@@ -604,7 +604,22 @@ message ChatCommandRequest {
   string command = 2;
 }
 
-message ChatCommandResult { string message = 1; }
+message ChatCommandResult {
+  string message = 1;
+  // How the session is configured now that the command has run, described the
+  // way `ChatHandle` describes it at open. A command that changed the model,
+  // the reasoning effort or the agent behind them answers with the session's
+  // new configuration, so an attached footer stops showing the selection it
+  // arrived on. Absent on daemons that predate this, and absent for a command
+  // that changed nothing; a client reads absence as "unchanged", never as
+  // "unconfigured".
+  optional string provider = 2;
+  optional string model = 3;
+  optional string reasoning_effort = 4;
+  optional uint64 context_window = 5;
+  optional bool bypass_permissions = 6;
+  optional bool dangerous_mode = 7;
+}
 
 // One open chat, named.
 message ChatRef {

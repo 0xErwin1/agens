@@ -24,7 +24,7 @@ use agens_core::hosted::{
 use agens_tools::{
     CommandBusyPolicy, CommandCatalog, McpStatusHandle, SkillCatalog, ToolDispatcher,
 };
-use agens_tui::{PaletteEntry, TuiProviderOutcome, TuiSubmissionOutcome};
+use agens_tui::{PaletteEntry, TuiPresentation, TuiProviderOutcome, TuiSubmissionOutcome};
 
 use crate::extensions::resolved_tui_palette;
 use agens_agents::subagent_catalog;
@@ -40,9 +40,23 @@ use agens_tool_runtime::mcp::{ProductionMcpRuntime, load_configured_mcp_registry
 
 pub const TUI_ERROR_ACTION: &str = "Correct the command or runtime condition, then retry.";
 
+/// What a hosted command answered, and how the daemon describes the session it
+/// ran against once it had run.
+///
+/// The description comes from the daemon rather than from the reply text: the
+/// session that holds the new model, effort and window is the daemon's, so a
+/// footer redressed from anything else would be this client guessing. `None`
+/// means the daemon described nothing, which reads as unchanged — a daemon that
+/// predates the description answers that way for every command.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HostedCommandReply {
+    pub message: String,
+    pub presentation: Option<TuiPresentation>,
+}
+
 pub(crate) trait AttachedRouteBackend: Send + Sync {
     fn catalog(&self, kind: CatalogKind) -> Result<CatalogResult, CliError>;
-    fn command(&self, command: &str) -> Result<String, CliError>;
+    fn command(&self, command: &str) -> Result<HostedCommandReply, CliError>;
     fn list_files(
         &self,
         selector: &Path,

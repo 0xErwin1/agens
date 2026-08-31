@@ -156,6 +156,16 @@ pub trait ChatTurns: Send {
         ))
     }
 
+    /// How the session is configured right now.
+    ///
+    /// Read after a command has run, so a client that changed the model or the
+    /// reasoning effort learns the new selection from the session that holds
+    /// it rather than from the reply text. `None` for a chat that describes
+    /// nothing, which a client reads as unchanged.
+    fn presentation(&self) -> Option<ChatPresentation> {
+        None
+    }
+
     /// Runs one prompt to completion, reporting progress through `progress`.
     ///
     /// `cancellation` belongs to this turn and to no other. It is not the
@@ -203,6 +213,17 @@ pub struct ChatPresentation {
     pub bypass_permissions: bool,
     /// Whether the session currently runs in dangerous mode.
     pub dangerous_mode: bool,
+}
+
+/// What a hosted command answered, and how the session is configured after it.
+///
+/// The description is the session's own, read once the command has run, so a
+/// command that changed the selection carries the change rather than leaving
+/// the client to parse it out of the message.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ChatCommandOutcome {
+    pub message: String,
+    pub presentation: Option<ChatPresentation>,
 }
 
 /// A chat session the daemon opened, and how it described it.
@@ -404,7 +425,7 @@ enum ChatInput {
     Prompt(SessionMessage),
     Command {
         command: String,
-        result: SyncSender<Result<String, ChatError>>,
+        result: SyncSender<Result<ChatCommandOutcome, ChatError>>,
     },
 }
 
@@ -578,7 +599,11 @@ impl ChatSessions {
     }
 
     /// Executes a command on the same serialized state that owns hosted turns.
-    pub fn command(&self, session: SessionId, command: String) -> Result<String, ChatError> {
+    pub fn command(
+        &self,
+        session: SessionId,
+        command: String,
+    ) -> Result<ChatCommandOutcome, ChatError> {
         let inputs = self
             .locked()?
             .get(&session)
@@ -1017,7 +1042,11 @@ fn serve_prompts(
 
         let message = match inbox.recv_timeout(PROMPT_POLL) {
             Ok(ChatInput::Command { command, result }) => {
-                drop(result.send(turns.command(&command)));
+                let answered = turns.command(&command).map(|message| ChatCommandOutcome {
+                    message,
+                    presentation: turns.presentation(),
+                });
+                drop(result.send(answered));
                 continue;
             }
             Ok(ChatInput::Prompt(message)) => message,
