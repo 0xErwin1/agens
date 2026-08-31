@@ -264,7 +264,10 @@ const fn default_parked_reason(state: &TeamState) -> &'static str {
 /// One repository's runs, as the daemon holds them.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TeamRepo {
+    /// The daemon's own fingerprint for the repository.
     pub id: String,
+    /// What to call it on the board, which is never the fingerprint.
+    pub label: String,
     pub nodes: Vec<TeamNode>,
 }
 

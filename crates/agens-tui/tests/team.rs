@@ -41,6 +41,7 @@ fn fleet() -> TeamSnapshot {
         repos: vec![
             TeamRepo {
                 id: "agens".to_owned(),
+                label: "agens".to_owned(),
                 nodes: vec![
                     TeamNode {
                         attempt: Some(2),
@@ -61,6 +62,7 @@ fn fleet() -> TeamSnapshot {
             },
             TeamRepo {
                 id: "harness".to_owned(),
+                label: "harness".to_owned(),
                 nodes: vec![TeamNode {
                     is_self: true,
                     ..TeamNode::chat(90, "~/dev/harness", TeamState::Answering)
@@ -482,4 +484,23 @@ fn an_approval_is_recognised_as_a_merge_authorization_and_a_question_is_not() {
 
     assert!(merge.is_approval());
     assert!(!asked.is_approval());
+}
+
+#[test]
+fn a_repository_is_headed_by_its_label_rather_than_its_fingerprint() {
+    let mut screen = screen(100, 30);
+    let surface = TeamSurface::new(TeamSnapshot {
+        inbox: Vec::new(),
+        repos: vec![TeamRepo {
+            id: "a1b2c3d4e5f60718".to_owned(),
+            label: "agens".to_owned(),
+            nodes: vec![TeamNode::run(11, "ship the api", TeamState::Running)],
+        }],
+    });
+
+    screen.draw(&surface).expect("the board draws");
+    let text = rendered(&screen);
+
+    assert!(text.contains("agens"), "{text}");
+    assert!(!text.contains("a1b2c3d4e5f60718"), "{text}");
 }

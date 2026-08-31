@@ -22,6 +22,7 @@ pub mod repository;
 pub mod resume;
 pub mod router;
 pub mod session;
+pub mod team;
 pub mod turn;
 pub mod undo;
 

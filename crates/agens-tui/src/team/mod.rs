@@ -360,7 +360,7 @@ impl TeamSurface {
         let mut rows = Vec::new();
 
         for repo in &self.snapshot.repos {
-            rows.push(TeamRow::Repo(&repo.id));
+            rows.push(TeamRow::Repo(&repo.label));
 
             for node in &repo.nodes {
                 let depth = usize::from(
@@ -394,6 +394,7 @@ mod tests {
             repos: vec![
                 TeamRepo {
                     id: "agens".to_owned(),
+                    label: "agens".to_owned(),
                     nodes: vec![
                         TeamNode::run(11, "ship the api", TeamState::Running),
                         TeamNode {
@@ -404,6 +405,7 @@ mod tests {
                 },
                 TeamRepo {
                     id: "harness".to_owned(),
+                    label: "harness".to_owned(),
                     nodes: vec![TeamNode::chat(90, "~/dev/harness", TeamState::Idle)],
                 },
             ],
@@ -449,6 +451,7 @@ mod tests {
             inbox: Vec::new(),
             repos: vec![TeamRepo {
                 id: "agens".to_owned(),
+                label: "agens".to_owned(),
                 nodes: vec![TeamNode::run(11, "ship the api", TeamState::Running)],
             }],
         });
