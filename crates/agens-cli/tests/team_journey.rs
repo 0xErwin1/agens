@@ -21,6 +21,12 @@
 //! root this test removes on the way out. The one thing that crosses over is
 //! the credentials file, and only the entry for the provider under test.
 
+// Only the single-directory reap is wanted here; the tree walk belongs to the
+// suites that own a whole fixture root.
+#[allow(dead_code)]
+#[path = "support/daemon_reaper.rs"]
+mod daemon_reaper;
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
@@ -186,7 +192,10 @@ impl Probe {
         let mut stopper = self.agens();
         stopper.args(["serve", "stop"]);
 
-        Daemon { stopper }
+        Daemon {
+            stopper,
+            data_directory: self.data_directory.clone(),
+        }
     }
 
     async fn walk_the_journey(&self) -> Journey {
@@ -336,6 +345,7 @@ impl Journey {
 /// is not its child any more, and a signal is what it answers to either way.
 struct Daemon {
     stopper: Command,
+    data_directory: PathBuf,
 }
 
 impl Daemon {
@@ -345,8 +355,13 @@ impl Daemon {
 }
 
 impl Drop for Daemon {
+    /// The stop is asked for first so the daemon reports what it left behind,
+    /// and then the reap makes sure it is actually gone: a `serve stop` that
+    /// failed returns quietly, and a journey that ends with a daemon still
+    /// holding this probe's data directory is a leak the next run inherits.
     fn drop(&mut self) {
         self.stop();
+        daemon_reaper::reap(&self.data_directory);
     }
 }
 

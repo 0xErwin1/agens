@@ -10,6 +10,9 @@
 //! on the process being gone, and both waits are bounded so a hang fails the
 //! test instead of the suite.
 
+#[path = "support/daemon_reaper.rs"]
+mod daemon_reaper;
+
 use std::io::ErrorKind;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -129,46 +132,16 @@ impl Operator {
 }
 
 impl Drop for Operator {
-    /// Whatever the test proved or failed to prove, no daemon outlives it.
+    /// Whatever the test proved or failed to prove, no daemon outlives it —
+    /// including one this fixture never spawned.
     ///
-    /// `serve stop` is asked first so the daemon gets its bounded shutdown, and
-    /// asked again while one is still coming up: a stop that raced the start is
-    /// refused, and giving up there is how suites have leaked daemons whose
-    /// HOME and binary were then deleted out from under them. A daemon that
-    /// still holds its pid when the patience runs out is killed outright — at
-    /// this point it is a leak, not a process whose report anybody will read.
+    /// The reap is by data directory, not by handle and not through the
+    /// binary: a bare launch makes the binary start its own daemon, and a test
+    /// that broke the configuration on purpose is one `serve stop` can no
+    /// longer resolve. The pid the daemon publishes under this operator's data
+    /// directory is what both of those still have in common.
     fn drop(&mut self) {
-        let deadline = Instant::now() + PATIENCE;
-
-        loop {
-            let _ = self
-                .command()
-                .args(["serve", "stop"])
-                .stdin(Stdio::null())
-                .output();
-
-            let published = std::fs::read_to_string(self.pid_path())
-                .ok()
-                .and_then(|contents| contents.trim().parse::<i32>().ok())
-                .filter(|pid| *pid > 0);
-
-            match published {
-                Some(pid) if alive(pid) => {
-                    if Instant::now() >= deadline {
-                        unsafe { libc::kill(pid, libc::SIGKILL) };
-                        break;
-                    }
-                }
-                Some(_) | None if !accepts(&self.socket()) => break,
-                Some(_) | None => {
-                    if Instant::now() >= deadline {
-                        break;
-                    }
-                }
-            }
-
-            std::thread::sleep(POLL);
-        }
+        daemon_reaper::reap_under(&self.root);
 
         let _ = std::fs::remove_dir_all(&self.root);
     }
@@ -697,5 +670,74 @@ fn no_daemon_survives_its_operators_teardown() {
     assert!(
         !alive(survivor),
         "the teardown stopped the daemon the test spawned"
+    );
+}
+
+/// The same hygiene for a daemon the harness never spawned. A bare launch makes
+/// the BINARY re-execute itself as `serve --foreground`, so what the teardown
+/// has to stop is a process it has no handle to and never asked for. The
+/// fixture owns the data directory, and the daemon serving that directory is
+/// the fixture's to reap however it came to exist.
+#[test]
+fn no_daemon_survives_a_teardown_that_never_spawned_one() {
+    let survivor = {
+        let operator = Operator::prepare();
+
+        let launch = operator.run(&[]);
+        assert!(
+            !launch.status.success(),
+            "the non-terminal attached TUI still refuses"
+        );
+
+        let pid = operator.published_pid();
+        assert!(alive(pid), "the bare launch auto-started a daemon");
+
+        pid
+    };
+
+    assert!(
+        !alive(survivor),
+        "the teardown stopped the daemon the binary started"
+    );
+}
+
+/// The escape that leaked daemons for a day. A teardown that stops the daemon
+/// by running `agens serve stop` has to resolve the operator's configuration
+/// first — and the test that just proved a broken configuration is survivable
+/// is exactly the one whose configuration is broken at teardown. Every stop
+/// then failed, the guard waited out its whole patience, and what it finally
+/// did was `SIGKILL` a daemon it could have asked politely.
+///
+/// The pid the daemon publishes is enough to signal it, so the teardown no
+/// longer depends on a file the test was allowed to corrupt.
+#[test]
+fn a_teardown_reaches_the_daemon_through_a_configuration_the_test_broke() {
+    let started;
+    let elapsed;
+    let survivor = {
+        let operator = Operator::prepare();
+        assert_succeeded(&operator.run(&["serve"]), "serve");
+        let pid = operator.published_pid();
+
+        // What a configuration test leaves behind: nothing the CLI can
+        // bootstrap from, and a daemon that started before it broke.
+        operator.write_config("[provider]\nmodel = \"???\"\n");
+        assert!(
+            !operator.run(&["serve", "stop"]).status.success(),
+            "a stop through the binary cannot resolve this configuration"
+        );
+
+        started = Instant::now();
+        drop(operator);
+        elapsed = started.elapsed();
+
+        pid
+    };
+
+    assert!(!alive(survivor), "the teardown stopped the daemon");
+    assert!(
+        elapsed < Duration::from_secs(15),
+        "the teardown asked the daemon to stop instead of waiting out its \
+         patience and killing it: {elapsed:?}"
     );
 }
