@@ -349,7 +349,7 @@ fn team_and_attach_are_first_class_attached_entry_points() {
     assert_eq!(
         team_help,
         success(
-            "enter team mode or inspect the machine fleet\n\nUsage: agens team [PROMPT]...\n\nArguments:\n  [PROMPT]...  An optional first prompt for the attached chat. Fleet operations are `ls [--json]`, `show <id> [--follow]`, `answer <question-id> <answer>`, `answer <chat-id> <prompt-id> <option-id>`, `permission <chat-id> <prompt-id> <answer>`, `merge <approval-question-id>`, and `cancel <id>`\n\nOptions:\n  -h, --help  Print help\n"
+            "enter team mode or inspect the machine fleet\n\nUsage: agens team [PROMPT]...\n\nArguments:\n  [PROMPT]...  An optional first prompt for the attached chat\n\nOptions:\n  -h, --help  Print help\n\nFleet operations:\n  ls [--json]                              list the daemon's live runs and chats\n  show <id> [--follow]                     inspect a run or chat, optionally live\n  answer <question-id> <answer>            answer a run's open question\n  answer <chat-id> <prompt-id> <option-id> answer a chat's ask-user question\n  permission <chat-id> <prompt-id> <answer>\n                                           decide a chat's permission prompt\n  merge <approval-question-id>             authorize a merge\n  cancel <id>                              cancel a run or chat\n"
         )
     );
     assert_eq!(*starts.lock().expect("start count lock"), 1);

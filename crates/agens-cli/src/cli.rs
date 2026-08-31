@@ -73,13 +73,19 @@ pub(crate) enum Command {
         /// The hosted session to resume. Without one, attach to this checkout's latest chat.
         target: Option<i64>,
     },
-    #[command(about = "enter team mode or inspect the machine fleet")]
+    #[command(
+        about = "enter team mode or inspect the machine fleet",
+        after_help = "Fleet operations:\n  \
+            ls [--json]                              list the daemon's live runs and chats\n  \
+            show <id> [--follow]                     inspect a run or chat, optionally live\n  \
+            answer <question-id> <answer>            answer a run's open question\n  \
+            answer <chat-id> <prompt-id> <option-id> answer a chat's ask-user question\n  \
+            permission <chat-id> <prompt-id> <answer>\n                                           decide a chat's permission prompt\n  \
+            merge <approval-question-id>             authorize a merge\n  \
+            cancel <id>                              cancel a run or chat"
+    )]
     Team {
-        /// An optional first prompt for the attached chat. Fleet operations are `ls [--json]`,
-        /// `show <id> [--follow]`, `answer <question-id> <answer>`,
-        /// `answer <chat-id> <prompt-id> <option-id>`,
-        /// `permission <chat-id> <prompt-id> <answer>`, `merge <approval-question-id>`, and
-        /// `cancel <id>`.
+        /// An optional first prompt for the attached chat
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         prompt: Vec<String>,
     },
