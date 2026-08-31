@@ -5,6 +5,7 @@
   packages = [
     pkgs.cargo-deny
     pkgs.jq
+    pkgs.mold
   ];
 
   languages.rust = {
