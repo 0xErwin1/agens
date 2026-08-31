@@ -646,8 +646,7 @@ impl ControlPlaneStore {
     /// it, never because anybody wrote it down in advance.
     pub fn run_repo_ids(&self) -> Result<Vec<String>> {
         let operation = "load run repositories";
-        let failure =
-            |error| ControlPlaneError::operation(operation, &self.database_path, error);
+        let failure = |error| ControlPlaneError::operation(operation, &self.database_path, error);
 
         let mut prepared = self
             .connection
