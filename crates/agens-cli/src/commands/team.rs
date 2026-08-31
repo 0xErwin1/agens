@@ -132,9 +132,21 @@ pub(crate) fn run_team_ls(json: bool, dependencies: &CliDependencies) -> Result<
             }
         }
 
+        // Read the row by id rather than looking it up in `sessions`: that
+        // listing only carries resumable sessions, so a chat that has not
+        // completed a turn is absent from it and would report an age counted
+        // from the epoch.
+        let mut chat_store = SessionStore::open(bootstrap.data_directory())
+            .map_err(|_| CliError::storage("the sessions database is unavailable"))?;
+
         for open in chat.open_everywhere().await.map_err(client_error)? {
-            let metadata = sessions.get(&open.session_id);
-            let created_at = metadata.map_or(0, |session| session.created_at);
+            let stored = chat_store
+                .read_session(open.session_id)
+                .ok()
+                .flatten()
+                .map(|session| session.metadata);
+            let metadata = stored.as_ref().or_else(|| sessions.get(&open.session_id));
+            let created_at = metadata.map_or(now, |session| session.created_at);
             let last_activity = metadata.map_or(created_at, |session| session.updated_at);
             let state = if open.answering { "running" } else { "idle" };
 
