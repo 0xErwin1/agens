@@ -404,6 +404,66 @@ fn a_refused_handshake_blocks_the_attach_with_its_report() {
     assert!(refused.stderr.contains("0.1.0+old"), "{}", refused.stderr);
 }
 
+/// A local configuration only the daemon consumes — a broken model string, a
+/// malformed MCP section, a bogus permission rule — must not stop an attached
+/// launch, while `--local` keeps refusing exactly the same file. The daemon is
+/// the source of truth for that configuration; the attached client only
+/// locates it and renders.
+#[test]
+fn a_broken_local_config_stops_local_but_not_attached_launches() {
+    let broken_configs = [
+        (
+            "model",
+            "[provider]\nmodel = \"unknown-provider/gpt-4.1\"\n",
+        ),
+        ("mcp", "[mcp.broken]\ntransport = \"stdio\"\n"),
+        ("permissions", "[permissions]\nallow = [true]\n"),
+    ];
+
+    for (name, config) in broken_configs {
+        let root = std::env::temp_dir().join(format!(
+            "agens-attached-broken-{name}-{}",
+            std::process::id()
+        ));
+        let config_home = root.join("config");
+        let dependencies = CliDependencies::for_test(
+            root.join("project"),
+            Some(root.join("home")),
+            BTreeMap::from([(
+                "AGENS_CONFIG_HOME".to_owned(),
+                config_home.display().to_string(),
+            )]),
+            BTreeMap::from([(config_home.join("config.toml"), config.to_owned())]),
+        )
+        .with_daemon_ensurer(|_| Ok(false))
+        .with_tui_launcher(|bootstrap, launch| {
+            assert_eq!(
+                bootstrap.model(),
+                None,
+                "an attached launch must not carry local provider configuration"
+            );
+            Ok(format!("mode={:?}", launch.mode()))
+        });
+
+        let attached = execute(std::iter::empty::<&str>(), &dependencies);
+        assert_eq!(
+            attached.status,
+            ExitStatus::Success,
+            "{name}: {}",
+            attached.stderr
+        );
+        assert_eq!(attached.stdout, "mode=Attached\n");
+
+        let local = execute(["--local"], &dependencies);
+        assert_eq!(
+            local.status,
+            ExitStatus::Configuration,
+            "{name}: --local must keep refusing the broken configuration"
+        );
+        assert!(local.stderr.starts_with("error:"), "{}", local.stderr);
+    }
+}
+
 /// What the handshake did — replaced an idle daemon, or kept serving with a
 /// compatible older one — surfaces as the launch's startup notice.
 #[test]

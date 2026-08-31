@@ -100,6 +100,21 @@ impl Operator {
         self.data_directory.join("serve.sock")
     }
 
+    /// Replaces the configuration file this operator's commands resolve.
+    fn write_config(&self, contents: &str) {
+        std::fs::write(self.root.join("config/config.toml"), contents)
+            .expect("rewrite the configuration");
+    }
+
+    /// A configuration that still names this operator's data directory, plus
+    /// whatever `extra` sections a case is about.
+    fn config_with(&self, extra: &str) -> String {
+        format!(
+            "[options]\ndata_dir = \"{}\"\n\n{extra}",
+            self.data_directory.display()
+        )
+    }
+
     fn pid_path(&self) -> PathBuf {
         self.data_directory.join("serve.pid")
     }
@@ -334,6 +349,91 @@ fn default_chat_reuses_the_running_daemon() {
         .expect("default chat runs");
 
     assert_eq!(operator.published_pid(), pid);
+}
+
+/// The daemon is the source of truth for provider, MCP, permission and
+/// credential configuration; the attached client only locates it and renders.
+/// Breaking those sections locally after the daemon started must never fail
+/// the attach with the CLIENT's own configuration error.
+///
+/// Every failure below ends the launch some other way — the terminal refusal
+/// every non-tty run in this file ends in, or a refusal attributed to the
+/// daemon (`error: daemon: ...`) when the daemon's own per-open fresh read of
+/// the global document rejects it — but never as this client's own
+/// `error: config: ...`, which is what resolving those sections locally
+/// produced before the attached bootstrap was slimmed.
+#[test]
+fn an_attach_survives_configuration_broken_after_the_daemon_started() {
+    let operator = Operator::prepare();
+    assert_succeeded(&operator.run(&["serve"]), "serve");
+
+    let breakages = [
+        "[provider]\nmodel = \"unknown-provider/gpt-4.1\"\n",
+        "[provider]\nmodel = \"???\"\n",
+        "[mcp.broken]\ntransport = \"stdio\"\n",
+        "[permissions]\nallow = [true]\n",
+    ];
+    for breakage in breakages {
+        operator.write_config(&operator.config_with(breakage));
+
+        let attach = operator.run(&["attach"]);
+
+        assert!(
+            !attach.status.success(),
+            "the non-terminal attached TUI still refuses"
+        );
+        let complaint = String::from_utf8_lossy(&attach.stderr);
+        assert!(
+            !complaint.starts_with("error: config:"),
+            "a section the daemon owns stopped the attach client-side: {complaint}"
+        );
+    }
+
+    // An unreadable credentials file is the daemon's to complain about too.
+    use std::os::unix::fs::PermissionsExt;
+    let credentials = operator.root.join("config/auth.json");
+    std::fs::set_permissions(&credentials, std::fs::Permissions::from_mode(0o000))
+        .expect("make the credentials unreadable");
+    operator.write_config(&operator.config_with(""));
+
+    let attach = operator.run(&["attach"]);
+
+    assert!(
+        !attach.status.success(),
+        "the non-terminal attached TUI still refuses"
+    );
+    assert!(
+        !String::from_utf8_lossy(&attach.stderr).starts_with("error: config:"),
+        "unreadable credentials stopped the attach client-side: {}",
+        String::from_utf8_lossy(&attach.stderr)
+    );
+}
+
+/// The bare launch auto-starts the daemon by re-executing this binary, and it
+/// is the DAEMON process that parses the full configuration. Its refusal has
+/// to surface through the startup-failure path — the client reports the dead
+/// start, and the log holds the daemon's own reason — never silently.
+#[test]
+fn the_auto_start_surfaces_the_daemons_own_configuration_failure() {
+    let operator = Operator::prepare();
+    operator
+        .write_config(&operator.config_with("[provider]\nmodel = \"unknown-provider/gpt-4.1\"\n"));
+
+    let output = operator.run(&[]);
+
+    assert!(
+        !output.status.success(),
+        "a daemon that refused to start fails the launch"
+    );
+    let complaint = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        complaint.contains("stopped before it started serving"),
+        "{complaint}"
+    );
+
+    let log = std::fs::read_to_string(operator.data_directory.join("serve.log"))
+        .expect("the daemon wrote its refusal to the log");
+    assert!(log.contains("provider.model"), "{log}");
 }
 
 #[test]

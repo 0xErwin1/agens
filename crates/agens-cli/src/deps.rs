@@ -208,3 +208,10 @@ impl CliDependencies {
 pub fn bootstrap(dependencies: &CliDependencies) -> Result<Bootstrap, CliError> {
     agens_bootstrap::resolve(&dependencies.host)
 }
+
+/// The attached counterpart: resolves only what locating the daemon and
+/// rendering need, so configuration the daemon owns — the model, permission
+/// rules, MCP servers, credentials — can neither fail nor influence an attach.
+pub(crate) fn attached_bootstrap(dependencies: &CliDependencies) -> Result<Bootstrap, CliError> {
+    agens_bootstrap::resolve_attached(&dependencies.host)
+}
