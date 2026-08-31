@@ -639,6 +639,29 @@ impl ControlPlaneStore {
         )
     }
 
+    /// Every repository that holds a run, in repository-id order.
+    ///
+    /// This is how the fleet board learns which projects the daemon actually
+    /// hosts: a repository exists here because somebody created a run against
+    /// it, never because anybody wrote it down in advance.
+    pub fn run_repo_ids(&self) -> Result<Vec<String>> {
+        let operation = "load run repositories";
+        let failure =
+            |error| ControlPlaneError::operation(operation, &self.database_path, error);
+
+        let mut prepared = self
+            .connection
+            .prepare("SELECT DISTINCT repo_id FROM runs ORDER BY repo_id")
+            .map_err(failure)?;
+        let ids = prepared
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(failure)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(failure)?;
+
+        Ok(ids)
+    }
+
     /// Every run in one state, oldest first, across every repository.
     ///
     /// The daemon is one process per machine serving N projects, so the queue

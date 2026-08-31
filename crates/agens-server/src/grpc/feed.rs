@@ -114,6 +114,18 @@ impl Feed for FeedFacade {
         Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))
     }
 
+    async fn repos(
+        &self,
+        _request: Request<proto::ReposRequest>,
+    ) -> Result<Response<proto::RepoList>, Status> {
+        let repo_ids = self
+            .core
+            .call(move |core, principal, now| core.repos(principal, now))
+            .await?;
+
+        Ok(Response::new(proto::RepoList { repo_ids }))
+    }
+
     async fn tree(
         &self,
         request: Request<proto::TreeRequest>,

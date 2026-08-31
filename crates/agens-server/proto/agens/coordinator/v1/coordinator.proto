@@ -355,10 +355,23 @@ message InboxView {
   repeated InboxItem items = 2;
 }
 
+message ReposRequest {}
+
+// Every repository this daemon holds runs for.
+//
+// The one unscoped listing on this plane, and deliberately so: it names
+// repositories rather than runs, and exists so the operator's fleet board can
+// enumerate what the daemon actually hosts instead of a pre-declared list.
+// Runs themselves stay behind the repository-scoped `Tree`.
+message RepoList {
+  repeated string repo_ids = 1;
+}
+
 // The read plane. Nothing here writes, so a reader cannot see a state that
 // never happened and cannot cause one either.
 service Feed {
   rpc Subscribe(EventFilter) returns (stream Event);
+  rpc Repos(ReposRequest) returns (RepoList);
   rpc Tree(TreeRequest) returns (TreeSnapshot);
   rpc RunDetail(RunDetailRequest) returns (RunView);
   rpc Inbox(InboxRequest) returns (InboxView);
