@@ -42,6 +42,10 @@ fn checkout(under: &std::path::Path, name: &str) -> PathBuf {
     path.canonicalize().unwrap()
 }
 
+fn settings() -> PolicySettings {
+    serving(Vec::new())
+}
+
 fn serving(roots: Vec<PathBuf>) -> PolicySettings {
     PolicySettings {
         project_roots: roots,
@@ -231,16 +235,39 @@ fn the_operators_trust_verb_grants_a_served_repository_without_a_question() {
     );
 }
 
+/// Runs admit any git checkout dynamically, so a grant against a checkout no
+/// configuration ever named is a grant that applies to that repository's next
+/// run — it is recorded, not refused.
 #[test]
-fn the_trust_verb_refuses_a_repository_the_daemon_does_not_serve() {
+fn the_trust_verb_grants_a_repository_no_configuration_ever_named() {
     let directory = data_directory();
     let repository = repository(&directory, "elsewhere");
 
-    let error = trust_repository(&directory, serving(Vec::new()), &repository, 1_700_000_000)
-        .expect_err("a grant that could never apply is not recorded");
+    let trusted = trust_repository(&directory, settings(), &repository, 1_700_000_000)
+        .expect("an undeclared checkout can be trusted");
+
+    let policy = PolicyStore::open(&directory, settings()).unwrap();
+
+    assert_eq!(
+        policy.hook_trust(&trusted.repo_id),
+        HookTrust::Granted,
+        "the grant applies to the repository the operator named"
+    );
+}
+
+/// What the trust verb still refuses is a directory with no repository behind
+/// it: a grant is keyed on a repository's identity, and a plain directory has
+/// none.
+#[test]
+fn the_trust_verb_refuses_a_directory_that_is_not_a_git_worktree() {
+    let directory = data_directory();
+    let plain = checkout(&directory, "not-a-repo");
+
+    let error = trust_repository(&directory, settings(), &plain, 1_700_000_000)
+        .expect_err("a directory with no repository behind it cannot be trusted");
 
     assert!(
-        error.to_string().contains("team.project_roots"),
-        "the refusal names the same remedy a run against it would get: {error}"
+        error.to_string().contains("not a git worktree"),
+        "the refusal names what the path is missing: {error}"
     );
 }
