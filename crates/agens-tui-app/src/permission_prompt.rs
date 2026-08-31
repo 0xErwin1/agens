@@ -95,8 +95,14 @@ pub fn parse_permission_prompt_answer(value: &str) -> Option<PermissionPromptAns
 /// neither is a spelling anyone writes down. The identity keeps deciding the
 /// grant; it is only unfit to be read.
 pub fn render_permission_prompt(context: &PermissionPromptContext) -> String {
+    let reason = if context.reason.is_empty() {
+        String::new()
+    } else {
+        format!("Reason: {}\n", context.reason)
+    };
+
     format!(
-        "Permission required for {} ({:?})\nTarget: {}\n[a]llow once, allow [always], [d]eny once, deny [always], or [c]ancel: ",
+        "Permission required for {} ({:?})\nTarget: {}\n{reason}[a]llow once, allow [always], [d]eny once, deny [always], or [c]ancel: ",
         agens_core::bare_tool_name(&context.tool_identity),
         context.access,
         sanitize_permission_target(&context.tool_identity, &context.target_identifier),
@@ -366,6 +372,36 @@ mod tests {
 
         assert!(prompt.contains("Target: [redacted]"));
         assert!(!prompt.contains("SENTINEL_JSON"));
+    }
+
+    /// AGN-229: the terminal question carries the reason the gate recorded, so
+    /// the person answering a headless chat's prompt knows why they are asked.
+    #[test]
+    fn render_permission_prompt_carries_the_reason_when_one_exists() {
+        let prompt = render_permission_prompt(&agens_tools::PermissionPromptContext {
+            project_id: "project".into(),
+            tool_identity: "native::read".into(),
+            target_identifier: "notes.md".into(),
+            access: agens_core::ToolAccess::ReadOnly,
+            reason: "permission policy requires confirmation".into(),
+            denylist: None,
+        });
+
+        assert!(
+            prompt.contains("Reason: permission policy requires confirmation\n"),
+            "got: {prompt}"
+        );
+
+        let prompt = render_permission_prompt(&agens_tools::PermissionPromptContext {
+            project_id: "project".into(),
+            tool_identity: "native::read".into(),
+            target_identifier: "notes.md".into(),
+            access: agens_core::ToolAccess::ReadOnly,
+            reason: String::new(),
+            denylist: None,
+        });
+
+        assert!(!prompt.contains("Reason:"), "got: {prompt}");
     }
 
     /// A `bash` prompt shows the command with shaped secrets redacted, and the
