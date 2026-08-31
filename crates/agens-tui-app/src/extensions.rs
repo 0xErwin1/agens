@@ -69,6 +69,15 @@ const TUI_BUILT_INS: &[TuiBuiltinCommand] = &[
         11,
     ),
     TuiBuiltinCommand::new(
+        "cd",
+        "Switch to another project's conversation",
+        "<path>",
+        None,
+        CommandBusyPolicy::IdleOnly,
+        false,
+        26,
+    ),
+    TuiBuiltinCommand::new(
         "connect",
         "Connect to ChatGPT",
         "[--device-auth]",
@@ -908,6 +917,7 @@ mod tests {
                 "attach",
                 "undo",
                 "redo",
+                "cd",
                 "review",
                 "shared",
                 "inspect",

@@ -330,7 +330,7 @@ fn attached_surface_forwards_every_daemon_catalogued_builtin_without_local_disco
     for command in crate::extensions::tui_hosted_builtin_entries() {
         if matches!(
             command.name(),
-            "attach" | "bypass" | "dangerous" | "skills" | "mcp" | "select" | "quit"
+            "attach" | "bypass" | "cd" | "dangerous" | "skills" | "mcp" | "select" | "quit"
         ) {
             continue;
         }
@@ -342,6 +342,151 @@ fn attached_surface_forwards_every_daemon_catalogued_builtin_without_local_disco
     }
 
     assert!(!backend.commands.lock().unwrap().is_empty());
+}
+
+fn attached_router_with_switch_slot(
+    temporary: &std::path::Path,
+) -> (TuiRuntimeRouter, Arc<Mutex<Option<std::path::PathBuf>>>) {
+    let bootstrap = tui_session_bootstrap(temporary, &[]);
+    let switch = Arc::new(Mutex::new(None));
+    let router = TuiRuntimeRouter::attached(
+        bootstrap,
+        Arc::new(Mutex::new(SessionContext::fresh())),
+        Arc::new(FakeAttachedBackend::default()),
+    )
+    .with_checkout_switch(Arc::clone(&switch));
+
+    (router, switch)
+}
+
+#[test]
+fn local_cd_is_refused_and_points_at_attached_mode() {
+    let temporary = tui_session_directory("local-cd-refused");
+    let bootstrap = tui_session_bootstrap(&temporary, &[]);
+    let router = TuiRuntimeRouter::new(
+        bootstrap,
+        Arc::new(Mutex::new(SessionContext::fresh())),
+        Arc::new(Mutex::new(None)),
+        Arc::new(agens_tools::CommandCatalog::default()),
+        Arc::new(agens_tools::SkillCatalog::default()),
+    );
+
+    let (progress, _) = std::sync::mpsc::channel();
+    let outcome = router.route_request(TuiRouteRequest::Input("/cd /tmp".into()), progress);
+
+    match outcome {
+        TuiSubmissionOutcome::LocalActionableError { message, .. } => {
+            assert!(message.contains("attached"), "{message}");
+        }
+        other => panic!("expected a local refusal, got {other:?}"),
+    }
+
+    std::fs::remove_dir_all(temporary).unwrap();
+}
+
+#[test]
+fn attached_cd_resolves_the_directory_and_requests_the_switch() {
+    let temporary = tui_session_directory("attached-cd-switch");
+    let target = temporary.join("elsewhere");
+    std::fs::create_dir_all(&target).unwrap();
+    let (router, switch) = attached_router_with_switch_slot(&temporary);
+
+    let outcome = attached_route(
+        &router,
+        TuiRouteRequest::Input(format!("/cd {}", target.display())),
+    );
+
+    assert_eq!(outcome, TuiSubmissionOutcome::Quit);
+    assert_eq!(
+        switch.lock().unwrap().as_deref(),
+        Some(target.canonicalize().unwrap().as_path())
+    );
+
+    std::fs::remove_dir_all(temporary).unwrap();
+}
+
+#[test]
+fn attached_cd_without_an_argument_is_usage_and_switches_nothing() {
+    let temporary = tui_session_directory("attached-cd-usage");
+    let (router, switch) = attached_router_with_switch_slot(&temporary);
+
+    let outcome = attached_route(&router, TuiRouteRequest::Input("/cd".into()));
+
+    match outcome {
+        TuiSubmissionOutcome::LocalActionableError { message, .. } => {
+            assert!(message.contains("/cd <path>"), "{message}");
+        }
+        other => panic!("expected a usage error, got {other:?}"),
+    }
+    assert!(switch.lock().unwrap().is_none());
+
+    std::fs::remove_dir_all(temporary).unwrap();
+}
+
+#[test]
+fn attached_cd_to_a_missing_path_reports_it_and_switches_nothing() {
+    let temporary = tui_session_directory("attached-cd-missing");
+    let missing = temporary.join("nowhere");
+    let (router, switch) = attached_router_with_switch_slot(&temporary);
+
+    let outcome = attached_route(
+        &router,
+        TuiRouteRequest::Input(format!("/cd {}", missing.display())),
+    );
+
+    match outcome {
+        TuiSubmissionOutcome::LocalActionableError { message, .. } => {
+            assert!(message.contains("cannot be opened"), "{message}");
+        }
+        other => panic!("expected an open failure, got {other:?}"),
+    }
+    assert!(switch.lock().unwrap().is_none());
+
+    std::fs::remove_dir_all(temporary).unwrap();
+}
+
+#[test]
+fn attached_cd_to_a_file_reports_it_and_switches_nothing() {
+    let temporary = tui_session_directory("attached-cd-file");
+    let file = temporary.join("notes.txt");
+    std::fs::write(&file, "not a project").unwrap();
+    let (router, switch) = attached_router_with_switch_slot(&temporary);
+
+    let outcome = attached_route(
+        &router,
+        TuiRouteRequest::Input(format!("/cd {}", file.display())),
+    );
+
+    match outcome {
+        TuiSubmissionOutcome::LocalActionableError { message, .. } => {
+            assert!(message.contains("not a directory"), "{message}");
+        }
+        other => panic!("expected a directory refusal, got {other:?}"),
+    }
+    assert!(switch.lock().unwrap().is_none());
+
+    std::fs::remove_dir_all(temporary).unwrap();
+}
+
+#[test]
+fn attached_cd_keeps_a_path_with_spaces_whole() {
+    let temporary = tui_session_directory("attached-cd-spaces");
+    let target = temporary.join("two words");
+    std::fs::create_dir_all(&target).unwrap();
+    let (router, switch) = attached_router_with_switch_slot(&temporary);
+
+    let outcome = attached_route(
+        &router,
+        TuiRouteRequest::Input(format!("/cd {}", target.display())),
+    );
+
+    assert_eq!(outcome, TuiSubmissionOutcome::Quit);
+    assert_eq!(
+        switch.lock().unwrap().as_deref(),
+        Some(target.canonicalize().unwrap().as_path())
+    );
+
+    std::fs::remove_dir_all(temporary).unwrap();
 }
 
 #[test]
