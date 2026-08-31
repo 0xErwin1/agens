@@ -408,19 +408,36 @@ pub fn serve_until_shutdown(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Everything the hosted serve path composes from shared stores.
+///
+/// Built by a closure that runs only after the daemon's slot is claimed, so a
+/// process that loses the slot race never opens a shared database at all —
+/// two racing daemons must fail on the slot, not on each other's write locks.
+pub struct HostedComposition {
+    pub chat: ChatSessionFactory,
+    pub chat_history: ChatHistorySource,
+    pub catalogs: Arc<dyn HostedCatalogs>,
+    pub files: Arc<dyn HostedWorkspaceFiles>,
+    pub mcp: Box<dyn HostedMcpControl>,
+    pub tasks: Box<dyn HostedTaskJournal>,
+}
+
 pub fn serve_until_shutdown_with_hosted(
     data_directory: &Path,
     settings: &CoordinatorSettings,
     worker: RunWorkerFactory,
-    chat: ChatSessionFactory,
-    chat_history: ChatHistorySource,
     shutdown: &HeadlessTurnCancellation,
-    catalogs: Arc<dyn HostedCatalogs>,
-    files: Arc<dyn HostedWorkspaceFiles>,
-    mcp: Box<dyn HostedMcpControl>,
-    tasks: Box<dyn HostedTaskJournal>,
+    hosted: Box<dyn FnOnce() -> Result<HostedComposition, String>>,
 ) -> Result<SessionShutdown, ServerError> {
     let daemon = Daemon::start(data_directory)?;
+    let HostedComposition {
+        chat,
+        chat_history,
+        catalogs,
+        files,
+        mcp,
+        tasks,
+    } = hosted().map_err(ServerError::Unavailable)?;
     let coordinator = Coordinator::start(
         data_directory,
         settings,

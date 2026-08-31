@@ -135,22 +135,27 @@ fn run_daemon(
         ..CoordinatorSettings::default()
     };
 
-    let tasks =
-        hosted_tasks(bootstrap).map_err(|error| CliError::unavailable(error.to_string()))?;
-    let catalogs =
-        hosted_catalogs(bootstrap).map_err(|error| CliError::unavailable(error.to_string()))?;
-    let mcp = hosted_mcp(bootstrap).map_err(|error| CliError::unavailable(error.to_string()))?;
+    // Composed only after the slot is claimed: a process that loses the slot
+    // race must never open the shared stores another daemon is migrating.
+    let hosted_bootstrap = bootstrap.clone();
+    let hosted = Box::new(move || {
+        let bootstrap = &hosted_bootstrap;
+        let tasks = hosted_tasks(bootstrap).map_err(|error| error.to_string())?;
+        Ok(agens_server::HostedComposition {
+            chat: hosted_chat_with_tasks(bootstrap, tasks.clone()),
+            chat_history: hosted_chat_history(bootstrap),
+            catalogs: hosted_catalogs(bootstrap).map_err(|error| error.to_string())?,
+            files: hosted_files(bootstrap),
+            mcp: hosted_mcp(bootstrap).map_err(|error| error.to_string())?,
+            tasks: Box::new(tasks),
+        })
+    });
     let shutdown = agens_server::serve_until_shutdown_with_hosted(
         bootstrap.data_directory(),
         &settings,
         run_worker(bootstrap),
-        hosted_chat_with_tasks(bootstrap, tasks.clone()),
-        hosted_chat_history(bootstrap),
         cancellation,
-        catalogs,
-        hosted_files(bootstrap),
-        mcp,
-        Box::new(tasks),
+        hosted,
     )
     .map_err(|error| match error {
         ServerError::AlreadyRunning => CliError::unavailable(
