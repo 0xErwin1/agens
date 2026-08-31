@@ -24,11 +24,11 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
+use std::sync::{Mutex, MutexGuard, TryLockError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use agens_bootstrap::Bootstrap;
 use agens_coordinator_client::{
@@ -208,10 +208,7 @@ impl Attachment {
     /// command has run. A daemon that described nothing leaves the footer as
     /// it is.
     fn command(&self, command: &str) -> Result<HostedCommandReply, CliError> {
-        let mut chat = self
-            .chat
-            .lock()
-            .map_err(|_| unavailable("the connection to the daemon is unusable"))?;
+        let mut chat = connection_between_turns(&self.chat, CONNECTION_PATIENCE)?;
 
         let reply = self
             .runtime
@@ -515,10 +512,7 @@ impl Attachment {
 /// the cancellation waits for the thing it is cancelling.
 impl AttachedRouteBackend for Attachment {
     fn catalog(&self, kind: CatalogKind) -> Result<CatalogResult, CliError> {
-        let mut chat = self
-            .chat
-            .lock()
-            .map_err(|_| unavailable("the connection to the daemon is unusable"))?;
+        let mut chat = connection_between_turns(&self.chat, CONNECTION_PATIENCE)?;
         self.runtime
             .block_on(chat.catalog(kind, None))
             .map_err(refused)
@@ -532,10 +526,7 @@ impl AttachedRouteBackend for Attachment {
         &self,
         selector: &Path,
     ) -> Result<Result<Vec<WorkspaceFile>, FileError>, CliError> {
-        let mut chat = self
-            .chat
-            .lock()
-            .map_err(|_| unavailable("the connection to the daemon is unusable"))?;
+        let mut chat = connection_between_turns(&self.chat, CONNECTION_PATIENCE)?;
         self.runtime
             .block_on(chat.list_workspace_files(&self.checkout, selector))
             .map_err(refused)
@@ -545,20 +536,14 @@ impl AttachedRouteBackend for Attachment {
         &self,
         selector: &Path,
     ) -> Result<Result<WorkspaceFileContent, FileError>, CliError> {
-        let mut chat = self
-            .chat
-            .lock()
-            .map_err(|_| unavailable("the connection to the daemon is unusable"))?;
+        let mut chat = connection_between_turns(&self.chat, CONNECTION_PATIENCE)?;
         self.runtime
             .block_on(chat.read_workspace_file(&self.checkout, selector))
             .map_err(refused)
     }
 
     fn mcp_status(&self) -> Result<HostedMcpResult, CliError> {
-        let mut chat = self
-            .chat
-            .lock()
-            .map_err(|_| unavailable("the connection to the daemon is unusable"))?;
+        let mut chat = connection_between_turns(&self.chat, CONNECTION_PATIENCE)?;
         self.runtime.block_on(chat.mcp_status()).map_err(refused)
     }
 
@@ -567,10 +552,7 @@ impl AttachedRouteBackend for Attachment {
         server: &str,
         action: HostedMcpAction,
     ) -> Result<HostedMcpResult, CliError> {
-        let mut chat = self
-            .chat
-            .lock()
-            .map_err(|_| unavailable("the connection to the daemon is unusable"))?;
+        let mut chat = connection_between_turns(&self.chat, CONNECTION_PATIENCE)?;
         self.runtime
             .block_on(chat.mcp_control(server, action))
             .map_err(refused)
@@ -1187,6 +1169,43 @@ fn unavailable(detail: &str) -> CliError {
     CliError::unavailable(detail.to_owned())
 }
 
+/// How long a request the surface makes waits for the connection a running
+/// turn is holding.
+///
+/// A turn keeps the client for as long as it takes to answer, and the thread
+/// that would wait for it here is the thread that draws. Long enough to ride
+/// out the moment between two requests, short enough that nobody watching the
+/// terminal sees it stop.
+const CONNECTION_PATIENCE: Duration = Duration::from_millis(250);
+
+/// The connection, for a request that is not the turn.
+///
+/// Waiting is bounded rather than open-ended: a request the running turn's
+/// hold makes impossible right now comes back as something to say, and the
+/// surface keeps drawing and stays cancellable.
+fn connection_between_turns<T>(
+    connection: &Mutex<T>,
+    patience: Duration,
+) -> Result<MutexGuard<'_, T>, CliError> {
+    let deadline = Instant::now() + patience;
+
+    loop {
+        match connection.try_lock() {
+            Ok(held) => return Ok(held),
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(unavailable("the connection to the daemon is unusable"));
+            }
+            Err(TryLockError::WouldBlock) if Instant::now() >= deadline => {
+                return Err(CliError::unavailable(
+                    "the daemon is answering; this is available again once the turn ends"
+                        .to_owned(),
+                ));
+            }
+            Err(TryLockError::WouldBlock) => thread::sleep(Duration::from_millis(5)),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1667,5 +1686,36 @@ mod tests {
                     if message.contains("not supported while attached")
             ));
         }
+    }
+}
+
+#[cfg(test)]
+mod connection_tests {
+    use super::*;
+
+    /// The thread that draws is the thread that routes a command, so what a
+    /// turn's hold on the connection can cost it is bounded: a wait that
+    /// outlasts the patience comes back as a refusal to show rather than a
+    /// terminal that has stopped answering the keyboard.
+    #[test]
+    fn a_request_made_while_a_turn_holds_the_connection_gives_up_rather_than_waiting_for_it() {
+        let connection = Mutex::new(0_u8);
+        let turn = connection.lock().expect("the connection is lockable");
+
+        let asked = Instant::now();
+        let refused = connection_between_turns(&connection, Duration::from_millis(50));
+        let waited = asked.elapsed();
+
+        assert!(refused.is_err(), "the held connection was handed out");
+        assert!(
+            waited < Duration::from_secs(1),
+            "the request waited {waited:?} on the turn",
+        );
+
+        drop(turn);
+        assert!(
+            connection_between_turns(&connection, Duration::from_millis(50)).is_ok(),
+            "the connection is available again once the turn releases it",
+        );
     }
 }

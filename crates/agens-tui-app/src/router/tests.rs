@@ -5090,3 +5090,44 @@ fn an_attached_model_command_redresses_the_footer_from_the_daemons_description()
 
     std::fs::remove_dir_all(temporary).unwrap();
 }
+
+/// A command's busy policy is a property of the command, not of where the
+/// session it runs on lives. Attached it decides more than tidiness: a command
+/// the daemon can only run between turns is one this terminal would otherwise
+/// send and then sit waiting on, drawing nothing until the turn it is queued
+/// behind has finished answering.
+#[test]
+fn an_attached_idle_only_command_is_refused_while_the_daemon_is_answering() {
+    let temporary = tui_session_directory("attached-busy-idle-only");
+    let bootstrap = tui_session_bootstrap(&temporary, &[]);
+    let backend = Arc::new(FakeAttachedBackend::default());
+    let attached = TuiRuntimeRouter::attached(
+        bootstrap,
+        Arc::new(Mutex::new(SessionContext::fresh())),
+        backend.clone(),
+    );
+
+    for command in ["/new", "/model gpt-5.6", "/bypass"] {
+        let outcome = attached_route(&attached, TuiRouteRequest::BusyInput(command.into()));
+        assert!(
+            matches!(outcome, TuiSubmissionOutcome::BusyRefusal(_)),
+            "{command} was not refused: {outcome:?}"
+        );
+    }
+
+    assert!(
+        backend.commands.lock().unwrap().is_empty(),
+        "a refused command must never reach the answering daemon"
+    );
+
+    let queued = attached_route(
+        &attached,
+        TuiRouteRequest::BusyInput("what does this repository do".into()),
+    );
+    assert!(
+        matches!(queued, TuiSubmissionOutcome::BusyProviderMessage { .. }),
+        "a prompt sent while the daemon answers still queues: {queued:?}"
+    );
+
+    std::fs::remove_dir_all(temporary).unwrap();
+}
