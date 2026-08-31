@@ -16,12 +16,13 @@ use std::{
 use agens_server::{
     AdmissionControl, AnswerQuestion, ApiCore, ApiError, ApprovePlan, AuthorizeMerge,
     CleaningAction, CleaningDisposition, CreateRun, Delivery, DeliveryGrain, DeliveryPayload,
-    DeliveryQueue, DetailQuestionRefusal, EventFeed, EventFilter, HookPolicy, HookTrust,
-    MergeAuthorization, OPERATION_AUTHORIZATION, Operation, PendingHookTrust, PortError, Ports,
-    Principal, ProvisionedWorktree, RepositoryIdentity, RepositoryPolicy, RetryRequest, RunFacts,
-    RunRef, RunTrigger, SessionControl, StateMachines, StopRequest, StopScope, Subscription,
-    TURN_FAILED_EVENT, TakeoverHandle, TransitionRejection, TrustReadFailure, TurnFailure,
-    WorktreeDerivation, WorktreeGate, WorktreeRequest, praetor_may_answer,
+    DeliveryQueue, DetailQuestionRefusal, Direction, Escalation, EventFeed, EventFilter,
+    HookPolicy, HookTrust, MergeAuthorization, OPERATION_AUTHORIZATION, Operation,
+    PendingHookTrust, PortError, Ports, Principal, ProvisionedWorktree, RepositoryIdentity,
+    RepositoryPolicy, RequestMerge, RetryRequest, RunFacts, RunRef, RunTrigger, SessionControl,
+    StateMachines, StopRequest, StopScope, Subscription, TURN_FAILED_EVENT, TakeoverHandle,
+    TransitionRejection, TrustReadFailure, TurnFailure, WorktreeDerivation, WorktreeGate,
+    WorktreeRequest, praetor_may_answer,
 };
 use agens_store::{
     ControlPlaneStore, QuestionAuthor, QuestionKind, QuestionRow, QuestionState, RetryTrigger,
@@ -465,6 +466,10 @@ const EVERY_OPERATION: &[Operation] = &[
     Operation::AuthorizeMerge,
     Operation::CancelRun,
     Operation::Retry,
+    Operation::Escalate,
+    Operation::Direct,
+    Operation::RequestMerge,
+    Operation::Reclaim,
     Operation::Cleaning,
     Operation::Takeover,
     Operation::PauseAdmissions,
@@ -508,6 +513,13 @@ fn the_table_grants_exactly_what_the_design_says_it_grants() {
         (Operation::AuthorizeMerge, &[Principal::User]),
         (Operation::CancelRun, &[Principal::User, Principal::Praetor]),
         (Operation::Retry, &[Principal::User, Principal::Praetor]),
+        (Operation::Escalate, &[Principal::User, Principal::Praetor]),
+        (Operation::Direct, &[Principal::User, Principal::Praetor]),
+        (
+            Operation::RequestMerge,
+            &[Principal::User, Principal::Praetor],
+        ),
+        (Operation::Reclaim, &[Principal::User, Principal::Praetor]),
         (Operation::Cleaning, &[Principal::User]),
         (Operation::Takeover, &[Principal::User]),
         (Operation::PauseAdmissions, &[Principal::User]),
@@ -538,6 +550,10 @@ fn the_coordinator_reaches_no_team_operation() {
         Operation::AuthorizeMerge,
         Operation::CancelRun,
         Operation::Retry,
+        Operation::Escalate,
+        Operation::Direct,
+        Operation::RequestMerge,
+        Operation::Reclaim,
         Operation::Cleaning,
         Operation::Takeover,
         Operation::PauseAdmissions,
@@ -2345,4 +2361,260 @@ fn the_detail_question_policy_reads_the_shape_a_worker_actually_writes() {
         praetor_may_answer(&unrecognizable, "7"),
         Err(DetailQuestionRefusal::OutsideOptions)
     );
+}
+
+#[test]
+fn praetor_escalates_a_decision_without_moving_the_run() {
+    let mut store = store();
+    let run_id = store
+        .insert_run(&run_in(RunState::Running, Some(WorktreeStatus::Active)))
+        .unwrap();
+    let mut harness = Harness::build(store, RecordingWorktrees::new(false, true));
+
+    let question_id = harness
+        .core
+        .escalate(
+            Principal::Praetor,
+            &Escalation {
+                run_id,
+                blocked_decision: "which database the importer writes to".to_owned(),
+                options: r#"[{"id":"postgres","label":"write to postgres"}]"#.to_owned(),
+                recommendation: Some("postgres".to_owned()),
+                now: NOW,
+            },
+        )
+        .unwrap();
+
+    let question = harness
+        .core
+        .machines()
+        .store()
+        .load_question(question_id)
+        .unwrap()
+        .unwrap();
+
+    // Never an approval: an escalation opens a decision and freezes no bytes.
+    assert_eq!(question.kind, QuestionKind::Question);
+    assert_eq!(question.state, QuestionState::Open);
+    assert!(question.tree_hash.is_none());
+    assert_eq!(harness.run_state(run_id), RunState::Running);
+    assert!(
+        harness
+            .event_types(run_id)
+            .contains(&"escalated".to_owned())
+    );
+}
+
+#[test]
+fn praetor_queues_a_directive_for_a_running_run() {
+    let mut store = store();
+    let run_id = store
+        .insert_run(&run_in(RunState::Running, Some(WorktreeStatus::Active)))
+        .unwrap();
+    let mut harness = Harness::build(store, RecordingWorktrees::new(false, true));
+
+    harness
+        .core
+        .direct(
+            Principal::Praetor,
+            &Direction {
+                run_id,
+                directive: "stop widening the scope".to_owned(),
+                now: NOW,
+            },
+        )
+        .unwrap();
+
+    let queued = harness.delivery.queued.lock().unwrap();
+
+    assert_eq!(queued.len(), 1);
+    assert_eq!(
+        queued[0].payload,
+        DeliveryPayload::Directive("stop widening the scope".to_owned())
+    );
+    assert_eq!(queued[0].grain, DeliveryGrain::Turn);
+}
+
+/// A directive nothing will ever read must not be queued and reported as
+/// queued: a manager that believes it steered a finished run stops looking.
+#[test]
+fn a_settled_run_takes_no_directive() {
+    let mut store = store();
+    let run_id = store
+        .insert_run(&run_in(RunState::Done, Some(WorktreeStatus::Active)))
+        .unwrap();
+    let mut harness = Harness::build(store, RecordingWorktrees::new(false, true));
+
+    let error = harness
+        .core
+        .direct(
+            Principal::Praetor,
+            &Direction {
+                run_id,
+                directive: "keep going".to_owned(),
+                now: NOW,
+            },
+        )
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        ApiError::Rejected(TransitionRejection::GuardFailed { .. })
+    ));
+    assert!(harness.delivery.queued.lock().unwrap().is_empty());
+}
+
+/// The two halves of a merge cannot be held by the same party: Praetor opens
+/// the authorization and is still refused when it tries to grant one.
+#[test]
+fn praetor_requests_a_merge_it_cannot_grant() {
+    let mut store = store();
+    let run_id = store
+        .insert_run(&run_in(RunState::Done, Some(WorktreeStatus::Active)))
+        .unwrap();
+    let mut harness = Harness::build(store, RecordingWorktrees::new(true, true));
+
+    let opened = harness
+        .core
+        .request_merge(
+            Principal::Praetor,
+            &RequestMerge {
+                run_id,
+                reason: Some("the definition of done is met".to_owned()),
+                expires_at: None,
+                now: NOW,
+            },
+        )
+        .unwrap();
+
+    let question = harness
+        .core
+        .machines()
+        .store()
+        .load_question(opened.question_id)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(question.kind, QuestionKind::Approval);
+    assert_eq!(question.state, QuestionState::Open);
+    assert_eq!(
+        question.tree_hash.as_deref(),
+        Some(opened.tree_hash.as_str())
+    );
+
+    let error = harness
+        .core
+        .authorize_merge(
+            Principal::Praetor,
+            &AuthorizeMerge {
+                subject: MergeAuthorization::Existing(opened.question_id),
+                answer: "merge".to_owned(),
+                now: NOW,
+            },
+        )
+        .unwrap_err();
+
+    assert_eq!(
+        unauthorized(&error),
+        (Operation::AuthorizeMerge, Principal::Praetor, true)
+    );
+    assert_eq!(
+        harness
+            .core
+            .machines()
+            .store()
+            .load_question(opened.question_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        QuestionState::Open
+    );
+}
+
+/// A receipt frozen over a dirty worktree would authorize a tree that does not
+/// carry the work, so the request is refused rather than frozen.
+#[test]
+fn a_merge_request_over_uncommitted_work_is_refused() {
+    let mut store = store();
+    let run_id = store
+        .insert_run(&run_in(RunState::Done, Some(WorktreeStatus::Active)))
+        .unwrap();
+    let mut harness = Harness::build(store, RecordingWorktrees::new(true, false));
+
+    let error = harness
+        .core
+        .request_merge(
+            Principal::Praetor,
+            &RequestMerge {
+                run_id,
+                reason: None,
+                expires_at: None,
+                now: NOW,
+            },
+        )
+        .unwrap_err();
+
+    assert_eq!(
+        unauthorized(&error),
+        (Operation::RequestMerge, Principal::Praetor, true)
+    );
+}
+
+/// Releasing and discarding are different authorities. Praetor reclaims a
+/// worktree git already shows merged, and the same call with the other
+/// disposition stays the user's.
+#[test]
+fn praetor_reclaims_but_never_disposes() {
+    let mut store = store();
+    let run_id = store
+        .insert_run(&run_in(RunState::Done, Some(WorktreeStatus::Reclaimable)))
+        .unwrap();
+    let mut harness = Harness::build(store, RecordingWorktrees::new(true, true));
+
+    let reclaimed = harness
+        .core
+        .cleaning(
+            Principal::Praetor,
+            &CleaningAction {
+                run_id,
+                disposition: CleaningDisposition::Reclaim,
+                confirmed: false,
+                now: NOW,
+            },
+        )
+        .unwrap();
+
+    assert_eq!(reclaimed.applied().unwrap().to, WorktreeStatus::Cleaned);
+    assert_eq!(*harness.worktrees.removed.lock().unwrap(), vec![run_id]);
+}
+
+/// A reclaim takes its facts from git rather than from the requester: a branch
+/// nobody has shown to be merged is not released however it was asked for.
+#[test]
+fn a_reclaim_praetor_asks_for_still_needs_git_to_agree() {
+    let mut store = store();
+    let run_id = store
+        .insert_run(&run_in(RunState::Done, Some(WorktreeStatus::Active)))
+        .unwrap();
+    let mut harness = Harness::build(store, RecordingWorktrees::new(false, true));
+
+    let error = harness
+        .core
+        .cleaning(
+            Principal::Praetor,
+            &CleaningAction {
+                run_id,
+                disposition: CleaningDisposition::Reclaim,
+                confirmed: false,
+                now: NOW,
+            },
+        )
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        ApiError::Rejected(TransitionRejection::GuardFailed { .. })
+            | ApiError::Rejected(TransitionRejection::NoSuchTransition { .. })
+    ));
+    assert!(harness.worktrees.removed.lock().unwrap().is_empty());
 }

@@ -58,13 +58,13 @@ use agens_core::hosted::{
 pub use api::{
     AdmissionControl, AdmissionState, AnswerQuestion, AnsweredQuestion, ApiCore, ApiError,
     ApprovePlan, AuthorizeMerge, CleaningAction, CleaningDisposition, CreateRun, CreatedRun,
-    Delivery, DeliveryGrain, DeliveryPayload, DeliveryQueue, DetailQuestionRefusal, EventFeed,
-    EventFilter, HookPolicy, InboxItem, InboxView, MergeAuthorization, MergeAuthorized,
-    OPERATION_AUTHORIZATION, Operation, OperationAuthorization, PortError, Ports, PreparedRun,
-    ProvisionedWorktree, RepositoryIdentity, RetryRequest, RunRef, RunSummary, RunView,
-    SessionControl, StopRequest, StopScope, Subscription, TURN_FAILED_EVENT, TakeoverHandle,
-    TreeSnapshot, TurnFailure, WorktreeDerivation, WorktreeGate, WorktreeRequest,
-    praetor_may_answer,
+    Delivery, DeliveryGrain, DeliveryPayload, DeliveryQueue, DetailQuestionRefusal, Direction,
+    Escalation, EventFeed, EventFilter, HookPolicy, InboxItem, InboxView, MergeAuthorization,
+    MergeAuthorized, OPERATION_AUTHORIZATION, OpenedApproval, Operation, OperationAuthorization,
+    PortError, Ports, PreparedRun, ProvisionedWorktree, RepositoryIdentity, RequestMerge,
+    RetryRequest, RunRef, RunSummary, RunView, SessionControl, StopRequest, StopScope, Subscription,
+    TURN_FAILED_EVENT, TakeoverHandle, TreeSnapshot, TurnFailure, WorktreeDerivation, WorktreeGate,
+    WorktreeRequest, praetor_may_answer,
 };
 pub use blocking::{BlockingBoundary, BlockingError};
 pub use chat::{

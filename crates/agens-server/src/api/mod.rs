@@ -51,7 +51,8 @@ pub use ports::{
 pub use runs::{CreateRun, CreatedRun, PreparedRun};
 pub use team::{
     AdmissionState, AnswerQuestion, AnsweredQuestion, ApprovePlan, AuthorizeMerge, CleaningAction,
-    CleaningDisposition, MergeAuthorization, MergeAuthorized, RetryRequest, RunRef, StopRequest,
+    CleaningDisposition, Direction, Escalation, MergeAuthorization, MergeAuthorized,
+    OpenedApproval, RequestMerge, RetryRequest, RunRef, StopRequest,
 };
 
 /// The journal entry a turn that ended without a completion is recorded as.

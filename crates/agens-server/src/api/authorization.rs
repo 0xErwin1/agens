@@ -25,6 +25,10 @@ pub enum Operation {
     AuthorizeMerge,
     CancelRun,
     Retry,
+    Escalate,
+    Direct,
+    RequestMerge,
+    Reclaim,
     Cleaning,
     Takeover,
     PauseAdmissions,
@@ -45,6 +49,10 @@ impl Operation {
             Self::AuthorizeMerge => "authorize_merge",
             Self::CancelRun => "cancel_run",
             Self::Retry => "retry",
+            Self::Escalate => "escalate",
+            Self::Direct => "direct",
+            Self::RequestMerge => "request_merge",
+            Self::Reclaim => "reclaim",
             Self::Cleaning => "cleaning",
             Self::Takeover => "takeover",
             Self::PauseAdmissions => "pause_admissions",
@@ -124,9 +132,34 @@ pub static OPERATION_AUTHORIZATION: &[OperationAuthorization] = &[
         rationale: "a retry re-runs an already approved scope, and records who asked",
     },
     OperationAuthorization {
+        operation: Operation::Escalate,
+        principals: USER_AND_PRAETOR,
+        rationale: "handing a decision to the person takes no authority away from anybody: it \
+                    opens a question and answers none",
+    },
+    OperationAuthorization {
+        operation: Operation::Direct,
+        principals: USER_AND_PRAETOR,
+        rationale: "guidance moves what a run is doing inside a scope the user already approved, \
+                    which is what a manager is for",
+    },
+    OperationAuthorization {
+        operation: Operation::RequestMerge,
+        principals: USER_AND_PRAETOR,
+        rationale: "asking for an authorization is not holding one: the approval is opened here \
+                    and only the user's grant lands anything",
+    },
+    OperationAuthorization {
+        operation: Operation::Reclaim,
+        principals: USER_AND_PRAETOR,
+        rationale: "releasing a worktree whose branch git already shows merged destroys nothing, \
+                    and the derivation refuses the request when git disagrees",
+    },
+    OperationAuthorization {
         operation: Operation::Cleaning,
         principals: USER_ONLY,
-        rationale: "discarding a worktree is irreversible and needs a person's confirmation",
+        rationale: "discarding an unmerged worktree is irreversible and needs a person's \
+                    confirmation",
     },
     OperationAuthorization {
         operation: Operation::Takeover,
