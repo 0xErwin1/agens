@@ -12,7 +12,7 @@ mod provider;
 mod resolve;
 mod routing;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::profiles::{AgentProfileStore, ProfileEditor};
@@ -114,6 +114,10 @@ pub struct TuiRuntimeRouter {
     profile_focus: Arc<Mutex<Option<String>>>,
     profile_store: Option<Arc<dyn AgentProfileStore>>,
     team_transition: Arc<std::sync::atomic::AtomicBool>,
+    /// Where `/cd` puts the checkout the person asked to switch to. The
+    /// attached run loop reads it after the surface quits and re-attaches
+    /// against that checkout instead of returning to the shell.
+    checkout_switch: Arc<Mutex<Option<PathBuf>>>,
     attached_backend: Option<Arc<dyn AttachedRouteBackend>>,
 }
 
@@ -201,6 +205,7 @@ impl TuiRuntimeRouter {
             profile_focus: Arc::new(Mutex::new(None)),
             profile_store: None,
             team_transition: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            checkout_switch: Arc::new(Mutex::new(None)),
             attached_backend: None,
         }
     }
@@ -245,8 +250,16 @@ impl TuiRuntimeRouter {
             profile_focus: Arc::new(Mutex::new(None)),
             profile_store: None,
             team_transition: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            checkout_switch: Arc::new(Mutex::new(None)),
             attached_backend: Some(backend),
         }
+    }
+
+    /// Shares the slot the attached run loop reads a `/cd` target from, so a
+    /// switch requested through this router survives the surface quitting.
+    pub(crate) fn with_checkout_switch(mut self, slot: Arc<Mutex<Option<PathBuf>>>) -> Self {
+        self.checkout_switch = slot;
+        self
     }
 
     fn attached_backend(&self) -> Result<Arc<dyn AttachedRouteBackend>, CliError> {

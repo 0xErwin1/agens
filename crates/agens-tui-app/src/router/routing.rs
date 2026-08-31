@@ -380,6 +380,18 @@ impl TuiRuntimeRouter {
         let mut words = command.split_whitespace();
         let name = words.next().unwrap_or_default().trim_start_matches('/');
         match name {
+            // Resolved on the client, like "attach" and "select": the daemon
+            // never sees "/cd" — the surface quits and the attached run loop
+            // re-attaches against the requested checkout.
+            "cd" => {
+                let argument = command
+                    .trim_start_matches('/')
+                    .strip_prefix("cd")
+                    .unwrap_or_default()
+                    .trim();
+                self.request_checkout_switch(argument)?;
+                return Ok(TuiSubmissionOutcome::Quit);
+            }
             "attach" => {
                 let selector = words
                     .next()
@@ -504,6 +516,41 @@ impl TuiRuntimeRouter {
         backend
             .command(command)
             .map(TuiSubmissionOutcome::LocalInfo)
+    }
+
+    /// Validates a `/cd` target the way the daemon validates a chat's
+    /// checkout: `~` expands, the path must resolve on this filesystem, and it
+    /// must name a directory. The canonical path is recorded for the attached
+    /// run loop, which re-attaches against it — the daemon keys open chats by
+    /// checkout, so canonicalizing here is what makes both sides agree on
+    /// which conversation that is.
+    fn request_checkout_switch(&self, argument: &str) -> Result<(), CliError> {
+        if argument.is_empty() {
+            return Err(CliError::usage("/cd requires a directory: /cd <path>"));
+        }
+
+        let expanded = agens_config::expand_home_prefix(argument, std::env::home_dir().as_deref());
+        let target = expanded.canonicalize().map_err(|error| {
+            CliError::usage(format!(
+                "the directory {} cannot be opened: {error}",
+                expanded.display()
+            ))
+        })?;
+
+        if !target.is_dir() {
+            return Err(CliError::usage(format!(
+                "{} is not a directory",
+                target.display()
+            )));
+        }
+
+        let mut slot = self
+            .checkout_switch
+            .lock()
+            .map_err(|_| CliError::storage("the checkout switch is unavailable"))?;
+        *slot = Some(target);
+
+        Ok(())
     }
 
     fn resolve_daemon_dialog_action(&self, action: &str) -> Result<TuiSubmissionOutcome, CliError> {

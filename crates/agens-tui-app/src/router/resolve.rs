@@ -151,6 +151,12 @@ impl TuiRuntimeRouter {
             "/stash" => self.open_dialog("stash")?,
             command if command.starts_with("/attach") => self.attach_media(command)?,
             "/quit" => TuiSubmissionOutcome::Quit,
+            command if command == "/cd" || command.starts_with("/cd ") => {
+                return Err(CliError::usage(
+                    "/cd switches projects only while attached to a daemon; \
+                     launch agens in that directory for a local session",
+                ));
+            }
             "/team" => {
                 self.team_transition
                     .store(true, std::sync::atomic::Ordering::SeqCst);

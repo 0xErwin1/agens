@@ -469,6 +469,12 @@ pub fn run_attached_tui(
 /// `startup_notice` is what the launch has to say before the arrival does:
 /// the one thing it carries today is that this launch just started the daemon
 /// the arrival is about to describe.
+///
+/// This runs one attachment at a time but not necessarily one per launch:
+/// `/cd` ends the current attachment and comes back here with another
+/// checkout, and the loop re-attaches against it exactly as a fresh launch in
+/// that directory would — rejoining that checkout's open chat or opening one.
+/// The conversation left behind stays alive in the daemon.
 pub fn run_attached_tui_with_prompt(
     bootstrap: &Bootstrap,
     socket: &Path,
@@ -476,17 +482,59 @@ pub fn run_attached_tui_with_prompt(
     initial_prompt: Option<&str>,
     startup_notice: Option<&str>,
 ) -> Result<String, CliError> {
-    let checkout = bootstrap
+    let mut checkout = bootstrap
         .project_root
         .clone()
         .unwrap_or_else(|| PathBuf::from("."));
+    let mut resume = resume;
+    let mut initial_prompt = initial_prompt;
+    let mut startup_notice = startup_notice;
 
+    loop {
+        let switch = Arc::new(Mutex::new(None));
+        let output = attach_and_run(
+            bootstrap,
+            socket,
+            &checkout,
+            resume,
+            initial_prompt,
+            startup_notice,
+            Arc::clone(&switch),
+        )?;
+
+        let Some(target) = switch.lock().ok().and_then(|mut slot| slot.take()) else {
+            return Ok(output);
+        };
+
+        // Everything launch-specific belonged to the attachment that ended: a
+        // resumed session id names a session on the previous checkout, and the
+        // prompt and startup notice were already delivered.
+        checkout = target;
+        resume = None;
+        initial_prompt = None;
+        startup_notice = None;
+    }
+}
+
+/// One attachment's lifetime: attach to `checkout`'s chat, run the surface
+/// against it, and report how the run ended. `switch` comes back holding a
+/// checkout when the person asked to move to another project's conversation
+/// rather than to leave.
+fn attach_and_run(
+    bootstrap: &Bootstrap,
+    socket: &Path,
+    checkout: &Path,
+    resume: Option<i64>,
+    initial_prompt: Option<&str>,
+    startup_notice: Option<&str>,
+    switch: Arc<Mutex<Option<PathBuf>>>,
+) -> Result<String, CliError> {
     let staging = Arc::new(Mutex::new(SessionContext::fresh()));
     let (permissions, permission_requests) = TuiPermissionBridge::channel();
     let (ask_user, ask_user_requests) = TuiAskUserBridge::channel();
     let (attachment, engine, arrival) = attach(
         socket,
-        &checkout,
+        checkout,
         resume,
         permissions,
         ask_user,
@@ -507,7 +555,8 @@ pub fn run_attached_tui_with_prompt(
     }
     let attachment = Arc::new(attachment);
     let router =
-        TuiRuntimeRouter::attached(bootstrap.clone(), Arc::clone(&staging), attachment.clone());
+        TuiRuntimeRouter::attached(bootstrap.clone(), Arc::clone(&staging), attachment.clone())
+            .with_checkout_switch(switch);
     tui.set_palette_entries(router.attached_palette_entries()?);
     tui.set_file_candidates(router.attached_file_candidates()?);
     if let Some(prompt) = initial_prompt {
