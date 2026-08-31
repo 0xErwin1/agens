@@ -601,8 +601,11 @@ message ChatRef {
 message ChatAck {}
 
 message ListChatsRequest {
-  // Required. One daemon serves N projects, and a terminal offered another
-  // project's conversation is a terminal that can attach to the wrong one.
+  // Scopes the listing to one checkout. One daemon serves N projects, and a
+  // terminal offered another project's conversation is a terminal that can
+  // attach to the wrong one, so anything that attaches names its checkout.
+  // Empty means every open chat on the machine: the operator's read-only
+  // board, through which nothing attaches.
   string checkout = 1;
 }
 
