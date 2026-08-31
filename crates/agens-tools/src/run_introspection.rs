@@ -305,7 +305,7 @@ fn parse_ask(arguments: &Value) -> Result<Ask, String> {
     .map_err(describe_ask_error)
 }
 
-fn parse_option(value: &Value) -> Result<AskOption, String> {
+pub(crate) fn parse_option(value: &Value) -> Result<AskOption, String> {
     let object = object_with_only(value, &["id", "label", "consequence"])
         .ok_or_else(|| "an option is invalid".to_owned())?;
 
@@ -316,7 +316,10 @@ fn parse_option(value: &Value) -> Result<AskOption, String> {
     ))
 }
 
-fn object_with_only<'a>(value: &'a Value, allowed: &[&str]) -> Option<&'a Map<String, Value>> {
+pub(crate) fn object_with_only<'a>(
+    value: &'a Value,
+    allowed: &[&str],
+) -> Option<&'a Map<String, Value>> {
     let object = value.as_object()?;
 
     object
@@ -325,7 +328,10 @@ fn object_with_only<'a>(value: &'a Value, allowed: &[&str]) -> Option<&'a Map<St
         .then_some(object)
 }
 
-fn required_string(object: &Map<String, Value>, key: &'static str) -> Result<String, String> {
+pub(crate) fn required_string(
+    object: &Map<String, Value>,
+    key: &'static str,
+) -> Result<String, String> {
     object
         .get(key)
         .and_then(Value::as_str)
@@ -333,7 +339,7 @@ fn required_string(object: &Map<String, Value>, key: &'static str) -> Result<Str
         .ok_or_else(|| format!("{key} is required and must be a string"))
 }
 
-fn optional_string(
+pub(crate) fn optional_string(
     object: &Map<String, Value>,
     key: &'static str,
 ) -> Result<Option<String>, String> {
@@ -344,7 +350,10 @@ fn optional_string(
     }
 }
 
-fn optional_integer(object: &Map<String, Value>, key: &'static str) -> Result<Option<i64>, String> {
+pub(crate) fn optional_integer(
+    object: &Map<String, Value>,
+    key: &'static str,
+) -> Result<Option<i64>, String> {
     match object.get(key) {
         None | Some(Value::Null) => Ok(None),
         Some(value) => value
@@ -407,7 +416,7 @@ fn describe_checkpoint_error(error: CheckpointError) -> String {
     }
 }
 
-fn describe_ask_error(error: AskError) -> String {
+pub(crate) fn describe_ask_error(error: AskError) -> String {
     match error {
         AskError::NoBlockedDecision => "blocked_decision is required".to_owned(),
         AskError::NoOptions => "a question needs the options it is choosing between".to_owned(),
