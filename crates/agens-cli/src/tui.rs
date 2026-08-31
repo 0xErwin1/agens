@@ -139,7 +139,13 @@ pub(crate) fn run_tui(
     initial_prompt: Option<String>,
     daemon_startup: Option<crate::commands::serve::DaemonStartupRequest>,
 ) -> Result<String, CliError> {
-    let bootstrap = bootstrap(dependencies)?;
+    // An attached launch resolves the slim bootstrap: the daemon carrying the
+    // session did its own full resolution, and a local configuration it never
+    // consumed must not be able to stop this client from rendering it.
+    let bootstrap = match mode {
+        TuiMode::Local => bootstrap(dependencies)?,
+        TuiMode::Attached => crate::deps::attached_bootstrap(dependencies)?,
+    };
     let started = daemon_startup
         .map(|request| (dependencies.daemon_ensurer)(&bootstrap, request))
         .transpose()
