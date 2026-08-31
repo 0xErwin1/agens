@@ -29,7 +29,12 @@ pub(crate) fn run_chat(
         &attach,
     )?;
     seed_configured_reasoning_effort(&mut request, &bootstrap);
-    let output = (dependencies.headless_chat)(request, &bootstrap, cancellation)?;
+    let output = (dependencies.headless_chat)(
+        request,
+        &bootstrap,
+        cancellation,
+        (dependencies.stdin_is_terminal)(),
+    )?;
     cancellation_result(cancellation)?;
 
     Ok(format!("{output}\n"))

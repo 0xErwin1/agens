@@ -199,3 +199,5 @@ crates/agens-server/src/api/runs.rs	let _ = self.machines.apply_question(	second
 crates/agens-server/src/coordinator/mod.rs	let _ = core.journal_backlogged_fact(WHEEL_REPORTER, &refused);	best_effort_observability
 crates/agens-server/src/introspection.rs	let _ = core.journal_backlogged_fact(CHECKPOINT_REPORTER, &refused);	best_effort_observability
 crates/agens-tui-app/src/attached.rs	let _ = self.runtime.block_on(chat.cancel(self.session_id));	documented_no_op
+crates/agens-cli/src/headless.rs	let _ = writeln!(	best_effort_observability
+crates/agens-cli/src/headless.rs	let _ = self.notice.flush();	best_effort_observability

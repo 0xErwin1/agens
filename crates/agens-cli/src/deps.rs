@@ -32,8 +32,16 @@ const UNAVAILABLE_MESSAGE: &str = "this command is not implemented yet";
 /// already returned — instead of only ever answering for the process's own discovered root.
 /// Creates a configuration file, failing when one already exists.
 type ConfigCreator = Box<dyn Fn(&Path, &str) -> Result<(), CliError>>;
+/// The trailing `bool` is whether standard input is a terminal, observed
+/// through `stdin_is_terminal` by the command: it decides whether a permission
+/// question is asked on the terminal or denied fast with a printed notice.
 type HeadlessChat = Box<
-    dyn Fn(HeadlessChatRequest, &Bootstrap, &HeadlessTurnCancellation) -> Result<String, CliError>,
+    dyn Fn(
+        HeadlessChatRequest,
+        &Bootstrap,
+        &HeadlessTurnCancellation,
+        bool,
+    ) -> Result<String, CliError>,
 >;
 type TuiLauncher = Box<dyn Fn(&Bootstrap, TuiLaunch) -> Result<String, CliError>>;
 type DaemonEnsurer = Box<dyn Fn(&Bootstrap, DaemonStartupRequest) -> Result<bool, CliError>>;
@@ -123,7 +131,7 @@ impl CliDependencies {
         Self {
             host: HostEnvironment::fixed(current_directory, home_directory, environment, files),
             create_file: Box::new(|_, _| Err(CliError::unavailable(UNAVAILABLE_MESSAGE))),
-            headless_chat: Box::new(|_, _, _| Err(CliError::unavailable(UNAVAILABLE_MESSAGE))),
+            headless_chat: Box::new(|_, _, _, _| Err(CliError::unavailable(UNAVAILABLE_MESSAGE))),
             tui_launcher: Box::new(|_, _| Err(CliError::unavailable(UNAVAILABLE_MESSAGE))),
             daemon_ensurer: Box::new(|_, _| Ok(false)),
             daemon_build_check: Box::new(|_, _| Ok(None)),
@@ -147,6 +155,7 @@ impl CliDependencies {
             HeadlessChatRequest,
             &Bootstrap,
             &HeadlessTurnCancellation,
+            bool,
         ) -> Result<String, CliError>
         + 'static,
     ) -> Self {

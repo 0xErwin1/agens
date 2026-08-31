@@ -836,7 +836,7 @@ fn table_a_auth_holds() {
 /// Echoes every field of the parsed `HeadlessChatRequest` so the assertion
 /// exercises actual argument parsing, not just a stubbed success path.
 fn echoing_chat_dependencies(temporary: &TemporaryDirectory) -> CliDependencies {
-    base_dependencies(temporary).with_headless_chat(|request, _, _| {
+    base_dependencies(temporary).with_headless_chat(|request, _, _, _| {
         Ok(format!(
             "model={:?} system={:?} max_iterations={:?} mode={:?} dangerously_allow_all={} prompt={:?}",
             request.model,
@@ -2750,4 +2750,45 @@ fn auth_login_without_a_terminal_keeps_the_usage_listing_and_never_opens_the_men
         "a non-terminal bare `auth login` must keep the usage listing, got: {}",
         actual.stderr
     );
+}
+
+/// AGN-229: `agens chat` decides how a permission question reaches a person by
+/// whether standard input is a terminal, so the command must hand that seam to
+/// the headless turn instead of letting the turn wait on a durable question
+/// nobody can see. With a terminal, the question is asked on it.
+#[test]
+fn chat_reports_a_terminal_stdin_to_the_headless_turn() {
+    let temporary = TemporaryDirectory::new("chat-terminal-stdin-seam");
+    let dependencies = base_dependencies(&temporary)
+        .with_stdin_is_terminal(true)
+        .with_headless_chat(|_, _, _, stdin_is_terminal| {
+            Ok(format!("stdin_is_terminal={stdin_is_terminal}"))
+        });
+
+    let actual = execute(
+        argv(&["chat", "hi"]).iter().map(String::as_str),
+        &dependencies,
+    );
+
+    assert_eq!(actual, success("stdin_is_terminal=true\n"));
+}
+
+/// The other side of the same seam: a piped or redirected `agens chat` has no
+/// terminal to ask on, and the turn must know that so it can refuse the call
+/// fast instead of waiting silently.
+#[test]
+fn chat_reports_a_non_terminal_stdin_to_the_headless_turn() {
+    let temporary = TemporaryDirectory::new("chat-non-terminal-stdin-seam");
+    let dependencies = base_dependencies(&temporary)
+        .with_stdin_is_terminal(false)
+        .with_headless_chat(|_, _, _, stdin_is_terminal| {
+            Ok(format!("stdin_is_terminal={stdin_is_terminal}"))
+        });
+
+    let actual = execute(
+        argv(&["chat", "hi"]).iter().map(String::as_str),
+        &dependencies,
+    );
+
+    assert_eq!(actual, success("stdin_is_terminal=false\n"));
 }

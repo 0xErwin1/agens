@@ -553,7 +553,7 @@ fn command_boundaries_invoke_injected_headless_and_tui_services_without_network(
         BTreeMap::new(),
         BTreeMap::new(),
     )
-    .with_headless_chat(|request, _, _| Ok(format!("answer:{}", request.prompt)))
+    .with_headless_chat(|request, _, _, _| Ok(format!("answer:{}", request.prompt)))
     .with_tui_launcher(|_, launch| Ok(format!("tui-selected:{:?}", launch.resume())));
 
     let chat = execute(["chat", "hello"], &dependencies);
@@ -1498,7 +1498,7 @@ fn headless_chat_bootstraps_config_runs_local_turn_and_supports_session_resume()
             format!("[options]\ndata_dir = \"{}\"\n", data_directory.display()),
         )]),
     )
-    .with_headless_chat(|_, bootstrap, _| {
+    .with_headless_chat(|_, bootstrap, _, _| {
         let mut provider = LocalProvider {
             iterations: vec![
                 Ok(vec![
@@ -1617,7 +1617,7 @@ fn injected_shutdown_cancels_headless_chat_with_deterministic_output_and_no_sess
         BTreeMap::new(),
         BTreeMap::new(),
     )
-    .with_headless_chat(|_, _, cancellation| {
+    .with_headless_chat(|_, _, cancellation, _| {
         assert!(cancellation.is_cancelled());
         Ok("must not be emitted".to_owned())
     });
@@ -3354,6 +3354,84 @@ fn production_binary_denies_unresolved_native_call_without_dispatching_and_conti
             .expect("project grants should load")
             .is_empty(),
         "non-TTY denial must not persist a grant"
+    );
+
+    server.join();
+}
+
+/// AGN-229: a piped `agens chat` with the default configuration used to park a
+/// permission question on a durable row nobody watching the terminal could
+/// see or answer, so the turn sat silent until the unattended budget expired.
+/// Without a terminal on standard input the question is now denied for that
+/// one call immediately, with a notice on stderr naming the blocked tool and
+/// both ways forward, and the turn continues under ordinary deny semantics.
+#[test]
+fn production_binary_without_a_terminal_denies_a_permission_ask_fast_with_a_notice() {
+    let temporary = TemporaryDirectory::new("production-non-tty-ask-notice");
+    let project_root = temporary.path().join("project");
+    let config_home = temporary.path().join("config");
+    let data_directory = temporary.path().join("data");
+    std::fs::create_dir_all(project_root.join(".git")).expect("project marker should exist");
+    std::fs::create_dir_all(&config_home).expect("config directory should exist");
+    let protected = project_root.join("asked-about.txt");
+    std::fs::write(&protected, "must not be read").expect("protected fixture should exist");
+    let server = ScriptedNativeOpenAiMockServer::start(vec![
+        ScriptedOpenAiResponse {
+            required_body_fragments: vec!["native::read".to_owned()],
+            response: native_tool_call_response(
+                "call_ask",
+                "native::read",
+                r#"{"path":"asked-about.txt"}"#,
+            ),
+        },
+        ScriptedOpenAiResponse {
+            required_body_fragments: vec![
+                "\"call_id\":\"call_ask\"".to_owned(),
+                "\"output\":\"permission denied\"".to_owned(),
+            ],
+            response: text_response("non-tty ask denial handled"),
+        },
+    ]);
+    std::fs::write(
+        config_home.join("config.toml"),
+        format!(
+            "[provider]\nmodel = \"openai-api/test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n",
+            server.base_url(),
+            data_directory.display(),
+        ),
+    )
+    .expect("config should be written");
+
+    let output = isolated_agens_command(&temporary)
+        .args(["chat", "request native tool"])
+        .current_dir(&project_root)
+        .env("AGENS_CONFIG_HOME", &config_home)
+        .env("OPENAI_API_KEY", "SENTINEL_OPENAI_API_KEY")
+        .output()
+        .expect("production binary should execute");
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "non-tty ask denial handled\n"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("permission required for read"),
+        "the notice must name the blocked tool, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("standard input is not a terminal"),
+        "the notice must say why the question could not be asked, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("[permissions]"),
+        "the notice must point at an allow rule, got: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&protected).expect("protected fixture should remain readable"),
+        "must not be read"
     );
 
     server.join();
