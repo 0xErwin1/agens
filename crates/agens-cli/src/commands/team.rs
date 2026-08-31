@@ -136,7 +136,7 @@ pub(crate) fn run_team_ls(json: bool, dependencies: &CliDependencies) -> Result<
         // listing only carries resumable sessions, so a chat that has not
         // completed a turn is absent from it and would report an age counted
         // from the epoch.
-        let mut chat_store = SessionStore::open(bootstrap.data_directory())
+        let chat_store = SessionStore::open(bootstrap.data_directory())
             .map_err(|_| CliError::storage("the sessions database is unavailable"))?;
 
         for open in chat.open_everywhere().await.map_err(client_error)? {
