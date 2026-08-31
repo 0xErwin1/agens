@@ -179,8 +179,8 @@ pub(crate) enum ServeAction {
         about = "authorize a repository's provisioning hooks, which run with the daemon's environment"
     )]
     Trust {
-        /// The checkout to trust. It has to be one the daemon serves, which is
-        /// what `team.project_roots` says.
+        /// The checkout to trust. Any git worktree may be named; the grant
+        /// applies to that repository's next run.
         repository: PathBuf,
     },
     #[command(about = "stop the daemon running for this machine")]

@@ -6309,7 +6309,10 @@ fn serve_trust_grants_any_git_checkout_and_refuses_a_directory_that_is_not_one()
 
     let plain = temporary.path().join("plain");
     std::fs::create_dir_all(&plain).expect("the fixture directory should exist");
-    let refused = execute(["serve", "trust", &plain.display().to_string()], &dependencies);
+    let refused = execute(
+        ["serve", "trust", &plain.display().to_string()],
+        &dependencies,
+    );
 
     assert_eq!(refused.status, ExitStatus::Configuration);
     assert!(

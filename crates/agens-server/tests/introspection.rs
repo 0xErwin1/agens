@@ -145,14 +145,6 @@ impl EventFeed for Unreached {
 }
 
 impl RepositoryPolicy for Unreached {
-    fn admits(&self, _repository: &std::path::Path) -> bool {
-        false
-    }
-
-    fn admission_remedy(&self) -> String {
-        "no introspection write names a repository".to_owned()
-    }
-
     fn hook_trust(&self, _repo_id: &str) -> HookTrust {
         HookTrust::Refused
     }

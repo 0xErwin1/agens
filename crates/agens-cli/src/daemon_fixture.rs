@@ -152,7 +152,6 @@ impl DaemonFixture {
         model: &str,
         extra_config: &str,
     ) -> Self {
-        let mut settings = settings;
         let root = scratch();
         let checkout = checkout(&root);
         let config_home = root.join("config");
@@ -190,13 +189,6 @@ impl DaemonFixture {
         };
         let dependencies = dependency_seed.dependencies();
         let bootstrap = bootstrap(&dependencies).expect("the production bootstrap is valid");
-
-        // The daemon serves the checkouts its operator wrote down, and nothing
-        // else: a repository nobody named is a repository whose hooks it would
-        // be executing on a caller's say-so. The fixture's own checkout is the
-        // only one any of these runs names, so the fixture is what declares it
-        // rather than every caller repeating it.
-        settings.policy.project_roots = vec![checkout.clone()];
 
         let socket = agens_server::socket_path(&data_directory);
 

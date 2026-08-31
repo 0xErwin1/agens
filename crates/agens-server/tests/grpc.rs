@@ -400,8 +400,7 @@ async fn wire_forwarding(
     let core = Arc::new(Mutex::new(ApiCore::new(
         StateMachines::new(store),
         ports,
-        Arc::new(PolicyStore::in_memory(vec![repository.clone()], Vec::new()))
-            as Arc<dyn RepositoryPolicy>,
+        Arc::new(PolicyStore::in_memory(Vec::new())) as Arc<dyn RepositoryPolicy>,
     )));
     let blocking = BlockingBoundary::new(tokio::runtime::Handle::current());
     let handle = CoreHandle::new(Arc::clone(&core), blocking, principal);
@@ -1022,7 +1021,7 @@ fn serving_no_address_is_refused_rather_than_treated_as_serving_nothing() {
             sessions: Arc::new(StubSessions),
             feed: Arc::new(StubFeed::default()),
         },
-        Arc::new(PolicyStore::in_memory(Vec::new(), Vec::new())) as Arc<dyn RepositoryPolicy>,
+        Arc::new(PolicyStore::in_memory(Vec::new())) as Arc<dyn RepositoryPolicy>,
     )));
     let blocking = BlockingBoundary::new(runtime.handle().clone());
     let shutdown = HeadlessTurnCancellation::new();
@@ -1055,7 +1054,7 @@ fn the_daemon_serves_the_facade_on_its_socket() {
             sessions: Arc::new(StubSessions),
             feed: Arc::new(StubFeed::default()),
         },
-        Arc::new(PolicyStore::in_memory(Vec::new(), Vec::new())) as Arc<dyn RepositoryPolicy>,
+        Arc::new(PolicyStore::in_memory(Vec::new())) as Arc<dyn RepositoryPolicy>,
     );
 
     let daemon = agens_server::Daemon::start(&directory).unwrap();

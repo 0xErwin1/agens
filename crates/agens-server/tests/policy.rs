@@ -1,15 +1,16 @@
-//! The operator's decisions: which checkouts the daemon serves, whose hooks it
-//! will execute, and what those hooks may export.
+//! The operator's decisions: whose hooks the daemon will execute, and what
+//! those hooks may export.
 //!
-//! Every default here is the closed one. A daemon that has never been
-//! configured serves nothing and runs nobody's hooks, because the alternative
-//! is a socket any local process can reach deciding to execute a repository's
-//! code on the strength of the request naming it.
+//! Which checkouts may be named is no decision at all — a run admits any git
+//! checkout dynamically, the way a chat does. The hook default stays the
+//! closed one: a daemon that has never been configured runs nobody's hooks,
+//! because the alternative is a socket any local process can reach deciding to
+//! execute a repository's code on the strength of the request naming it.
 //!
 //! The two halves are proved separately because they have different writers:
-//! the roots come from the operator's configuration and nothing the daemon runs
-//! can add to them, and the hook decisions live in the control plane, where a
-//! run's own worktree has no file to append itself to.
+//! the export allowlist comes from the operator's configuration and nothing
+//! the daemon runs can add to it, and the hook decisions live in the control
+//! plane, where a run's own worktree has no file to append itself to.
 
 use std::fs;
 use std::path::PathBuf;
@@ -43,14 +44,8 @@ fn checkout(under: &std::path::Path, name: &str) -> PathBuf {
 }
 
 fn settings() -> PolicySettings {
-    serving(Vec::new())
-}
-
-fn serving(roots: Vec<PathBuf>) -> PolicySettings {
     PolicySettings {
-        project_roots: roots,
         hook_exports: Vec::new(),
-        config_path: Some(PathBuf::from("/home/dev/.config/agens/config.toml")),
     }
 }
 
@@ -69,41 +64,13 @@ fn repository(under: &std::path::Path, name: &str) -> PathBuf {
 }
 
 #[test]
-fn a_daemon_with_no_policy_serves_no_checkout_and_trusts_no_repository() {
+fn a_daemon_with_no_policy_trusts_no_repository_and_exports_nothing() {
     let directory = data_directory();
-    let policy = PolicyStore::open(&directory, serving(Vec::new()))
-        .expect("an absent policy is not an error");
+    let policy =
+        PolicyStore::open(&directory, settings()).expect("an absent policy is not an error");
 
-    assert!(
-        !policy.admits(&checkout(&directory, "anywhere")),
-        "an unconfigured daemon admits nothing rather than everything"
-    );
     assert_eq!(policy.hook_trust(REPO), HookTrust::Unknown);
     assert!(policy.hook_exports().is_empty());
-
-    let remedy = policy.admission_remedy();
-    assert!(
-        remedy.contains("team.project_roots") && remedy.contains("config.toml"),
-        "the refusal names the key and the file the operator has to write it in: {remedy}"
-    );
-}
-
-#[test]
-fn a_configured_root_admits_what_is_under_it_and_nothing_beside_it() {
-    let directory = data_directory();
-    let served = checkout(&directory, "dev");
-    let inside = checkout(&served, "agens");
-    let beside = checkout(&directory, "development");
-
-    let policy = PolicyStore::open(&directory, serving(vec![served.clone()]))
-        .expect("the configured roots need no file");
-
-    assert!(policy.admits(&served), "the root itself is served");
-    assert!(policy.admits(&inside), "so is a checkout under it");
-    assert!(
-        !policy.admits(&beside),
-        "a name that merely starts with the root's is a different directory"
-    );
 }
 
 #[test]
@@ -115,7 +82,7 @@ fn the_retired_policy_file_stops_the_daemon_rather_than_being_ignored() {
     )
     .unwrap();
 
-    let error = PolicyStore::open(&directory, serving(Vec::new()))
+    let error = PolicyStore::open(&directory, settings())
         .expect_err("a file that configures nothing is not silently obeyed");
 
     assert!(
@@ -130,13 +97,13 @@ fn a_register_anyone_can_reach_stops_the_daemon() {
     use std::os::unix::fs::PermissionsExt;
 
     let directory = data_directory();
-    let policy = PolicyStore::open(&directory, serving(Vec::new())).expect("the register opens");
+    let policy = PolicyStore::open(&directory, settings()).expect("the register opens");
     drop(policy);
 
     let database = agens_store::unified_database_path(&directory);
     fs::set_permissions(&database, fs::Permissions::from_mode(0o666)).unwrap();
 
-    let error = PolicyStore::open(&directory, serving(Vec::new()))
+    let error = PolicyStore::open(&directory, settings())
         .expect_err("a register the whole machine can write decides nothing");
 
     assert!(
@@ -150,7 +117,7 @@ fn answering_a_pending_question_grants_the_repository_durably() {
     let directory = data_directory();
     let repository = checkout(&directory, "agens");
 
-    let policy = PolicyStore::open(&directory, serving(Vec::new())).unwrap();
+    let policy = PolicyStore::open(&directory, settings()).unwrap();
     policy
         .record_pending(&PendingHookTrust {
             question_id: 7,
@@ -169,7 +136,7 @@ fn answering_a_pending_question_grants_the_repository_durably() {
     );
 
     drop(policy);
-    let reopened = PolicyStore::open(&directory, serving(Vec::new()))
+    let reopened = PolicyStore::open(&directory, settings())
         .expect("the grant was written to the control plane");
 
     assert_eq!(
@@ -184,7 +151,7 @@ fn a_refusal_is_recorded_so_the_operator_is_not_asked_again() {
     let directory = data_directory();
     let repository = checkout(&directory, "agens");
 
-    let policy = PolicyStore::open(&directory, serving(Vec::new())).unwrap();
+    let policy = PolicyStore::open(&directory, settings()).unwrap();
     policy
         .record_pending(&PendingHookTrust {
             question_id: 9,
@@ -201,7 +168,7 @@ fn a_refusal_is_recorded_so_the_operator_is_not_asked_again() {
 #[test]
 fn an_answer_to_a_question_the_policy_never_asked_grants_nothing() {
     let directory = data_directory();
-    let policy = PolicyStore::open(&directory, serving(Vec::new())).unwrap();
+    let policy = PolicyStore::open(&directory, settings()).unwrap();
 
     assert!(
         !policy.resolve_pending(11, true).unwrap(),
@@ -211,22 +178,16 @@ fn an_answer_to_a_question_the_policy_never_asked_grants_nothing() {
 }
 
 #[test]
-fn the_operators_trust_verb_grants_a_served_repository_without_a_question() {
+fn the_operators_trust_verb_grants_a_repository_without_a_question() {
     let directory = data_directory();
-    let served = checkout(&directory, "dev");
-    let repository = repository(&served, "agens");
+    let repository = repository(&directory, "agens");
 
-    let trusted = trust_repository(
-        &directory,
-        serving(vec![served]),
-        &repository,
-        1_700_000_000,
-    )
-    .expect("a served checkout can be trusted");
+    let trusted = trust_repository(&directory, settings(), &repository, 1_700_000_000)
+        .expect("a checkout can be trusted");
 
     assert_eq!(trusted.repository, repository);
 
-    let policy = PolicyStore::open(&directory, serving(Vec::new())).unwrap();
+    let policy = PolicyStore::open(&directory, settings()).unwrap();
 
     assert_eq!(
         policy.hook_trust(&trusted.repo_id),

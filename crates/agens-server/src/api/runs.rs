@@ -12,8 +12,9 @@
 //! design refuses everywhere else.
 //!
 //! Creation is three steps rather than one because the middle one is slow.
-//! [`ApiCore::prepare_run`] decides — who is asking, whether the daemon serves
-//! this checkout, and whether the repository's hooks may run; provisioning
+//! [`ApiCore::prepare_run`] decides — who is asking, whether the named path
+//! resolves to a git worktree, and whether the repository's hooks may run;
+//! provisioning
 //! copies files and executes those hooks, which the repository bounds and the
 //! daemon does not; [`ApiCore::open_run`] writes the row. The daemon holds the
 //! core's lock across the first and the third and releases it for the second,
@@ -28,7 +29,7 @@ use agens_store::{
 };
 
 use super::{ApiCore, ApiError, Operation};
-use crate::api::ports::{HookPolicy, ProvisionedWorktree, WorktreeRequest};
+use crate::api::ports::{HookPolicy, ProvisionedWorktree, RepositoryIdentity, WorktreeRequest};
 use crate::fsm::{
     Principal, QuestionFacts, QuestionTrigger, RunFacts, RunTrigger, WorktreeFacts, WorktreeTrigger,
 };
@@ -154,10 +155,12 @@ impl ApiCore {
     ///
     /// Three refusals live here rather than further down: a principal the
     /// operation does not admit, a request nothing could be measured against,
-    /// and a checkout this daemon does not serve. The last one is why the
-    /// repository is canonicalized before anything else looks at it — a path
-    /// arrives from a client, and a client that could name any path could have
-    /// the daemon execute any repository's hooks.
+    /// and a path with no git worktree behind it. The last one is why the
+    /// repository is canonicalized and identified before anything else looks
+    /// at it — a path arrives from a client, and what admits it is the
+    /// repository it resolves to, never the name it was handed. Admission
+    /// grants nothing beyond being served: the repository's hooks stay exactly
+    /// as trusted or untrusted as the operator's register says.
     pub fn prepare_run(
         &mut self,
         principal: Principal,
@@ -166,8 +169,7 @@ impl ApiCore {
         self.authorize(Operation::CreateRun, principal, None, request.now)?;
         self.check_describable(principal, request)?;
 
-        let repository = self.admitted_repository(principal, request)?;
-        let identity = self.ports.worktrees.identify(&repository)?;
+        let (repository, identity) = self.admitted_repository(principal, request)?;
         let name = worktree_name(&request.task, &identity.repo_id, request.now);
         let branch = format!("agens/{name}");
         let hooks = self.hook_policy(principal, &identity.repo_id, request.now);
@@ -291,31 +293,49 @@ impl ApiCore {
         );
     }
 
-    /// The checkout the request named, resolved and checked against the roots
-    /// the operator serves.
+    /// The checkout the request named, resolved and proven to be a git
+    /// worktree.
+    ///
+    /// Admission is dynamic, the same as a chat's: no configuration declares
+    /// which checkouts may be named, and any path that resolves to a git
+    /// worktree is served. What that admission does not touch is hook trust,
+    /// which stays the operator's explicit per-repository grant.
     fn admitted_repository(
         &mut self,
         principal: Principal,
         request: &CreateRun,
-    ) -> Result<PathBuf, ApiError> {
-        let canonical = request.repo_root.canonicalize().ok();
-
-        let Some(repository) = canonical.filter(|path| self.policy.admits(path)) else {
-            let remedy = self.policy.admission_remedy();
-
+    ) -> Result<(PathBuf, RepositoryIdentity), ApiError> {
+        let Ok(repository) = request.repo_root.canonicalize() else {
             return Err(self.refuse(
                 Operation::CreateRun,
                 principal,
                 None,
                 request.now,
                 format!(
-                    "the daemon does not serve {}: {remedy}",
+                    "the checkout {} does not exist",
                     request.repo_root.display()
                 ),
             ));
         };
 
-        Ok(repository)
+        let identity = match self.ports.worktrees.identify(&repository) {
+            Ok(identity) => identity,
+            Err(error) => {
+                return Err(self.refuse(
+                    Operation::CreateRun,
+                    principal,
+                    None,
+                    request.now,
+                    format!(
+                        "the checkout {} is not a git worktree: {}",
+                        repository.display(),
+                        error.detail()
+                    ),
+                ));
+            }
+        };
+
+        Ok((repository, identity))
     }
 
     /// Whether this run's provisioning hooks may run.
