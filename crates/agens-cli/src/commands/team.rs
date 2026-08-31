@@ -1,20 +1,16 @@
 //! The non-interactive fleet view over the daemon's existing control-plane views.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::io::{self, Write};
-use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use agens_config::TeamSettings;
 use agens_coordinator_client::{
     ChatClient, ClientError, Coordinator, FeedClient, HostedChatEvent, proto,
 };
 use agens_core::{Message, MessagePart, Role};
 use agens_error::CliError;
 use agens_store::{QuestionClass, QuestionStore, SessionStore};
-use agens_tools::SessionWorktrees;
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 use tokio_stream::StreamExt;
 
 use crate::CliDependencies;
@@ -66,10 +62,6 @@ pub(crate) fn run_team_ls(json: bool, dependencies: &CliDependencies) -> Result<
             Err(error) => return Err(CliError::unavailable(error.to_string())),
         };
 
-        let roots = TeamSettings::from(bootstrap.settings())
-            .project_roots
-            .into_iter()
-            .collect::<BTreeSet<_>>();
         let sessions = SessionStore::open(bootstrap.data_directory())
             .and_then(|store| store.list_sessions())
             .map_err(|_| CliError::storage("the sessions database is unavailable"))?
@@ -87,14 +79,15 @@ pub(crate) fn run_team_ls(json: bool, dependencies: &CliDependencies) -> Result<
             })
             .map(|(session_id, class)| (session_id, waiting_label(class).to_owned()))
             .collect::<BTreeMap<_, _>>();
-        let worktrees = SessionWorktrees::new(bootstrap.data_directory());
         let now = now_seconds();
         let mut feed = coordinator.feed();
         let mut chat = coordinator.chat();
         let mut items = Vec::new();
 
-        for root in roots {
-            let repo_id = repository_id(&worktrees, &root)?;
+        // The daemon names the projects, never the configuration: a repository
+        // exists on this board because somebody created a run against it, and
+        // a chat because somebody opened one, wherever either happened.
+        for repo_id in feed.repos().await.map_err(client_error)? {
             let tree = feed.tree(&repo_id).await.map_err(client_error)?;
             let inbox = feed
                 .inbox(&repo_id)
@@ -136,24 +129,24 @@ pub(crate) fn run_team_ls(json: bool, dependencies: &CliDependencies) -> Result<
                     last_activity: last_event.map_or(row.created_at, |event| event.ts),
                 });
             }
+        }
 
-            for open in chat.open_against(&root).await.map_err(client_error)? {
-                let metadata = sessions.get(&open.session_id);
-                let created_at = metadata.map_or(0, |session| session.created_at);
-                let last_activity = metadata.map_or(created_at, |session| session.updated_at);
-                let state = if open.answering { "running" } else { "idle" };
+        for open in chat.open_everywhere().await.map_err(client_error)? {
+            let metadata = sessions.get(&open.session_id);
+            let created_at = metadata.map_or(0, |session| session.created_at);
+            let last_activity = metadata.map_or(created_at, |session| session.updated_at);
+            let state = if open.answering { "running" } else { "idle" };
 
-                items.push(FleetItem {
-                    id: open.session_id.to_string(),
-                    kind: "chat",
-                    state: state.to_owned(),
-                    age_seconds: age_seconds(now, created_at),
-                    last_event: Some(state.to_owned()),
-                    worktree: Some(open.checkout.display().to_string()),
-                    waiting: waiting_sessions.get(&open.session_id).cloned(),
-                    last_activity,
-                });
-            }
+            items.push(FleetItem {
+                id: open.session_id.to_string(),
+                kind: "chat",
+                state: state.to_owned(),
+                age_seconds: age_seconds(now, created_at),
+                last_event: Some(state.to_owned()),
+                worktree: Some(open.checkout.display().to_string()),
+                waiting: waiting_sessions.get(&open.session_id).cloned(),
+                last_activity,
+            });
         }
 
         items.sort_by_key(|item| std::cmp::Reverse(item.last_activity));
@@ -279,15 +272,10 @@ pub(crate) fn run_team_action(
                 ))
             }
             TeamAction::Cancel { id } => {
-                let roots = TeamSettings::from(bootstrap.settings())
-                    .project_roots
-                    .into_iter()
-                    .collect::<BTreeSet<_>>();
-                let worktrees = SessionWorktrees::new(bootstrap.data_directory());
                 let mut feed = coordinator.feed();
                 let mut chat = coordinator.chat();
 
-                match locate_target(id, &roots, &worktrees, &mut feed, &mut chat).await? {
+                match locate_target(id, &mut feed, &mut chat).await? {
                     ShowTarget::Run(run_id) => {
                         coordinator
                             .team()
@@ -397,15 +385,10 @@ pub(crate) fn run_team_show(
             Err(ClientError::NotRunning(_)) => return Ok(no_daemon(false)),
             Err(error) => return Err(client_error(error)),
         };
-        let roots = TeamSettings::from(bootstrap.settings())
-            .project_roots
-            .into_iter()
-            .collect::<BTreeSet<_>>();
-        let worktrees = SessionWorktrees::new(bootstrap.data_directory());
         let numeric_id = positive_i64(id, "team show requires a positive numeric id")?;
         let mut feed = coordinator.feed();
         let mut chat = coordinator.chat();
-        let target = locate_target(numeric_id, &roots, &worktrees, &mut feed, &mut chat).await?;
+        let target = locate_target(numeric_id, &mut feed, &mut chat).await?;
 
         match target {
             ShowTarget::Run(run_id) => {
@@ -446,16 +429,12 @@ pub(crate) fn run_team_show(
 
 async fn locate_target(
     id: i64,
-    roots: &BTreeSet<std::path::PathBuf>,
-    worktrees: &SessionWorktrees,
     feed: &mut FeedClient,
     chat: &mut ChatClient,
 ) -> Result<ShowTarget, CliError> {
     let mut run_found = false;
-    let mut chat_found = false;
 
-    for root in roots {
-        let repo_id = repository_id(worktrees, root)?;
+    for repo_id in feed.repos().await.map_err(client_error)? {
         run_found |= feed
             .tree(&repo_id)
             .await
@@ -463,13 +442,14 @@ async fn locate_target(
             .runs
             .iter()
             .any(|run| run.run_id == id);
-        chat_found |= chat
-            .open_against(root)
-            .await
-            .map_err(client_error)?
-            .iter()
-            .any(|open| open.session_id == id);
     }
+
+    let chat_found = chat
+        .open_everywhere()
+        .await
+        .map_err(client_error)?
+        .iter()
+        .any(|open| open.session_id == id);
 
     resolve_show_target(&id.to_string(), run_found, chat_found)
 }
@@ -650,27 +630,6 @@ fn render(view: FleetView, json: bool) -> String {
         ));
     }
     output
-}
-
-fn repository_id(worktrees: &SessionWorktrees, root: &Path) -> Result<String, CliError> {
-    let identity = worktrees.repository_identity(root).map_err(|error| {
-        CliError::configuration(format!("team project root is unavailable: {error}"))
-    })?;
-    let mut digest = Sha256::new();
-    digest.update(identity.common_directory.display().to_string().as_bytes());
-    if let Some(remote_url) = identity.remote_url {
-        digest.update([0x1f]);
-        digest.update(remote_url.as_bytes());
-    }
-
-    Ok(digest
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>()
-        .chars()
-        .take(16)
-        .collect())
 }
 
 fn is_live_run(state: &str) -> bool {

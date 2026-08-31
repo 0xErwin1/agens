@@ -27,6 +27,9 @@ mod headless;
 mod headless_tests;
 
 #[cfg(test)]
+mod team_fleet_tests;
+
+#[cfg(test)]
 mod permission_tests;
 pub mod profile_store;
 #[cfg(test)]
