@@ -917,6 +917,7 @@ mod tests {
                 "attach",
                 "undo",
                 "redo",
+                "cd",
                 "review",
                 "shared",
                 "inspect",
