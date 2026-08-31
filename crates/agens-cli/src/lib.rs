@@ -198,5 +198,9 @@ fn execute_command(
         Err(error) => return cli::clap_outcome(error),
     };
 
+    if let Some(error) = cli::subcommand_flag_conflict(&parsed) {
+        return cli::clap_outcome(error);
+    }
+
     commands::dispatch(parsed, dependencies, cancellation)
 }

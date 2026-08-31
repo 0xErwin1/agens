@@ -246,34 +246,23 @@ fn default_chat_starts_the_daemon_under_an_isolated_config_home() {
 }
 
 #[test]
-fn explicit_team_starts_the_daemon_under_an_isolated_config_home() {
+fn bare_team_lists_the_fleet_without_starting_a_daemon() {
     let operator = Operator::prepare();
 
     let output = operator.run(&["team"]);
 
     assert!(
-        !output.status.success(),
-        "the non-terminal TUI still refuses"
+        output.status.success(),
+        "bare `agens team` is `team ls`, a non-interactive fleet view"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "No daemon is running.\n"
     );
     assert!(
-        accepts(&operator.socket()),
-        "an explicit attached transition waits for the daemon"
+        !operator.socket().exists(),
+        "a fleet view reports the daemon, it never starts one"
     );
-}
-
-#[test]
-fn concurrent_explicit_team_starts_wait_for_one_ready_daemon() {
-    let operator = Operator::prepare();
-
-    let outputs = std::thread::scope(|scope| {
-        let first = scope.spawn(|| operator.run(&["team"]));
-        let second = scope.spawn(|| operator.run(&["team"]));
-        [first.join().unwrap(), second.join().unwrap()]
-    });
-
-    assert!(outputs.iter().all(|output| !output.status.success()));
-    assert!(accepts(&operator.socket()));
-    assert!(alive(operator.published_pid()));
 }
 
 /// The point of starting the daemon detached: the client that started it is

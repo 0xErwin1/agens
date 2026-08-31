@@ -308,8 +308,8 @@ fn table_a_root_shapes_hold() {
 }
 
 #[test]
-fn team_and_attach_are_first_class_attached_entry_points() {
-    let temporary = TemporaryDirectory::new("team-and-attach-entry-points");
+fn attach_is_the_only_first_class_attached_entry_point() {
+    let temporary = TemporaryDirectory::new("attach-entry-point");
     let starts = std::sync::Arc::new(std::sync::Mutex::new(0usize));
     let observed_starts = std::sync::Arc::clone(&starts);
     let dependencies = base_dependencies(&temporary)
@@ -328,17 +328,12 @@ fn team_and_attach_are_first_class_attached_entry_points() {
         });
 
     let attach = execute(["attach", "17"], &dependencies);
-    let team = execute(["team", "coordinate", "this"], &dependencies);
     let attach_help = execute(["attach", "--help"], &dependencies);
     let team_help = execute(["team", "--help"], &dependencies);
 
     assert_eq!(
         attach,
         success("mode=Attached;resume=Some(17);prompt=None;notice=None\n")
-    );
-    assert_eq!(
-        team,
-        success("mode=Attached;resume=None;prompt=Some(\"coordinate this\");notice=None\n")
     );
     assert_eq!(
         attach_help,
@@ -349,10 +344,11 @@ fn team_and_attach_are_first_class_attached_entry_points() {
     assert_eq!(
         team_help,
         success(
-            "enter team mode or inspect the machine fleet\n\nUsage: agens team [PROMPT]...\n\nArguments:\n  [PROMPT]...  An optional first prompt for the attached chat\n\nOptions:\n  -h, --help  Print help\n\nFleet operations:\n  ls [--json]                              list the daemon's live runs and chats\n  show <id> [--follow]                     inspect a run or chat, optionally live\n  answer <question-id> <answer>            answer a run's open question\n  answer <chat-id> <prompt-id> <option-id> answer a chat's ask-user question\n  permission <chat-id> <prompt-id> <answer>\n                                           decide a chat's permission prompt\n  merge <approval-question-id>             authorize a merge\n  cancel <id>                              cancel a run or chat\n"
+            "inspect the machine fleet\n\nUsage: agens team [OPERATION]...\n\nArguments:\n  [OPERATION]...  The fleet operation to run; without one, `ls`\n\nOptions:\n  -h, --help  Print help\n\nFleet operations:\n  ls [--json]                              list the daemon's live runs and chats\n  show <id> [--follow]                     inspect a run or chat, optionally live\n  answer <question-id> <answer>            answer a run's open question\n  answer <chat-id> <prompt-id> <option-id> answer a chat's ask-user question\n  permission <chat-id> <prompt-id> <answer>\n                                           decide a chat's permission prompt\n  merge <approval-question-id>             authorize a merge\n  cancel <id>                              cancel a run or chat\n"
         )
     );
-    assert_eq!(*starts.lock().expect("start count lock"), 1);
+    // An explicit attach reuses whatever daemon is there; it never starts one.
+    assert_eq!(*starts.lock().expect("start count lock"), 0);
 }
 
 #[test]
@@ -363,13 +359,17 @@ fn a_mistyped_fleet_operation_is_a_usage_error_not_a_chat() {
     });
 
     let mistyped: &[&[&str]] = &[
-        // A flag the parser swallowed into the prompt, like `agens team --local ls`.
+        // A flag the parser swallowed into the operation, like `agens team --local ls`.
         &["team", "--local", "ls"],
         &["team", "--json"],
         // A fleet verb with the wrong arity.
         &["team", "ls", "extra"],
         &["team", "show"],
         &["team", "show", "17", "--follow", "extra"],
+        // The retired chat door: a prompt-looking tail is a mistyped fleet
+        // operation now, never an attached chat.
+        &["team", "coordinate", "this"],
+        &["team", "chat"],
     ];
 
     for argv in mistyped {
@@ -387,6 +387,44 @@ fn a_mistyped_fleet_operation_is_a_usage_error_not_a_chat() {
     }
 }
 
+/// `--resume`, `--local` and `--attach` configure the chat that bare `agens`
+/// opens. Next to a subcommand they used to parse and then be silently
+/// ignored; an invocation that says two things at once is refused instead.
+#[test]
+fn root_chat_flags_take_no_subcommand() {
+    let temporary = TemporaryDirectory::new("root-flags-no-subcommand");
+    let dependencies = base_dependencies(&temporary)
+        .with_tui_launcher(|_, _| panic!("a refused shape never launches the TUI"));
+
+    let cases: &[(&[&str], &str, &str)] = &[
+        (&["--local", "models"], "--local", "models"),
+        (&["--local", "chat", "hi"], "--local", "chat"),
+        (&["--attach", "sessions", "list"], "--attach", "sessions"),
+        (&["--attach", "team", "ls"], "--attach", "team"),
+        (
+            &["--resume", "42", "models"],
+            "--resume [<SESSION_ID>]",
+            "models",
+        ),
+        (&["--local", "version"], "--local", "version"),
+    ];
+
+    for (argv, flag, subcommand) in cases {
+        let result = execute(argv.iter().copied(), &dependencies);
+
+        assert_eq!(
+            result,
+            preformatted_failure(
+                ExitStatus::Usage,
+                format!(
+                    "error: the subcommand '{subcommand}' cannot be used with '{flag}'\n\nUsage: agens [OPTIONS] [COMMAND]\n\nFor more information, try '--help'.\n"
+                ),
+            ),
+            "argv {argv:?} must be refused as a usage error"
+        );
+    }
+}
+
 #[test]
 fn team_ls_reports_an_absent_daemon_without_starting_the_tui() {
     let temporary = TemporaryDirectory::new("team-ls-no-daemon");
@@ -394,6 +432,12 @@ fn team_ls_reports_an_absent_daemon_without_starting_the_tui() {
         panic!("team ls is a non-interactive fleet command, not a TUI launch")
     });
 
+    // Bare `agens team` is `team ls`: the command's identity is inspecting
+    // the fleet, and the chat has exactly one door, bare `agens`.
+    assert_eq!(
+        execute(["team"], &dependencies),
+        success("No daemon is running.\n")
+    );
     assert_eq!(
         execute(["team", "ls"], &dependencies),
         success("No daemon is running.\n")
@@ -1193,7 +1237,7 @@ fn table_a_models_and_sessions_hold() {
 mod parser_surface_baseline {
     pub(crate) const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-    pub(crate) const ROOT_HELP: &str = "Agens is a coding agent CLI\n\nUsage: agens [OPTIONS] [COMMAND]\n\nCommands:\n  config    inspect configuration\n  auth      inspect supported authentication\n  chat      run a headless agent turn\n  models    list provider models\n  attach    attach the terminal to a chat in the machine daemon\n  team      enter team mode or inspect the machine fleet\n  serve     run the headless daemon for this machine\n  sessions  inspect completed turns\n  direct    queue a message for a running session, delivered at its next safe point\n\nOptions:\n      --resume [<SESSION_ID>]  Resume the most recent session, or the given session id\n      --local                  Run the turn in this process\n      --attach                 Run the turn in the machine's daemon\n  -h, --help                   Print help\n  -V, --version                Print version\n";
+    pub(crate) const ROOT_HELP: &str = "Agens is a coding agent CLI\n\nUsage: agens [OPTIONS] [COMMAND]\n\nCommands:\n  config    inspect configuration\n  auth      inspect supported authentication\n  chat      run a headless agent turn\n  models    list provider models\n  attach    attach the terminal to a chat in the machine daemon\n  team      inspect the machine fleet\n  serve     run the headless daemon for this machine\n  sessions  inspect completed turns\n  direct    queue a message for a running session, delivered at its next safe point\n\nOptions:\n      --resume [<SESSION_ID>]  Resume the most recent session, or the given session id\n      --local                  Run the turn in this process\n      --attach                 Run the turn in the machine's daemon\n  -h, --help                   Print help\n  -V, --version                Print version\n";
 
     pub(crate) fn version_line() -> String {
         format!("agens {VERSION}\n")
