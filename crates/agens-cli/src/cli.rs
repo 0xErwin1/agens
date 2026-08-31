@@ -74,7 +74,7 @@ pub(crate) enum Command {
         target: Option<i64>,
     },
     #[command(
-        about = "enter team mode or inspect the machine fleet",
+        about = "inspect the machine fleet",
         after_help = "Fleet operations:\n  \
             ls [--json]                              list the daemon's live runs and chats\n  \
             show <id> [--follow]                     inspect a run or chat, optionally live\n  \
@@ -85,9 +85,9 @@ pub(crate) enum Command {
             cancel <id>                              cancel a run or chat"
     )]
     Team {
-        /// An optional first prompt for the attached chat
+        /// The fleet operation to run; without one, `ls`
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        prompt: Vec<String>,
+        operation: Vec<String>,
     },
     #[command(about = "run the headless daemon for this machine")]
     Serve {

@@ -53,58 +53,44 @@ pub(crate) fn dispatch(
             None,
             None,
         ),
-        Some(cli::Command::Team { prompt })
-            if prompt.first().is_some_and(|action| {
+        // Bare `agens team` is `team ls`: the command's identity is
+        // inspecting the fleet, and the chat has exactly one door, bare
+        // `agens`.
+        Some(cli::Command::Team { operation }) if operation.is_empty() => {
+            run_team_ls(false, dependencies)
+        }
+        Some(cli::Command::Team { operation })
+            if operation.first().is_some_and(|action| {
                 matches!(
                     action.as_str(),
                     "answer" | "permission" | "merge" | "cancel"
                 )
             }) =>
         {
-            run_team_action(&prompt, dependencies)
+            run_team_action(&operation, dependencies)
         }
-        Some(cli::Command::Team { prompt })
-            if matches!(prompt.as_slice(), [action] if action == "ls")
-                || matches!(prompt.as_slice(), [action, json] if action == "ls" && json == "--json") =>
+        Some(cli::Command::Team { operation })
+            if matches!(operation.as_slice(), [action] if action == "ls")
+                || matches!(operation.as_slice(), [action, json] if action == "ls" && json == "--json") =>
         {
             run_team_ls(
-                matches!(prompt.as_slice(), [_, json] if json == "--json"),
+                matches!(operation.as_slice(), [_, json] if json == "--json"),
                 dependencies,
             )
         }
-        Some(cli::Command::Team { prompt })
-            if matches!(prompt.as_slice(), [action, _] if action == "show")
-                || matches!(prompt.as_slice(), [action, _, follow] if action == "show" && follow == "--follow") =>
+        Some(cli::Command::Team { operation })
+            if matches!(operation.as_slice(), [action, _] if action == "show")
+                || matches!(operation.as_slice(), [action, _, follow] if action == "show" && follow == "--follow") =>
         {
             run_team_show(
-                &prompt[1],
-                matches!(prompt.as_slice(), [_, _, follow] if follow == "--follow"),
+                &operation[1],
+                matches!(operation.as_slice(), [_, _, follow] if follow == "--follow"),
                 dependencies,
             )
         }
-        // A first token that looks like a flag, or a fleet verb whose
-        // arguments did not match any accepted form, is a mistyped fleet
-        // operation. Opening a chat with it as the prompt would silently
-        // swallow the mistake, so it is refused instead. A prompt whose first
-        // token is a plain word stays a chat prompt on purpose.
-        Some(cli::Command::Team { prompt })
-            if prompt.first().is_some_and(|first| {
-                first.starts_with('-')
-                    || matches!(
-                        first.as_str(),
-                        "ls" | "show" | "answer" | "permission" | "merge" | "cancel"
-                    )
-            }) =>
-        {
-            Err(CliError::usage(team::FLEET_USAGE))
-        }
-        Some(cli::Command::Team { prompt }) => run_tui(
-            dependencies,
-            None,
-            crate::tui::TuiMode::Attached,
-            (!prompt.is_empty()).then(|| prompt.join(" ")),
-            Some(serve::DaemonStartupRequest::ExplicitAttached),
-        ),
+        // Anything else is a mistyped fleet operation and is refused with
+        // the accepted forms; team never opens a chat.
+        Some(cli::Command::Team { .. }) => Err(CliError::usage(team::FLEET_USAGE)),
         Some(cli::Command::Serve { foreground, action }) => {
             run_serve(foreground, action, dependencies, cancellation)
         }

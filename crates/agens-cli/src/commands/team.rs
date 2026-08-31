@@ -19,8 +19,8 @@ use crate::deps::bootstrap;
 
 const LIVE_RUN_STATES: &[&str] = &["queued", "running", "awaiting_input", "awaiting_quota"];
 
-/// Every fleet form `agens team` accepts, for the usage error a mistyped one
-/// gets instead of being opened as a chat prompt.
+/// Every fleet form `agens team` accepts, for the usage error anything
+/// else gets.
 pub(crate) const FLEET_USAGE: &str = "team fleet operations are `ls [--json]`, \
     `show <id> [--follow]`, `answer <question-id> <answer>`, \
     `answer <chat-id> <prompt-id> <option-id>`, \
