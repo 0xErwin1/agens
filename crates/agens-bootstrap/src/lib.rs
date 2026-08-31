@@ -336,6 +336,96 @@ pub fn resolve(host: &HostEnvironment) -> Result<Bootstrap, CliError> {
     })
 }
 
+/// The configuration sections an attached launch may consume: where the
+/// daemon lives (`options`) and how this terminal renders (`ui`).
+///
+/// Everything else — the model, permission rules, MCP servers, credentials —
+/// is the daemon's to resolve for itself, exactly as a remote server's
+/// configuration would be. Keeping those sections out of the attached
+/// document, rather than merely unvalidated, is what guarantees no attached
+/// code path can read a local value the daemon never saw.
+const ATTACHED_SECTIONS: [&str; 2] = ["options", "ui"];
+
+/// Resolves only what an attached launch needs: the data directory the
+/// daemon's socket lives under, the project root a chat is opened for, and
+/// this terminal's render preferences.
+///
+/// A configuration the full [`resolve`] would refuse — a broken model
+/// string, a malformed `[mcp]` section, a bogus permission rule, an
+/// unreadable credentials file — must not stop an attach, because the daemon
+/// being attached to never consumed any of it. Only a configuration file
+/// whose TOML cannot be parsed at all still fails, since the daemon's own
+/// location (`options.data_dir`) is unreadable then too.
+pub fn resolve_attached(host: &HostEnvironment) -> Result<Bootstrap, CliError> {
+    let current_directory = (host.current_directory)()?;
+    let home_directory = (host.home_directory)();
+    let environment = (host.environment)();
+    let project_root = discover_project_root(&current_directory);
+    let config_root = project_root.as_deref().unwrap_or(&current_directory);
+    let paths = resolve_paths(config_root, home_directory.as_deref(), &environment);
+
+    let (global, global_loaded) = load_attached_sections(&paths.global_config, "global", host)?;
+    let (project, project_loaded) = load_attached_sections(&paths.project_config, "project", host)?;
+
+    let document = merge_toml_documents(global.clone(), project.clone());
+    let document = expand_document(document, &environment)?;
+    let settings = resolve_settings(&global, &project, &document);
+
+    Ok(Bootstrap {
+        model: None,
+        environment: environment.clone(),
+        max_iterations: None,
+        parallel_tool_calls: true,
+        collapse_thinking: settings.boolean("ui.collapse_thinking").unwrap_or(false),
+        debug: settings.boolean("options.debug").unwrap_or(true),
+        default_agent: None,
+        reasoning_effort: None,
+        tool_limits: ToolLimitSettings::from(&settings),
+        subagent_limits: SubagentSettings::from(&settings),
+        unattended_permission: UnattendedPermissionSettings::from(&settings),
+        mcp_defaults: McpDefaultSettings::from(&settings),
+        settings,
+        data_directory: data_directory(&document, home_directory.as_deref(), &environment),
+        project_root,
+        mcp_servers: Vec::new(),
+        mcp_status: McpStatusHandle::default(),
+        mcp_registry: SharedMcpRegistry::default(),
+        permission_rules: Vec::new(),
+        config_reader: Arc::clone(&host.read_file),
+        paths,
+        global_loaded,
+        project_loaded,
+    })
+}
+
+/// Reads a configuration document and keeps only [`ATTACHED_SECTIONS`].
+///
+/// No `validate_toml_document` on purpose: validation is a statement about
+/// configuration the daemon consumes, and an attached client refusing to
+/// start over a section it will never read would fail launches the daemon
+/// itself is serving fine.
+fn load_attached_sections(
+    path: &Path,
+    scope: &str,
+    host: &HostEnvironment,
+) -> Result<(toml::Table, bool), CliError> {
+    let Some(contents) = (host.read_file)(path)? else {
+        return Ok((toml::Table::new(), false));
+    };
+
+    let document = parse_toml_document(&contents)
+        .map_err(|_| CliError::configuration(format!("{scope} configuration is invalid")))?;
+
+    let mut pruned = toml::Table::new();
+    for section in ATTACHED_SECTIONS {
+        if let Some(value) = document.get(section) {
+            pruned.insert(section.to_owned(), value.clone());
+        }
+    }
+
+    Ok((pruned, true))
+}
+
 pub fn discover_project_root(current_directory: &Path) -> Option<PathBuf> {
     let mut current = fs::canonicalize(current_directory).ok()?;
 
@@ -577,11 +667,105 @@ pub fn discover_skill_catalog(
 
 #[cfg(test)]
 mod tests {
-    use super::{HostEnvironment, provider_api_key};
+    use super::{HostEnvironment, provider_api_key, resolve, resolve_attached};
     use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
+    use agens_error::CliError;
     use agens_tools::McpRegistry;
+
+    /// A host whose global configuration is `config`, resolved under a fixed
+    /// config home. `credentials_unavailable` makes the credentials file
+    /// refuse to be read, the way a permission error would on a real machine.
+    fn fixture_host(config: String, credentials_unavailable: bool) -> HostEnvironment {
+        let environment: BTreeMap<String, String> = BTreeMap::from([(
+            "AGENS_CONFIG_HOME".to_owned(),
+            "/fixture/config".to_owned(),
+        )]);
+
+        HostEnvironment {
+            current_directory: Box::new(|| Ok(PathBuf::from("/"))),
+            home_directory: Box::new(|| None),
+            environment: Box::new(move || environment.clone()),
+            read_file: Arc::new(move |path| {
+                if path == Path::new("/fixture/config/config.toml") {
+                    return Ok(Some(config.clone()));
+                }
+                if path == Path::new("/fixture/config/auth.json") {
+                    if credentials_unavailable {
+                        return Err(CliError::configuration(
+                            "configuration file is unavailable",
+                        ));
+                    }
+                    return Ok(Some("{}".to_owned()));
+                }
+                Ok(None)
+            }),
+        }
+    }
+
+    const RENDER_SECTIONS: &str =
+        "[options]\ndata_dir = \"/fixture/data\"\n\n[ui]\ncollapse_thinking = true\n";
+
+    #[test]
+    fn attached_resolution_survives_configuration_only_the_daemon_consumes() {
+        let broken = [
+            (
+                "invalid model string",
+                format!("{RENDER_SECTIONS}\n[provider]\nmodel = \"unknown-provider/gpt-4.1\"\n"),
+                false,
+            ),
+            (
+                "malformed mcp section",
+                format!("{RENDER_SECTIONS}\n[mcp.broken]\ntransport = \"stdio\"\n"),
+                false,
+            ),
+            (
+                "bogus permission rule",
+                format!("{RENDER_SECTIONS}\n[permissions]\nallow = [true]\n"),
+                false,
+            ),
+            (
+                "unreadable credentials",
+                RENDER_SECTIONS.to_owned(),
+                true,
+            ),
+        ];
+
+        for (name, config, credentials_unavailable) in broken {
+            let host = fixture_host(config, credentials_unavailable);
+
+            resolve(&host)
+                .map(|_| ())
+                .expect_err("the full local bootstrap must keep refusing this configuration");
+
+            let bootstrap = resolve_attached(&host)
+                .unwrap_or_else(|error| panic!("{name} must not stop an attach: {error:?}"));
+
+            assert_eq!(bootstrap.data_directory(), Path::new("/fixture/data"));
+            assert!(bootstrap.collapse_thinking, "{name}: render preference lost");
+        }
+    }
+
+    #[test]
+    fn attached_resolution_does_not_carry_daemon_owned_configuration() {
+        let config = concat!(
+            "[provider]\nmodel = \"openai-api/gpt-4.1\"\n\n",
+            "[permissions]\nallow = [\"read\"]\n\n",
+            "[mcp.echo]\ncommand = \"echo\"\n\n",
+            "[agent]\ndefault_agent = \"build\"\n",
+        );
+        let host = fixture_host(config.to_owned(), false);
+
+        let bootstrap = resolve_attached(&host).expect("a valid configuration resolves");
+
+        assert_eq!(bootstrap.model(), None);
+        assert!(bootstrap.mcp_servers.is_empty());
+        assert!(bootstrap.permission_rules().is_empty());
+        assert_eq!(bootstrap.settings().text("provider.model"), None);
+        assert_eq!(bootstrap.default_agent(), None);
+    }
 
     fn environment(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
         pairs
