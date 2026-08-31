@@ -12,11 +12,13 @@ use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Padding, Paragraph},
+    widgets::{Block, Borders, Clear, Padding, Paragraph},
 };
 
-use super::model::{TeamEventClass, TeamNode, TeamNodeDetail, TeamNodeKind, TeamState};
-use super::{TeamRow, TeamSurface, TeamTab};
+use super::model::{
+    TeamEventClass, TeamInboxItem, TeamNode, TeamNodeDetail, TeamNodeKind, TeamState,
+};
+use super::{AnswerPrompt, TeamRow, TeamSurface, TeamTab};
 use crate::widgets::{ColorLevel, UnicodeLevel, quantize_buffer};
 
 /// How wide the tree is against the context panel beside it.
@@ -83,9 +85,82 @@ fn render_team(frame: &mut Frame<'_>, surface: &TeamSurface, level: UnicodeLevel
     frame.render_widget(tab_line(surface.tab()), tabs);
     render_body(frame, surface, level, body);
     frame.render_widget(footer_line(level), footer);
+
+    if let Some(prompt) = surface.answering() {
+        render_answer_prompt(frame, prompt, level, area);
+    }
+}
+
+/// The answer prompt, over whichever view raised it.
+fn render_answer_prompt(
+    frame: &mut Frame<'_>,
+    prompt: &AnswerPrompt,
+    level: UnicodeLevel,
+    area: Rect,
+) {
+    let question = &prompt.question;
+    let height = u16::try_from(question.options.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(6)
+        .min(area.height);
+    let width = area.width.saturating_mul(3) / 4;
+    let modal = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+
+    let mut lines = vec![
+        Line::from(Span::styled(
+            format!("run {} · {}", question.run_id, question.waiting_label()),
+            DIM,
+        )),
+        Line::from(Span::raw(question.blocked_decision.clone())),
+        Line::default(),
+    ];
+    let marker = match level {
+        UnicodeLevel::Extended => "❯",
+        UnicodeLevel::Ascii => ">",
+    };
+    for (index, option) in question.options.iter().enumerate() {
+        let picked = index == prompt.option;
+        let style = if picked {
+            Style::new().add_modifier(Modifier::BOLD)
+        } else {
+            Style::new()
+        };
+        let recommended = question.recommendation.as_deref() == Some(option.as_str());
+        let mut spans = vec![
+            Span::styled(if picked { marker } else { " " }, style),
+            Span::styled(format!(" {option}"), style),
+        ];
+        if recommended {
+            spans.push(Span::styled(" (recommended)", DIM));
+        }
+        lines.push(Line::from(spans));
+    }
+    if question.options.is_empty() {
+        lines.push(Line::from(Span::styled("no options were offered", DIM)));
+    }
+
+    frame.render_widget(Clear, modal);
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .padding(Padding::horizontal(1))
+                .title(format!(" answer question {} ", question.question_id)),
+        ),
+        modal,
+    );
 }
 
 fn render_body(frame: &mut Frame<'_>, surface: &TeamSurface, level: UnicodeLevel, body: Rect) {
+    if surface.tab() == TeamTab::Inbox {
+        frame.render_widget(inbox_pane(surface, level), body);
+        return;
+    }
     if surface.is_expanded() {
         frame.render_widget(detail_pane(surface, level, true), body);
         return;
@@ -127,6 +202,17 @@ fn header_line(surface: &TeamSurface) -> Paragraph<'static> {
         ));
     }
 
+    let waiting = surface.snapshot().inbox.len();
+    if waiting > 0 {
+        spans.push(Span::styled(
+            format!("  inbox {waiting} "),
+            Style::new()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
     Paragraph::new(Line::from(spans))
 }
 
@@ -157,7 +243,7 @@ fn footer_line(level: UnicodeLevel) -> Paragraph<'static> {
     };
 
     Paragraph::new(Line::from(Span::styled(
-        format!(" {arrows} move   {enter} detail   0 chat   esc back "),
+        format!(" {arrows} move   {enter} detail   a answer   0 chat   esc back "),
         DIM,
     )))
 }
@@ -197,6 +283,68 @@ fn tree_pane<'a>(surface: &'a TeamSurface, level: UnicodeLevel) -> Paragraph<'a>
     }
 
     Paragraph::new(lines).block(block)
+}
+
+/// Every question the fleet is stopped on, in the order the daemon reports.
+fn inbox_pane<'a>(surface: &'a TeamSurface, level: UnicodeLevel) -> Paragraph<'a> {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .padding(Padding::horizontal(1))
+        .title(" inbox ");
+    let items = &surface.snapshot().inbox;
+
+    if items.is_empty() {
+        return Paragraph::new(Line::from(Span::styled("nothing is waiting on you", DIM)))
+            .block(block);
+    }
+
+    let marker = match level {
+        UnicodeLevel::Extended => "❯",
+        UnicodeLevel::Ascii => ">",
+    };
+    let mut lines = Vec::new();
+    for (index, item) in items.iter().enumerate() {
+        let selected = index == surface.inbox_selected();
+        lines.extend(inbox_lines(item, selected, marker));
+    }
+
+    Paragraph::new(lines).block(block)
+}
+
+fn inbox_lines(item: &TeamInboxItem, selected: bool, marker: &str) -> Vec<Line<'static>> {
+    let style = if selected {
+        Style::new().add_modifier(Modifier::BOLD)
+    } else {
+        Style::new()
+    };
+    let mut heading = vec![
+        Span::styled(format!("{} ", if selected { marker } else { " " }), style),
+        Span::styled(
+            item.waiting_label().to_owned(),
+            Style::new().fg(Color::Yellow),
+        ),
+        Span::styled(format!(" · run {} ", item.run_id), DIM),
+    ];
+    if let Some(age) = item.age {
+        heading.push(Span::styled(
+            format!("· waiting {}", super::format_duration(age)),
+            DIM,
+        ));
+    }
+
+    let mut lines = vec![
+        Line::from(heading),
+        Line::from(Span::styled(format!("   {}", item.blocked_decision), style)),
+    ];
+    if !item.options.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!("   {}", item.options.join(" | ")),
+            DIM,
+        )));
+    }
+    lines.push(Line::default());
+
+    lines
 }
 
 /// One node as the two lines it occupies: what it is, and how it is going.

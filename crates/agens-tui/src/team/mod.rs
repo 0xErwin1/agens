@@ -13,8 +13,9 @@ mod model;
 mod render;
 
 pub use model::{
-    TeamAttempt, TeamEvent, TeamEventClass, TeamNode, TeamNodeDetail, TeamNodeKind, TeamQuestion,
-    TeamRepo, TeamSnapshot, TeamState, format_cost, format_duration,
+    TeamAttempt, TeamEvent, TeamEventClass, TeamInboxItem, TeamNode, TeamNodeDetail, TeamNodeKind,
+    TeamQuestion, TeamRepo, TeamSnapshot, TeamState, format_cost, format_duration,
+    waiting_label_for_kind,
 };
 pub use render::TeamScreen;
 
@@ -29,16 +30,70 @@ use crate::Key;
 pub enum TeamTab {
     #[default]
     Tree,
+    Inbox,
 }
 
 impl TeamTab {
     /// The tabs in the order the header shows them, the chat included.
-    pub(crate) const HEADER: [(u8, &'static str); 2] = [(0, "chat"), (1, "tree")];
+    pub(crate) const HEADER: [(u8, &'static str); 3] = [(0, "chat"), (1, "tree"), (2, "inbox")];
 
     pub(crate) const fn digit(self) -> u8 {
         match self {
             Self::Tree => 1,
+            Self::Inbox => 2,
         }
+    }
+}
+
+/// An answer the reader composed, for the host to deliver.
+///
+/// The surface never writes to a run. It says which question was answered and
+/// with what, and whether that answer authorizes a merge or answers a question,
+/// because those are different calls on the daemon.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TeamAnswer {
+    pub question_id: i64,
+    pub run_id: i64,
+    pub kind: String,
+    pub answer: String,
+}
+
+impl TeamAnswer {
+    #[must_use]
+    pub fn is_approval(&self) -> bool {
+        self.kind == "approval"
+    }
+}
+
+/// The open answer prompt: one question, and which of its options is picked.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AnswerPrompt {
+    pub(crate) question: TeamInboxItem,
+    pub(crate) option: usize,
+}
+
+impl AnswerPrompt {
+    fn new(question: TeamInboxItem) -> Self {
+        Self {
+            question,
+            option: 0,
+        }
+    }
+
+    fn step(&mut self, delta: isize) {
+        let last = self.question.options.len().saturating_sub(1);
+        self.option = self.option.saturating_add_signed(delta).min(last);
+    }
+
+    fn answer(&self) -> Option<TeamAnswer> {
+        let answer = self.question.options.get(self.option)?;
+
+        Some(TeamAnswer {
+            question_id: self.question.question_id,
+            run_id: self.question.run_id,
+            kind: self.question.kind.clone(),
+            answer: answer.clone(),
+        })
     }
 }
 
@@ -54,6 +109,8 @@ pub enum TeamCommand {
     Selected(i64),
     /// Back to the conversation.
     LeaveToChat,
+    /// The reader answered a question the fleet was stopped on.
+    Answer(TeamAnswer),
 }
 
 /// One row of the tree as it is drawn: a repository header, or a node under it.
@@ -74,6 +131,10 @@ pub struct TeamSurface {
     detail: Option<TeamNodeDetail>,
     /// Whether the detail owns the whole frame instead of the context panel.
     expanded: bool,
+    /// Which inbox row the reader is standing on.
+    inbox_selected: usize,
+    /// The open answer prompt, which any view can raise.
+    answering: Option<AnswerPrompt>,
 }
 
 impl TeamSurface {
@@ -87,6 +148,8 @@ impl TeamSurface {
             selected,
             detail: None,
             expanded: false,
+            inbox_selected: 0,
+            answering: None,
         }
     }
 
@@ -101,6 +164,9 @@ impl TeamSurface {
         if kept != self.selected {
             self.detail = None;
         }
+        self.inbox_selected = self
+            .inbox_selected
+            .min(snapshot.inbox.len().saturating_sub(1));
         self.snapshot = snapshot;
         self.selected = kept;
     }
@@ -125,6 +191,15 @@ impl TeamSurface {
     }
 
     #[must_use]
+    pub const fn inbox_selected(&self) -> usize {
+        self.inbox_selected
+    }
+
+    pub(crate) const fn answering(&self) -> Option<&AnswerPrompt> {
+        self.answering.as_ref()
+    }
+
+    #[must_use]
     pub const fn tab(&self) -> TeamTab {
         self.tab
     }
@@ -145,16 +220,69 @@ impl TeamSurface {
     }
 
     /// Applies one key press.
+    ///
+    /// An open answer prompt owns the keyboard: it is the one thing on this
+    /// surface that writes anywhere, so no key reaches the board behind it.
     pub fn handle_key(&mut self, key: Key) -> TeamCommand {
+        if self.answering.is_some() {
+            return self.answer_key(key);
+        }
+
         match key {
             Key::Up | Key::CtrlK => self.step(-1),
             Key::Down | Key::CtrlJ => self.step(1),
             Key::Enter => self.toggle_expanded(),
+            Key::Char('a') => self.open_answer(),
             Key::Escape if self.expanded => self.toggle_expanded(),
             Key::Char('0') | Key::Escape => TeamCommand::LeaveToChat,
             Key::Char('1') => self.show(TeamTab::Tree),
+            Key::Char('2') => self.show(TeamTab::Inbox),
             _ => TeamCommand::Ignored,
         }
+    }
+
+    fn answer_key(&mut self, key: Key) -> TeamCommand {
+        let Some(prompt) = self.answering.as_mut() else {
+            return TeamCommand::Ignored;
+        };
+
+        match key {
+            Key::Up | Key::CtrlK => {
+                prompt.step(-1);
+                TeamCommand::Handled
+            }
+            Key::Down | Key::CtrlJ => {
+                prompt.step(1);
+                TeamCommand::Handled
+            }
+            Key::Enter => match prompt.answer() {
+                Some(answer) => {
+                    self.answering = None;
+                    TeamCommand::Answer(answer)
+                }
+                None => TeamCommand::Ignored,
+            },
+            Key::Escape => {
+                self.answering = None;
+                TeamCommand::Handled
+            }
+            _ => TeamCommand::Ignored,
+        }
+    }
+
+    /// Raises the answer prompt for whatever the current view is pointing at:
+    /// the selected inbox row, or the question the selected node is parked on.
+    fn open_answer(&mut self) -> TeamCommand {
+        let question = match self.tab {
+            TeamTab::Inbox => self.snapshot.inbox.get(self.inbox_selected),
+            TeamTab::Tree => self.selected.and_then(|id| self.snapshot.question_for(id)),
+        };
+        let Some(question) = question.cloned() else {
+            return TeamCommand::Ignored;
+        };
+
+        self.answering = Some(AnswerPrompt::new(question));
+        TeamCommand::Handled
     }
 
     /// Opens or closes the full-frame detail of the selected node.
@@ -175,6 +303,10 @@ impl TeamSurface {
     /// Moves the selection by whole nodes, ignoring the repository headers
     /// between them, and stops at both ends rather than wrapping.
     fn step(&mut self, delta: isize) -> TeamCommand {
+        if self.tab == TeamTab::Inbox {
+            return self.step_inbox(delta);
+        }
+
         let ids: Vec<i64> = self
             .snapshot
             .repos
@@ -209,6 +341,18 @@ impl TeamSurface {
         self.selected = Some(*id);
         self.detail = None;
         TeamCommand::Selected(*id)
+    }
+
+    fn step_inbox(&mut self, delta: isize) -> TeamCommand {
+        if self.snapshot.inbox.is_empty() {
+            return TeamCommand::Ignored;
+        }
+
+        self.inbox_selected = self
+            .inbox_selected
+            .saturating_add_signed(delta)
+            .min(self.snapshot.inbox.len() - 1);
+        TeamCommand::Handled
     }
 
     /// The rows the tree draws, repository headers included.
@@ -246,6 +390,7 @@ mod tests {
 
     fn fleet() -> TeamSnapshot {
         TeamSnapshot {
+            inbox: Vec::new(),
             repos: vec![
                 TeamRepo {
                     id: "agens".to_owned(),
@@ -301,6 +446,7 @@ mod tests {
         surface.handle_key(Key::Down);
 
         surface.refresh(TeamSnapshot {
+            inbox: Vec::new(),
             repos: vec![TeamRepo {
                 id: "agens".to_owned(),
                 nodes: vec![TeamNode::run(11, "ship the api", TeamState::Running)],

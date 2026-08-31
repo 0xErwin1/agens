@@ -272,6 +272,8 @@ pub struct TeamRepo {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TeamSnapshot {
     pub repos: Vec<TeamRepo>,
+    /// Every question open across the whole fleet, newest last.
+    pub inbox: Vec<TeamInboxItem>,
 }
 
 impl TeamSnapshot {
@@ -286,6 +288,12 @@ impl TeamSnapshot {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.repos.iter().all(|repo| repo.nodes.is_empty())
+    }
+
+    /// The open question addressed to one node, when there is one.
+    #[must_use]
+    pub fn question_for(&self, run_id: i64) -> Option<&TeamInboxItem> {
+        self.inbox.iter().find(|item| item.run_id == run_id)
     }
 }
 
@@ -317,11 +325,53 @@ impl TeamQuestion {
     /// What the question is asking for, in the words the fleet console uses.
     #[must_use]
     pub fn waiting_label(&self) -> &'static str {
-        if self.kind == "approval" {
-            "merge authorization"
-        } else {
-            "question"
-        }
+        waiting_label_for_kind(&self.kind)
+    }
+}
+
+/// What a question of this class is asking for.
+///
+/// The daemon classes a question as `approval` or as anything else, and the
+/// difference matters to the reader: one authorizes a merge, the other answers
+/// a question. Shared so the terminal and the fleet console name it identically.
+#[must_use]
+pub fn waiting_label_for_kind(kind: &str) -> &'static str {
+    if kind == "approval" {
+        "merge authorization"
+    } else {
+        "question"
+    }
+}
+
+/// One question the fleet is stopped on, addressed to whoever is watching.
+///
+/// Questions are born at runtime: nothing declares them in advance, so the
+/// inbox is whatever the daemon reports open right now.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TeamInboxItem {
+    pub repo_id: String,
+    pub run_id: i64,
+    pub question_id: i64,
+    /// "question" or "approval", as the daemon classes it.
+    pub kind: String,
+    pub blocked_decision: String,
+    pub options: Vec<String>,
+    pub recommendation: Option<String>,
+    /// How long it has been waiting, when the reading carries a clock.
+    pub age: Option<Duration>,
+}
+
+impl TeamInboxItem {
+    #[must_use]
+    pub fn waiting_label(&self) -> &'static str {
+        waiting_label_for_kind(&self.kind)
+    }
+
+    /// Whether answering this authorizes a merge rather than answering a
+    /// question, which is a different call on the daemon.
+    #[must_use]
+    pub fn is_approval(&self) -> bool {
+        self.kind == "approval"
     }
 }
 

@@ -3,8 +3,8 @@
 use std::time::Duration;
 
 use agens_tui::team::{
-    TeamAttempt, TeamEvent, TeamEventClass, TeamNode, TeamNodeDetail, TeamQuestion, TeamRepo,
-    TeamScreen, TeamSnapshot, TeamState, TeamSurface,
+    TeamAnswer, TeamAttempt, TeamCommand, TeamEvent, TeamEventClass, TeamInboxItem, TeamNode,
+    TeamNodeDetail, TeamQuestion, TeamRepo, TeamScreen, TeamSnapshot, TeamState, TeamSurface,
 };
 use agens_tui::{ColorLevel, Key, UnicodeLevel};
 use ratatui::{Terminal, backend::TestBackend};
@@ -37,6 +37,7 @@ fn rendered(screen: &TeamScreen<TestBackend>) -> String {
 
 fn fleet() -> TeamSnapshot {
     TeamSnapshot {
+        inbox: Vec::new(),
         repos: vec![
             TeamRepo {
                 id: "agens".to_owned(),
@@ -318,4 +319,167 @@ fn an_empty_fleet_says_the_daemon_holds_nothing_rather_than_drawing_a_blank() {
 
     assert!(text.contains("the daemon holds no runs or chats"), "{text}");
     assert!(text.contains("nothing selected"), "{text}");
+}
+
+fn inbox() -> Vec<TeamInboxItem> {
+    vec![
+        TeamInboxItem {
+            repo_id: "agens".to_owned(),
+            run_id: 12,
+            question_id: 5,
+            kind: "approval".to_owned(),
+            blocked_decision: "merge the branch".to_owned(),
+            options: vec!["merge".to_owned(), "reject".to_owned()],
+            recommendation: Some("merge".to_owned()),
+            age: Some(Duration::from_secs(240)),
+        },
+        TeamInboxItem {
+            repo_id: "agens".to_owned(),
+            run_id: 13,
+            question_id: 6,
+            kind: "question".to_owned(),
+            blocked_decision: "which store to port first".to_owned(),
+            options: vec!["sessions".to_owned(), "questions".to_owned()],
+            recommendation: None,
+            age: Some(Duration::from_secs(30)),
+        },
+    ]
+}
+
+fn fleet_with_inbox() -> TeamSnapshot {
+    TeamSnapshot {
+        inbox: inbox(),
+        ..fleet()
+    }
+}
+
+#[test]
+fn the_header_badges_how_many_answers_the_fleet_is_waiting_for() {
+    let mut screen = screen(100, 30);
+    let surface = TeamSurface::new(fleet_with_inbox());
+
+    screen.draw(&surface).expect("the board draws");
+    let header = rendered(&screen)
+        .lines()
+        .next()
+        .expect("the header is drawn")
+        .to_owned();
+
+    assert!(header.contains("inbox 2"), "{header}");
+}
+
+#[test]
+fn an_empty_inbox_badges_nothing_rather_than_a_zero() {
+    let mut screen = screen(100, 30);
+    let surface = TeamSurface::new(fleet());
+
+    screen.draw(&surface).expect("the board draws");
+    let header = rendered(&screen)
+        .lines()
+        .next()
+        .expect("the header is drawn")
+        .to_owned();
+
+    assert!(!header.contains("inbox"), "{header}");
+}
+
+#[test]
+fn the_inbox_tab_lists_every_question_with_the_decision_it_blocks() {
+    let mut screen = screen(100, 30);
+    let mut surface = TeamSurface::new(fleet_with_inbox());
+    surface.handle_key(Key::Char('2'));
+
+    screen.draw(&surface).expect("the board draws");
+    let text = rendered(&screen);
+
+    assert!(text.contains("[2 inbox]"), "{text}");
+    assert!(text.contains("merge authorization"), "{text}");
+    assert!(text.contains("merge the branch"), "{text}");
+    assert!(text.contains("which store to port first"), "{text}");
+    assert!(text.contains("run 12"), "{text}");
+    assert!(text.contains("merge | reject"), "{text}");
+}
+
+#[test]
+fn an_empty_inbox_says_so_instead_of_drawing_a_blank_pane() {
+    let mut screen = screen(100, 30);
+    let mut surface = TeamSurface::new(fleet());
+    surface.handle_key(Key::Char('2'));
+
+    screen.draw(&surface).expect("the board draws");
+
+    assert!(
+        rendered(&screen).contains("nothing is waiting on you"),
+        "{}",
+        rendered(&screen)
+    );
+}
+
+#[test]
+fn answering_opens_from_the_tree_on_the_question_the_selected_node_is_parked_on() {
+    let mut screen = screen(100, 30);
+    let mut surface = TeamSurface::new(fleet_with_inbox());
+    surface.handle_key(Key::Down);
+
+    assert_eq!(surface.handle_key(Key::Char('a')), TeamCommand::Handled);
+    screen.draw(&surface).expect("the board draws");
+    let text = rendered(&screen);
+
+    assert!(text.contains("answer question 5"), "{text}");
+    assert!(text.contains("merge the branch"), "{text}");
+    assert!(text.contains("merge"), "{text}");
+}
+
+#[test]
+fn answering_a_node_with_no_open_question_is_refused_rather_than_guessed_at() {
+    let mut surface = TeamSurface::new(fleet_with_inbox());
+
+    assert_eq!(surface.handle_key(Key::Char('a')), TeamCommand::Ignored);
+}
+
+#[test]
+fn the_chosen_option_is_handed_back_with_the_question_it_answers() {
+    let mut surface = TeamSurface::new(fleet_with_inbox());
+    surface.handle_key(Key::Char('2'));
+    surface.handle_key(Key::Char('a'));
+    surface.handle_key(Key::Down);
+
+    let command = surface.handle_key(Key::Enter);
+
+    assert_eq!(
+        command,
+        TeamCommand::Answer(TeamAnswer {
+            question_id: 5,
+            run_id: 12,
+            kind: "approval".to_owned(),
+            answer: "reject".to_owned(),
+        })
+    );
+}
+
+#[test]
+fn escape_abandons_an_answer_without_sending_one() {
+    let mut surface = TeamSurface::new(fleet_with_inbox());
+    surface.handle_key(Key::Char('2'));
+    surface.handle_key(Key::Char('a'));
+
+    assert_eq!(surface.handle_key(Key::Escape), TeamCommand::Handled);
+    assert_eq!(surface.handle_key(Key::Escape), TeamCommand::LeaveToChat);
+}
+
+#[test]
+fn an_approval_is_recognised_as_a_merge_authorization_and_a_question_is_not() {
+    let merge = TeamAnswer {
+        question_id: 5,
+        run_id: 12,
+        kind: "approval".to_owned(),
+        answer: "merge".to_owned(),
+    };
+    let asked = TeamAnswer {
+        kind: "question".to_owned(),
+        ..merge.clone()
+    };
+
+    assert!(merge.is_approval());
+    assert!(!asked.is_approval());
 }
