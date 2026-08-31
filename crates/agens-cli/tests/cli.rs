@@ -6221,11 +6221,13 @@ fn journey_runs_without_any_real_credential_in_its_environment() {
 /// The operator's one verb for authorizing a repository's provisioning hooks,
 /// which run with the daemon's environment.
 ///
-/// It reaches the same register the daemon reads, and it refuses a checkout the
-/// daemon does not serve: a grant nothing could ever apply is worse than no
-/// grant, because the operator walks away believing hooks will run.
+/// It reaches the same register the daemon reads, and it grants any git
+/// checkout the operator names: runs admit their checkout dynamically, so a
+/// grant against one no configuration ever declared applies to that
+/// repository's next run. What it still refuses is a directory with no
+/// repository behind it, because a grant is keyed on a repository's identity.
 #[test]
-fn serve_trust_grants_a_served_repository_and_refuses_one_outside_the_configured_roots() {
+fn serve_trust_grants_any_git_checkout_and_refuses_a_directory_that_is_not_one() {
     let temporary = TemporaryDirectory::new("serve-trust");
     let config_home = temporary.path().join("config");
     let data_directory = temporary.path().join("data");
@@ -6293,15 +6295,29 @@ fn serve_trust_grants_a_served_repository_and_refuses_one_outside_the_configured
         "the daemon reads a grant, not a message"
     );
 
-    let refused = execute(
+    let undeclared = execute(
         ["serve", "trust", &unserved.display().to_string()],
+        &dependencies,
+    );
+
+    assert_eq!(
+        undeclared.status,
+        ExitStatus::Success,
+        "a checkout no configuration names is granted all the same: {}",
+        undeclared.stderr
+    );
+
+    let plain = temporary.path().join("plain");
+    std::fs::create_dir_all(&plain).expect("the fixture directory should exist");
+    let refused = execute(
+        ["serve", "trust", &plain.display().to_string()],
         &dependencies,
     );
 
     assert_eq!(refused.status, ExitStatus::Configuration);
     assert!(
-        refused.stderr.contains("team.project_roots"),
-        "the refusal names the key that would serve it: {}",
+        refused.stderr.contains("not a git worktree"),
+        "the refusal names what the path is missing: {}",
         refused.stderr
     );
 }

@@ -105,9 +105,7 @@ fn policy_settings(bootstrap: &Bootstrap) -> PolicySettings {
     let team = TeamSettings::from(bootstrap.settings());
 
     PolicySettings {
-        project_roots: team.project_roots,
         hook_exports: team.hook_exports,
-        config_path: Some(bootstrap.paths().global_config.clone()),
     }
 }
 

@@ -400,8 +400,7 @@ async fn wire_forwarding(
     let core = Arc::new(Mutex::new(ApiCore::new(
         StateMachines::new(store),
         ports,
-        Arc::new(PolicyStore::in_memory(vec![repository.clone()], Vec::new()))
-            as Arc<dyn RepositoryPolicy>,
+        Arc::new(PolicyStore::in_memory(Vec::new())) as Arc<dyn RepositoryPolicy>,
     )));
     let blocking = BlockingBoundary::new(tokio::runtime::Handle::current());
     let handle = CoreHandle::new(Arc::clone(&core), blocking, principal);
@@ -1022,7 +1021,7 @@ fn serving_no_address_is_refused_rather_than_treated_as_serving_nothing() {
             sessions: Arc::new(StubSessions),
             feed: Arc::new(StubFeed::default()),
         },
-        Arc::new(PolicyStore::in_memory(Vec::new(), Vec::new())) as Arc<dyn RepositoryPolicy>,
+        Arc::new(PolicyStore::in_memory(Vec::new())) as Arc<dyn RepositoryPolicy>,
     )));
     let blocking = BlockingBoundary::new(runtime.handle().clone());
     let shutdown = HeadlessTurnCancellation::new();
@@ -1055,7 +1054,7 @@ fn the_daemon_serves_the_facade_on_its_socket() {
             sessions: Arc::new(StubSessions),
             feed: Arc::new(StubFeed::default()),
         },
-        Arc::new(PolicyStore::in_memory(Vec::new(), Vec::new())) as Arc<dyn RepositoryPolicy>,
+        Arc::new(PolicyStore::in_memory(Vec::new())) as Arc<dyn RepositoryPolicy>,
     );
 
     let daemon = agens_server::Daemon::start(&directory).unwrap();
@@ -1167,19 +1166,19 @@ async fn a_slow_provisioning_blocks_neither_another_request_nor_the_core() {
     assert!(created.run_id > 0, "the run exists once provisioning ended");
 }
 
-/// A checkout no configured root covers is refused over the wire, with the code
+/// A checkout that resolves to nothing is refused over the wire, with the code
 /// that says the caller may not rather than the one that says try again.
 #[tokio::test]
-async fn a_checkout_the_daemon_does_not_serve_is_refused_over_the_wire() {
+async fn a_checkout_that_does_not_exist_is_refused_over_the_wire() {
     let mut wire = wire_for(Principal::User).await;
-    let elsewhere = wire.repository.parent().map(Path::to_path_buf).unwrap();
+    let missing = wire.repository.join("never-created");
 
     let refused = wire
         .team
-        .create_run(creation(&elsewhere))
+        .create_run(creation(&missing))
         .await
-        .expect_err("the daemon serves the roots the operator configured");
+        .expect_err("a path that resolves to nothing was never a checkout");
 
     assert_eq!(code(&refused), Code::PermissionDenied);
-    assert!(refused.message().contains("does not serve"));
+    assert!(refused.message().contains("does not exist"));
 }

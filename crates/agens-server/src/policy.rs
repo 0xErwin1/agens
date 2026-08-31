@@ -1,27 +1,29 @@
 //! What the operator has decided about the repositories a daemon serves.
 //!
 //! One daemon serves N projects and every one of them arrives by name, from a
-//! client, over a socket that authenticates nobody. Three decisions therefore
-//! cannot be derived from the request:
+//! client, over a socket that authenticates nobody. Which checkouts a run may
+//! name is not among the operator's decisions: a run admits its checkout
+//! dynamically, the same way a chat does, as long as the path resolves to a
+//! git worktree the daemon's user can reach. Two decisions remain that cannot
+//! be derived from the request:
 //!
-//! - **Which checkouts are servable at all.** A `repo_root` is a path a caller
-//!   chose, so the daemon compares its canonical form against roots the
-//!   operator wrote down rather than trusting the name it was handed.
 //! - **Whose provisioning hooks may run.** A hook is repository code executed
 //!   with the daemon's whole environment, provider credentials included. It
 //!   runs when the operator has said so about that repository, and never
-//!   because a request asked nicely.
+//!   because a request asked nicely. Admitting a checkout dynamically grants
+//!   nothing here: an undeclared repository's hooks are exactly as untrusted
+//!   as a declared one's until the operator decides about them.
 //! - **What a hook may export.** An exported name lands in the environment of
 //!   every hook after it, so an unrestricted export is a hook rewriting the
 //!   next hook's `PATH`.
 //!
 //! The two halves have different writers, so they live in different places.
-//! The roots and the export allowlist are the operator's alone and are read
-//! from the configuration file (`team.project_roots`, `team.hook_exports`),
-//! where nothing the daemon runs can add to them. Trust in a repository's hooks
-//! moves while the daemon runs — a durable question is answered, or the
-//! operator runs `agens serve trust` — so it is recorded in the control plane,
-//! not in a document a run's own worktree could append its fingerprint to.
+//! The export allowlist is the operator's alone and is read from the
+//! configuration file (`team.hook_exports`), where nothing the daemon runs can
+//! add to it. Trust in a repository's hooks moves while the daemon runs — a
+//! durable question is answered, or the operator runs `agens serve trust` — so
+//! it is recorded in the control plane, not in a document a run's own worktree
+//! could append its fingerprint to.
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -96,18 +98,10 @@ impl TrustReadFailure {
 /// keys, their validation and their file are `agens-config`'s.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PolicySettings {
-    /// The checkouts, or the directories containing them, that runs may be
-    /// created against. Empty admits nothing: a daemon reachable by any local
-    /// client is not a place for a permissive default.
-    pub project_roots: Vec<PathBuf>,
     /// The environment names a provisioning hook may export. Empty exports
     /// nothing, which is what a repository that never asked for an export
     /// expects.
     pub hook_exports: Vec<String>,
-    /// The configuration file the roots are written in, named in the refusal a
-    /// request against an unserved checkout gets. `None` when the caller
-    /// composed the policy without a file behind it.
-    pub config_path: Option<PathBuf>,
 }
 
 /// The operator's decisions, as the service core reads them.
@@ -116,14 +110,6 @@ pub struct PolicySettings {
 /// before a data directory exists, and because a suite proving what the core
 /// does with a refusal should not have to write a file to produce one.
 pub trait RepositoryPolicy: Send + Sync {
-    /// Whether a canonical checkout path is one this daemon serves.
-    fn admits(&self, repository: &Path) -> bool;
-
-    /// A sentence naming what the operator would have to write down for
-    /// [`Self::admits`] to accept this path. Returned rather than composed by
-    /// the caller so the refusal names the real key and the real file.
-    fn admission_remedy(&self) -> String;
-
     fn hook_trust(&self, repo_id: &str) -> HookTrust;
 
     /// The environment names a hook may export.
@@ -223,13 +209,9 @@ impl PolicyStore {
     /// A policy held in memory, for a caller that composes a core without a
     /// data directory behind it.
     #[must_use]
-    pub fn in_memory(project_roots: Vec<PathBuf>, hook_exports: Vec<String>) -> Self {
+    pub fn in_memory(hook_exports: Vec<String>) -> Self {
         Self {
-            settings: PolicySettings {
-                project_roots,
-                hook_exports,
-                config_path: None,
-            },
+            settings: PolicySettings { hook_exports },
             register: Register::Memory(Mutex::new(MemoryRegister::default())),
         }
     }
@@ -264,25 +246,6 @@ fn lock<T>(held: &Mutex<T>) -> Result<std::sync::MutexGuard<'_, T>, PortError> {
 }
 
 impl RepositoryPolicy for PolicyStore {
-    fn admits(&self, repository: &Path) -> bool {
-        self.settings
-            .project_roots
-            .iter()
-            .any(|root| is_within(repository, root))
-    }
-
-    fn admission_remedy(&self) -> String {
-        let Some(config) = &self.settings.config_path else {
-            return "the daemon serves no configured project root".to_owned();
-        };
-
-        format!(
-            "add the checkout, or a directory above it, to team.project_roots in {}, \
-             then restart the daemon",
-            config.display()
-        )
-    }
-
     fn hook_trust(&self, repo_id: &str) -> HookTrust {
         let stored =
             match &self.register {
@@ -408,9 +371,11 @@ pub struct TrustedRepository {
 /// repository: the daemon reads trust through to the control plane on every
 /// request and has no cached document to invalidate.
 ///
-/// The checkout has to be one the daemon serves. A grant against a repository
-/// outside `team.project_roots` would be a decision that never applies to
-/// anything, and the refusal names the same remedy a run against it would get.
+/// The checkout may be any git worktree the operator names: runs admit their
+/// checkout dynamically, so a grant against a repository no configuration ever
+/// declared applies to that repository's next run. What is refused is a path
+/// with no repository behind it, because a grant is keyed on a repository's
+/// identity and a plain directory has none.
 pub fn trust_repository(
     data_directory: &Path,
     settings: PolicySettings,
@@ -423,21 +388,19 @@ pub fn trust_repository(
 
     let policy = PolicyStore::open(data_directory, settings)?;
 
-    if !policy.admits(&canonical) {
-        return Err(PolicyError::detail(format!(
-            "the daemon does not serve {}: {}",
-            canonical.display(),
-            policy.admission_remedy()
-        )));
-    }
-
     let identity = GitWorktreeGate::new(
         SessionWorktrees::new(data_directory),
         MAIN_REF_FOR_IDENTITY,
         Vec::new(),
     )
     .identify(&canonical)
-    .map_err(|error| PolicyError::new(&canonical, error.detail()))?;
+    .map_err(|error| {
+        PolicyError::detail(format!(
+            "{} is not a git worktree: {}",
+            canonical.display(),
+            error.detail()
+        ))
+    })?;
 
     policy
         .decide(&identity.repo_id, &canonical, true, now)
@@ -470,17 +433,6 @@ impl std::fmt::Display for PolicyError {
 }
 
 impl std::error::Error for PolicyError {}
-
-/// Whether `repository` is `root` or lives under it.
-///
-/// Both sides are compared as whole path components, so a root of `/home/dev`
-/// admits `/home/dev/agens` and refuses `/home/development`, which a prefix
-/// comparison on the string would not.
-fn is_within(repository: &Path, root: &Path) -> bool {
-    let root = root.canonicalize();
-
-    root.is_ok_and(|root| repository == root || repository.starts_with(&root))
-}
 
 /// Refuses a register file the daemon's user does not own, or that anyone
 /// beyond that user can read or write.

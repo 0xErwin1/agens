@@ -74,6 +74,9 @@ struct RecordingWorktrees {
     /// The hooks the repository declares, reported back the way a real
     /// contract with hooks would.
     declared_hooks: Vec<String>,
+    /// Whether identifying a repository fails, which is how a test names a
+    /// directory the real gate would find no git worktree behind.
+    refuses_to_identify: bool,
 }
 
 impl RecordingWorktrees {
@@ -89,11 +92,17 @@ impl RecordingWorktrees {
             provisioned: Mutex::new(Vec::new()),
             hook_policies: Mutex::new(Vec::new()),
             declared_hooks: Vec::new(),
+            refuses_to_identify: false,
         }
     }
 
     fn declaring_hooks(mut self, hooks: &[&str]) -> Self {
         self.declared_hooks = hooks.iter().map(|hook| (*hook).to_owned()).collect();
+        self
+    }
+
+    fn refusing_to_identify(mut self) -> Self {
+        self.refuses_to_identify = true;
         self
     }
 }
@@ -109,6 +118,10 @@ impl WorktreeGate for RecordingWorktrees {
     }
 
     fn identify(&self, _repository: &std::path::Path) -> Result<RepositoryIdentity, PortError> {
+        if self.refuses_to_identify {
+            return Err(PortError::new("worktrees", "fatal: not a git repository"));
+        }
+
         Ok(RepositoryIdentity {
             repo_id: REPO.to_owned(),
             remote_url: Some("git@github.com:agens/agens.git".to_owned()),
@@ -135,7 +148,6 @@ impl WorktreeGate for RecordingWorktrees {
 
 /// The operator's decisions, as a test sets them.
 struct RecordingPolicy {
-    roots: Mutex<Vec<std::path::PathBuf>>,
     trust: Mutex<HookTrust>,
     pending: Mutex<Vec<PendingHookTrust>>,
     /// Every decision an answer applied, as `(repo_id, granted)`.
@@ -145,17 +157,18 @@ struct RecordingPolicy {
     refuses_to_record: bool,
 }
 
-impl RecordingPolicy {
-    fn serving(root: &std::path::Path) -> Self {
+impl Default for RecordingPolicy {
+    fn default() -> Self {
         Self {
-            roots: Mutex::new(vec![root.to_path_buf()]),
             trust: Mutex::new(HookTrust::Unknown),
             pending: Mutex::new(Vec::new()),
             decided: Mutex::new(Vec::new()),
             refuses_to_record: false,
         }
     }
+}
 
+impl RecordingPolicy {
     fn refusing_to_record(mut self) -> Self {
         self.refuses_to_record = true;
         self
@@ -168,18 +181,6 @@ impl RecordingPolicy {
 }
 
 impl RepositoryPolicy for RecordingPolicy {
-    fn admits(&self, repository: &std::path::Path) -> bool {
-        self.roots
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|root| repository.starts_with(root))
-    }
-
-    fn admission_remedy(&self) -> String {
-        "name the checkout in the daemon's policy".to_owned()
-    }
-
     fn hook_trust(&self, _repo_id: &str) -> HookTrust {
         *self.trust.lock().unwrap()
     }
@@ -294,16 +295,20 @@ struct Harness {
     feed: Arc<RecordingFeed>,
     policy: Arc<RecordingPolicy>,
     /// A checkout that exists on disk, because the core canonicalizes what it
-    /// was handed before deciding whether the daemon serves it.
+    /// was handed before identifying the repository behind it.
     repository: std::path::PathBuf,
 }
 
 impl Harness {
     fn build(store: ControlPlaneStore, worktrees: RecordingWorktrees) -> Self {
         let repository = checkout();
-        let policy = Arc::new(RecordingPolicy::serving(&repository));
 
-        Self::with_policy(store, worktrees, policy, repository)
+        Self::with_policy(
+            store,
+            worktrees,
+            Arc::new(RecordingPolicy::default()),
+            repository,
+        )
     }
 
     fn with_policy(
@@ -1816,38 +1821,95 @@ fn a_run_with_no_scope_or_definition_of_done_is_refused_before_any_worktree_exis
     );
 }
 
-// The repository policy: which checkouts a daemon serves, and whose hooks it
-// is willing to execute. Both are the operator's, and neither is derivable
-// from a request that arrives over a socket authenticating nobody.
+// The repository policy: whose hooks the daemon is willing to execute. That
+// decision is the operator's, and it is not derivable from a request that
+// arrives over a socket authenticating nobody. Which checkouts are served is
+// not a policy question at all: a run admits its checkout dynamically, the
+// same way a chat does.
 
+/// A checkout nobody declared anywhere is served the moment a run names it.
+/// What stays closed is the hook boundary: a dynamically admitted repository's
+/// hooks are as untrusted as a declared one's until the operator grants them.
 #[test]
-fn a_checkout_outside_every_configured_root_is_refused_before_any_worktree_exists() {
-    let served = checkout();
+fn an_undeclared_checkout_is_admitted_and_its_hooks_stay_untrusted() {
     let elsewhere = checkout();
-    let harness = Harness::with_policy(
+    let mut harness = Harness::build(
         store(),
-        RecordingWorktrees::new(false, true),
-        Arc::new(RecordingPolicy::serving(&served)),
-        elsewhere.clone(),
+        RecordingWorktrees::new(false, true).declaring_hooks(&["setup"]),
     );
-    let mut harness = harness;
+
+    let created = harness
+        .core
+        .create_run(Principal::User, &create_run(&elsewhere))
+        .expect("a checkout no configuration names is admitted dynamically");
+
+    assert_eq!(
+        *harness.worktrees.hook_policies.lock().unwrap(),
+        vec![HookPolicy::Ask],
+        "an undeclared repository's hooks stay untrusted until granted"
+    );
+    assert!(
+        !created.hooks_ran,
+        "no hook ran on the strength of the request alone"
+    );
+    assert!(
+        created.hook_authorization_question.is_some(),
+        "the operator is asked before the hooks ever run"
+    );
+}
+
+/// Dynamic admission still refuses what a chat would: a path that resolves to
+/// nothing was never a checkout, and no worktree exists for it.
+#[test]
+fn a_checkout_that_does_not_exist_is_refused_before_any_worktree_exists() {
+    let mut harness = Harness::build(store(), RecordingWorktrees::new(false, true));
+    let missing = data_directory().join("never-created");
 
     let error = harness
         .core
-        .create_run(Principal::User, &create_run(&elsewhere))
+        .create_run(Principal::User, &create_run(&missing))
         .unwrap_err();
 
     match error {
         ApiError::Unauthorized { reason, .. } => assert!(
-            reason.contains("does not serve"),
-            "the refusal names the checkout and what would admit it: {reason}"
+            reason.contains("does not exist"),
+            "the refusal says the path resolved to nothing: {reason}"
         ),
-        other => panic!("a checkout the daemon does not serve is refused: {other:?}"),
+        other => panic!("a path that resolves to nothing is refused: {other:?}"),
     }
 
     assert!(
         harness.worktrees.provisioned.lock().unwrap().is_empty(),
-        "nothing is created on disk for a repository the daemon does not serve"
+        "nothing is created on disk for a checkout that does not exist"
+    );
+}
+
+/// A directory that exists but has no git worktree behind it is refused the
+/// same way: dynamic admission serves repositories, not paths.
+#[test]
+fn a_checkout_that_is_not_a_git_worktree_is_refused_before_any_worktree_exists() {
+    let mut harness = Harness::build(
+        store(),
+        RecordingWorktrees::new(false, true).refusing_to_identify(),
+    );
+    let repository = harness.repository.clone();
+
+    let error = harness
+        .core
+        .create_run(Principal::User, &create_run(&repository))
+        .unwrap_err();
+
+    match error {
+        ApiError::Unauthorized { reason, .. } => assert!(
+            reason.contains("not a git worktree"),
+            "the refusal names what the path is missing: {reason}"
+        ),
+        other => panic!("a directory that is not a checkout is refused: {other:?}"),
+    }
+
+    assert!(
+        harness.worktrees.provisioned.lock().unwrap().is_empty(),
+        "nothing is created on disk for a directory that is not a checkout"
     );
 }
 
@@ -1894,7 +1956,7 @@ fn a_repository_whose_hooks_the_operator_authorized_runs_them() {
     let mut harness = Harness::with_policy(
         store(),
         RecordingWorktrees::new(false, true).declaring_hooks(&["devshell"]),
-        Arc::new(RecordingPolicy::serving(&repository).trusting(HookTrust::Granted)),
+        Arc::new(RecordingPolicy::default().trusting(HookTrust::Granted)),
         repository.clone(),
     );
 
@@ -1920,7 +1982,7 @@ fn a_repository_nobody_has_decided_on_does_not_run_its_hooks_and_asks() {
     let mut harness = Harness::with_policy(
         store(),
         RecordingWorktrees::new(false, true).declaring_hooks(&["devshell", "fixtures"]),
-        Arc::new(RecordingPolicy::serving(&repository)),
+        Arc::new(RecordingPolicy::default()),
         repository.clone(),
     );
 
@@ -1988,7 +2050,7 @@ fn a_repository_whose_hooks_the_operator_refused_is_not_asked_again() {
     let mut harness = Harness::with_policy(
         store(),
         RecordingWorktrees::new(false, true).declaring_hooks(&["devshell"]),
-        Arc::new(RecordingPolicy::serving(&repository).trusting(HookTrust::Refused)),
+        Arc::new(RecordingPolicy::default().trusting(HookTrust::Refused)),
         repository.clone(),
     );
 
@@ -2015,8 +2077,7 @@ fn a_hook_trust_register_that_cannot_be_read_refuses_and_says_why() {
         store(),
         RecordingWorktrees::new(false, true).declaring_hooks(&["devshell"]),
         Arc::new(
-            RecordingPolicy::serving(&repository)
-                .trusting(HookTrust::Unreadable(TrustReadFailure::Poisoned)),
+            RecordingPolicy::default().trusting(HookTrust::Unreadable(TrustReadFailure::Poisoned)),
         ),
         repository.clone(),
     );
@@ -2065,7 +2126,7 @@ fn a_run_praetor_proposed_never_runs_a_repositorys_hooks() {
     let mut harness = Harness::with_policy(
         store(),
         RecordingWorktrees::new(false, true).declaring_hooks(&["devshell"]),
-        Arc::new(RecordingPolicy::serving(&repository).trusting(HookTrust::Granted)),
+        Arc::new(RecordingPolicy::default().trusting(HookTrust::Granted)),
         repository.clone(),
     );
 
@@ -2089,7 +2150,7 @@ fn answering_the_hook_question_records_the_operators_decision() {
     let mut harness = Harness::with_policy(
         store(),
         RecordingWorktrees::new(false, true).declaring_hooks(&["devshell"]),
-        Arc::new(RecordingPolicy::serving(&repository)),
+        Arc::new(RecordingPolicy::default()),
         repository.clone(),
     );
 
@@ -2124,7 +2185,7 @@ fn an_answer_that_is_not_the_grant_refuses_the_repositorys_hooks() {
     let mut harness = Harness::with_policy(
         store(),
         RecordingWorktrees::new(false, true).declaring_hooks(&["devshell"]),
-        Arc::new(RecordingPolicy::serving(&repository)),
+        Arc::new(RecordingPolicy::default()),
         repository.clone(),
     );
 
@@ -2158,7 +2219,7 @@ fn praetor_may_not_authorize_a_repositorys_hooks() {
     let mut harness = Harness::with_policy(
         store(),
         RecordingWorktrees::new(false, true).declaring_hooks(&["devshell"]),
-        Arc::new(RecordingPolicy::serving(&repository)),
+        Arc::new(RecordingPolicy::default()),
         repository.clone(),
     );
 
@@ -2207,7 +2268,7 @@ fn a_creation_that_fails_after_the_row_exists_leaves_no_run_and_no_worktree() {
     let mut harness = Harness::with_policy(
         store(),
         RecordingWorktrees::new(false, true).declaring_hooks(&["devshell"]),
-        Arc::new(RecordingPolicy::serving(&repository).refusing_to_record()),
+        Arc::new(RecordingPolicy::default().refusing_to_record()),
         repository.clone(),
     );
 
