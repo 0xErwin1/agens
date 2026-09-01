@@ -239,6 +239,56 @@ fn a_command_executes_on_the_daemon_owned_chat_state() {
     );
 }
 
+/// A command runs on the same serialized state a turn owns, so a turn that is
+/// running is a command that cannot run yet. The caller is told so promptly
+/// rather than parked on the turn: a terminal that blocks on this answer is a
+/// terminal that has stopped drawing.
+#[test]
+fn a_command_sent_while_a_turn_is_running_is_refused_rather_than_waited_on() {
+    let harness = harness();
+    let session = harness
+        .chats
+        .open(&request(1))
+        .expect("the chat opens")
+        .session;
+    let events = harness.chats.subscribe(session).expect("the chat is open");
+
+    harness
+        .chats
+        .prompt(session, user_message("first"))
+        .expect("the prompt is accepted");
+    assert_eq!(
+        harness.started.recv_timeout(PATIENCE),
+        Ok("first".to_owned())
+    );
+
+    let asked = Instant::now();
+    let refusal = harness.chats.command(session, "/effort high".to_owned());
+    let waited = asked.elapsed();
+
+    assert_eq!(refusal, Err(ChatError::Busy));
+    assert!(
+        waited < Duration::from_secs(1),
+        "the command waited {waited:?} on the running turn",
+    );
+
+    harness
+        .release
+        .send(ChatTurnOutcome::Completed("done".to_owned()))
+        .expect("the turn is waiting");
+    wait_for(&events, |event| {
+        matches!(event, ChatEvent::TurnCompleted { .. })
+    });
+
+    assert_eq!(
+        harness.chats.command(session, "/effort high".to_owned()),
+        Ok(agens_server::ChatCommandOutcome {
+            message: "Reasoning effort: high.".to_owned(),
+            presentation: None,
+        }),
+    );
+}
+
 #[test]
 fn a_prompt_reaches_the_turn_and_its_progress_reaches_a_subscriber() {
     let harness = harness();

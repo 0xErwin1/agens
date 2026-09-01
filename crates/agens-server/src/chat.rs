@@ -19,7 +19,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
@@ -50,6 +50,16 @@ const PROMPT_BACKLOG: usize = 1;
 /// again. Cancellation is a flag rather than a channel, so a session that is
 /// parked on input polls it the way the rest of the daemon does.
 const PROMPT_POLL: Duration = Duration::from_millis(50);
+
+/// How long a command waits for the chat's serialized state to take it.
+///
+/// A command runs where the turns run, so it can only run between them. The
+/// wait is bounded rather than open-ended because the caller is a terminal:
+/// one that parks on this answer for the length of a turn is one that has
+/// stopped drawing, and a refusal it can act on is worth more than an answer
+/// it cannot wait for. Long enough for the loop's next look at its inbox,
+/// short enough that nobody watches it.
+const COMMAND_ANSWER: Duration = Duration::from_millis(500);
 
 /// How many events one subscriber may have waiting before the fan-out gives up
 /// on it.
@@ -426,6 +436,11 @@ enum ChatInput {
     Command {
         command: String,
         result: SyncSender<Result<ChatCommandOutcome, ChatError>>,
+        /// Set when the caller stopped waiting for the answer. A command whose
+        /// caller was told the chat is busy must not run later on its own:
+        /// nobody would see what it did, and what it did would be a change
+        /// they were told had not happened.
+        abandoned: Arc<AtomicBool>,
     },
 }
 
@@ -604,22 +619,44 @@ impl ChatSessions {
         session: SessionId,
         command: String,
     ) -> Result<ChatCommandOutcome, ChatError> {
-        let inputs = self
-            .locked()?
-            .get(&session)
-            .ok_or(ChatError::Unknown)?
-            .inputs
-            .clone();
+        let (inputs, running) = {
+            let open = self.locked()?;
+            let chat = open.get(&session).ok_or(ChatError::Unknown)?;
+            (chat.inputs.clone(), Arc::clone(&chat.running))
+        };
+
+        // A turn holds the state this command would run on for as long as it
+        // takes to answer, so a chat that is answering is refused here rather
+        // than queued behind the turn.
+        if running.lock().is_ok_and(|turn| turn.is_some()) {
+            return Err(ChatError::Busy);
+        }
+
         let (result, answered) = sync_channel(1);
+        let abandoned = Arc::new(AtomicBool::new(false));
 
         inputs
-            .try_send(ChatInput::Command { command, result })
+            .try_send(ChatInput::Command {
+                command,
+                result,
+                abandoned: Arc::clone(&abandoned),
+            })
             .map_err(|error| match error {
                 TrySendError::Full(_) => ChatError::Busy,
                 TrySendError::Disconnected(_) => ChatError::Unknown,
             })?;
 
-        answered.recv().map_err(|_| ChatError::Unknown)?
+        match answered.recv_timeout(COMMAND_ANSWER) {
+            Ok(answer) => answer,
+            // A turn that started between the check above and this send owns
+            // the loop now, so the command is withdrawn rather than left to
+            // run whenever that turn ends.
+            Err(RecvTimeoutError::Timeout) => {
+                abandoned.store(true, Ordering::SeqCst);
+                Err(ChatError::Busy)
+            }
+            Err(RecvTimeoutError::Disconnected) => Err(ChatError::Unknown),
+        }
     }
 
     fn validate_media(&self, message: &SessionMessage) -> Result<(), ChatError> {
@@ -1041,7 +1078,14 @@ fn serve_prompts(
         }
 
         let message = match inbox.recv_timeout(PROMPT_POLL) {
-            Ok(ChatInput::Command { command, result }) => {
+            Ok(ChatInput::Command {
+                command,
+                result,
+                abandoned,
+            }) => {
+                if abandoned.load(Ordering::SeqCst) {
+                    continue;
+                }
                 let answered = turns.command(&command).map(|message| ChatCommandOutcome {
                     message,
                     presentation: turns.presentation(),

@@ -20,6 +20,10 @@ use agens_session::provider::ProviderKind;
 
 use super::{TUI_ERROR_ACTION, TuiRuntimeRouter, auth_route_outcome};
 
+/// What a command refused for running only on an idle session is answered
+/// with, wherever that session is hosted.
+const BUSY_REFUSAL: &str = "This command is unavailable while a response is in progress.";
+
 #[cfg(any(test, feature = "test-support"))]
 fn legacy_outcome(outcome: TuiSubmissionOutcome) -> TuiSubmissionOutcome {
     match outcome {
@@ -110,12 +114,10 @@ impl TuiRuntimeRouter {
             let result = match request {
                 TuiRouteRequest::Input(input) => self.resolve_daemon_attached(text_message(input)),
                 TuiRouteRequest::InputMessage(input) => self.resolve_daemon_attached(input),
-                TuiRouteRequest::BusyInput(input) => self
-                    .resolve_daemon_attached(text_message(input))
-                    .map(queue_attached),
-                TuiRouteRequest::BusyMessage(input) => {
-                    self.resolve_daemon_attached(input).map(queue_attached)
+                TuiRouteRequest::BusyInput(input) => {
+                    self.route_attached_busy_input(text_message(input))
                 }
+                TuiRouteRequest::BusyMessage(input) => self.route_attached_busy_input(input),
                 TuiRouteRequest::DialogAction(action) => self.resolve_daemon_dialog_action(&action),
                 _ => Err(CliError::usage(
                     "this action is not supported while attached to a daemon",
@@ -302,6 +304,26 @@ impl TuiRuntimeRouter {
                 action: TUI_ERROR_ACTION.into(),
             },
         )
+    }
+
+    /// A submission made while the daemon is answering.
+    ///
+    /// A command that may only run on an idle session is refused here, before
+    /// anything is sent: the state it would run on belongs to the turn, so the
+    /// daemon could only take it once that turn is over, and waiting for that
+    /// is the terminal not drawing for as long as the answer takes. Everything
+    /// else routes as it does when the session is idle, which for a prompt
+    /// means queueing behind the running turn.
+    fn route_attached_busy_input(
+        &self,
+        input: agens_core::Message,
+    ) -> Result<TuiSubmissionOutcome, CliError> {
+        let text = agens_tui::user_message_text(&input);
+        if idle_only_command(&text) {
+            return Ok(TuiSubmissionOutcome::BusyRefusal(BUSY_REFUSAL.into()));
+        }
+
+        self.resolve_daemon_attached(input).map(queue_attached)
     }
 
     fn resolve_daemon_attached(
@@ -697,9 +719,7 @@ impl TuiRuntimeRouter {
                     },
                 }
             }
-            super::BusyPolicy::Reject => TuiSubmissionOutcome::BusyRefusal(
-                "This command is unavailable while a response is in progress.".into(),
-            ),
+            super::BusyPolicy::Reject => TuiSubmissionOutcome::BusyRefusal(BUSY_REFUSAL.into()),
             super::BusyPolicy::Local | super::BusyPolicy::Quit | super::BusyPolicy::Invalid => self
                 .resolve_with_cancellation(input, &cancellation)
                 .unwrap_or_else(|error| TuiSubmissionOutcome::LocalActionableError {
@@ -812,6 +832,20 @@ fn hosted_task_event(
         agent: agent.to_owned(),
         event,
     })
+}
+
+/// Whether an input names a built-in command that may only run between turns.
+fn idle_only_command(input: &str) -> bool {
+    let trimmed = input.trim();
+    let Some(invocation) = trimmed.strip_prefix('/') else {
+        return false;
+    };
+    let name_end = invocation
+        .find(char::is_whitespace)
+        .unwrap_or(invocation.len());
+
+    crate::extensions::tui_builtin_busy_policy(&invocation[..name_end])
+        .is_some_and(|policy| policy == agens_tools::CommandBusyPolicy::IdleOnly)
 }
 
 fn queue_attached(outcome: TuiSubmissionOutcome) -> TuiSubmissionOutcome {
