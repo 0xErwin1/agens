@@ -157,6 +157,12 @@ impl TuiRuntimeRouter {
                      launch agens in that directory for a local session",
                 ));
             }
+            "/chats" => {
+                return Err(CliError::usage(
+                    "/chats lists the daemon's open chats and needs an attachment; \
+                     a local session is the only conversation there is",
+                ));
+            }
             "/team" => {
                 self.team_transition
                     .store(true, std::sync::atomic::Ordering::SeqCst);

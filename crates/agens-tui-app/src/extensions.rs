@@ -78,6 +78,15 @@ const TUI_BUILT_INS: &[TuiBuiltinCommand] = &[
         26,
     ),
     TuiBuiltinCommand::new(
+        "chats",
+        "Switch between this checkout's open chats",
+        "",
+        None,
+        CommandBusyPolicy::Local,
+        false,
+        27,
+    ),
+    TuiBuiltinCommand::new(
         "connect",
         "Connect to ChatGPT",
         "[--device-auth]",
@@ -932,6 +941,7 @@ mod tests {
                 "undo",
                 "redo",
                 "cd",
+                "chats",
                 "review",
                 "shared",
                 "inspect",

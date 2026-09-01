@@ -40,12 +40,21 @@ fn attached_route(router: &TuiRuntimeRouter, request: TuiRouteRequest) -> TuiSub
 
 #[derive(Default)]
 struct FakeAttachedBackend {
+    open: Vec<crate::router::AttachedChat>,
     commands: Mutex<Vec<String>>,
     controls: Mutex<Vec<(String, agens_core::hosted::HostedMcpAction)>>,
     task_controls: Mutex<Vec<agens_core::hosted::HostedControlKind>>,
 }
 
 impl AttachedRouteBackend for FakeAttachedBackend {
+    fn session_id(&self) -> i64 {
+        7
+    }
+
+    fn open_chats(&self) -> Result<Vec<crate::router::AttachedChat>, CliError> {
+        Ok(self.open.clone())
+    }
+
     fn catalog(
         &self,
         kind: agens_core::hosted::CatalogKind,
@@ -344,7 +353,16 @@ fn attached_surface_forwards_every_daemon_catalogued_builtin_without_local_disco
     for command in crate::extensions::tui_hosted_builtin_entries() {
         if matches!(
             command.name(),
-            "attach" | "bypass" | "cd" | "dangerous" | "skills" | "mcp" | "select" | "quit"
+            "attach"
+                | "bypass"
+                | "cd"
+                | "chats"
+                | "dangerous"
+                | "new"
+                | "skills"
+                | "mcp"
+                | "select"
+                | "quit"
         ) {
             continue;
         }
@@ -371,6 +389,121 @@ fn attached_router_with_switch_slot(
     .with_checkout_switch(Arc::clone(&switch));
 
     (router, switch)
+}
+
+fn attached_router_with_chat_slot(
+    temporary: &std::path::Path,
+    open: Vec<crate::router::AttachedChat>,
+) -> (
+    TuiRuntimeRouter,
+    Arc<Mutex<Option<crate::router::SessionSwitch>>>,
+) {
+    let bootstrap = tui_session_bootstrap(temporary, &[]);
+    let chat = Arc::new(Mutex::new(None));
+    let router = TuiRuntimeRouter::attached(
+        bootstrap,
+        Arc::new(Mutex::new(SessionContext::fresh())),
+        Arc::new(FakeAttachedBackend {
+            open,
+            ..FakeAttachedBackend::default()
+        }),
+    )
+    .with_session_switch(Arc::clone(&chat));
+
+    (router, chat)
+}
+
+/// `/new` never reaches the daemon: the chat this terminal is on is not told
+/// anything, so a turn it is running keeps running, and the surface quits so
+/// the run loop can open a chat beside it.
+#[test]
+fn attached_new_asks_for_a_fresh_chat_without_a_daemon_command() {
+    let temporary = tui_session_directory("attached-new-switch");
+    let (router, chat) = attached_router_with_chat_slot(&temporary, Vec::new());
+
+    let outcome = attached_route(&router, TuiRouteRequest::Input("/new".into()));
+
+    assert_eq!(outcome, TuiSubmissionOutcome::Quit);
+    assert_eq!(
+        *chat.lock().unwrap(),
+        Some(crate::router::SessionSwitch::Fresh)
+    );
+
+    std::fs::remove_dir_all(temporary).unwrap();
+}
+
+#[test]
+fn attached_chats_lists_this_checkouts_chats_and_marks_the_one_you_are_in() {
+    let temporary = tui_session_directory("attached-chats-list");
+    let (router, chat) = attached_router_with_chat_slot(
+        &temporary,
+        vec![
+            crate::router::AttachedChat {
+                session_id: 9,
+                answering: true,
+            },
+            crate::router::AttachedChat {
+                session_id: 7,
+                answering: false,
+            },
+        ],
+    );
+
+    let TuiSubmissionOutcome::Dialog(dialog) =
+        attached_route(&router, TuiRouteRequest::Input("/chats".into()))
+    else {
+        panic!("the switcher is an overlay over the chats that are open");
+    };
+
+    let rendered = format!("{dialog:?}");
+    assert!(rendered.contains("session #9"), "{rendered}");
+    assert!(rendered.contains("answering"), "{rendered}");
+    assert!(rendered.contains("session #7"), "{rendered}");
+    assert!(rendered.contains("you are here"), "{rendered}");
+    assert!(chat.lock().unwrap().is_none(), "listing switches nothing");
+
+    std::fs::remove_dir_all(temporary).unwrap();
+}
+
+#[test]
+fn choosing_a_chat_in_the_switcher_asks_for_it_by_name() {
+    let temporary = tui_session_directory("attached-chats-choose");
+    let (router, chat) = attached_router_with_chat_slot(&temporary, Vec::new());
+
+    let outcome = attached_route(&router, TuiRouteRequest::DialogAction("chat:9".into()));
+
+    assert_eq!(outcome, TuiSubmissionOutcome::Quit);
+    assert_eq!(
+        *chat.lock().unwrap(),
+        Some(crate::router::SessionSwitch::Existing(9))
+    );
+
+    std::fs::remove_dir_all(temporary).unwrap();
+}
+
+#[test]
+fn local_chats_is_refused_and_points_at_attached_mode() {
+    let temporary = tui_session_directory("local-chats-refused");
+    let bootstrap = tui_session_bootstrap(&temporary, &[]);
+    let router = TuiRuntimeRouter::new(
+        bootstrap,
+        Arc::new(Mutex::new(SessionContext::fresh())),
+        Arc::new(Mutex::new(None)),
+        Arc::new(agens_tools::CommandCatalog::default()),
+        Arc::new(agens_tools::SkillCatalog::default()),
+    );
+
+    let (progress, _) = std::sync::mpsc::channel();
+    let outcome = router.route_request(TuiRouteRequest::Input("/chats".into()), progress);
+
+    match outcome {
+        TuiSubmissionOutcome::LocalActionableError { message, .. } => {
+            assert!(message.contains("attachment"), "{message}");
+        }
+        other => panic!("expected a local refusal, got {other:?}"),
+    }
+
+    std::fs::remove_dir_all(temporary).unwrap();
 }
 
 #[test]

@@ -57,7 +57,8 @@ use tokio_stream::{Stream, StreamExt};
 use agens_tui::{TuiRouteRequest, TuiSubmissionOutcome};
 
 use crate::router::{
-    AttachedRouteBackend, HostedCommandReply, TuiRuntimeRouter, tui_provider_outcome,
+    AttachedChat, AttachedRouteBackend, HostedCommandReply, SessionSwitch, TuiRuntimeRouter,
+    tui_provider_outcome,
 };
 
 /// What this mode cannot serve yet, said the same way everywhere it comes up.
@@ -511,6 +512,26 @@ impl Attachment {
 /// turn is parked on the stream, and reaching through the same lock would mean
 /// the cancellation waits for the thing it is cancelling.
 impl AttachedRouteBackend for Attachment {
+    fn session_id(&self) -> i64 {
+        self.session_id
+    }
+
+    fn open_chats(&self) -> Result<Vec<AttachedChat>, CliError> {
+        let mut chat = connection_between_turns(&self.chat, CONNECTION_PATIENCE)?;
+        let open = self
+            .runtime
+            .block_on(chat.open_against(&self.checkout))
+            .map_err(refused)?;
+
+        Ok(open
+            .into_iter()
+            .map(|chat| AttachedChat {
+                session_id: chat.session_id,
+                answering: chat.answering,
+            })
+            .collect())
+    }
+
     fn catalog(&self, kind: CatalogKind) -> Result<CatalogResult, CliError> {
         let mut chat = connection_between_turns(&self.chat, CONNECTION_PATIENCE)?;
         self.runtime
@@ -678,11 +699,13 @@ pub fn run_attached_tui(
 /// the one thing it carries today is that this launch just started the daemon
 /// the arrival is about to describe.
 ///
-/// This runs one attachment at a time but not necessarily one per launch:
+/// This runs one attachment at a time but not necessarily one per launch.
 /// `/cd` ends the current attachment and comes back here with another
 /// checkout, and the loop re-attaches against it exactly as a fresh launch in
-/// that directory would — rejoining that checkout's open chat or opening one.
-/// The conversation left behind stays alive in the daemon.
+/// that directory would. `/new` and the chat switcher end it with another chat
+/// on the same checkout. Either way the conversation left behind stays alive
+/// in the daemon, still running whatever turn it was running, and this loop is
+/// what makes coming back to it a matter of attaching again.
 pub fn run_attached_tui_with_prompt(
     bootstrap: &Bootstrap,
     socket: &Path,
@@ -694,7 +717,7 @@ pub fn run_attached_tui_with_prompt(
         .project_root
         .clone()
         .unwrap_or_else(|| PathBuf::from("."));
-    let mut resume = resume;
+    let mut opening = resume.map_or(Opening::Rejoin, Opening::Named);
     let mut initial_prompt = initial_prompt;
     let mut startup_notice = startup_notice;
 
@@ -704,20 +727,35 @@ pub fn run_attached_tui_with_prompt(
             bootstrap,
             socket,
             &checkout,
-            resume,
+            opening,
             initial_prompt,
             startup_notice,
             &signals,
         )?;
+
+        // Everything launch-specific belonged to the attachment that ended:
+        // the prompt and the startup notice were already delivered, and the
+        // next attachment says where it landed for itself.
+        initial_prompt = None;
+        startup_notice = None;
 
         // The supervision board is a detour, not a destination: it runs over
         // the terminal the chat just gave back, and coming out of it comes
         // back to the same checkout's conversation.
         if signals.board.load(Ordering::SeqCst) {
             crate::team::run_team_board(socket, signals.own_session())?;
-            resume = None;
-            initial_prompt = None;
-            startup_notice = None;
+            opening = Opening::Rejoin;
+            continue;
+        }
+
+        // Another chat on the same checkout: nothing was said to the one being
+        // left, so it keeps answering, and this terminal opens or rejoins the
+        // one that was asked for.
+        if let Some(target) = signals.take_chat() {
+            opening = match target {
+                SessionSwitch::Fresh => Opening::Fresh,
+                SessionSwitch::Existing(session_id) => Opening::Named(session_id),
+            };
             continue;
         }
 
@@ -725,14 +763,24 @@ pub fn run_attached_tui_with_prompt(
             return Ok(output);
         };
 
-        // Everything launch-specific belonged to the attachment that ended: a
-        // resumed session id names a session on the previous checkout, and the
-        // prompt and startup notice were already delivered.
+        // A resumed session id named a session on the checkout being left, so
+        // the new one starts from what is open there.
         checkout = target;
-        resume = None;
-        initial_prompt = None;
-        startup_notice = None;
+        opening = Opening::Rejoin;
     }
+}
+
+/// Which chat on the checkout an attachment is for.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Opening {
+    /// Come back to the chat already open here, opening one only when there is
+    /// none. What a launch means, and what coming back from the board means.
+    Rejoin,
+    /// Open a chat beside the ones already open. What `/new` means: the chats
+    /// already running here are left running.
+    Fresh,
+    /// Attach to this chat by name, because the person picked it.
+    Named(i64),
 }
 
 /// What one attachment reports back about how it ended, beside its output.
@@ -744,6 +792,9 @@ pub fn run_attached_tui_with_prompt(
 struct AttachmentSignals {
     /// The checkout the person asked to move to, when they asked to move.
     switch: Arc<Mutex<Option<PathBuf>>>,
+    /// The chat on this checkout they asked to move to, when they asked for
+    /// another chat rather than another project.
+    chat: Arc<Mutex<Option<SessionSwitch>>>,
     /// Whether they asked for the supervision board instead of leaving.
     board: Arc<AtomicBool>,
     /// The chat this attachment was on, so the board can mark it as this
@@ -759,17 +810,21 @@ impl AttachmentSignals {
     fn take_switch(&self) -> Option<PathBuf> {
         self.switch.lock().ok().and_then(|mut slot| slot.take())
     }
+
+    fn take_chat(&self) -> Option<SessionSwitch> {
+        self.chat.lock().ok().and_then(|mut slot| slot.take())
+    }
 }
 
-/// One attachment's lifetime: attach to `checkout`'s chat, run the surface
-/// against it, and report how the run ended. `switch` comes back holding a
-/// checkout when the person asked to move to another project's conversation
-/// rather than to leave.
+/// One attachment's lifetime: attach to the chat `opening` names on
+/// `checkout`, run the surface against it, and report how the run ended. The
+/// signals come back holding a checkout or a chat when the person asked to
+/// move to another conversation rather than to leave.
 fn attach_and_run(
     bootstrap: &Bootstrap,
     socket: &Path,
     checkout: &Path,
-    resume: Option<i64>,
+    opening: Opening,
     initial_prompt: Option<&str>,
     startup_notice: Option<&str>,
     signals: &AttachmentSignals,
@@ -780,7 +835,7 @@ fn attach_and_run(
     let (attachment, engine, arrival) = attach(
         socket,
         checkout,
-        resume,
+        opening,
         permissions,
         ask_user,
         Arc::clone(&staging),
@@ -803,6 +858,7 @@ fn attach_and_run(
     let router =
         TuiRuntimeRouter::attached(bootstrap.clone(), Arc::clone(&staging), attachment.clone())
             .with_checkout_switch(Arc::clone(&signals.switch))
+            .with_session_switch(Arc::clone(&signals.chat))
             .with_team_transition(Arc::clone(&signals.board));
     tui.set_palette_entries(router.attached_palette_entries()?);
     tui.set_file_candidates(router.attached_file_candidates()?);
@@ -1000,7 +1056,7 @@ impl Arrival {
 fn attach(
     socket: &Path,
     checkout: &Path,
-    resume: Option<i64>,
+    opening: Opening,
     permissions: TuiPermissionBridge,
     ask_user: TuiAskUserBridge,
     staging: Arc<Mutex<SessionContext>>,
@@ -1019,10 +1075,10 @@ fn attach(
     // otherwise the chat already open for this checkout is the one they mean,
     // because a terminal that opened a second one beside it would leave the
     // first answering into a stream nobody reads.
-    let mut arrival = match resume {
+    let mut arrival = match opening {
         // A named session is the person saying which conversation they want, so
         // it is not second-guessed and not looked up in the listing first.
-        Some(session_id) => {
+        Opening::Named(session_id) => {
             let opened = runtime
                 .block_on(chat.open(checkout, Some(session_id)))
                 .map_err(refused)?;
@@ -1034,7 +1090,20 @@ fn attach(
                 presentation: described_presentation(&opened),
             }
         }
-        None => rejoin_or_open(&runtime, &mut chat, checkout)?,
+        // Unnamed and deliberately not rejoined: the daemon opens a session
+        // beside whatever is already running here, which is what asking for a
+        // new chat means.
+        Opening::Fresh => {
+            let opened = runtime
+                .block_on(chat.open(checkout, None))
+                .map_err(refused)?;
+
+            Arrival {
+                presentation: described_presentation(&opened),
+                ..Arrival::opened(opened.session_id)
+            }
+        }
+        Opening::Rejoin => rejoin_or_open(&runtime, &mut chat, checkout)?,
     };
 
     // Read after the arrival is settled and before the subscription opens, so
@@ -1296,6 +1365,42 @@ mod tests {
             outcome,
             TuiSubmissionOutcome::LocalInfo("executed:/agent all".to_owned())
         );
+    }
+
+    /// A launch names a session, `/new` names none, and the switcher names the
+    /// one that was picked. The run loop turns each into what the next
+    /// attachment opens, and nothing here cancels or closes what is being
+    /// left.
+    #[test]
+    fn every_way_of_naming_the_next_chat_maps_to_one_opening() {
+        assert_eq!(
+            None::<i64>.map_or(Opening::Rejoin, Opening::Named),
+            Opening::Rejoin
+        );
+        assert_eq!(
+            Some(7).map_or(Opening::Rejoin, Opening::Named),
+            Opening::Named(7)
+        );
+
+        let signals = AttachmentSignals::default();
+        *signals.chat.lock().unwrap() = Some(SessionSwitch::Fresh);
+        assert_eq!(signals.take_chat(), Some(SessionSwitch::Fresh));
+        assert_eq!(signals.take_chat(), None, "a switch is taken once");
+
+        *signals.chat.lock().unwrap() = Some(SessionSwitch::Existing(9));
+        assert_eq!(signals.take_chat(), Some(SessionSwitch::Existing(9)));
+    }
+
+    /// The two switches are independent slots: asking for another chat here
+    /// does not move the checkout, and asking for another checkout does not
+    /// name a chat on it.
+    #[test]
+    fn a_chat_switch_leaves_the_checkout_where_it_was() {
+        let signals = AttachmentSignals::default();
+        *signals.chat.lock().unwrap() = Some(SessionSwitch::Fresh);
+
+        assert!(signals.take_switch().is_none());
+        assert_eq!(signals.take_chat(), Some(SessionSwitch::Fresh));
     }
 
     #[test]

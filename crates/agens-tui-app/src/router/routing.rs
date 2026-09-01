@@ -18,7 +18,7 @@ use agens_error::CliError;
 use agens_providers::chatgpt_login::upsert_provider_entry;
 use agens_session::provider::ProviderKind;
 
-use super::{TUI_ERROR_ACTION, TuiRuntimeRouter, auth_route_outcome};
+use super::{AttachedChat, SessionSwitch, TUI_ERROR_ACTION, TuiRuntimeRouter, auth_route_outcome};
 
 /// What a command refused for running only on an idle session is answered
 /// with, wherever that session is hosted.
@@ -414,6 +414,25 @@ impl TuiRuntimeRouter {
                 self.request_checkout_switch(argument)?;
                 return Ok(TuiSubmissionOutcome::Quit);
             }
+            // Also client-side: a new chat on this checkout is one the daemon
+            // opens for the next attachment, not a command against the chat
+            // this terminal is leaving. The conversation being left keeps
+            // whatever turn it is running.
+            "new" => {
+                self.request_session_switch(SessionSwitch::Fresh)?;
+                return Ok(TuiSubmissionOutcome::Quit);
+            }
+            "chats" => {
+                return Ok(TuiSubmissionOutcome::Dialog(chats_dialog(
+                    backend.session_id(),
+                    backend.open_chats()?,
+                )));
+            }
+            "team" => {
+                self.team_transition
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                return Ok(TuiSubmissionOutcome::Quit);
+            }
             "attach" => {
                 let selector = words
                     .next()
@@ -586,7 +605,29 @@ impl TuiRuntimeRouter {
         Ok(())
     }
 
+    /// Records the chat this terminal should attach to next.
+    ///
+    /// Nothing is sent to the daemon here. The chat being left is not
+    /// cancelled, closed or told anything: it keeps running, and this terminal
+    /// simply stops being the client that watches it.
+    fn request_session_switch(&self, target: SessionSwitch) -> Result<(), CliError> {
+        let mut slot = self
+            .session_switch
+            .lock()
+            .map_err(|_| CliError::storage("the chat switch is unavailable"))?;
+        *slot = Some(target);
+
+        Ok(())
+    }
+
     fn resolve_daemon_dialog_action(&self, action: &str) -> Result<TuiSubmissionOutcome, CliError> {
+        if let Some(id) = action.strip_prefix("chat:") {
+            let session_id = id
+                .parse::<i64>()
+                .map_err(|_| CliError::usage("that is not a chat this daemon lists"))?;
+            self.request_session_switch(SessionSwitch::Existing(session_id))?;
+            return Ok(TuiSubmissionOutcome::Quit);
+        }
         if let Some(path) = action.strip_prefix("attach:") {
             return self.resolve_daemon_command(&format!("/attach {path}"));
         }
@@ -786,6 +827,35 @@ fn catalog_dialog(title: &str, result: CatalogResult) -> Result<DialogView, CliE
         Some(format!("Daemon catalog · revision {}", snapshot.revision())),
         entries,
     ))
+}
+
+/// The chats open on this checkout, to pick the one to come back to.
+///
+/// The chat this terminal is already on is listed too, and marked, so the
+/// overlay answers "which one am I in" as well as "which one do I want".
+fn chats_dialog(current: i64, chats: Vec<AttachedChat>) -> DialogView {
+    let entries = chats
+        .iter()
+        .map(|chat| {
+            let state = if chat.answering { "answering" } else { "idle" };
+            let here = if chat.session_id == current {
+                " \u{b7} you are here"
+            } else {
+                ""
+            };
+            DialogEntry::action_with_detail(
+                format!("session #{}", chat.session_id),
+                Some(format!("{state}{here}")),
+                format!("chat:{}", chat.session_id),
+            )
+        })
+        .collect();
+
+    DialogView::selection(
+        "Chats",
+        Some("Open on this checkout \u{b7} leaving one does not stop it"),
+        entries,
+    )
 }
 
 fn mcp_dialog(result: HostedMcpResult) -> DialogView {

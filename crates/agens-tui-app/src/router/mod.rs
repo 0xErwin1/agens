@@ -54,8 +54,37 @@ pub(crate) struct HostedCommandReply {
     pub presentation: Option<TuiPresentation>,
 }
 
+/// One chat the daemon holds open for this checkout.
+///
+/// Enough to choose between them and no more: which conversation it is, and
+/// whether it is answering right now. The daemon's listing carries nothing
+/// else, so nothing else is offered.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AttachedChat {
+    pub session_id: i64,
+    pub answering: bool,
+}
+
+/// The conversation this terminal should move to.
+///
+/// Neither reaches the daemon as a command. The surface quits, and the
+/// attached run loop attaches again against the chat named here, so the chat
+/// being left keeps running whatever it was running.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SessionSwitch {
+    /// Open a new chat on the same checkout.
+    Fresh,
+    /// Go back to a chat that is already open.
+    Existing(i64),
+}
+
 pub(crate) trait AttachedRouteBackend: Send + Sync {
     fn catalog(&self, kind: CatalogKind) -> Result<CatalogResult, CliError>;
+    /// The chat this terminal is attached to.
+    fn session_id(&self) -> i64;
+    /// Every chat the daemon holds open for this terminal's checkout, newest
+    /// first.
+    fn open_chats(&self) -> Result<Vec<AttachedChat>, CliError>;
     fn command(&self, command: &str) -> Result<HostedCommandReply, CliError>;
     fn list_files(
         &self,
@@ -132,6 +161,9 @@ pub struct TuiRuntimeRouter {
     /// attached run loop reads it after the surface quits and re-attaches
     /// against that checkout instead of returning to the shell.
     checkout_switch: Arc<Mutex<Option<PathBuf>>>,
+    /// Where `/new` and the chat switcher put the conversation the person
+    /// asked for. Read by the attached run loop after the surface quits.
+    session_switch: Arc<Mutex<Option<SessionSwitch>>>,
     attached_backend: Option<Arc<dyn AttachedRouteBackend>>,
 }
 
@@ -220,6 +252,7 @@ impl TuiRuntimeRouter {
             profile_store: None,
             team_transition: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             checkout_switch: Arc::new(Mutex::new(None)),
+            session_switch: Arc::new(Mutex::new(None)),
             attached_backend: None,
         }
     }
@@ -265,6 +298,7 @@ impl TuiRuntimeRouter {
             profile_store: None,
             team_transition: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             checkout_switch: Arc::new(Mutex::new(None)),
+            session_switch: Arc::new(Mutex::new(None)),
             attached_backend: Some(backend),
         }
     }
@@ -273,6 +307,14 @@ impl TuiRuntimeRouter {
     /// switch requested through this router survives the surface quitting.
     pub(crate) fn with_checkout_switch(mut self, slot: Arc<Mutex<Option<PathBuf>>>) -> Self {
         self.checkout_switch = slot;
+        self
+    }
+
+    /// Shares the slot the attached run loop reads the chat to move to from,
+    /// so a switch requested through this router survives the surface
+    /// quitting.
+    pub(crate) fn with_session_switch(mut self, slot: Arc<Mutex<Option<SessionSwitch>>>) -> Self {
+        self.session_switch = slot;
         self
     }
 
