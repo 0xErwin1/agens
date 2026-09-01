@@ -938,6 +938,12 @@ fn opening_notices(startup_notice: Option<&str>, arrival: &Arrival) -> Vec<Strin
     }
 
     notices.push(arrival.describe());
+    if arrival.siblings > 0 {
+        notices.push(format!(
+            "{} other chats are open here; /chats switches between them and /new opens another",
+            arrival.siblings
+        ));
+    }
     notices.push(
         "attached mode uses daemon-owned commands, skills, files, MCP state, and tasks".to_owned(),
     );
@@ -955,6 +961,12 @@ struct Arrival {
     history: Vec<Message>,
     /// What the daemon said the chat is configured as when it was opened.
     presentation: HostedPresentation,
+    /// How many other chats the daemon holds open on this checkout.
+    ///
+    /// Once there is more than one conversation here, which one this terminal
+    /// is in stops being obvious, so the arrival says how many there are and
+    /// the footer keeps naming the session.
+    siblings: usize,
 }
 
 /// The footer presentation this arrival earns, or `None` when the daemon did
@@ -1017,6 +1029,7 @@ impl Arrival {
             landing: Landing::Opened,
             history: Vec::new(),
             presentation: HostedPresentation::default(),
+            siblings: 0,
         }
     }
 
@@ -1078,6 +1091,7 @@ fn attach(
                 landing: Landing::CameBack { answering: false },
                 history: Vec::new(),
                 presentation: described_presentation(&opened),
+                siblings: 0,
             }
         }
         // Unnamed and deliberately not rejoined: the daemon opens a session
@@ -1114,10 +1128,15 @@ fn attach(
     // publishes everything it still does — including its end — onto the
     // stream just opened, while a turn that ended before the subscription can
     // no longer be seen answering and is not adopted.
+    //
+    // The same listing says how many conversations this checkout has, which is
+    // what the arrival needs to say whether being in one of them is a choice.
+    let open = runtime
+        .block_on(chat.open_against(checkout))
+        .map_err(refused)?;
+    arrival.siblings = open.len().saturating_sub(1);
     if matches!(arrival.landing, Landing::CameBack { .. }) {
-        let answering = runtime
-            .block_on(chat.open_against(checkout))
-            .map_err(refused)?
+        let answering = open
             .iter()
             .any(|open| open.session_id == session_id && open.answering);
         arrival.landing = Landing::CameBack { answering };
@@ -1183,6 +1202,7 @@ fn rejoin_or_open(
                 },
                 history: Vec::new(),
                 presentation: described_presentation(&opened),
+                siblings: 0,
             });
         }
 
@@ -1476,6 +1496,7 @@ mod tests {
             landing: Landing::CameBack { answering },
             history: Vec::new(),
             presentation: HostedPresentation::default(),
+            siblings: 0,
         }
     }
 
@@ -1503,6 +1524,7 @@ mod tests {
                 bypass_permissions: false,
                 dangerous_mode: false,
             },
+            siblings: 0,
         };
 
         let presentation = arrival_presentation(&arrival).expect("the daemon described the chat");
@@ -1537,6 +1559,7 @@ mod tests {
                 bypass_permissions: true,
                 dangerous_mode: false,
             },
+            siblings: 0,
         };
 
         let mut tui = Tui::new(StubEngine);
@@ -1577,6 +1600,7 @@ mod tests {
                 bypass_permissions: false,
                 dangerous_mode: false,
             },
+            siblings: 0,
         };
 
         let presentation = arrival_presentation(&arrival).expect("the daemon described the chat");
@@ -1609,6 +1633,7 @@ mod tests {
                 bypass_permissions: false,
                 dangerous_mode: false,
             },
+            siblings: 0,
         };
 
         let presentation = arrival_presentation(&arrival).expect("the daemon described the chat");
@@ -1635,6 +1660,7 @@ mod tests {
                 bypass_permissions: false,
                 dangerous_mode: false,
             },
+            siblings: 0,
         };
 
         let presentation = arrival_presentation(&arrival).expect("the daemon described the chat");
@@ -1686,6 +1712,32 @@ mod tests {
 
         assert!(notices[0].contains("session 7"), "{notices:?}");
         assert!(!notices.iter().any(|notice| notice.contains("started")));
+    }
+
+    /// One conversation on a checkout needs no explaining. Several do: the
+    /// arrival says how many there are and how to move between them, and the
+    /// footer keeps naming the one this terminal is in.
+    #[test]
+    fn the_arrival_says_when_this_checkout_has_more_than_one_chat() {
+        let alone = opening_notices(None, &Arrival::opened(7));
+        assert!(
+            !alone.iter().any(|notice| notice.contains("/chats")),
+            "{alone:?}"
+        );
+
+        let crowded = opening_notices(
+            None,
+            &Arrival {
+                siblings: 2,
+                ..Arrival::opened(7)
+            },
+        );
+        let said = crowded
+            .iter()
+            .find(|notice| notice.contains("/chats"))
+            .expect("the arrival names the switcher");
+        assert!(said.contains('2'), "{said}");
+        assert!(said.contains("/new"), "{said}");
     }
 
     /// A fresh chat says that leaving does not stop it, because that is the one
