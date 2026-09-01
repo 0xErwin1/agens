@@ -481,6 +481,116 @@ fn choosing_a_chat_in_the_switcher_asks_for_it_by_name() {
     std::fs::remove_dir_all(temporary).unwrap();
 }
 
+/// Nothing an attached person can type is refused for the daemon being busy.
+/// Every command either runs now or waits in the queue, and a prompt waits
+/// where it always did.
+#[test]
+fn no_attached_submission_is_ever_refused_for_a_running_turn() {
+    let temporary = tui_session_directory("attached-busy-never-refused");
+    let bootstrap = tui_session_bootstrap(&temporary, &[]);
+    let backend = Arc::new(FakeAttachedBackend::default());
+    let switch = Arc::new(Mutex::new(None));
+    let chat = Arc::new(Mutex::new(None));
+    let router = TuiRuntimeRouter::attached(
+        bootstrap,
+        Arc::new(Mutex::new(SessionContext::fresh())),
+        backend.clone(),
+    )
+    .with_checkout_switch(Arc::clone(&switch))
+    .with_session_switch(Arc::clone(&chat));
+
+    let mut submissions = vec![
+        "and the tests too".to_owned(),
+        "/new".to_owned(),
+        "/quit".to_owned(),
+        "/chats".to_owned(),
+        "/skills".to_owned(),
+        "/mcp".to_owned(),
+        "/select".to_owned(),
+    ];
+    submissions.extend(
+        crate::extensions::tui_hosted_builtin_entries()
+            .iter()
+            .map(|entry| format!("/{}", entry.name())),
+    );
+
+    for submission in submissions {
+        let outcome = attached_route(&router, TuiRouteRequest::BusyInput(submission.clone()));
+        assert!(
+            !matches!(outcome, TuiSubmissionOutcome::BusyRefusal(_)),
+            "{submission} was refused: {outcome:?}"
+        );
+    }
+
+    std::fs::remove_dir_all(temporary).unwrap();
+}
+
+/// The three classes, by what they touch. A client-side switch runs now, a
+/// read-only daemon request runs now, and a command that changes what the chat
+/// is waits with the prompts.
+#[test]
+fn an_attached_submission_during_a_turn_runs_now_or_queues_by_what_it_touches() {
+    let temporary = tui_session_directory("attached-busy-classes");
+    let bootstrap = tui_session_bootstrap(&temporary, &[]);
+    let backend = Arc::new(FakeAttachedBackend::default());
+    let chat = Arc::new(Mutex::new(None));
+    let router = TuiRuntimeRouter::attached(
+        bootstrap,
+        Arc::new(Mutex::new(SessionContext::fresh())),
+        backend.clone(),
+    )
+    .with_session_switch(Arc::clone(&chat));
+
+    assert_eq!(
+        attached_route(&router, TuiRouteRequest::BusyInput("/new".into())),
+        TuiSubmissionOutcome::Quit,
+        "a client-side switch runs now"
+    );
+    assert_eq!(
+        *chat.lock().unwrap(),
+        Some(crate::router::SessionSwitch::Fresh)
+    );
+
+    assert!(
+        matches!(
+            attached_route(&router, TuiRouteRequest::BusyInput("/skills".into())),
+            TuiSubmissionOutcome::Dialog(_)
+        ),
+        "a read-only daemon request runs now"
+    );
+
+    assert_eq!(
+        attached_route(&router, TuiRouteRequest::BusyInput("/model gpt-5".into())),
+        TuiSubmissionOutcome::BusyCommand {
+            display: "/model gpt-5".into(),
+            command: "/model gpt-5".into(),
+        },
+        "a command that changes the chat waits for the turn"
+    );
+    assert!(
+        !backend
+            .commands
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|command| command.starts_with("/model")),
+        "a queued command is not sent while the turn runs"
+    );
+
+    assert!(
+        matches!(
+            attached_route(
+                &router,
+                TuiRouteRequest::BusyInput("write the tests".into())
+            ),
+            TuiSubmissionOutcome::BusyProviderMessage { .. }
+        ),
+        "a prompt queues as it always did"
+    );
+
+    std::fs::remove_dir_all(temporary).unwrap();
+}
+
 #[test]
 fn local_chats_is_refused_and_points_at_attached_mode() {
     let temporary = tui_session_directory("local-chats-refused");
@@ -5245,13 +5355,12 @@ fn an_attached_model_command_redresses_the_footer_from_the_daemons_description()
     std::fs::remove_dir_all(temporary).unwrap();
 }
 
-/// A command's busy policy is a property of the command, not of where the
-/// session it runs on lives. Attached it decides more than tidiness: a command
-/// the daemon can only run between turns is one this terminal would otherwise
-/// send and then sit waiting on, drawing nothing until the turn it is queued
-/// behind has finished answering.
+/// A command that changes what the chat is belongs to the running turn's
+/// state, so it waits rather than being sent. This is what keeps the terminal
+/// from sitting on a request the daemon could only take once the answer is
+/// over, drawing nothing meanwhile — the guarantee that used to be a refusal.
 #[test]
-fn an_attached_idle_only_command_is_refused_while_the_daemon_is_answering() {
+fn an_attached_chat_command_waits_for_the_turn_instead_of_reaching_the_daemon() {
     let temporary = tui_session_directory("attached-busy-idle-only");
     let bootstrap = tui_session_bootstrap(&temporary, &[]);
     let backend = Arc::new(FakeAttachedBackend::default());
@@ -5261,17 +5370,21 @@ fn an_attached_idle_only_command_is_refused_while_the_daemon_is_answering() {
         backend.clone(),
     );
 
-    for command in ["/new", "/model gpt-5.6", "/bypass"] {
+    for command in ["/model gpt-5.6", "/bypass"] {
         let outcome = attached_route(&attached, TuiRouteRequest::BusyInput(command.into()));
-        assert!(
-            matches!(outcome, TuiSubmissionOutcome::BusyRefusal(_)),
-            "{command} was not refused: {outcome:?}"
+        assert_eq!(
+            outcome,
+            TuiSubmissionOutcome::BusyCommand {
+                display: command.into(),
+                command: command.into(),
+            },
+            "{command} did not wait for the turn"
         );
     }
 
     assert!(
         backend.commands.lock().unwrap().is_empty(),
-        "a refused command must never reach the answering daemon"
+        "a queued command must never reach the answering daemon"
     );
 
     let queued = attached_route(
