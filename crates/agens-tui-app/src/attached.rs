@@ -184,7 +184,7 @@ const fn announces_running_turn(event: &HostedChatEvent) -> bool {
 /// would see the whole turn.
 struct Attachment {
     runtime: Arc<Runtime>,
-    chat: Mutex<ChatClient>,
+    connections: Connections<ChatClient>,
     events: Mutex<Events>,
     session_id: i64,
     checkout: PathBuf,
@@ -209,7 +209,7 @@ impl Attachment {
     /// command has run. A daemon that described nothing leaves the footer as
     /// it is.
     fn command(&self, command: &str) -> Result<HostedCommandReply, CliError> {
-        let mut chat = connection_between_turns(&self.chat, CONNECTION_PATIENCE)?;
+        let mut chat = self.connections.services(CONNECTION_PATIENCE)?;
 
         let reply = self
             .runtime
@@ -236,10 +236,7 @@ impl Attachment {
         // Claimed before the stream is locked, so the idle watcher stops
         // parking on it and this turn is not kept waiting behind a park.
         let _stream = self.handoff.claim_for_turn();
-        let mut chat = self
-            .chat
-            .lock()
-            .map_err(|_| unavailable("the connection to the daemon is unusable"))?;
+        let mut chat = self.connections.turn()?;
         let mut events = self
             .events
             .lock()
@@ -270,10 +267,7 @@ impl Attachment {
     fn adopt_turn(&self, progress: &Sender<TurnEvent>) -> Result<String, CliError> {
         let asking = HeadlessTurnCancellation::new();
         let _stream = self.handoff.claim_for_turn();
-        let mut chat = self
-            .chat
-            .lock()
-            .map_err(|_| unavailable("the connection to the daemon is unusable"))?;
+        let mut chat = self.connections.turn()?;
         let mut events = self
             .events
             .lock()
@@ -430,14 +424,10 @@ impl Attachment {
     /// terminal last read the chat, so the surface has to be handed the
     /// conversation again to draw what it is missing.
     ///
-    /// The client is taken rather than waited for: a turn already holds it for
-    /// as long as it runs, and an adoption that queued behind one would be
-    /// announcing a turn nobody is going to adopt.
+    /// Read on the connection no turn holds, so the catch-up happens while the
+    /// turn it is catching up on is still running.
     fn conversation_so_far(&self) -> Result<Vec<Message>, CliError> {
-        let mut chat = self
-            .chat
-            .try_lock()
-            .map_err(|_| unavailable("the connection to the daemon is busy"))?;
+        let mut chat = self.connections.services(CONNECTION_PATIENCE)?;
 
         self.runtime
             .block_on(chat.history(self.session_id))
@@ -517,7 +507,7 @@ impl AttachedRouteBackend for Attachment {
     }
 
     fn open_chats(&self) -> Result<Vec<AttachedChat>, CliError> {
-        let mut chat = connection_between_turns(&self.chat, CONNECTION_PATIENCE)?;
+        let mut chat = self.connections.services(CONNECTION_PATIENCE)?;
         let open = self
             .runtime
             .block_on(chat.open_against(&self.checkout))
@@ -533,7 +523,7 @@ impl AttachedRouteBackend for Attachment {
     }
 
     fn catalog(&self, kind: CatalogKind) -> Result<CatalogResult, CliError> {
-        let mut chat = connection_between_turns(&self.chat, CONNECTION_PATIENCE)?;
+        let mut chat = self.connections.services(CONNECTION_PATIENCE)?;
         self.runtime
             .block_on(chat.catalog(kind, None))
             .map_err(refused)
@@ -547,7 +537,7 @@ impl AttachedRouteBackend for Attachment {
         &self,
         selector: &Path,
     ) -> Result<Result<Vec<WorkspaceFile>, FileError>, CliError> {
-        let mut chat = connection_between_turns(&self.chat, CONNECTION_PATIENCE)?;
+        let mut chat = self.connections.services(CONNECTION_PATIENCE)?;
         self.runtime
             .block_on(chat.list_workspace_files(&self.checkout, selector))
             .map_err(refused)
@@ -557,14 +547,14 @@ impl AttachedRouteBackend for Attachment {
         &self,
         selector: &Path,
     ) -> Result<Result<WorkspaceFileContent, FileError>, CliError> {
-        let mut chat = connection_between_turns(&self.chat, CONNECTION_PATIENCE)?;
+        let mut chat = self.connections.services(CONNECTION_PATIENCE)?;
         self.runtime
             .block_on(chat.read_workspace_file(&self.checkout, selector))
             .map_err(refused)
     }
 
     fn mcp_status(&self) -> Result<HostedMcpResult, CliError> {
-        let mut chat = connection_between_turns(&self.chat, CONNECTION_PATIENCE)?;
+        let mut chat = self.connections.services(CONNECTION_PATIENCE)?;
         self.runtime.block_on(chat.mcp_status()).map_err(refused)
     }
 
@@ -573,14 +563,14 @@ impl AttachedRouteBackend for Attachment {
         server: &str,
         action: HostedMcpAction,
     ) -> Result<HostedMcpResult, CliError> {
-        let mut chat = connection_between_turns(&self.chat, CONNECTION_PATIENCE)?;
+        let mut chat = self.connections.services(CONNECTION_PATIENCE)?;
         self.runtime
             .block_on(chat.mcp_control(server, action))
             .map_err(refused)
     }
 
     fn task_snapshot(&self) -> Result<Result<HostedTaskReplay, TaskControlError>, CliError> {
-        let mut chat = connection_between_turns(&self.chat, CONNECTION_PATIENCE)?;
+        let mut chat = self.connections.services(CONNECTION_PATIENCE)?;
         self.runtime
             .block_on(chat.task_snapshot(self.session_id))
             .map_err(refused)
@@ -602,7 +592,7 @@ impl AttachedRouteBackend for Attachment {
             command_id,
             kind,
         );
-        let mut chat = connection_between_turns(&self.chat, CONNECTION_PATIENCE)?;
+        let mut chat = self.connections.services(CONNECTION_PATIENCE)?;
         self.runtime
             .block_on(chat.task_control(&command))
             .map_err(refused)
@@ -1142,7 +1132,10 @@ fn attach(
     Ok((
         Attachment {
             runtime,
-            chat: Mutex::new(chat),
+            connections: Connections {
+                turn: Mutex::new(chat),
+                services: Mutex::new(coordinator.chat()),
+            },
             events: Mutex::new(Box::pin(events)),
             session_id,
             checkout: checkout.to_path_buf(),
@@ -1279,6 +1272,39 @@ fn unavailable(detail: &str) -> CliError {
 /// out the moment between two requests, short enough that nobody watching the
 /// terminal sees it stop.
 const CONNECTION_PATIENCE: Duration = Duration::from_millis(250);
+
+/// The two connections one attachment holds to the same daemon.
+///
+/// A turn holds its connection for as long as it takes to answer. Everything
+/// else the surface asks — the catalogs it draws, the files it lists, the MCP
+/// state it shows, the task journal it replays — asks on the other one, so a
+/// request made while an answer is arriving never waits on that answer. They
+/// share one socket: a second `chat()` off the same coordinator is another
+/// stream on the channel, not another connection to open.
+struct Connections<T> {
+    /// Held for as long as a turn runs, by the thread following it.
+    turn: Mutex<T>,
+    /// Never held by a turn.
+    services: Mutex<T>,
+}
+
+impl<T> Connections<T> {
+    /// The connection a turn runs on, waited for without a bound because the
+    /// thread asking for it is the one about to run the turn.
+    fn turn(&self) -> Result<MutexGuard<'_, T>, CliError> {
+        self.turn
+            .lock()
+            .map_err(|_| unavailable("the connection to the daemon is unusable"))
+    }
+
+    /// The connection everything that is not a turn runs on.
+    ///
+    /// Still bounded: two requests from different threads can meet here, and
+    /// the thread that draws must not park on one.
+    fn services(&self, patience: Duration) -> Result<MutexGuard<'_, T>, CliError> {
+        connection_between_turns(&self.services, patience)
+    }
+}
 
 /// The connection, for a request that is not the turn.
 ///
@@ -1830,6 +1856,33 @@ mod tests {
 #[cfg(test)]
 mod connection_tests {
     use super::*;
+
+    /// The point of holding two: a request the surface makes while a turn is
+    /// answering must not wait on the turn at all, let alone be refused for
+    /// it. Nothing in this attachment can put the surface behind the answer.
+    #[test]
+    fn a_request_made_while_a_turn_answers_does_not_wait_on_the_turn() {
+        let connections = Connections {
+            turn: Mutex::new(0_u8),
+            services: Mutex::new(0_u8),
+        };
+        let answering = connections.turn().expect("the turn takes its connection");
+
+        let asked = Instant::now();
+        let served = connections.services(Duration::from_millis(50));
+        let waited = asked.elapsed();
+
+        assert!(
+            served.is_ok(),
+            "a request was refused for a turn it does not share a connection with",
+        );
+        assert!(
+            waited < Duration::from_millis(50),
+            "the request waited {waited:?} on the turn",
+        );
+
+        drop(answering);
+    }
 
     /// The thread that draws is the thread that routes a command, so what a
     /// turn's hold on the connection can cost it is bounded: a wait that
