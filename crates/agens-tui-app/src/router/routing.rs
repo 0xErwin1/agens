@@ -18,7 +18,7 @@ use agens_error::CliError;
 use agens_providers::chatgpt_login::upsert_provider_entry;
 use agens_session::provider::ProviderKind;
 
-use super::{TUI_ERROR_ACTION, TuiRuntimeRouter, auth_route_outcome};
+use super::{AttachedChat, SessionSwitch, TUI_ERROR_ACTION, TuiRuntimeRouter, auth_route_outcome};
 
 /// What a command refused for running only on an idle session is answered
 /// with, wherever that session is hosted.
@@ -308,22 +308,36 @@ impl TuiRuntimeRouter {
 
     /// A submission made while the daemon is answering.
     ///
-    /// A command that may only run on an idle session is refused here, before
-    /// anything is sent: the state it would run on belongs to the turn, so the
-    /// daemon could only take it once that turn is over, and waiting for that
-    /// is the terminal not drawing for as long as the answer takes. Everything
-    /// else routes as it does when the session is idle, which for a prompt
-    /// means queueing behind the running turn.
+    /// Nothing is refused here. A submission either runs now or waits, and
+    /// which of the two it does follows from what it touches:
+    ///
+    /// - a client-side switch runs now, because it never reaches the daemon
+    ///   at all;
+    /// - a read-only daemon request runs now, because it asks its own
+    ///   question on its own connection and never waits on the turn;
+    /// - anything that changes what the chat is waits in the queue, next to
+    ///   the prompts, and runs when the turn ends;
+    /// - a prompt waits the same way it always has.
     fn route_attached_busy_input(
         &self,
         input: agens_core::Message,
     ) -> Result<TuiSubmissionOutcome, CliError> {
         let text = agens_tui::user_message_text(&input);
-        if idle_only_command(&text) {
-            return Ok(TuiSubmissionOutcome::BusyRefusal(BUSY_REFUSAL.into()));
-        }
+        let command = text.trim();
 
-        self.resolve_daemon_attached(input).map(queue_attached)
+        let Some(name) = command.strip_prefix('/').map(invocation_name) else {
+            return self.resolve_daemon_attached(input).map(queue_attached);
+        };
+
+        match attached_busy_class(name) {
+            AttachedBusyClass::ClientSwitch | AttachedBusyClass::ReadOnly => {
+                self.resolve_daemon_attached(input)
+            }
+            AttachedBusyClass::Deferred => Ok(TuiSubmissionOutcome::BusyCommand {
+                display: command.to_owned(),
+                command: command.to_owned(),
+            }),
+        }
     }
 
     fn resolve_daemon_attached(
@@ -412,6 +426,25 @@ impl TuiRuntimeRouter {
                     .unwrap_or_default()
                     .trim();
                 self.request_checkout_switch(argument)?;
+                return Ok(TuiSubmissionOutcome::Quit);
+            }
+            // Also client-side: a new chat on this checkout is one the daemon
+            // opens for the next attachment, not a command against the chat
+            // this terminal is leaving. The conversation being left keeps
+            // whatever turn it is running.
+            "new" => {
+                self.request_session_switch(SessionSwitch::Fresh)?;
+                return Ok(TuiSubmissionOutcome::Quit);
+            }
+            "chats" => {
+                return Ok(TuiSubmissionOutcome::Dialog(chats_dialog(
+                    backend.session_id(),
+                    backend.open_chats()?,
+                )));
+            }
+            "team" => {
+                self.team_transition
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
                 return Ok(TuiSubmissionOutcome::Quit);
             }
             "attach" => {
@@ -586,7 +619,29 @@ impl TuiRuntimeRouter {
         Ok(())
     }
 
+    /// Records the chat this terminal should attach to next.
+    ///
+    /// Nothing is sent to the daemon here. The chat being left is not
+    /// cancelled, closed or told anything: it keeps running, and this terminal
+    /// simply stops being the client that watches it.
+    fn request_session_switch(&self, target: SessionSwitch) -> Result<(), CliError> {
+        let mut slot = self
+            .session_switch
+            .lock()
+            .map_err(|_| CliError::storage("the chat switch is unavailable"))?;
+        *slot = Some(target);
+
+        Ok(())
+    }
+
     fn resolve_daemon_dialog_action(&self, action: &str) -> Result<TuiSubmissionOutcome, CliError> {
+        if let Some(id) = action.strip_prefix("chat:") {
+            let session_id = id
+                .parse::<i64>()
+                .map_err(|_| CliError::usage("that is not a chat this daemon lists"))?;
+            self.request_session_switch(SessionSwitch::Existing(session_id))?;
+            return Ok(TuiSubmissionOutcome::Quit);
+        }
         if let Some(path) = action.strip_prefix("attach:") {
             return self.resolve_daemon_command(&format!("/attach {path}"));
         }
@@ -788,6 +843,35 @@ fn catalog_dialog(title: &str, result: CatalogResult) -> Result<DialogView, CliE
     ))
 }
 
+/// The chats open on this checkout, to pick the one to come back to.
+///
+/// The chat this terminal is already on is listed too, and marked, so the
+/// overlay answers "which one am I in" as well as "which one do I want".
+fn chats_dialog(current: i64, chats: Vec<AttachedChat>) -> DialogView {
+    let entries = chats
+        .iter()
+        .map(|chat| {
+            let state = if chat.answering { "answering" } else { "idle" };
+            let here = if chat.session_id == current {
+                " \u{b7} you are here"
+            } else {
+                ""
+            };
+            DialogEntry::action_with_detail(
+                format!("session #{}", chat.session_id),
+                Some(format!("{state}{here}")),
+                format!("chat:{}", chat.session_id),
+            )
+        })
+        .collect();
+
+    DialogView::selection(
+        "Chats",
+        Some("Open on this checkout \u{b7} leaving one does not stop it"),
+        entries,
+    )
+}
+
 fn mcp_dialog(result: HostedMcpResult) -> DialogView {
     let entries = result
         .servers()
@@ -834,18 +918,41 @@ fn hosted_task_event(
     })
 }
 
-/// Whether an input names a built-in command that may only run between turns.
-fn idle_only_command(input: &str) -> bool {
-    let trimmed = input.trim();
-    let Some(invocation) = trimmed.strip_prefix('/') else {
-        return false;
-    };
+/// The command name in an invocation, without its arguments.
+fn invocation_name(invocation: &str) -> &str {
     let name_end = invocation
         .find(char::is_whitespace)
         .unwrap_or(invocation.len());
 
-    crate::extensions::tui_builtin_busy_policy(&invocation[..name_end])
-        .is_some_and(|policy| policy == agens_tools::CommandBusyPolicy::IdleOnly)
+    &invocation[..name_end]
+}
+
+/// What an attached command does while the daemon is answering.
+///
+/// The three are told apart by what the command touches, not by a policy
+/// written down twice: the ones that run now are exactly the ones
+/// [`TuiRuntimeRouter::resolve_daemon_command`] answers without sending a
+/// hosted command, and everything else is a hosted command against the chat's
+/// own state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AttachedBusyClass {
+    /// Runs now. It never reaches the daemon: the surface quits and the
+    /// attached run loop acts on it, so the running turn is not involved.
+    ClientSwitch,
+    /// Runs now. It asks the daemon a question that reads nothing the turn
+    /// owns, on a connection the turn is not holding.
+    ReadOnly,
+    /// Waits. It changes what the chat is, which is the running turn's, so it
+    /// queues with the prompts and runs when that turn ends.
+    Deferred,
+}
+
+fn attached_busy_class(name: &str) -> AttachedBusyClass {
+    match name {
+        "cd" | "new" | "chats" | "team" | "quit" => AttachedBusyClass::ClientSwitch,
+        "attach" | "skills" | "mcp" | "select" => AttachedBusyClass::ReadOnly,
+        _ => AttachedBusyClass::Deferred,
+    }
 }
 
 fn queue_attached(outcome: TuiSubmissionOutcome) -> TuiSubmissionOutcome {

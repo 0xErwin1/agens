@@ -552,6 +552,93 @@ fn opening_a_live_chat_again_from_the_same_checkout_rejoins_it() {
     );
 }
 
+/// The journey `/new` walks, from the daemon's side.
+///
+/// A terminal on a chat that is answering asks for another one. Nothing is
+/// said to the chat it is leaving: the turn keeps running, the daemon opens a
+/// second chat beside it, and both are listed for this checkout with the first
+/// still marked as answering. Coming back to the first finds the same session
+/// and the turn it was still running, which is what the terminal adopts.
+#[test]
+fn a_new_chat_opens_beside_one_that_is_still_answering_and_both_stay_listed() {
+    let harness = harness();
+    let checkout = PathBuf::from("/projects/agens");
+
+    let answering = harness
+        .chats
+        .open(&request(1))
+        .expect("the first chat opens")
+        .session;
+    let events = harness
+        .chats
+        .subscribe(answering)
+        .expect("the first chat is open");
+    harness
+        .chats
+        .prompt(answering, user_message("what changed here"))
+        .expect("the chat takes the prompt");
+    assert_eq!(
+        harness.started.recv_timeout(PATIENCE),
+        Ok("what changed here".to_owned()),
+    );
+
+    // The switch: a chat beside the running one, on the same checkout.
+    let beside = harness
+        .chats
+        .open(&request(2))
+        .expect("a second chat opens on the same checkout")
+        .session;
+    assert_ne!(beside, answering);
+
+    let open = harness
+        .chats
+        .open_against(&checkout)
+        .expect("this checkout's chats are listed");
+    assert_eq!(open.len(), 2, "{open:?}");
+    assert!(
+        open.iter()
+            .any(|chat| chat.session_id == answering && chat.answering),
+        "the chat that was left is not still answering: {open:?}",
+    );
+    assert!(
+        open.iter()
+            .any(|chat| chat.session_id == beside && !chat.answering),
+        "the new chat is not listed as idle: {open:?}",
+    );
+
+    // Coming back: the same session, still the one with the turn on it.
+    let returned = harness
+        .chats
+        .open(&request(1))
+        .expect("the chat that was left is rejoined")
+        .session;
+    assert_eq!(returned, answering);
+    assert!(
+        harness
+            .chats
+            .open_against(&checkout)
+            .expect("this checkout's chats are listed")
+            .iter()
+            .any(|chat| chat.session_id == answering && chat.answering),
+        "the turn did not survive being left and rejoined",
+    );
+
+    // And it is the turn that was running all along that ends.
+    harness
+        .release
+        .send(ChatTurnOutcome::Completed("it answered".to_owned()))
+        .expect("the turn is waiting");
+    assert_eq!(
+        wait_for(&events, |event| matches!(
+            event,
+            ChatEvent::TurnCompleted { .. }
+        )),
+        ChatEvent::TurnCompleted {
+            text: "it answered".to_owned(),
+        },
+    );
+}
+
 /// The same id opened against another checkout is a genuine conflict, and it
 /// keeps being refused: rejoining is for the client coming back to its own
 /// conversation, not a way around the registry.

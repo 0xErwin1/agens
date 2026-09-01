@@ -549,6 +549,14 @@ pub enum TuiSubmissionOutcome {
         display: String,
         message: Message,
     },
+    /// A command accepted into the queue behind the running turn.
+    ///
+    /// It runs when that turn ends, in the order it was typed, and it can be
+    /// withdrawn from the queue until then, exactly like a queued prompt.
+    BusyCommand {
+        display: String,
+        command: String,
+    },
     /// A busy-session refusal that preserves the composer draft for editing.
     BusyRefusal(String),
     /// Opens an isolated credential-entry overlay.
@@ -7377,6 +7385,33 @@ where
         }
     }
 
+    /// Drops what was queued for the conversation this surface is leaving.
+    ///
+    /// A queued prompt or command was typed at one chat. Quitting the surface
+    /// ends this client's part in that chat — whether the terminal is closing
+    /// or switching to another session — so the queue goes with it rather than
+    /// draining against whatever comes next.
+    fn discard_queue_on_leaving(&mut self) {
+        let discarded = self.scheduler.discard_queue();
+        if discarded > 0 {
+            self.status = Some(format!(
+                "{discarded} queued entries were discarded with this conversation"
+            ));
+        }
+    }
+
+    /// The queued entry to act on now that nothing is running.
+    ///
+    /// The end of a turn only starts the next queued prompt. A queued command
+    /// and everything behind it stay in the queue until this drains them, one
+    /// entry per call, so a command never races the turn queued behind it.
+    fn take_stalled_queue_work(&mut self) -> Option<StalledQueueWork> {
+        match self.scheduler.take_stalled_queue_entry()? {
+            Effect::RunQueuedCommand { command } => Some(StalledQueueWork::Command(command)),
+            effect => next_scheduled_prompt(vec![effect]).map(StalledQueueWork::Prompt),
+        }
+    }
+
     /// Starts the turn a finished background subagent scheduled, but only at a safe point.
     ///
     /// The shared runtime rejects a concurrent turn, and firing over a composer the user is
@@ -7577,6 +7612,10 @@ where
                 self.enqueue_resolved_composer_message(display, message);
                 None
             }
+            TuiSubmissionOutcome::BusyCommand { display, command } => {
+                self.enqueue_resolved_command(display, command);
+                None
+            }
             TuiSubmissionOutcome::BusyRefusal(message) => {
                 self.status = Some(message);
                 None
@@ -7731,6 +7770,7 @@ where
             }
             TuiSubmissionOutcome::Quit => {
                 self.local_route_active = false;
+                self.discard_queue_on_leaving();
                 None
             }
         }
@@ -7748,6 +7788,10 @@ where
             }
             TuiSubmissionOutcome::BusyProviderMessage { display, message } => {
                 self.enqueue_resolved_composer_message(display, message);
+                None
+            }
+            TuiSubmissionOutcome::BusyCommand { display, command } => {
+                self.enqueue_resolved_command(display, command);
                 None
             }
             TuiSubmissionOutcome::BusyRefusal(message) => {
@@ -10335,6 +10379,25 @@ where
         self.dispatch_steer_effects(&effects);
         self.record_prompt_history(&message);
         self.claim_composer_media(&message);
+        self.clear_composer();
+        self.surface_focus = SurfaceFocus::Composer;
+    }
+
+    /// Puts a command in the queue behind the running turn.
+    ///
+    /// The composer is cleared and the entry shows in the same queue a prompt
+    /// waits in, so what is pending reads the same whether it is something to
+    /// answer or something to run.
+    fn enqueue_resolved_command(&mut self, display: String, command: String) {
+        let effects = self.scheduler.reduce(AppEvent::QueueCommand {
+            display: display.clone(),
+            command,
+        });
+        if let Some(Effect::RefusePrompt(reason)) = effects.first() {
+            self.status = Some(reason.clone());
+            return;
+        }
+        self.status = Some(format!("{display} queued \u{b7} runs when the turn ends"));
         self.clear_composer();
         self.surface_focus = SurfaceFocus::Composer;
     }
@@ -13032,6 +13095,15 @@ struct ProviderDrain {
     next_prompt: Option<ScheduledPrompt>,
 }
 
+/// What draining one stalled queue entry asks the run loop to do.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum StalledQueueWork {
+    /// Run this command, then come back for the next entry.
+    Command(String),
+    /// Start this prompt as the next turn.
+    Prompt(ScheduledPrompt),
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ScheduledPrompt {
     display: String,
@@ -13462,6 +13534,43 @@ where
             ask_user_requests.as_ref(),
         ) {
             active_ask_user = Some(id);
+            dirty = true;
+        }
+        // What waited behind the turn that just ended: a queued command runs
+        // here as its own route, and the prompt behind it starts only once
+        // that route has come back, so the two never overlap.
+        if active_route.is_none()
+            && let Some(work) = tui.take_stalled_queue_work()
+        {
+            match work {
+                StalledQueueWork::Command(command) => {
+                    tui.begin_route();
+                    next_route_id = next_route_id.wrapping_add(1).max(1);
+                    let route_id = next_route_id;
+                    let cancellation = TuiRouteCancellation::new();
+                    active_route = Some((route_id, cancellation.clone(), false));
+                    let route = Arc::clone(&route);
+                    let route_sender = route_sender.clone();
+                    let progress = route_progress_sender.clone();
+                    thread::spawn(move || {
+                        let outcome =
+                            route(TuiRouteRequest::Input(command), progress, cancellation);
+                        let _ = route_sender.send((route_id, outcome));
+                    });
+                }
+                StalledQueueWork::Prompt(next) => {
+                    tui.begin_message_submission(next.message.clone());
+                    let generation = tui.active_generation();
+                    let submit = Arc::clone(&submit);
+                    let sender = sender.clone();
+                    let metrics = metrics_sender.clone();
+                    let completion_sender = completion_sender.clone();
+                    thread::spawn(move || {
+                        let outcome = submit(next.message, SubmitOrigin::User, sender, metrics);
+                        let _ = completion_sender.send((generation, outcome));
+                    });
+                }
+            }
             dirty = true;
         }
         if active_route.is_none()
@@ -17782,5 +17891,72 @@ mod runtime_tests {
         );
         assert!(tui.scheduler.queued_prompts().is_empty());
         assert!(tui.view().running);
+    }
+
+    #[test]
+    fn a_command_submitted_during_a_turn_is_queued_and_says_so() {
+        let mut tui = Tui::with_queue_capacity(NoopEngine, 2);
+        tui.begin_submission("active");
+
+        let submitted = tui.apply_busy_submission_outcome(TuiSubmissionOutcome::BusyCommand {
+            display: "/model gpt-5".into(),
+            command: "/model gpt-5".into(),
+        });
+
+        assert_eq!(submitted, None);
+        assert_eq!(tui.scheduler.queued_prompts(), vec!["/model gpt-5"]);
+        let status = tui.view().status.expect("the queue says what it took");
+        assert!(status.contains("queued"), "{status}");
+        assert!(status.contains("runs when the turn ends"), "{status}");
+    }
+
+    #[test]
+    fn a_queued_command_drains_before_the_prompt_behind_it() {
+        let mut tui = Tui::with_queue_capacity(NoopEngine, 4);
+        tui.begin_submission("active");
+        let generation = tui.scheduler.lifecycle().active().unwrap().generation();
+        tui.apply_busy_submission_outcome(TuiSubmissionOutcome::BusyCommand {
+            display: "/effort high".into(),
+            command: "/effort high".into(),
+        });
+        tui.input = "and then this".into();
+        tui.enqueue_composer();
+
+        assert!(
+            tui.take_stalled_queue_work().is_none(),
+            "the turn is running"
+        );
+
+        tui.finish_provider_turn_scheduled_for_generation(
+            generation,
+            TuiProviderOutcome::Completed("done".into()),
+        );
+
+        assert_eq!(
+            tui.take_stalled_queue_work(),
+            Some(StalledQueueWork::Command("/effort high".into()))
+        );
+        assert_eq!(
+            tui.take_stalled_queue_work()
+                .map(|work| matches!(work, StalledQueueWork::Prompt(_))),
+            Some(true)
+        );
+        assert_eq!(tui.take_stalled_queue_work(), None);
+    }
+
+    #[test]
+    fn leaving_a_conversation_takes_its_queue_with_it() {
+        let mut tui = Tui::with_queue_capacity(NoopEngine, 2);
+        tui.begin_submission("active");
+        tui.apply_busy_submission_outcome(TuiSubmissionOutcome::BusyCommand {
+            display: "/model gpt-5".into(),
+            command: "/model gpt-5".into(),
+        });
+
+        tui.apply_submission_outcome(TuiSubmissionOutcome::Quit);
+
+        assert!(tui.scheduler.queued_prompts().is_empty());
+        let status = tui.view().status.expect("the discard is reported");
+        assert!(status.contains("discarded"), "{status}");
     }
 }

@@ -78,6 +78,15 @@ const TUI_BUILT_INS: &[TuiBuiltinCommand] = &[
         26,
     ),
     TuiBuiltinCommand::new(
+        "chats",
+        "Switch between this checkout's open chats",
+        "",
+        None,
+        CommandBusyPolicy::Local,
+        false,
+        27,
+    ),
+    TuiBuiltinCommand::new(
         "connect",
         "Connect to ChatGPT",
         "[--device-auth]",
@@ -298,20 +307,6 @@ const TUI_BUILT_INS: &[TuiBuiltinCommand] = &[
 
 pub(crate) fn tui_builtin_commands() -> &'static [TuiBuiltinCommand] {
     TUI_BUILT_INS
-}
-
-/// The busy policy of a built-in command, by name.
-///
-/// The built-ins are the same set on both sides of an attachment, so an
-/// attached client can decide what a command may do while a turn is running
-/// without asking the daemon: the answer is a property of the command, and the
-/// daemon hosts these very entries. Project commands and skills are not here
-/// on purpose — those the daemon owns.
-pub(crate) fn tui_builtin_busy_policy(name: &str) -> Option<CommandBusyPolicy> {
-    TUI_BUILT_INS
-        .iter()
-        .find(|command| command.name == name)
-        .map(|command| command.busy_policy)
 }
 
 pub fn tui_hosted_builtin_entries() -> Vec<agens_core::hosted::CatalogEntry> {
@@ -932,6 +927,7 @@ mod tests {
                 "undo",
                 "redo",
                 "cd",
+                "chats",
                 "review",
                 "shared",
                 "inspect",

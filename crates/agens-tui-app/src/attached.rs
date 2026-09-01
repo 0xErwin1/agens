@@ -57,7 +57,8 @@ use tokio_stream::{Stream, StreamExt};
 use agens_tui::{TuiRouteRequest, TuiSubmissionOutcome};
 
 use crate::router::{
-    AttachedRouteBackend, HostedCommandReply, TuiRuntimeRouter, tui_provider_outcome,
+    AttachedChat, AttachedRouteBackend, HostedCommandReply, SessionSwitch, TuiRuntimeRouter,
+    tui_provider_outcome,
 };
 
 /// What this mode cannot serve yet, said the same way everywhere it comes up.
@@ -183,7 +184,7 @@ const fn announces_running_turn(event: &HostedChatEvent) -> bool {
 /// would see the whole turn.
 struct Attachment {
     runtime: Arc<Runtime>,
-    chat: Mutex<ChatClient>,
+    connections: Connections<ChatClient>,
     events: Mutex<Events>,
     session_id: i64,
     checkout: PathBuf,
@@ -208,7 +209,7 @@ impl Attachment {
     /// command has run. A daemon that described nothing leaves the footer as
     /// it is.
     fn command(&self, command: &str) -> Result<HostedCommandReply, CliError> {
-        let mut chat = connection_between_turns(&self.chat, CONNECTION_PATIENCE)?;
+        let mut chat = self.connections.services(CONNECTION_PATIENCE)?;
 
         let reply = self
             .runtime
@@ -235,10 +236,7 @@ impl Attachment {
         // Claimed before the stream is locked, so the idle watcher stops
         // parking on it and this turn is not kept waiting behind a park.
         let _stream = self.handoff.claim_for_turn();
-        let mut chat = self
-            .chat
-            .lock()
-            .map_err(|_| unavailable("the connection to the daemon is unusable"))?;
+        let mut chat = self.connections.turn()?;
         let mut events = self
             .events
             .lock()
@@ -269,10 +267,7 @@ impl Attachment {
     fn adopt_turn(&self, progress: &Sender<TurnEvent>) -> Result<String, CliError> {
         let asking = HeadlessTurnCancellation::new();
         let _stream = self.handoff.claim_for_turn();
-        let mut chat = self
-            .chat
-            .lock()
-            .map_err(|_| unavailable("the connection to the daemon is unusable"))?;
+        let mut chat = self.connections.turn()?;
         let mut events = self
             .events
             .lock()
@@ -429,14 +424,10 @@ impl Attachment {
     /// terminal last read the chat, so the surface has to be handed the
     /// conversation again to draw what it is missing.
     ///
-    /// The client is taken rather than waited for: a turn already holds it for
-    /// as long as it runs, and an adoption that queued behind one would be
-    /// announcing a turn nobody is going to adopt.
+    /// Read on the connection no turn holds, so the catch-up happens while the
+    /// turn it is catching up on is still running.
     fn conversation_so_far(&self) -> Result<Vec<Message>, CliError> {
-        let mut chat = self
-            .chat
-            .try_lock()
-            .map_err(|_| unavailable("the connection to the daemon is busy"))?;
+        let mut chat = self.connections.services(CONNECTION_PATIENCE)?;
 
         self.runtime
             .block_on(chat.history(self.session_id))
@@ -511,8 +502,28 @@ impl Attachment {
 /// turn is parked on the stream, and reaching through the same lock would mean
 /// the cancellation waits for the thing it is cancelling.
 impl AttachedRouteBackend for Attachment {
+    fn session_id(&self) -> i64 {
+        self.session_id
+    }
+
+    fn open_chats(&self) -> Result<Vec<AttachedChat>, CliError> {
+        let mut chat = self.connections.services(CONNECTION_PATIENCE)?;
+        let open = self
+            .runtime
+            .block_on(chat.open_against(&self.checkout))
+            .map_err(refused)?;
+
+        Ok(open
+            .into_iter()
+            .map(|chat| AttachedChat {
+                session_id: chat.session_id,
+                answering: chat.answering,
+            })
+            .collect())
+    }
+
     fn catalog(&self, kind: CatalogKind) -> Result<CatalogResult, CliError> {
-        let mut chat = connection_between_turns(&self.chat, CONNECTION_PATIENCE)?;
+        let mut chat = self.connections.services(CONNECTION_PATIENCE)?;
         self.runtime
             .block_on(chat.catalog(kind, None))
             .map_err(refused)
@@ -526,7 +537,7 @@ impl AttachedRouteBackend for Attachment {
         &self,
         selector: &Path,
     ) -> Result<Result<Vec<WorkspaceFile>, FileError>, CliError> {
-        let mut chat = connection_between_turns(&self.chat, CONNECTION_PATIENCE)?;
+        let mut chat = self.connections.services(CONNECTION_PATIENCE)?;
         self.runtime
             .block_on(chat.list_workspace_files(&self.checkout, selector))
             .map_err(refused)
@@ -536,14 +547,14 @@ impl AttachedRouteBackend for Attachment {
         &self,
         selector: &Path,
     ) -> Result<Result<WorkspaceFileContent, FileError>, CliError> {
-        let mut chat = connection_between_turns(&self.chat, CONNECTION_PATIENCE)?;
+        let mut chat = self.connections.services(CONNECTION_PATIENCE)?;
         self.runtime
             .block_on(chat.read_workspace_file(&self.checkout, selector))
             .map_err(refused)
     }
 
     fn mcp_status(&self) -> Result<HostedMcpResult, CliError> {
-        let mut chat = connection_between_turns(&self.chat, CONNECTION_PATIENCE)?;
+        let mut chat = self.connections.services(CONNECTION_PATIENCE)?;
         self.runtime.block_on(chat.mcp_status()).map_err(refused)
     }
 
@@ -552,14 +563,14 @@ impl AttachedRouteBackend for Attachment {
         server: &str,
         action: HostedMcpAction,
     ) -> Result<HostedMcpResult, CliError> {
-        let mut chat = connection_between_turns(&self.chat, CONNECTION_PATIENCE)?;
+        let mut chat = self.connections.services(CONNECTION_PATIENCE)?;
         self.runtime
             .block_on(chat.mcp_control(server, action))
             .map_err(refused)
     }
 
     fn task_snapshot(&self) -> Result<Result<HostedTaskReplay, TaskControlError>, CliError> {
-        let mut chat = connection_between_turns(&self.chat, CONNECTION_PATIENCE)?;
+        let mut chat = self.connections.services(CONNECTION_PATIENCE)?;
         self.runtime
             .block_on(chat.task_snapshot(self.session_id))
             .map_err(refused)
@@ -581,7 +592,7 @@ impl AttachedRouteBackend for Attachment {
             command_id,
             kind,
         );
-        let mut chat = connection_between_turns(&self.chat, CONNECTION_PATIENCE)?;
+        let mut chat = self.connections.services(CONNECTION_PATIENCE)?;
         self.runtime
             .block_on(chat.task_control(&command))
             .map_err(refused)
@@ -678,11 +689,13 @@ pub fn run_attached_tui(
 /// the one thing it carries today is that this launch just started the daemon
 /// the arrival is about to describe.
 ///
-/// This runs one attachment at a time but not necessarily one per launch:
+/// This runs one attachment at a time but not necessarily one per launch.
 /// `/cd` ends the current attachment and comes back here with another
 /// checkout, and the loop re-attaches against it exactly as a fresh launch in
-/// that directory would — rejoining that checkout's open chat or opening one.
-/// The conversation left behind stays alive in the daemon.
+/// that directory would. `/new` and the chat switcher end it with another chat
+/// on the same checkout. Either way the conversation left behind stays alive
+/// in the daemon, still running whatever turn it was running, and this loop is
+/// what makes coming back to it a matter of attaching again.
 pub fn run_attached_tui_with_prompt(
     bootstrap: &Bootstrap,
     socket: &Path,
@@ -694,7 +707,7 @@ pub fn run_attached_tui_with_prompt(
         .project_root
         .clone()
         .unwrap_or_else(|| PathBuf::from("."));
-    let mut resume = resume;
+    let mut opening = resume.map_or(Opening::Rejoin, Opening::Named);
     let mut initial_prompt = initial_prompt;
     let mut startup_notice = startup_notice;
 
@@ -704,20 +717,35 @@ pub fn run_attached_tui_with_prompt(
             bootstrap,
             socket,
             &checkout,
-            resume,
+            opening,
             initial_prompt,
             startup_notice,
             &signals,
         )?;
+
+        // Everything launch-specific belonged to the attachment that ended:
+        // the prompt and the startup notice were already delivered, and the
+        // next attachment says where it landed for itself.
+        initial_prompt = None;
+        startup_notice = None;
 
         // The supervision board is a detour, not a destination: it runs over
         // the terminal the chat just gave back, and coming out of it comes
         // back to the same checkout's conversation.
         if signals.board.load(Ordering::SeqCst) {
             crate::team::run_team_board(socket, signals.own_session())?;
-            resume = None;
-            initial_prompt = None;
-            startup_notice = None;
+            opening = Opening::Rejoin;
+            continue;
+        }
+
+        // Another chat on the same checkout: nothing was said to the one being
+        // left, so it keeps answering, and this terminal opens or rejoins the
+        // one that was asked for.
+        if let Some(target) = signals.take_chat() {
+            opening = match target {
+                SessionSwitch::Fresh => Opening::Fresh,
+                SessionSwitch::Existing(session_id) => Opening::Named(session_id),
+            };
             continue;
         }
 
@@ -725,14 +753,24 @@ pub fn run_attached_tui_with_prompt(
             return Ok(output);
         };
 
-        // Everything launch-specific belonged to the attachment that ended: a
-        // resumed session id names a session on the previous checkout, and the
-        // prompt and startup notice were already delivered.
+        // A resumed session id named a session on the checkout being left, so
+        // the new one starts from what is open there.
         checkout = target;
-        resume = None;
-        initial_prompt = None;
-        startup_notice = None;
+        opening = Opening::Rejoin;
     }
+}
+
+/// Which chat on the checkout an attachment is for.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Opening {
+    /// Come back to the chat already open here, opening one only when there is
+    /// none. What a launch means, and what coming back from the board means.
+    Rejoin,
+    /// Open a chat beside the ones already open. What `/new` means: the chats
+    /// already running here are left running.
+    Fresh,
+    /// Attach to this chat by name, because the person picked it.
+    Named(i64),
 }
 
 /// What one attachment reports back about how it ended, beside its output.
@@ -744,6 +782,9 @@ pub fn run_attached_tui_with_prompt(
 struct AttachmentSignals {
     /// The checkout the person asked to move to, when they asked to move.
     switch: Arc<Mutex<Option<PathBuf>>>,
+    /// The chat on this checkout they asked to move to, when they asked for
+    /// another chat rather than another project.
+    chat: Arc<Mutex<Option<SessionSwitch>>>,
     /// Whether they asked for the supervision board instead of leaving.
     board: Arc<AtomicBool>,
     /// The chat this attachment was on, so the board can mark it as this
@@ -759,17 +800,21 @@ impl AttachmentSignals {
     fn take_switch(&self) -> Option<PathBuf> {
         self.switch.lock().ok().and_then(|mut slot| slot.take())
     }
+
+    fn take_chat(&self) -> Option<SessionSwitch> {
+        self.chat.lock().ok().and_then(|mut slot| slot.take())
+    }
 }
 
-/// One attachment's lifetime: attach to `checkout`'s chat, run the surface
-/// against it, and report how the run ended. `switch` comes back holding a
-/// checkout when the person asked to move to another project's conversation
-/// rather than to leave.
+/// One attachment's lifetime: attach to the chat `opening` names on
+/// `checkout`, run the surface against it, and report how the run ended. The
+/// signals come back holding a checkout or a chat when the person asked to
+/// move to another conversation rather than to leave.
 fn attach_and_run(
     bootstrap: &Bootstrap,
     socket: &Path,
     checkout: &Path,
-    resume: Option<i64>,
+    opening: Opening,
     initial_prompt: Option<&str>,
     startup_notice: Option<&str>,
     signals: &AttachmentSignals,
@@ -780,7 +825,7 @@ fn attach_and_run(
     let (attachment, engine, arrival) = attach(
         socket,
         checkout,
-        resume,
+        opening,
         permissions,
         ask_user,
         Arc::clone(&staging),
@@ -803,6 +848,7 @@ fn attach_and_run(
     let router =
         TuiRuntimeRouter::attached(bootstrap.clone(), Arc::clone(&staging), attachment.clone())
             .with_checkout_switch(Arc::clone(&signals.switch))
+            .with_session_switch(Arc::clone(&signals.chat))
             .with_team_transition(Arc::clone(&signals.board));
     tui.set_palette_entries(router.attached_palette_entries()?);
     tui.set_file_candidates(router.attached_file_candidates()?);
@@ -892,6 +938,12 @@ fn opening_notices(startup_notice: Option<&str>, arrival: &Arrival) -> Vec<Strin
     }
 
     notices.push(arrival.describe());
+    if arrival.siblings > 0 {
+        notices.push(format!(
+            "{} other chats are open here; /chats switches between them and /new opens another",
+            arrival.siblings
+        ));
+    }
     notices.push(
         "attached mode uses daemon-owned commands, skills, files, MCP state, and tasks".to_owned(),
     );
@@ -909,6 +961,12 @@ struct Arrival {
     history: Vec<Message>,
     /// What the daemon said the chat is configured as when it was opened.
     presentation: HostedPresentation,
+    /// How many other chats the daemon holds open on this checkout.
+    ///
+    /// Once there is more than one conversation here, which one this terminal
+    /// is in stops being obvious, so the arrival says how many there are and
+    /// the footer keeps naming the session.
+    siblings: usize,
 }
 
 /// The footer presentation this arrival earns, or `None` when the daemon did
@@ -971,6 +1029,7 @@ impl Arrival {
             landing: Landing::Opened,
             history: Vec::new(),
             presentation: HostedPresentation::default(),
+            siblings: 0,
         }
     }
 
@@ -1000,7 +1059,7 @@ impl Arrival {
 fn attach(
     socket: &Path,
     checkout: &Path,
-    resume: Option<i64>,
+    opening: Opening,
     permissions: TuiPermissionBridge,
     ask_user: TuiAskUserBridge,
     staging: Arc<Mutex<SessionContext>>,
@@ -1019,10 +1078,10 @@ fn attach(
     // otherwise the chat already open for this checkout is the one they mean,
     // because a terminal that opened a second one beside it would leave the
     // first answering into a stream nobody reads.
-    let mut arrival = match resume {
+    let mut arrival = match opening {
         // A named session is the person saying which conversation they want, so
         // it is not second-guessed and not looked up in the listing first.
-        Some(session_id) => {
+        Opening::Named(session_id) => {
             let opened = runtime
                 .block_on(chat.open(checkout, Some(session_id)))
                 .map_err(refused)?;
@@ -1032,9 +1091,23 @@ fn attach(
                 landing: Landing::CameBack { answering: false },
                 history: Vec::new(),
                 presentation: described_presentation(&opened),
+                siblings: 0,
             }
         }
-        None => rejoin_or_open(&runtime, &mut chat, checkout)?,
+        // Unnamed and deliberately not rejoined: the daemon opens a session
+        // beside whatever is already running here, which is what asking for a
+        // new chat means.
+        Opening::Fresh => {
+            let opened = runtime
+                .block_on(chat.open(checkout, None))
+                .map_err(refused)?;
+
+            Arrival {
+                presentation: described_presentation(&opened),
+                ..Arrival::opened(opened.session_id)
+            }
+        }
+        Opening::Rejoin => rejoin_or_open(&runtime, &mut chat, checkout)?,
     };
 
     // Read after the arrival is settled and before the subscription opens, so
@@ -1055,10 +1128,15 @@ fn attach(
     // publishes everything it still does — including its end — onto the
     // stream just opened, while a turn that ended before the subscription can
     // no longer be seen answering and is not adopted.
+    //
+    // The same listing says how many conversations this checkout has, which is
+    // what the arrival needs to say whether being in one of them is a choice.
+    let open = runtime
+        .block_on(chat.open_against(checkout))
+        .map_err(refused)?;
+    arrival.siblings = open.len().saturating_sub(1);
     if matches!(arrival.landing, Landing::CameBack { .. }) {
-        let answering = runtime
-            .block_on(chat.open_against(checkout))
-            .map_err(refused)?
+        let answering = open
             .iter()
             .any(|open| open.session_id == session_id && open.answering);
         arrival.landing = Landing::CameBack { answering };
@@ -1073,7 +1151,10 @@ fn attach(
     Ok((
         Attachment {
             runtime,
-            chat: Mutex::new(chat),
+            connections: Connections {
+                turn: Mutex::new(chat),
+                services: Mutex::new(coordinator.chat()),
+            },
             events: Mutex::new(Box::pin(events)),
             session_id,
             checkout: checkout.to_path_buf(),
@@ -1121,6 +1202,7 @@ fn rejoin_or_open(
                 },
                 history: Vec::new(),
                 presentation: described_presentation(&opened),
+                siblings: 0,
             });
         }
 
@@ -1211,6 +1293,39 @@ fn unavailable(detail: &str) -> CliError {
 /// terminal sees it stop.
 const CONNECTION_PATIENCE: Duration = Duration::from_millis(250);
 
+/// The two connections one attachment holds to the same daemon.
+///
+/// A turn holds its connection for as long as it takes to answer. Everything
+/// else the surface asks — the catalogs it draws, the files it lists, the MCP
+/// state it shows, the task journal it replays — asks on the other one, so a
+/// request made while an answer is arriving never waits on that answer. They
+/// share one socket: a second `chat()` off the same coordinator is another
+/// stream on the channel, not another connection to open.
+struct Connections<T> {
+    /// Held for as long as a turn runs, by the thread following it.
+    turn: Mutex<T>,
+    /// Never held by a turn.
+    services: Mutex<T>,
+}
+
+impl<T> Connections<T> {
+    /// The connection a turn runs on, waited for without a bound because the
+    /// thread asking for it is the one about to run the turn.
+    fn turn(&self) -> Result<MutexGuard<'_, T>, CliError> {
+        self.turn
+            .lock()
+            .map_err(|_| unavailable("the connection to the daemon is unusable"))
+    }
+
+    /// The connection everything that is not a turn runs on.
+    ///
+    /// Still bounded: two requests from different threads can meet here, and
+    /// the thread that draws must not park on one.
+    fn services(&self, patience: Duration) -> Result<MutexGuard<'_, T>, CliError> {
+        connection_between_turns(&self.services, patience)
+    }
+}
+
 /// The connection, for a request that is not the turn.
 ///
 /// Waiting is bounded rather than open-ended: a request the running turn's
@@ -1298,6 +1413,42 @@ mod tests {
         );
     }
 
+    /// A launch names a session, `/new` names none, and the switcher names the
+    /// one that was picked. The run loop turns each into what the next
+    /// attachment opens, and nothing here cancels or closes what is being
+    /// left.
+    #[test]
+    fn every_way_of_naming_the_next_chat_maps_to_one_opening() {
+        assert_eq!(
+            None::<i64>.map_or(Opening::Rejoin, Opening::Named),
+            Opening::Rejoin
+        );
+        assert_eq!(
+            Some(7).map_or(Opening::Rejoin, Opening::Named),
+            Opening::Named(7)
+        );
+
+        let signals = AttachmentSignals::default();
+        *signals.chat.lock().unwrap() = Some(SessionSwitch::Fresh);
+        assert_eq!(signals.take_chat(), Some(SessionSwitch::Fresh));
+        assert_eq!(signals.take_chat(), None, "a switch is taken once");
+
+        *signals.chat.lock().unwrap() = Some(SessionSwitch::Existing(9));
+        assert_eq!(signals.take_chat(), Some(SessionSwitch::Existing(9)));
+    }
+
+    /// The two switches are independent slots: asking for another chat here
+    /// does not move the checkout, and asking for another checkout does not
+    /// name a chat on it.
+    #[test]
+    fn a_chat_switch_leaves_the_checkout_where_it_was() {
+        let signals = AttachmentSignals::default();
+        *signals.chat.lock().unwrap() = Some(SessionSwitch::Fresh);
+
+        assert!(signals.take_switch().is_none());
+        assert_eq!(signals.take_chat(), Some(SessionSwitch::Fresh));
+    }
+
     #[test]
     fn control_ids_do_not_collide_between_attachments() {
         assert_ne!(control_command_id(7, 1, 1), control_command_id(7, 2, 1));
@@ -1345,6 +1496,7 @@ mod tests {
             landing: Landing::CameBack { answering },
             history: Vec::new(),
             presentation: HostedPresentation::default(),
+            siblings: 0,
         }
     }
 
@@ -1372,6 +1524,7 @@ mod tests {
                 bypass_permissions: false,
                 dangerous_mode: false,
             },
+            siblings: 0,
         };
 
         let presentation = arrival_presentation(&arrival).expect("the daemon described the chat");
@@ -1406,6 +1559,7 @@ mod tests {
                 bypass_permissions: true,
                 dangerous_mode: false,
             },
+            siblings: 0,
         };
 
         let mut tui = Tui::new(StubEngine);
@@ -1446,6 +1600,7 @@ mod tests {
                 bypass_permissions: false,
                 dangerous_mode: false,
             },
+            siblings: 0,
         };
 
         let presentation = arrival_presentation(&arrival).expect("the daemon described the chat");
@@ -1478,6 +1633,7 @@ mod tests {
                 bypass_permissions: false,
                 dangerous_mode: false,
             },
+            siblings: 0,
         };
 
         let presentation = arrival_presentation(&arrival).expect("the daemon described the chat");
@@ -1504,6 +1660,7 @@ mod tests {
                 bypass_permissions: false,
                 dangerous_mode: false,
             },
+            siblings: 0,
         };
 
         let presentation = arrival_presentation(&arrival).expect("the daemon described the chat");
@@ -1555,6 +1712,32 @@ mod tests {
 
         assert!(notices[0].contains("session 7"), "{notices:?}");
         assert!(!notices.iter().any(|notice| notice.contains("started")));
+    }
+
+    /// One conversation on a checkout needs no explaining. Several do: the
+    /// arrival says how many there are and how to move between them, and the
+    /// footer keeps naming the one this terminal is in.
+    #[test]
+    fn the_arrival_says_when_this_checkout_has_more_than_one_chat() {
+        let alone = opening_notices(None, &Arrival::opened(7));
+        assert!(
+            !alone.iter().any(|notice| notice.contains("/chats")),
+            "{alone:?}"
+        );
+
+        let crowded = opening_notices(
+            None,
+            &Arrival {
+                siblings: 2,
+                ..Arrival::opened(7)
+            },
+        );
+        let said = crowded
+            .iter()
+            .find(|notice| notice.contains("/chats"))
+            .expect("the arrival names the switcher");
+        assert!(said.contains('2'), "{said}");
+        assert!(said.contains("/new"), "{said}");
     }
 
     /// A fresh chat says that leaving does not stop it, because that is the one
@@ -1725,6 +1908,33 @@ mod tests {
 #[cfg(test)]
 mod connection_tests {
     use super::*;
+
+    /// The point of holding two: a request the surface makes while a turn is
+    /// answering must not wait on the turn at all, let alone be refused for
+    /// it. Nothing in this attachment can put the surface behind the answer.
+    #[test]
+    fn a_request_made_while_a_turn_answers_does_not_wait_on_the_turn() {
+        let connections = Connections {
+            turn: Mutex::new(0_u8),
+            services: Mutex::new(0_u8),
+        };
+        let answering = connections.turn().expect("the turn takes its connection");
+
+        let asked = Instant::now();
+        let served = connections.services(Duration::from_millis(50));
+        let waited = asked.elapsed();
+
+        assert!(
+            served.is_ok(),
+            "a request was refused for a turn it does not share a connection with",
+        );
+        assert!(
+            waited < Duration::from_millis(50),
+            "the request waited {waited:?} on the turn",
+        );
+
+        drop(answering);
+    }
 
     /// The thread that draws is the thread that routes a command, so what a
     /// turn's hold on the connection can cost it is bounded: a wait that

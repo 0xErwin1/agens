@@ -620,6 +620,7 @@ pub fn run_tui_prompt(
                 | TuiSubmissionOutcome::ProviderMessage { .. }
                 | TuiSubmissionOutcome::BusyProviderTurn { .. }
                 | TuiSubmissionOutcome::BusyProviderMessage { .. }
+                | TuiSubmissionOutcome::BusyCommand { .. }
                 | TuiSubmissionOutcome::BusyRefusal(_)
                 | TuiSubmissionOutcome::StagedMediaReplaced { .. }
                 | TuiSubmissionOutcome::SecretEntry(_)

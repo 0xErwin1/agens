@@ -93,6 +93,12 @@ pub struct QueueEntry {
     message: Message,
     resolved: bool,
     steered: bool,
+    /// Whether this entry is a command to run rather than a prompt to answer.
+    ///
+    /// A command waits in the same queue a prompt waits in, and is withdrawn
+    /// the same way, but draining it runs the command instead of starting a
+    /// turn.
+    command: bool,
 }
 
 /// A prompt-scheduler transition safe to expose to local diagnostics.
@@ -183,6 +189,7 @@ impl QueueEntry {
             message,
             resolved: false,
             steered: false,
+            command: false,
         }
     }
 
@@ -193,6 +200,18 @@ impl QueueEntry {
             message,
             resolved: true,
             steered: false,
+            command: false,
+        }
+    }
+
+    fn queued_command(id: u64, display: String, command: String) -> Self {
+        Self {
+            id,
+            prompt: display,
+            message: text_message(command),
+            resolved: true,
+            steered: false,
+            command: true,
         }
     }
 
@@ -209,6 +228,11 @@ impl QueueEntry {
     /// Returns the immutable canonical content owned by this queue entry.
     pub fn message(&self) -> &Message {
         &self.message
+    }
+
+    /// Whether draining this entry runs a command rather than starting a turn.
+    pub const fn is_command(&self) -> bool {
+        self.command
     }
 
     /// Whether this entry was also handed to the mid-turn steering channel.
@@ -255,6 +279,11 @@ pub enum AppEvent {
         display: String,
         message: Message,
     },
+    /// Queues a command to run once the turn that is running ends.
+    QueueCommand {
+        display: String,
+        command: String,
+    },
     /// The running turn collected a steered message at one of its safe points.
     SteeringDelivered {
         text: String,
@@ -294,6 +323,10 @@ pub enum Effect {
     StartQueuedMessage {
         display: String,
         message: Message,
+    },
+    /// Run this queued command now that the turn it waited behind has ended.
+    RunQueuedCommand {
+        command: String,
     },
     /// Hand this queued entry's text to the running turn's steering channel.
     SteerPrompt {
@@ -389,6 +422,7 @@ impl AppState {
             AppEvent::SubmitPrompt(prompt) => self.submit_prompt(prompt),
             AppEvent::QueuePrompt { display, prompt } => self.queue_prompt(display, prompt),
             AppEvent::QueueMessage { display, message } => self.queue_message(display, message),
+            AppEvent::QueueCommand { display, command } => self.queue_command(display, command),
             AppEvent::SteeringDelivered { text } => self.steering_delivered(&text),
             AppEvent::TurnCompletedFor { generation, output } => {
                 self.complete_turn(generation, output)
@@ -439,6 +473,21 @@ impl AppState {
     /// Returns queued entries with stable identities in FIFO order.
     pub fn queued_entries(&self) -> Vec<&QueueEntry> {
         self.queued_prompts.iter().collect()
+    }
+
+    /// Drops every undispatched entry, reporting how many there were.
+    ///
+    /// What is queued belongs to the conversation it was typed in. A surface
+    /// that is leaving that conversation takes the queue with it rather than
+    /// letting it arrive somewhere else.
+    pub fn discard_queue(&mut self) -> usize {
+        let discarded = self.queued_prompts.len();
+        self.queued_prompts.clear();
+        for _ in 0..discarded {
+            self.observability.record(PromptTransition::Removed);
+        }
+
+        discarded
     }
 
     /// Removes an undispatched entry by its stable identity.
@@ -501,6 +550,33 @@ impl AppState {
         self.dialog.as_ref()
     }
 
+    /// Drains the queue that a finished turn left behind.
+    ///
+    /// A queue with entries in it while nothing is running is stalled: the
+    /// ordinary hand-off at the end of a turn only starts prompts, so a queued
+    /// command and everything behind it wait here. Draining one entry per call
+    /// is what keeps a command from racing the turn queued behind it.
+    pub fn take_stalled_queue_entry(&mut self) -> Option<Effect> {
+        if self.lifecycle != TurnLifecycle::Idle || self.queued_prompts.is_empty() {
+            return None;
+        }
+
+        if self
+            .queued_prompts
+            .front()
+            .is_some_and(|entry| entry.command)
+        {
+            let entry = self.queued_prompts.pop_front()?;
+            self.observability.record(PromptTransition::Dequeued);
+
+            return Some(Effect::RunQueuedCommand {
+                command: queued_message_text(&entry.message),
+            });
+        }
+
+        self.begin_next_queued_turn()
+    }
+
     /// Starts one coalesced internal turn only after all user work is idle.
     pub fn take_ready_auto_turn(&mut self) -> Option<usize> {
         if self.pending_auto_turns == 0
@@ -548,6 +624,28 @@ impl AppState {
         let entry = QueueEntry::resolved_message(self.next_queue_entry_id, display, message);
         self.next_queue_entry_id += 1;
         self.enqueue_running(entry)
+    }
+
+    /// Queues a command to run at the end of the turn that is running.
+    ///
+    /// A command waits where a prompt waits: the queue is the same, it shows
+    /// on the surface, and it can be withdrawn. It is never steered into the
+    /// running turn, because it is not something the model is being told.
+    ///
+    /// It is queued even between turns, and drained on the next pass, so there
+    /// is one path that runs a queued command rather than two.
+    fn queue_command(&mut self, display: String, command: String) -> Vec<Effect> {
+        self.disarm_exit();
+        if self.queued_prompts.len() == self.queue_capacity {
+            return vec![Effect::RefusePrompt(QUEUE_FULL_REFUSAL.into())];
+        }
+
+        let entry = QueueEntry::queued_command(self.next_queue_entry_id, display, command);
+        self.next_queue_entry_id += 1;
+        self.queued_prompts.push_back(entry);
+        self.observability.record(PromptTransition::Queued);
+
+        Vec::new()
     }
 
     /// Queues one entry behind the active turn, steering it when the channel
@@ -653,7 +751,16 @@ impl AppState {
             .map(|route| route.prompt.clone())
     }
 
+    /// Starts the next queued prompt, if the next queued entry is a prompt.
+    ///
+    /// A queued command is left where it is. It is drained by
+    /// [`Self::take_stalled_queue_entry`] instead, which keeps running it and
+    /// starting the next turn as two separate steps rather than one race.
     fn begin_next_queued_turn(&mut self) -> Option<Effect> {
+        if self.queued_prompts.front()?.command {
+            return None;
+        }
+
         let entry = self.queued_prompts.pop_front()?;
         self.observability.record(PromptTransition::Dequeued);
         let display = entry.prompt;
@@ -840,5 +947,115 @@ mod tests {
             );
             assert_eq!(app, before);
         }
+    }
+
+    #[test]
+    fn a_command_typed_between_turns_is_drained_on_the_next_pass() {
+        let mut app = AppState::new(2);
+
+        assert_eq!(
+            app.reduce(AppEvent::QueueCommand {
+                display: "/model gpt-5".into(),
+                command: "/model gpt-5".into(),
+            }),
+            Vec::new()
+        );
+        assert_eq!(
+            app.take_stalled_queue_entry(),
+            Some(Effect::RunQueuedCommand {
+                command: "/model gpt-5".into(),
+            })
+        );
+        assert!(app.queued_prompts().is_empty());
+    }
+
+    #[test]
+    fn a_command_typed_during_a_turn_waits_in_the_visible_queue_and_is_never_refused() {
+        let mut app = AppState::new(2);
+        let _ = app.reduce(AppEvent::SubmitPrompt("active".into()));
+
+        assert_eq!(
+            app.reduce(AppEvent::QueueCommand {
+                display: "/model gpt-5".into(),
+                command: "/model gpt-5".into(),
+            }),
+            Vec::new()
+        );
+        assert_eq!(app.queued_prompts(), vec!["/model gpt-5"]);
+        assert!(app.queued_entries()[0].is_command());
+        assert!(!app.queued_entries()[0].steered());
+    }
+
+    #[test]
+    fn a_queued_command_can_be_withdrawn_like_a_queued_prompt() {
+        let mut app = AppState::new(2);
+        let _ = app.reduce(AppEvent::SubmitPrompt("active".into()));
+        let _ = app.reduce(AppEvent::QueueCommand {
+            display: "/effort high".into(),
+            command: "/effort high".into(),
+        });
+
+        let id = app.queued_entries()[0].id();
+
+        assert!(app.remove_queue_entry(id).is_some());
+        assert!(app.queued_prompts().is_empty());
+    }
+
+    #[test]
+    fn a_queued_command_runs_at_the_turns_end_before_the_prompt_behind_it() {
+        let mut app = AppState::new(4);
+        let effects = app.reduce(AppEvent::SubmitPrompt("active".into()));
+        let generation = match effects.first() {
+            Some(Effect::StartPrompt(_)) => app.lifecycle().active().unwrap().generation(),
+            other => panic!("expected a started turn, got {other:?}"),
+        };
+        let _ = app.reduce(AppEvent::QueueCommand {
+            display: "/effort high".into(),
+            command: "/effort high".into(),
+        });
+        let _ = app.reduce(AppEvent::QueuePrompt {
+            display: "and then this".into(),
+            prompt: "and then this".into(),
+        });
+
+        // The turn ending starts no prompt, because a command is in front of it.
+        let effects = app.reduce(AppEvent::TurnCompletedFor {
+            generation,
+            output: "done".into(),
+        });
+        assert!(
+            !effects.iter().any(|effect| matches!(
+                effect,
+                Effect::StartPrompt(_) | Effect::StartQueuedMessage { .. }
+            )),
+            "{effects:?}"
+        );
+
+        assert_eq!(
+            app.take_stalled_queue_entry(),
+            Some(Effect::RunQueuedCommand {
+                command: "/effort high".into(),
+            })
+        );
+        assert_eq!(
+            app.take_stalled_queue_entry(),
+            Some(Effect::StartQueuedMessage {
+                display: "and then this".into(),
+                message: text_message("and then this".into()),
+            })
+        );
+        assert_eq!(app.take_stalled_queue_entry(), None);
+    }
+
+    #[test]
+    fn a_queue_with_a_running_turn_is_not_drained_as_stalled() {
+        let mut app = AppState::new(2);
+        let _ = app.reduce(AppEvent::SubmitPrompt("active".into()));
+        let _ = app.reduce(AppEvent::QueueCommand {
+            display: "/effort high".into(),
+            command: "/effort high".into(),
+        });
+
+        assert_eq!(app.take_stalled_queue_entry(), None);
     }
 }
