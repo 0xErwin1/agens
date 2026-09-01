@@ -559,10 +559,7 @@ impl AttachedRouteBackend for Attachment {
     }
 
     fn task_snapshot(&self) -> Result<Result<HostedTaskReplay, TaskControlError>, CliError> {
-        let mut chat = self
-            .chat
-            .lock()
-            .map_err(|_| unavailable("the connection to the daemon is unusable"))?;
+        let mut chat = connection_between_turns(&self.chat, CONNECTION_PATIENCE)?;
         self.runtime
             .block_on(chat.task_snapshot(self.session_id))
             .map_err(refused)
@@ -584,10 +581,7 @@ impl AttachedRouteBackend for Attachment {
             command_id,
             kind,
         );
-        let mut chat = self
-            .chat
-            .lock()
-            .map_err(|_| unavailable("the connection to the daemon is unusable"))?;
+        let mut chat = connection_between_turns(&self.chat, CONNECTION_PATIENCE)?;
         self.runtime
             .block_on(chat.task_control(&command))
             .map_err(refused)
@@ -1717,5 +1711,40 @@ mod connection_tests {
             connection_between_turns(&connection, Duration::from_millis(50)).is_ok(),
             "the connection is available again once the turn releases it",
         );
+    }
+
+    /// Every request the surface makes off the turn goes through this wait, so
+    /// the two ways it can fail have to read differently: a turn holding the
+    /// connection is something to try again after, and a connection nothing
+    /// can use again is not.
+    #[test]
+    fn a_turns_hold_and_an_unusable_connection_are_told_apart() {
+        let held = Mutex::new(0_u8);
+        let turn = held.lock().expect("the connection is lockable");
+        let busy = connection_between_turns(&held, Duration::from_millis(10))
+            .expect_err("the held connection was handed out")
+            .to_string();
+
+        let broken = Mutex::new(0_u8);
+        let poisoning = std::panic::catch_unwind(|| {
+            let _poisoned = broken.lock().expect("the connection is lockable");
+            panic!("the thread holding the connection died");
+        });
+        assert!(poisoning.is_err(), "the connection was not poisoned");
+
+        let unusable = connection_between_turns(&broken, Duration::from_millis(10))
+            .expect_err("the poisoned connection was handed out")
+            .to_string();
+
+        assert!(
+            busy.contains("once the turn ends"),
+            "the refusal does not say the turn is what is in the way: {busy}",
+        );
+        assert_ne!(
+            busy, unusable,
+            "a turn's hold reads the same as a connection nothing can use",
+        );
+
+        drop(turn);
     }
 }
