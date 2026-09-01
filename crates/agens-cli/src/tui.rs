@@ -123,6 +123,11 @@ pub(crate) fn run_production_tui(
         bootstrap,
         crate::commands::serve::SkewPolicy::RestartWhenIdle,
     )?;
+
+    // `/team` from a local surface asked for the board, not for a daemon. The
+    // daemon is only what the board reads, so it opens on the board and lands
+    // on the attached conversation when the reader asks for one.
+    agens_tui_app::team::run_team_board(&socket, None)?;
     agens_tui_app::attached::run_attached_tui_with_prompt(
         bootstrap,
         &socket,

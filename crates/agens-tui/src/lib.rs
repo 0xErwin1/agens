@@ -9,6 +9,7 @@ mod conversation;
 pub mod perf;
 mod render;
 pub mod shortcuts;
+pub mod team;
 mod terminal;
 mod widgets;
 

@@ -17,7 +17,9 @@ pub(crate) use blocks::{
     is_ask_user_tool_name, tool_argument_detail_text, tool_header,
 };
 pub use capability::{ColorLevel, UnicodeLevel};
-pub(crate) use capability::{Glyph, detect_color_level, detect_unicode_level, quantize_buffer};
+pub(crate) use capability::{
+    Glyph, detect_capabilities, detect_color_level, detect_unicode_level, quantize_buffer,
+};
 pub use expand::DisplayMode;
 pub(crate) use expand::{ExpandMode, ExpandableBody};
 pub use footer::abbreviate_path;

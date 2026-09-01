@@ -13,6 +13,7 @@ use agens_core::{
 };
 use agens_error::CliError;
 use agens_store::{OpenQuestionStatus, QuestionClass, QuestionStore, SessionStore};
+use agens_tui::team::waiting_label_for_kind;
 use serde::Serialize;
 use tokio_stream::{Stream, StreamExt};
 
@@ -137,10 +138,9 @@ pub(crate) fn run_team_ls(json: bool, dependencies: &CliDependencies) -> Result<
                     .filter_map(|attempt| attempt.session_id)
                     .find_map(|session_id| waiting_sessions.get(&session_id).cloned())
                     .or_else(|| {
-                        inbox.get(&run.run_id).map(|item| match item.kind.as_str() {
-                            "approval" => "merge authorization".to_owned(),
-                            _ => "question".to_owned(),
-                        })
+                        inbox
+                            .get(&run.run_id)
+                            .map(|item| waiting_label_for_kind(&item.kind).to_owned())
                     });
 
                 items.push(FleetItem {
