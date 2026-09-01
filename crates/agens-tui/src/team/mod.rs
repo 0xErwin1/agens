@@ -13,13 +13,21 @@ mod model;
 mod render;
 
 pub use model::{
-    TeamAttempt, TeamEvent, TeamEventClass, TeamInboxItem, TeamNode, TeamNodeDetail, TeamNodeKind,
-    TeamQuestion, TeamRepo, TeamSnapshot, TeamState, format_cost, format_duration,
-    waiting_label_for_kind,
+    TeamAttempt, TeamEvent, TeamEventClass, TeamInboxItem, TeamLens, TeamLogLine, TeamNode,
+    TeamNodeDetail, TeamNodeKind, TeamQuestion, TeamRepo, TeamSnapshot, TeamState, format_cost,
+    format_duration, waiting_label_for_kind,
 };
 pub use render::TeamScreen;
 
+use std::collections::VecDeque;
+
 use crate::Key;
+
+/// How many journal lines the wall holds before the oldest scroll off.
+///
+/// The fleet's journal is unbounded and the board is long-lived, so the wall is
+/// a window on it rather than a transcript of it.
+pub(crate) const LOG_CAPACITY: usize = 500;
 
 /// Which tab the surface is showing.
 ///
@@ -31,16 +39,19 @@ pub enum TeamTab {
     #[default]
     Tree,
     Inbox,
+    Logs,
 }
 
 impl TeamTab {
     /// The tabs in the order the header shows them, the chat included.
-    pub(crate) const HEADER: [(u8, &'static str); 3] = [(0, "chat"), (1, "tree"), (2, "inbox")];
+    pub(crate) const HEADER: [(u8, &'static str); 4] =
+        [(0, "chat"), (1, "tree"), (2, "inbox"), (3, "logs")];
 
     pub(crate) const fn digit(self) -> u8 {
         match self {
             Self::Tree => 1,
             Self::Inbox => 2,
+            Self::Logs => 3,
         }
     }
 }
@@ -137,6 +148,10 @@ pub struct TeamSurface {
     answering: Option<AnswerPrompt>,
     /// What went wrong last, when something did.
     notice: Option<String>,
+    /// The fleet's journal as it arrives, oldest first, newest last.
+    logs: VecDeque<TeamLogLine>,
+    /// How much of that journal the wall is showing.
+    lens: TeamLens,
 }
 
 impl TeamSurface {
@@ -153,6 +168,8 @@ impl TeamSurface {
             inbox_selected: 0,
             answering: None,
             notice: None,
+            logs: VecDeque::new(),
+            lens: TeamLens::default(),
         }
     }
 
@@ -213,6 +230,26 @@ impl TeamSurface {
         self.notice.as_deref()
     }
 
+    /// Records one line of the fleet's journal, dropping the oldest once the
+    /// window is full.
+    pub fn push_log(&mut self, line: TeamLogLine) {
+        if self.logs.len() == LOG_CAPACITY {
+            self.logs.pop_front();
+        }
+
+        self.logs.push_back(line);
+    }
+
+    /// The journal as the current lens admits it, oldest first.
+    pub fn logs(&self) -> impl Iterator<Item = &TeamLogLine> {
+        self.logs.iter().filter(|line| self.lens.admits(line))
+    }
+
+    #[must_use]
+    pub const fn lens(&self) -> TeamLens {
+        self.lens
+    }
+
     #[must_use]
     pub const fn tab(&self) -> TeamTab {
         self.tab
@@ -251,6 +288,11 @@ impl TeamSurface {
             Key::Char('0') | Key::Escape => TeamCommand::LeaveToChat,
             Key::Char('1') => self.show(TeamTab::Tree),
             Key::Char('2') => self.show(TeamTab::Inbox),
+            Key::Char('3') => self.show(TeamTab::Logs),
+            Key::Char('l') if self.tab == TeamTab::Logs => {
+                self.lens = self.lens.next();
+                TeamCommand::Handled
+            }
             _ => TeamCommand::Ignored,
         }
     }
@@ -290,6 +332,7 @@ impl TeamSurface {
         let question = match self.tab {
             TeamTab::Inbox => self.snapshot.inbox.get(self.inbox_selected),
             TeamTab::Tree => self.selected.and_then(|id| self.snapshot.question_for(id)),
+            TeamTab::Logs => None,
         };
         let Some(question) = question.cloned() else {
             return TeamCommand::Ignored;
@@ -301,7 +344,7 @@ impl TeamSurface {
 
     /// Opens or closes the full-frame detail of the selected node.
     fn toggle_expanded(&mut self) -> TeamCommand {
-        if self.selected.is_none() {
+        if self.tab == TeamTab::Logs || self.selected.is_none() {
             return TeamCommand::Ignored;
         }
 
@@ -317,8 +360,12 @@ impl TeamSurface {
     /// Moves the selection by whole nodes, ignoring the repository headers
     /// between them, and stops at both ends rather than wrapping.
     fn step(&mut self, delta: isize) -> TeamCommand {
-        if self.tab == TeamTab::Inbox {
-            return self.step_inbox(delta);
+        match self.tab {
+            TeamTab::Inbox => return self.step_inbox(delta),
+            // The wall tails the journal. Moving here would silently walk the
+            // tree behind it, and fetch details for a node nobody can see.
+            TeamTab::Logs => return TeamCommand::Ignored,
+            TeamTab::Tree => {}
         }
 
         let ids: Vec<i64> = self
@@ -550,6 +597,62 @@ mod tests {
         surface.handle_key(Key::Down);
 
         assert_eq!(surface.detail(), None);
+    }
+
+    fn log(kind: &str, class: TeamEventClass, ts: i64) -> TeamLogLine {
+        TeamLogLine {
+            repo: "agens".to_owned(),
+            run_id: Some(11),
+            class,
+            kind: kind.to_owned(),
+            payload: String::new(),
+            ts,
+        }
+    }
+
+    #[test]
+    fn the_wall_keeps_the_newest_lines_and_drops_what_scrolled_off() {
+        let mut surface = TeamSurface::new(fleet());
+
+        for index in 0..(LOG_CAPACITY + 5) {
+            let ts = i64::try_from(index).unwrap();
+            surface.push_log(log("turn_started", TeamEventClass::Agent, ts));
+        }
+
+        let kept: Vec<i64> = surface.logs().map(|line| line.ts).collect();
+
+        assert_eq!(kept.len(), LOG_CAPACITY);
+        assert_eq!(kept.first(), Some(&5));
+        assert_eq!(kept.last(), Some(&i64::try_from(LOG_CAPACITY + 4).unwrap()));
+    }
+
+    #[test]
+    fn the_lens_cycles_through_each_class_and_back_to_the_whole_journal() {
+        let mut surface = TeamSurface::new(fleet());
+        surface.push_log(log("turn_started", TeamEventClass::Agent, 1));
+        surface.push_log(log("worktree_created", TeamEventClass::Infra, 2));
+        surface.handle_key(Key::Char('3'));
+
+        assert_eq!(surface.lens(), TeamLens::Everything);
+        assert_eq!(surface.logs().count(), 2);
+
+        assert_eq!(surface.handle_key(Key::Char('l')), TeamCommand::Handled);
+        assert_eq!(surface.lens(), TeamLens::Class(TeamEventClass::Agent));
+        assert_eq!(surface.logs().count(), 1);
+
+        surface.handle_key(Key::Char('l'));
+        assert_eq!(surface.lens(), TeamLens::Class(TeamEventClass::Infra));
+
+        surface.handle_key(Key::Char('l'));
+        assert_eq!(surface.lens(), TeamLens::Everything);
+    }
+
+    #[test]
+    fn the_lens_key_means_nothing_where_there_is_no_wall_to_narrow() {
+        let mut surface = TeamSurface::new(fleet());
+
+        assert_eq!(surface.handle_key(Key::Char('l')), TeamCommand::Ignored);
+        assert_eq!(surface.lens(), TeamLens::Everything);
     }
 
     #[test]

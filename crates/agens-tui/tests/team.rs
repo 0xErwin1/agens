@@ -3,8 +3,9 @@
 use std::time::Duration;
 
 use agens_tui::team::{
-    TeamAnswer, TeamAttempt, TeamCommand, TeamEvent, TeamEventClass, TeamInboxItem, TeamNode,
-    TeamNodeDetail, TeamQuestion, TeamRepo, TeamScreen, TeamSnapshot, TeamState, TeamSurface,
+    TeamAnswer, TeamAttempt, TeamCommand, TeamEvent, TeamEventClass, TeamInboxItem, TeamLogLine,
+    TeamNode, TeamNodeDetail, TeamQuestion, TeamRepo, TeamScreen, TeamSnapshot, TeamState,
+    TeamSurface,
 };
 use agens_tui::{ColorLevel, Key, UnicodeLevel};
 use ratatui::{Terminal, backend::TestBackend};
@@ -515,6 +516,106 @@ fn a_reading_that_failed_is_said_out_loud_rather_than_swallowed() {
 
     assert!(
         rendered(&screen).contains("the daemon stopped answering"),
+        "{}",
+        rendered(&screen)
+    );
+}
+
+fn wall() -> Vec<TeamLogLine> {
+    vec![
+        TeamLogLine {
+            repo: "agens".to_owned(),
+            run_id: Some(11),
+            class: TeamEventClass::Agent,
+            kind: "tool_called".to_owned(),
+            payload: "{\"name\":\"edit\"}".to_owned(),
+            ts: 10,
+        },
+        TeamLogLine {
+            repo: "harness".to_owned(),
+            run_id: Some(21),
+            class: TeamEventClass::Infra,
+            kind: "worktree_created".to_owned(),
+            payload: "/tmp/harness".to_owned(),
+            ts: 11,
+        },
+    ]
+}
+
+#[test]
+fn the_wall_is_tab_three_and_names_where_every_line_came_from() {
+    let mut screen = screen(100, 30);
+    let mut surface = TeamSurface::new(fleet());
+    for line in wall() {
+        surface.push_log(line);
+    }
+
+    assert_eq!(surface.handle_key(Key::Char('3')), TeamCommand::Handled);
+    screen.draw(&surface).expect("the board draws");
+    let text = rendered(&screen);
+
+    assert!(text.contains("[3 logs]"), "{text}");
+    assert!(text.contains("agens"), "{text}");
+    assert!(text.contains("11"), "{text}");
+    assert!(text.contains("tool_called"), "{text}");
+    assert!(text.contains("worktree_created"), "{text}");
+}
+
+#[test]
+fn a_lens_narrows_the_wall_to_the_class_it_names() {
+    let mut screen = screen(100, 30);
+    let mut surface = TeamSurface::new(fleet());
+    for line in wall() {
+        surface.push_log(line);
+    }
+    surface.handle_key(Key::Char('3'));
+
+    assert_eq!(surface.handle_key(Key::Char('l')), TeamCommand::Handled);
+    screen.draw(&surface).expect("the board draws");
+    let text = rendered(&screen);
+
+    assert!(text.contains("tool_called"), "{text}");
+    assert!(!text.contains("worktree_created"), "{text}");
+
+    surface.handle_key(Key::Char('l'));
+    screen.draw(&surface).expect("the board draws");
+    let text = rendered(&screen);
+
+    assert!(text.contains("worktree_created"), "{text}");
+    assert!(!text.contains("tool_called"), "{text}");
+}
+
+#[test]
+fn a_quiet_journal_says_so_instead_of_drawing_a_blank_wall() {
+    let mut screen = screen(100, 30);
+    let mut surface = TeamSurface::new(fleet());
+    surface.handle_key(Key::Char('3'));
+
+    screen.draw(&surface).expect("the board draws");
+
+    assert!(
+        rendered(&screen).contains("the journal has said nothing yet"),
+        "{}",
+        rendered(&screen)
+    );
+}
+
+#[test]
+fn the_footer_names_the_lens_key_only_where_it_does_something() {
+    let mut screen = screen(100, 30);
+    let mut surface = TeamSurface::new(fleet());
+
+    screen.draw(&surface).expect("the board draws");
+    assert!(
+        !rendered(&screen).contains("l lens"),
+        "{}",
+        rendered(&screen)
+    );
+
+    surface.handle_key(Key::Char('3'));
+    screen.draw(&surface).expect("the board draws");
+    assert!(
+        rendered(&screen).contains("l lens"),
         "{}",
         rendered(&screen)
     );

@@ -9,22 +9,31 @@
 //!
 //! Every function here is a projection. Nothing decides, retries or writes.
 
+use std::collections::BTreeSet;
 use std::path::Path;
+use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agens_coordinator_client::{ClientError, Coordinator, OpenChat, proto};
 use agens_error::{CliError, ExitStatus};
 use agens_tui::team::{
-    TeamAnswer, TeamAttempt, TeamCommand, TeamEvent, TeamEventClass, TeamInboxItem, TeamNode,
-    TeamNodeDetail, TeamQuestion, TeamRepo, TeamScreen, TeamSnapshot, TeamState, TeamSurface,
+    TeamAnswer, TeamAttempt, TeamCommand, TeamEvent, TeamEventClass, TeamInboxItem, TeamLogLine,
+    TeamNode, TeamNodeDetail, TeamQuestion, TeamRepo, TeamScreen, TeamSnapshot, TeamState,
+    TeamSurface,
 };
 use agens_tui::{Event, Terminal};
 use tokio::runtime::Runtime;
+use tokio_stream::StreamExt;
 
 /// How long the board parks on the keyboard before it redraws anyway.
 const POLL: Duration = Duration::from_millis(200);
 /// How often the fleet is read again while nobody is pressing anything.
 const REFRESH: Duration = Duration::from_secs(2);
+/// How many journal lines one draw drains before painting anyway.
+///
+/// A fleet under load produces faster than a terminal repaints, so the drain is
+/// bounded: the wall stays behind by a frame rather than starving the redraw.
+const DRAIN_LIMIT: usize = 256;
 
 /// Runs whose cost and attempt count are worth a detail round trip.
 ///
@@ -76,12 +85,15 @@ fn drive(
 ) -> Result<(), CliError> {
     let mut screen = TeamScreen::stdout().map_err(surface_failure)?;
     let mut refreshed = Instant::now();
+    let mut journal = JournalTail::new();
+    journal.follow(runtime, coordinator, surface.snapshot());
 
     if let Some(id) = surface.selected() {
         load_detail(surface, runtime, coordinator, id);
     }
 
     loop {
+        journal.drain(surface);
         screen.draw(surface).map_err(surface_failure)?;
 
         if let Some(Event::Key(key)) = terminal.poll(POLL).map_err(surface_failure)? {
@@ -103,11 +115,101 @@ fn drive(
 
         match runtime.block_on(read_fleet(coordinator, own_session, now_seconds())) {
             Ok(snapshot) => {
+                journal.follow(runtime, coordinator, &snapshot);
                 surface.refresh(snapshot);
                 surface.set_notice(None);
             }
             Err(error) => surface.set_notice(Some(format!("the fleet could not be read: {error}"))),
         }
+    }
+}
+
+/// The fleet's journal as it arrives, one subscription per repository.
+///
+/// The daemon's feed is scoped to a repository on purpose: one daemon serves N
+/// projects, and an unscoped stream would hand a surface another project's
+/// runs. A board watches all of them, so it holds one subscription each and
+/// merges what they say into a single wall.
+struct JournalTail {
+    lines: Receiver<TeamLogLine>,
+    sender: Sender<TeamLogLine>,
+    /// The repositories already subscribed to, so a refresh that names the
+    /// same ones does not open a second stream over each.
+    following: BTreeSet<String>,
+}
+
+impl JournalTail {
+    fn new() -> Self {
+        let (sender, lines) = channel();
+
+        Self {
+            lines,
+            sender,
+            following: BTreeSet::new(),
+        }
+    }
+
+    /// Opens a subscription for every repository in the snapshot that is not
+    /// being followed yet. A repository exists because somebody created a run
+    /// against it, so the set grows while the board is up.
+    fn follow(&mut self, runtime: &Runtime, coordinator: &Coordinator, snapshot: &TeamSnapshot) {
+        for repo_id in self.opened(snapshot) {
+            let label = snapshot
+                .repos
+                .iter()
+                .find(|repo| repo.id == repo_id)
+                .map_or_else(|| repo_id.clone(), |repo| repo.label.clone());
+            let mut feed = coordinator.feed();
+            let sender = self.sender.clone();
+
+            runtime.spawn(async move {
+                let Ok(mut events) = feed.subscribe(&repo_id, Vec::new()).await else {
+                    return;
+                };
+
+                while let Some(Ok(event)) = events.next().await {
+                    if sender.send(log_line(&label, &event)).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    }
+
+    /// Marks every repository worth a new subscription and reports which ones
+    /// those are. A repository with no nodes has no journal to follow yet.
+    fn opened(&mut self, snapshot: &TeamSnapshot) -> Vec<String> {
+        snapshot
+            .repos
+            .iter()
+            .filter(|repo| !repo.nodes.is_empty())
+            .map(|repo| repo.id.clone())
+            .filter(|id| self.following.insert(id.clone()))
+            .collect()
+    }
+
+    /// Moves whatever has arrived onto the wall, bounded so a loud fleet cannot
+    /// hold the frame.
+    fn drain(&self, surface: &mut TeamSurface) {
+        for _ in 0..DRAIN_LIMIT {
+            match self.lines.try_recv() {
+                Ok(line) => surface.push_log(line),
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => return,
+            }
+        }
+    }
+}
+
+/// One journal entry as the wall shows it, headed by the repository it belongs
+/// to rather than by the fingerprint the wire names.
+fn log_line(repo: &str, event: &proto::Event) -> TeamLogLine {
+    TeamLogLine {
+        repo: repo.to_owned(),
+        run_id: event.run_id,
+        class: TeamEventClass::parse(&event.class),
+        kind: event.r#type.clone(),
+        payload: event.payload.clone(),
+        ts: event.ts,
     }
 }
 
@@ -659,5 +761,54 @@ mod tests {
     fn a_clock_that_moved_backwards_reads_as_no_time_rather_than_a_future_span() {
         assert_eq!(elapsed(1_000, 1_500), Duration::from_secs(0));
         assert_eq!(elapsed(1_500, 1_000), Duration::from_secs(500));
+    }
+
+    #[test]
+    fn a_journal_line_is_headed_by_the_repository_rather_than_its_fingerprint() {
+        let line = log_line("agens", &event("infra", "worktree_created", 1_700));
+
+        assert_eq!(line.repo, "agens");
+        assert_eq!(line.run_id, Some(11));
+        assert_eq!(line.class, TeamEventClass::Infra);
+        assert_eq!(line.kind, "worktree_created");
+        assert_eq!(line.ts, 1_700);
+    }
+
+    #[test]
+    fn a_repository_is_followed_once_however_often_it_is_read_again() {
+        let mut journal = JournalTail::new();
+        let snapshot = TeamSnapshot {
+            inbox: Vec::new(),
+            repos: vec![
+                TeamRepo {
+                    id: "a1b2".to_owned(),
+                    label: "agens".to_owned(),
+                    nodes: vec![TeamNode::run(11, "ship the api", TeamState::Running)],
+                },
+                TeamRepo {
+                    id: "empty".to_owned(),
+                    label: "empty".to_owned(),
+                    nodes: Vec::new(),
+                },
+            ],
+        };
+
+        assert_eq!(journal.opened(&snapshot), vec!["a1b2".to_owned()]);
+        assert!(journal.opened(&snapshot).is_empty());
+    }
+
+    #[test]
+    fn the_drain_moves_what_arrived_onto_the_wall_and_stops_when_it_is_empty() {
+        let journal = JournalTail::new();
+        let mut surface = TeamSurface::new(TeamSnapshot::default());
+        journal
+            .sender
+            .send(log_line("agens", &event("agent", "turn_started", 1)))
+            .expect("the wall is listening");
+
+        journal.drain(&mut surface);
+        journal.drain(&mut surface);
+
+        assert_eq!(surface.logs().count(), 1);
     }
 }

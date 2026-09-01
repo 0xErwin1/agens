@@ -16,7 +16,7 @@ use ratatui::{
 };
 
 use super::model::{
-    TeamEventClass, TeamInboxItem, TeamNode, TeamNodeDetail, TeamNodeKind, TeamState,
+    TeamEventClass, TeamInboxItem, TeamLogLine, TeamNode, TeamNodeDetail, TeamNodeKind, TeamState,
 };
 use super::{AnswerPrompt, TeamRow, TeamSurface, TeamTab};
 use crate::widgets::{ColorLevel, UnicodeLevel, quantize_buffer};
@@ -178,6 +178,10 @@ fn render_body(frame: &mut Frame<'_>, surface: &TeamSurface, level: UnicodeLevel
         frame.render_widget(inbox_pane(surface, level), body);
         return;
     }
+    if surface.tab() == TeamTab::Logs {
+        frame.render_widget(logs_pane(surface, body.height), body);
+        return;
+    }
     if surface.is_expanded() {
         frame.render_widget(detail_pane(surface, level, true), body);
         return;
@@ -257,10 +261,10 @@ fn footer_line(surface: &TeamSurface, level: UnicodeLevel) -> Paragraph<'static>
         )));
     }
 
-    keys_line(level)
+    keys_line(surface.tab(), level)
 }
 
-fn keys_line(level: UnicodeLevel) -> Paragraph<'static> {
+fn keys_line(tab: TeamTab, level: UnicodeLevel) -> Paragraph<'static> {
     let enter = match level {
         UnicodeLevel::Extended => "⏎",
         UnicodeLevel::Ascii => "enter",
@@ -270,10 +274,67 @@ fn keys_line(level: UnicodeLevel) -> Paragraph<'static> {
         UnicodeLevel::Ascii => "up/down",
     };
 
-    Paragraph::new(Line::from(Span::styled(
-        format!(" {arrows} move   {enter} detail   a answer   0 chat   esc back "),
-        DIM,
-    )))
+    let keys = if tab == TeamTab::Logs {
+        " l lens   0 chat   esc back ".to_owned()
+    } else {
+        format!(" {arrows} move   {enter} detail   a answer   0 chat   esc back ")
+    };
+
+    Paragraph::new(Line::from(Span::styled(keys, DIM)))
+}
+
+/// The whole fleet's journal, newest at the bottom, through the current lens.
+///
+/// The wall tails rather than scrolls: it exists to be watched, and a reader
+/// who wants one run's journal opens that run's detail instead.
+fn logs_pane<'a>(surface: &'a TeamSurface, height: u16) -> Paragraph<'a> {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .padding(Padding::horizontal(1))
+        .title(format!(" logs · {} ", surface.lens().label()));
+    let room = usize::from(height.saturating_sub(2)).max(1);
+    let lines: Vec<Line<'static>> = surface
+        .logs()
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .take(room)
+        .rev()
+        .map(log_line)
+        .collect();
+
+    if lines.is_empty() {
+        return Paragraph::new(Line::from(Span::styled(
+            "the journal has said nothing yet",
+            DIM,
+        )))
+        .block(block);
+    }
+
+    Paragraph::new(lines).block(block)
+}
+
+fn log_line(line: &TeamLogLine) -> Line<'static> {
+    let origin = match line.run_id {
+        Some(run_id) => format!("{} {run_id} ", line.repo,),
+        None => format!("{} ", line.repo),
+    };
+
+    Line::from(vec![
+        Span::styled(origin, DIM),
+        Span::styled(
+            format!("{} ", line.kind),
+            Style::new().fg(class_color(line.class)),
+        ),
+        Span::styled(one_line(&line.payload), DIM),
+    ])
+}
+
+const fn class_color(class: TeamEventClass) -> Color {
+    match class {
+        TeamEventClass::Agent => Color::Green,
+        TeamEventClass::Infra => Color::Blue,
+    }
 }
 
 fn tree_pane<'a>(surface: &'a TeamSurface, level: UnicodeLevel) -> Paragraph<'a> {

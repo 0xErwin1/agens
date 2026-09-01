@@ -416,6 +416,67 @@ pub struct TeamEvent {
     pub ts: i64,
 }
 
+/// One line of the fleet-wide journal, with where it came from kept.
+///
+/// A run's own journal is read back with the run. This is the other reading:
+/// what the whole fleet is saying while nobody is standing on any one node, so
+/// each line has to carry its own origin or it says nothing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TeamLogLine {
+    pub repo: String,
+    /// Absent for a fact that belongs to no run, such as a provider's quota
+    /// resetting.
+    pub run_id: Option<i64>,
+    pub class: TeamEventClass,
+    pub kind: String,
+    pub payload: String,
+    pub ts: i64,
+}
+
+/// How much of the journal the wall is showing.
+///
+/// The classes are the journal's own split, the same one the detail view draws
+/// the two halves with: what the agent did, and what the machine did to it.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TeamLens {
+    #[default]
+    Everything,
+    Class(TeamEventClass),
+}
+
+impl TeamLens {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Everything => "everything",
+            Self::Class(class) => class.label(),
+        }
+    }
+
+    /// The next lens in the cycle, ending back at the whole journal so no
+    /// reader is ever stuck inside one class.
+    #[must_use]
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Everything => Self::Class(TeamEventClass::Agent),
+            Self::Class(TeamEventClass::Agent) => Self::Class(TeamEventClass::Infra),
+            Self::Class(TeamEventClass::Infra) => Self::Everything,
+        }
+    }
+
+    #[must_use]
+    pub const fn admits(self, line: &TeamLogLine) -> bool {
+        match self {
+            Self::Everything => true,
+            Self::Class(class) => matches!(
+                (class, line.class),
+                (TeamEventClass::Agent, TeamEventClass::Agent)
+                    | (TeamEventClass::Infra, TeamEventClass::Infra)
+            ),
+        }
+    }
+}
+
 /// Everything the detail view knows about one node, as the daemon reports it.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TeamNodeDetail {
