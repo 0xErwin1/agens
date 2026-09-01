@@ -41,7 +41,7 @@ agens-perf = { path = "../agens-perf", optional = true }
 agens-tui = { path = "../agens-tui" }
 ratatui = { version = "0.30.2", optional = true }
 serde_json = "1"
-tokio = { version = "1", features = ["rt", "time"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "time"] }
 tokio-stream = "0.1"
 
 [dev-dependencies]
