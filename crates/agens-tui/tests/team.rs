@@ -614,9 +614,31 @@ fn the_footer_names_the_lens_key_only_where_it_does_something() {
 
     surface.handle_key(Key::Char('3'));
     screen.draw(&surface).expect("the board draws");
-    assert!(
-        rendered(&screen).contains("l lens"),
-        "{}",
-        rendered(&screen)
-    );
+    let text = rendered(&screen);
+    assert!(text.contains("l lens"), "{text}");
+    assert!(text.contains("a answer"), "{text}");
+    assert!(!text.contains("detail"), "{text}");
+}
+
+#[test]
+fn answering_from_the_wall_falls_back_to_the_inbox_it_cannot_select_from() {
+    let mut screen = screen(100, 30);
+    let mut surface = TeamSurface::new(fleet_with_inbox());
+    surface.handle_key(Key::Char('3'));
+
+    assert_eq!(surface.handle_key(Key::Char('a')), TeamCommand::Handled);
+    screen.draw(&surface).expect("the board draws");
+    let text = rendered(&screen);
+
+    assert!(text.contains("[2 inbox]"), "{text}");
+    assert!(text.contains("answer question 5"), "{text}");
+}
+
+#[test]
+fn a_wall_with_nothing_waiting_refuses_to_answer_rather_than_moving_the_reader() {
+    let mut surface = TeamSurface::new(fleet());
+    surface.handle_key(Key::Char('3'));
+
+    assert_eq!(surface.handle_key(Key::Char('a')), TeamCommand::Ignored);
+    assert_eq!(surface.lens().label(), "everything");
 }

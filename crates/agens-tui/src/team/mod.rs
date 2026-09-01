@@ -332,12 +332,18 @@ impl TeamSurface {
         let question = match self.tab {
             TeamTab::Inbox => self.snapshot.inbox.get(self.inbox_selected),
             TeamTab::Tree => self.selected.and_then(|id| self.snapshot.question_for(id)),
-            TeamTab::Logs => None,
+            // The wall selects nothing, so answering from it means answering
+            // whatever is waiting. Showing the inbox as it opens is how the
+            // reader sees which question that turned out to be.
+            TeamTab::Logs => self.snapshot.inbox.get(self.inbox_selected),
         };
         let Some(question) = question.cloned() else {
             return TeamCommand::Ignored;
         };
 
+        if self.tab == TeamTab::Logs {
+            self.tab = TeamTab::Inbox;
+        }
         self.answering = Some(AnswerPrompt::new(question));
         TeamCommand::Handled
     }

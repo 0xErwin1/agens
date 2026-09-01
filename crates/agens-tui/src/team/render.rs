@@ -275,7 +275,7 @@ fn keys_line(tab: TeamTab, level: UnicodeLevel) -> Paragraph<'static> {
     };
 
     let keys = if tab == TeamTab::Logs {
-        " l lens   0 chat   esc back ".to_owned()
+        " l lens   a answer   0 chat   esc back ".to_owned()
     } else {
         format!(" {arrows} move   {enter} detail   a answer   0 chat   esc back ")
     };
