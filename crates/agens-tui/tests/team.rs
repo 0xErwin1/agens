@@ -504,3 +504,18 @@ fn a_repository_is_headed_by_its_label_rather_than_its_fingerprint() {
     assert!(text.contains("agens"), "{text}");
     assert!(!text.contains("a1b2c3d4e5f60718"), "{text}");
 }
+
+#[test]
+fn a_reading_that_failed_is_said_out_loud_rather_than_swallowed() {
+    let mut screen = screen(100, 30);
+    let mut surface = TeamSurface::new(fleet());
+    surface.set_notice(Some("the daemon stopped answering".to_owned()));
+
+    screen.draw(&surface).expect("the board draws");
+
+    assert!(
+        rendered(&screen).contains("the daemon stopped answering"),
+        "{}",
+        rendered(&screen)
+    );
+}

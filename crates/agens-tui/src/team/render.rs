@@ -8,7 +8,7 @@ use std::io;
 
 use ratatui::{
     Frame, Terminal,
-    backend::Backend,
+    backend::{Backend, CrosstermBackend},
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
@@ -37,6 +37,23 @@ pub struct TeamScreen<B: Backend> {
     terminal: Terminal<B>,
     color_level: ColorLevel,
     unicode_level: UnicodeLevel,
+}
+
+impl TeamScreen<CrosstermBackend<std::io::Stdout>> {
+    /// A board painted onto this process's terminal, at whatever colour and
+    /// glyph repertoire the environment claims.
+    ///
+    /// The composition root of a real session calls this. A test builds its own
+    /// backend instead, so what it renders does not move with `TERM`.
+    pub fn stdout() -> io::Result<Self> {
+        let (color_level, unicode_level) = crate::widgets::detect_capabilities();
+
+        Ok(Self::new(
+            Terminal::new(CrosstermBackend::new(std::io::stdout()))?,
+            color_level,
+            unicode_level,
+        ))
+    }
 }
 
 impl<B: Backend> TeamScreen<B> {
@@ -84,7 +101,7 @@ fn render_team(frame: &mut Frame<'_>, surface: &TeamSurface, level: UnicodeLevel
     frame.render_widget(header_line(surface), header);
     frame.render_widget(tab_line(surface.tab()), tabs);
     render_body(frame, surface, level, body);
-    frame.render_widget(footer_line(level), footer);
+    frame.render_widget(footer_line(surface, level), footer);
 
     if let Some(prompt) = surface.answering() {
         render_answer_prompt(frame, prompt, level, area);
@@ -232,7 +249,18 @@ fn tab_line(active: TeamTab) -> Paragraph<'static> {
     Paragraph::new(Line::from(spans))
 }
 
-fn footer_line(level: UnicodeLevel) -> Paragraph<'static> {
+fn footer_line(surface: &TeamSurface, level: UnicodeLevel) -> Paragraph<'static> {
+    if let Some(notice) = surface.notice() {
+        return Paragraph::new(Line::from(Span::styled(
+            format!(" {notice} "),
+            Style::new().fg(Color::Red),
+        )));
+    }
+
+    keys_line(level)
+}
+
+fn keys_line(level: UnicodeLevel) -> Paragraph<'static> {
     let enter = match level {
         UnicodeLevel::Extended => "⏎",
         UnicodeLevel::Ascii => "enter",

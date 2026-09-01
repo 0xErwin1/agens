@@ -1406,6 +1406,27 @@ fn team_switches_out_of_local_mode_and_praetor_is_not_an_agent_rotation() {
 }
 
 #[test]
+fn team_from_an_attached_terminal_raises_the_board_the_same_way() {
+    let temporary = tui_session_directory("attached-team-transition");
+    let bootstrap = tui_session_bootstrap(&temporary, &[]);
+    let requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let router = TuiRuntimeRouter::attached(
+        bootstrap,
+        Arc::new(Mutex::new(SessionContext::fresh())),
+        Arc::new(FakeAttachedBackend::default()),
+    )
+    .with_team_transition(Arc::clone(&requested));
+
+    assert_eq!(
+        router.resolve("/team".to_owned()).unwrap(),
+        TuiSubmissionOutcome::Quit
+    );
+    assert!(requested.load(std::sync::atomic::Ordering::SeqCst));
+
+    std::fs::remove_dir_all(temporary).unwrap();
+}
+
+#[test]
 fn tui_enter_routes_unknown_slash_and_local_output_without_provider_history() {
     let temporary = tui_session_directory("enter-local-routing");
     let bootstrap = tui_session_bootstrap(&temporary, &[]);

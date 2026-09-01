@@ -135,6 +135,8 @@ pub struct TeamSurface {
     inbox_selected: usize,
     /// The open answer prompt, which any view can raise.
     answering: Option<AnswerPrompt>,
+    /// What went wrong last, when something did.
+    notice: Option<String>,
 }
 
 impl TeamSurface {
@@ -150,6 +152,7 @@ impl TeamSurface {
             expanded: false,
             inbox_selected: 0,
             answering: None,
+            notice: None,
         }
     }
 
@@ -197,6 +200,17 @@ impl TeamSurface {
 
     pub(crate) const fn answering(&self) -> Option<&AnswerPrompt> {
         self.answering.as_ref()
+    }
+
+    /// Says what went wrong, so a board that stopped refreshing does not keep
+    /// showing a stale fleet as if it were current.
+    pub fn set_notice(&mut self, notice: Option<String>) {
+        self.notice = notice;
+    }
+
+    #[must_use]
+    pub fn notice(&self) -> Option<&str> {
+        self.notice.as_deref()
     }
 
     #[must_use]

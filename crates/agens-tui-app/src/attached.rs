@@ -25,7 +25,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::thread;
 use std::time::Duration;
@@ -723,7 +723,7 @@ pub fn run_attached_tui_with_prompt(
     let mut startup_notice = startup_notice;
 
     loop {
-        let switch = Arc::new(Mutex::new(None));
+        let signals = AttachmentSignals::default();
         let output = attach_and_run(
             bootstrap,
             socket,
@@ -731,10 +731,21 @@ pub fn run_attached_tui_with_prompt(
             resume,
             initial_prompt,
             startup_notice,
-            Arc::clone(&switch),
+            &signals,
         )?;
 
-        let Some(target) = switch.lock().ok().and_then(|mut slot| slot.take()) else {
+        // The supervision board is a detour, not a destination: it runs over
+        // the terminal the chat just gave back, and coming out of it comes
+        // back to the same checkout's conversation.
+        if signals.board.load(Ordering::SeqCst) {
+            crate::team::run_team_board(socket, signals.own_session())?;
+            resume = None;
+            initial_prompt = None;
+            startup_notice = None;
+            continue;
+        }
+
+        let Some(target) = signals.take_switch() else {
             return Ok(output);
         };
 
@@ -745,6 +756,32 @@ pub fn run_attached_tui_with_prompt(
         resume = None;
         initial_prompt = None;
         startup_notice = None;
+    }
+}
+
+/// What one attachment reports back about how it ended, beside its output.
+///
+/// A slot rather than a return value because the surface fills them while it
+/// is still running: the router reaches them from inside the loop, and the
+/// launch reads them once that loop is over.
+#[derive(Default)]
+struct AttachmentSignals {
+    /// The checkout the person asked to move to, when they asked to move.
+    switch: Arc<Mutex<Option<PathBuf>>>,
+    /// Whether they asked for the supervision board instead of leaving.
+    board: Arc<AtomicBool>,
+    /// The chat this attachment was on, so the board can mark it as this
+    /// terminal's own node.
+    session: Arc<AtomicI64>,
+}
+
+impl AttachmentSignals {
+    fn own_session(&self) -> Option<i64> {
+        Some(self.session.load(Ordering::SeqCst)).filter(|id| *id > 0)
+    }
+
+    fn take_switch(&self) -> Option<PathBuf> {
+        self.switch.lock().ok().and_then(|mut slot| slot.take())
     }
 }
 
@@ -759,7 +796,7 @@ fn attach_and_run(
     resume: Option<i64>,
     initial_prompt: Option<&str>,
     startup_notice: Option<&str>,
-    switch: Arc<Mutex<Option<PathBuf>>>,
+    signals: &AttachmentSignals,
 ) -> Result<String, CliError> {
     let staging = Arc::new(Mutex::new(SessionContext::fresh()));
     let (permissions, permission_requests) = TuiPermissionBridge::channel();
@@ -785,10 +822,12 @@ fn attach_and_run(
     for notice in opening_notices(startup_notice, &arrival) {
         tui.add_info(notice);
     }
+    signals.session.store(arrival.session_id, Ordering::SeqCst);
     let attachment = Arc::new(attachment);
     let router =
         TuiRuntimeRouter::attached(bootstrap.clone(), Arc::clone(&staging), attachment.clone())
-            .with_checkout_switch(switch);
+            .with_checkout_switch(Arc::clone(&signals.switch))
+            .with_team_transition(Arc::clone(&signals.board));
     tui.set_palette_entries(router.attached_palette_entries()?);
     tui.set_file_candidates(router.attached_file_candidates()?);
     if let Some(prompt) = initial_prompt {

@@ -100,6 +100,29 @@ pub(crate) fn detect_unicode_level(
     }
 }
 
+/// What this process's terminal claims it can show.
+///
+/// The environment is read here and nowhere else in a render path, so a test
+/// that builds its own backend renders the same frame under every `TERM`.
+pub(crate) fn detect_capabilities() -> (ColorLevel, UnicodeLevel) {
+    (
+        detect_color_level(
+            std::env::var("NO_COLOR").ok().as_deref(),
+            std::env::var("AGENS_COLOR").ok().as_deref(),
+            std::env::var("COLORTERM").ok().as_deref(),
+            std::env::var("TERM").ok().as_deref(),
+        ),
+        detect_unicode_level(
+            std::env::var("AGENS_GLYPHS").ok().as_deref(),
+            std::env::var("LC_ALL")
+                .or_else(|_| std::env::var("LC_CTYPE"))
+                .or_else(|_| std::env::var("LANG"))
+                .ok()
+                .as_deref(),
+        ),
+    )
+}
+
 /// Chrome glyphs the transcript draws itself with.
 ///
 /// Every variant is one column wide in both sets. That is the whole contract:

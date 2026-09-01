@@ -10,19 +10,175 @@
 //! Every function here is a projection. Nothing decides, retries or writes.
 
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agens_coordinator_client::{ClientError, Coordinator, OpenChat, proto};
+use agens_error::{CliError, ExitStatus};
 use agens_tui::team::{
-    TeamAttempt, TeamEvent, TeamEventClass, TeamInboxItem, TeamNode, TeamNodeDetail, TeamQuestion,
-    TeamRepo, TeamSnapshot, TeamState,
+    TeamAnswer, TeamAttempt, TeamCommand, TeamEvent, TeamEventClass, TeamInboxItem, TeamNode,
+    TeamNodeDetail, TeamQuestion, TeamRepo, TeamScreen, TeamSnapshot, TeamState, TeamSurface,
 };
+use agens_tui::{Event, Terminal};
+use tokio::runtime::Runtime;
+
+/// How long the board parks on the keyboard before it redraws anyway.
+const POLL: Duration = Duration::from_millis(200);
+/// How often the fleet is read again while nobody is pressing anything.
+const REFRESH: Duration = Duration::from_secs(2);
 
 /// Runs whose cost and attempt count are worth a detail round trip.
 ///
 /// A settled run keeps its row on the board, but nothing about it will change
 /// again, so the tree does not pay a call per run to redraw a finished one.
 const LIVE_STATES: [&str; 4] = ["queued", "running", "awaiting_input", "awaiting_quota"];
+
+/// Opens the supervision board over this terminal and runs it until the
+/// reader asks for the conversation back.
+///
+/// The board owns the terminal for as long as it is up, exactly as the chat
+/// does: it enters the alternate screen, restores it on every exit path, and
+/// hands the terminal back the way it found it.
+pub fn run_team_board(socket: &Path, own_session: Option<i64>) -> Result<(), CliError> {
+    let runtime = Runtime::new().map_err(|error| {
+        CliError::unavailable(format!("the team board is unavailable: {error}"))
+    })?;
+    let coordinator = runtime
+        .block_on(Coordinator::attach(socket))
+        .map_err(unavailable)?;
+    let snapshot = runtime
+        .block_on(read_fleet(&coordinator, own_session, now_seconds()))
+        .map_err(unavailable)?;
+    let mut surface = TeamSurface::new(snapshot);
+    let mut terminal = Terminal::enter().map_err(surface_failure)?;
+    let outcome = drive(
+        &mut surface,
+        &mut terminal,
+        &runtime,
+        &coordinator,
+        own_session,
+    );
+
+    // Restored before the result is reported: a board that fails still has to
+    // give the terminal back, or the shell it returns to is left in raw mode.
+    let restored = terminal.restore();
+    outcome?;
+    restored.map_err(surface_failure)
+}
+
+/// One board's lifetime: draw, wait, act, and read the fleet again on its own
+/// clock so a run that moved while nobody typed still shows as moved.
+fn drive(
+    surface: &mut TeamSurface,
+    terminal: &mut Terminal,
+    runtime: &Runtime,
+    coordinator: &Coordinator,
+    own_session: Option<i64>,
+) -> Result<(), CliError> {
+    let mut screen = TeamScreen::stdout().map_err(surface_failure)?;
+    let mut refreshed = Instant::now();
+
+    if let Some(id) = surface.selected() {
+        load_detail(surface, runtime, coordinator, id);
+    }
+
+    loop {
+        screen.draw(surface).map_err(surface_failure)?;
+
+        if let Some(Event::Key(key)) = terminal.poll(POLL).map_err(surface_failure)? {
+            match surface.handle_key(key) {
+                TeamCommand::LeaveToChat => return Ok(()),
+                TeamCommand::Selected(id) => load_detail(surface, runtime, coordinator, id),
+                TeamCommand::Answer(answer) => {
+                    deliver(surface, runtime, coordinator, &answer);
+                    refreshed = Instant::now().checked_sub(REFRESH).unwrap_or(refreshed);
+                }
+                TeamCommand::Handled | TeamCommand::Ignored => {}
+            }
+        }
+
+        if refreshed.elapsed() < REFRESH {
+            continue;
+        }
+        refreshed = Instant::now();
+
+        match runtime.block_on(read_fleet(coordinator, own_session, now_seconds())) {
+            Ok(snapshot) => {
+                surface.refresh(snapshot);
+                surface.set_notice(None);
+            }
+            Err(error) => surface.set_notice(Some(format!("the fleet could not be read: {error}"))),
+        }
+    }
+}
+
+/// Reads back the selected node, when it is a run. A chat's detail is its
+/// conversation, which is the chat's own surface and not this one.
+fn load_detail(
+    surface: &mut TeamSurface,
+    runtime: &Runtime,
+    coordinator: &Coordinator,
+    node_id: i64,
+) {
+    if surface
+        .selected_node()
+        .is_none_or(|node| node.kind != agens_tui::team::TeamNodeKind::Run)
+    {
+        return;
+    }
+
+    match runtime.block_on(read_detail(coordinator, node_id)) {
+        Ok(detail) => {
+            surface.set_detail(detail);
+            surface.set_notice(None);
+        }
+        Err(error) => surface.set_notice(Some(format!("run {node_id} could not be read: {error}"))),
+    }
+}
+
+/// Delivers one answer, on whichever call the question's class names.
+fn deliver(
+    surface: &mut TeamSurface,
+    runtime: &Runtime,
+    coordinator: &Coordinator,
+    answer: &TeamAnswer,
+) {
+    let mut team = coordinator.team();
+    let delivered = if answer.is_approval() {
+        runtime
+            .block_on(team.authorize_merge(proto::AuthorizeMergeRequest {
+                subject: Some(proto::authorize_merge_request::Subject::QuestionId(
+                    answer.question_id,
+                )),
+                answer: answer.answer.clone(),
+                expires_at: None,
+            }))
+            .map(|_| ())
+    } else {
+        runtime
+            .block_on(team.answer_question(answer.question_id, &answer.answer))
+            .map(|_| ())
+    };
+
+    surface.set_notice(
+        delivered
+            .err()
+            .map(|error| format!("question {} was not answered: {error}", answer.question_id)),
+    );
+}
+
+fn now_seconds() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| i64::try_from(elapsed.as_secs()).unwrap_or(0))
+}
+
+fn unavailable(error: ClientError) -> CliError {
+    CliError::unavailable(error.to_string())
+}
+
+fn surface_failure(error: std::io::Error) -> CliError {
+    CliError::new(ExitStatus::Failure, "ui", error.to_string())
+}
 
 /// Every repository, run, chat and open question the daemon holds.
 ///
